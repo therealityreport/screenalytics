@@ -1,0 +1,25 @@
+version: 1
+assistant: "claude"
+system_preamble: |
+  Place all feature docs in FEATURES/<feature>/docs/ until promotion.
+  Root docs require promotion mode. Never modify db/migrations/ or infra/ without explicit approval.
+path_policies:
+  default:
+    allow:
+      - "FEATURES/**/docs/**"
+      - "FEATURES/**/TODO.md"
+      - "MASTER_TODO.md"
+    deny:
+      - "docs/**"
+      - "db/migrations/**"
+      - "infra/**"
+  promote:
+    allow:
+      - "docs/**"
+      - "FEATURES/**/docs/**"
+      - "FEATURES/**/TODO.md"
+      - "MASTER_TODO.md"
+    deny:
+      - "db/migrations/**"
+messages:
+  reminder: "Root docs only when promoting."

@@ -1,1 +1,31 @@
-# Filled later with provider, models, MCP servers, and write policies
+[provider]
+name = "openai"
+env_api_key = "OPENAI_API_KEY"
+
+[model]
+default = "gpt-5-reasoning"
+temperature = 0.2
+
+[policies]
+allow_write_paths = ["FEATURES/**/docs/**","FEATURES/**/TODO.md","MASTER_TODO.md"]
+deny_paths = ["docs/**","db/migrations/**","infra/**",".github/**"]
+
+[profiles.promote]
+allow_write_paths = ["docs/**","FEATURES/**/docs/**","FEATURES/**/TODO.md","MASTER_TODO.md"]
+deny_paths = ["db/migrations/**"]
+
+[mcp.servers.screenalytics]
+command = "uv"
+args = ["run","mcps/screenalytics/server.py"]
+env = ["DB_URL","S3_ENDPOINT","S3_ACCESS_KEY","S3_SECRET_KEY"]
+timeout_ms = 300000
+
+[mcp.servers.storage]
+command = "uv"
+args = ["run","mcps/storage/server.py"]
+env = ["S3_ENDPOINT","S3_ACCESS_KEY","S3_SECRET_KEY"]
+
+[mcp.servers.postgres]
+command = "uv"
+args = ["run","mcps/postgres/server.py"]
+env = ["DB_URL"]

@@ -1,0 +1,35 @@
+name: feature-promote
+on:
+  pull_request:
+    paths-ignore: ["**/*.md"]
+jobs:
+  enforce-promotion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Block imports from FEATURES/**
+        run: |
+          if grep -R --include='*.py' -n 'from FEATURES' || grep -R --include='*.py' -n 'import FEATURES'; then
+            echo "Imports from FEATURES forbidden"
+            exit 1
+          fi
+      - name: TTL check for features
+        run: |
+          python - <<'PY'
+          import pathlib, sys, time
+          root = pathlib.Path("FEATURES")
+          if not root.exists():
+            sys.exit(0)
+          now = time.time()
+          bad = []
+          for feature_dir in root.iterdir():
+            if not feature_dir.is_dir():
+              continue
+            age_days = (now - feature_dir.stat().st_mtime) / (60*60*24)
+            if age_days > 30:
+              bad.append(f"{feature_dir} older than 30 days")
+          if bad:
+            print("\n".join(bad))
+            sys.exit(1)
+          print("TTL ok")
+          PY

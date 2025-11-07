@@ -1,0 +1,35 @@
+name: on-push-doc-sync
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/**"
+      - "workers/**"
+      - "packages/**"
+      - "db/**"
+      - "config/**"
+      - "FEATURES/**"
+      - "agents/**"
+      - "mcps/**"
+      - "infra/**"
+      - "tests/**"
+      - "tools/**"
+jobs:
+  sync-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: List changed files
+        id: diff
+        run: |
+          echo "changed<<EOF" >> "$GITHUB_OUTPUT"
+          git diff --name-only HEAD~1..HEAD >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+      - name: Run Codex playbook
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "${{ steps.diff.outputs.changed }}" > changed.txt
+          echo "Would call agents/playbooks/update-docs-on-change.yaml with changed files"
