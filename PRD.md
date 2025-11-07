@@ -52,6 +52,8 @@ Screenalytics delivers automated face, voice, and screen-time intelligence for u
 - ✅ Matching row in `ACCEPTANCE_MATRIX.md` marked Accepted for the promoted module.  
 - ✅ Docs + tests + config + promotion checklist complete.
 
+See `ACCEPTANCE_MATRIX.md` for the detailed acceptance checklist.
+
 ---
 
 ## 15. Future Enhancements

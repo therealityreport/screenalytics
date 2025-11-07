@@ -1,0 +1,3 @@
+- Use `FEATURES/<name>` for all new work until promotion.
+- Include tests and documentation before promoting any module.
+- Follow `SETUP.md` to bootstrap your environment and run services locally.

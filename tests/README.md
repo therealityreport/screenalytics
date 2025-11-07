@@ -1,3 +1,3 @@
 # Tests
 
-Placeholder for future API/workers/pipeline test plans.
+Add unit tests for each promoted module. CI will block promotion without tests.

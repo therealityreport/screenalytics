@@ -277,6 +277,8 @@ Planning/Scaffolding phase. See:
 * `DIRECTORY_STRUCTURE.md` — repo map and promotion policy
 * `ACCEPTANCE_MATRIX.md` — promotion acceptance gates
 
+See `ACCEPTANCE_MATRIX.md` for feature acceptance and promotion gates.
+
 ```
 ::contentReference[oaicite:0]{index=0}
 ```

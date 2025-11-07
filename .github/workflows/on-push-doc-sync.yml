@@ -19,17 +19,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-      - name: List changed files
+
+      - name: Compute changed files
         id: diff
         run: |
+          git fetch --prune --unshallow || true
           echo "changed<<EOF" >> "$GITHUB_OUTPUT"
           git diff --name-only HEAD~1..HEAD >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-      - name: Run Codex playbook
+
+      - name: Run Codex playbook (update-docs-on-change)
+        uses: openai/codex-action@v1
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          echo "${{ steps.diff.outputs.changed }}" > changed.txt
-          echo "Would call agents/playbooks/update-docs-on-change.yaml with changed files"
+        with:
+          args: >
+            exec
+            --config ./config/codex.config.toml
+            --playbook ./agents/playbooks/update-docs-on-change.yaml
+            --input.changed_files "${{ steps.diff.outputs.changed }}"
