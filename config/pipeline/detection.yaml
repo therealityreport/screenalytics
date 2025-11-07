@@ -1,0 +1,4 @@
+model_id: retinaface_r50
+min_size: 64
+confidence_th: 0.8
+iou_th: 0.4
