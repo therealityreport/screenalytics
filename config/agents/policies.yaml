@@ -1,0 +1,39 @@
+# Agent write policies for docs and updates
+version: 1
+defaults:
+  feature_ttl_days: 30
+  # Pre-promotion writes are limited to feature sandboxes:
+  allow_write_paths:
+    - "FEATURES/**/docs/**"
+    - "FEATURES/**/TODO.md"
+    - "MASTER_TODO.md"
+  deny_write_paths:
+    - "docs/**"           # root docs blocked until promotion
+    - "db/migrations/**"  # agents must not touch schema by default
+    - "infra/**"
+    - ".github/**"
+
+modes:
+  promote:
+    # Promotion task may write to root docs
+    allow_write_paths:
+      - "docs/**"
+      - "FEATURES/**/docs/**"
+      - "FEATURES/**/TODO.md"
+      - "MASTER_TODO.md"
+    deny_write_paths:
+      - "db/migrations/**"  # still blocked unless explicit
+rules:
+  - name: docs-placement
+    description: >
+      During feature development, all .md files and updates must live under FEATURES/<feature>/docs/.
+      Root docs may be modified only in 'promote' mode.
+    match:
+      - "*.md"
+    mode_required_for:
+      - "docs/**"   # requires 'promote' mode
+
+messages:
+  preamble: |
+    Write feature documentation to FEATURES/<feature>/docs/ first.
+    Do not modify /docs/** unless running the promotion task.

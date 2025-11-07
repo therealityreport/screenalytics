@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Node
+node_modules/
+.pnpm-store/
+.next/
+dist/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker
+*.log
+
+# Local data
+data/
