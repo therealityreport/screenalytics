@@ -31,6 +31,12 @@ pip install -r requirements.txt
 pnpm install --filter workspace-ui
 ```
 
+### Install Codex CLI
+```bash
+npm i -g @openai/codex   # or: brew install --cask codex
+codex                    # sign in with your ChatGPT plan
+```
+
 ### Environment file
 Copy `.env.example` → `.env` and fill in credentials:
 ```
