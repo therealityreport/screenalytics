@@ -1,23 +1,49 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
 .env
+.env.*
+.mypy_cache/
+pytest_cache/
+.cache/
 
-# Node
+# Node / UI
 node_modules/
 .pnpm-store/
 .next/
 dist/
+out/
+build/
 
-# OS/IDE
+# OS / IDE
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+*.log
+*.swp
+
+# Data / Artifacts
+data/
+videos/
+frames/
+chips/
+reports/
+manifests/
+logs/
 
 # Docker
-*.log
+docker-compose.override.yml
+*.pid
 
-# Local data
-data/
+# Coverage / reports
+htmlcov/
+.coverage
+coverage.xml
+
+# CI / Temp
+tmp/
+__temp__/

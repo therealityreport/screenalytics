@@ -1,0 +1,35 @@
+# Core runtime
+fastapi==0.115.0
+uvicorn[standard]==0.30.1
+pydantic==2.8.2
+redis==5.0.7
+psycopg[binary,pool]==3.2.1
+sqlalchemy==2.0.31
+
+# ML / analytics pipeline
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pandas==2.2.3
+torch==2.3.1
+torchvision==0.18.1
+insightface==0.7.3
+ultralytics==8.2.70
+scikit-learn==1.5.1
+pyannote.audio==3.1.1
+faster-whisper==1.0.1
+ffmpeg-python==0.2.0
+
+# Vector + config
+pgvector==0.2.5
+faiss-cpu==1.8.0
+pyyaml==6.0.1
+tomlkit==0.13.2
+
+# Utilities
+loguru==0.7.2
+tqdm==4.66.5
+requests==2.32.3
+
+# Agents / OpenAI
+openai==1.52.0
+anthropic==0.30.0
