@@ -92,13 +92,42 @@ pnpm install
 cp .env.example .env
 
 # Migrate DB
-psql "$DB_URL" -f db/migrations/0001_init_core.sql
+for f in db/migrations/*.sql; do
+  psql "$DB_URL" -f "$f"
+done
 
 # Run services
 uv run apps/api/main.py               # API
 uv run workers/orchestrator.py        # Workers (pipeline)
 pnpm --filter workspace-ui dev        # UI
 ````
+
+#### macOS (Apple Silicon) Python environment
+
+If you're on Apple Silicon and rely on the system `zsh`, use `pyenv` to guarantee that `python` points at 3.11.9 before creating the virtual environment:
+
+```bash
+brew install pyenv
+
+# ~/.zshrc
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init --path)"
+fi
+case $- in *i*) : ;; *) return ;; esac  # keep existing guard if you have one
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init -)"
+fi
+
+# back in the repo
+pyenv install 3.11.9
+pyenv local 3.11.9
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+`pyenv local 3.11.9` writes `.python-version`, so new shells automatically pick up the right interpreter before activating `.venv`.
 
 ### Minimal .env example
 

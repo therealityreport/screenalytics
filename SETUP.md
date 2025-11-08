@@ -19,6 +19,22 @@ cd screenalytics
 ```
 
 ### Virtual environment
+
+> **macOS (Apple Silicon):** install `pyenv`, add the following to `~/.zshrc`, then install + select Python 3.11.9 before creating the venv.
+> ```bash
+> brew install pyenv
+> if command -v pyenv >/dev/null; then
+>   eval "$(pyenv init --path)"
+> fi
+> if [[ $- == *i* ]]; then
+>   eval "$(pyenv init -)"
+> fi
+> pyenv install 3.11.9
+> pyenv local 3.11.9
+> ```
+
+Now create the environment with the pinned interpreter:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate # or .\.venv\Scripts\activate on Windows
