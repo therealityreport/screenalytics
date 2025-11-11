@@ -24,9 +24,10 @@ try:  # pragma: no cover - optional ML stack
 except ModuleNotFoundError:
     episode_run = None  # type: ignore[assignment]
 DEFAULT_DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DETECTOR_CHOICES = {"retinaface", "yolov8face"}
+DETECTOR_CHOICES = {"retinaface"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
-DEFAULT_DETECTOR_ENV = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
+_DEFAULT_DETECTOR_RAW = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
+DEFAULT_DETECTOR_ENV = _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
 
 
@@ -143,6 +144,7 @@ class JobService:
         try:
             progress_path.unlink()
         except FileNotFoundError:
+            # Old progress files are optional; ignore if missing.
             pass
 
         job_id = uuid.uuid4().hex
@@ -279,6 +281,8 @@ class JobService:
         track_path = get_path(ep_id, "tracks")
         if not track_path.exists():
             raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
+        device_value = device or "auto"
+        self.ensure_arcface_ready(device_value)
         progress_path = self._progress_path(ep_id)
         command = [
             sys.executable,
@@ -287,7 +291,7 @@ class JobService:
             ep_id,
             "--faces-embed",
             "--device",
-            device,
+            device_value,
             "--progress-file",
             str(progress_path),
         ]
@@ -300,7 +304,7 @@ class JobService:
             command += ["--jpeg-quality", str(jpeg_quality)]
         command += ["--thumb-size", str(thumb_size)]
         requested = {
-            "device": device,
+            "device": device_value,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -405,8 +409,10 @@ class JobService:
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except ProcessLookupError:
+                    # Process already exited on its own.
                     pass
                 except PermissionError:
+                    # PID belongs to another user; nothing else to do.
                     pass
             record["state"] = "canceled"
             record["ended_at"] = self._now()
@@ -454,6 +460,59 @@ class JobService:
         if error_detail:
             message = f"{message} ({error_detail})"
         raise ValueError(message)
+
+    def ensure_arcface_ready(self, device: str) -> None:
+        if episode_run is None:
+            raise ValueError(
+                "ArcFace validation unavailable: install the ML stack (pip install -r requirements-ml.txt) "
+                "before running face embedding."
+            )
+        ok, error_detail, _ = episode_run.ensure_arcface_ready(device)
+        if ok:
+            return
+        message = getattr(
+            episode_run,
+            "ARC_FACE_HELP",
+            "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py.",
+        )
+        if error_detail:
+            message = f"{message} ({error_detail})"
+        raise ValueError(message)
+
+    def emit_facebank_refresh(
+        self,
+        show_id: str,
+        cast_id: str,
+        *,
+        action: str,
+        seed_ids: list[str] | None = None,
+    ) -> JobRecord:
+        payload = {
+            "action": action,
+            "show_id": show_id,
+            "cast_id": cast_id,
+            "seed_ids": list(seed_ids or []),
+        }
+        job_id = f"facebank-refresh-{uuid.uuid4().hex[:10]}"
+        now = self._now()
+        record: JobRecord = {
+            "job_id": job_id,
+            "ep_id": f"{show_id}:{cast_id}",
+            "job_type": "facebank_refresh",
+            "pid": None,
+            "state": "succeeded",
+            "command": [],
+            "started_at": now,
+            "ended_at": now,
+            "progress_file": None,
+            "requested": payload,
+            "summary": payload,
+            "error": None,
+            "return_code": 0,
+            "data_root": str(self.data_root),
+        }
+        self._write_job(record)
+        return record
 
 
 __all__ = ["JobService", "JobNotFoundError", "JobRecord"]

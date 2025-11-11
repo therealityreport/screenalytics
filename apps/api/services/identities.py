@@ -371,6 +371,7 @@ def _write_track_index(ep_id: str, track_id: int, face_rows: Sequence[Dict[str, 
         try:
             index_path.unlink()
         except FileNotFoundError:
+            # Track index may already be removed by another cleanup worker.
             pass
         return
     crops_dir.mkdir(parents=True, exist_ok=True)
@@ -386,6 +387,7 @@ def _write_track_index(ep_id: str, track_id: int, face_rows: Sequence[Dict[str, 
     try:
         STORAGE.put_artifact(ctx, "crops", index_path, f"{_track_dir_name(track_id)}/index.json")
     except Exception:
+        # Remote sync failures are non-fatal; artifacts stay locally.
         pass
 
 
@@ -482,6 +484,7 @@ def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = 
                 try:
                     thumb_abs.unlink()
                 except FileNotFoundError:
+                    # Thumbs are optional outputs; ignore if already deleted.
                     pass
             crop_rel = row.get("crop_rel_path")
             if isinstance(crop_rel, str):
@@ -489,6 +492,7 @@ def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = 
                 try:
                     crop_abs.unlink()
                 except FileNotFoundError:
+                    # Crops may already be removed by previous delete requests.
                     pass
     identities = load_identities(ep_id)
     update_identity_stats(ep_id, identities)
@@ -525,6 +529,7 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
         try:
             roster_service.add_if_missing(show_slug, trimmed)
         except ValueError:
+            # Duplicate roster seeds are normal when multiple queues run.
             pass
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed}
 
@@ -598,6 +603,7 @@ def move_frames(
         try:
             roster_service.add_if_missing(show_id or ctx.show_slug, trimmed_name)
         except ValueError:
+            # Ignore duplicates when the name already exists on the roster.
             pass
 
     tracks = load_tracks(ep_id)
@@ -621,6 +627,7 @@ def move_frames(
             try:
                 old_crop_path.rename(new_crop_path)
             except OSError:
+                # Parallel transfers may hold locks; skip and keep old path.
                 pass
         old_thumb_rel = row.get("thumb_rel_path")
         old_thumb_path = thumbs_root / old_thumb_rel if old_thumb_rel else None
@@ -631,6 +638,7 @@ def move_frames(
             try:
                 old_thumb_path.rename(new_thumb_path)
             except OSError:
+                # Skip if filesystem renames collide; we'll refresh later.
                 pass
         row["track_id"] = new_track_id
         row["crop_rel_path"] = new_crop_rel
@@ -680,12 +688,4 @@ def move_frames(
         "target_identity_id": target_identity.get("identity_id"),
         "target_name": target_identity.get("name"),
         "clusters": summary["clusters"],
-    }
-    return {
-        "ep_id": ep_id,
-        "source_track_id": source_track_id,
-        "new_track_id": new_track_id,
-        "moved_frames": len(selected),
-        "target_identity_id": target_identity.get("identity_id"),
-        "target_name": target_identity.get("name"),
     }

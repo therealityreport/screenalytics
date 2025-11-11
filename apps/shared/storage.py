@@ -123,6 +123,7 @@ def _s3_read_json(key: str) -> Dict[str, Any]:
         try:
             body.close()
         except Exception:
+            # Some boto streams lack close(); ignoring keeps cleanup best-effort.
             pass
     try:
         return json.loads(data.decode("utf-8"))

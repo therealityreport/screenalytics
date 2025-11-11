@@ -97,12 +97,14 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
         try:
             out_path.unlink()
         except OSError:
+            # File may already be removed by another cleanup step.
             pass
         return False, "tiny_file"
     if variance <= 0.05 and range_val <= 1.0:
         try:
             out_path.unlink()
         except OSError:
+            # Ignore if concurrent deletion already removed the file.
             pass
         LOGGER.warning(
             "Removed near-uniform image %s (std=%.5f range=%.3f)", out_path, variance, range_val

@@ -5,10 +5,7 @@ import types
 
 import pytest
 
-try:  # pragma: no cover - optional ML dependency
-    import numpy  # noqa: F401
-except ImportError:  # pragma: no cover
-    pytest.skip("numpy is required for retinaface init tests", allow_module_level=True)
+pytest.importorskip("numpy")
 
 from tools import episode_run
 

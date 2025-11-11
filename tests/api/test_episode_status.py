@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import shutil
 
-import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.main import app

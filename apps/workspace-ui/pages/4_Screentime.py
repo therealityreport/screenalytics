@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import requests
 import streamlit as st
@@ -18,6 +19,12 @@ cfg = helpers.init_page("Screentime")
 st.title("Screentime")
 
 
+def _stop_forever() -> NoReturn:
+    """Wrapper so type-checkers understand we don't return after st.stop()."""
+    st.stop()
+    raise RuntimeError("Streamlit stop returned unexpectedly")
+
+
 def _require_episode() -> str:
     ep_id = helpers.get_ep_id()
     if ep_id:
@@ -26,11 +33,11 @@ def _require_episode() -> str:
         payload = helpers.api_get("/episodes")
     except requests.RequestException as exc:
         st.error(helpers.describe_error(f"{cfg['api_base']}/episodes", exc))
-        st.stop()
+        _stop_forever()
     episodes = payload.get("episodes", [])
     if not episodes:
         st.info("No episodes yet.")
-        st.stop()
+        _stop_forever()
     option_lookup = {ep["ep_id"]: ep for ep in episodes}
     selection = st.selectbox(
         "Episode",
@@ -39,7 +46,8 @@ def _require_episode() -> str:
     )
     if st.button("Load episode", use_container_width=True):
         helpers.set_ep_id(selection)
-    st.stop()
+        return selection
+    _stop_forever()
 
 
 ep_id = _require_episode()

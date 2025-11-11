@@ -58,4 +58,3 @@ def test_mirror_falls_back_to_v1(monkeypatch, tmp_path):
     assert mock_storage.mirror_calls
     _, kwargs = mock_storage.mirror_calls[0]
     assert kwargs["show_ref"] == "legacy"
-*** End Patch

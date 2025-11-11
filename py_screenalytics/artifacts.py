@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import ModuleType
-from typing import Any
 
 _PKG_FILE = (
     Path(__file__).resolve().parents[1] / "packages" / "py-screenalytics" / "artifacts.py"

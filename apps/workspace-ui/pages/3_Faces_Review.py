@@ -382,38 +382,60 @@ def _render_people_view(
         st.info("No people found for this show. Run 'Group Clusters (auto)' to create people.")
         return
 
-    st.markdown(f"**{len(people)} People** across show {show_id}")
-    for person in people:
+    filtered_people = people
+    if filter_cast_id:
+        filtered_people = [
+            person
+            for person in people
+            if str(person.get("person_id") or "").lower() == str(filter_cast_id).lower()
+        ]
+        if not filtered_people:
+            st.warning(f"{filter_cast_name or filter_cast_id} is not part of this show's roster.")
+            return
+
+    episode_people: List[tuple[Dict[str, Any], List[str]]] = []
+    for person in filtered_people:
+        episode_clusters = _episode_cluster_ids(person, ep_id)
+        if not episode_clusters:
+            continue
+        episode_people.append((person, episode_clusters))
+
+    if not episode_people:
+        if filter_cast_id:
+            st.info(
+                f"{filter_cast_name or filter_cast_id} has no clusters linked to episode {ep_id} yet."
+            )
+        else:
+            st.info("No clusters from this episode are linked to show-level people yet.")
+        return
+
+    st.markdown(f"**{len(episode_people)} People** in episode {ep_id}")
+    for person, episode_clusters in episode_people:
         person_id = str(person.get("person_id") or "")
         name = person.get("name") or "(unnamed)"
         total_clusters = len(person.get("cluster_ids", []) or [])
-        episode_clusters = _episode_cluster_ids(person, ep_id)
         with st.container(border=True):
             st.markdown(f"### 👤 {name}")
             st.caption(
                 f"ID: {person_id or 'n/a'} · {total_clusters} cluster(s) overall · "
                 f"{len(episode_clusters)} in this episode"
             )
-            if episode_clusters:
-                labels: List[str] = []
-                for identity_id in episode_clusters:
-                    cluster_meta = cluster_lookup.get(identity_id, {})
-                    identity_meta = identity_index.get(identity_id, {})
-                    label = (
-                        cluster_meta.get("name")
-                        or identity_meta.get("name")
-                        or cluster_meta.get("label")
-                        or identity_meta.get("label")
-                        or identity_id
-                    )
-                    labels.append(f"{label} (`{identity_id}`)")
-                st.markdown("**Clusters in this episode:** " + ", ".join(labels))
-            else:
-                st.caption("No clusters linked to this person in this episode yet.")
+            labels: List[str] = []
+            for identity_id in episode_clusters:
+                cluster_meta = cluster_lookup.get(identity_id, {})
+                identity_meta = identity_index.get(identity_id, {})
+                label = (
+                    cluster_meta.get("name")
+                    or identity_meta.get("name")
+                    or cluster_meta.get("label")
+                    or identity_meta.get("label")
+                    or identity_id
+                )
+                labels.append(f"{label} (`{identity_id}`)")
+            st.markdown("**Clusters in this episode:** " + ", ".join(labels))
             st.button(
                 "View clusters",
                 key=f"view_clusters_{person_id or name}",
-                disabled=not episode_clusters,
                 on_click=lambda pid=person_id: _set_view("person_clusters", person_id=pid),
             )
 
@@ -556,7 +578,8 @@ def _render_cluster_tracks(
         strip_cache[cache_key] = strip_items
 
     if strip_items:
-        window = 10
+        per_row = 5
+        window = per_row
         offsets = st.session_state.setdefault("cluster_strip_offsets", {})
         start_idx = int(offsets.get(identity_id, 0) or 0)
         start_idx = max(0, min(start_idx, max(0, len(strip_items) - window)))
@@ -575,38 +598,46 @@ def _render_cluster_tracks(
                 offsets[identity_id] = min(len(strip_items) - 1, start_idx + window)
                 st.rerun()
         visible = strip_items[start_idx : start_idx + window]
-        row_cols = st.columns(len(visible)) if visible else []
-        for idx, itm in enumerate(visible):
-            with row_cols[idx]:
-                st.markdown(
-                    helpers.thumb_html(itm.get("url"), alt=f"Track {itm.get('track_id')}") or "",
-                    unsafe_allow_html=True,
-                )
-                if st.button(
-                    "View track",
-                    key=f"strip_view_{identity_id}_{itm.get('track_id')}_{start_idx+idx}",
-                ):
-                    _set_view(
-                        "track",
-                        person_id=person_id,
-                        identity_id=identity_id,
-                        track_id=int(itm.get("track_id")),
+        if visible:
+            row_cols = st.columns(len(visible))
+            for idx, itm in enumerate(visible):
+                with row_cols[idx]:
+                    thumb_markup = helpers.thumb_html(
+                        itm.get("url"),
+                        alt=f"Track {itm.get('track_id')}",
+                        hide_if_missing=True,
                     )
-        st.caption(f"Showing {start_idx + 1}-{min(start_idx + window, len(strip_items))} of {len(strip_items)} thumbnails")
+                    if thumb_markup:
+                        st.markdown(thumb_markup, unsafe_allow_html=True)
+                    else:
+                        st.caption("Thumbnail unavailable.")
+                    if st.button(
+                        "View track",
+                        key=f"strip_view_{identity_id}_{itm.get('track_id')}_{start_idx+idx}",
+                    ):
+                        _set_view(
+                            "track",
+                            person_id=person_id,
+                            identity_id=identity_id,
+                            track_id=int(itm.get("track_id")),
+                        )
+            end_idx = start_idx + len(visible)
+            st.caption(f"Showing {start_idx + 1}-{end_idx} of {len(strip_items)} thumbnails")
 
     move_targets = [ident_id for ident_id in identity_index if ident_id != identity_id]
     cols_per_row = 5
     for row_start in range(0, len(tracks), cols_per_row):
         row_tracks = tracks[row_start : row_start + cols_per_row]
-        row_cols = st.columns(cols_per_row)
+        row_cols = st.columns(min(cols_per_row, len(row_tracks)))
         for idx, track in enumerate(row_tracks):
             with row_cols[idx]:
                 track_id = track.get("track_id")
                 thumb_url = helpers.resolve_thumb(track.get("rep_thumb_url"))
-                st.markdown(
-                    helpers.thumb_html(thumb_url, alt=f"Track {track_id}"),
-                    unsafe_allow_html=True,
-                )
+                thumb_markup = helpers.thumb_html(thumb_url, alt=f"Track {track_id}", hide_if_missing=True)
+                if thumb_markup:
+                    st.markdown(thumb_markup, unsafe_allow_html=True)
+                else:
+                    st.caption("Thumbnail unavailable.")
                 faces_count = track.get("faces") or 0
                 st.caption(f"Track {track_id} · {faces_count} faces")
                 if st.button(

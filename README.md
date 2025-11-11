@@ -143,7 +143,7 @@ The diagnostics logger (`DEBUG_THUMBS=1 python tools/episode_run.py …`) append
 - `data/frames/ep_demo/frames/` + `crops/` (only when `--save-frames`/`--save-crops` are provided)
 - `data/manifests/ep_demo/progress.json` (live `phase`/ETA snapshots written every ~25 frames)
 
-`episode_run.py` now auto-detects FPS whenever `--fps` is unset/`0`, emits structured progress JSON (frames, seconds, inferred FPS, device, detector, tracker, phase) to stdout **and** to `progress.json`, and finishes with a `phase:"done"` payload that includes stage-specific counts, per-run track metrics (`tracks_born`, `tracks_lost`, `id_switches`, `longest_tracks`), plus local + v2 S3 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). `--detector {retinaface,yolov8face}` toggles between the high-quality InsightFace RetinaFace weights and the faster YOLOv8-face variant, while `--tracker {bytetrack,strongsort}` chooses either the default face-only ByteTrack gates or a StrongSORT/BoT-SORT ReID path for occlusions. Both trackers operate purely on face boxes (track_thresh≈0.6, match_thresh≈0.8, buffer≈30, min box area≈20 px), so there’s no longer a person-class detector. `--max-gap` still controls how many skipped frames cause a track split. `--faces-embed` now runs ArcFace (`arcface_r100_v1`) via ONNX Runtime to produce 512-d unit-norm embeddings (plus optional crops/frames), and `--cluster` averages those per-track vectors before agglomerative clustering so the Facebank can relabel/merge tracks.
+`episode_run.py` now auto-detects FPS whenever `--fps` is unset/`0`, emits structured progress JSON (frames, seconds, inferred FPS, device, detector, tracker, phase) to stdout **and** to `progress.json`, and finishes with a `phase:"done"` payload that includes stage-specific counts, per-run track metrics (`tracks_born`, `tracks_lost`, `id_switches`, `longest_tracks`), plus local + v2 S3 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). `--detector retinaface` locks each run to the high-quality InsightFace RetinaFace weights so embeddings and trackers always see consistent geometry, while `--tracker {bytetrack,strongsort}` chooses either the default face-only ByteTrack gates or a StrongSORT/BoT-SORT ReID path for occlusions. Both trackers operate purely on face boxes (track_thresh≈0.6, match_thresh≈0.8, buffer≈30, min box area≈20 px), so there’s no longer a person-class detector. `--max-gap` still controls how many skipped frames cause a track split. `--faces-embed` now runs ArcFace (`arcface_r100_v1`) via ONNX Runtime to produce 512-d unit-norm embeddings (plus optional crops/frames), and `--cluster` averages those per-track vectors before agglomerative clustering so the Facebank can relabel/merge tracks.
 
 ### Dependency profiles
 
@@ -203,13 +203,13 @@ The diagnostics logger (`DEBUG_THUMBS=1 python tools/episode_run.py …`) append
 
 4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
 5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
-6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, then submit to mirror the footage locally and kick off the full YOLOv8 + ByteTrack pass (using the same defaults as Episode Detail—frames + crops exports enabled, JPEG quality 85, scene-cut detection on).
+6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, then submit to mirror the footage locally and kick off the full RetinaFace + ByteTrack pass (using the same defaults as Episode Detail—frames + crops exports enabled, JPEG quality 85, scene-cut detection on).
 7. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and calls `POST /jobs/detect_track_async` (with a synchronous fallback button if you really need it). Progress is streamed from `/jobs/{job_id}/progress`, so you can cancel or watch counts materialize without blocking the page.
 
 **Episode Detail live progress & exports**
 
 - “Run detect/track” negotiates `text/event-stream` against `POST /jobs/detect_track`, so Streamlit renders a live bar (`mm:ss / MM:SS • phase=<detect|track> • device=<…> • fps=<…>`). If SSE isn’t available (corporate proxies, etc.) the button falls back to `/jobs/detect_track_async` and polls the new `GET /episodes/{ep_id}/progress` every 500 ms until the `phase:"done"` payload lands.
-- Detector dropdown toggles between **RetinaFace (recommended)** and **YOLOv8-face (alt)**—both wired to the CLI’s `--detector {retinaface,yolov8face}` flag—while the new Tracker dropdown lets you pick **ByteTrack (default)** or **StrongSORT (ReID)** before launching a run. ByteTrack parameters (e.g. `--max-gap`, JPEG export toggles) stay available alongside the frame/crop exporter controls, and both “Save frames to S3” + “Save face crops to S3” are pre-selected so exports always land unless you opt out. The live status bar now renders `mm:ss / MM:SS • phase=<…> • detector=<…> • tracker=<…> • device=<…> • fps=<…>` so it’s obvious which models are currently running. Successful runs summarize counts, exporter stats, v2 prefixes, **and** the track quality metrics surfaced by the runner (`tracks born/lost`, `id switches`, `top longest tracks`, highlighting any track that exceeds 500 frames). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
+- Detector dropdown is fixed to **RetinaFace (required)** so every run uses the supported InsightFace weights, while the Tracker dropdown lets you pick **ByteTrack (default)** or **StrongSORT (ReID)** before launching a run. ByteTrack parameters (e.g. `--max-gap`, JPEG export toggles) stay available alongside the frame/crop exporter controls, and both “Save frames to S3” + “Save face crops to S3” are pre-selected so exports always land unless you opt out. The live status bar now renders `mm:ss / MM:SS • phase=<…> • detector=<…> • tracker=<…> • device=<…> • fps=<…>` so it’s obvious which models are currently running. Successful runs summarize counts, exporter stats, v2 prefixes, **and** the track quality metrics surfaced by the runner (`tracks born/lost`, `id switches`, `top longest tracks`, highlighting any track that exceeds 500 frames). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
 
 Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
@@ -230,14 +230,14 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
 **Faces pipeline + Facebank**
 
-- Use `Run Faces Harvest` (Episode Detail or the Facebank page) to trigger `POST /jobs/faces_embed` with SSE updates. The CLI exports square thumbnails plus ArcFace (`arcface_r100_v1`) embeddings via ONNX Runtime, so every face row in `faces.jsonl` stores a 512-d unit-norm vector (and the same matrix is materialized under `data/embeds/{ep_id}/faces.npy`). When legacy tracks are detected (old “person” detectors), the UI blocks harvest/cluster buttons until a fresh RetinaFace/YOLOv8-face run completes.
+- Use `Run Faces Harvest` (Episode Detail or the Facebank page) to trigger `POST /jobs/faces_embed` with SSE updates. The CLI exports square thumbnails plus ArcFace (`arcface_r100_v1`) embeddings via ONNX Runtime, so every face row in `faces.jsonl` stores a 512-d unit-norm vector (and the same matrix is materialized under `data/embeds/{ep_id}/faces.npy`). When legacy tracks are detected (old “person” detectors), the UI blocks harvest/cluster buttons until a fresh RetinaFace run completes.
 - `Run Cluster` streams `POST /jobs/cluster`, which averages the per-track embeddings, clusters them with Agglomerative (tunable via `--cluster-thresh` and `--min-cluster-size`), and emits `identities.json` alongside identity-level thumbnails under `artifacts/thumbs/{show}/s{ss}/e{ee}/identities/{id}/rep.jpg`.
 - When SSE can’t be established the UI falls back to the corresponding `..._async` endpoint and polls `GET /episodes/{ep_id}/progress` every 500 ms until `phase:"done"` arrives.
 - The revamped Facebank page opens with a tracked-vs-S3 episode selector, shows a uniform identity grid (presigned thumbnails, inline Rename/Delete controls, and a **Merge into…** dropdown), and lets you drill down into clusters → tracks via a filmstrip UI. Cluster detail now renders one row per track: left/right arrows scroll a 4:5 thumbnail rail (no image rewriting; pure CSS `aspect-ratio: 4 / 5`), and the default “Sample every N crops” value (3) prevents the browser from loading thousands of JPGs at once. Each row surfaces **View track**, **Move to identity**, **Remove from identity**, and **Delete track** actions; “Load more” streams the next page via `GET /episodes/{ep_id}/tracks/{track_id}/crops?sample=N&limit=40&start_after={cursor}`, where `next_start_after` is treated as an opaque cursor. View Track opens the same horizontal scroller at sample=1 with paginator arrows so moderators can flip between clusters and dedicated track rails without reloading the page, plus inline **Move/Remove/Delete** controls and a “Run Faces Harvest (save crops to S3)” button whenever a track only has S3 crops. Every thumbnail rail relies on presigned URLs from `/episodes/{ep_id}/tracks/{track_id}/crops`, so face strips render even when crops only exist in S3. All moderation actions call the dedicated `/episodes/{ep_id}/identities/...` endpoints so `faces.jsonl`, `tracks.jsonl`, `identities.json`, and the corresponding S3 manifests stay in sync.
 
 #### Run detection+tracking (real)
 
-Need the full YOLOv8 + ByteTrack pass outside the UI?
+Need the full RetinaFace + ByteTrack pass outside the UI?
 
 1. Install the ML extras:
 
@@ -255,7 +255,7 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
    - Higher `--stride` or smaller `--fps` are useful for exploratory passes on long episodes.
    - Device selection order: `auto` → CUDA GPU → Apple `mps` → CPU. Override with `--device cpu` if you need to stay on CPU.
    - `--scene-detect` (default `on`) runs a histogram prepass to detect hard cuts, resets ByteTrack at each cut, and forces `--scene-warmup-dets` consecutive detections to reacquire IDs. Tune `--scene-threshold` (0–2) and `--scene-min-len` (frames between cuts) when you need a stricter or looser cut detector.
-   - Faces harvesting accepts `--face-detector`, `--min-face-size`, `--min-face-conf`, `--face-validate`, and `--thumb-size` so you can choose SCRFD (default), fall back to MTCNN, or run the YOLOv8 face head before embeddings are written.
+   - Faces harvesting reuses the same RetinaFace detector as detect/track; you can still tune `--min-face-size`, `--min-face-conf`, `--face-validate`, and `--thumb-size` to control filtering and thumbnail outputs.
 
 3. (Optional) Verify the real pipeline via the ML test:
 
@@ -263,7 +263,7 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
    RUN_ML_TESTS=1 pytest tests/ml/test_detect_track_real.py -q
    ```
 
-The CLI and UI both emit manifests under `data/manifests/{ep_id}/` with YOLO metadata, so you can diff runs before pushing upstream.
+The CLI and UI both emit manifests under `data/manifests/{ep_id}/` with detector/track metadata, so you can diff runs before pushing upstream.
 
 #### Re-run on an existing episode
 

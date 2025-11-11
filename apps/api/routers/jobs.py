@@ -26,9 +26,10 @@ from apps.api.services.storage import artifact_prefixes, episode_context_from_id
 router = APIRouter()
 JOB_SERVICE = JobService()
 EPISODE_STORE = EpisodeStore()
-DETECTOR_CHOICES = {"retinaface", "yolov8face"}
+DETECTOR_CHOICES = {"retinaface"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
-DEFAULT_DETECTOR_ENV = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
+_DEFAULT_DETECTOR_RAW = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
+DEFAULT_DETECTOR_ENV = _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
 SCENE_DETECT_DEFAULT = getattr(jobs_service, "SCENE_DETECT_DEFAULT", True)
 SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 0.30)
@@ -88,7 +89,7 @@ class DetectTrackRequest(BaseModel):
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
     detector: str = Field(
         DEFAULT_DETECTOR_ENV,
-        description="Face detector backend (retinaface or yolov8face)",
+        description="Face detector backend (retinaface)",
     )
     tracker: str = Field(
         DEFAULT_TRACKER_ENV,
@@ -163,6 +164,7 @@ def _validate_episode_ready(ep_id: str) -> Path:
         raise HTTPException(status_code=400, detail="Episode video path is invalid.")
     try:
         with video_path.open("rb"):
+            # Just touching the file verifies readable bytes on disk.
             pass
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"Episode video unreadable: {exc}") from exc
@@ -453,6 +455,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     try:
         progress_path.unlink()
     except FileNotFoundError:
+        # Missing progress files are normal when a prior run never started.
         pass
     command = _build_detect_track_command(
         req,
@@ -493,6 +496,11 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     track_path = get_path(req.ep_id, "tracks")
     if not track_path.exists():
         raise HTTPException(status_code=400, detail="tracks.jsonl not found; run detect/track first")
+    device_value = req.device or "auto"
+    try:
+        JOB_SERVICE.ensure_arcface_ready(device_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     progress_path = _progress_file_path(req.ep_id)
     command = _build_faces_command(req, progress_path)
     result = _run_job_with_optional_sse(command, request)
@@ -539,6 +547,7 @@ async def run_cluster(req: ClusterRequest, request: Request):
             identities_count = len(identities_doc.get("identities", []))
             faces_count = int(identities_doc.get("stats", {}).get("faces", faces_count))
         except json.JSONDecodeError:
+            # A partially written identities.json should not break the API response.
             pass
     return {
         "job": "cluster",
@@ -606,7 +615,7 @@ async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) ->
             jpeg_quality=req.jpeg_quality,
             thumb_size=req.thumb_size,
         )
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "job_id": job["job_id"],

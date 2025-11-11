@@ -6,7 +6,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_DIR = REPO_ROOT / "FEATURES" / "tracking" / "src"
 sys.path.append(str(SRC_DIR))
 
-from bytetrack_runner import build_tracks, load_config, main  # noqa: E402
+from bytetrack_runner import build_tracks, main  # noqa: E402
 
 
 def test_build_tracks_generates_ids():

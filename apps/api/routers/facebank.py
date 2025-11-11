@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -17,11 +18,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from apps.api.services.cast import CastService
 from apps.api.services.facebank import FacebankService
+from apps.api.services.jobs import JobService
 
 router = APIRouter()
 cast_service = CastService()
 facebank_service = FacebankService()
-
+job_service = JobService()
+LOGGER = logging.getLogger(__name__)
 
 class FacebankResponse(BaseModel):
     show_id: str
@@ -41,6 +44,22 @@ class SeedUploadResponse(BaseModel):
 
 class DeleteSeedsRequest(BaseModel):
     seed_ids: List[str] = Field(..., description="List of seed IDs to delete")
+
+
+def _emit_facebank_refresh(show_id: str, cast_id: str, action: str, seed_ids: List[str]) -> str | None:
+    if not seed_ids:
+        return None
+    try:
+        record = job_service.emit_facebank_refresh(
+            show_id,
+            cast_id,
+            action=action,
+            seed_ids=seed_ids,
+        )
+    except Exception as exc:  # pragma: no cover - best-effort notification
+        LOGGER.warning("Facebank refresh emit failed for %s/%s: %s", show_id, cast_id, exc)
+        return None
+    return record.get("job_id")
 
 
 @router.get("/cast/{cast_id}/facebank")
@@ -171,12 +190,22 @@ async def upload_seeds(
         except Exception as exc:
             errors.append({"file": file.filename, "error": str(exc)})
 
+    refresh_job_id = None
+    if uploaded_seeds:
+        refresh_job_id = _emit_facebank_refresh(
+            show_id,
+            cast_id,
+            "upload",
+            [seed["fb_id"] for seed in uploaded_seeds],
+        )
+
     return {
         "cast_id": cast_id,
         "uploaded": len(uploaded_seeds),
         "failed": len(errors),
         "seeds": uploaded_seeds,
         "errors": errors,
+        "refresh_job_id": refresh_job_id,
     }
 
 
@@ -189,11 +218,15 @@ def delete_seeds(cast_id: str, show_id: str, body: DeleteSeedsRequest) -> dict:
         raise HTTPException(status_code=404, detail=f"Cast member {cast_id} not found")
 
     deleted_count = facebank_service.delete_seeds(show_id, cast_id, body.seed_ids)
+    refresh_job_id = None
+    if deleted_count:
+        refresh_job_id = _emit_facebank_refresh(show_id, cast_id, "delete", body.seed_ids)
 
     return {
         "cast_id": cast_id,
         "deleted": deleted_count,
         "requested": len(body.seed_ids),
+        "refresh_job_id": refresh_job_id,
     }
 
 

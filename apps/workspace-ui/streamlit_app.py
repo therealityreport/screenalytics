@@ -162,10 +162,12 @@ def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[s
     if state == "succeeded":
         counts = []
         if summary:
-            det_count = summary.get("detections_count")
-            trk_count = summary.get("tracks_count")
-            if det_count is not None and trk_count is not None:
+            normalized = helpers.normalize_summary(meta.get("ep_id", ""), summary)
+            det_count = helpers.coerce_int(normalized.get("detections"))
+            trk_count = helpers.coerce_int(normalized.get("tracks"))
+            if det_count is not None:
                 counts.append(f"detections: {det_count:,}")
+            if trk_count is not None:
                 counts.append(f"tracks: {trk_count:,}")
         msg = "Completed" + (" · " + ", ".join(counts) if counts else "")
         st.success(msg or "Job succeeded")

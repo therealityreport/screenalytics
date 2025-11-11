@@ -19,6 +19,7 @@ DEFAULT_REGION = "us-east-1"
 DEFAULT_EXPIRY = 900  # 15 minutes
 LOCAL_UPLOAD_BASE = "http://localhost/_local-storage"
 ARTIFACT_ROOT = "artifacts"
+CACHE_CONTROL_IMMUTABLE = "max-age=31536000,public"
 _V2_KEY_RE = re.compile(
     r"raw/videos/(?P<show>[^/]+)/s(?P<season>\d{2})/e(?P<episode>\d{2})/episode\.mp4"
 )
@@ -218,6 +219,16 @@ class StorageService:
     def s3_enabled(self) -> bool:
         return self.backend in {"s3", "minio"} and self._client is not None
 
+    def _object_extra_args(self, local_path: Path, *, content_type_hint: str | None = None) -> Dict[str, str]:
+        mime = content_type_hint or guess_type(str(local_path))[0]
+        suffix = local_path.suffix.lower()
+        if suffix in {".jsonl", ".ndjson"}:
+            mime = "application/json"
+        return {
+            "ContentType": mime or "application/octet-stream",
+            "CacheControl": CACHE_CONTROL_IMMUTABLE,
+        }
+
     def presign_episode_video(
         self,
         ep_id: str,
@@ -308,7 +319,6 @@ class StorageService:
                     continue
                 raise
         raise RuntimeError("Episode video not found in S3 (checked v2 then v1)")
-        return info
 
     def object_exists(self, key: str) -> bool:
         if self.backend not in {"s3", "minio"} or self._client is None or self._client_error_cls is None:
@@ -345,8 +355,14 @@ class StorageService:
             raise ValueError(f"Unknown artifact kind '{kind}'")
         key_rel = key_rel.lstrip("/\ ")
         key = f"{prefix}{key_rel}" if prefix.endswith("/") else f"{prefix}/{key_rel}"
+        extra_args = self._object_extra_args(local_path)
         try:
-            self._client.upload_file(str(local_path), self.bucket, key)  # type: ignore[union-attr]
+            self._client.upload_file(  # type: ignore[union-attr]
+                str(local_path),
+                self.bucket,
+                key,
+                ExtraArgs=extra_args,
+            )
             return True
         except Exception as exc:  # pragma: no cover - best-effort upload
             LOGGER.warning("Failed to upload artifact %s to s3://%s/%s: %s", local_path, self.bucket, key, exc)
@@ -400,11 +416,7 @@ class StorageService:
             if skip_exact and (rel in skip_exact or any(rel.startswith(prefix) for prefix in skip_prefixes)):
                 continue
             key = f"{prefix}{rel}" if rel else prefix.rstrip("/")
-            extra = None
-            if guess_mime:
-                mime, _ = guess_type(str(path))
-                if mime:
-                    extra = {"ContentType": mime}
+            extra = self._object_extra_args(path) if guess_mime else None
             try:
                 if extra:
                     self._client.upload_file(str(path), self.bucket, key, ExtraArgs=extra)  # type: ignore[union-attr]
@@ -739,7 +751,7 @@ class StorageService:
         return selected, next_cursor
 
     def _load_remote_track_index(self, index_key: str, track_prefix: str) -> List[Dict[str, Any]]:
-        if self.backend not in {"s3", "minio"} or self._client is None:
+        if self.backend not in {"s3", "minio"} or self._client is None or self._client_error_cls is None:
             return []
         try:
             response = self._client.get_object(Bucket=self.bucket, Key=index_key)

@@ -2,13 +2,20 @@
 
 import json
 import os
+import sys
+import types
 from io import BytesIO
 from pathlib import Path
 
 os.environ.setdefault("STORAGE_BACKEND", "local")
 
-import numpy as np
+import pytest
 from fastapi.testclient import TestClient
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    pytest.skip("numpy is required for facebank API tests", allow_module_level=True)
 
 from apps.api.main import app
 
@@ -211,3 +218,120 @@ def test_get_all_seeds_for_show(tmp_path, monkeypatch):
     for seed in all_seeds:
         assert "embedding" in seed
         assert len(seed["embedding"]) == 512
+
+
+def test_upload_seeds_emits_refresh_job(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    from apps.api.routers import facebank as facebank_router
+    from apps.api.services.cast import CastService
+    from apps.api.services.facebank import FacebankService
+
+    client = TestClient(app)
+    show_id = "rhobh"
+    cast_id = client.post(f"/shows/{show_id}/cast", json={"name": "Kyle"}).json()["cast_id"]
+
+    facebank_router.cast_service = CastService(data_root)
+    facebank_router.facebank_service = FacebankService(data_root)
+
+    class _DummyJobService:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def emit_facebank_refresh(self, show_id, cast_id, **kwargs):
+            self.calls.append({"show_id": show_id, "cast_id": cast_id, **kwargs})
+            return {"job_id": "refresh-upload"}
+
+    dummy_jobs = _DummyJobService()
+    facebank_router.job_service = dummy_jobs
+
+    class _Detection:
+        def __init__(self):
+            self.bbox = np.array([10, 10, 60, 60], dtype=np.float32)
+            self.landmarks = np.zeros(10, dtype=np.float32)
+
+    class _FakeDetector:
+        def __init__(self, device="auto"):
+            pass
+
+        def ensure_ready(self):
+            return None
+
+        def detect(self, image):
+            return [_Detection()]
+
+    class _FakeEmbedder:
+        def __init__(self, device="auto"):
+            pass
+
+        def ensure_ready(self):
+            return None
+
+        def embed_face(self, image, bbox, landmarks):
+            return np.zeros(512, dtype=np.float32)
+
+    fake_det_mod = types.SimpleNamespace(RetinaFaceDetector=_FakeDetector)
+    fake_arc_mod = types.SimpleNamespace(ArcFaceEmbedder=_FakeEmbedder)
+    monkeypatch.setitem(sys.modules, "FEATURES.detection.src.retinaface_detector", fake_det_mod)
+    monkeypatch.setitem(sys.modules, "FEATURES.recognition.src.arcface_embedder", fake_arc_mod)
+
+    files = [("files", ("seed.jpg", _create_test_image(), "image/jpeg"))]
+    resp = client.post(f"/cast/{cast_id}/seeds/upload?show_id={show_id}", files=files)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["refresh_job_id"] == "refresh-upload"
+    assert dummy_jobs.calls
+    call = dummy_jobs.calls[0]
+    assert call["action"] == "upload"
+    assert call["seed_ids"]
+
+
+def test_delete_seeds_emits_refresh_job(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    from apps.api.routers import facebank as facebank_router
+    from apps.api.services.cast import CastService
+    from apps.api.services.facebank import FacebankService
+
+    client = TestClient(app)
+    show_id = "rhobh"
+    cast_id = client.post(f"/shows/{show_id}/cast", json={"name": "Lisa"}).json()["cast_id"]
+
+    facebank_router.cast_service = CastService(data_root)
+    facebank_router.facebank_service = FacebankService(data_root)
+
+    image_path = data_root / "seed.jpg"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(b"fake")
+    seed_entry = facebank_router.facebank_service.add_seed(
+        show_id,
+        cast_id,
+        str(image_path),
+        np.zeros(512, dtype=np.float32),
+    )
+
+    class _DummyJobService:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def emit_facebank_refresh(self, show_id, cast_id, **kwargs):
+            self.calls.append({"show_id": show_id, "cast_id": cast_id, **kwargs})
+            return {"job_id": "refresh-delete"}
+
+    dummy_jobs = _DummyJobService()
+    facebank_router.job_service = dummy_jobs
+
+    resp = client.request(
+        "DELETE",
+        f"/cast/{cast_id}/seeds?show_id={show_id}",
+        json={"seed_ids": [seed_entry["fb_id"]]},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["refresh_job_id"] == "refresh-delete"
+    call = dummy_jobs.calls[0]
+    assert call["action"] == "delete"
+    assert call["seed_ids"] == [seed_entry["fb_id"]]

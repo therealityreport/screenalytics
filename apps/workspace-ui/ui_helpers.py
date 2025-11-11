@@ -4,6 +4,7 @@ import base64
 import html
 import json
 import math
+import mimetypes
 import numbers
 import os
 import re
@@ -33,7 +34,6 @@ _PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
 
 LABEL = {
     DEFAULT_DETECTOR: "RetinaFace (recommended)",
-    "yolov8face": "YOLOv8-face (alt)",
     DEFAULT_TRACKER: "ByteTrack (default)",
     "strongsort": "StrongSORT (ReID)",
 }
@@ -41,12 +41,11 @@ DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
 DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
 DETECTOR_OPTIONS = [
     ("RetinaFace (recommended)", DEFAULT_DETECTOR),
-    ("YOLOv8-face (alt)", "yolov8face"),
 ]
 DETECTOR_LABELS = [label for label, _ in DETECTOR_OPTIONS]
 DETECTOR_VALUE_MAP = {label: value for label, value in DETECTOR_OPTIONS}
 DETECTOR_LABEL_MAP = {value: label for label, value in DETECTOR_OPTIONS}
-FACE_ONLY_DETECTORS = {"retinaface", "yolov8face"}
+FACE_ONLY_DETECTORS = {"retinaface"}
 TRACKER_OPTIONS = [
     ("ByteTrack (default)", DEFAULT_TRACKER),
     ("StrongSORT (ReID)", "strongsort"),
@@ -265,7 +264,10 @@ def _data_url_cache(path_str: str) -> str | None:
     except OSError:
         return None
     encoded = base64.b64encode(data).decode("ascii")
-    return f"data:image/jpeg;base64,{encoded}"
+    mime_type, _ = mimetypes.guess_type(str(file_path))
+    if not mime_type:
+        mime_type = "image/jpeg"
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def ensure_media_url(path_or_url: str | Path | None) -> str | None:
@@ -628,14 +630,13 @@ def compose_progress_text(
     tracker_label = tracker_label_from_value(raw_tracker) if raw_tracker else "--"
     fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
-    show_time = video_time is not None and video_total is not None
     time_prefix = ""
-    if show_time:
+    if video_time is not None and video_total is not None:
         try:
             done_value = float(video_time)
             total_value = float(video_total)
         except (TypeError, ValueError):
-            show_time = False
+            pass
         else:
             done_value = min(done_value, total_value)
             time_prefix = f"{format_mmss(done_value)} / {format_mmss(total_value)} • "
@@ -853,6 +854,21 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
                 break
         if value is not None:
             summary[key] = value
+    # Final local-manifest fallback for detect/track counts
+    # If a job returns a summary "stage" without counts, infer from artifacts.
+    try:
+        if summary.get("detections") is None and local.get("detections"):
+            det_path = Path(str(local["detections"]))
+            if det_path.exists():
+                with det_path.open("r", encoding="utf-8") as fh:
+                    summary["detections"] = sum(1 for line in fh if line.strip())
+        if summary.get("tracks") is None and local.get("tracks"):
+            trk_path = Path(str(local["tracks"]))
+            if trk_path.exists():
+                with trk_path.open("r", encoding="utf-8") as fh:
+                    summary["tracks"] = sum(1 for line in fh if line.strip())
+    except OSError:
+        pass
     return summary
 
 
@@ -1105,6 +1121,9 @@ def inject_thumb_css() -> None:
         align-items:center;
         justify-content:center;
       }}
+      .thumb.thumb-hidden {{
+        display:none !important;
+      }}
       .thumb img {{
         width:100%;
         height:100%;
@@ -1145,8 +1164,6 @@ def resolve_thumb(src: str | None) -> str | None:
         return None
     if safe_url.startswith(("http://", "https://", "data:")):
         return safe_url
-    if safe_url != src:
-        return safe_url
     try:
         path = Path(src)
         if path.exists() and path.is_file():
@@ -1158,16 +1175,39 @@ def resolve_thumb(src: str | None) -> str | None:
     return None
 
 
-def thumb_html(src: str | None, alt: str = "thumb") -> str:
+@lru_cache(maxsize=1)
+def _placeholder_thumb_url() -> str:
+    return resolve_thumb(_PLACEHOLDER) or ensure_media_url(_PLACEHOLDER) or _PLACEHOLDER
+
+
+def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = False) -> str:
     """Generate HTML for a fixed 200×250 thumbnail frame.
 
     Args:
         src: Image source URL or path, or None for placeholder
         alt: Alt text for the image
+        hide_if_missing: When True, do not render a placeholder and hide the frame if the
+            image fails to load (404, revoked presign, etc.).
 
     Returns:
-        HTML string for the thumbnail
+        HTML string for the thumbnail or an empty string when hiding missing images
     """
-    img = src if src else _PLACEHOLDER
+    placeholder = _placeholder_thumb_url()
+    img = resolve_thumb(src)
+    if not img:
+        if hide_if_missing:
+            return ""
+        img = placeholder
+
     escaped_alt = html.escape(alt)
-    return f'<div class="thumb"><img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async"/></div>'
+    if hide_if_missing:
+        onerror_handler = "this.closest('.thumb').classList.add('thumb-hidden');"
+    else:
+        escaped_placeholder = placeholder.replace("'", "\\'")
+        onerror_handler = f"this.onerror=null;this.src='{escaped_placeholder}';"
+
+    return (
+        '<div class="thumb">'
+        f'<img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
+        "</div>"
+    )

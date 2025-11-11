@@ -13,3 +13,10 @@ def test_ensure_media_url_local_file(tmp_path):
     https_url = "https://example.com/frame.jpg"
     assert helpers.ensure_media_url(https_url) == https_url
     assert helpers.ensure_media_url(None) is None
+
+
+def test_thumb_html_placeholder_uses_data_url():
+    helpers = load_ui_helpers_module()
+    html_snippet = helpers.thumb_html(None, alt="missing thumb")
+    assert "data:image/svg+xml;base64," in html_snippet
+    assert 'alt="missing thumb"' in html_snippet

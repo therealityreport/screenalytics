@@ -26,6 +26,7 @@ class JsonlLogger:
         try:
             self._handle.close()
         except Exception:
+            # Closing failures aren't actionable; the log is best-effort.
             pass
 
 
@@ -95,4 +96,3 @@ def main(argv: Iterable[str] | None = None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover - CLI
     main()
-

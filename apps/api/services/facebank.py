@@ -73,7 +73,18 @@ class FacebankService:
         """Save facebank.json."""
         path = self._facebank_path(show_id, cast_id)
         data["updated_at"] = _now_iso()
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        payload = json.dumps(data, indent=2)
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except TypeError:  # Python < 3.8 compatibility
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            raise RuntimeError(f"Failed to persist facebank data for {show_id}/{cast_id}: {exc}") from exc
 
     def get_facebank(self, show_id: str, cast_id: str) -> Dict[str, Any]:
         """Get facebank data for a cast member."""

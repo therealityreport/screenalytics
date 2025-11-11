@@ -89,6 +89,7 @@ def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
             try:
                 thumb_file.unlink()
             except FileNotFoundError:
+                # Assets cleanup should be idempotent; ignore missing thumbs.
                 pass
         crop_rel = row.get("crop_rel_path")
         if isinstance(crop_rel, str):
@@ -96,6 +97,7 @@ def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
             try:
                 crop_file.unlink()
             except FileNotFoundError:
+                # Crops may have been purged already by another worker.
                 pass
 
 
@@ -1041,6 +1043,7 @@ def list_identities(ep_id: str) -> dict:
                 try:
                     roster_service.add_if_missing(show_slug, name)
                 except ValueError:
+                    # Ignore duplicates when multiple workers enqueue roster seeds.
                     pass
     return {"identities": identities, "stats": payload.get("stats", {})}
 
@@ -1433,6 +1436,7 @@ def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
                 try:
                     thumb_file.unlink()
                 except FileNotFoundError:
+                    # It's fine if the thumbnail file does not exist.
                     pass
             crop_rel = row.get("crop_rel_path")
             if isinstance(crop_rel, str):
@@ -1440,6 +1444,7 @@ def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
                 try:
                     crop_file.unlink()
                 except FileNotFoundError:
+                    # It's fine if the crop file does not exist.
                     pass
     _recount_track_faces(ep_id)
     identities = _load_identities(ep_id)

@@ -23,10 +23,7 @@ def test_detect_track_invalid_detector(tmp_path, monkeypatch):
     jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=1)
 
     client = TestClient(app)
-    response = client.post(
-        "/jobs/detect_track",
-        json={"ep_id": ep_id, "detector": "not_a_real_detector"},
-    )
+    response = client.post("/jobs/detect_track", json={"ep_id": ep_id, "detector": "yolov8face"})
     assert response.status_code == 400
     assert "Unsupported detector" in response.json().get("detail", "")
 

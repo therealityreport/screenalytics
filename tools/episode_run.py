@@ -14,10 +14,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Callable
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import logging
-from functools import lru_cache
 
 import numpy as np
 
@@ -32,21 +31,17 @@ from apps.api.services.storage import (
     episode_context_from_id,
 )
 from py_screenalytics.artifacts import ensure_dirs, get_path
-from tools._img_utils import clip_bbox, safe_crop, safe_imwrite, to_u8_bgr
+from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
 from tools.debug_thumbs import init_debug_logger, debug_thumbs_enabled, NullLogger, JsonlLogger
 
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
-YOLO_MODEL_NAME = os.environ.get("SCREENALYTICS_YOLO_MODEL", "yolov8n.pt")
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
-YOLO_IMAGE_SIZE = int(os.environ.get("SCREENALYTICS_YOLO_IMGSZ", 640))
-YOLO_CONF_THRESHOLD = float(os.environ.get("SCREENALYTICS_YOLO_CONF", 0.25))
-YOLO_IOU_THRESHOLD = float(os.environ.get("SCREENALYTICS_YOLO_IOU", 0.45))
 PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DETECTOR_CHOICES = ("retinaface", "yolov8face")
+DETECTOR_CHOICES = ("retinaface",)
 DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
 TRACKER_CHOICES = ("bytetrack", "strongsort")
 DEFAULT_TRACKER = TRACKER_CHOICES[0]
@@ -87,12 +82,12 @@ def _normalize_det_thresh(value: float | str | None) -> float:
     except (TypeError, ValueError):
         numeric = RETINAFACE_SCORE_THRESHOLD
     return min(max(numeric, 0.0), 1.0)
-YOLO_FACE_CONF = 0.5
 BYTE_TRACK_MIN_BOX_AREA = 20.0
 DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
 DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt")
 DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
 RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
+ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -257,6 +252,20 @@ def ensure_retinaface_ready(device: str, det_thresh: float | None = None) -> tup
     return True, None, resolved
 
 
+def ensure_arcface_ready(device: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """Ensure ArcFace weights/materials can initialize before running embeds."""
+
+    model = None
+    try:
+        model, resolved = _init_arcface(ARC_FACE_MODEL_NAME, device)
+    except Exception as exc:  # pragma: no cover - surfaced via API tests
+        return False, str(exc), None
+    finally:
+        if model is not None:
+            del model
+    return True, None, resolved
+
+
 def pick_device(explicit: str | None = None) -> str:
     """Return the safest device available.
 
@@ -276,6 +285,7 @@ def pick_device(explicit: str | None = None) -> str:
         if mps_available is not None and mps_available.is_available():  # pragma: no cover - mac only
             return "mps"
     except Exception:  # pragma: no cover - torch import/runtime guard
+        # Torch import issues should fall back to CPU without crashing CLI.
         pass
 
     return "cpu"
@@ -680,61 +690,7 @@ class RetinaFaceDetectorBackend:
         return samples
 
 
-class YoloFaceDetectorBackend:
-    def __init__(self, device: str) -> None:
-        from ultralytics import YOLO
-
-        self.device = device
-        self.model_path = os.environ.get("SCREENALYTICS_YOLO_FACE_MODEL", "yolov8n-face.pt")
-        self._model = YOLO(self.model_path)
-        self._resolved_device = _normalize_device_label(device)
-
-    @property
-    def model_name(self) -> str:
-        return self.model_path
-
-    @property
-    def resolved_device(self) -> str:
-        return self._resolved_device
-
-    def ensure_ready(self) -> None:
-        _ = self._model
-
-    def detect(self, image) -> list[DetectionSample]:
-        results = self._model.predict(
-            source=image,
-            imgsz=YOLO_IMAGE_SIZE,
-            conf=YOLO_FACE_CONF,
-            device=self.device,
-            verbose=False,
-        )
-        samples: list[DetectionSample] = []
-        if not results:
-            return samples
-        boxes = results[0].boxes
-        if boxes is None or boxes.data is None or len(boxes) == 0:
-            return samples
-        xyxy = boxes.xyxy.cpu().numpy()
-        scores = boxes.conf.cpu().numpy()
-        for idx in range(len(xyxy)):
-            bbox = xyxy[idx].astype(np.float32)
-            score = float(scores[idx])
-            if not _valid_face_box(bbox, score, min_score=YOLO_FACE_CONF, min_area=MIN_FACE_AREA):
-                continue
-            samples.append(
-                DetectionSample(
-                    bbox=bbox,
-                    conf=score,
-                    class_idx=0,
-                    class_label=FACE_CLASS_LABEL,
-                )
-            )
-        return samples
-
-
 def _build_face_detector(detector: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD):
-    if detector == "yolov8face":
-        return YoloFaceDetectorBackend(device)
     return RetinaFaceDetectorBackend(device, score_thresh=score_thresh)
 
 
@@ -810,6 +766,7 @@ def _prepare_face_crop(
             aligned = face_align.norm_crop(image, landmark=pts)
             return to_u8_bgr(aligned), None
         except Exception:
+            # If alignment fails, fall back to bbox-based cropping.
             pass
     x1, y1, x2, y2 = bbox
     width = max(x2 - x1, 1.0)
@@ -1550,6 +1507,7 @@ class FrameExporter:
         try:
             self.debug_logger(payload)
         except Exception:  # pragma: no cover - best effort diagnostics
+            # Debug logging must never break frame processing.
             pass
 
 
@@ -1580,6 +1538,7 @@ class FrameDecoder:
         try:
             self.close()
         except Exception:
+            # GC cleanup should never raise during interpreter shutdown.
             pass
 
 
@@ -1722,7 +1681,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--detector",
         choices=list(DETECTOR_CHOICES),
         default=DEFAULT_DETECTOR,
-        help="Face detector backend (RetinaFace high quality, YOLOv8-face fast)",
+        help="Face detector backend (RetinaFace only)",
     )
     parser.add_argument(
         "--tracker",
@@ -1982,14 +1941,10 @@ def _run_full_pipeline(
     device = pick_device(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
-    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
-    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
     args.detector = detector_choice
     args.tracker = tracker_choice
-    args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
-    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
-    args.tracker = tracker_choice
     det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
+    args.det_thresh = det_thresh
     detector_backend = _build_face_detector(detector_choice, device, det_thresh)
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)

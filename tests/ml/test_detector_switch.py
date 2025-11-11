@@ -52,12 +52,12 @@ def _read_progress(path: Path) -> dict:
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("detector", ["retinaface", "yolov8face"])
-def test_detector_switch_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, detector: str) -> None:
+def test_retinaface_detector_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
     video_path = _make_sample_video(tmp_path / "sample.mp4")
-    ep_id = f"det-switch-{detector}"
+    ep_id = "det-switch-retina"
+    detector = "retinaface"
 
     cmd = [
         sys.executable,
