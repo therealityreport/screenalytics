@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import ast
 
 import numpy as np
 import pytest
@@ -43,11 +44,20 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 @pytest.mark.timeout(120)
-def test_detect_track_real_pipeline(tmp_path: Path) -> None:
+def test_detect_track_real_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     data_root = tmp_path / "data"
     video_path = _make_sample_video(tmp_path / "sample.mp4")
     ep_id = "ml-test-episode"
+
+    try:
+        import torch  # type: ignore
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        if hasattr(torch.backends, "mps"):
+            monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    except Exception:  # pragma: no cover - torch missing
+        pass
 
     cmd = [
         sys.executable,
@@ -58,6 +68,8 @@ def test_detect_track_real_pipeline(tmp_path: Path) -> None:
         str(video_path),
         "--stride",
         "1",
+        "--device",
+        "cpu",
         "--out-root",
         str(data_root),
     ]
@@ -70,6 +82,17 @@ def test_detect_track_real_pipeline(tmp_path: Path) -> None:
         text=True,
         check=True,
     )
+
+    summary_line = next(
+        (line for line in completed.stdout.splitlines() if line.startswith("[episode_run]")),
+        "",
+    )
+    if summary_line.startswith("[episode_run]"):
+        try:
+            summary_json = ast.literal_eval(summary_line.split("[episode_run]")[-1].strip())
+        except Exception:
+            summary_json = {}
+        assert summary_json.get("analyzed_fps", 0) > 0
 
     manifest_root = data_root / "manifests" / ep_id
     detections_path = manifest_root / "detections.jsonl"

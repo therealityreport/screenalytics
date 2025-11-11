@@ -1,9 +1,17 @@
 import os
+import re
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
+
+
+def extract_episode_number(ep_id: str) -> int:
+    match = re.search(r"e(\d+)$", ep_id)
+    if not match:
+        raise ValueError(f"Unable to parse episode number from {ep_id}")
+    return int(match.group(1))
 
 
 def test_create_episode_and_presign(monkeypatch, tmp_path):
@@ -29,7 +37,8 @@ def test_create_episode_and_presign(monkeypatch, tmp_path):
     if data["method"] == "PUT":
         expected_bucket = os.getenv("AWS_S3_BUCKET", "screenalytics")
         assert data["bucket"] in {expected_bucket}
-        assert data["key"].startswith("raw/videos/")
+        number = extract_episode_number(ep_id)
+        assert data["key"] == f"raw/videos/rhoslc/s05/e{number:02}/episode.mp4"
         parsed = urlparse(data["upload_url"])
         assert parsed.scheme in {"http", "https"}
         assert data["headers"]["Content-Type"] == "video/mp4"

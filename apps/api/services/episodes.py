@@ -112,5 +112,10 @@ class EpisodeStore:
     def exists(self, ep_id: str) -> bool:
         return ep_id in self._read()
 
+    def list(self) -> list[EpisodeRecord]:
+        content = self._read()
+        records = [EpisodeRecord(**data) for data in content.values()]  # type: ignore[arg-type]
+        return sorted(records, key=lambda record: record.updated_at, reverse=True)
+
 
 __all__ = ["EpisodeStore", "EpisodeRecord"]
