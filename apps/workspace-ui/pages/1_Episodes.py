@@ -177,16 +177,26 @@ if st.button("Run detect/track", use_container_width=True):
         f"{helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)}"
     )
     with st.spinner(f"Running detect/track ({mode_label})…"):
-        try:
-            resp = helpers.api_post("/jobs/detect_track", job_payload)
-        except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track", exc))
-        else:
-            det_count = resp.get('detections_count') or resp.get('detections') or '?'
-            track_count = resp.get('tracks_count') or resp.get('tracks') or '?'
-            st.success(
-                f"detections: {det_count}, tracks: {track_count}"
-            )
+        summary, error_message = helpers.run_job_with_progress(
+            selected_ep_id,
+            "/jobs/detect_track",
+            job_payload,
+            requested_device=helpers.DEFAULT_DEVICE,
+            async_endpoint="/jobs/detect_track_async",
+            requested_detector=helpers.DEFAULT_DETECTOR,
+            requested_tracker=helpers.DEFAULT_TRACKER,
+        )
+    if error_message:
+        st.error(error_message)
+    else:
+        normalized = helpers.normalize_summary(selected_ep_id, summary)
+        detections = normalized.get("detections")
+        tracks = normalized.get("tracks")
+        details_line = [
+            f"detections: {detections:,}" if isinstance(detections, int) else "detections: ?",
+            f"tracks: {tracks:,}" if isinstance(tracks, int) else "tracks: ?",
+        ]
+        st.success("Completed · " + " · ".join(details_line))
 
 st.divider()
 _show_single_delete(selected_ep_id)
