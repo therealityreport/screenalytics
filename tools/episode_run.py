@@ -4,27 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
 from typing import Iterable, Tuple
 
-import cv2  # type: ignore
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
-from FEATURES.detection.src.run_retinaface import (
-    load_config as load_det_config,
-    run_detection,
-)
-from FEATURES.tracking.src.bytetrack_runner import (
-    load_config as load_track_config,
-    run_tracking,
-)
 
 
 def _copy_video(src: Path, dest: Path) -> None:
@@ -35,6 +26,8 @@ def _copy_video(src: Path, dest: Path) -> None:
 
 
 def _extract_frames(video_path: Path, frames_root: Path, target_fps: float) -> int:
+    import cv2  # type: ignore
+
     frames_root.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -90,9 +83,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         else Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
     )
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
-    if args.stub:
-        os.environ["SCREENALYTICS_VISION_STUB"] = "1"
-
     ensure_dirs(args.ep_id)
 
     video_src = Path(args.video)
@@ -100,6 +90,60 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise FileNotFoundError(f"Video not found: {video_src}")
     video_dest = get_path(args.ep_id, "video")
     _copy_video(video_src, video_dest)
+
+    if args.stub:
+        det_count, track_count, frames_exported = _run_stub_pipeline(args.ep_id)
+    else:
+        det_count, track_count, frames_exported = _run_full_pipeline(
+            args,
+            video_dest,
+        )
+
+    summary = {
+        "ep_id": args.ep_id,
+        "detections": det_count,
+        "tracks": track_count,
+        "frames_exported": frames_exported,
+        "data_root": str(data_root),
+    }
+    print("[episode_run]", summary)
+    return 0
+
+
+def _run_stub_pipeline(ep_id: str) -> Tuple[int, int, int]:
+    det_path = get_path(ep_id, "detections")
+    track_path = get_path(ep_id, "tracks")
+    det_rows = [
+        {
+            "ep_id": ep_id,
+            "frame_idx": 0,
+            "ts_s": 0.0,
+            "bbox": [0.1, 0.1, 0.9, 0.9],
+            "conf": 0.99,
+        }
+    ]
+    track_rows = [
+        {
+            "ep_id": ep_id,
+            "track_id": 1,
+            "frames": 1,
+            "ts_s": 0.0,
+        }
+    ]
+    _write_jsonl(det_path, det_rows)
+    _write_jsonl(track_path, track_rows)
+    return len(det_rows), len(track_rows), 0
+
+
+def _run_full_pipeline(args: argparse.Namespace, video_dest: Path) -> Tuple[int, int, int]:
+    from FEATURES.detection.src.run_retinaface import (  # type: ignore
+        load_config as load_det_config,
+        run_detection,
+    )
+    from FEATURES.tracking.src.bytetrack_runner import (  # type: ignore
+        load_config as load_track_config,
+        run_tracking,
+    )
 
     frames_exported = 0
     if args.fps:
@@ -120,16 +164,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     track_cfg = load_track_config(Path(args.tracking_config))
     track_path = get_path(args.ep_id, "tracks")
     track_count = run_tracking(det_path, track_path, track_cfg)
+    return det_count, track_count, frames_exported
 
-    summary = {
-        "ep_id": args.ep_id,
-        "detections": det_count,
-        "tracks": track_count,
-        "frames_exported": frames_exported,
-        "data_root": str(data_root),
-    }
-    print("[episode_run]", summary)
-    return 0
+
+def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
 
 
 if __name__ == "__main__":  # pragma: no cover

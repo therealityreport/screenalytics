@@ -63,8 +63,9 @@ with st.form("episode-upload"):
         help="Optional premiere date",
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
-    run_detect_track = st.checkbox("Run detect/track (stub)", value=True)
-    run_detect_track = st.checkbox("Run detect/track (stub)", value=True)
+    run_detect_track = st.checkbox(
+        "Run detect/track (stub)", value=True, key="run_detect_track_checkbox"
+    )
     submit = st.form_submit_button("Upload episode")
 
 detect_resp: Dict[str, Any] | None = None
