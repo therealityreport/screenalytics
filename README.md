@@ -119,6 +119,24 @@ python tools/episode_run.py --ep-id ep_demo --cluster
 
 Artifacts land under `data/` mirroring the future object-storage layout:
 
+### Rebuilding broken crops for one episode
+
+If an earlier run produced gray/blank crops, wipe and rebuild the episode-specific crops before re-uploading:
+
+```bash
+# 1) Drop the bad crops (keeps manifests + raw frames intact)
+rm -rf data/frames/<ep_id>/crops
+
+# 2) Re-run face harvest with the new safe cropper
+python tools/episode_run.py --ep-id <ep_id> --phase faces --save-crops 1
+
+# 3) Mirror the refreshed crops back to S3 (adjust bucket/prefix as needed)
+aws s3 sync data/frames/<ep_id>/crops \
+  s3://screenalytics/artifacts/crops/<show>/<season>/<episode>/ --delete
+```
+
+The diagnostics logger (`DEBUG_THUMBS=1 python tools/episode_run.py …`) appends per-crop metadata to `data/frames/<ep_id>/crops_debug.jsonl`, which you can summarize via `python tools/debug_thumbs.py data/frames/<ep_id>/crops_debug.jsonl`.
+
 - `data/videos/ep_demo/episode.mp4`
 - `data/manifests/ep_demo/detections.jsonl`
 - `data/manifests/ep_demo/tracks.jsonl`

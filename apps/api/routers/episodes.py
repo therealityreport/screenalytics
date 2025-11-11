@@ -6,9 +6,9 @@ import os
 import re
 import sys
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -45,6 +45,24 @@ def _faces_path(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "faces.jsonl"
 
 
+def _faces_ops_path(ep_id: str) -> Path:
+    return _manifests_dir(ep_id) / "faces_ops.jsonl"
+
+
+def _append_face_ops(ep_id: str, entries: Iterable[Dict[str, Any]]) -> None:
+    entries = list(entries)
+    if not entries:
+        return
+    path = _faces_ops_path(ep_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    with path.open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            payload = dict(entry)
+            payload.setdefault("ts", timestamp)
+            handle.write(json.dumps(payload) + "\n")
+
+
 def _identities_path(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "identities.json"
 
@@ -59,6 +77,26 @@ def _tracks_path(ep_id: str) -> Path:
 
 def _thumbs_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "thumbs"
+
+
+def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
+    frames_root = get_path(ep_id, "frames_root")
+    thumbs_root = _thumbs_root(ep_id)
+    for row in rows:
+        thumb_rel = row.get("thumb_rel_path")
+        if isinstance(thumb_rel, str):
+            thumb_file = thumbs_root / thumb_rel
+            try:
+                thumb_file.unlink()
+            except FileNotFoundError:
+                pass
+        crop_rel = row.get("crop_rel_path")
+        if isinstance(crop_rel, str):
+            crop_file = frames_root / crop_rel
+            try:
+                crop_file.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _analytics_root(ep_id: str) -> Path:
@@ -516,6 +554,18 @@ class FaceMoveRequest(BaseModel):
     target_identity_id: str | None = Field(None, description="Existing identity to receive frames")
     new_identity_name: str | None = Field(None, description="Create a new identity with this name")
     show_id: str | None = Field(None, description="Optional show slug for roster updates")
+
+
+class TrackFrameMoveRequest(BaseModel):
+    frame_ids: List[int] = Field(..., min_length=1, description="Track frame indices to move")
+    target_identity_id: str | None = Field(None, description="Existing identity target")
+    new_identity_name: str | None = Field(None, description="Optional new identity name")
+    show_id: str | None = Field(None, description="Optional show slug override")
+
+
+class TrackFrameDeleteRequest(BaseModel):
+    frame_ids: List[int] = Field(..., min_length=1, description="Track frame indices to delete")
+    delete_assets: bool = True
 
 
 class IdentityRenameRequest(BaseModel):
@@ -1075,6 +1125,7 @@ def track_detail(ep_id: str, track_id: int) -> dict:
             "frame_idx": row.get("frame_idx"),
             "ts": row.get("ts"),
             "thumbnail_url": _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key")),
+            "skip": row.get("skip"),
         }
         for row in faces
     ]
@@ -1128,6 +1179,112 @@ def list_track_frames(
     offset: int = Query(0, ge=0),
 ) -> List[Dict[str, Any]]:
     return _list_track_frame_media(ep_id, track_id, sample, limit, offset)
+
+
+@router.post("/episodes/{ep_id}/tracks/{track_id}/frames/move")
+def move_track_frames(ep_id: str, track_id: int, body: TrackFrameMoveRequest) -> dict:
+    frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
+    if not frame_ids:
+        raise HTTPException(status_code=400, detail="frame_ids_required")
+    face_rows = _track_face_rows(ep_id, track_id)
+    if not face_rows:
+        raise HTTPException(status_code=404, detail="track_not_found")
+    selected_faces: List[str] = []
+    ops: List[Dict[str, Any]] = []
+    for frame_idx in frame_ids:
+        row = face_rows.get(frame_idx)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"frame_not_found:{frame_idx}")
+        face_id = row.get("face_id")
+        if not face_id:
+            raise HTTPException(status_code=400, detail=f"face_id_missing:{frame_idx}")
+        selected_faces.append(str(face_id))
+        ops.append({"frame_idx": frame_idx, "face_id": face_id})
+    try:
+        result = identity_service.move_frames(
+            ep_id,
+            track_id,
+            selected_faces,
+            target_identity_id=body.target_identity_id,
+            new_identity_name=body.new_identity_name,
+            show_id=body.show_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _append_face_ops(
+        ep_id,
+        [
+            {
+                "op": "move_frame",
+                "frame_idx": entry["frame_idx"],
+                "face_id": entry["face_id"],
+                "source_track_id": track_id,
+                "target_track_id": result.get("new_track_id"),
+                "target_identity_id": result.get("target_identity_id") or body.target_identity_id,
+            }
+            for entry in ops
+        ],
+    )
+    return {
+        "moved": len(selected_faces),
+        "frame_ids": frame_ids,
+        "new_track_id": result.get("new_track_id"),
+        "target_identity_id": result.get("target_identity_id"),
+        "target_name": result.get("target_name"),
+        "clusters": result.get("clusters"),
+    }
+
+
+@router.delete("/episodes/{ep_id}/tracks/{track_id}/frames")
+def delete_track_frames(ep_id: str, track_id: int, body: TrackFrameDeleteRequest) -> dict:
+    frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
+    if not frame_ids:
+        raise HTTPException(status_code=400, detail="frame_ids_required")
+    faces = _load_faces(ep_id)
+    removed: List[Dict[str, Any]] = []
+    kept: List[Dict[str, Any]] = []
+    target_set = set(frame_ids)
+    for row in faces:
+        try:
+            tid = int(row.get("track_id", -1))
+        except (TypeError, ValueError):
+            tid = -1
+        frame_idx = row.get("frame_idx")
+        try:
+            frame_val = int(frame_idx)
+        except (TypeError, ValueError):
+            frame_val = None
+        if tid == track_id and frame_val in target_set:
+            removed.append(row)
+        else:
+            kept.append(row)
+    if not removed:
+        raise HTTPException(status_code=404, detail="frames_not_found")
+    faces_path = _write_faces(ep_id, kept)
+    if body.delete_assets:
+        _remove_face_assets(ep_id, removed)
+    _append_face_ops(
+        ep_id,
+        [
+            {
+                "op": "delete_frame",
+                "track_id": track_id,
+                "frame_idx": int(row.get("frame_idx", -1)),
+                "face_id": row.get("face_id"),
+            }
+            for row in removed
+        ],
+    )
+    _recount_track_faces(ep_id)
+    identities = _load_identities(ep_id)
+    _update_identity_stats(ep_id, identities)
+    identities_path = _write_identities(ep_id, identities)
+    _sync_manifests(ep_id, faces_path, identities_path)
+    return {
+        "track_id": track_id,
+        "deleted": len(removed),
+        "remaining": len(kept),
+    }
 
 
 @router.post("/episodes/{ep_id}/identities/{identity_id}/rename")

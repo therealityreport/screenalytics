@@ -500,24 +500,6 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             )
         if action_cols[1].button("Delete selected", key=f"track_delete_selected_{track_id}", type="secondary"):
             _delete_frames_api(ep_id, track_id, selected_frames)
-    else:
-        action_cols = st.columns([1.0, 1.0, 1.0])
-        with action_cols[0]:
-            targets = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
-            if targets:
-                target_choice = st.selectbox(
-                    "Move entire track",
-                    targets,
-                    key=f"track_view_move_{track_id}",
-                )
-                if st.button("Move track", key=f"track_view_move_btn_{track_id}"):
-                    _move_track(ep_id, track_id, target_choice)
-        with action_cols[1]:
-            if st.button("Remove from identity", key=f"track_view_remove_{track_id}"):
-                _move_track(ep_id, track_id, None)
-        with action_cols[2]:
-            if st.button("Delete track", key=f"track_view_delete_{track_id}"):
-                _delete_track(ep_id, track_id)
 
 
 def _rename_identity(ep_id: str, identity_id: str, label: str) -> None:

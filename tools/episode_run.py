@@ -10,11 +10,11 @@ import os
 import shutil
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Callable
 
 import logging
 from functools import lru_cache
@@ -32,6 +32,8 @@ from apps.api.services.storage import (
     episode_context_from_id,
 )
 from py_screenalytics.artifacts import ensure_dirs, get_path
+from tools._img_utils import clip_bbox, safe_crop, safe_imwrite, to_u8_bgr
+from tools.debug_thumbs import init_debug_logger, debug_thumbs_enabled, NullLogger, JsonlLogger
 
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
@@ -708,8 +710,9 @@ def _resize_for_arcface(image):
     return resized
 
 
-def _prepare_face_crop(image, bbox: list[float], landmarks: list[float] | None, margin: float = 0.15):
-    import cv2  # type: ignore
+def _prepare_face_crop(
+    image, bbox: list[float], landmarks: list[float] | None, margin: float = 0.15
+) -> tuple[np.ndarray | None, str | None]:
     import numpy as _np
 
     if landmarks and len(landmarks) >= 10:
@@ -717,25 +720,61 @@ def _prepare_face_crop(image, bbox: list[float], landmarks: list[float] | None, 
             from insightface.utils import face_align  # type: ignore
 
             pts = _np.asarray(landmarks, dtype=_np.float32).reshape(-1, 2)
-            return face_align.norm_crop(image, landmark=pts)
+            aligned = face_align.norm_crop(image, landmark=pts)
+            return to_u8_bgr(aligned), None
         except Exception:
             pass
-    h, w = image.shape[:2]
     x1, y1, x2, y2 = bbox
-    width = x2 - x1
-    height = y2 - y1
+    width = max(x2 - x1, 1.0)
+    height = max(y2 - y1, 1.0)
     expand_x = width * margin
     expand_y = height * margin
-    x1 = max(int(math.floor(x1 - expand_x)), 0)
-    y1 = max(int(math.floor(y1 - expand_y)), 0)
-    x2 = min(int(math.ceil(x2 + expand_x)), w)
-    y2 = min(int(math.ceil(y2 + expand_y)), h)
-    if x2 <= x1 or y2 <= y1:
-        return _blank_image()
-    crop = image[y1:y2, x1:x2]
-    if crop.size == 0:
-        return _blank_image()
-    return crop
+    expanded_box = [
+        x1 - expand_x,
+        y1 - expand_y,
+        x2 + expand_x,
+        y2 + expand_y,
+    ]
+    crop, _, err = safe_crop(image, expanded_box)
+    if crop is None:
+        return None, err or "crop_failed"
+    return crop, None
+
+
+def _make_skip_face_row(
+    ep_id: str,
+    track_id: int,
+    frame_idx: int,
+    ts_val: float,
+    bbox: list[float],
+    detector_choice: str,
+    reason: str,
+    *,
+    crop_rel_path: str | None = None,
+    crop_s3_key: str | None = None,
+    thumb_rel_path: str | None = None,
+    thumb_s3_key: str | None = None,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "ep_id": ep_id,
+        "face_id": f"face_{track_id:04d}_{frame_idx:06d}",
+        "track_id": track_id,
+        "frame_idx": frame_idx,
+        "ts": ts_val,
+        "bbox_xyxy": bbox,
+        "detector": detector_choice,
+        "pipeline_ver": PIPELINE_VERSION,
+        "skip": reason,
+    }
+    if crop_rel_path:
+        row["crop_rel_path"] = crop_rel_path
+    if crop_s3_key:
+        row["crop_s3_key"] = crop_s3_key
+    if thumb_rel_path:
+        row["thumb_rel_path"] = thumb_rel_path
+    if thumb_s3_key:
+        row["thumb_s3_key"] = thumb_s3_key
+    return row
 
 
 class TrackRecorder:
@@ -941,12 +980,10 @@ class ThumbWriter:
     def write(self, image, bbox: List[float], track_id: int, frame_idx: int) -> tuple[str | None, Path | None]:
         if self._cv2 is None or image is None:
             return None, None
-        h, w = image.shape[:2]
-        clamp = sanitize_xyxy(bbox[0], bbox[1], bbox[2], bbox[3], w, h)
-        if clamp is None:
+        crop, clipped_bbox, err = safe_crop(image, bbox)
+        if crop is None:
+            LOGGER.debug("Skipping thumb track=%s frame=%s reason=%s", track_id, frame_idx, err)
             return None, None
-        x1, y1, x2, y2 = clamp
-        crop = image[y1:y2, x1:x2]
         thumb = self._letterbox(crop)
         if self._stat_samples < self._stat_limit:
             mn, mx, mean = _image_stats(thumb)
@@ -956,7 +993,10 @@ class ThumbWriter:
             self._stat_samples += 1
         rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
         abs_path = self.root_dir / rel_path
-        save_jpeg(abs_path, thumb, quality=self.jpeg_quality, color="bgr")
+        ok, reason = safe_imwrite(abs_path, thumb, self.jpeg_quality)
+        if not ok:
+            LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
+            return None, None
         return rel_path.as_posix(), abs_path
 
     def _letterbox(self, crop):
@@ -1245,6 +1285,7 @@ class FrameExporter:
         save_frames: bool,
         save_crops: bool,
         jpeg_quality: int,
+        debug_logger: JsonlLogger | NullLogger | None = None,
     ) -> None:
         self.ep_id = ep_id
         self.save_frames = save_frames
@@ -1262,6 +1303,12 @@ class FrameExporter:
         self._track_indexes: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
         self._stat_samples = 0
         self._stat_limit = 10
+        self._crop_attempts = 0
+        self._crop_error_counts: Counter[str] = Counter()
+        self._fail_fast_threshold = 0.10
+        self._fail_fast_min_attempts = 10
+        self._fail_fast_reasons = {"near_uniform_gray", "tiny_file"}
+        self.debug_logger = debug_logger
 
     def _log_image_stats(self, kind: str, path: Path, image) -> None:
         if self._stat_samples >= self._stat_limit:
@@ -1287,21 +1334,16 @@ class FrameExporter:
             for track_id, bbox in crops:
                 if track_id is None:
                     continue
-                clamp = sanitize_xyxy(bbox[0], bbox[1], bbox[2], bbox[3], image.shape[1], image.shape[0])
-                if clamp is None:
-                    continue
-                x1, y1, x2, y2 = clamp
-                crop_img = image[y1:y2, x1:x2]
-                if crop_img.size == 0:
-                    continue
                 crop_path = self.crop_abs_path(track_id, frame_idx)
                 try:
-                    self._log_image_stats("crop", crop_path, crop_img)
-                    save_jpeg(crop_path, crop_img, quality=self.jpeg_quality, color="bgr")
-                    self.crops_written += 1
-                    self._record_crop_index(track_id, frame_idx, ts)
+                    saved = self._write_crop(image, bbox, crop_path, track_id, frame_idx)
                 except Exception as exc:  # pragma: no cover - best effort
                     LOGGER.warning("Failed to save crop %s: %s", crop_path, exc)
+                    self._register_crop_attempt("exception")
+                    saved = False
+                if saved:
+                    self.crops_written += 1
+                    self._record_crop_index(track_id, frame_idx, ts)
 
     def crop_component(self, track_id: int, frame_idx: int) -> str:
         return f"track_{track_id:04d}/frame_{frame_idx:06d}.jpg"
@@ -1338,6 +1380,90 @@ class FrameExporter:
                 index_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
             except Exception as exc:  # pragma: no cover - best effort
                 LOGGER.warning("Failed to write crop index %s: %s", index_path, exc)
+
+    def _register_crop_attempt(self, reason: str | None) -> None:
+        self._crop_attempts += 1
+        if reason:
+            self._crop_error_counts[reason] += 1
+        if reason in self._fail_fast_reasons:
+            self._maybe_fail_fast()
+
+    def _maybe_fail_fast(self) -> None:
+        if self._crop_attempts < self._fail_fast_min_attempts:
+            return
+        bad = sum(self._crop_error_counts.get(reason, 0) for reason in self._fail_fast_reasons)
+        ratio = bad / max(self._crop_attempts, 1)
+        if ratio >= self._fail_fast_threshold:
+            raise RuntimeError(
+                f"Too many invalid crops ({bad}/{self._crop_attempts}, {ratio:.1%}); aborting export"
+            )
+
+    def _write_crop(
+        self,
+        image,
+        bbox: List[float],
+        crop_path: Path,
+        track_id: int,
+        frame_idx: int,
+    ) -> bool:
+        start = time.time()
+        bbox_vals = [float(val) for val in bbox]
+        crop, clipped_bbox, crop_err = safe_crop(image, bbox_vals)
+        debug_payload: Dict[str, Any] | None = None
+        if self.debug_logger:
+            debug_payload = {
+                "track_id": track_id,
+                "frame_idx": frame_idx,
+                "out": str(crop_path),
+                "bbox": bbox_vals,
+                "clipped_bbox": list(clipped_bbox) if clipped_bbox else None,
+                "err_before_save": crop_err,
+            }
+        if crop is None:
+            self._register_crop_attempt(crop_err or "no_crop")
+            if debug_payload is not None:
+                debug_payload.update(
+                    {
+                        "save_ok": False,
+                        "save_err": crop_err or "no_crop",
+                        "ms": int((time.time() - start) * 1000),
+                    }
+                )
+                self._emit_debug(debug_payload)
+            return False
+
+        ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
+        reason = save_err if not ok else None
+        self._register_crop_attempt(reason)
+
+        if debug_payload is not None:
+            mn, mx, mean = _image_stats(crop)
+            debug_payload.update(
+                {
+                    "shape": tuple(int(x) for x in crop.shape),
+                    "dtype": str(crop.dtype),
+                    "min": mn,
+                    "max": mx,
+                    "mean": mean,
+                    "save_ok": bool(ok),
+                    "save_err": save_err,
+                    "file_size": crop_path.stat().st_size if ok and crop_path.exists() else None,
+                    "ms": int((time.time() - start) * 1000),
+                }
+            )
+            self._emit_debug(debug_payload)
+
+        if not ok and save_err:
+            LOGGER.warning("Failed to save crop %s: %s", crop_path, save_err)
+        return bool(ok)
+
+    def _emit_debug(self, payload: Dict[str, Any]) -> None:
+        if not self.debug_logger:
+            return
+        try:
+            self.debug_logger(payload)
+        except Exception:  # pragma: no cover - best effort diagnostics
+            pass
 
 
 class FrameDecoder:
@@ -2031,6 +2157,7 @@ def _run_detect_track_stage(
             save_frames=save_frames,
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
+            debug_logger=None,
         )
         if (save_frames or save_crops)
         else None
@@ -2147,12 +2274,17 @@ def _run_faces_embed_stage(
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
+    frames_root = get_path(args.ep_id, "frames_root")
+    debug_logger_obj: JsonlLogger | NullLogger | None = None
+    if save_crops and debug_thumbs_enabled():
+        debug_logger_obj = init_debug_logger(args.ep_id, frames_root)
     exporter = (
         FrameExporter(
             args.ep_id,
             save_frames=save_frames,
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
+            debug_logger=debug_logger_obj,
         )
         if (save_frames or save_crops)
         else None
@@ -2201,12 +2333,42 @@ def _run_faces_embed_stage(
             ts_val = round(float(sample["ts"]), 4)
             landmarks = sample.get("landmarks")
 
-            image = None
             if not video_path.exists():
                 raise FileNotFoundError("Local video not found for crop export")
             if frame_decoder is None:
                 frame_decoder = FrameDecoder(video_path)
             image = frame_decoder.read(frame_idx)
+            frame_std = float(np.std(image)) if image is not None else 0.0
+            if image is None or frame_std < 1.0:
+                LOGGER.warning(
+                    "Low-variance frame %s std=%.4f; retrying decode for track %s", frame_idx, frame_std, track_id
+                )
+                image = frame_decoder.read(frame_idx)
+                frame_std = float(np.std(image)) if image is not None else 0.0
+            if image is None or frame_std < 1.0:
+                LOGGER.error("Skipping frame %s for track %s due to bad_source_frame", frame_idx, track_id)
+                rows.append(
+                    _make_skip_face_row(
+                        args.ep_id,
+                        track_id,
+                        frame_idx,
+                        ts_val,
+                        bbox,
+                        detector_choice,
+                        "bad_source_frame",
+                    )
+                )
+                faces_done = min(faces_total, faces_done + 1)
+                progress.emit(
+                    faces_done,
+                    phase="faces_embed",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=embed_device,
+                    extra=phase_meta,
+                )
+                continue
 
             if exporter and image is not None:
                 exporter.export(frame_idx, image, [(track_id, bbox)], ts=ts_val)
@@ -2215,13 +2377,39 @@ def _run_faces_embed_stage(
                     if s3_prefixes and s3_prefixes.get("crops"):
                         crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
             if image is not None:
-                thumb_rel_path, thumb_abs = thumb_writer.write(image, bbox, track_id, frame_idx)
+                thumb_rel_path, _ = thumb_writer.write(image, bbox, track_id, frame_idx)
                 if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
                     thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
 
-            if image is None:
-                raise RuntimeError("Unable to read frame for faces embedding")
-            crop = _prepare_face_crop(image, bbox, landmarks)
+            crop, crop_err = _prepare_face_crop(image, bbox, landmarks)
+            if crop is None:
+                rows.append(
+                    _make_skip_face_row(
+                        args.ep_id,
+                        track_id,
+                        frame_idx,
+                        ts_val,
+                        bbox,
+                        detector_choice,
+                        crop_err or "crop_failed",
+                        crop_rel_path=crop_rel_path,
+                        crop_s3_key=crop_s3_key,
+                        thumb_rel_path=thumb_rel_path,
+                        thumb_s3_key=thumb_s3_key,
+                    )
+                )
+                faces_done = min(faces_total, faces_done + 1)
+                progress.emit(
+                    faces_done,
+                    phase="faces_embed",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=embed_device,
+                    extra=phase_meta,
+                )
+                continue
+
             encoded = embedder.encode([crop])
             if encoded.size:
                 embedding_vec = encoded[0]
@@ -2369,6 +2557,8 @@ def _run_faces_embed_stage(
     finally:
         if frame_decoder:
             frame_decoder.close()
+        if debug_logger_obj:
+            debug_logger_obj.close()
         progress.close()
 
 
@@ -2737,16 +2927,6 @@ def _materialize_identity_thumb(
     if s3_prefixes and s3_prefixes.get("thumbs_identities"):
         s3_key = f"{s3_prefixes['thumbs_identities']}{identity_id}/rep.jpg"
     return dest_rel.as_posix(), s3_key
-
-
-def _blank_image(width: int = 160, height: int = 160, color: tuple[int, int, int] = (180, 180, 180)):
-    try:
-        import numpy as np  # type: ignore
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("numpy is required when saving face crops") from exc
-    image = np.zeros((height, width, 3), dtype=np.uint8)
-    image[:, :] = color
-    return image
 
 
 def _build_identity_clusters(
