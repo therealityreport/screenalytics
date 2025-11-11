@@ -53,6 +53,18 @@ TRACKER_OPTIONS = [
 TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
 TRACKER_VALUE_MAP = {label: value for label, value in TRACKER_OPTIONS}
 TRACKER_LABEL_MAP = {value: label for label, value in TRACKER_OPTIONS}
+SCENE_DETECTOR_OPTIONS = [
+    ("PySceneDetect (recommended)", "pyscenedetect"),
+    ("HSV histogram (fallback)", "internal"),
+    ("Disabled", "off"),
+]
+SCENE_DETECTOR_LABELS = [label for label, _ in SCENE_DETECTOR_OPTIONS]
+SCENE_DETECTOR_VALUE_MAP = {label: value for label, value in SCENE_DETECTOR_OPTIONS}
+SCENE_DETECTOR_LABEL_MAP = {value: label for label, value in SCENE_DETECTOR_OPTIONS}
+_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
+SCENE_DETECTOR_DEFAULT = (
+    _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
+)
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 
 
@@ -121,8 +133,7 @@ def format_count(value: Any) -> str | None:
     return f"{numeric:,}"
 
 
-SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
-SCENE_THRESHOLD_DEFAULT = max(min(_env_float("SCENE_THRESHOLD", 0.30), 2.0), 0.0)
+SCENE_THRESHOLD_DEFAULT = max(_env_float("SCENE_THRESHOLD", 27.0), 0.0)
 SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
 SCENE_WARMUP_DETS_DEFAULT = max(_env_int("SCENE_WARMUP_DETS", 3), 0)
 
@@ -172,6 +183,7 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
         st.session_state["device_default_label"] = _guess_device_label()
     st.session_state.setdefault("detector_choice", DEFAULT_DETECTOR)
     st.session_state.setdefault("tracker_choice", DEFAULT_TRACKER)
+    st.session_state.setdefault("scene_detector_choice", SCENE_DETECTOR_DEFAULT)
 
     sidebar = st.sidebar
     sidebar.header("API")
@@ -378,6 +390,26 @@ def remember_tracker(value: str | None) -> None:
         st.session_state["tracker_choice"] = key
 
 
+def scene_detector_label_index(value: str | None = None) -> int:
+    effective = (value or SCENE_DETECTOR_DEFAULT).lower()
+    label = SCENE_DETECTOR_LABEL_MAP.get(effective, SCENE_DETECTOR_LABELS[0])
+    try:
+        return SCENE_DETECTOR_LABELS.index(label)
+    except ValueError:
+        return 0
+
+
+def scene_detector_value_from_label(label: str | None) -> str:
+    if not label:
+        return SCENE_DETECTOR_DEFAULT
+    return SCENE_DETECTOR_VALUE_MAP.get(label, SCENE_DETECTOR_DEFAULT)
+
+
+def scene_detector_label(value: str | None) -> str:
+    key = (value or SCENE_DETECTOR_DEFAULT).lower()
+    return SCENE_DETECTOR_LABEL_MAP.get(key, key)
+
+
 def default_detect_track_payload(
     ep_id: str,
     *,
@@ -395,7 +427,7 @@ def default_detect_track_payload(
         "save_frames": True,
         "save_crops": True,
         "jpeg_quality": 85,
-        "scene_detect": SCENE_DETECT_DEFAULT,
+        "scene_detector": SCENE_DETECTOR_DEFAULT,
         "scene_threshold": SCENE_THRESHOLD_DEFAULT,
         "scene_min_len": SCENE_MIN_LEN_DEFAULT,
         "scene_warmup_dets": SCENE_WARMUP_DETS_DEFAULT,
@@ -883,8 +915,20 @@ def scene_cuts_badge_text(summary: Dict[str, Any] | None) -> str | None:
     if not scene_block:
         return None
     count = scene_block.get("count")
+    detector_name: str | None = None
+    detector_value = scene_block.get("detector")
+    if isinstance(detector_value, str):
+        if detector_value == "off":
+            detector_name = "disabled"
+        else:
+            detector_name = scene_detector_label(detector_value)
     if isinstance(count, int):
-        return f"Scene cuts: {count:,}"
+        prefix = f"Scene cuts: {count:,}"
+        if detector_name:
+            if detector_name == "disabled":
+                return "Scene cuts: disabled"
+            return f"{prefix} via {detector_name}"
+        return prefix
     return None
 
 

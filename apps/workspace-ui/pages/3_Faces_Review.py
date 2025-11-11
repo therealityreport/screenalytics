@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+import math
+
 import requests
 import streamlit as st
 
@@ -115,7 +117,6 @@ def _save_identity_name(ep_id: str, identity_id: str, name: str, show: str | Non
         return
     st.toast(f"Saved name '{cleaned}' for {identity_id}")
     _refresh_roster_names(show)
-    st.session_state.get("track_detail_cache", {}).clear()
     st.rerun()
 
 
@@ -141,7 +142,6 @@ def _move_frames_api(
     name = resp.get("target_name") or resp.get("target_identity_id") or target_identity_id or "target identity"
     st.toast(f"Moved {moved} frame(s) to {name}")
     _refresh_roster_names(show)
-    st.session_state.get("track_detail_cache", {}).pop(track_id, None)
     st.session_state.setdefault("track_frame_selection", {}).pop(track_id, None)
     st.rerun()
 
@@ -153,7 +153,6 @@ def _delete_frames_api(ep_id: str, track_id: int, frame_ids: List[int], delete_a
         return
     deleted = resp.get("deleted") or len(frame_ids)
     st.toast(f"Deleted {deleted} frame(s)")
-    st.session_state.get("track_detail_cache", {}).pop(track_id, None)
     st.session_state.setdefault("track_frame_selection", {}).pop(track_id, None)
     st.rerun()
 
@@ -248,7 +247,6 @@ def _initialize_state(ep_id: str) -> None:
         st.session_state["selected_person"] = None
         st.session_state["selected_identity"] = None
         st.session_state["selected_track"] = None
-    st.session_state.setdefault("track_detail_cache", {})
 
 
 def _set_view(
@@ -328,7 +326,7 @@ def _fetch_track_media(
     ep_id: str,
     track_id: int,
     *,
-    sample: int = 5,
+    sample: int = 1,
     limit: int = 2,
     cursor: str | None = None,
 ) -> tuple[List[Dict[str, Any]], str | None]:
@@ -341,7 +339,7 @@ def _fetch_track_media(
     next_cursor = payload.get("next_start_after") if isinstance(payload, dict) else None
     normalized: List[Dict[str, Any]] = []
     for item in items:
-        url = item.get("url") or item.get("thumbnail_url")
+        url = item.get("media_url") or item.get("url") or item.get("thumbnail_url")
         resolved = helpers.resolve_thumb(url)
         if not resolved:
             continue
@@ -351,6 +349,27 @@ def _fetch_track_media(
             "track_id": track_id,
         })
     return normalized, next_cursor
+
+
+def _fetch_track_frames(
+    ep_id: str,
+    track_id: int,
+    *,
+    sample: int,
+    page: int,
+    page_size: int,
+) -> Dict[str, Any]:
+    params = {
+        "sample": int(sample),
+        "page": int(page),
+        "page_size": int(page_size),
+    }
+    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/frames", params=params)
+    if isinstance(payload, list):
+        return {"items": payload}
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
 def _render_people_view(
@@ -550,7 +569,7 @@ def _render_cluster_tracks(
         st.info("No tracks linked to this identity yet.")
         return
 
-    # Build a horizontal strip: 2 thumbnails per track with arrows to scroll
+    # Build a crop gallery sampled from every track
     strip_cache: Dict[str, List[Dict[str, Any]]] = st.session_state.setdefault("cluster_track_strip", {})
     cache_key = f"{ep_id}:{identity_id}"
     strip_items = strip_cache.get(cache_key)
@@ -562,82 +581,65 @@ def _render_cluster_tracks(
                 tid_int = int(tid)
             except (TypeError, ValueError):
                 continue
-            thumbs, _ = _fetch_track_media(ep_id, tid_int, sample=5, limit=2, cursor=None)
-            # Fallback to rep thumb if no crops
-            if not thumbs:
-                rep = helpers.resolve_thumb(t.get("rep_thumb_url"))
-                if rep:
-                    thumbs = [{"url": rep, "track_id": tid_int}]
-            # Ensure exactly two per track if available (duplicate if only one)
-            if len(thumbs) == 1:
-                thumbs = thumbs * 2
-            elif len(thumbs) > 2:
-                thumbs = thumbs[:2]
-            for itm in thumbs:
+            crops, _ = _fetch_track_media(ep_id, tid_int, sample=5, limit=5, cursor=None)
+            for itm in crops:
+                if not itm.get("url"):
+                    continue
                 strip_items.append({"url": itm.get("url"), "track_id": tid_int})
         strip_cache[cache_key] = strip_items
 
+    track_previews: Dict[int, str] = {}
     if strip_items:
-        per_row = 5
-        window = per_row
-        offsets = st.session_state.setdefault("cluster_strip_offsets", {})
-        start_idx = int(offsets.get(identity_id, 0) or 0)
-        start_idx = max(0, min(start_idx, max(0, len(strip_items) - window)))
-        offsets[identity_id] = start_idx
-        nav_cols = st.columns([0.5, 9, 0.5])
-        with nav_cols[0]:
-            if st.button("←", key=f"cluster_strip_left_{identity_id}", disabled=start_idx == 0):
-                offsets[identity_id] = max(0, start_idx - window)
-                st.rerun()
-        with nav_cols[2]:
-            if st.button(
-                "→",
-                key=f"cluster_strip_right_{identity_id}",
-                disabled=start_idx + window >= len(strip_items),
-            ):
-                offsets[identity_id] = min(len(strip_items) - 1, start_idx + window)
-                st.rerun()
-        visible = strip_items[start_idx : start_idx + window]
-        if visible:
-            row_cols = st.columns(len(visible))
-            for idx, itm in enumerate(visible):
+        st.caption(f"{len(strip_items)} crop(s) sampled across {len(tracks)} track(s)")
+        cols_per_row = 6
+        for row_start in range(0, len(strip_items), cols_per_row):
+            chunk = strip_items[row_start : row_start + cols_per_row]
+            row_cols = st.columns(len(chunk))
+            for idx, itm in enumerate(chunk):
                 with row_cols[idx]:
-                    thumb_markup = helpers.thumb_html(
-                        itm.get("url"),
-                        alt=f"Track {itm.get('track_id')}",
-                        hide_if_missing=True,
-                    )
+                    tid = itm.get("track_id")
+                    url = itm.get("url")
+                    thumb_markup = helpers.thumb_html(url, alt=f"Track {tid}", hide_if_missing=True)
                     if thumb_markup:
                         st.markdown(thumb_markup, unsafe_allow_html=True)
                     else:
-                        st.caption("Thumbnail unavailable.")
-                    if st.button(
-                        "View track",
-                        key=f"strip_view_{identity_id}_{itm.get('track_id')}_{start_idx+idx}",
-                    ):
-                        _set_view(
-                            "track",
-                            person_id=person_id,
-                            identity_id=identity_id,
-                            track_id=int(itm.get("track_id")),
-                        )
-            end_idx = start_idx + len(visible)
-            st.caption(f"Showing {start_idx + 1}-{end_idx} of {len(strip_items)} thumbnails")
+                        st.caption("Crop unavailable.")
+                    if tid is not None:
+                        try:
+                            tid_int = int(tid)
+                            if url:
+                                track_previews.setdefault(tid_int, url)
+                        except (TypeError, ValueError):
+                            tid_int = None
+                        if tid_int is not None and st.button(
+                            "View track",
+                            key=f"strip_view_{identity_id}_{tid_int}_{row_start+idx}",
+                        ):
+                            _set_view(
+                                "track",
+                                person_id=person_id,
+                                identity_id=identity_id,
+                                track_id=tid_int,
+                            )
 
     move_targets = [ident_id for ident_id in identity_index if ident_id != identity_id]
-    cols_per_row = 5
+    cols_per_row = 6
     for row_start in range(0, len(tracks), cols_per_row):
         row_tracks = tracks[row_start : row_start + cols_per_row]
         row_cols = st.columns(min(cols_per_row, len(row_tracks)))
         for idx, track in enumerate(row_tracks):
             with row_cols[idx]:
                 track_id = track.get("track_id")
-                thumb_url = helpers.resolve_thumb(track.get("rep_thumb_url"))
-                thumb_markup = helpers.thumb_html(thumb_url, alt=f"Track {track_id}", hide_if_missing=True)
+                preview_url = None
+                try:
+                    preview_url = track_previews.get(int(track_id))
+                except (TypeError, ValueError):
+                    preview_url = None
+                thumb_markup = helpers.thumb_html(preview_url, alt=f"Track {track_id}", hide_if_missing=True)
                 if thumb_markup:
                     st.markdown(thumb_markup, unsafe_allow_html=True)
                 else:
-                    st.caption("Thumbnail unavailable.")
+                    st.caption("No crops sampled yet.")
                 faces_count = track.get("faces") or 0
                 st.caption(f"Track {track_id} · {faces_count} faces")
                 if st.button(
@@ -687,14 +689,64 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     current_identity = st.session_state.get("selected_identity")
     show_slug = _episode_show_slug(ep_id)
     roster_names = _fetch_roster_names(show_slug)
-    track_detail_cache = st.session_state.setdefault("track_detail_cache", {})
-    detail = track_detail_cache.get(track_id)
-    if detail is None:
-        detail = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}")
-        if detail is None:
-            return
-        track_detail_cache[track_id] = detail
-    frames = detail.get("frames", [])
+    sample_key = f"track_sample_{ep_id}_{track_id}"
+    if sample_key not in st.session_state:
+        st.session_state[sample_key] = 1
+    frame_controls = st.columns([1, 1, 2])
+    with frame_controls[0]:
+        prev_sample = st.session_state[sample_key]
+        sample = int(
+            st.slider(
+                "Sample every N crops",
+                min_value=1,
+                max_value=20,
+                value=prev_sample,
+                key=sample_key,
+            )
+        )
+    page_key = f"track_page_{ep_id}_{track_id}"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
+    if sample != prev_sample:
+        st.session_state[page_key] = 1
+    current_page = int(st.session_state[page_key])
+    with frame_controls[1]:
+        page = int(
+            st.number_input(
+                "Page",
+                min_value=1,
+                value=current_page,
+                step=1,
+                key=page_key,
+            )
+        )
+    page = int(st.session_state[page_key])
+    page_size = 50
+    frames_payload = _fetch_track_frames(ep_id, track_id, sample=sample, page=page, page_size=page_size)
+    frames = frames_payload.get("items", [])
+    total_sampled = int(frames_payload.get("total") or 0)
+    total_frames = int(frames_payload.get("total_frames") or total_sampled)
+    max_page = max(1, math.ceil(total_sampled / page_size)) if total_sampled else 1
+    nav_cols = st.columns([1, 1, 3])
+    with nav_cols[0]:
+        if st.button("Prev page", key=f"track_prev_{track_id}", disabled=page <= 1):
+            st.session_state[page_key] = max(1, page - 1)
+            st.rerun()
+    with nav_cols[1]:
+        if st.button("Next page", key=f"track_next_{track_id}", disabled=page >= max_page):
+            st.session_state[page_key] = min(max_page, page + 1)
+            st.rerun()
+    shown = len(frames)
+    summary = f"Frames shown: {shown} / {total_sampled or 0} (page {page}/{max_page}) · Sample every {sample}"
+    if total_frames:
+        summary += f" · Faces tracked: {total_frames}"
+    nav_cols[2].caption(summary)
+    integrity = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/integrity")
+    if integrity and not integrity.get("ok"):
+        st.warning(
+            "Crops on disk are missing for this track. Faces manifest"
+            f"={integrity.get('faces_manifest', 0)} · crops={integrity.get('crops_files', 0)}"
+        )
     action_cols = st.columns([1.0, 1.0, 1.0])
     with action_cols[0]:
         targets = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
@@ -719,10 +771,10 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     selected_frames: List[int] = []
     if frames:
         st.caption("Select frames to move or delete.")
-        cols_per_row = 5
+        cols_per_row = 6
         for row_start in range(0, len(frames), cols_per_row):
             row_frames = frames[row_start : row_start + cols_per_row]
-            row_cols = st.columns(cols_per_row)
+            row_cols = st.columns(len(row_frames))
             for idx, frame_meta in enumerate(row_frames):
                 face_id = frame_meta.get("face_id")
                 frame_idx = frame_meta.get("frame_idx")
@@ -730,12 +782,16 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                     frame_idx_int = int(frame_idx)
                 except (TypeError, ValueError):
                     frame_idx_int = None
-                thumb_url = frame_meta.get("thumbnail_url")
+                thumb_url = frame_meta.get("media_url") or frame_meta.get("thumbnail_url")
                 skip_reason = frame_meta.get("skip")
                 with row_cols[idx]:
                     caption = f"Frame {frame_idx}" if frame_idx is not None else (face_id or "frame")
                     resolved_thumb = helpers.resolve_thumb(thumb_url)
-                    st.markdown(helpers.thumb_html(resolved_thumb, alt=caption), unsafe_allow_html=True)
+                    thumb_markup = helpers.thumb_html(resolved_thumb, alt=caption, hide_if_missing=True)
+                    if thumb_markup:
+                        st.markdown(thumb_markup, unsafe_allow_html=True)
+                    else:
+                        st.caption("Crop unavailable.")
                     st.caption(caption)
                     if skip_reason:
                         st.markdown(f":red[⚠ invalid crop] {skip_reason}")
@@ -754,7 +810,10 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         selected_frames = sorted(track_selection)
         st.caption(f"{len(selected_frames)} frame(s) selected.")
     else:
-        st.info("No frames recorded for this track yet.")
+        if total_sampled:
+            st.info("No frames on this page. Try a smaller page number or lower sampling.")
+        else:
+            st.info("No frames recorded for this track yet.")
 
     if selected_frames:
         identity_values = [None] + [ident["identity_id"] for ident in identities]
@@ -823,8 +882,6 @@ def _move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> No
 
 def _delete_track(ep_id: str, track_id: int) -> None:
     if _api_post(f"/identities/{ep_id}/drop_track", {"track_id": track_id}):
-        # Clear track detail cache so deleted track doesn't reappear
-        st.session_state.get("track_detail_cache", {}).pop(track_id, None)
         # Clear selection state for this track
         st.session_state.get("track_frame_selection", {}).pop(track_id, None)
         # Navigate back within the person/cluster context
@@ -844,8 +901,6 @@ def _delete_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool
         "delete_assets": delete_assets,
     }
     if _api_post(f"/identities/{ep_id}/drop_frame", payload):
-        # Clear track detail cache for this specific track to reload fresh data
-        st.session_state.get("track_detail_cache", {}).pop(track_id, None)
         # Stay on track view - don't navigate away
         st.success("Frame removed.")
         st.rerun()

@@ -145,6 +145,33 @@ The diagnostics logger (`DEBUG_THUMBS=1 python tools/episode_run.py …`) append
 
 `episode_run.py` now auto-detects FPS whenever `--fps` is unset/`0`, emits structured progress JSON (frames, seconds, inferred FPS, device, detector, tracker, phase) to stdout **and** to `progress.json`, and finishes with a `phase:"done"` payload that includes stage-specific counts, per-run track metrics (`tracks_born`, `tracks_lost`, `id_switches`, `longest_tracks`), plus local + v2 S3 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). `--detector retinaface` locks each run to the high-quality InsightFace RetinaFace weights so embeddings and trackers always see consistent geometry, while `--tracker {bytetrack,strongsort}` chooses either the default face-only ByteTrack gates or a StrongSORT/BoT-SORT ReID path for occlusions. Both trackers operate purely on face boxes (track_thresh≈0.6, match_thresh≈0.8, buffer≈30, min box area≈20 px), so there’s no longer a person-class detector. `--max-gap` still controls how many skipped frames cause a track split. `--faces-embed` now runs ArcFace (`arcface_r100_v1`) via ONNX Runtime to produce 512-d unit-norm embeddings (plus optional crops/frames), and `--cluster` averages those per-track vectors before agglomerative clustering so the Facebank can relabel/merge tracks.
 
+### Episode cleanup (tracks → clusters → people)
+
+`tools/episode_cleanup.py` sequentially runs detect/track, faces embed, clustering, and grouping with the appearance/IoU gate + face-quality filters enabled. It produces a `cleanup_report.json` (tracks/clusters before vs after, split reasons, grouping stats) and replays uploads to the v2 S3 layout.
+
+```bash
+python tools/episode_cleanup.py \
+  --ep-id rhobh-s05e02 \
+  --video data/videos/rhobh-s05e02/episode.mp4 \
+  --stride 3 --device auto --embed-device auto \
+  --cluster-thresh 0.58 --min-cluster-size 2 \
+  --actions split_tracks reembed recluster group_clusters
+```
+
+The API exposes the same workflow asynchronously:
+
+```bash
+POST /jobs/episode_cleanup_async
+{
+  "ep_id": "rhobh-s05e02",
+  "stride": 3,
+  "actions": ["split_tracks", "reembed", "recluster", "group_clusters"],
+  "write_back": true
+}
+```
+
+This spawns `episode_cleanup.py`, streams per-stage summaries to `progress.json`, and publishes `cleanup_report.json` + `track_metrics.json` under `data/manifests/<ep_id>/`.
+
 ### Dependency profiles
 
 - **Core (API/UI/tests):**
@@ -203,7 +230,7 @@ The diagnostics logger (`DEBUG_THUMBS=1 python tools/episode_run.py …`) append
 
 4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
 5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
-6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, then submit to mirror the footage locally and kick off the full RetinaFace + ByteTrack pass (using the same defaults as Episode Detail—frames + crops exports enabled, JPEG quality 85, scene-cut detection on).
+6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, then submit to mirror the footage locally and kick off the full RetinaFace + ByteTrack pass (using the same defaults as Episode Detail—frames + crops exports enabled, JPEG quality 85, PySceneDetect hard-cut resets on).
 7. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and calls `POST /jobs/detect_track_async` (with a synchronous fallback button if you really need it). Progress is streamed from `/jobs/{job_id}/progress`, so you can cancel or watch counts materialize without blocking the page.
 
 **Episode Detail live progress & exports**
@@ -254,7 +281,7 @@ Need the full RetinaFace + ByteTrack pass outside the UI?
    - Lower `--stride` (for example `1` or `2`) and higher `--fps` increase recall but also GPU/CPU time.
    - Higher `--stride` or smaller `--fps` are useful for exploratory passes on long episodes.
    - Device selection order: `auto` → CUDA GPU → Apple `mps` → CPU. Override with `--device cpu` if you need to stay on CPU.
-   - `--scene-detect` (default `on`) runs a histogram prepass to detect hard cuts, resets ByteTrack at each cut, and forces `--scene-warmup-dets` consecutive detections to reacquire IDs. Tune `--scene-threshold` (0–2) and `--scene-min-len` (frames between cuts) when you need a stricter or looser cut detector.
+   - `--scene-detector` (`pyscenedetect` | `internal` | `off`) picks the hard-cut pass. PySceneDetect (default) yields the cleanest resets; the internal HSV histogram fallback matches the legacy behavior. `--scene-threshold` now defaults to `27.0` for PySceneDetect but still accepts `0–2` when you switch to the histogram detector, and `--scene-min-len` / `--scene-warmup-dets` behave as before.
    - Faces harvesting reuses the same RetinaFace detector as detect/track; you can still tune `--min-face-size`, `--min-face-conf`, `--face-validate`, and `--thumb-size` to control filtering and thumbnail outputs.
 
 3. (Optional) Verify the real pipeline via the ML test:
@@ -272,7 +299,7 @@ Already uploaded footage to S3 and just need to run detect/track again?
 1. Start the API + Streamlit UI, then choose **Existing Episode** in the sidebar.
 2. Browse the **S3 videos** list to pick any `raw/videos/{show}/s{season}/e{episode}/episode.mp4` object. If it isn’t in the EpisodeStore yet, hit **Create episode in store** – the UI parses the v2 key, POSTs `/episodes/upsert_by_id`, and immediately shows whether it created or reused the record (along with the derived `ep_id`).
 3. Click **Mirror from S3** to download the v2 object into `data/videos/{ep_id}/episode.mp4`. When only a legacy `raw/videos/{ep_id}/episode.mp4` exists, the UI falls back to it and shows a note until you migrate.
-4. Adjust `Stride`, optional `FPS` (set `0` to reuse the detected FPS shown in the UI), **Device**, frame/crop export toggles (pre-checked to save frames + crops by default), and the advanced scene-cut settings, then hit **Run detect/track**. The progress widget always renders `mm:ss / mm:ss`, device, FPS, and the target S3 prefixes (frames/crops/manifests) so you know exactly where artifacts land once the run completes, and the completion toast now includes a `Scene cuts: N` pill so you can quickly gauge how many tracker resets fired.
+4. Adjust `Stride`, optional `FPS` (set `0` to reuse the detected FPS shown in the UI), **Device**, frame/crop export toggles (pre-checked to save frames + crops by default), and the advanced scene-cut settings (detector type + thresholds), then hit **Run detect/track**. The progress widget always renders `mm:ss / mm:ss`, device, FPS, and the target S3 prefixes (frames/crops/manifests) so you know exactly where artifacts land once the run completes, and the completion toast now includes a `Scene cuts: N` pill so you can quickly gauge how many tracker resets fired.
 
  Manifest links for that episode stay visible so you can open `detections.jsonl` / `tracks.jsonl` directly after each pass.
 

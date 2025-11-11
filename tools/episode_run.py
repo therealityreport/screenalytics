@@ -88,6 +88,15 @@ DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt"
 DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
 RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
+GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.50"))
+GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.60"))
+GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "3")), 1)
+GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.10"))
+GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
+GATE_EMB_EVERY_DEFAULT = max(int(os.environ.get("TRACK_GATE_EMB_EVERY", "0")), 0)
+FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
+FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
+FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -151,8 +160,11 @@ SEED_BOOST_ENABLED = _env_flag("SEED_BOOST_ENABLED", False)
 SEED_BOOST_SCORE_DELTA = float(os.environ.get("SEED_BOOST_SCORE_DELTA", "0.15"))
 SEED_BOOST_MIN_SIM = float(os.environ.get("SEED_BOOST_MIN_SIM", "0.42"))
 
-SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
-SCENE_THRESHOLD_DEFAULT = max(min(_env_float("SCENE_THRESHOLD", 0.30), 2.0), 0.0)
+SCENE_DETECTOR_CHOICES = ("pyscenedetect", "internal", "off")
+_RAW_SCENE_DETECTOR = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
+SCENE_DETECTOR_DEFAULT = _RAW_SCENE_DETECTOR if _RAW_SCENE_DETECTOR in SCENE_DETECTOR_CHOICES else "pyscenedetect"
+SCENE_DETECT_DEFAULT = SCENE_DETECTOR_DEFAULT != "off"
+SCENE_THRESHOLD_DEFAULT = _env_float("SCENE_THRESHOLD", 27.0)
 SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
 SCENE_WARMUP_DETS_DEFAULT = max(_env_int("SCENE_WARMUP_DETS", 3), 0)
 
@@ -307,6 +319,14 @@ def _normalize_tracker_choice(tracker: str | None) -> str:
     return DEFAULT_TRACKER
 
 
+def _normalize_scene_detector_choice(scene_detector: str | None) -> str:
+    if scene_detector:
+        value = scene_detector.strip().lower()
+        if value in SCENE_DETECTOR_CHOICES:
+            return value
+    return SCENE_DETECTOR_DEFAULT
+
+
 def _valid_face_box(bbox: np.ndarray, score: float, *, min_score: float, min_area: float) -> bool:
     width = bbox[2] - bbox[0]
     height = bbox[3] - bbox[1]
@@ -344,22 +364,37 @@ class TrackAccumulator:
     class_id: int | str
     first_ts: float
     last_ts: float
+    first_frame_idx: int = -1
+    last_frame_idx: int = -1
     frame_count: int = 0
     samples: List[dict] = field(default_factory=list)
 
-    def add(self, ts: float, frame_idx: int, bbox_xyxy: List[float], landmarks: List[float] | None = None) -> None:
+    def add(
+        self,
+        ts: float,
+        frame_idx: int,
+        bbox_xyxy: List[float],
+        *,
+        confidence: float | None = None,
+        landmarks: List[float] | None = None,
+    ) -> None:
         self.frame_count += 1
         self.last_ts = ts
+        if self.first_frame_idx < 0:
+            self.first_frame_idx = frame_idx
+        self.last_frame_idx = frame_idx
         limit = TRACK_SAMPLE_LIMIT
         if limit is None or len(self.samples) < limit:
-            self.samples.append(
-                {
-                    "frame_idx": frame_idx,
-                    "ts": round(float(ts), 4),
-                    "bbox_xyxy": [round(float(coord), 4) for coord in bbox_xyxy],
-                    **({"landmarks": [round(float(val), 4) for val in landmarks]} if landmarks else {}),
-                }
-            )
+            sample = {
+                "frame_idx": frame_idx,
+                "ts": round(float(ts), 4),
+                "bbox_xyxy": [round(float(coord), 4) for coord in bbox_xyxy],
+            }
+            if landmarks:
+                sample["landmarks"] = [round(float(val), 4) for val in landmarks]
+            if confidence is not None:
+                sample["conf"] = round(float(confidence), 4)
+            self.samples.append(sample)
 
     def to_row(self) -> dict:
         row = {
@@ -370,6 +405,10 @@ class TrackAccumulator:
             "frame_count": self.frame_count,
             "pipeline_ver": PIPELINE_VERSION,
         }
+        if self.first_frame_idx >= 0:
+            row["first_frame_idx"] = int(self.first_frame_idx)
+        if self.last_frame_idx >= 0:
+            row["last_frame_idx"] = int(self.last_frame_idx)
         if self.samples:
             row["bboxes_sampled"] = self.samples
         return row
@@ -395,6 +434,127 @@ class TrackedObject:
     det_index: int | None = None
     landmarks: np.ndarray | None = None
 
+
+
+@dataclass
+class GateConfig:
+    appear_t_hard: float = GATE_APPEAR_T_HARD_DEFAULT
+    appear_t_soft: float = GATE_APPEAR_T_SOFT_DEFAULT
+    appear_streak: int = GATE_APPEAR_STREAK_DEFAULT
+    gate_iou: float = GATE_IOU_THRESHOLD_DEFAULT
+    proto_momentum: float = GATE_PROTO_MOMENTUM_DEFAULT
+    emb_every: int | None = None
+
+
+@dataclass
+class GateTrackState:
+    proto: np.ndarray | None = None
+    last_box: np.ndarray | None = None
+    low_sim_streak: int = 0
+
+
+def _l2_normalize(vec: np.ndarray | None) -> np.ndarray | None:
+    if vec is None:
+        return None
+    norm = float(np.linalg.norm(vec))
+    if norm <= 0.0:
+        return vec
+    return (vec / norm).astype(np.float32)
+
+
+def _cosine_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float | None:
+    if a is None or b is None:
+        return None
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 0.0:
+        return None
+    return float(np.dot(a, b) / denom)
+
+
+class AppearanceGate:
+    def __init__(self, config: GateConfig) -> None:
+        self.config = config
+        self._states: dict[int, GateTrackState] = {}
+        self.stats: Counter[str] = Counter()
+
+    def reset_all(self) -> None:
+        self._states.clear()
+
+    def prune(self, active_ids: set[int]) -> None:
+        for tracker_id in list(self._states.keys()):
+            if tracker_id not in active_ids:
+                self._states.pop(tracker_id, None)
+
+    def process(
+        self,
+        tracker_id: int,
+        bbox: np.ndarray,
+        embedding: np.ndarray | None,
+        frame_idx: int,
+    ) -> tuple[bool, str | None, float | None, float]:
+        state = self._states.setdefault(tracker_id, GateTrackState())
+        bbox_arr = bbox.astype(np.float32, copy=True)
+        similarity = _cosine_similarity(embedding, state.proto)
+        iou = 1.0
+        if state.last_box is not None:
+            iou = float(_bbox_iou(state.last_box.tolist(), bbox_arr.tolist()))
+        split = False
+        reason: str | None = None
+        low_similarity = similarity is not None and similarity < self.config.appear_t_soft
+        if similarity is not None and similarity < self.config.appear_t_hard:
+            split = True
+            reason = "hard"
+        elif low_similarity:
+            state.low_sim_streak += 1
+            if state.low_sim_streak >= self.config.appear_streak:
+                split = True
+                reason = "streak"
+        else:
+            state.low_sim_streak = 0
+        if not split and iou < self.config.gate_iou and (similarity is None or similarity < 0.65):
+            split = True
+            reason = "iou"
+        if split:
+            self.stats["splits_total"] += 1
+            if reason:
+                self.stats[f"split_{reason}"] += 1
+            LOGGER.info(
+                "[gate] split track=%s f=%s sim=%s iou=%.3f reason=%s",
+                tracker_id,
+                frame_idx,
+                f"{similarity:.3f}" if similarity is not None else "n/a",
+                iou,
+                reason or "unknown",
+            )
+            state.low_sim_streak = 0
+            state.proto = _l2_normalize(embedding.copy()) if embedding is not None else None
+        else:
+            if similarity is not None:
+                self.stats["sim_sum"] += similarity
+                self.stats["sim_count"] += 1
+            if embedding is not None and not low_similarity:
+                if state.proto is None:
+                    state.proto = _l2_normalize(embedding.copy())
+                else:
+                    mixed = self.config.proto_momentum * state.proto + (1.0 - self.config.proto_momentum) * embedding
+                    state.proto = _l2_normalize(mixed)
+        state.last_box = bbox_arr
+        return split, reason, similarity, iou
+
+    def summary(self) -> Dict[str, Any]:
+        sim_count = self.stats.get("sim_count", 0)
+        avg_sim = None
+        if sim_count:
+            avg_sim = self.stats.get("sim_sum", 0.0) / max(sim_count, 1)
+        return {
+            "splits": {
+                "hard": self.stats.get("split_hard", 0),
+                "streak": self.stats.get("split_streak", 0),
+                "iou": self.stats.get("split_iou", 0),
+                "total": self.stats.get("splits_total", 0),
+            },
+            "avg_sim_kept": round(avg_sim, 4) if avg_sim is not None else None,
+        }
 
 
 
@@ -785,6 +945,14 @@ def _prepare_face_crop(
     return crop, None
 
 
+def _estimate_blur_score(image) -> float:
+    import cv2  # type: ignore
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return float(variance)
+
+
 def _make_skip_face_row(
     ep_id: str,
     track_id: int,
@@ -831,7 +999,12 @@ class TrackRecorder:
         self._mapping: dict[int, dict[str, int]] = {}
         self._active_exports: set[int] = set()
         self._accumulators: dict[int, TrackAccumulator] = {}
-        self.metrics = {"tracks_born": 0, "tracks_lost": 0, "id_switches": 0}
+        self.metrics = {
+            "tracks_born": 0,
+            "tracks_lost": 0,
+            "id_switches": 0,
+            "forced_splits": 0,
+        }
 
     def _spawn_export_id(self) -> int:
         export_id = self._next_export_id
@@ -854,6 +1027,8 @@ class TrackRecorder:
         bbox: list[float] | np.ndarray,
         class_label: int | str,
         landmarks: list[float] | None = None,
+        confidence: float | None = None,
+        force_new_track: bool = False,
     ) -> int:
         if isinstance(bbox, np.ndarray):
             bbox_values = bbox.tolist()
@@ -867,6 +1042,10 @@ class TrackRecorder:
                 gap = frame_idx - mapping.get("last_frame", frame_idx)
                 if gap > self.max_gap:
                     self.metrics["id_switches"] += 1
+                    self._complete_track(mapping["export_id"])
+                    start_new = True
+                elif force_new_track:
+                    self.metrics["forced_splits"] += 1
                     self._complete_track(mapping["export_id"])
                     start_new = True
             if start_new:
@@ -887,13 +1066,26 @@ class TrackRecorder:
         if track is None:
             track = TrackAccumulator(track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts)
             self._accumulators[export_id] = track
-        track.add(ts, frame_idx, bbox_values, landmarks=landmarks)
+        track.add(ts, frame_idx, bbox_values, confidence=confidence, landmarks=landmarks)
         return export_id
 
     def finalize(self) -> None:
         for export_id in list(self._active_exports):
             self._complete_track(export_id)
         self._mapping.clear()
+
+    def on_cut(self, frame_idx: int | None = None) -> None:
+        """Force-complete all active exports so new IDs spawn after a hard cut."""
+
+        if not self._mapping:
+            return
+        forced = 0
+        for mapping in list(self._mapping.values()):
+            self._complete_track(mapping["export_id"])
+            forced += 1
+        self._mapping.clear()
+        if forced:
+            self.metrics["forced_splits"] += forced
 
     def rows(self) -> list[dict]:
         payload: list[dict] = []
@@ -1665,7 +1857,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run detection + tracking locally.")
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
-    parser.add_argument("--stride", type=int, default=5, help="Frame stride for detection sampling")
+    parser.add_argument("--stride", type=int, default=3, help="Frame stride for detection sampling")
     parser.add_argument(
         "--fps",
         type=float,
@@ -1690,16 +1882,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Tracker backend (ByteTrack default, StrongSORT optional for occlusions)",
     )
     parser.add_argument(
-        "--scene-detect",
-        choices=["on", "off"],
-        default="on" if SCENE_DETECT_DEFAULT else "off",
-        help="Enable histogram-based scene cut detection",
+        "--scene-detector",
+        choices=list(SCENE_DETECTOR_CHOICES),
+        default=SCENE_DETECTOR_DEFAULT,
+        help="Scene-cut prepass backend (PySceneDetect default, internal histogram fallback, or off)",
     )
     parser.add_argument(
         "--scene-threshold",
         type=float,
         default=SCENE_THRESHOLD_DEFAULT,
-        help="Scene-cut threshold (1 - HSV histogram correlation, 0-2 range)",
+        help="Scene-cut threshold passed to the detector (PySceneDetect≈27, histogram fallback expects 0-2)",
     )
     parser.add_argument(
         "--scene-min-len",
@@ -1754,6 +1946,43 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=2,
         help="Minimum tracks per identity before splitting into singletons",
     )
+    gate_group = parser.add_argument_group("Appearance gate")
+    gate_group.add_argument(
+        "--gate-appear-hard",
+        type=float,
+        default=GATE_APPEAR_T_HARD_DEFAULT,
+        help="Force split when cosine similarity drops below this hard threshold (default 0.50)",
+    )
+    gate_group.add_argument(
+        "--gate-appear-soft",
+        type=float,
+        default=GATE_APPEAR_T_SOFT_DEFAULT,
+        help="Begin streak counting when similarity drops below this soft threshold (default 0.60)",
+    )
+    gate_group.add_argument(
+        "--gate-appear-streak",
+        type=int,
+        default=GATE_APPEAR_STREAK_DEFAULT,
+        help="Consecutive soft violations before forcing a split",
+    )
+    gate_group.add_argument(
+        "--gate-iou",
+        type=float,
+        default=GATE_IOU_THRESHOLD_DEFAULT,
+        help="Minimum IoU to keep extending a track when appearance is uncertain",
+    )
+    gate_group.add_argument(
+        "--gate-proto-momentum",
+        type=float,
+        default=GATE_PROTO_MOMENTUM_DEFAULT,
+        help="Momentum applied when updating per-track prototypes (0→current, 1→frozen)",
+    )
+    gate_group.add_argument(
+        "--gate-emb-every",
+        type=int,
+        default=GATE_EMB_EVERY_DEFAULT,
+        help="Frames between gate embeddings (0 uses detect stride)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1761,9 +1990,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if hasattr(args, "det_thresh"):
         args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
-    scene_flag = str(getattr(args, "scene_detect", "on")).strip().lower()
-    args.scene_detect = scene_flag not in {"0", "false", "off", "no"}
-    args.scene_threshold = max(min(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 2.0), 0.0)
+    args.scene_detector = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
+    args.scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
     args.scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
     args.scene_warmup_dets = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
     cli_track_limit = getattr(args, "track_sample_limit", None)
@@ -1806,6 +2034,30 @@ def main(argv: Iterable[str] | None = None) -> int:
     return 0
 
 
+def _gate_config_from_args(args: argparse.Namespace, frame_stride: int) -> GateConfig:
+    def _clamp(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, float(value)))
+
+    appear_hard = _clamp(getattr(args, "gate_appear_hard", GATE_APPEAR_T_HARD_DEFAULT))
+    appear_soft = _clamp(getattr(args, "gate_appear_soft", GATE_APPEAR_T_SOFT_DEFAULT))
+    streak = max(int(getattr(args, "gate_appear_streak", GATE_APPEAR_STREAK_DEFAULT)), 1)
+    gate_iou = _clamp(getattr(args, "gate_iou", GATE_IOU_THRESHOLD_DEFAULT), lo=0.0, hi=1.0)
+    proto_mom = _clamp(getattr(args, "gate_proto_momentum", GATE_PROTO_MOMENTUM_DEFAULT))
+    emb_every = getattr(args, "gate_emb_every", None)
+    if emb_every is None or int(emb_every) <= 0:
+        emb_stride = max(frame_stride, 1)
+    else:
+        emb_stride = max(int(emb_every), 1)
+    return GateConfig(
+        appear_t_hard=appear_hard,
+        appear_t_soft=max(appear_soft, appear_hard + 0.01),
+        appear_streak=streak,
+        gate_iou=gate_iou,
+        proto_momentum=proto_mom,
+        emb_every=emb_stride,
+    )
+
+
 def _effective_stride(stride: int, target_fps: float | None, source_fps: float) -> int:
     stride = max(stride, 1)
     if target_fps and target_fps > 0 and source_fps > 0:
@@ -1835,14 +2087,14 @@ def _detect_fps(video_path: Path) -> float:
     return fps
 
 
-def detect_scene_cuts(
+def _detect_scene_cuts_histogram(
     video_path: str | Path,
     *,
     thr: float = SCENE_THRESHOLD_DEFAULT,
     min_len: int = SCENE_MIN_LEN_DEFAULT,
     progress: ProgressEmitter | None = None,
 ) -> list[int]:
-    """Lightweight HSV histogram scene-cut detector."""
+    """Lightweight HSV histogram scene-cut detector used as a fallback."""
 
     import cv2  # type: ignore
 
@@ -1855,14 +2107,6 @@ def detect_scene_cuts(
     prev_hist = None
     last_cut = -10**9
     idx = 0
-    if progress:
-        progress.emit(
-            0,
-            phase="scene_detect:cut",
-            summary={"threshold": round(float(threshold), 3), "min_len": min_gap},
-            extra=_non_video_phase_meta("start"),
-            force=True,
-        )
     target_frames = progress.target_frames if progress else 0
     emit_interval = 50  # Emit every 50 frames to reduce spam
     while True:
@@ -1885,18 +2129,108 @@ def detect_scene_cuts(
             progress.emit(
                 frames_done,
                 phase="scene_detect:cut",
-                summary={"count": len(cuts)},
+                summary={"count": len(cuts), "detector": "internal"},
                 extra=_non_video_phase_meta(),
             )
         prev_hist = hist
         idx += 1
     cap.release()
+    return cuts
+
+
+def detect_scene_cuts_pyscenedetect(
+    video_path: str | Path,
+    *,
+    threshold: float = SCENE_THRESHOLD_DEFAULT,
+    min_len: int = SCENE_MIN_LEN_DEFAULT,
+) -> list[int]:
+    """Detect hard cuts via PySceneDetect's ContentDetector."""
+
+    try:
+        from scenedetect import SceneManager, open_video  # type: ignore
+        from scenedetect.detectors import ContentDetector  # type: ignore
+    except ImportError as exc:  # pragma: no cover - enforced via optional dependency
+        raise RuntimeError(
+            "PySceneDetect is required for scene detection. Install it via `pip install scenedetect>=0.6.4`."
+        ) from exc
+
+    video = open_video(str(video_path))
+    manager = SceneManager()
+    detector = ContentDetector(threshold=float(threshold), min_scene_len=max(int(min_len), 1))
+    manager.add_detector(detector)
+    try:
+        manager.detect_scenes(video, show_progress=False)
+        scenes = manager.get_scene_list()
+    finally:
+        close_handle = getattr(video, "close", None)
+        if callable(close_handle):  # pragma: no cover - depends on backend
+            close_handle()
+        else:  # pragma: no cover - fallback path
+            release_handle = getattr(video, "release", None)
+            if callable(release_handle):
+                release_handle()
+    return [start.get_frames() for (start, _end) in scenes]
+
+
+def detect_scene_cuts(
+    video_path: str | Path,
+    *,
+    detector: str | None = None,
+    thr: float = SCENE_THRESHOLD_DEFAULT,
+    min_len: int = SCENE_MIN_LEN_DEFAULT,
+    progress: ProgressEmitter | None = None,
+) -> list[int]:
+    """Run the configured scene-cut detector and emit consistent progress events."""
+
+    detector_choice = _normalize_scene_detector_choice(detector)
+    threshold_value = max(float(thr), 0.0)
+    if detector_choice == "internal":
+        threshold_value = max(min(threshold_value, 2.0), 0.0)
+    summary_start = {
+        "detector": detector_choice,
+        "threshold": round(float(threshold_value), 3),
+        "min_len": max(int(min_len), 1),
+    }
     if progress:
-        final_frames = target_frames or idx
         progress.emit(
-            final_frames,
+            0,
             phase="scene_detect:cut",
-            summary={"cuts": len(cuts)},
+            summary=summary_start,
+            extra=_non_video_phase_meta("start"),
+            force=True,
+        )
+
+    if detector_choice == "off":
+        cuts: list[int] = []
+    elif detector_choice == "pyscenedetect":
+        cuts = detect_scene_cuts_pyscenedetect(
+            video_path,
+            threshold=threshold_value,
+            min_len=min_len,
+        )
+    else:
+        cuts = _detect_scene_cuts_histogram(
+            video_path,
+            thr=threshold_value,
+            min_len=min_len,
+            progress=progress,
+        )
+
+    if progress:
+        total_frames = progress.target_frames or (cuts[-1] if cuts else 0)
+        summary_done = {"count": len(cuts), "detector": detector_choice}
+        if cuts:
+            summary_done["first_cut"] = cuts[0]
+        progress.emit(
+            total_frames,
+            phase="scene_detect:cut",
+            summary=summary_done,
+            extra=_non_video_phase_meta(),
+        )
+        progress.emit(
+            total_frames,
+            phase="scene_detect:done",
+            summary=summary_done,
             force=True,
             extra=_non_video_phase_meta("done"),
         )
@@ -1963,19 +2297,35 @@ def _run_full_pipeline(
         )
 
     tracker_adapter = _build_tracker_adapter(tracker_choice, frame_rate=source_fps or 30.0)
-    scene_enabled = bool(getattr(args, "scene_detect", True))
-    scene_threshold = max(min(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 2.0), 0.0)
+    appearance_gate: AppearanceGate | None = None
+    gate_embedder: ArcFaceEmbedder | None = None
+    gate_config: GateConfig | None = None
+    gate_embed_stride = frame_stride
+    if tracker_choice == "bytetrack":
+        gate_config = _gate_config_from_args(args, frame_stride)
+        appearance_gate = AppearanceGate(gate_config)
+        gate_embed_stride = gate_config.emb_every or frame_stride
+        try:
+            gate_embedder = ArcFaceEmbedder(device)
+            gate_embedder.ensure_ready()
+        except Exception as exc:
+            LOGGER.warning("Appearance gate embeddings disabled (ArcFace init failed): %s", exc)
+            gate_embedder = None
+    scene_detector_choice = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
+    args.scene_detector = scene_detector_choice
+    scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
     scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
     scene_warmup = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
     scene_cuts: list[int] = []
-    if scene_enabled:
+    if scene_detector_choice != "off":
         scene_cuts = detect_scene_cuts(
             str(video_dest),
+            detector=scene_detector_choice,
             thr=scene_threshold,
             min_len=scene_min_len,
             progress=progress,
         )
-    scene_summary = {"count": len(scene_cuts), "indices": scene_cuts}
+    scene_summary = {"count": len(scene_cuts), "indices": scene_cuts, "detector": scene_detector_choice}
     cut_ix = 0
     next_cut = scene_cuts[cut_ix] if scene_cuts else None
     frames_since_cut = 10**9
@@ -2001,6 +2351,9 @@ def _run_full_pipeline(
                     reset_tracker = getattr(tracker_adapter, "reset", None)
                     if callable(reset_tracker):
                         reset_tracker()
+                    if appearance_gate:
+                        appearance_gate.reset_all()
+                    recorder.on_cut(frame_idx)
                     frames_since_cut = 0
                     cut_ix += 1
                     next_cut = scene_cuts[cut_ix] if cut_ix < len(scene_cuts) else None
@@ -2041,6 +2394,31 @@ def _run_full_pipeline(
                 face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
                 tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
                 crop_records: list[tuple[int, list[float]]] = []
+                gate_embeddings: dict[int, np.ndarray | None] = {}
+                should_embed_gate = False
+                if appearance_gate:
+                    should_embed_gate = True if frames_since_cut < scene_warmup else False
+                    stride_for_gate = gate_embed_stride or frame_stride
+                    if stride_for_gate > 1 and not should_embed_gate:
+                        should_embed_gate = frame_idx % stride_for_gate == 0
+                    else:
+                        should_embed_gate = True
+                    if should_embed_gate and gate_embedder and tracked_objects:
+                        embed_inputs: list[np.ndarray] = []
+                        embed_track_ids: list[int] = []
+                        for obj in tracked_objects:
+                            crop, _, err = safe_crop(frame, obj.bbox.tolist())
+                            if crop is None:
+                                continue
+                            aligned = _resize_for_arcface(crop)
+                            embed_inputs.append(aligned)
+                            embed_track_ids.append(obj.track_id)
+                        if embed_inputs:
+                            encoded = gate_embedder.encode(embed_inputs)
+                            for idx, tid in enumerate(embed_track_ids):
+                                gate_embeddings[tid] = encoded[idx]
+                    for obj in tracked_objects:
+                        gate_embeddings.setdefault(obj.track_id, None)
 
                 if not face_detections:
                     if frame_exporter and frame_exporter.save_frames:
@@ -2049,11 +2427,22 @@ def _run_full_pipeline(
                     frames_since_cut += 1
                     continue
 
+                active_ids: set[int] = set()
                 for obj in tracked_objects:
+                    active_ids.add(obj.track_id)
                     class_value = FACE_CLASS_LABEL
                     landmarks = None
                     if obj.landmarks is not None:
                         landmarks = obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                    force_split = False
+                    if appearance_gate:
+                        embedding_vec = gate_embeddings.get(obj.track_id)
+                        force_split, _, _, _ = appearance_gate.process(
+                            obj.track_id,
+                            obj.bbox,
+                            embedding_vec,
+                            frame_idx,
+                        )
                     export_id = recorder.record(
                         tracker_track_id=obj.track_id,
                         frame_idx=frame_idx,
@@ -2061,6 +2450,8 @@ def _run_full_pipeline(
                         bbox=obj.bbox,
                         class_label=class_value,
                         landmarks=landmarks,
+                        confidence=float(obj.conf) if obj.conf is not None else None,
+                        force_new_track=force_split,
                     )
                     bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
                     row = {
@@ -2084,6 +2475,9 @@ def _run_full_pipeline(
                     if frame_exporter and frame_exporter.save_crops:
                         crop_records.append((export_id, bbox_list))
 
+                if appearance_gate:
+                    appearance_gate.prune(active_ids)
+
                 if frame_exporter and (frame_exporter.save_frames or crop_records):
                     frame_exporter.export(frame_idx, frame, crop_records, ts=ts)
 
@@ -2100,6 +2494,7 @@ def _run_full_pipeline(
                             "tracks_born": recorder.metrics["tracks_born"],
                             "tracks_lost": recorder.metrics["tracks_lost"],
                             "id_switches": recorder.metrics["id_switches"],
+                            "forced_splits": recorder.metrics.get("forced_splits", 0),
                         },
                         extra=track_meta,
                     )
@@ -2134,8 +2529,11 @@ def _run_full_pipeline(
         "tracks_born": recorder.metrics["tracks_born"],
         "tracks_lost": recorder.metrics["tracks_lost"],
         "id_switches": recorder.metrics["id_switches"],
+        "forced_splits": recorder.metrics.get("forced_splits", 0),
         "longest_tracks": recorder.top_long_tracks(),
     }
+    if appearance_gate:
+        metrics["appearance_gate"] = appearance_gate.summary()
     if progress:
         final_track_index = max(frame_idx - 1, 0)
         track_done_frames, track_done_meta = _progress_value(final_track_index, include_current=True, step="done")
@@ -2277,11 +2675,26 @@ def _run_detect_track_stage(
             },
         }
         scene_summary = scene_summary or {"count": 0}
+        metrics_path = manifests_dir / "track_metrics.json"
+        metrics_payload = {
+            "ep_id": args.ep_id,
+            "generated_at": _utcnow_iso(),
+            "metrics": track_metrics,
+            "scene_cuts": scene_summary,
+        }
+        try:
+            metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+            summary["artifacts"]["local"]["track_metrics"] = str(metrics_path)
+        except OSError as exc:  # pragma: no cover - best effort diagnostics
+            LOGGER.warning("Failed to write track metrics for %s: %s", args.ep_id, exc)
         scene_count = scene_summary.get("count")
         scene_cuts_payload: Dict[str, Any] = {"count": int(scene_count) if isinstance(scene_count, int) else 0}
         indices = scene_summary.get("indices")
         if isinstance(indices, list):
             scene_cuts_payload["indices"] = indices
+        detector_label = scene_summary.get("detector")
+        if isinstance(detector_label, str):
+            scene_cuts_payload["detector"] = detector_label
         summary["scene_cuts"] = scene_cuts_payload
         progress.complete(
             summary,
@@ -2390,8 +2803,11 @@ def _run_faces_embed_stage(
             thumb_rel_path = None
             thumb_s3_key = None
             embedding_vec: np.ndarray | None = None
-            conf = 1.0
-            quality = 1.0
+            raw_conf = sample.get("conf")
+            if raw_conf is None:
+                raw_conf = sample.get("confidence")
+            conf = float(raw_conf) if raw_conf is not None else 1.0
+            quality = max(min(conf, 1.0), 0.0)
             bbox = sample["bbox_xyxy"]
             track_id = sample["track_id"]
             frame_idx = sample["frame_idx"]
@@ -2457,6 +2873,48 @@ def _run_faces_embed_stage(
                         bbox,
                         detector_choice,
                         crop_err or "crop_failed",
+                        crop_rel_path=crop_rel_path,
+                        crop_s3_key=crop_s3_key,
+                        thumb_rel_path=thumb_rel_path,
+                        thumb_s3_key=thumb_s3_key,
+                    )
+                )
+                faces_done = min(faces_total, faces_done + 1)
+                progress.emit(
+                    faces_done,
+                    phase="faces_embed",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=embed_device,
+                    extra=phase_meta,
+                )
+                continue
+
+            crop_std = float(np.std(crop))
+            blur_score = _estimate_blur_score(crop)
+            skip_reason: str | None = None
+            skip_meta: str | None = None
+            if conf < FACE_MIN_CONFIDENCE:
+                skip_reason = "low_confidence"
+                skip_meta = f"{conf:.2f}"
+            elif crop_std < FACE_MIN_STD:
+                skip_reason = "low_contrast"
+                skip_meta = f"{crop_std:.2f}"
+            elif blur_score < FACE_MIN_BLUR:
+                skip_reason = "blurry"
+                skip_meta = f"{blur_score:.1f}"
+            if skip_reason:
+                reason = f"{skip_reason}:{skip_meta}" if skip_meta else skip_reason
+                rows.append(
+                    _make_skip_face_row(
+                        args.ep_id,
+                        track_id,
+                        frame_idx,
+                        ts_val,
+                        bbox,
+                        detector_choice,
+                        reason,
                         crop_rel_path=crop_rel_path,
                         crop_s3_key=crop_s3_key,
                         thumb_rel_path=thumb_rel_path,

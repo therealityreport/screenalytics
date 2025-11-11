@@ -593,16 +593,29 @@ class StorageService:
         cursor_cycle: int,
     ) -> Dict[str, Any]:
         crops_root = get_path(ep_id, "frames_root") / "crops"
-        track_dir = crops_root / track_prefix.rstrip("/")
-        if not track_dir.exists() or not track_dir.is_dir():
+        candidate_roots: List[Path] = [crops_root]
+        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+        legacy_root = fallback_root / ep_id / "tracks"
+        if legacy_root not in candidate_roots:
+            candidate_roots.append(legacy_root)
+        base_root: Path | None = None
+        entries: List[Dict[str, Any]] = []
+        for root in candidate_roots:
+            track_dir = root / track_prefix.rstrip("/")
+            if not track_dir.exists() or not track_dir.is_dir():
+                continue
+            entries = self._load_track_index_from_path(track_dir, track_prefix)
+            if not entries:
+                entries = self._entries_from_files(track_dir, track_prefix)
+            if entries:
+                base_root = root
+                break
+        if not entries or base_root is None:
             return {"items": [], "next_start_after": None}
-        entries = self._load_track_index_from_path(track_dir, track_prefix)
-        if not entries:
-            entries = self._entries_from_files(track_dir, track_prefix)
         filtered: List[Dict[str, Any]] = []
         for entry in entries:
             rel_key = entry["key"]
-            abs_path = crops_root / rel_key
+            abs_path = (base_root / rel_key).resolve()
             if not abs_path.exists():
                 continue
             filtered.append({**entry, "_abs_path": abs_path})

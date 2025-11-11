@@ -79,6 +79,43 @@ def _thumbs_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "thumbs"
 
 
+def _crops_root(ep_id: str) -> Path:
+    return get_path(ep_id, "frames_root") / "crops"
+
+
+def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    if s3_key:
+        url = STORAGE.presign_get(s3_key)
+        if url:
+            return url
+    if not rel_path:
+        return None
+    normalized = rel_path.strip()
+    if not normalized:
+        return None
+    frames_root = get_path(ep_id, "frames_root")
+    local = frames_root / normalized
+    if local.exists():
+        return str(local)
+    rel_parts = Path(normalized)
+    if rel_parts.parts and rel_parts.parts[0] == "crops":
+        rel_parts = Path(*rel_parts.parts[1:])
+    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+    legacy = fallback_root / ep_id / "tracks" / rel_parts
+    if legacy.exists():
+        return str(legacy)
+    return None
+
+
+def _resolve_face_media_url(ep_id: str, row: Dict[str, Any] | None) -> str | None:
+    if not row:
+        return None
+    media = _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
+    if media:
+        return media
+    return _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
+
+
 def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
     frames_root = get_path(ep_id, "frames_root")
     thumbs_root = _thumbs_root(ep_id)
@@ -445,22 +482,19 @@ def _track_face_rows(ep_id: str, track_id: int) -> Dict[int, Dict[str, Any]]:
     return rows
 
 
-def _max_candidate_count(limit: int, offset: int, sample: int) -> int:
-    limit = max(1, limit)
-    offset = max(0, offset)
-    sample = max(1, sample)
-    return max(1, (offset + limit) * sample)
-
-
-def _apply_sampling(entries: List[Dict[str, Any]], sample: int, offset: int, limit: int) -> List[Dict[str, Any]]:
-    sample = max(1, sample)
-    offset = max(0, offset)
-    limit = max(1, limit)
-    downsampled = [item for idx, item in enumerate(entries) if idx % sample == 0]
-    if offset >= len(downsampled):
-        return []
-    end = offset + limit if limit else None
-    return downsampled[offset:end]
+def _first_face_lookup(ep_id: str) -> Dict[int, Dict[str, Any]]:
+    faces = _load_faces(ep_id, include_skipped=False)
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for row in faces:
+        try:
+            tid = int(row.get("track_id", -1))
+            frame_idx = int(row.get("frame_idx", 10**9))
+        except (TypeError, ValueError):
+            continue
+        existing = lookup.get(tid)
+        if existing is None or frame_idx < int(existing.get("frame_idx", 10**9)):
+            lookup[tid] = row
+    return lookup
 
 
 def _require_episode_context(ep_id: str):
@@ -471,51 +505,203 @@ def _require_episode_context(ep_id: str):
     return ctx, artifact_prefixes(ctx)
 
 
-def _media_entry(track_id: int, frame_idx: int, key: str, url: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+_FRAME_FILE_RE = re.compile(r"frame_(\d{6})\.jpg$", re.IGNORECASE)
+
+
+def _parse_frame_idx_from_name(name: str) -> int | None:
+    match = _FRAME_FILE_RE.search(name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _track_crop_candidates(ep_id: str, track_id: int) -> List[Path]:
+    track_component = f"track_{track_id:04d}"
+    frames_root = get_path(ep_id, "frames_root")
+    primary = frames_root / "crops" / track_component
+    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+    legacy = fallback_root / ep_id / "tracks" / track_component
+    candidates: List[Path] = []
+    for path in (primary, legacy):
+        if path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def _load_crop_index(path: Path) -> List[Dict[str, Any]]:
+    index_path = path / "index.json"
+    if not index_path.exists():
+        return []
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("Failed to parse crop index at %s", index_path)
+        return []
+    if not isinstance(data, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        frame_idx = entry.get("frame_idx")
+        if not isinstance(key, str):
+            continue
+        try:
+            frame_val = int(frame_idx)
+        except (TypeError, ValueError):
+            frame_val = _parse_frame_idx_from_name(Path(key).name)
+        if frame_val is None:
+            continue
+        normalized.append({"key": key, "frame_idx": frame_val, "ts": entry.get("ts")})
+    return normalized
+
+
+def _discover_crop_entries(ep_id: str, track_id: int) -> List[Dict[str, Any]]:
+    track_component = f"track_{track_id:04d}"
+    for root in _track_crop_candidates(ep_id, track_id):
+        if not root.exists():
+            continue
+        entries = _load_crop_index(root)
+        if not entries:
+            for jpeg in sorted(root.glob("frame_*.jpg")):
+                idx = _parse_frame_idx_from_name(jpeg.name)
+                if idx is None:
+                    continue
+                entries.append({"key": f"{track_component}/{jpeg.name}", "frame_idx": idx, "ts": None})
+        if not entries:
+            continue
+        normalized: Dict[int, Dict[str, Any]] = {}
+        for entry in entries:
+            filename = Path(entry["key"]).name
+            rel_path = Path("crops") / track_component / filename
+            abs_path = root / filename
+            normalized[int(entry["frame_idx"])] = {
+                "frame_idx": int(entry["frame_idx"]),
+                "ts": entry.get("ts"),
+                "rel_path": rel_path.as_posix(),
+                "abs_path": abs_path if abs_path.exists() else None,
+            }
+        if normalized:
+            return [normalized[idx] for idx in sorted(normalized.keys())]
+    return []
+
+
+
+def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, page_size: int) -> Dict[str, Any]:
+    sample = max(1, sample)
+    page = max(1, page)
+    page_size = max(1, min(page_size, TRACK_LIST_MAX_LIMIT))
+    face_rows = _track_face_rows(ep_id, track_id)
+    crops = _discover_crop_entries(ep_id, track_id)
+    ctx, prefixes = _require_episode_context(ep_id)
+    crops_prefix = (prefixes or {}).get("crops") if prefixes else None
+    if not crops and not face_rows:
+        return {
+            "items": [],
+            "total": 0,
+            "total_frames": 0,
+            "page": page,
+            "page_size": page_size,
+            "sample": sample,
+        }
+    if not crops:
+        frame_indices = sorted(face_rows.keys())
+        sampled_indices = frame_indices[::sample]
+        total_items = len(sampled_indices)
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_indices = sampled_indices[start:end] if start < total_items else []
+        items: List[Dict[str, Any]] = []
+        for idx in page_indices:
+            meta = face_rows.get(idx, {})
+            media_url = _resolve_face_media_url(ep_id, meta)
+            fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
+            url = media_url or fallback
+            items.append(
+                {
+                    "track_id": track_id,
+                    "frame_idx": idx,
+                    "ts": meta.get("ts"),
+                    "media_url": url,
+                    "thumbnail_url": url,
+                    "crop_rel_path": meta.get("crop_rel_path"),
+                    "crop_s3_key": meta.get("crop_s3_key"),
+                    "w": meta.get("crop_width") or meta.get("width"),
+                    "h": meta.get("crop_height") or meta.get("height"),
+                    "skip": meta.get("skip"),
+                    "face_id": meta.get("face_id"),
+                }
+            )
+        return {
+            "items": items,
+            "total": total_items,
+            "total_frames": len(frame_indices),
+            "returned": len(items),
+            "page": page,
+            "page_size": page_size,
+            "sample": sample,
+        }
+
+    sampled_entries = crops[::sample]
+    total_items = len(sampled_entries)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_entries = sampled_entries[start:end] if start < total_items else []
+    items: List[Dict[str, Any]] = []
+    for entry in page_entries:
+        frame_idx = entry["frame_idx"]
+        meta = face_rows.get(frame_idx, {})
+        local_path = entry.get("abs_path")
+        local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
+        rel_path = entry.get("rel_path")
+        s3_key = None
+        if crops_prefix and rel_path:
+            suffix = rel_path.split("crops/", 1)[-1]
+            s3_key = f"{crops_prefix}{suffix}"
+        media_url = local_url or _resolve_crop_url(ep_id, rel_path, s3_key if not local_url else None)
+        fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
+        url = media_url or fallback
+        items.append(
+            {
+                "track_id": track_id,
+                "frame_idx": frame_idx,
+                "ts": meta.get("ts") if meta else entry.get("ts"),
+                "media_url": url,
+                "thumbnail_url": url,
+                "crop_rel_path": rel_path,
+                "crop_s3_key": s3_key,
+                "w": meta.get("crop_width") or meta.get("width"),
+                "h": meta.get("crop_height") or meta.get("height"),
+                "skip": meta.get("skip"),
+                "face_id": meta.get("face_id"),
+            }
+        )
     return {
-        "track_id": track_id,
-        "frame_idx": frame_idx,
-        "key": key,
-        "url": url,
-        "w": meta.get("crop_width") or meta.get("width"),
-        "h": meta.get("crop_height") or meta.get("height"),
-        "ts": meta.get("ts"),
+        "items": items,
+        "total": total_items,
+        "total_frames": len(crops),
+        "returned": len(items),
+        "page": page,
+        "page_size": page_size,
+        "sample": sample,
     }
 
 
-
-def _list_track_frame_media(ep_id: str, track_id: int, sample: int, limit: int, offset: int) -> List[Dict[str, Any]]:
-    sample = max(1, sample)
-    limit = max(1, min(limit, TRACK_LIST_MAX_LIMIT))
-    offset = max(0, offset)
-    face_rows = _track_face_rows(ep_id, track_id)
-    if not face_rows:
-        return []
-    frame_indices = sorted(face_rows.keys())
-    max_candidates = _max_candidate_count(limit, offset, sample)
-    frame_indices = frame_indices[:max_candidates]
-    entries: List[Dict[str, Any]] = []
-    if STORAGE.backend == "local":
-        frames_dir = get_path(ep_id, "frames_root") / "frames"
-        for idx in frame_indices:
-            path = frames_dir / f"frame_{idx:06d}.jpg"
-            if not path.exists():
-                continue
-            path_str = path.as_posix()
-            meta = face_rows.get(idx, {})
-            entries.append(_media_entry(track_id, idx, path_str, path_str, meta))
-    else:
-        _, prefixes = _require_episode_context(ep_id)
-        base_prefix = prefixes["frames"]
-        for idx in frame_indices:
-            key = f"{base_prefix}frame_{idx:06d}.jpg"
-            url = STORAGE.presign_get(key)
-            if not url:
-                continue
-            meta = face_rows.get(idx, {})
-            entries.append(_media_entry(track_id, idx, key, url, meta))
-    entries.sort(key=lambda item: item["frame_idx"])
-    return _apply_sampling(entries, sample, offset, limit)
+def _count_track_crops(ctx, track_id: int) -> int:
+    total = 0
+    cursor: str | None = None
+    while True:
+        payload = STORAGE.list_track_crops(ctx, track_id, sample=1, max_keys=500, start_after=cursor)
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        total += len(items)
+        cursor = payload.get("next_start_after") if isinstance(payload, dict) else None
+        if not cursor:
+            break
+    return total
 
 
 class EpisodeCreateRequest(BaseModel):
@@ -1006,6 +1192,7 @@ def episode_video_meta(ep_id: str) -> EpisodeVideoMeta:
 def list_identities(ep_id: str) -> dict:
     payload = _load_identities(ep_id)
     track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id)}
+    first_faces = _first_face_lookup(ep_id)
     identities = []
     for identity in payload.get("identities", []):
         track_ids = []
@@ -1017,6 +1204,15 @@ def list_identities(ep_id: str) -> dict:
         faces_total = identity.get("size")
         if faces_total is None:
             faces_total = sum(int(track_lookup.get(tid, {}).get("faces_count", 0)) for tid in track_ids)
+        preview_url = None
+        if track_ids:
+            preview_url = _resolve_face_media_url(ep_id, first_faces.get(track_ids[0]))
+        if not preview_url:
+            preview_url = _resolve_thumb_url(
+                ep_id,
+                identity.get("rep_thumb_rel_path"),
+                identity.get("rep_thumb_s3_key"),
+            )
         identities.append(
             {
                 "identity_id": identity.get("identity_id"),
@@ -1024,11 +1220,8 @@ def list_identities(ep_id: str) -> dict:
                 "name": identity.get("name"),
                 "track_ids": track_ids,
                 "faces": faces_total,
-                "rep_thumbnail_url": _resolve_thumb_url(
-                    ep_id,
-                    identity.get("rep_thumb_rel_path"),
-                    identity.get("rep_thumb_s3_key"),
-                ),
+                "rep_thumbnail_url": preview_url,
+                "rep_media_url": preview_url,
             }
         )
     try:
@@ -1054,9 +1247,22 @@ def list_cluster_tracks(
     limit_per_cluster: int | None = Query(None, ge=1, description="Optional max tracks per cluster"),
 ) -> dict:
     try:
-        return identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster)
+        payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    first_faces = _first_face_lookup(ep_id)
+    for cluster in payload.get("clusters", []):
+        for track in cluster.get("tracks", []) or []:
+            tid = track.get("track_id")
+            try:
+                tid_int = int(tid)
+            except (TypeError, ValueError):
+                continue
+            media_url = _resolve_face_media_url(ep_id, first_faces.get(tid_int))
+            if media_url:
+                track["rep_media_url"] = media_url
+                track["rep_thumb_url"] = media_url
+    return payload
 
 
 @router.get("/episodes/{ep_id}/faces_grid")
@@ -1071,13 +1277,15 @@ def faces_grid(ep_id: str, track_id: int | None = Query(None)) -> dict:
             continue
         if track_id is not None and tid != track_id:
             continue
+        media_url = _resolve_face_media_url(ep_id, row)
         items.append(
             {
                 "face_id": row.get("face_id"),
                 "track_id": tid,
                 "frame_idx": row.get("frame_idx"),
                 "ts": row.get("ts"),
-                "thumbnail_url": _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key")),
+                "thumbnail_url": media_url,
+                "media_url": media_url,
                 "identity_id": identity_lookup.get(tid),
             }
         )
@@ -1091,18 +1299,26 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
     if not identity:
         raise HTTPException(status_code=404, detail="Identity not found")
     track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id)}
-    tracks_payload = []
+    first_faces = _first_face_lookup(ep_id)
+    tracks_payload: List[Dict[str, Any]] = []
+    track_ids: List[int] = []
     for raw_tid in identity.get("track_ids", []) or []:
         try:
             tid = int(raw_tid)
         except (TypeError, ValueError):
             continue
+        track_ids.append(tid)
         track_row = track_lookup.get(tid, {})
+        face_row = first_faces.get(tid)
+        media_url = _resolve_face_media_url(ep_id, face_row)
+        if not media_url:
+            media_url = _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
         tracks_payload.append(
             {
                 "track_id": tid,
                 "faces_count": track_row.get("faces_count", 0),
-                "thumbnail_url": _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key")),
+                "thumbnail_url": media_url,
+                "media_url": media_url,
             }
         )
     return {
@@ -1110,12 +1326,17 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
             "identity_id": identity_id,
             "label": identity.get("label"),
             "name": identity.get("name"),
-            "track_ids": identity.get("track_ids", []),
-            "rep_thumbnail_url": _resolve_thumb_url(
+            "track_ids": track_ids,
+            "rep_thumbnail_url": _resolve_face_media_url(
                 ep_id,
-                identity.get("rep_thumb_rel_path"),
-                identity.get("rep_thumb_s3_key"),
-            ),
+                first_faces.get(track_ids[0]) if track_ids else None,
+            )
+            or _resolve_thumb_url(ep_id, identity.get("rep_thumb_rel_path"), identity.get("rep_thumb_s3_key")),
+            "rep_media_url": _resolve_face_media_url(
+                ep_id,
+                first_faces.get(track_ids[0]) if track_ids else None,
+            )
+            or _resolve_thumb_url(ep_id, identity.get("rep_thumb_rel_path"), identity.get("rep_thumb_s3_key")),
         },
         "tracks": tracks_payload,
     }
@@ -1124,25 +1345,34 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
 @router.get("/episodes/{ep_id}/tracks/{track_id}")
 def track_detail(ep_id: str, track_id: int) -> dict:
     faces = [row for row in _load_faces(ep_id, include_skipped=False) if int(row.get("track_id", -1)) == track_id]
-    frames = [
-        {
-            "face_id": row.get("face_id"),
-            "frame_idx": row.get("frame_idx"),
-            "ts": row.get("ts"),
-            "thumbnail_url": _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key")),
-            "skip": row.get("skip"),
-        }
-        for row in faces
-    ]
+    frames = []
+    for row in faces:
+        media_url = _resolve_face_media_url(ep_id, row)
+        frames.append(
+            {
+                "face_id": row.get("face_id"),
+                "frame_idx": row.get("frame_idx"),
+                "ts": row.get("ts"),
+                "thumbnail_url": media_url,
+                "media_url": media_url,
+                "skip": row.get("skip"),
+                "crop_rel_path": row.get("crop_rel_path"),
+                "crop_s3_key": row.get("crop_s3_key"),
+            }
+        )
     track_row = next((row for row in _load_tracks(ep_id) if int(row.get("track_id", -1)) == track_id), None)
-    return {
-        "track_id": track_id,
-        "faces_count": len(frames),
-        "thumbnail_url": _resolve_thumb_url(
+    preview_url = _resolve_face_media_url(ep_id, faces[0] if faces else None)
+    if not preview_url:
+        preview_url = _resolve_thumb_url(
             ep_id,
             (track_row or {}).get("thumb_rel_path"),
             (track_row or {}).get("thumb_s3_key"),
-        ),
+        )
+    return {
+        "track_id": track_id,
+        "faces_count": len(frames),
+        "thumbnail_url": preview_url,
+        "media_url": preview_url,
         "frames": frames,
     }
 
@@ -1151,7 +1381,7 @@ def track_detail(ep_id: str, track_id: int) -> dict:
 def list_track_crops(
     ep_id: str,
     track_id: int,
-    sample: int = Query(5, ge=1, le=100, description="Return every Nth crop"),
+    sample: int = Query(1, ge=1, le=100, description="Return every Nth crop"),
     limit: int = Query(200, ge=1, le=TRACK_LIST_MAX_LIMIT),
     start_after: str | None = Query(None, description="Opaque cursor returned by the previous call"),
 ) -> Dict[str, Any]:
@@ -1179,11 +1409,25 @@ def list_track_crops(
 def list_track_frames(
     ep_id: str,
     track_id: int,
-    sample: int = Query(5, ge=1, le=100, description="Return every Nth frame"),
-    limit: int = Query(200, ge=1, le=TRACK_LIST_MAX_LIMIT),
-    offset: int = Query(0, ge=0),
-) -> List[Dict[str, Any]]:
-    return _list_track_frame_media(ep_id, track_id, sample, limit, offset)
+    sample: int = Query(1, ge=1, le=100, description="Return every Nth frame"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=TRACK_LIST_MAX_LIMIT),
+) -> Dict[str, Any]:
+    return _list_track_frame_media(ep_id, track_id, sample, page, page_size)
+
+
+@router.get("/episodes/{ep_id}/tracks/{track_id}/integrity")
+def track_integrity(ep_id: str, track_id: int) -> Dict[str, Any]:
+    face_rows = _track_face_rows(ep_id, track_id)
+    ctx, _ = _require_episode_context(ep_id)
+    crops = _count_track_crops(ctx, track_id)
+    faces_count = len(face_rows)
+    return {
+        "track_id": track_id,
+        "faces_manifest": faces_count,
+        "crops_files": crops,
+        "ok": crops >= faces_count > 0,
+    }
 
 
 @router.post("/episodes/{ep_id}/tracks/{track_id}/frames/move")

@@ -11,7 +11,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,18 +29,11 @@ TRACKER_CHOICES = {"bytetrack", "strongsort"}
 _DEFAULT_DETECTOR_RAW = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
 DEFAULT_DETECTOR_ENV = _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "off", "no"}:
-        return False
-    return default
+SCENE_DETECTOR_CHOICES = tuple(getattr(episode_run, "SCENE_DETECTOR_CHOICES", ("pyscenedetect", "internal", "off")))
+_SCENE_DETECTOR_ENV = os.getenv("SCENE_DETECTOR", "pyscenedetect").strip().lower()
+if _SCENE_DETECTOR_ENV not in SCENE_DETECTOR_CHOICES:
+    _SCENE_DETECTOR_ENV = "pyscenedetect"
+SCENE_DETECTOR_DEFAULT = getattr(episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -63,14 +56,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-SCENE_DETECT_DEFAULT = getattr(episode_run, "SCENE_DETECT_DEFAULT", _env_flag("SCENE_DETECT", True))
-SCENE_THRESHOLD_DEFAULT = getattr(episode_run, "SCENE_THRESHOLD_DEFAULT", _env_float("SCENE_THRESHOLD", 0.30))
+SCENE_THRESHOLD_DEFAULT = getattr(episode_run, "SCENE_THRESHOLD_DEFAULT", _env_float("SCENE_THRESHOLD", 27.0))
 SCENE_MIN_LEN_DEFAULT = getattr(episode_run, "SCENE_MIN_LEN_DEFAULT", max(_env_int("SCENE_MIN_LEN", 12), 1))
 SCENE_WARMUP_DETS_DEFAULT = getattr(
     episode_run,
     "SCENE_WARMUP_DETS_DEFAULT",
     max(_env_int("SCENE_WARMUP_DETS", 3), 0),
 )
+CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
 
 JobRecord = Dict[str, Any]
 
@@ -196,7 +189,7 @@ class JobService:
         tracker: str,
         max_gap: int | None,
         det_thresh: float | None,
-        scene_detect: bool,
+        scene_detector: str,
         scene_threshold: float,
         scene_min_len: int,
         scene_warmup_dets: int,
@@ -207,10 +200,10 @@ class JobService:
         tracker_value = self._normalize_tracker(tracker)
         self.ensure_retinaface_ready(detector_value, device, det_thresh)
         progress_path = self._progress_path(ep_id)
+        scene_detector_value = self._normalize_scene_detector(scene_detector)
         scene_min_len = max(int(scene_min_len), 1)
         scene_warmup_dets = max(int(scene_warmup_dets), 0)
-        scene_detect_flag = "on" if scene_detect else "off"
-        scene_threshold = max(min(float(scene_threshold), 2.0), 0.0)
+        scene_threshold = max(float(scene_threshold), 0.0)
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -240,7 +233,7 @@ class JobService:
             command += ["--max-gap", str(max_gap)]
         if det_thresh is not None:
             command += ["--det-thresh", str(det_thresh)]
-        command += ["--scene-detect", scene_detect_flag]
+        command += ["--scene-detector", scene_detector_value]
         command += ["--scene-threshold", str(scene_threshold)]
         command += ["--scene-min-len", str(scene_min_len)]
         command += ["--scene-warmup-dets", str(scene_warmup_dets)]
@@ -255,7 +248,7 @@ class JobService:
             "tracker": tracker_value,
             "max_gap": max_gap,
             "det_thresh": det_thresh,
-            "scene_detect": scene_detect,
+            "scene_detector": scene_detector_value,
             "scene_threshold": scene_threshold,
             "scene_min_len": scene_min_len,
             "scene_warmup_dets": scene_warmup_dets,
@@ -357,6 +350,122 @@ class JobService:
             requested=requested,
         )
 
+    def start_episode_cleanup_job(
+        self,
+        *,
+        ep_id: str,
+        video_path: Path,
+        stride: int,
+        fps: float | None,
+        device: str,
+        embed_device: str,
+        save_frames: bool,
+        save_crops: bool,
+        jpeg_quality: int,
+        detector: str,
+        tracker: str,
+        max_gap: int,
+        det_thresh: float | None,
+        scene_detector: str,
+        scene_threshold: float,
+        scene_min_len: int,
+        scene_warmup_dets: int,
+        cluster_thresh: float,
+        min_cluster_size: int,
+        thumb_size: int,
+        actions: List[str],
+        write_back: bool,
+    ) -> JobRecord:
+        if not video_path.exists():
+            raise FileNotFoundError(f"Episode video not found: {video_path}")
+        detector_value = self._normalize_detector(detector)
+        tracker_value = self._normalize_tracker(tracker)
+        scene_detector_value = self._normalize_scene_detector(scene_detector)
+        progress_path = self._progress_path(ep_id)
+        command: List[str] = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "episode_cleanup.py"),
+            "--ep-id",
+            ep_id,
+            "--video",
+            str(video_path),
+            "--stride",
+            str(stride),
+            "--max-gap",
+            str(max_gap),
+            "--device",
+            device,
+            "--embed-device",
+            embed_device or device,
+            "--detector",
+            detector_value,
+            "--tracker",
+            tracker_value,
+            "--scene-detector",
+            scene_detector_value,
+            "--scene-threshold",
+            str(scene_threshold),
+            "--scene-min-len",
+            str(scene_min_len),
+            "--scene-warmup-dets",
+            str(scene_warmup_dets),
+            "--cluster-thresh",
+            str(cluster_thresh),
+            "--min-cluster-size",
+            str(min_cluster_size),
+            "--thumb-size",
+            str(thumb_size),
+            "--jpeg-quality",
+            str(jpeg_quality),
+            "--progress-file",
+            str(progress_path),
+        ]
+        if fps and fps > 0:
+            command += ["--fps", str(fps)]
+        if det_thresh is not None:
+            command += ["--det-thresh", str(det_thresh)]
+        if save_frames:
+            command.append("--save-frames")
+        else:
+            command.append("--no-save-frames")
+        if save_crops:
+            command.append("--save-crops")
+        else:
+            command.append("--no-save-crops")
+        if not write_back:
+            command.append("--no-write-back")
+        normalized_actions = [action for action in actions if action in CLEANUP_ACTIONS] or list(CLEANUP_ACTIONS)
+        command += ["--actions", *normalized_actions]
+        requested = {
+            "stride": stride,
+            "fps": fps,
+            "device": device,
+            "embed_device": embed_device,
+            "save_frames": save_frames,
+            "save_crops": save_crops,
+            "jpeg_quality": jpeg_quality,
+            "detector": detector_value,
+            "tracker": tracker_value,
+            "max_gap": max_gap,
+            "det_thresh": det_thresh,
+            "scene_detector": scene_detector_value,
+            "scene_threshold": scene_threshold,
+            "scene_min_len": scene_min_len,
+            "scene_warmup_dets": scene_warmup_dets,
+            "cluster_thresh": cluster_thresh,
+            "min_cluster_size": min_cluster_size,
+            "thumb_size": thumb_size,
+            "actions": normalized_actions,
+            "write_back": write_back,
+        }
+        return self._launch_job(
+            job_type="episode_cleanup",
+            ep_id=ep_id,
+            command=command,
+            progress_path=progress_path,
+            requested=requested,
+        )
+
     def _monitor_process(self, job_id: str, proc: subprocess.Popen) -> None:
         error_msg: str | None = None
         try:
@@ -435,6 +544,13 @@ class JobService:
         value = (tracker or fallback).strip().lower()
         if value not in TRACKER_CHOICES:
             raise ValueError(f"Unsupported tracker '{tracker}'")
+        return value
+
+    def _normalize_scene_detector(self, scene_detector: str | None) -> str:
+        fallback = SCENE_DETECTOR_DEFAULT or "pyscenedetect"
+        value = (scene_detector or fallback).strip().lower()
+        if value not in SCENE_DETECTOR_CHOICES:
+            raise ValueError(f"Unsupported scene detector '{scene_detector}'")
         return value
 
     def ensure_retinaface_ready(

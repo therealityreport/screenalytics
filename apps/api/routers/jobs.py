@@ -31,10 +31,13 @@ TRACKER_CHOICES = {"bytetrack", "strongsort"}
 _DEFAULT_DETECTOR_RAW = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
 DEFAULT_DETECTOR_ENV = _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
-SCENE_DETECT_DEFAULT = getattr(jobs_service, "SCENE_DETECT_DEFAULT", True)
-SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 0.30)
+SCENE_DETECTOR_CHOICES = getattr(jobs_service, "SCENE_DETECTOR_CHOICES", ("pyscenedetect", "internal", "off"))
+SCENE_DETECTOR_DEFAULT = getattr(jobs_service, "SCENE_DETECTOR_DEFAULT", "pyscenedetect")
+SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 27.0)
 SCENE_MIN_LEN_DEFAULT = getattr(jobs_service, "SCENE_MIN_LEN_DEFAULT", 12)
 SCENE_WARMUP_DETS_DEFAULT = getattr(jobs_service, "SCENE_WARMUP_DETS_DEFAULT", 3)
+CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
+CleanupAction = Literal["split_tracks", "reembed", "recluster", "group_clusters"]
 
 
 LEGACY_SUFFIX = "st" "ub"
@@ -81,7 +84,7 @@ class TrackRequest(BaseModel):
 
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stride: int = Field(5, description="Frame stride for detection sampling")
+    stride: int = Field(3, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
     device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
@@ -102,16 +105,11 @@ class DetectTrackRequest(BaseModel):
         le=1.0,
         description="RetinaFace detection threshold (0-1)",
     )
-    scene_detect: bool = Field(
-        SCENE_DETECT_DEFAULT,
-        description="Enable scene-cut histogram detection prepass",
+    scene_detector: Literal[SCENE_DETECTOR_CHOICES] = Field(
+        SCENE_DETECTOR_DEFAULT,
+        description="Scene-cut detector backend (PySceneDetect default, internal fallback, or off)",
     )
-    scene_threshold: float = Field(
-        SCENE_THRESHOLD_DEFAULT,
-        ge=0.0,
-        le=2.0,
-        description="Scene-cut threshold (1 - HSV histogram correlation)",
-    )
+    scene_threshold: float = Field(SCENE_THRESHOLD_DEFAULT, ge=0.0, description="Scene-cut threshold passed to the selected detector")
     scene_min_len: int = Field(
         SCENE_MIN_LEN_DEFAULT,
         ge=1,
@@ -142,6 +140,30 @@ class ClusterRequest(BaseModel):
     )
     cluster_thresh: float = Field(0.6, gt=0.0, le=1.0, description="Cosine distance threshold for clustering")
     min_cluster_size: int = Field(2, ge=1, description="Minimum tracks per identity")
+
+
+class CleanupJobRequest(BaseModel):
+    ep_id: str = Field(..., description="Episode identifier")
+    stride: int = Field(3, ge=1, le=50)
+    fps: float | None = Field(None, ge=0.0)
+    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Detect/track device")
+    embed_device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Faces embed device")
+    detector: str = Field(DEFAULT_DETECTOR_ENV, description="Detector backend (retinaface)")
+    tracker: str = Field(DEFAULT_TRACKER_ENV, description="Tracker backend")
+    max_gap: int = Field(30, ge=1, le=240)
+    det_thresh: float | None = Field(None, ge=0.0, le=1.0)
+    save_frames: bool = False
+    save_crops: bool = False
+    jpeg_quality: int = Field(85, ge=50, le=100)
+    scene_detector: Literal[SCENE_DETECTOR_CHOICES] = Field(SCENE_DETECTOR_DEFAULT)
+    scene_threshold: float = Field(SCENE_THRESHOLD_DEFAULT, ge=0.0)
+    scene_min_len: int = Field(SCENE_MIN_LEN_DEFAULT, ge=1)
+    scene_warmup_dets: int = Field(SCENE_WARMUP_DETS_DEFAULT, ge=0)
+    cluster_thresh: float = Field(0.6, ge=0.05, le=1.0)
+    min_cluster_size: int = Field(2, ge=1, le=50)
+    thumb_size: int = Field(256, ge=64, le=512)
+    actions: List[CleanupAction] = Field(default_factory=lambda: list(CLEANUP_ACTIONS))
+    write_back: bool = Field(True, description="Update people.json with grouping assignments")
 
 def _artifact_summary(ep_id: str) -> dict:
     ensure_dirs(ep_id)
@@ -201,6 +223,14 @@ def _normalize_tracker(tracker: str | None) -> str:
     return value
 
 
+def _normalize_scene_detector(scene_detector: str | None) -> str:
+    fallback = SCENE_DETECTOR_DEFAULT or "pyscenedetect"
+    value = (scene_detector or fallback).strip().lower()
+    if value not in SCENE_DETECTOR_CHOICES:
+        raise HTTPException(status_code=400, detail=f"Unsupported scene detector '{scene_detector}'")
+    return value
+
+
 def _build_detect_track_command(
     req: DetectTrackRequest,
     video_path: Path,
@@ -208,7 +238,7 @@ def _build_detect_track_command(
     detector_value: str,
     tracker_value: str,
     det_thresh: float | None,
-    scene_detect: bool,
+    scene_detector: str,
     scene_threshold: float,
     scene_min_len: int,
     scene_warmup_dets: int,
@@ -241,7 +271,7 @@ def _build_detect_track_command(
         command += ["--max-gap", str(req.max_gap)]
     if det_thresh is not None:
         command += ["--det-thresh", str(det_thresh)]
-    command += ["--scene-detect", "on" if scene_detect else "off"]
+    command += ["--scene-detector", scene_detector]
     command += ["--scene-threshold", str(scene_threshold)]
     command += ["--scene-min-len", str(max(scene_min_len, 1))]
     command += ["--scene-warmup-dets", str(max(scene_warmup_dets, 0))]
@@ -447,6 +477,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     video_path = _validate_episode_ready(req.ep_id)
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
+    scene_detector_value = _normalize_scene_detector(req.scene_detector)
     try:
         JOB_SERVICE.ensure_retinaface_ready(detector_value, req.device, req.det_thresh)
     except ValueError as exc:
@@ -464,7 +495,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         detector_value,
         tracker_value,
         req.det_thresh,
-        req.scene_detect,
+        scene_detector_value,
         req.scene_threshold,
         req.scene_min_len,
         req.scene_warmup_dets,
@@ -483,6 +514,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         "device": req.device,
         "detector": detector_value,
         "tracker": tracker_value,
+        "scene_detector": scene_detector_value,
         "detections_count": detections_count,
         "tracks_count": tracks_count,
         "artifacts": artifacts,
@@ -571,6 +603,7 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
     fps_value = req.fps if req.fps and req.fps > 0 else None
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
+    scene_detector_value = _normalize_scene_detector(req.scene_detector)
     try:
         job = JOB_SERVICE.start_detect_track_job(
             ep_id=req.ep_id,
@@ -585,7 +618,7 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             tracker=tracker_value,
             max_gap=req.max_gap,
             det_thresh=req.det_thresh,
-            scene_detect=req.scene_detect,
+            scene_detector=scene_detector_value,
             scene_threshold=req.scene_threshold,
             scene_min_len=req.scene_min_len,
             scene_warmup_dets=req.scene_warmup_dets,
@@ -646,6 +679,54 @@ async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
         "started_at": job["started_at"],
         "progress_file": job.get("progress_file"),
         "requested": job.get("requested"),
+    }
+
+
+@router.post("/episode_cleanup_async")
+async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request) -> dict:
+    await _reject_legacy_payload(request)
+    artifacts = _artifact_summary(req.ep_id)
+    video_path = _validate_episode_ready(req.ep_id)
+    fps_value = req.fps if req.fps and req.fps > 0 else None
+    detector_value = _normalize_detector(req.detector)
+    tracker_value = _normalize_tracker(req.tracker)
+    scene_detector_value = _normalize_scene_detector(req.scene_detector)
+    actions = req.actions or list(CLEANUP_ACTIONS)
+    try:
+        job = JOB_SERVICE.start_episode_cleanup_job(
+            ep_id=req.ep_id,
+            video_path=video_path,
+            stride=req.stride,
+            fps=fps_value,
+            device=req.device,
+            embed_device=req.embed_device or req.device,
+            save_frames=req.save_frames,
+            save_crops=req.save_crops,
+            jpeg_quality=req.jpeg_quality,
+            detector=detector_value,
+            tracker=tracker_value,
+            max_gap=req.max_gap,
+            det_thresh=req.det_thresh,
+            scene_detector=scene_detector_value,
+            scene_threshold=req.scene_threshold,
+            scene_min_len=req.scene_min_len,
+            scene_warmup_dets=req.scene_warmup_dets,
+            cluster_thresh=req.cluster_thresh,
+            min_cluster_size=req.min_cluster_size,
+            thumb_size=req.thumb_size,
+            actions=actions,
+            write_back=req.write_back,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "job_id": job["job_id"],
+        "ep_id": req.ep_id,
+        "state": job["state"],
+        "started_at": job["started_at"],
+        "progress_file": job.get("progress_file"),
+        "requested": job.get("requested"),
+        "artifacts": artifacts,
     }
 
 

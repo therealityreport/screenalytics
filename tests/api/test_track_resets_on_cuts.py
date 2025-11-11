@@ -103,7 +103,7 @@ def test_tracker_resets_on_scene_cuts(tmp_path, monkeypatch) -> None:
         save_frames=False,
         save_crops=False,
         jpeg_quality=85,
-        scene_detect=True,
+        scene_detector="internal",
         scene_threshold=0.3,
         scene_min_len=1,
         scene_warmup_dets=2,

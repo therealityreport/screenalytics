@@ -177,18 +177,21 @@ with col_detect:
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
     max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=30, step=1)
     with st.expander("Advanced detect/track", expanded=False):
-        scene_detect_toggle = st.checkbox(
-            "Scene cut detection",
-            value=helpers.SCENE_DETECT_DEFAULT,
-            help="Detect hard scene transitions before tracking and reset ByteTrack per cut",
+        scene_detector_label = st.selectbox(
+            "Scene detector",
+            helpers.SCENE_DETECTOR_LABELS,
+            index=helpers.scene_detector_label_index(st.session_state.get("scene_detector_choice")),
+            help="PySceneDetect uses content detection for accurate hard cuts; switch to the internal HSV histogram fallback or disable if PySceneDetect is unavailable.",
+            key="scene_detector_select",
         )
+        scene_detector_value = helpers.scene_detector_value_from_label(scene_detector_label)
+        st.session_state["scene_detector_choice"] = scene_detector_value
         scene_threshold_value = st.number_input(
             "Scene cut threshold",
             min_value=0.0,
-            max_value=2.0,
             value=float(helpers.SCENE_THRESHOLD_DEFAULT),
             step=0.05,
-            help="Higher values require bigger histogram differences before a cut is recorded",
+            help="PySceneDetect defaults to 27.0 (ContentDetector threshold). The histogram fallback still expects 0-2 deltas.",
         )
         scene_min_len_value = st.number_input(
             "Minimum frames between cuts",
@@ -219,7 +222,7 @@ with col_detect:
                 "save_crops": bool(save_crops),
                 "jpeg_quality": int(jpeg_quality),
                 "max_gap": int(max_gap_value),
-                "scene_detect": bool(scene_detect_toggle),
+                "scene_detector": scene_detector_value,
                 "scene_threshold": float(scene_threshold_value),
                 "scene_min_len": int(scene_min_len_value),
                 "scene_warmup_dets": int(scene_warmup_value),
