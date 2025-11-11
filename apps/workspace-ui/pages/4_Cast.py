@@ -92,7 +92,10 @@ if not cast_resp:
 
 cast_members = cast_resp.get("cast", [])
 
-if not cast_members:
+# Check if we're in add form mode
+show_add_form = st.session_state.get("cast_show_add_form") and not st.session_state.get("selected_cast_id")
+
+if not cast_members and not show_add_form:
     st.info(f"No cast members found for {show_id}" + (f" in {season_filter}" if season_filter else ""))
 
     # Add new cast member button
@@ -100,48 +103,138 @@ if not cast_members:
         st.session_state["cast_show_add_form"] = True
         st.rerun()
 
-    if st.session_state.get("cast_show_add_form"):
-        with st.form("add_cast_form"):
-            st.subheader("Add New Cast Member")
-            name = st.text_input("Name", key="new_cast_name")
-            role = st.selectbox("Role", options=["main", "friend", "guest", "other"], key="new_cast_role")
-            status = st.selectbox("Status", options=["active", "past", "inactive"], key="new_cast_status")
-            aliases_text = st.text_input("Aliases (comma-separated)", key="new_cast_aliases")
-            seasons_text = st.text_input("Seasons (comma-separated, e.g., S05,S06)", key="new_cast_seasons")
-
-            cols = st.columns([1, 1])
-            if cols[0].form_submit_button("Create"):
-                aliases = [a.strip() for a in aliases_text.split(",") if a.strip()]
-                seasons = [s.strip() for s in seasons_text.split(",") if s.strip()]
-
-                payload = {
-                    "name": name,
-                    "role": role,
-                    "status": status,
-                    "aliases": aliases,
-                    "seasons": seasons,
-                }
-
-                result = _api_post(f"/shows/{show_id}/cast", payload)
-                if result:
-                    st.success(f"Created cast member: {name}")
-                    st.session_state.pop("cast_show_add_form", None)
-                    st.rerun()
-
-            if cols[1].form_submit_button("Cancel"):
-                st.session_state.pop("cast_show_add_form", None)
-                st.rerun()
-
     st.stop()
 
 # Display cast list and detail
 st.divider()
-st.subheader(f"Cast Members ({len(cast_members)})")
+st.subheader(f"Cast Members ({len(cast_members)})" if cast_members else "Cast Members")
 
 # Add new cast member button
 if st.button("Add Cast Member", key="cast_add_new_btn"):
     st.session_state["cast_show_add_form"] = True
     st.rerun()
+
+# Add cast member form (appears when button is clicked)
+if show_add_form:
+    with st.container(border=True):
+        st.subheader("➕ Add New Cast Member")
+
+        # Step 1: Cast member details
+        if not st.session_state.get("new_cast_created"):
+            with st.form("add_cast_details_form"):
+                st.markdown("**Cast Member Information**")
+                name = st.text_input("Name*", key="new_cast_name", placeholder="e.g., Kyle Richards")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    role = st.selectbox("Role", options=["main", "friend", "guest", "other"], key="new_cast_role")
+                with col2:
+                    status = st.selectbox("Status", options=["active", "past", "inactive"], key="new_cast_status")
+
+                aliases_text = st.text_input(
+                    "Aliases (comma-separated)",
+                    key="new_cast_aliases",
+                    placeholder="e.g., Kyle, Kyle R"
+                )
+                seasons_text = st.text_input(
+                    "Seasons (comma-separated)",
+                    key="new_cast_seasons",
+                    placeholder="e.g., S01,S02,S03"
+                )
+
+                cols = st.columns([1, 1])
+                if cols[0].form_submit_button("Create Cast Member", type="primary"):
+                    if not name or not name.strip():
+                        st.error("Name is required")
+                    else:
+                        aliases = [a.strip() for a in aliases_text.split(",") if a.strip()]
+                        seasons = [s.strip() for s in seasons_text.split(",") if s.strip()]
+
+                        payload = {
+                            "name": name.strip(),
+                            "role": role,
+                            "status": status,
+                            "aliases": aliases,
+                            "seasons": seasons,
+                        }
+
+                        result = _api_post(f"/shows/{show_id}/cast", payload)
+                        if result:
+                            st.session_state["new_cast_created"] = result["cast_id"]
+                            st.session_state["new_cast_name"] = name.strip()
+                            st.rerun()
+
+                if cols[1].form_submit_button("Cancel"):
+                    st.session_state.pop("cast_show_add_form", None)
+                    st.rerun()
+
+        # Step 2: Upload seed images (optional)
+        else:
+            new_cast_id = st.session_state["new_cast_created"]
+            new_cast_name = st.session_state.get("new_cast_name", "new member")
+
+            st.success(f"✓ Created cast member: **{new_cast_name}**")
+            st.markdown("**Optional: Upload Seed Images**")
+            st.caption("Upload photos/portraits of this person to improve face recognition. Images must contain exactly 1 face.")
+
+            with st.form("upload_seeds_after_create_form"):
+                uploaded_files = st.file_uploader(
+                    "Choose seed images",
+                    type=["jpg", "jpeg", "png"],
+                    accept_multiple_files=True,
+                    key="new_cast_upload_files",
+                    help="Select one or more photos of this person"
+                )
+
+                cols = st.columns([1, 1, 1])
+                if cols[0].form_submit_button("Upload Seeds", type="primary"):
+                    if uploaded_files:
+                        # Upload via API
+                        base = cfg["api_base"]
+                        url = f"{base}/cast/{new_cast_id}/seeds/upload?show_id={show_id}"
+                        files = [("files", (f.name, f.getvalue(), f.type)) for f in uploaded_files]
+
+                        try:
+                            resp = requests.post(url, files=files, timeout=120)
+                            resp.raise_for_status()
+                            result = resp.json()
+
+                            uploaded_count = result.get("uploaded", 0)
+                            failed_count = result.get("failed", 0)
+
+                            if uploaded_count > 0:
+                                st.success(f"Uploaded {uploaded_count} seed(s)")
+                            if failed_count > 0:
+                                st.warning(f"{failed_count} file(s) failed")
+                                for error in result.get("errors", []):
+                                    st.error(f"{error['file']}: {error['error']}")
+
+                            # Clean up and view the new cast member
+                            st.session_state.pop("cast_show_add_form", None)
+                            st.session_state.pop("new_cast_created", None)
+                            st.session_state.pop("new_cast_name", None)
+                            st.session_state["selected_cast_id"] = new_cast_id
+                            st.rerun()
+
+                        except requests.RequestException as exc:
+                            st.error(f"Upload failed: {exc}")
+                    else:
+                        st.warning("No files selected")
+
+                if cols[1].form_submit_button("Skip & Finish"):
+                    # Skip upload, just finish
+                    st.session_state.pop("cast_show_add_form", None)
+                    st.session_state.pop("new_cast_created", None)
+                    st.session_state.pop("new_cast_name", None)
+                    st.session_state["selected_cast_id"] = new_cast_id
+                    st.rerun()
+
+                if cols[2].form_submit_button("Cancel"):
+                    # Cancel and clean up
+                    st.session_state.pop("cast_show_add_form", None)
+                    st.session_state.pop("new_cast_created", None)
+                    st.session_state.pop("new_cast_name", None)
+                    st.rerun()
 
 # Cast list with selection
 selected_cast_id = st.session_state.get("selected_cast_id")
