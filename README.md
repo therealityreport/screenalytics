@@ -86,19 +86,64 @@ docker compose -f infra/docker/compose.yaml up -d
 
 # Python deps (uv) and UI deps
 uv sync
+source .venv/bin/activate
 pnpm install
 
 # Seed env
 cp .env.example .env
 
-# Migrate DB
-psql "$DB_URL" -f db/migrations/0001_init_core.sql
+# Dev infra (DB/Redis/S3 + migrations + env exports)
+source ./tools/dev-up.sh
 
 # Run services
 uv run apps/api/main.py               # API
 uv run workers/orchestrator.py        # Workers (pipeline)
 pnpm --filter workspace-ui dev        # UI
 ````
+
+> `tools/dev-up.sh` exports `DB_URL`, `REDIS_URL`, and `S3_*` for the current shell while bringing the Docker stack online. Source it (`source ./tools/dev-up.sh`) whenever you open a new terminal.
+
+### Dev quick run
+
+```bash
+source .venv/bin/activate
+./tools/dev-up.sh
+python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 5 --stub
+```
+
+Artifacts land under `data/` mirroring the future object-storage layout:
+
+- `data/videos/ep_demo/episode.mp4`
+- `data/manifests/ep_demo/detections.jsonl`
+- `data/manifests/ep_demo/tracks.jsonl`
+- `data/frames/ep_demo/` (only when `--fps` is provided)
+
+#### macOS (Apple Silicon) Python environment
+
+If you're on Apple Silicon and rely on the system `zsh`, use `pyenv` to guarantee that `python` points at 3.11.9 before creating the virtual environment:
+
+```bash
+brew install pyenv
+
+# ~/.zshrc
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init --path)"
+fi
+case $- in *i*) : ;; *) return ;; esac  # keep existing guard if you have one
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init -)"
+fi
+
+# back in the repo
+pyenv install 3.11.9
+pyenv local 3.11.9
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+`pyenv local 3.11.9` writes `.python-version`, so new shells automatically pick up the right interpreter before activating `.venv`.
 
 ### Minimal .env example
 

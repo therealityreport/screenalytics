@@ -1,11 +1,11 @@
 # Tracking Progress
 
 ## Current status
-- Stubbed `bytetrack_runner.py` with CLI that reads detections and emits `tracks.jsonl`.
-- Added unit tests for track building + CLI I/O expectations.
-- CLI adheres to `track_v1` schema for downstream stages.
+- `bytetrack_runner.py` upgraded to ByteTrack-lite: filters detections, matches by IoU, honors `track_thresh/match_thresh/track_buffer`, and now defaults to the artifact resolver.
+- Outputs full `track_v1` rows (frame span + stats) and exposes `run_tracking`.
+- New regression test (`tests/FEATURES/tracking/test_tracking_tracks.py`) validates deterministic IDs + schema.
 
 ## Next steps
-- Integrate real ByteTrack association + scene boundary handling.
-- Carry over detector confidence to track-level scoring.
-- Emit thumbnails/chip references for QA tooling.
+- Swap IoU-only association with full ByteTrack (high/low confidence pools + velocity gating).
+- Surface QA metrics (ID switches, FPS) and optionally emit thumbnails.
+- Integrate multi-episode CLI entry and logging hooks for orchestration.

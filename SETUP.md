@@ -19,6 +19,22 @@ cd screenalytics
 ```
 
 ### Virtual environment
+
+> **macOS (Apple Silicon):** install `pyenv`, add the following to `~/.zshrc`, then install + select Python 3.11.9 before creating the venv.
+> ```bash
+> brew install pyenv
+> if command -v pyenv >/dev/null; then
+>   eval "$(pyenv init --path)"
+> fi
+> if [[ $- == *i* ]]; then
+>   eval "$(pyenv init -)"
+> fi
+> pyenv install 3.11.9
+> pyenv local 3.11.9
+> ```
+
+Now create the environment with the pinned interpreter:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate # or .\.venv\Scripts\activate on Windows
@@ -79,6 +95,30 @@ psql "$DB_URL" -f db/migrations/0001_init_core.sql
 ## 6️⃣ Verify install
 Visit [http://localhost:3000](http://localhost:3000) → Upload tab should appear.  
 API health check: [http://localhost:8000/health](http://localhost:8000/health) returns `{"status":"ok"}`.
+
+---
+
+## 🔍 Detection & Tracking Artifacts
+
+### det_v1 (`detections.jsonl`)
+- `ep_id` – episode id.
+- `frame_idx` – zero-based frame number.
+- `ts_s` – timestamp in seconds.
+- `bbox` – `[x1,y1,x2,y2]` normalized (0–1) coordinates.
+- `landmarks` – flattened `[x,y]*5` facial landmarks.
+- `conf` – detector confidence.
+- `model_id`, `schema_version`.
+
+### track_v1 (`tracks.jsonl`)
+- `track_id` – deterministic `track-00001` style id.
+- `ep_id` – episode id.
+- `start_s` / `end_s` – timestamps for the track span.
+- `frame_span` – `[start_frame,end_frame]`.
+- `sample_thumbs` – list of thumbnail paths (empty for now).
+- `stats` – `{detections, avg_conf}` summary.
+- `schema_version` – `"track_v1"`.
+
+These files are produced by the RetinaFace detection runner and ByteTrack-lite tracker under `FEATURES/detection` and `FEATURES/tracking`.
 
 ---
 
