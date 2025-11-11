@@ -182,8 +182,10 @@ if st.button("Run detect/track", use_container_width=True):
         except requests.RequestException as exc:
             st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track", exc))
         else:
+            det_count = resp.get('detections_count') or resp.get('detections') or '?'
+            track_count = resp.get('tracks_count') or resp.get('tracks') or '?'
             st.success(
-                f"detections: {resp['detections_count']}, tracks: {resp['tracks_count']}"
+                f"detections: {det_count}, tracks: {track_count}"
             )
 
 st.divider()
