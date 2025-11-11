@@ -20,6 +20,12 @@ from py_screenalytics.artifacts import get_path  # noqa: E402
 cfg = helpers.init_page("Episode Detail")
 st.title("Episode Detail")
 
+if "detector" in st.session_state:
+    del st.session_state["detector"]
+if "tracker" in st.session_state:
+    del st.session_state["tracker"]
+st.cache_data.clear()
+
 
 
 def _handle_missing_episode(ep_id: str) -> None:
@@ -139,33 +145,11 @@ with col_detect:
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
     stub_toggle = st.checkbox("Use stub (fast, no ML)", value=False)
-    device_choice = st.selectbox(
-        "Device",
-        helpers.DEVICE_LABELS,
-        index=helpers.device_label_index(default_device_label),
+    st.caption(
+        f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
+        f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
+        "Device: auto (falls back to CPU for RetinaFace/ArcFace)."
     )
-    device_value = helpers.DEVICE_VALUE_MAP[device_choice]
-    detector_default_value = helpers.detector_default_value()
-    detector_label = st.selectbox(
-        "Detector",
-        helpers.DETECTOR_LABELS,
-        index=helpers.detector_label_index(detector_default_value),
-    )
-    detector_value = helpers.DETECTOR_VALUE_MAP[detector_label]
-    helpers.set_detector_choice(detector_value)
-    tracker_default_value = helpers.tracker_default_value()
-    tracker_label = st.selectbox(
-        "Tracker",
-        helpers.TRACKER_LABELS,
-        index=helpers.tracker_label_index(tracker_default_value),
-    )
-    tracker_value = helpers.TRACKER_VALUE_MAP[tracker_label]
-    helpers.set_tracker_choice(tracker_value)
-    if device_value == "mps" and detector_value == "retinaface":
-        st.info(
-            "RetinaFace + ArcFace run via ONNX Runtime on CPU when MPS is selected. "
-            "Detector/embeddings will use CPU; tracking still uses your chosen device."
-        )
     save_frames = st.checkbox("Save frames to S3", value=False)
     save_crops = st.checkbox("Save face crops to S3", value=False)
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
@@ -173,30 +157,35 @@ with col_detect:
     run_disabled = False
     run_label = "Run detect/track"
     if st.button(run_label, use_container_width=True, disabled=run_disabled):
-        job_payload: Dict[str, Any] = {
-            "ep_id": ep_id,
-            "stub": bool(stub_toggle),
-            "stride": int(stride_value),
-            "device": device_value,
-            "save_frames": bool(save_frames),
-            "save_crops": bool(save_crops),
-            "jpeg_quality": int(jpeg_quality),
-            "detector": detector_value,
-            "tracker": tracker_value,
-            "max_gap": int(max_gap_value),
-        }
+        job_payload = helpers.default_detect_track_payload(
+            ep_id,
+            stub=bool(stub_toggle),
+            stride=int(stride_value),
+            det_thresh=helpers.DEFAULT_DET_THRESH,
+        )
+        job_payload.update(
+            {
+                "save_frames": bool(save_frames),
+                "save_crops": bool(save_crops),
+                "jpeg_quality": int(jpeg_quality),
+                "max_gap": int(max_gap_value),
+            }
+        )
         if fps_value > 0:
             job_payload["fps"] = fps_value
-        mode_label = "stub (no ML)" if stub_toggle else detector_label
+        mode_label = (
+            f"{helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} + "
+            f"{helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)}"
+        )
         with st.spinner(f"Running detect/track ({mode_label})…"):
             summary, error_message = helpers.run_job_with_progress(
                 ep_id,
                 "/jobs/detect_track",
                 job_payload,
-                requested_device=device_value,
+                requested_device=helpers.DEFAULT_DEVICE,
                 async_endpoint="/jobs/detect_track_async",
-                requested_detector=detector_value,
-                requested_tracker=tracker_value,
+                requested_detector=helpers.DEFAULT_DETECTOR,
+                requested_tracker=helpers.DEFAULT_TRACKER,
             )
         if error_message:
             if "RetinaFace weights missing or could not initialize" in error_message:
@@ -212,10 +201,6 @@ with col_detect:
             crops_exported = normalized.get("crops_exported")
             detector_summary = normalized.get("detector")
             tracker_summary = normalized.get("tracker")
-            if detector_summary:
-                helpers.set_detector_choice(str(detector_summary))
-            if tracker_summary:
-                helpers.set_tracker_choice(str(tracker_summary))
             details_line = [
                 f"detections: {detections:,}" if isinstance(detections, int) else "detections: ?",
                 f"tracks: {tracks:,}" if isinstance(tracks, int) else "tracks: ?",

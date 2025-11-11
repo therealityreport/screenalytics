@@ -66,7 +66,7 @@ def test_detect_track_retinaface_missing_models_returns_400(tmp_path, monkeypatc
     jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=3)
     monkeypatch.setattr(jobs_router, "JOB_SERVICE", JobService(data_root=data_root))
     fake_episode_run = types.SimpleNamespace(
-        ensure_retinaface_ready=lambda device: (False, "weights missing", None),
+        ensure_retinaface_ready=lambda device, det_thresh=None: (False, "weights missing", None),
         RETINAFACE_HELP="RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py.",
     )
     monkeypatch.setattr(jobs_service, "episode_run", fake_episode_run)

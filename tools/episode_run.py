@@ -54,8 +54,36 @@ RETINAFACE_MODEL_NAME = os.environ.get("RETINAFACE_MODEL", "retinaface_r50_v1")
 FACE_CLASS_LABEL = "face"
 MIN_FACE_AREA = 20.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
-RETINAFACE_SCORE_THRESHOLD = 0.6
+RETINAFACE_SCORE_THRESHOLD = 0.5
 RETINAFACE_NMS = 0.45
+def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return 640, 640
+    tokens: list[str] = []
+    buf = value.replace("x", ",").replace("X", ",")
+    for part in buf.split(","):
+        part = part.strip()
+        if part:
+            tokens.append(part)
+    if len(tokens) != 2:
+        return 640, 640
+    try:
+        width = max(int(float(tokens[0])), 1)
+        height = max(int(float(tokens[1])), 1)
+        return width, height
+    except ValueError:
+        return 640, 640
+
+
+RETINAFACE_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_DET_SIZE"))
+
+
+def _normalize_det_thresh(value: float | str | None) -> float:
+    try:
+        numeric = float(value) if value is not None else RETINAFACE_SCORE_THRESHOLD
+    except (TypeError, ValueError):
+        numeric = RETINAFACE_SCORE_THRESHOLD
+    return min(max(numeric, 0.0), 1.0)
 YOLO_FACE_CONF = 0.5
 BYTE_TRACK_MIN_BOX_AREA = 20.0
 DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
@@ -93,7 +121,7 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
     return providers, resolved
 
 
-def _init_retinaface(model_name: str, device: str) -> tuple[Any, str]:
+def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> tuple[Any, str]:
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover - runtime guard
@@ -106,7 +134,21 @@ def _init_retinaface(model_name: str, device: str) -> tuple[Any, str]:
             f"RetinaFace weights '{model_name}' not found. Install insightface models or run scripts/fetch_models.py."
         )
     ctx_id = 0 if resolved == "cuda" else -1
-    model.prepare(ctx_id=ctx_id, providers=providers, nms=RETINAFACE_NMS)
+    # InsightFace 0.7.x configures detection threshold at prepare-time
+    # (detect() no longer accepts a `threshold` kwarg).
+    prepare_kwargs = {
+        "ctx_id": ctx_id,
+        "providers": providers,
+        "nms": RETINAFACE_NMS,
+        "det_thresh": float(score_thresh),
+    }
+    if RETINAFACE_DET_SIZE:
+        prepare_kwargs["input_size"] = RETINAFACE_DET_SIZE
+    try:
+        model.prepare(**prepare_kwargs)
+    except TypeError:
+        prepare_kwargs.pop("input_size", None)
+        model.prepare(**prepare_kwargs)
     return model, resolved
 
 
@@ -127,12 +169,16 @@ def _init_arcface(model_name: str, device: str):
     return model, resolved
 
 
-def ensure_retinaface_ready(device: str) -> tuple[bool, Optional[str], Optional[str]]:
+def ensure_retinaface_ready(device: str, det_thresh: float | None = None) -> tuple[bool, Optional[str], Optional[str]]:
     """Lightweight readiness probe for API preflight checks."""
 
     model = None
     try:
-        model, resolved = _init_retinaface(RETINAFACE_MODEL_NAME, device)
+        model, resolved = _init_retinaface(
+            RETINAFACE_MODEL_NAME,
+            device,
+            det_thresh if det_thresh is not None else RETINAFACE_SCORE_THRESHOLD,
+        )
     except Exception as exc:  # pragma: no cover - surfaced via API tests
         return False, str(exc), None
     finally:
@@ -428,9 +474,9 @@ class StrongSortAdapter:
 
 
 class RetinaFaceDetectorBackend:
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> None:
         self.device = device
-        self.score_thresh = RETINAFACE_SCORE_THRESHOLD
+        self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
         self.min_area = MIN_FACE_AREA
         self._model = None
         self._resolved_device: Optional[str] = None
@@ -439,7 +485,7 @@ class RetinaFaceDetectorBackend:
         if self._model is not None:
             return self._model
         try:
-            model, resolved = _init_retinaface(self.model_name, self.device)
+            model, resolved = _init_retinaface(self.model_name, self.device, self.score_thresh)
         except Exception as exc:
             raise RuntimeError(f"{RETINAFACE_HELP} ({exc})") from exc
         self._resolved_device = resolved
@@ -461,7 +507,14 @@ class RetinaFaceDetectorBackend:
 
     def detect(self, image) -> list[DetectionSample]:
         model = self._lazy_model()
-        bboxes, landmarks = model.detect(image, threshold=self.score_thresh, scale=1.0)
+        # Threshold + input size configured during model.prepare. Some InsightFace
+        # RetinaFace builds still require an explicit input_size, so pass it when
+        # available.
+        detect_kwargs = {}
+        input_size = getattr(model, "input_size", None) or RETINAFACE_DET_SIZE
+        if input_size:
+            detect_kwargs["input_size"] = input_size
+        bboxes, landmarks = model.detect(image, **detect_kwargs)
         if bboxes is None or len(bboxes) == 0:
             return []
         pending: list[tuple[np.ndarray, float, np.ndarray | None]] = []
@@ -542,10 +595,10 @@ class YoloFaceDetectorBackend:
         return samples
 
 
-def _build_face_detector(detector: str, device: str):
+def _build_face_detector(detector: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD):
     if detector == "yolov8face":
         return YoloFaceDetectorBackend(device)
-    return RetinaFaceDetectorBackend(device)
+    return RetinaFaceDetectorBackend(device, score_thresh=score_thresh)
 
 
 def _build_tracker_adapter(tracker: str, frame_rate: float) -> ByteTrackAdapter | StrongSortAdapter:
@@ -1164,26 +1217,52 @@ def _sync_artifacts_to_s3(
     exporter: FrameExporter | None,
     thumb_dir: Path | None = None,
 ) -> Dict[str, int]:
-    stats = {"manifests": 0, "frames": 0, "crops": 0}
-    if storage is None or ep_ctx is None:
+    stats = {"manifests": 0, "frames": 0, "crops": 0, "thumbs_tracks": 0}
+    if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
         return stats
     prefixes = artifact_prefixes(ep_ctx)
     manifests_dir = get_path(ep_id, "detections").parent
-    manifest_files = ["detections.jsonl", "tracks.jsonl", "faces.jsonl", "identities.json"]
-    for name in manifest_files:
-        path = manifests_dir / name
-        if not path.exists():
-            continue
-        uploaded = storage.put_artifact(ep_ctx, "manifests", path, name)
-        if uploaded:
-            stats["manifests"] += 1
+    stats["manifests"] = storage.upload_dir(manifests_dir, prefixes["manifests"])
+    frames_root = get_path(ep_id, "frames_root")
+    frames_dir = frames_root / "frames"
+    crops_dir = frames_root / "crops"
     if exporter and exporter.save_frames and exporter.frames_dir.exists():
-        stats["frames"] = storage.sync_tree_to_s3(ep_ctx, exporter.frames_dir, prefixes["frames"])
+        stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
+    elif frames_dir.exists():
+        stats["frames"] = storage.upload_dir(frames_dir, prefixes["frames"])
     if exporter and exporter.save_crops and exporter.crops_dir.exists():
-        stats["crops"] = storage.sync_tree_to_s3(ep_ctx, exporter.crops_dir, prefixes["crops"])
+        stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
+    elif crops_dir.exists():
+        stats["crops"] = storage.upload_dir(crops_dir, prefixes["crops"])
     if thumb_dir is not None and thumb_dir.exists():
-        stats["thumbs"] = storage.sync_tree_to_s3(ep_ctx, thumb_dir, prefixes.get("thumbs_tracks", ""))
+        stats["thumbs_tracks"] = storage.upload_dir(thumb_dir, prefixes.get("thumbs_tracks", ""))
     return stats
+
+
+def _report_s3_upload(
+    progress: ProgressEmitter | None,
+    stats: Dict[str, int],
+    *,
+    device: str | None,
+    detector: str | None,
+    tracker: str | None,
+    resolved_device: str | None,
+) -> None:
+    if not progress:
+        return
+    if not any(stats.values()):
+        return
+    frames = progress.target_frames or 0
+    progress.emit(
+        frames,
+        phase="mirror_s3",
+        device=device,
+        summary={"s3_uploads": stats},
+        detector=detector,
+        tracker=tracker,
+        resolved_device=resolved_device,
+        force=True,
+    )
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -1213,6 +1292,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         choices=list(TRACKER_CHOICES),
         default=DEFAULT_TRACKER,
         help="Tracker backend (ByteTrack default, StrongSORT optional for occlusions)",
+    )
+    parser.add_argument(
+        "--det-thresh",
+        type=float,
+        default=RETINAFACE_SCORE_THRESHOLD,
+        help="RetinaFace detection score threshold (0-1, default 0.5)",
     )
     parser.add_argument(
         "--max-gap",
@@ -1249,6 +1334,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    if hasattr(args, "det_thresh"):
+        args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
     data_root = (
         Path(args.out_root).expanduser()
         if args.out_root
@@ -1435,9 +1522,15 @@ def _run_full_pipeline(
     device = pick_device(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
-    args.tracker = tracker_choice
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
-    detector_backend = _build_face_detector(detector_choice, device)
+    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
+    args.detector = detector_choice
+    args.tracker = tracker_choice
+    args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
+    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
+    args.tracker = tracker_choice
+    det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
+    detector_backend = _build_face_detector(detector_choice, device, det_thresh)
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
     tracker_label = tracker_choice
@@ -1634,6 +1727,7 @@ def _run_detect_track_stage(
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
+    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
     frame_exporter = (
         FrameExporter(
             args.ep_id,
@@ -1682,6 +1776,14 @@ def _run_detect_track_stage(
 
         manifests_dir = get_path(args.ep_id, "detections").parent
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
+        _report_s3_upload(
+            progress,
+            s3_stats,
+            device=pipeline_device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=detector_device,
+        )
         summary: Dict[str, Any] = {
             "stage": "detect_track",
             "ep_id": args.ep_id,
@@ -1890,6 +1992,14 @@ def _run_faces_embed_stage(
             exporter.write_indexes()
 
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
+        _report_s3_upload(
+            progress,
+            s3_stats,
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=embed_device,
+        )
         summary: Dict[str, Any] = {
             "stage": "faces_embed",
             "ep_id": args.ep_id,
@@ -2068,6 +2178,14 @@ def _run_cluster_stage(
     }
     identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
+    _report_s3_upload(
+        progress,
+        s3_stats,
+        device=device,
+        detector=detector_choice,
+        tracker=tracker_choice,
+        resolved_device=resolved_device,
+    )
 
     summary: Dict[str, Any] = {
         "stage": "cluster",

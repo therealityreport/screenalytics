@@ -27,6 +27,8 @@ JOB_SERVICE = JobService()
 EPISODE_STORE = EpisodeStore()
 DETECTOR_CHOICES = {"retinaface", "yolov8face"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
+DEFAULT_DETECTOR_ENV = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
+DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
 
 
 class DetectRequest(BaseModel):
@@ -51,9 +53,21 @@ class DetectTrackRequest(BaseModel):
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
     save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
-    detector: str = Field("retinaface", description="Face detector backend (retinaface or yolov8face)")
-    tracker: str = Field("bytetrack", description="Tracker backend (bytetrack or strongsort)")
+    detector: str = Field(
+        DEFAULT_DETECTOR_ENV,
+        description="Face detector backend (retinaface or yolov8face)",
+    )
+    tracker: str = Field(
+        DEFAULT_TRACKER_ENV,
+        description="Tracker backend (bytetrack or strongsort)",
+    )
     max_gap: int | None = Field(30, ge=1, description="Frame gap before forcing a new track")
+    det_thresh: float | None = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="RetinaFace detection threshold (0-1)",
+    )
 
 
 class FacesEmbedRequest(BaseModel):
@@ -122,14 +136,16 @@ def _progress_file_path(ep_id: str) -> Path:
 
 
 def _normalize_detector(detector: str | None) -> str:
-    value = (detector or "").strip().lower()
+    fallback = DEFAULT_DETECTOR_ENV or "retinaface"
+    value = (detector or fallback).strip().lower()
     if value not in DETECTOR_CHOICES:
         raise HTTPException(status_code=400, detail=f"Unsupported detector '{detector}'")
     return value
 
 
 def _normalize_tracker(tracker: str | None) -> str:
-    value = (tracker or "").strip().lower()
+    fallback = DEFAULT_TRACKER_ENV or "bytetrack"
+    value = (tracker or fallback).strip().lower()
     if value not in TRACKER_CHOICES:
         raise HTTPException(status_code=400, detail=f"Unsupported tracker '{tracker}'")
     return value
@@ -141,6 +157,7 @@ def _build_detect_track_command(
     progress_path: Path,
     detector_value: str,
     tracker_value: str,
+    det_thresh: float | None,
 ) -> List[str]:
     command: List[str] = [
         sys.executable,
@@ -170,6 +187,8 @@ def _build_detect_track_command(
     command += ["--tracker", tracker_value]
     if req.max_gap:
         command += ["--max-gap", str(req.max_gap)]
+    if det_thresh is not None:
+        command += ["--det-thresh", str(det_thresh)]
     return command
 
 
@@ -377,7 +396,7 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
     try:
-        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.stub, req.device)
+        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.stub, req.device, req.det_thresh)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     progress_path = _progress_file_path(req.ep_id)
@@ -385,7 +404,14 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
         progress_path.unlink()
     except FileNotFoundError:
         pass
-    command = _build_detect_track_command(req, video_path, progress_path, detector_value, tracker_value)
+    command = _build_detect_track_command(
+        req,
+        video_path,
+        progress_path,
+        detector_value,
+        tracker_value,
+        req.det_thresh,
+    )
     result = _run_job_with_optional_sse(command, request)
     if isinstance(result, StreamingResponse):
         return result
@@ -494,6 +520,7 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
             detector=detector_value,
             tracker=tracker_value,
             max_gap=req.max_gap,
+            det_thresh=req.det_thresh,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))

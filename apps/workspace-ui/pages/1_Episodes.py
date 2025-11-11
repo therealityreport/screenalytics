@@ -153,32 +153,32 @@ with col2:
     st.write("")
 
 st.subheader("Quick detect/track")
-col_stride, col_fps, col_stub, col_device = st.columns(4)
+col_stride, col_fps, col_stub = st.columns(3)
 with col_stride:
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
 with col_fps:
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
 with col_stub:
     stub_toggle = st.checkbox("Use stub", value=False)
-default_device_label = helpers.device_default_label()
-with col_device:
-    device_choice = st.selectbox(
-        "Device",
-        helpers.DEVICE_LABELS,
-        index=helpers.device_label_index(default_device_label),
-    )
-device_value = helpers.DEVICE_VALUE_MAP[device_choice]
+st.caption(
+    f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
+    f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
+    "Device: auto"
+)
 
 if st.button("Run detect/track", use_container_width=True):
-    job_payload: dict[str, Any] = {
-        "ep_id": selected_ep_id,
-        "stub": bool(stub_toggle),
-        "stride": int(stride_value),
-        "device": device_value,
-    }
+    job_payload = helpers.default_detect_track_payload(
+        selected_ep_id,
+        stub=bool(stub_toggle),
+        stride=int(stride_value),
+        det_thresh=helpers.DEFAULT_DET_THRESH,
+    )
     if fps_value > 0:
         job_payload["fps"] = fps_value
-    mode_label = "stub (no ML)" if stub_toggle else "YOLOv8 + ByteTrack"
+    mode_label = (
+        f"{helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} + "
+        f"{helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)}"
+    )
     with st.spinner(f"Running detect/track ({mode_label})…"):
         try:
             resp = helpers.api_post("/jobs/detect_track", job_payload)

@@ -198,8 +198,54 @@ def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[s
         st.rerun()
     return False
 
+
+def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | None:
+    payload = helpers.default_detect_track_payload(ep_id, stub=False)
+    payload["stride"] = helpers.DEFAULT_STRIDE
+    payload["device"] = helpers.DEFAULT_DEVICE
+    endpoint = "/jobs/detect_track_async"
+    try:
+        job_resp = helpers.api_post(endpoint, payload)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response else None
+        if status in {404, 405, 501}:
+            try:
+                resp = helpers.api_post("/jobs/detect_track", payload)
+            except requests.RequestException as sync_exc:
+                st.error(
+                    helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track", sync_exc)
+                )
+                return None
+            else:
+                st.info("Async detect/track not available; ran synchronously.")
+                resp.setdefault("ep_id", ep_id)
+                return {"sync": resp, "payload": payload}
+        st.error(helpers.describe_error(f"{cfg['api_base']}{endpoint}", exc))
+        return None
+    except requests.RequestException as exc:
+        st.error(helpers.describe_error(f"{cfg['api_base']}{endpoint}", exc))
+        return None
+    _register_async_job(
+        job_resp,
+        ep_id=ep_id,
+        label=label,
+        stride=payload.get("stride", helpers.DEFAULT_STRIDE),
+        fps=payload.get("fps"),
+        stub=payload.get("stub", False),
+        device=payload.get("device", helpers.DEFAULT_DEVICE),
+    )
+    st.success(f"Job `{job_resp['job_id']}` queued; monitor progress above.")
+    job_resp["payload"] = payload
+    return {"job": job_resp, "payload": payload}
+
 cfg = helpers.init_page("Screenalytics Upload")
 st.title("Upload & Run")
+
+if "detector" in st.session_state:
+    del st.session_state["detector"]
+if "tracker" in st.session_state:
+    del st.session_state["tracker"]
+st.cache_data.clear()
 
 flash_message = st.session_state.pop("upload_flash", None)
 if flash_message:
@@ -252,21 +298,9 @@ with st.form("episode-upload"):
         help="Optional premiere date",
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
-    with col2:
-        fps_value = st.number_input("FPS (optional)", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
-    with col3:
-        use_stub_detect = st.checkbox("Use stub (fast, no ML)", value=False)
-    default_device_label = helpers.device_default_label()
-    with col4:
-        device_choice = st.selectbox(
-            "Device",
-            helpers.DEVICE_LABELS,
-            index=helpers.device_label_index(default_device_label),
-        )
-    device_value = helpers.DEVICE_VALUE_MAP[device_choice]
+    st.caption(
+        "Detect/track runs automatically after upload using RetinaFace + ByteTrack (det_thresh=0.5, device=auto)."
+    )
     submit = st.form_submit_button("Upload episode")
 
 if submit:
@@ -324,39 +358,10 @@ if submit:
     if detected_fps_value:
         st.info(f"Detected FPS: {detected_fps_value:.3f}")
 
-    jobs_path = "/jobs/detect_track_async"
-    job_payload: Dict[str, Any] = {
-        "ep_id": ep_id,
-        "stub": bool(use_stub_detect),
-        "stride": int(stride_value),
-        "device": device_value,
-    }
-    fps_override = float(fps_value) if fps_value > 0 else None
-    if fps_override:
-        job_payload["fps"] = fps_override
-    mode_label = "stub (no ML)" if use_stub_detect else "YOLOv8 + ByteTrack"
-    job_error: str | None = None
-    job_resp: Dict[str, Any] | None = None
-    with st.spinner(f"Queueing detect/track ({mode_label})…"):
-        try:
-            job_resp = helpers.api_post(jobs_path, job_payload)
-        except requests.RequestException as exc:
-            endpoint = f"{cfg['api_base']}{jobs_path}"
-            job_error = helpers.describe_error(endpoint, exc)
-
-    if job_error:
-        st.error(f"Detect/track failed: {job_error}")
+    with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
+        job_result = _launch_default_detect_track(ep_id, label=f"Upload detect/track · {ep_id}")
+    if job_result is None:
         st.stop()
-    assert job_resp is not None
-    _register_async_job(
-        job_resp,
-        ep_id=ep_id,
-        label=f"Upload detect/track · {ep_id}",
-        stride=int(stride_value),
-        fps=fps_override,
-        stub=bool(use_stub_detect),
-        device=device_value,
-    )
 
     artifacts = {
         "video": get_path(ep_id, "video"),
@@ -367,7 +372,19 @@ if submit:
     flash_lines.append(f"Video → {helpers.link_local(artifacts['video'])}")
     flash_lines.append(f"Detections → {helpers.link_local(artifacts['detections'])}")
     flash_lines.append(f"Tracks → {helpers.link_local(artifacts['tracks'])}")
-    flash_lines.append(f"Detect/track job `{job_resp['job_id']}` queued ({mode_label}); progress below.")
+    if job_result.get("job"):
+        job_resp = job_result["job"]
+        flash_lines.append(
+            f"Detect/track job `{job_resp['job_id']}` queued (RetinaFace + ByteTrack, auto device)."
+        )
+    elif job_result.get("sync"):
+        sync_resp = job_result["sync"]
+        dets = sync_resp.get("detections_count")
+        trks = sync_resp.get("tracks_count")
+        flash_lines.append(
+            "Detect/track ran synchronously (RetinaFace + ByteTrack). "
+            f"detections={dets if dets is not None else '?'} tracks={trks if trks is not None else '?'}"
+        )
     st.session_state["upload_flash"] = "\n".join(flash_lines)
     helpers.set_ep_id(ep_id)
 
@@ -462,7 +479,7 @@ if s3_items:
                         helpers.set_ep_id(upsert_resp["ep_id"])
                         st.rerun()
         elif ep_id_from_s3:
-            action_cols = st.columns([1, 1])
+            action_cols = st.columns([1, 1, 1])
             with action_cols[0]:
                 st.button(
                     "Open Episode Detail",
@@ -486,83 +503,19 @@ if s3_items:
                             f"Mirrored to {helpers.link_local(mirror_resp['local_video_path'])} "
                             f"({helpers.human_size(mirror_resp.get('bytes'))})"
                         )
-            default_device_label = helpers.device_default_label()
-            with st.form(f"s3-detect-track-{ep_id_from_s3}"):
-                col_stride, col_fps, col_stub, col_device = st.columns(4)
-                with col_stride:
-                    stride_value = st.number_input(
-                        "Stride",
-                        min_value=1,
-                        max_value=50,
-                        value=helpers.DEFAULT_STRIDE,
-                        step=1,
-                        key=f"s3_stride_{ep_id_from_s3}",
-                    )
-                with col_fps:
-                    fps_value = st.number_input(
-                        "FPS",
-                        min_value=0.0,
-                        max_value=120.0,
-                        value=0.0,
-                        step=1.0,
-                        key=f"s3_fps_{ep_id_from_s3}",
-                    )
-                with col_stub:
-                    stub_toggle = st.checkbox("Use stub", value=False, key=f"s3_stub_{ep_id_from_s3}")
-                with col_device:
-                    device_choice = st.selectbox(
-                        "Device",
-                        helpers.DEVICE_LABELS,
-                        index=helpers.device_label_index(default_device_label),
-                        key=f"s3_device_{ep_id_from_s3}",
-                    )
-                run_job = st.form_submit_button("Run detect/track (async)")
-                if run_job:
-                    device_value = helpers.DEVICE_VALUE_MAP[device_choice]
-                    fps_override = float(fps_value) if fps_value > 0 else None
-                    payload = {
-                        "ep_id": ep_id_from_s3,
-                        "stride": int(stride_value),
-                        "stub": bool(stub_toggle),
-                        "device": device_value,
-                    }
-                    if fps_override:
-                        payload["fps"] = fps_override
-                    try:
-                        job_resp = helpers.api_post("/jobs/detect_track_async", payload)
-                    except requests.RequestException as exc:
-                        st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track_async", exc))
-                    else:
-                        _register_async_job(
-                            job_resp,
-                            ep_id=ep_id_from_s3,
+            with action_cols[2]:
+                if st.button(
+                    "Queue detect/track (defaults)",
+                    key=f"queue_detect_track_{ep_id_from_s3}",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
+                        result = _launch_default_detect_track(
+                            ep_id_from_s3,
                             label=f"S3 detect/track · {ep_id_from_s3}",
-                            stride=int(stride_value),
-                            fps=fps_override,
-                            stub=bool(stub_toggle),
-                            device=device_value,
                         )
-                        st.success(f"Job `{job_resp['job_id']}` queued; monitor progress above.")
+                    if result and result.get("job"):
                         st.rerun()
-
-            if st.button("Run synchronously (blocking)", key=f"sync_{ep_id_from_s3}"):
-                device_value = helpers.DEVICE_VALUE_MAP[device_choice]
-                payload = {
-                    "ep_id": ep_id_from_s3,
-                    "stride": int(stride_value),
-                    "stub": bool(stub_toggle),
-                    "device": device_value,
-                }
-                if fps_value > 0:
-                    payload["fps"] = float(fps_value)
-                try:
-                    resp = helpers.api_post("/jobs/detect_track", payload)
-                except requests.RequestException as exc:
-                    st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track", exc))
-                else:
-                    st.success(
-                        f"detections: {resp['detections_count']}, tracks: {resp['tracks_count']}"
-                    )
 
             artifacts = {
                 "video": get_path(ep_id_from_s3, "video"),

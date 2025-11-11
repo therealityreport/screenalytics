@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from mimetypes import guess_type
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -168,6 +169,7 @@ class StorageService:
         self.bucket = DEFAULT_BUCKET
         self._client = None
         self._client_error_cls = None
+        self.write_enabled = True
 
         if self.backend == "s3":
             boto3_mod = _boto3()
@@ -178,7 +180,8 @@ class StorageService:
             if custom_endpoint:
                 client_kwargs["endpoint_url"] = custom_endpoint
             self._client = boto3_mod.client("s3", **client_kwargs)
-            self.bucket = os.environ.get("AWS_S3_BUCKET", DEFAULT_BUCKET)
+            configured_bucket = os.environ.get("SCREENALYTICS_S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
+            self.bucket = configured_bucket or DEFAULT_BUCKET
             self._client_error_cls = ClientError
             self._ensure_s3_bucket(ClientError)
         elif self.backend == "minio":
@@ -205,6 +208,15 @@ class StorageService:
             self.bucket = "local"
         else:
             raise ValueError(f"Unsupported STORAGE_BACKEND '{self.backend}'")
+
+        flag = os.environ.get("S3_WRITE")
+        default_enabled = self.backend in {"s3", "minio"} and self._client is not None
+        if flag is not None:
+            default_enabled = flag.lower() in {"1", "true", "yes"}
+        self.write_enabled = default_enabled and self.backend in {"s3", "minio"} and self._client is not None
+
+    def s3_enabled(self) -> bool:
+        return self.backend in {"s3", "minio"} and self._client is not None
 
     def presign_episode_video(
         self,
@@ -343,28 +355,38 @@ class StorageService:
     def sync_tree_to_s3(self, ep_ctx: EpisodeContext, local_dir: Path, s3_prefix: str) -> int:
         """Sync an entire directory tree to the configured bucket (best effort)."""
 
-        if self.backend not in {"s3", "minio"} or self._client is None:
+        return self.upload_dir(local_dir, s3_prefix)
+
+    def upload_dir(self, local_dir: Path | str, s3_prefix: str, *, guess_mime: bool = True) -> int:
+        if not self.s3_enabled() or not self.write_enabled:
             return 0
-        if not local_dir.exists() or not local_dir.is_dir():
+        root = Path(local_dir)
+        if not root.exists() or not root.is_dir():
             return 0
-        s3_prefix = s3_prefix.rstrip("/") + "/"
+        prefix = (s3_prefix or "").rstrip("/")
+        if not prefix:
+            LOGGER.debug("Empty S3 prefix for upload_dir; skipping")
+            return 0
+        prefix = prefix + "/"
         uploaded = 0
-        for path in local_dir.rglob("*"):
+        for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            rel = path.relative_to(local_dir).as_posix()
-            key = f"{s3_prefix}{rel}" if rel else s3_prefix.rstrip("/")
+            rel = path.relative_to(root).as_posix()
+            key = f"{prefix}{rel}" if rel else prefix.rstrip("/")
+            extra = None
+            if guess_mime:
+                mime, _ = guess_type(str(path))
+                if mime:
+                    extra = {"ContentType": mime}
             try:
-                self._client.upload_file(str(path), self.bucket, key)  # type: ignore[union-attr]
+                if extra:
+                    self._client.upload_file(str(path), self.bucket, key, ExtraArgs=extra)  # type: ignore[union-attr]
+                else:
+                    self._client.upload_file(str(path), self.bucket, key)  # type: ignore[union-attr]
                 uploaded += 1
-            except Exception as exc:  # pragma: no cover - best-effort upload
-                LOGGER.warning(
-                    "Failed to sync artifact %s to s3://%s/%s: %s",
-                    path,
-                    self.bucket,
-                    key,
-                    exc,
-                )
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning("Failed to upload %s to s3://%s/%s: %s", path, self.bucket, key, exc)
         return uploaded
 
     def list_objects(self, prefix: str, suffix: str | None = None, max_items: int = 1000) -> List[str]:

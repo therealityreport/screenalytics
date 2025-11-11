@@ -26,6 +26,8 @@ except ModuleNotFoundError:
 DEFAULT_DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DETECTOR_CHOICES = {"retinaface", "yolov8face"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
+DEFAULT_DETECTOR_ENV = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
+DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
 
 JobRecord = Dict[str, Any]
 
@@ -150,12 +152,13 @@ class JobService:
         detector: str,
         tracker: str,
         max_gap: int | None,
+        det_thresh: float | None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
-        self.ensure_retinaface_ready(detector_value, stub, device)
+        self.ensure_retinaface_ready(detector_value, stub, device, det_thresh)
         progress_path = self._progress_path(ep_id)
         command = [
             sys.executable,
@@ -186,6 +189,8 @@ class JobService:
         command += ["--tracker", tracker_value]
         if max_gap is not None:
             command += ["--max-gap", str(max_gap)]
+        if det_thresh is not None:
+            command += ["--det-thresh", str(det_thresh)]
         requested = {
             "stride": stride,
             "fps": fps,
@@ -197,6 +202,7 @@ class JobService:
             "detector": detector_value,
             "tracker": tracker_value,
             "max_gap": max_gap,
+            "det_thresh": det_thresh,
         }
         return self._launch_job(
             job_type="detect_track",
@@ -366,18 +372,26 @@ class JobService:
         return self._mutate_job(job_id, _apply)
 
     def _normalize_detector(self, detector: str | None) -> str:
-        value = (detector or "").strip().lower()
+        fallback = DEFAULT_DETECTOR_ENV or "retinaface"
+        value = (detector or fallback).strip().lower()
         if value not in DETECTOR_CHOICES:
             raise ValueError(f"Unsupported detector '{detector}'")
         return value
 
     def _normalize_tracker(self, tracker: str | None) -> str:
-        value = (tracker or "").strip().lower()
+        fallback = DEFAULT_TRACKER_ENV or "bytetrack"
+        value = (tracker or fallback).strip().lower()
         if value not in TRACKER_CHOICES:
             raise ValueError(f"Unsupported tracker '{tracker}'")
         return value
 
-    def ensure_retinaface_ready(self, detector: str, stub: bool, device: str) -> None:
+    def ensure_retinaface_ready(
+        self,
+        detector: str,
+        stub: bool,
+        device: str,
+        det_thresh: float | None,
+    ) -> None:
         if stub or detector != "retinaface":
             return
         if episode_run is None:
@@ -385,7 +399,10 @@ class JobService:
                 "RetinaFace validation unavailable: install the ML stack (pip install -r requirements-ml.txt) "
                 "before running RetinaFace."
             )
-        ok, error_detail, _ = episode_run.ensure_retinaface_ready(device)
+        ok, error_detail, _ = episode_run.ensure_retinaface_ready(
+            device,
+            det_thresh if det_thresh is not None else None,
+        )
         if ok:
             return
         message = episode_run.RETINAFACE_HELP

@@ -15,10 +15,21 @@ import streamlit.components.v1 as components
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DEFAULT_STRIDE = 3
+DEFAULT_DETECTOR = "retinaface"
+DEFAULT_TRACKER = "bytetrack"
+DEFAULT_DEVICE = "auto"
+DEFAULT_DEVICE_LABEL = "Auto"
+DEFAULT_DET_THRESH = 0.5
+LABEL = {
+    DEFAULT_DETECTOR: "RetinaFace (recommended)",
+    "yolov8face": "YOLOv8-face (alt)",
+    DEFAULT_TRACKER: "ByteTrack (default)",
+    "strongsort": "StrongSORT (ReID)",
+}
 DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
 DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
 DETECTOR_OPTIONS = [
-    ("RetinaFace (recommended)", "retinaface"),
+    ("RetinaFace (recommended)", DEFAULT_DETECTOR),
     ("YOLOv8-face (alt)", "yolov8face"),
 ]
 DETECTOR_LABELS = [label for label, _ in DETECTOR_OPTIONS]
@@ -26,7 +37,7 @@ DETECTOR_VALUE_MAP = {label: value for label, value in DETECTOR_OPTIONS}
 DETECTOR_LABEL_MAP = {value: label for label, value in DETECTOR_OPTIONS}
 FACE_ONLY_DETECTORS = {"retinaface", "yolov8face"}
 TRACKER_OPTIONS = [
-    ("ByteTrack (default)", "bytetrack"),
+    ("ByteTrack (default)", DEFAULT_TRACKER),
     ("StrongSORT (ReID)", "strongsort"),
 ]
 TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
@@ -82,8 +93,8 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
 
     if "device_default_label" not in st.session_state:
         st.session_state["device_default_label"] = _guess_device_label()
-    st.session_state.setdefault("detector_choice", "retinaface")
-    st.session_state.setdefault("tracker_choice", "bytetrack")
+    st.session_state.setdefault("detector_choice", DEFAULT_DETECTOR)
+    st.session_state.setdefault("tracker_choice", DEFAULT_TRACKER)
 
     sidebar = st.sidebar
     sidebar.header("API")
@@ -181,11 +192,11 @@ def device_label_index(label: str) -> int:
 
 
 def detector_default_value() -> str:
-    return st.session_state.get("detector_choice", "retinaface")
+    return st.session_state.get("detector_choice", DEFAULT_DETECTOR)
 
 
 def detector_label_index(value: str | None) -> int:
-    key = str(value).lower() if value else "retinaface"
+    key = str(value).lower() if value else DEFAULT_DETECTOR
     label = DETECTOR_LABEL_MAP.get(key)
     if label in DETECTOR_LABELS:
         return DETECTOR_LABELS.index(label)
@@ -199,12 +210,6 @@ def detector_label_from_value(value: str | None) -> str:
     return DETECTOR_LABEL_MAP.get(value, value)
 
 
-def set_detector_choice(value: str) -> None:
-    key = (value or "").lower()
-    if key in FACE_ONLY_DETECTORS:
-        st.session_state["detector_choice"] = key
-
-
 def remember_detector(value: str | None) -> None:
     key = (value or "").lower() if value else ""
     if key in FACE_ONLY_DETECTORS:
@@ -212,11 +217,11 @@ def remember_detector(value: str | None) -> None:
 
 
 def tracker_default_value() -> str:
-    return st.session_state.get("tracker_choice", "bytetrack")
+    return st.session_state.get("tracker_choice", DEFAULT_TRACKER)
 
 
 def tracker_label_index(value: str | None) -> int:
-    key = str(value).lower() if value else "bytetrack"
+    key = str(value).lower() if value else DEFAULT_TRACKER
     label = TRACKER_LABEL_MAP.get(key)
     if label in TRACKER_LABELS:
         return TRACKER_LABELS.index(label)
@@ -229,16 +234,30 @@ def tracker_label_from_value(value: str | None) -> str:
     return TRACKER_LABEL_MAP.get(value.lower(), value)
 
 
-def set_tracker_choice(value: str) -> None:
-    key = (value or "").lower()
-    if key in TRACKER_LABEL_MAP:
-        st.session_state["tracker_choice"] = key
-
-
 def remember_tracker(value: str | None) -> None:
     key = (value or "").lower() if value else ""
     if key in TRACKER_LABEL_MAP:
         st.session_state["tracker_choice"] = key
+
+
+def default_detect_track_payload(
+    ep_id: str,
+    *,
+    stub: bool = False,
+    stride: int | None = None,
+    device: str | None = None,
+    det_thresh: float | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "ep_id": ep_id,
+        "stub": bool(stub),
+        "stride": int(stride if stride is not None else DEFAULT_STRIDE),
+        "device": (device or DEFAULT_DEVICE).lower(),
+        "detector": DEFAULT_DETECTOR,
+        "tracker": DEFAULT_TRACKER,
+        "det_thresh": float(det_thresh if det_thresh is not None else DEFAULT_DET_THRESH),
+    }
+    return payload
 
 
 def _guess_device_label() -> str:
