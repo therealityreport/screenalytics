@@ -357,7 +357,14 @@ class StorageService:
 
         return self.upload_dir(local_dir, s3_prefix)
 
-    def upload_dir(self, local_dir: Path | str, s3_prefix: str, *, guess_mime: bool = True) -> int:
+    def upload_dir(
+        self,
+        local_dir: Path | str,
+        s3_prefix: str,
+        *,
+        guess_mime: bool = True,
+        skip_subdirs: Iterable[str] | None = None,
+    ) -> int:
         if not self.s3_enabled() or not self.write_enabled:
             return 0
         root = Path(local_dir)
@@ -368,11 +375,30 @@ class StorageService:
             LOGGER.debug("Empty S3 prefix for upload_dir; skipping")
             return 0
         prefix = prefix + "/"
+        skip_exact: set[str] = set()
+        skip_prefixes: tuple[str, ...] = ()
+        if skip_subdirs:
+            normalized: List[str] = []
+            for entry in skip_subdirs:
+                if entry is None:
+                    continue
+                raw = str(entry).strip()
+                if not raw:
+                    continue
+                cleaned = raw.strip("/\\")
+                if not cleaned:
+                    continue
+                normalized.append(cleaned.replace("\\", "/"))
+            if normalized:
+                skip_exact = set(normalized)
+                skip_prefixes = tuple(f"{value}/" for value in skip_exact)
         uploaded = 0
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
             rel = path.relative_to(root).as_posix()
+            if skip_exact and (rel in skip_exact or any(rel.startswith(prefix) for prefix in skip_prefixes)):
+                continue
             key = f"{prefix}{rel}" if rel else prefix.rstrip("/")
             extra = None
             if guess_mime:

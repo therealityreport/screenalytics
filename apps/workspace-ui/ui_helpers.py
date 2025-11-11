@@ -548,7 +548,7 @@ def attempt_sse_run(
     url = f"{_api_base()}{endpoint_path}"
     headers = {"Accept": "text/event-stream"}
     try:
-        response = requests.post(url, json=payload, headers=headers, stream=True, timeout=(5, 60))
+        response = requests.post(url, json=payload, headers=headers, stream=True, timeout=(5, 300))
         response.raise_for_status()
     except requests.RequestException as exc:
         return None, describe_error(url, exc), False

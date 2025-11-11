@@ -1280,7 +1280,7 @@ def _sync_artifacts_to_s3(
     exporter: FrameExporter | None,
     thumb_dir: Path | None = None,
 ) -> Dict[str, int]:
-    stats = {"manifests": 0, "frames": 0, "crops": 0, "thumbs_tracks": 0}
+    stats = {"manifests": 0, "frames": 0, "crops": 0, "thumbs_tracks": 0, "thumbs_identities": 0}
     if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
         return stats
     prefixes = artifact_prefixes(ep_ctx)
@@ -1298,7 +1298,17 @@ def _sync_artifacts_to_s3(
     elif crops_dir.exists():
         stats["crops"] = storage.upload_dir(crops_dir, prefixes["crops"])
     if thumb_dir is not None and thumb_dir.exists():
-        stats["thumbs_tracks"] = storage.upload_dir(thumb_dir, prefixes.get("thumbs_tracks", ""))
+        identities_dir = thumb_dir / "identities"
+        stats["thumbs_tracks"] = storage.upload_dir(
+            thumb_dir,
+            prefixes.get("thumbs_tracks", ""),
+            skip_subdirs=("identities",),
+        )
+        if identities_dir.exists():
+            stats["thumbs_identities"] = storage.upload_dir(
+                identities_dir,
+                prefixes.get("thumbs_identities", ""),
+            )
     return stats
 
 
