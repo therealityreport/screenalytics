@@ -24,6 +24,7 @@ from .people import PeopleService, l2_normalize, cosine_distance
 GROUP_WITHIN_EP_DISTANCE = float(os.getenv("GROUP_WITHIN_EP_DISTANCE", "0.35"))
 PEOPLE_MATCH_DISTANCE = float(os.getenv("PEOPLE_MATCH_DISTANCE", "0.35"))
 PEOPLE_PROTO_MOMENTUM = float(os.getenv("PEOPLE_PROTO_MOMENTUM", "0.9"))
+SEED_CLUSTER_DELTA = float(os.getenv("SEED_CLUSTER_DELTA", "0.05"))
 
 DEFAULT_DATA_ROOT = Path("data").expanduser()
 
@@ -100,6 +101,7 @@ class GroupingService:
         # Load faces and group by cluster
         cluster_embeddings: Dict[str, List[np.ndarray]] = {cid: [] for cid in cluster_to_tracks}
         cluster_counts: Dict[str, int] = {cid: 0 for cid in cluster_to_tracks}
+        cluster_seed_matches: Dict[str, List[str]] = {cid: [] for cid in cluster_to_tracks}
 
         with faces_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -113,6 +115,7 @@ class GroupingService:
 
                 track_id = face.get("track_id")
                 embedding = face.get("embedding")
+                seed_cast_id = face.get("seed_cast_id")
 
                 if track_id is None or not embedding:
                     continue
@@ -123,6 +126,8 @@ class GroupingService:
                         emb_vec = np.array(embedding, dtype=np.float32)
                         cluster_embeddings[cluster_id].append(emb_vec)
                         cluster_counts[cluster_id] += 1
+                        if seed_cast_id:
+                            cluster_seed_matches[cluster_id].append(seed_cast_id)
                         break
 
         # Compute centroids
@@ -136,11 +141,29 @@ class GroupingService:
             mean_emb = np.mean(embs, axis=0)
             centroid = l2_normalize(mean_emb)
 
-            centroids.append({
+            # Determine primary seed (most common seed_cast_id)
+            seed_matches = cluster_seed_matches.get(cluster_id, [])
+            primary_seed = None
+            seed_confidence = 0.0
+            if seed_matches:
+                from collections import Counter
+                seed_counts = Counter(seed_matches)
+                most_common_seed, count = seed_counts.most_common(1)[0]
+                seed_confidence = count / len(seed_matches)
+                # Only use seed if >50% of faces match
+                if seed_confidence > 0.5:
+                    primary_seed = most_common_seed
+
+            centroid_entry = {
                 "cluster_id": cluster_id,
                 "centroid": centroid.tolist(),
                 "num_faces": cluster_counts[cluster_id],
-            })
+            }
+            if primary_seed:
+                centroid_entry["seed_cast_id"] = primary_seed
+                centroid_entry["seed_confidence"] = round(float(seed_confidence), 3)
+
+            centroids.append(centroid_entry)
 
         # Save to file
         output = {"ep_id": ep_id, "centroids": centroids, "computed_at": _now_iso()}
@@ -176,16 +199,24 @@ class GroupingService:
             # Nothing to group
             return {"groups": [], "merged_count": 0}
 
-        # Extract cluster IDs and centroid vectors
+        # Extract cluster IDs, centroid vectors, and seed information
         cluster_ids = [c["cluster_id"] for c in centroids_list]
         vectors = np.array([c["centroid"] for c in centroids_list], dtype=np.float32)
+        seed_cast_ids = [c.get("seed_cast_id") for c in centroids_list]
 
-        # Compute pairwise cosine distances
+        # Compute pairwise cosine distances with seed-based adjustment
         n = len(vectors)
         distance_matrix = np.zeros((n, n), dtype=np.float32)
+        seed_adjustments = 0
         for i in range(n):
             for j in range(i + 1, n):
                 dist = cosine_distance(vectors[i], vectors[j])
+
+                # Apply seed-based distance reduction if both clusters match same seed
+                if seed_cast_ids[i] and seed_cast_ids[j] and seed_cast_ids[i] == seed_cast_ids[j]:
+                    dist = max(0.0, dist - SEED_CLUSTER_DELTA)
+                    seed_adjustments += 1
+
                 distance_matrix[i, j] = dist
                 distance_matrix[j, i] = dist
 
@@ -210,6 +241,7 @@ class GroupingService:
             "groups": [{"cluster_ids": cids} for cids in merged_groups],
             "merged_count": len(merged_groups),
             "all_labels": labels.tolist(),
+            "seed_adjustments": seed_adjustments,
         }
 
     def group_across_episodes(
