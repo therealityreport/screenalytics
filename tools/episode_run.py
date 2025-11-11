@@ -806,12 +806,83 @@ def _try_import(module: str):
         return None
 
 
+def sanitize_xyxy(x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> tuple[int, int, int, int] | None:
+    """Round + clamp XYXY boxes to integer pixel coordinates, skipping empty windows."""
+    if width <= 0 or height <= 0:
+        return None
+    x1_int = int(max(0, min(round(x1), width - 1)))
+    y1_int = int(max(0, min(round(y1), height - 1)))
+    x2_int = int(max(0, min(round(x2), width)))
+    y2_int = int(max(0, min(round(y2), height)))
+    if x2_int <= x1_int or y2_int <= y1_int:
+        return None
+    return x1_int, y1_int, x2_int, y2_int
+
+
+def _image_stats(image) -> tuple[float, float, float]:
+    arr = np.asarray(image)
+    if arr.size == 0:
+        return 0.0, 0.0, 0.0
+    return float(np.nanmin(arr)), float(np.nanmax(arr)), float(np.nanmean(arr))
+
+
+def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.size == 0:
+        return arr
+    if arr.dtype == np.uint8:
+        return arr
+    if np.issubdtype(arr.dtype, np.floating):
+        mn = float(np.nanmin(arr))
+        mx = float(np.nanmax(arr))
+        if mx <= 1.0 and mn >= 0.0:
+            arr = (arr * 255.0).round()
+        elif mn >= -1.0 and mx <= 1.0:
+            arr = ((arr + 1.0) * 127.5).round()
+        arr = np.nan_to_num(arr, nan=0.0, posinf=255.0, neginf=0.0)
+        return np.clip(arr, 0, 255).astype(np.uint8)
+    if np.issubdtype(arr.dtype, np.integer):
+        arr = np.clip(arr.astype(np.int64), 0, 255)
+        return arr.astype(np.uint8)
+    return arr.astype(np.uint8, copy=False)
+
+
+def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr") -> None:
+    """Normalize + persist an image to JPEG, ensuring non-blank uint8 BGR data."""
+    import cv2  # type: ignore
+
+    arr = np.asarray(image)
+    if arr.size == 0:
+        raise ValueError(f"Cannot save empty image to {path}")
+    arr = np.ascontiguousarray(_normalize_to_uint8(arr))
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        mode = color.lower()
+        if mode == "rgb":
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        elif mode not in {"bgr", "rgb"}:
+            raise ValueError(f"Unsupported color mode '{color}'")
+    else:
+        raise ValueError(f"Unsupported image shape for JPEG write: {arr.shape}")
+    arr = np.ascontiguousarray(arr)
+    jpeg_quality = max(1, min(int(quality or 85), 100))
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(out_path), arr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    if not ok:
+        raise RuntimeError(f"cv2.imwrite failed for {out_path}")
+
+
 class ThumbWriter:
-    def __init__(self, ep_id: str, size: int = 256) -> None:
+    def __init__(self, ep_id: str, size: int = 256, jpeg_quality: int = 85) -> None:
         self.ep_id = ep_id
         self.size = size
+        self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
         self.root_dir.mkdir(parents=True, exist_ok=True)
+        self._stat_samples = 0
+        self._stat_limit = 10
         try:
             import cv2  # type: ignore
 
@@ -822,15 +893,22 @@ class ThumbWriter:
     def write(self, image, bbox: List[float], track_id: int, frame_idx: int) -> tuple[str | None, Path | None]:
         if self._cv2 is None or image is None:
             return None, None
-        x1, y1, x2, y2 = [int(max(coord, 0)) for coord in bbox]
-        x2 = max(x2, x1 + 1)
-        y2 = max(y2, y1 + 1)
+        h, w = image.shape[:2]
+        clamp = sanitize_xyxy(bbox[0], bbox[1], bbox[2], bbox[3], w, h)
+        if clamp is None:
+            return None, None
+        x1, y1, x2, y2 = clamp
         crop = image[y1:y2, x1:x2]
         thumb = self._letterbox(crop)
+        if self._stat_samples < self._stat_limit:
+            mn, mx, mean = _image_stats(thumb)
+            LOGGER.info("thumb stats track=%s frame=%s min=%.3f max=%.3f mean=%.3f", track_id, frame_idx, mn, mx, mean)
+            if mx - mn < 1e-6:
+                LOGGER.warning("Nearly constant thumb track=%s frame=%s", track_id, frame_idx)
+            self._stat_samples += 1
         rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
         abs_path = self.root_dir / rel_path
-        abs_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cv2.imwrite(str(abs_path), thumb)
+        save_jpeg(abs_path, thumb, quality=self.jpeg_quality, color="bgr")
         return rel_path.as_posix(), abs_path
 
     def _letterbox(self, crop):
@@ -1030,35 +1108,18 @@ class FrameExporter:
             self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.frames_written = 0
         self.crops_written = 0
-        self._cv2 = None
         self._track_indexes: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self._stat_samples = 0
+        self._stat_limit = 10
 
-    def _ensure_cv2(self):
-        if self._cv2 is None:
-            import cv2  # type: ignore
-
-            self._cv2 = cv2
-
-    def _write_jpeg(self, path: Path, image) -> None:
-        self._ensure_cv2()
-        cv2 = self._cv2
-        params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
-        ok, buffer = cv2.imencode(".jpg", image, params)
-        if not ok:
-            raise RuntimeError(f"Failed to encode JPEG for {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(buffer.tobytes())
-
-    def _clamp_bbox(self, image, bbox: List[float]) -> tuple[int, int, int, int] | None:
-        h, w = image.shape[:2]
-        x1, y1, x2, y2 = bbox
-        x1 = max(int(math.floor(x1)), 0)
-        y1 = max(int(math.floor(y1)), 0)
-        x2 = min(int(math.ceil(x2)), w)
-        y2 = min(int(math.ceil(y2)), h)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        return x1, y1, x2, y2
+    def _log_image_stats(self, kind: str, path: Path, image) -> None:
+        if self._stat_samples >= self._stat_limit:
+            return
+        mn, mx, mean = _image_stats(image)
+        LOGGER.info("%s stats %s min=%.3f max=%.3f mean=%.3f", kind, path, mn, mx, mean)
+        if mx - mn < 1e-6:
+            LOGGER.warning("Nearly constant %s %s mn=%.6f mx=%.6f mean=%.6f", kind, path, mn, mx, mean)
+        self._stat_samples += 1
 
     def export(self, frame_idx: int, image, crops: List[Tuple[int, List[float]]], ts: float | None = None) -> None:
         if not (self.save_frames or self.save_crops):
@@ -1066,7 +1127,8 @@ class FrameExporter:
         if self.save_frames:
             frame_path = self.frames_dir / f"frame_{frame_idx:06d}.jpg"
             try:
-                self._write_jpeg(frame_path, image)
+                self._log_image_stats("frame", frame_path, image)
+                save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
                 self.frames_written += 1
             except Exception as exc:  # pragma: no cover - best effort
                 LOGGER.warning("Failed to save frame %s: %s", frame_path, exc)
@@ -1074,7 +1136,7 @@ class FrameExporter:
             for track_id, bbox in crops:
                 if track_id is None:
                     continue
-                clamp = self._clamp_bbox(image, bbox)
+                clamp = sanitize_xyxy(bbox[0], bbox[1], bbox[2], bbox[3], image.shape[1], image.shape[0])
                 if clamp is None:
                     continue
                 x1, y1, x2, y2 = clamp
@@ -1083,7 +1145,8 @@ class FrameExporter:
                     continue
                 crop_path = self.crop_abs_path(track_id, frame_idx)
                 try:
-                    self._write_jpeg(crop_path, crop_img)
+                    self._log_image_stats("crop", crop_path, crop_img)
+                    save_jpeg(crop_path, crop_img, quality=self.jpeg_quality, color="bgr")
                     self.crops_written += 1
                     self._record_crop_index(track_id, frame_idx, ts)
                 except Exception as exc:  # pragma: no cover - best effort

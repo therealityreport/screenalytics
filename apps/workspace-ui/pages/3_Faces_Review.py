@@ -164,8 +164,24 @@ def _fetch_track_media(
     if isinstance(payload, dict):
         items = payload.get("items", []) or []
         next_cursor = payload.get("next_start_after")
-        return items, next_cursor
-    return payload or [], None
+        return _prepare_media_items(items), next_cursor
+    return _prepare_media_items(payload or []), None
+
+
+def _prepare_media_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        normalized_url = helpers.ensure_media_url(url)
+        if normalized_url != url:
+            cloned = dict(entry)
+            cloned["url"] = normalized_url
+            normalized.append(cloned)
+        else:
+            normalized.append(entry)
+    return normalized
 
 
 def _episode_header(ep_id: str) -> Dict[str, Any] | None:

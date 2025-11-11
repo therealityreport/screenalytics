@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
 import json
 import time
 import html
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -20,6 +23,7 @@ DEFAULT_TRACKER = "bytetrack"
 DEFAULT_DEVICE = "auto"
 DEFAULT_DEVICE_LABEL = "Auto"
 DEFAULT_DET_THRESH = 0.5
+_LOCAL_MEDIA_CACHE_SIZE = 256
 LABEL = {
     DEFAULT_DETECTOR: "RetinaFace (recommended)",
     "yolov8face": "YOLOv8-face (alt)",
@@ -159,6 +163,46 @@ def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[st
 
 def link_local(path: Path | str) -> str:
     return f"`{path}`"
+
+
+@lru_cache(maxsize=_LOCAL_MEDIA_CACHE_SIZE)
+def _data_url_cache(path_str: str) -> str | None:
+    file_path = Path(path_str)
+    try:
+        data = file_path.read_bytes()
+    except OSError:
+        return None
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def ensure_media_url(path_or_url: str | Path | None) -> str | None:
+    """Return a browser-safe URL for local artifacts, falling back to the original string."""
+    if not path_or_url:
+        return None
+    value = str(path_or_url)
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https", "data"}:
+        return value
+    candidate_paths: List[Path] = []
+    if scheme == "file":
+        candidate_paths.append(Path(parsed.path))
+    else:
+        candidate_paths.append(Path(value))
+    first = candidate_paths[0]
+    if not first.is_absolute():
+        candidate_paths.append((DATA_ROOT / first).expanduser())
+    for candidate in candidate_paths:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved.is_file():
+            cached = _data_url_cache(str(resolved))
+            if cached:
+                return cached
+    return value
 
 
 def human_size(num_bytes: int | None) -> str:
