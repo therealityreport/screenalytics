@@ -496,9 +496,27 @@ def update_progress_display(
     requested_device: str,
     requested_detector: str | None,
     requested_tracker: str | None,
-) -> None:
+) -> tuple[str, str]:
     ratio = progress_ratio(progress)
     progress_bar.progress(ratio)
+    status_line, frames_line = compose_progress_text(
+        progress,
+        requested_device=requested_device,
+        requested_detector=requested_detector,
+        requested_tracker=requested_tracker,
+    )
+    status_placeholder.write(status_line)
+    detail_placeholder.caption(frames_line)
+    return status_line, frames_line
+
+
+def compose_progress_text(
+    progress: Dict[str, Any],
+    *,
+    requested_device: str,
+    requested_detector: str | None,
+    requested_tracker: str | None,
+) -> tuple[str, str]:
     secs_total = total_seconds_hint(progress)
     secs_done = progress.get("secs_done") or progress.get("elapsed_sec")
     phase = progress.get("phase") or "detect"
@@ -513,12 +531,12 @@ def update_progress_display(
     tracker_label = tracker_label_from_value(raw_tracker) if raw_tracker else "--"
     fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
-    status_placeholder.write(
-        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • phase={phase} • detector={detector_label} • tracker={tracker_label} • device={device_text} • fps={fps_text}"
+    status_line = (
+        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • "
+        f"phase={phase} • detector={detector_label} • tracker={tracker_label} • device={device_text} • fps={fps_text}"
     )
-    detail_placeholder.caption(
-        f"Frames {progress.get('frames_done', 0):,} / {progress.get('frames_total') or '?'}"
-    )
+    frames_line = f"Frames {progress.get('frames_done', 0):,} / {progress.get('frames_total') or '?'}"
+    return status_line, frames_line
 
 
 def attempt_sse_run(
@@ -689,11 +707,15 @@ def run_job_with_progress(
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
     detail_placeholder = st.empty()
+    log_placeholder = st.empty()
+    log_lines: List[str] = []
+    max_log_lines = 25
+    log_placeholder.code("Waiting for progress updates…", language="text")
 
     def _cb(progress: Dict[str, Any]) -> None:
         if progress.get("detector"):
             remember_detector(progress.get("detector"))
-        update_progress_display(
+        status_line, frames_line = update_progress_display(
             progress,
             progress_bar=progress_bar,
             status_placeholder=status_placeholder,
@@ -702,6 +724,10 @@ def run_job_with_progress(
             requested_detector=requested_detector,
             requested_tracker=requested_tracker,
         )
+        log_lines.append(f"{status_line}\n{frames_line}")
+        if len(log_lines) > max_log_lines:
+            del log_lines[0 : len(log_lines) - max_log_lines]
+        log_placeholder.code("\n\n".join(log_lines), language="text")
 
     summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
     if (error_message or summary is None) and not error_message and async_endpoint:
