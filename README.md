@@ -183,6 +183,11 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
 **Note:** Stub mode (`Run detect/track (stub)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
 
+**Common errors**
+
+- `Connection refused` — Start the API via `python -m uvicorn apps.api.main:app --reload` and confirm it responds: `curl http://localhost:8000/healthz`.
+- `API_BASE_URL mismatch` — Export the correct `SCREENALYTICS_API_URL` (or update `.env`) so the UI hits the right host/port.
+
 #### Troubleshooting (macOS / FFmpeg / PyAV)
 
 `faster-whisper` depends on PyAV, which may try to build against Homebrew’s FFmpeg 8.x headers on Apple Silicon. If you only need the API, UI, or stub detect/track flow, stick to `requirements-core.txt`—these features do **not** require PyAV or the rest of the ML stack. Install `requirements-ml.txt` only when you plan to run the full pipeline and have a working FFmpeg toolchain.

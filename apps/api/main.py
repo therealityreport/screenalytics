@@ -25,3 +25,8 @@ app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"ok": True}
