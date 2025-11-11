@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -19,6 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 from apps.api.services.grouping import GroupingService
+
+LOGGER = logging.getLogger("episode_cleanup")
 
 
 DEFAULT_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
@@ -198,6 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ensure_dirs(args.ep_id)
     manifests_dir = get_path(args.ep_id, "detections").parent
     data_actions = _normalize_actions(args.actions)
+    LOGGER.info("[cleanup] starting run ep_id=%s actions=%s", args.ep_id, data_actions)
     progress_path = Path(args.progress_file) if args.progress_file else manifests_dir / "cleanup_progress.json"
     video_path = Path(args.video) if args.video else get_path(args.ep_id, "video")
     if not video_path.exists():
@@ -216,20 +220,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     if "split_tracks" in data_actions:
         _run_command(_build_detect_command(args, video_path, progress_path))
         tracks_after = _count_lines(tracks_path)
+        LOGGER.info(
+            "[cleanup] split_tracks done: tracks %s → %s (Δ %+d)",
+            tracks_before,
+            tracks_after,
+            tracks_after - tracks_before,
+        )
     else:
         tracks_after = tracks_before
 
     if "reembed" in data_actions:
         _run_command(_build_faces_command(args, progress_path))
+        LOGGER.info("[cleanup] reembed done: faces now %s", _count_lines(faces_path))
     if "recluster" in data_actions:
         _run_command(_build_cluster_command(args, progress_path))
+        LOGGER.info("[cleanup] recluster done (identities will refresh).")
     faces_after = _count_lines(faces_path)
     identities_doc = _read_json(identities_path)
     clusters_after = len(identities_doc.get("identities", [])) if identities_doc else 0
+    LOGGER.info(
+        "[cleanup] cluster stats: clusters %s → %s (Δ %+d) · faces=%s",
+        clusters_before,
+        clusters_after,
+        clusters_after - clusters_before,
+        faces_after,
+    )
 
     metrics_path = manifests_dir / "track_metrics.json"
     metrics_payload = _read_json(metrics_path) or {}
     splits = metrics_payload.get("metrics", {}).get("appearance_gate", {}).get("splits", {})
+    if splits:
+        LOGGER.info(
+            "[cleanup] gate splits breakdown: hard=%s streak=%s iou=%s total=%s",
+            splits.get("hard"),
+            splits.get("streak"),
+            splits.get("iou"),
+            splits.get("total"),
+        )
 
     grouping_result = None
     if "group_clusters" in data_actions:
@@ -244,6 +271,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "within_episode": within,
             "across_episodes": across,
         }
+        centroids_count = len(centroids.get("centroids", []))
+        merged = within.get("merged_count", 0) if isinstance(within, dict) else 0
+        assigned = len(across.get("assigned", [])) if isinstance(across, dict) else 0
+        new_people = across.get("new_people_count", 0) if isinstance(across, dict) else 0
+        LOGGER.info(
+            "[cleanup] grouping done: centroids=%s merged=%s assigned=%s new_people=%s",
+            centroids_count,
+            merged,
+            assigned,
+            new_people,
+        )
 
     report = {
         "ep_id": args.ep_id,
@@ -260,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _write_json(report_path, report)
     _write_json(progress_path, {"stage": "episode_cleanup", "summary": report, "ep_id": args.ep_id})
 
-    print(f"[cleanup] wrote report to {report_path}")
+    LOGGER.info("[cleanup] completed run for %s; report → %s", args.ep_id, report_path)
     return 0
 
 

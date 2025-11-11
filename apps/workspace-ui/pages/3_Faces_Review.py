@@ -282,11 +282,19 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
             if _api_post(f"/episodes/{ep_id}/mirror"):
                 st.success("Mirror complete.")
                 st.rerun()
-    st.button(
+    action_cols = st.columns([1, 1])
+    action_cols[0].button(
         "Open Episode Detail",
         key="facebank_open_detail",
         on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
     )
+    with action_cols[1]:
+        if st.button("Cluster Cleanup", key="facebank_cleanup_button"):
+            payload = helpers.default_cleanup_payload(ep_id)
+            with st.spinner("Starting cleanup job…"):
+                resp = _api_post("/jobs/episode_cleanup_async", payload)
+            if resp:
+                st.success(f"Cleanup job {resp.get('job_id', 'queued')} started.")
     return detail
 
 

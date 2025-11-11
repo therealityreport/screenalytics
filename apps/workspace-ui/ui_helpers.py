@@ -26,6 +26,7 @@ DEFAULT_TRACKER = "bytetrack"
 DEFAULT_DEVICE = "auto"
 DEFAULT_DEVICE_LABEL = "Auto"
 DEFAULT_DET_THRESH = 0.5
+DEFAULT_MAX_GAP = 30
 _LOCAL_MEDIA_CACHE_SIZE = 256
 
 # Thumbnail constants
@@ -433,6 +434,33 @@ def default_detect_track_payload(
         "scene_warmup_dets": SCENE_WARMUP_DETS_DEFAULT,
     }
     return payload
+
+
+def default_cleanup_payload(ep_id: str) -> Dict[str, Any]:
+    """Default payload for /jobs/episode_cleanup_async."""
+    return {
+        "ep_id": ep_id,
+        "stride": DEFAULT_STRIDE,
+        "fps": 0.0,
+        "device": DEFAULT_DEVICE,
+        "embed_device": DEFAULT_DEVICE,
+        "detector": DEFAULT_DETECTOR,
+        "tracker": DEFAULT_TRACKER,
+        "max_gap": DEFAULT_MAX_GAP,
+        "det_thresh": DEFAULT_DET_THRESH,
+        "save_frames": False,
+        "save_crops": False,
+        "jpeg_quality": 85,
+        "scene_detector": SCENE_DETECTOR_DEFAULT,
+        "scene_threshold": SCENE_THRESHOLD_DEFAULT,
+        "scene_min_len": SCENE_MIN_LEN_DEFAULT,
+        "scene_warmup_dets": SCENE_WARMUP_DETS_DEFAULT,
+        "cluster_thresh": 0.6,
+        "min_cluster_size": 2,
+        "thumb_size": 256,
+        "actions": ["split_tracks", "reembed", "recluster", "group_clusters"],
+        "write_back": True,
+    }
 
 
 def _guess_device_label() -> str:
