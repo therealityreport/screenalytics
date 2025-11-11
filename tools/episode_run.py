@@ -762,6 +762,7 @@ class FrameExporter:
         self.frames_written = 0
         self.crops_written = 0
         self._cv2 = None
+        self._track_indexes: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
     def _ensure_cv2(self):
         if self._cv2 is None:
@@ -790,7 +791,7 @@ class FrameExporter:
             return None
         return x1, y1, x2, y2
 
-    def export(self, frame_idx: int, image, crops: List[Tuple[int, List[float]]]) -> None:
+    def export(self, frame_idx: int, image, crops: List[Tuple[int, List[float]]], ts: float | None = None) -> None:
         if not (self.save_frames or self.save_crops):
             return
         if self.save_frames:
@@ -815,6 +816,7 @@ class FrameExporter:
                 try:
                     self._write_jpeg(crop_path, crop_img)
                     self.crops_written += 1
+                    self._record_crop_index(track_id, frame_idx, ts)
                 except Exception as exc:  # pragma: no cover - best effort
                     LOGGER.warning("Failed to save crop %s: %s", crop_path, exc)
 
@@ -826,6 +828,33 @@ class FrameExporter:
 
     def crop_abs_path(self, track_id: int, frame_idx: int) -> Path:
         return self.crops_dir / self.crop_component(track_id, frame_idx)
+
+    def _record_crop_index(self, track_id: int, frame_idx: int, ts: float | None) -> None:
+        if not self.save_crops:
+            return
+        key = self.crop_component(track_id, frame_idx)
+        entry = {
+            "key": key,
+            "frame_idx": int(frame_idx),
+            "ts": round(float(ts), 4) if ts is not None else None,
+        }
+        self._track_indexes.setdefault(track_id, {})[key] = entry
+
+    def write_indexes(self) -> None:
+        if not self.save_crops or not self._track_indexes:
+            return
+        for track_id, entries in self._track_indexes.items():
+            if not entries:
+                continue
+            track_dir = self.crops_dir / f"track_{track_id:04d}"
+            if not track_dir.exists():
+                continue
+            ordered = sorted(entries.values(), key=lambda item: item["frame_idx"])
+            index_path = track_dir / "index.json"
+            try:
+                index_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
+            except Exception as exc:  # pragma: no cover - best effort
+                LOGGER.warning("Failed to write crop index %s: %s", index_path, exc)
 
 
 class FrameDecoder:
@@ -1204,7 +1233,7 @@ def _run_full_pipeline(
 
                 if not detections:
                     if frame_exporter and frame_exporter.save_frames:
-                        frame_exporter.export(frame_idx, frame, [])
+                        frame_exporter.export(frame_idx, frame, [], ts=ts)
                     if progress:
                         emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
                         progress.emit(
@@ -1252,7 +1281,7 @@ def _run_full_pipeline(
                         crop_records.append((export_id, bbox_list))
 
                 if frame_exporter and (frame_exporter.save_frames or crop_records):
-                    frame_exporter.export(frame_idx, frame, crop_records)
+                    frame_exporter.export(frame_idx, frame, crop_records, ts=ts)
 
                 if progress:
                     emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
@@ -1272,6 +1301,8 @@ def _run_full_pipeline(
         cap.release()
 
     recorder.finalize()
+    if frame_exporter:
+        frame_exporter.write_indexes()
     track_rows = recorder.rows()
     for row in track_rows:
         row["ep_id"] = args.ep_id
@@ -1503,7 +1534,7 @@ def _run_faces_embed_stage(
                 image = frame_decoder.read(frame_idx)
 
             if exporter and image is not None:
-                exporter.export(frame_idx, image, [(track_id, bbox)])
+                exporter.export(frame_idx, image, [(track_id, bbox)], ts=ts_val)
                 if exporter.save_crops:
                     crop_rel_path = exporter.crop_rel_path(track_id, frame_idx)
                     if s3_prefixes and s3_prefixes.get("crops"):
@@ -1568,6 +1599,8 @@ def _run_faces_embed_stage(
             np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
 
         _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
+        if exporter:
+            exporter.write_indexes()
 
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
         summary: Dict[str, Any] = {

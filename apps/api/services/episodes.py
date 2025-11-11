@@ -154,5 +154,13 @@ class EpisodeStore:
         records = [EpisodeRecord(**data) for data in content.values()]  # type: ignore[arg-type]
         return sorted(records, key=lambda record: record.updated_at, reverse=True)
 
+    def delete(self, ep_id: str) -> bool:
+        content = self._read()
+        if ep_id not in content:
+            return False
+        content.pop(ep_id, None)
+        self._write(content)
+        return True
+
 
 __all__ = ["EpisodeStore", "EpisodeRecord"]

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
+import re
 import sys
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List
-
-import json
-import re
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -19,11 +20,19 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.storage import StorageService, artifact_prefixes, episode_context_from_id
+from apps.api.services.storage import (
+    StorageService,
+    artifact_prefixes,
+    delete_local_tree,
+    delete_s3_prefix,
+    episode_context_from_id,
+    v2_artifact_prefixes,
+)
 
 router = APIRouter()
 EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
+LOGGER = logging.getLogger(__name__)
 
 
 def _manifests_dir(ep_id: str) -> Path:
@@ -44,6 +53,69 @@ def _tracks_path(ep_id: str) -> Path:
 
 def _thumbs_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "thumbs"
+
+
+def _analytics_root(ep_id: str) -> Path:
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+    return data_root / "analytics" / ep_id
+
+
+def _episode_local_dirs(ep_id: str) -> List[Path]:
+    dirs = [
+        get_path(ep_id, "video").parent,
+        get_path(ep_id, "frames_root"),
+        _manifests_dir(ep_id),
+        _analytics_root(ep_id),
+    ]
+    unique: List[Path] = []
+    seen = set()
+    for path in dirs:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def _delete_episode_assets(ep_id: str, options: DeleteEpisodeIn) -> Dict[str, Any]:
+    record = EPISODE_STORE.get(ep_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid episode id") from exc
+    local_deleted = 0
+    if options.delete_local:
+        for path in _episode_local_dirs(ep_id):
+            if not path.exists():
+                continue
+            try:
+                delete_local_tree(path)
+                local_deleted += 1
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                LOGGER.warning("Failed to delete %s: %s", path, exc)
+    s3_deleted = 0
+    prefixes: Dict[str, str] | None = None
+    if options.delete_artifacts or options.delete_raw:
+        prefixes = v2_artifact_prefixes(ep_ctx)
+    if options.delete_artifacts and prefixes:
+        for key in ("frames", "crops", "manifests", "analytics"):
+            prefix = prefixes.get(key)
+            if prefix:
+                s3_deleted += delete_s3_prefix(STORAGE.bucket, prefix, storage=STORAGE)
+    if options.delete_raw and prefixes:
+        for key in ("raw_v2", "raw_v1"):
+            prefix = prefixes.get(key)
+            if prefix:
+                s3_deleted += delete_s3_prefix(STORAGE.bucket, prefix, storage=STORAGE)
+    removed = EPISODE_STORE.delete(ep_id)
+    return {
+        "ep_id": ep_id,
+        "deleted": {"local_dirs": local_deleted, "s3_objects": s3_deleted},
+        "removed_from_store": removed,
+    }
 
 
 FRAME_IDX_RE = re.compile(r"frame_(\d+)\.jpg$", re.IGNORECASE)
@@ -254,40 +326,6 @@ def _media_entry(track_id: int, frame_idx: int, key: str, url: str, meta: Dict[s
     }
 
 
-def _list_track_crop_media(ep_id: str, track_id: int, sample: int, limit: int, offset: int) -> List[Dict[str, Any]]:
-    sample = max(1, sample)
-    limit = max(1, min(limit, TRACK_LIST_MAX_LIMIT))
-    offset = max(0, offset)
-    face_rows = _track_face_rows(ep_id, track_id)
-    max_candidates = _max_candidate_count(limit, offset, sample)
-    entries: List[Dict[str, Any]] = []
-    if STORAGE.backend == "local":
-        crops_dir = get_path(ep_id, "frames_root") / "crops" / f"track_{track_id:04d}"
-        if crops_dir.exists():
-            files = sorted(crops_dir.glob("frame_*.jpg"))[:max_candidates]
-            for path in files:
-                frame_idx = _frame_idx_from_name(path.name)
-                if frame_idx is None:
-                    continue
-                meta = face_rows.get(frame_idx, {})
-                path_str = path.as_posix()
-                entries.append(_media_entry(track_id, frame_idx, path_str, path_str, meta))
-    else:
-        _, prefixes = _require_episode_context(ep_id)
-        base_prefix = f"{prefixes['crops']}track_{track_id:04d}/"
-        keys = STORAGE.list_objects(base_prefix, suffix=".jpg", max_items=max_candidates)
-        for key in keys:
-            frame_idx = _frame_idx_from_name(key)
-            if frame_idx is None:
-                continue
-            url = STORAGE.presign_get(key)
-            if not url:
-                continue
-            meta = face_rows.get(frame_idx, {})
-            entries.append(_media_entry(track_id, frame_idx, key, url, meta))
-    entries.sort(key=lambda item: item["frame_idx"])
-    return _apply_sampling(entries, sample, offset, limit)
-
 
 def _list_track_frame_media(ep_id: str, track_id: int, sample: int, limit: int, offset: int) -> List[Dict[str, Any]]:
     sample = max(1, sample)
@@ -456,6 +494,19 @@ class EpisodeVideoMeta(BaseModel):
     fps_detected: float | None = None
 
 
+class DeleteEpisodeIn(BaseModel):
+    delete_artifacts: bool = True
+    delete_raw: bool = False
+    delete_local: bool = True
+
+
+class PurgeAllIn(BaseModel):
+    confirm: str
+    delete_artifacts: bool = True
+    delete_raw: bool = False
+    delete_local: bool = True
+
+
 @router.get("/episodes", response_model=EpisodeListResponse, tags=["episodes"])
 def list_episodes() -> EpisodeListResponse:
     records = EPISODE_STORE.list()
@@ -501,6 +552,31 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
         if len(items) >= limit:
             break
     return S3VideosResponse(items=items, count=len(items))
+
+
+@router.delete("/episodes/{ep_id}")
+def delete_episode(ep_id: str, body: DeleteEpisodeIn = Body(default=DeleteEpisodeIn())) -> Dict[str, Any]:
+    return _delete_episode_assets(ep_id, body)
+
+
+@router.post("/episodes/purge_all")
+def purge_all(body: PurgeAllIn) -> Dict[str, Any]:
+    if body.confirm.strip() != "DELETE ALL":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch.")
+    records = EPISODE_STORE.list()
+    deleted: List[str] = []
+    totals = {"local_dirs": 0, "s3_objects": 0}
+    delete_opts = DeleteEpisodeIn(
+        delete_artifacts=body.delete_artifacts,
+        delete_raw=body.delete_raw,
+        delete_local=body.delete_local,
+    )
+    for record in records:
+        result = _delete_episode_assets(record.ep_id, delete_opts)
+        deleted.append(result["ep_id"])
+        totals["local_dirs"] += result["deleted"]["local_dirs"]
+        totals["s3_objects"] += result["deleted"]["s3_objects"]
+    return {"deleted": totals, "episodes": deleted, "count": len(deleted)}
 
 
 @router.get("/episodes/{ep_id}", response_model=EpisodeDetailResponse, tags=["episodes"])
@@ -814,9 +890,26 @@ def list_track_crops(
     track_id: int,
     sample: int = Query(5, ge=1, le=100, description="Return every Nth crop"),
     limit: int = Query(200, ge=1, le=TRACK_LIST_MAX_LIMIT),
-    offset: int = Query(0, ge=0),
-) -> List[Dict[str, Any]]:
-    return _list_track_crop_media(ep_id, track_id, sample, limit, offset)
+    start_after: str | None = Query(None, description="Opaque cursor returned by the previous call"),
+) -> Dict[str, Any]:
+    ctx, _ = _require_episode_context(ep_id)
+    payload = STORAGE.list_track_crops(ctx, track_id, sample=sample, max_keys=limit, start_after=start_after)
+    face_rows = _track_face_rows(ep_id, track_id)
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    for item in items:
+        frame_idx = item.get("frame_idx")
+        try:
+            frame_int = int(frame_idx)
+        except (TypeError, ValueError):
+            continue
+        meta = face_rows.get(frame_int, {})
+        if meta:
+            if "w" not in item and "crop_width" in meta:
+                item["w"] = meta.get("crop_width") or meta.get("width")
+            if "h" not in item and "crop_height" in meta:
+                item["h"] = meta.get("crop_height") or meta.get("height")
+            item.setdefault("ts", meta.get("ts"))
+    return payload
 
 
 @router.get("/episodes/{ep_id}/tracks/{track_id}/frames")

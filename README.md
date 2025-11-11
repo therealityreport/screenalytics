@@ -110,9 +110,9 @@ source .venv/bin/activate
 ./tools/dev-up.sh
 # Add --stub for the fast path; omit it for the YOLOv8-face + StrongSORT(ReID) pipeline.
 python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 --stub
-# Export sampled frames/crops with JPEG quality control + face-first tracking gates
+# Export sampled frames/crops with RetinaFace + ByteTrack (face-only) and JPEG controls
 python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 \
-  --detector face --tracker strongsort --min-face 96 --ratio-face 0.7,1.4 --max-gap 20 \
+  --detector retinaface --max-gap 30 \
   --save-frames --save-crops --jpeg-quality 90
 # Faces pipeline (stub paths shown below)
 python tools/episode_run.py --ep-id ep_demo --faces-embed --stub --save-crops
@@ -127,7 +127,7 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 - `data/frames/ep_demo/frames/` + `crops/` (only when `--save-frames`/`--save-crops` are provided)
 - `data/manifests/ep_demo/progress.json` (live `phase`/ETA snapshots written every ~25 frames)
 
-`episode_run.py` now auto-detects FPS whenever `--fps` is unset/`0`, emits structured progress JSON (frames, seconds, inferred FPS, device, phase) to stdout **and** to `progress.json`, and finishes with a `phase:"done"` payload that includes stage-specific counts, per-run track metrics (`tracks_born`, `tracks_lost`, `id_switches`, `longest_tracks`), plus local + v2 S3 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). `--detector {face,person}` and `--tracker {strongsort,bytetrack}` gate the pipeline (default = `face` + `strongsort` whenever GPU/MPS is available). Face-first runs accept additional safeguards: `--conf-face`, `--min-face`, `--ratio-face min,max`, and `--max-gap` (frames of silence allowed before a track is forcibly split). `--faces-embed` writes `faces.jsonl` (optionally exporting crops + S3 sync) and `--cluster` produces `identities.json` with per-identity stats so the Facebank can relabel/merge tracks.
+`episode_run.py` now auto-detects FPS whenever `--fps` is unset/`0`, emits structured progress JSON (frames, seconds, inferred FPS, device, detector, phase) to stdout **and** to `progress.json`, and finishes with a `phase:"done"` payload that includes stage-specific counts, per-run track metrics (`tracks_born`, `tracks_lost`, `id_switches`, `longest_tracks`), plus local + v2 S3 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). `--detector {retinaface,yolov8face}` toggles between the high-quality InsightFace RetinaFace weights and the faster YOLOv8-face variant; ByteTrack is always run in face-only mode with tuned thresholds, so there’s no longer a separate tracker dropdown or person-class detector. `--max-gap` still controls how many skipped frames cause a track split. `--faces-embed` now runs ArcFace (`arcface_r100_v1`) via ONNX Runtime to produce 512-d unit-norm embeddings (plus optional crops/frames), and `--cluster` averages those per-track vectors before agglomerative clustering so the Facebank can relabel/merge tracks.
 
 ### Dependency profiles
 
@@ -193,7 +193,7 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 **Episode Detail live progress & exports**
 
 - “Run detect/track” negotiates `text/event-stream` against `POST /jobs/detect_track`, so Streamlit renders a live bar (`mm:ss / MM:SS • phase=<detect|track> • device=<…> • fps=<…>`). If SSE isn’t available (corporate proxies, etc.) the button falls back to `/jobs/detect_track_async` and polls the new `GET /episodes/{ep_id}/progress` every 500 ms until the `phase:"done"` payload lands.
-- Detector + tracker dropdowns bubble down to the CLI (`--detector {face,person}`, `--tracker {strongsort,bytetrack}`) with an advanced expander for the new face gates (`--conf-face`, `--min-face`, `--ratio-face`, `--max-gap`). Two checkboxes map to the exporter flags (**Save frames to S3**/`--save-frames` and **Save face crops to S3**/`--save-crops`) and a JPEG quality spinner (default 85) feeds `--jpeg-quality`. Successful runs summarize counts, exporter stats, v2 prefixes, **and** the track quality metrics surfaced by the runner (`tracks born/lost`, `id switches`, `top longest tracks`, highlighting any track that exceeds 500 frames). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
+- Detector dropdown toggles between **RetinaFace (default, higher quality)** and **YOLOv8-face (fast)**—both wired to the CLI’s `--detector {retinaface,yolov8face}` flag—while ByteTrack parameters (e.g. `--max-gap`) stay available alongside the frame/crop exporter toggles. The live status bar now renders `mm:ss / MM:SS • phase=<…> • detector=<…> • device=<…> • fps=<…>` so it’s obvious which model is currently running. Successful runs summarize counts, exporter stats, v2 prefixes, **and** the track quality metrics surfaced by the runner (`tracks born/lost`, `id switches`, `top longest tracks`, highlighting any track that exceeds 500 frames). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
 
 Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
@@ -216,10 +216,10 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
 **Faces pipeline + Facebank**
 
-- Use `Run Faces Harvest` (Episode Detail or the Facebank page) to trigger `POST /jobs/faces_embed` with SSE updates. The CLI now accepts advanced controls—`--face-detector {scrfd,mtcnn,yolov8_face}`, `--min-face-size`, `--min-face-conf`, `--face-validate/--face-validate-threshold`, and `--thumb-size`—so you can filter non-faces, enforce minimum bounding boxes, and generate uniform 256×256 letterboxed thumbnails. Every accepted face records its embedding in both `faces.jsonl` and `data/embeds/{ep_id}/faces.npy`, plus `thumbs/track_{id}/thumb_{frame}.jpg` for quick previews.
+- Use `Run Faces Harvest` (Episode Detail or the Facebank page) to trigger `POST /jobs/faces_embed` with SSE updates. The CLI exports square thumbnails plus ArcFace (`arcface_r100_v1`) embeddings via ONNX Runtime, so every face row in `faces.jsonl` stores a 512-d unit-norm vector (and the same matrix is materialized under `data/embeds/{ep_id}/faces.npy`). When legacy tracks are detected (old “person” detectors), the UI blocks harvest/cluster buttons until a fresh RetinaFace/YOLOv8-face run completes.
 - `Run Cluster` streams `POST /jobs/cluster`, which averages the per-track embeddings, clusters them with Agglomerative (tunable via `--cluster-thresh` and `--min-cluster-size`), and emits `identities.json` alongside identity-level thumbnails under `artifacts/thumbs/{show}/s{ss}/e{ee}/identities/{id}/rep.jpg`.
 - When SSE can’t be established the UI falls back to the corresponding `..._async` endpoint and polls `GET /episodes/{ep_id}/progress` every 500 ms until `phase:"done"` arrives.
-- The revamped Facebank page opens with a tracked-vs-S3 episode selector, shows a uniform identity grid (presigned thumbnails, inline Rename/Delete controls, and a **Merge into…** dropdown), and lets you drill down into clusters → tracks via a filmstrip UI. Cluster detail now renders one row per track: left/right arrows scroll a 4:5 thumbnail rail (no image rewriting; pure CSS `aspect-ratio: 4 / 5`), and a “Sample every N crops” control prevents the browser from loading thousands of JPGs at once. Each row surfaces **View track**, **Move to identity**, and **Remove from identity** actions; “Load more” fetches the next page via `GET /episodes/{ep_id}/tracks/{track_id}/crops?sample=N&limit=40&offset=…`. View Track opens the same horizontal scroller as a dedicated “modal” with its own paginator. All moderation actions call the dedicated `/identities/{ep_id}/rename|merge|move_track|drop_track|drop_frame` endpoints so `faces.jsonl`, `tracks.jsonl`, `identities.json`, and the corresponding S3 manifests stay in sync.
+- The revamped Facebank page opens with a tracked-vs-S3 episode selector, shows a uniform identity grid (presigned thumbnails, inline Rename/Delete controls, and a **Merge into…** dropdown), and lets you drill down into clusters → tracks via a filmstrip UI. Cluster detail now renders one row per track: left/right arrows scroll a 4:5 thumbnail rail (no image rewriting; pure CSS `aspect-ratio: 4 / 5`), and a “Sample every N crops” control prevents the browser from loading thousands of JPGs at once. Each row surfaces **View track**, **Move to identity**, and **Remove from identity** actions; “Load more” streams the next page via `GET /episodes/{ep_id}/tracks/{track_id}/crops?sample=N&limit=40&start_after={cursor}`, where `next_start_after` is treated as an opaque cursor. View Track opens the same horizontal scroller with paginator arrows, so moderators can flip between clusters and dedicated track rails without reloading the page. All moderation actions call the dedicated `/episodes/{ep_id}/identities/...` endpoints so `faces.jsonl`, `tracks.jsonl`, `identities.json`, and the corresponding S3 manifests stay in sync.
 
 #### Run detection+tracking (real)
 
@@ -260,6 +260,12 @@ Already uploaded footage to S3 and just need to run detect/track again?
 4. Adjust `Stride`, optional `FPS` (set `0` to reuse the detected FPS shown in the UI), **Device**, frame/crop export toggles, and the **Use stub (fast, no ML)** toggle, then hit **Run detect/track**. The progress widget always renders `mm:ss / mm:ss`, device, FPS, and the target S3 prefixes (frames/crops/manifests) so you know exactly where artifacts land once the run completes.
 
 Manifest links for that episode stay visible so you can open `detections.jsonl` / `tracks.jsonl` directly after each pass.
+
+#### Delete episodes & data
+
+- **Delete episode** (Episodes page) opens a confirmation body for the currently selected `ep_id`. Pick whether to remove local caches (`data/videos`, `data/manifests`, `data/frames`, `data/analytics`), artifact prefixes in S3, and optionally the raw upload under both v2 (`raw/videos/{show}/s{ss}/e{ee}/`) and the legacy v1 (`raw/videos/{ep_id}/`). Results report how many directories/files were removed locally plus the number of S3 objects deleted by `DELETE /episodes/{ep_id}`.
+- **Delete ALL episodes & data** requires typing `DELETE ALL` and then POSTs `/episodes/purge_all`. Defaults keep raw uploads but wipe EpisodeStore, local artifacts, and S3 mirrors; checking “delete raw” removes both the v2 and v1 keys for every episode. The API response includes the episode count plus aggregate deletion stats so the UI can show a concise toast.
+- Safety guardrails refuse to delete empty prefixes, so even the “delete raw video” option is scoped to the episode-specific folders rather than the entire bucket.
 
 **Common errors**
 

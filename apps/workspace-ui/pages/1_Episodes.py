@@ -17,6 +17,110 @@ import ui_helpers as helpers  # noqa: E402
 cfg = helpers.init_page("Episodes")
 st.title("Episodes Browser")
 
+
+def _api_delete(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    base = st.session_state.get("api_base")
+    if not base:
+        st.error("API base URL missing; run init_page().")
+        return None
+    try:
+        resp = requests.delete(f"{base}{path}", json=payload, timeout=90)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+    except requests.RequestException as exc:
+        st.error(helpers.describe_error(f"{base}{path}", exc))
+        return None
+
+
+def _reset_delete_state() -> None:
+    st.session_state.pop("episodes_delete_target", None)
+
+
+def _reset_purge_state() -> None:
+    st.session_state.pop("episodes_purge_open", None)
+
+
+def _show_single_delete(ep_id: str) -> None:
+    st.markdown("#### Delete this episode")
+    if st.button("Delete episode", key=f"episodes_delete_btn_{ep_id}"):
+        st.session_state["episodes_delete_target"] = ep_id
+    target = st.session_state.get("episodes_delete_target")
+    if target != ep_id:
+        st.caption("Deletes the EpisodeStore entry, local manifests/frames, and S3 artifacts.")
+        return
+    with st.container(border=True):
+        st.warning(
+            f"You are about to delete `{ep_id}`. This removes the EpisodeStore record, manifests, frames/crops, and identities."
+        )
+        delete_local = st.checkbox("Remove local data (videos/, manifests/, frames/, analytics/)", value=True)
+        delete_artifacts = st.checkbox("Remove S3 artifacts (frames, crops, manifests, analytics)", value=True)
+        delete_raw = st.checkbox("Also delete raw source video in raw/videos/...", value=False)
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"):
+                payload = {
+                    "delete_local": delete_local,
+                    "delete_artifacts": delete_artifacts,
+                    "delete_raw": delete_raw,
+                }
+                resp = _api_delete(f"/episodes/{ep_id}", payload)
+                if resp is not None:
+                    deleted = resp.get("deleted", {})
+                    st.success(
+                        f"Deleted {ep_id}: local dirs removed={deleted.get('local_dirs', 0)}, "
+                        f"S3 objects deleted={deleted.get('s3_objects', 0)}."
+                    )
+                    _reset_delete_state()
+                    st.rerun()
+        with cols[1]:
+            if st.button("Cancel", key=f"cancel_delete_{ep_id}"):
+                _reset_delete_state()
+                st.rerun()
+
+
+def _show_purge_section() -> None:
+    st.markdown("#### Delete ALL episodes & data")
+    if st.button("Delete ALL episodes & data", key="episodes_purge_btn"):
+        st.session_state["episodes_purge_open"] = True
+    if not st.session_state.get("episodes_purge_open"):
+        st.caption("Danger zone: wipes every tracked episode.")
+        return
+    with st.container(border=True):
+        st.error(
+            "This action deletes every EpisodeStore entry plus optional local/S3 artifacts. "
+            "Type DELETE ALL to confirm."
+        )
+        delete_local = st.checkbox("Remove all local episode data", value=True, key="purge_local")
+        delete_artifacts = st.checkbox("Remove all S3 artifacts", value=True, key="purge_artifacts")
+        delete_raw = st.checkbox("Also delete every raw episode video", value=False, key="purge_raw")
+        confirm_text = st.text_input("Type DELETE ALL to confirm", key="purge_confirm")
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("Confirm purge", type="primary", key="purge_confirm_btn"):
+                payload = {
+                    "confirm": confirm_text.strip(),
+                    "delete_local": delete_local,
+                    "delete_artifacts": delete_artifacts,
+                    "delete_raw": delete_raw,
+                }
+                try:
+                    resp = helpers.api_post("/episodes/purge_all", payload)
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/purge_all", exc))
+                else:
+                    totals = resp.get("deleted", {})
+                    st.success(
+                        "Purged episodes: "
+                        f"{resp.get('count', 0)} removed · local dirs cleared={totals.get('local_dirs', 0)} · "
+                        f"S3 objects deleted={totals.get('s3_objects', 0)}."
+                    )
+                    _reset_purge_state()
+                    st.rerun()
+        with cols[1]:
+            if st.button("Cancel purge", key="purge_cancel_btn"):
+                _reset_purge_state()
+                st.rerun()
+
 try:
     episodes_payload = helpers.api_get("/episodes")
 except requests.RequestException as exc:
@@ -93,3 +197,7 @@ if st.button("Run detect/track", use_container_width=True):
             st.success(
                 f"detections: {resp['detections_count']}, tracks: {resp['tracks_count']}"
             )
+
+st.divider()
+_show_single_delete(selected_ep_id)
+_show_purge_section()

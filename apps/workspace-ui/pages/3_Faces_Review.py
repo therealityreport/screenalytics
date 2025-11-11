@@ -140,7 +140,7 @@ def _prepare_track_view_state(track_id: int, sample_every: int) -> None:
     cache = st.session_state.setdefault("track_view_cache", {})
     cache[track_id] = {
         "items": [],
-        "offset": 0,
+        "cursor": None,
         "sample": sample_every,
         "exhausted": False,
     }
@@ -151,19 +151,21 @@ def _fetch_track_media(
     track_id: int,
     *,
     sample: int,
-    offset: int,
     limit: int,
+    cursor: str | None = None,
     asset: str = "crops",
-) -> List[Dict[str, Any]]:
-    params = {"sample": max(1, int(sample)), "offset": max(0, int(offset)), "limit": max(1, int(limit))}
+) -> tuple[List[Dict[str, Any]], str | None]:
+    params = {"sample": max(1, int(sample)), "limit": max(1, int(limit))}
+    if cursor:
+        params["start_after"] = cursor
     payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/{asset}", params=params)
-    if payload is None:
-        return []
-    if isinstance(payload, dict) and "items" in payload:
-        data = payload.get("items", [])
-    else:
-        data = payload
-    return data or []
+    if not payload:
+        return [], None
+    if isinstance(payload, dict):
+        items = payload.get("items", []) or []
+        next_cursor = payload.get("next_start_after")
+        return items, next_cursor
+    return payload or [], None
 
 
 def _episode_header(ep_id: str) -> Dict[str, Any] | None:
@@ -268,19 +270,18 @@ def _render_cluster_view(ep_id: str, identity_id: str) -> None:
         track_id = track["track_id"]
         cache_entry = cluster_cache.setdefault(
             track_id,
-            {"items": [], "offset": 0, "exhausted": False},
+            {"items": [], "cursor": None, "exhausted": False},
         )
         if not cache_entry["items"] and not cache_entry.get("exhausted"):
-            fetched = _fetch_track_media(
+            fetched, cursor = _fetch_track_media(
                 ep_id,
                 track_id,
                 sample=new_sample,
-                offset=0,
                 limit=TRACK_STRIP_LIMIT,
             )
             cache_entry["items"] = fetched
-            cache_entry["offset"] = len(fetched)
-            cache_entry["exhausted"] = len(fetched) < TRACK_STRIP_LIMIT
+            cache_entry["cursor"] = cursor
+            cache_entry["exhausted"] = cursor is None or not fetched
         st.markdown(f"#### Track {track_id} · {track.get('faces_count', 0)} frames")
         action_cols = st.columns([1.1, 1.3, 1.2])
         with action_cols[0]:
@@ -305,21 +306,19 @@ def _render_cluster_view(ep_id: str, identity_id: str) -> None:
             helpers.render_track_row(track_id, row_items, thumb_height=200)
         else:
             st.info("No crops available for this track yet. Try lowering the sampling interval.")
-        if not cache_entry.get("exhausted"):
+        if not cache_entry.get("exhausted") and cache_entry.get("cursor"):
             if st.button("Load more", key=f"cluster_load_more_{identity_id}_{track_id}"):
-                more = _fetch_track_media(
+                more, cursor = _fetch_track_media(
                     ep_id,
                     track_id,
                     sample=new_sample,
-                    offset=cache_entry.get("offset", 0),
                     limit=TRACK_STRIP_LIMIT,
+                    cursor=cache_entry.get("cursor"),
                 )
                 if more:
                     cache_entry["items"].extend(more)
-                    cache_entry["offset"] = cache_entry.get("offset", 0) + len(more)
-                    cache_entry["exhausted"] = len(more) < TRACK_STRIP_LIMIT
-                else:
-                    cache_entry["exhausted"] = True
+                cache_entry["cursor"] = cursor
+                cache_entry["exhausted"] = cursor is None or not more
                 st.rerun()
         st.divider()
 
@@ -339,7 +338,12 @@ def _render_track_view(ep_id: str, track_id: int) -> None:
     cache = st.session_state.setdefault("track_view_cache", {})
     state = cache.setdefault(
         track_id,
-        {"items": [], "offset": 0, "sample": st.session_state.get("cluster_sample_every", 5), "exhausted": False},
+        {
+            "items": [],
+            "cursor": None,
+            "sample": st.session_state.get("cluster_sample_every", 5),
+            "exhausted": False,
+        },
     )
     current_sample = int(state.get("sample", st.session_state.get("cluster_sample_every", 5)))
     new_sample = int(
@@ -352,40 +356,37 @@ def _render_track_view(ep_id: str, track_id: int) -> None:
         )
     )
     if new_sample != current_sample:
-        state.update({"sample": new_sample, "items": [], "offset": 0, "exhausted": False})
+        state.update({"sample": new_sample, "items": [], "cursor": None, "exhausted": False})
         cache[track_id] = state
         st.rerun()
     if not state["items"] and not state.get("exhausted"):
-        fetched = _fetch_track_media(
+        fetched, cursor = _fetch_track_media(
             ep_id,
             track_id,
             sample=new_sample,
-            offset=0,
             limit=TRACK_VIEW_LIMIT,
         )
         state["items"] = fetched
-        state["offset"] = len(fetched)
-        state["exhausted"] = len(fetched) < TRACK_VIEW_LIMIT
+        state["cursor"] = cursor
+        state["exhausted"] = cursor is None or not fetched
     items = state.get("items", [])
     if items:
         helpers.render_track_row(track_id, items, thumb_height=240)
     else:
         st.info("No crops available for this track. Try decreasing the sample interval.")
-    if not state.get("exhausted"):
+    if not state.get("exhausted") and state.get("cursor"):
         if st.button("Load more", key=f"track_view_load_more_{track_id}"):
-            more = _fetch_track_media(
+            more, cursor = _fetch_track_media(
                 ep_id,
                 track_id,
                 sample=new_sample,
-                offset=state.get("offset", 0),
                 limit=TRACK_VIEW_LIMIT,
+                cursor=state.get("cursor"),
             )
             if more:
                 state["items"].extend(more)
-                state["offset"] = state.get("offset", 0) + len(more)
-                state["exhausted"] = len(more) < TRACK_VIEW_LIMIT
-            else:
-                state["exhausted"] = True
+            state["cursor"] = cursor
+            state["exhausted"] = cursor is None or not more
             st.rerun()
 
 

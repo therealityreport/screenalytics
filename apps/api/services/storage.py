@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from py_screenalytics.artifacts import get_path
 
@@ -21,7 +23,59 @@ _V2_KEY_RE = re.compile(
 )
 _V1_KEY_RE = re.compile(r"raw/videos/(?P<ep_id>[^/]+)/episode\.mp4")
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
+_FRAME_NAME_RE = re.compile(r"frame_(\d{6})\.jpg$", re.IGNORECASE)
+_CURSOR_SEP = "|"
 LOGGER = logging.getLogger(__name__)
+
+
+def _frame_idx_from_key(key: str) -> int | None:
+    match = _FRAME_NAME_RE.search(key)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _split_cursor(raw: str | None) -> tuple[str | None, int]:
+    if not raw:
+        return None, 0
+    value = raw.strip()
+    if not value:
+        return None, 0
+    if _CURSOR_SEP in value:
+        key, _, remainder = value.partition(_CURSOR_SEP)
+        try:
+            cycle = int(remainder)
+        except ValueError:
+            cycle = 0
+        return key or None, max(cycle, 0)
+    return value, 0
+
+
+def _encode_cursor(key: str, cycle: int) -> str:
+    cycle = max(int(cycle), 0)
+    return f"{key}{_CURSOR_SEP}{cycle}" if cycle else key
+
+
+def _normalize_cursor_key(track_prefix: str, raw_key: str | None) -> str | None:
+    if not raw_key:
+        return None
+    candidate = raw_key.strip()
+    if not candidate:
+        return None
+    candidate = candidate.replace("\\", "/")
+    marker = track_prefix
+    idx = candidate.find(marker)
+    if idx >= 0:
+        candidate = candidate[idx:]
+    if candidate.startswith(marker):
+        return candidate
+    leaf = candidate.split("/")[-1]
+    if not leaf:
+        return None
+    return f"{marker}{leaf}"
 
 
 def _boto3():
@@ -350,6 +404,40 @@ class StorageService:
                 break
         return results
 
+    def delete_prefix(self, prefix: str, *, bucket_override: str | None = None) -> int:
+        if self.backend not in {"s3", "minio"} or self._client is None:
+            return 0
+        normalized = (prefix or "").lstrip("/")
+        if not normalized:
+            LOGGER.warning("Refusing to delete empty S3 prefix")
+            return 0
+        bucket = bucket_override or self.bucket
+        total_deleted = 0
+        continuation_token: str | None = None
+        while True:
+            kwargs: Dict[str, Any] = {
+                "Bucket": bucket,
+                "Prefix": normalized,
+                "MaxKeys": 1000,
+            }
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = self._client.list_objects_v2(**kwargs)
+            contents: Iterable[Dict[str, Any]] = response.get("Contents", [])
+            if not contents:
+                break
+            batch = [{"Key": obj.get("Key")} for obj in contents if isinstance(obj.get("Key"), str)]
+            if not batch:
+                break
+            self._client.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
+            total_deleted += len(batch)
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                break
+        return total_deleted
+
     def list_episode_videos_s3(
         self,
         prefix: str = "raw/videos/",
@@ -401,6 +489,297 @@ class StorageService:
                 break
         return results
 
+    # ------------------------------------------------------------------
+    def list_track_crops(
+        self,
+        ep_ctx: EpisodeContext,
+        track_id: int,
+        *,
+        sample: int = 1,
+        max_keys: int = 500,
+        start_after: str | None = None,
+    ) -> Dict[str, Any]:
+        sample = max(1, int(sample or 1))
+        max_keys = max(1, min(int(max_keys or 1), 1000))
+        track_prefix = f"track_{max(int(track_id), 0):04d}/"
+        cursor_key, cursor_cycle = _split_cursor(start_after)
+        cursor_cycle = cursor_cycle % sample
+        normalized_cursor = _normalize_cursor_key(track_prefix, cursor_key)
+        if self.backend in {"s3", "minio"} and self._client is not None:
+            return self._list_remote_track_crops(
+                ep_ctx,
+                track_prefix,
+                sample,
+                max_keys,
+                normalized_cursor,
+                cursor_cycle,
+            )
+        return self._list_local_track_crops(
+            ep_ctx.ep_id,
+            track_prefix,
+            sample,
+            max_keys,
+            normalized_cursor,
+            cursor_cycle,
+        )
+
+    def _list_local_track_crops(
+        self,
+        ep_id: str,
+        track_prefix: str,
+        sample: int,
+        max_keys: int,
+        cursor_key: str | None,
+        cursor_cycle: int,
+    ) -> Dict[str, Any]:
+        crops_root = get_path(ep_id, "frames_root") / "crops"
+        track_dir = crops_root / track_prefix.rstrip("/")
+        if not track_dir.exists() or not track_dir.is_dir():
+            return {"items": [], "next_start_after": None}
+        entries = self._load_track_index_from_path(track_dir, track_prefix)
+        if not entries:
+            entries = self._entries_from_files(track_dir, track_prefix)
+        filtered: List[Dict[str, Any]] = []
+        for entry in entries:
+            rel_key = entry["key"]
+            abs_path = crops_root / rel_key
+            if not abs_path.exists():
+                continue
+            filtered.append({**entry, "_abs_path": abs_path})
+        selected, cursor = self._slice_entries(filtered, sample, max_keys, cursor_key, cursor_cycle)
+        items: List[Dict[str, Any]] = []
+        for entry in selected:
+            abs_path: Path = entry.get("_abs_path")  # type: ignore[assignment]
+            items.append(
+                {
+                    "key": entry["key"],
+                    "frame_idx": entry["frame_idx"],
+                    "ts": entry.get("ts"),
+                    "url": abs_path.as_posix() if abs_path else None,
+                }
+            )
+        return {"items": items, "next_start_after": cursor}
+
+    def _list_remote_track_crops(
+        self,
+        ep_ctx: EpisodeContext,
+        track_prefix: str,
+        sample: int,
+        max_keys: int,
+        cursor_key: str | None,
+        cursor_cycle: int,
+    ) -> Dict[str, Any]:
+        prefixes = artifact_prefixes(ep_ctx)
+        crops_prefix = prefixes.get("crops")
+        if not crops_prefix:
+            return {"items": [], "next_start_after": None}
+        base_prefix = crops_prefix.rstrip("/") + "/"
+        track_prefix_full = f"{base_prefix}{track_prefix}"
+        index_key = f"{track_prefix_full}index.json"
+        entries = self._load_remote_track_index(index_key, track_prefix)
+        if entries:
+            selected, cursor = self._slice_entries(entries, sample, max_keys, cursor_key, cursor_cycle)
+            items: List[Dict[str, Any]] = []
+            for entry in selected:
+                s3_key = f"{base_prefix}{entry['key']}"
+                url = self.presign_get(s3_key)
+                if not url:
+                    continue
+                items.append(
+                    {
+                        "key": entry["key"],
+                        "frame_idx": entry["frame_idx"],
+                        "ts": entry.get("ts"),
+                        "url": url,
+                    }
+                )
+            return {"items": items, "next_start_after": cursor}
+        return self._list_remote_without_index(
+            base_prefix,
+            track_prefix,
+            sample,
+            max_keys,
+            cursor_key,
+            cursor_cycle,
+        )
+
+    def _load_track_index_from_path(self, track_dir: Path, track_prefix: str) -> List[Dict[str, Any]]:
+        index_path = track_dir / "index.json"
+        if not index_path.exists():
+            return []
+        try:
+            raw = json.loads(index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            LOGGER.warning("Invalid track index at %s", index_path)
+            return []
+        if not isinstance(raw, list):
+            return []
+        return self._normalize_track_index_entries(raw, track_prefix)
+
+    def _entries_from_files(self, track_dir: Path, track_prefix: str) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        if not track_dir.exists():
+            return entries
+        for path in sorted(track_dir.glob("frame_*.jpg")):
+            key = f"{track_prefix}{path.name}"
+            frame_idx = _frame_idx_from_key(key)
+            if frame_idx is None:
+                continue
+            entries.append({"key": key, "frame_idx": frame_idx, "ts": None})
+        return entries
+
+    def _normalize_track_index_entries(self, raw_entries: Iterable[Any], track_prefix: str) -> List[Dict[str, Any]]:
+        normalized: Dict[str, Dict[str, Any]] = {}
+        marker = track_prefix
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_key = entry.get("key")
+            if not isinstance(raw_key, str):
+                continue
+            candidate = raw_key.strip().replace("\\", "/")
+            idx = candidate.find(marker)
+            if idx >= 0:
+                candidate = candidate[idx:]
+            elif candidate:
+                leaf = candidate.split("/")[-1]
+                candidate = f"{marker}{leaf}" if leaf else candidate
+            frame_idx = entry.get("frame_idx")
+            if not isinstance(frame_idx, int):
+                frame_idx = _frame_idx_from_key(candidate)
+                if frame_idx is None:
+                    continue
+            ts_val = entry.get("ts")
+            if ts_val is not None:
+                try:
+                    ts_val = float(ts_val)
+                except (TypeError, ValueError):
+                    ts_val = None
+            normalized[candidate] = {"key": candidate, "frame_idx": frame_idx, "ts": ts_val}
+        ordered = sorted(normalized.values(), key=lambda item: item["frame_idx"])
+        return ordered
+
+    def _slice_entries(
+        self,
+        entries: List[Dict[str, Any]],
+        sample: int,
+        max_keys: int,
+        cursor_key: str | None,
+        cursor_cycle: int,
+    ) -> tuple[List[Dict[str, Any]], str | None]:
+        if not entries:
+            return [], None
+        start_index = 0
+        if cursor_key:
+            for idx, entry in enumerate(entries):
+                if entry.get("key") == cursor_key:
+                    start_index = idx + 1
+                    break
+        cycle = cursor_cycle % sample
+        selected: List[Dict[str, Any]] = []
+        next_cursor: str | None = None
+        for idx in range(start_index, len(entries)):
+            entry = entries[idx]
+            include = cycle == 0
+            cycle = (cycle + 1) % sample
+            if not include:
+                continue
+            selected.append(entry)
+            if len(selected) >= max_keys:
+                next_cursor = _encode_cursor(entry["key"], cycle)
+                break
+        return selected, next_cursor
+
+    def _load_remote_track_index(self, index_key: str, track_prefix: str) -> List[Dict[str, Any]]:
+        if self.backend not in {"s3", "minio"} or self._client is None:
+            return []
+        try:
+            response = self._client.get_object(Bucket=self.bucket, Key=index_key)
+        except self._client_error_cls as exc:  # type: ignore[misc]
+            error_code = exc.response.get("Error", {}).get("Code") if hasattr(exc, "response") else None
+            if error_code in {"404", "NoSuchKey", "NotFound"}:
+                return []
+            raise
+        body = response.get("Body")
+        if body is None:
+            return []
+        data = body.read()
+        if isinstance(data, bytes):
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                LOGGER.warning("Unable to decode %s as UTF-8", index_key)
+                return []
+        else:
+            text = str(data)
+        try:
+            raw_entries = json.loads(text)
+        except json.JSONDecodeError:
+            LOGGER.warning("Invalid JSON in %s", index_key)
+            return []
+        if not isinstance(raw_entries, list):
+            return []
+        return self._normalize_track_index_entries(raw_entries, track_prefix)
+
+    def _list_remote_without_index(
+        self,
+        crops_prefix: str,
+        track_prefix: str,
+        sample: int,
+        max_keys: int,
+        cursor_key: str | None,
+        cursor_cycle: int,
+    ) -> Dict[str, Any]:
+        if self.backend not in {"s3", "minio"} or self._client is None:
+            return {"items": [], "next_start_after": None}
+        normalized_prefix = crops_prefix.rstrip("/") + "/"
+        track_root = f"{normalized_prefix}{track_prefix}"
+        start_after_key = f"{normalized_prefix}{cursor_key}" if cursor_key else None
+        items: List[Dict[str, Any]] = []
+        next_cursor: str | None = None
+        cycle = cursor_cycle % sample
+        continuation_token: str | None = None
+        more_available = False
+        while len(items) < max_keys:
+            remaining = max(max_keys - len(items), 1)
+            fetch_budget = min(1000, max(remaining * sample, sample))
+            kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": track_root, "MaxKeys": fetch_budget}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            elif start_after_key:
+                kwargs["StartAfter"] = start_after_key
+            response = self._client.list_objects_v2(**kwargs)
+            contents: Iterable[Dict[str, Any]] = response.get("Contents", [])
+            if not contents:
+                break
+            for obj in contents:
+                key = obj.get("Key")
+                if not isinstance(key, str) or not key.endswith(".jpg"):
+                    continue
+                rel = key[len(normalized_prefix) :]
+                if not rel.startswith(track_prefix):
+                    continue
+                frame_idx = _frame_idx_from_key(rel)
+                if frame_idx is None:
+                    continue
+                include = cycle == 0
+                cycle = (cycle + 1) % sample
+                if not include:
+                    continue
+                url = self.presign_get(key)
+                if not url:
+                    continue
+                items.append({"key": rel, "frame_idx": frame_idx, "ts": None, "url": url})
+                if len(items) >= max_keys:
+                    next_cursor = _encode_cursor(rel, cycle)
+                    more_available = True
+                    break
+            if len(items) >= max_keys or not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+            start_after_key = None
+        return {"items": items, "next_start_after": next_cursor if more_available else None}
+
     def _parse_s3_key_metadata(self, key: str) -> Dict[str, object]:
         parsed_v2 = parse_v2_episode_key(key)
         if parsed_v2:
@@ -433,11 +812,40 @@ class StorageService:
                 ) from exc
 
 
+def delete_s3_prefix(bucket: str, prefix: str, storage: StorageService | None = None) -> int:
+    service = storage or StorageService()
+    target_bucket = bucket or service.bucket
+    return service.delete_prefix(prefix, bucket_override=target_bucket)
+
+
+def delete_local_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_file() or path.is_symlink():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def v2_artifact_prefixes(ep_ctx: EpisodeContext) -> Dict[str, str]:
+    base = artifact_prefixes(ep_ctx).copy()
+    show = ep_ctx.show_slug
+    season = ep_ctx.season_number
+    episode = ep_ctx.episode_number
+    base.setdefault("analytics", f"{ARTIFACT_ROOT}/analytics/{show}/s{season:02d}/e{episode:02d}/")
+    base.setdefault("raw_v2", f"raw/videos/{show}/s{season:02d}/e{episode:02d}/")
+    base.setdefault("raw_v1", f"raw/videos/{ep_ctx.ep_id}/")
+    return base
+
+
 __all__ = [
     "EpisodeContext",
     "PresignedUpload",
     "StorageService",
     "artifact_prefixes",
+    "delete_local_tree",
+    "delete_s3_prefix",
     "episode_context_from_id",
     "parse_v2_episode_key",
+    "v2_artifact_prefixes",
 ]
