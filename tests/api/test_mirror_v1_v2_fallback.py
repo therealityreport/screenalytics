@@ -6,7 +6,7 @@ from apps.api.main import app
 from apps.api.routers import episodes as episodes_router
 
 
-class _StubStorage:
+class _MockStorage:
     bucket = "screenalytics"
 
     def __init__(self) -> None:
@@ -48,14 +48,14 @@ def test_mirror_falls_back_to_v1(monkeypatch, tmp_path):
     )
     ep_id = create_resp.json()["ep_id"]
 
-    stub_storage = _StubStorage()
-    monkeypatch.setattr(episodes_router, "STORAGE", stub_storage)
+    mock_storage = _MockStorage()
+    monkeypatch.setattr(episodes_router, "STORAGE", mock_storage)
 
     resp = client.post(f"/episodes/{ep_id}/mirror")
     assert resp.status_code == 200
     data = resp.json()
     assert data["used_key_version"] == "v1"
-    assert stub_storage.mirror_calls
-    _, kwargs = stub_storage.mirror_calls[0]
+    assert mock_storage.mirror_calls
+    _, kwargs = mock_storage.mirror_calls[0]
     assert kwargs["show_ref"] == "legacy"
 *** End Patch

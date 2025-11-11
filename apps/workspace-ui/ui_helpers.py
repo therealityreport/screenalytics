@@ -54,6 +54,44 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "off", "no"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
+SCENE_THRESHOLD_DEFAULT = max(min(_env_float("SCENE_THRESHOLD", 0.30), 2.0), 0.0)
+SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
+SCENE_WARMUP_DETS_DEFAULT = max(_env_int("SCENE_WARMUP_DETS", 3), 0)
+
+
 def describe_error(url: str, exc: requests.RequestException) -> str:
     detail = str(exc)
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
@@ -159,6 +197,24 @@ def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[st
     resp = requests.post(f"{base}{path}", json=json or {}, timeout=timeout, **kwargs)
     resp.raise_for_status()
     return resp.json()
+
+
+def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
+    url = f"{_api_base()}/episodes/{ep_id}/status"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def get_episode_status(ep_id: str) -> Dict[str, Any] | None:
+    return _episode_status_payload(ep_id)
 
 
 def link_local(path: Path | str) -> str:
@@ -287,19 +343,24 @@ def remember_tracker(value: str | None) -> None:
 def default_detect_track_payload(
     ep_id: str,
     *,
-    stub: bool = False,
     stride: int | None = None,
     device: str | None = None,
     det_thresh: float | None = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "ep_id": ep_id,
-        "stub": bool(stub),
         "stride": int(stride if stride is not None else DEFAULT_STRIDE),
         "device": (device or DEFAULT_DEVICE).lower(),
         "detector": DEFAULT_DETECTOR,
         "tracker": DEFAULT_TRACKER,
         "det_thresh": float(det_thresh if det_thresh is not None else DEFAULT_DET_THRESH),
+        "save_frames": True,
+        "save_crops": True,
+        "jpeg_quality": 85,
+        "scene_detect": SCENE_DETECT_DEFAULT,
+        "scene_threshold": SCENE_THRESHOLD_DEFAULT,
+        "scene_min_len": SCENE_MIN_LEN_DEFAULT,
+        "scene_warmup_dets": SCENE_WARMUP_DETS_DEFAULT,
     }
     return payload
 
@@ -517,8 +578,8 @@ def compose_progress_text(
     requested_detector: str | None,
     requested_tracker: str | None,
 ) -> tuple[str, str]:
-    secs_total = total_seconds_hint(progress)
-    secs_done = progress.get("secs_done") or progress.get("elapsed_sec")
+    video_time = progress.get("video_time")
+    video_total = progress.get("video_total")
     phase = progress.get("phase") or "detect"
     device_label = progress.get("device") or requested_device or "--"
     resolved_detector_device = progress.get("resolved_device")
@@ -531,12 +592,71 @@ def compose_progress_text(
     tracker_label = tracker_label_from_value(raw_tracker) if raw_tracker else "--"
     fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
+    show_time = video_time is not None and video_total is not None
+    time_prefix = ""
+    if show_time:
+        try:
+            done_value = float(video_time)
+            total_value = float(video_total)
+        except (TypeError, ValueError):
+            show_time = False
+        else:
+            done_value = min(done_value, total_value)
+            time_prefix = f"{format_mmss(done_value)} / {format_mmss(total_value)} • "
     status_line = (
-        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • "
+        f"{time_prefix}"
         f"phase={phase} • detector={detector_label} • tracker={tracker_label} • device={device_text} • fps={fps_text}"
     )
     frames_line = f"Frames {progress.get('frames_done', 0):,} / {progress.get('frames_total') or '?'}"
     return status_line, frames_line
+
+
+def _is_phase_done(progress: Dict[str, Any]) -> bool:
+    phase = str(progress.get("phase", "")).lower()
+    if phase == "done":
+        return True
+    step = str(progress.get("step", "")).lower()
+    # Any phase with step="done" indicates completion
+    if step == "done":
+        return True
+    return False
+
+
+def _phase_from_endpoint(endpoint_path: str | None) -> str | None:
+    if not endpoint_path:
+        return None
+    lowered = endpoint_path.lower()
+    if "faces_embed" in lowered:
+        return "faces_embed"
+    if "cluster" in lowered:
+        return "cluster"
+    return None
+
+
+def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
+    payload = _episode_status_payload(ep_id)
+    if not payload:
+        return None
+    phase_block = payload.get(phase)
+    if not isinstance(phase_block, dict):
+        return None
+    status_value = str(phase_block.get("status", "")).lower()
+    if status_value != "success":
+        return None
+    summary: Dict[str, Any] = {"stage": phase}
+    stats: Dict[str, Any] = {}
+    faces_value = phase_block.get("faces")
+    if isinstance(faces_value, int):
+        stats.setdefault("faces", faces_value)
+        key = "faces" if phase == "faces_embed" else "faces_count"
+        summary[key] = faces_value
+    identities_value = phase_block.get("identities")
+    if isinstance(identities_value, int):
+        summary["identities_count"] = identities_value
+        stats.setdefault("clusters", identities_value)
+    if stats:
+        summary["stats"] = stats
+    return summary
 
 
 def attempt_sse_run(
@@ -562,6 +682,8 @@ def attempt_sse_run(
         summary = body if isinstance(body, dict) else {"raw": body}
         return summary, None, False
 
+    ep_id = str(payload.get("ep_id") or "")
+    phase_hint = _phase_from_endpoint(endpoint_path)
     final_summary: Dict[str, Any] | None = None
     try:
         for event_name, event_payload in iter_sse_events(response):
@@ -573,10 +695,16 @@ def attempt_sse_run(
             phase = str(event_payload.get("phase", "")).lower()
             if event_name == "error" or phase == "error":
                 return None, event_payload.get("error") or "Job failed", True
-            if event_name == "done" or phase == "done":
+            if event_name == "done" or _is_phase_done(event_payload):
                 return final_summary or event_payload.get("summary"), None, True
     finally:
         response.close()
+    if final_summary:
+        return final_summary, None, True
+    if ep_id and phase_hint:
+        status_summary = _summary_from_status(ep_id, phase_hint)
+        if status_summary:
+            return status_summary, None, True
     return final_summary, None, True
 
 
@@ -615,7 +743,7 @@ def fallback_poll_progress(
         phase = str(progress.get("phase", "")).lower()
         if phase == "error":
             return None, progress.get("error") or "Job failed"
-        if phase == "done" and isinstance(progress.get("summary"), dict):
+        if _is_phase_done(progress) and isinstance(progress.get("summary"), dict):
             return progress["summary"], None
         time.sleep(0.5)
 
@@ -640,6 +768,22 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
     if "identities" not in summary and summary.get("identities_count") is not None:
         summary["identities"] = summary.get("identities_count")
     return summary
+
+
+def scene_cuts_badge_text(summary: Dict[str, Any] | None) -> str | None:
+    scene_block: Dict[str, Any] | None = None
+    if isinstance(summary, dict):
+        scene_field = summary.get("scene_cuts")
+        if isinstance(scene_field, dict):
+            scene_block = scene_field
+        else:
+            scene_block = summary if "count" in summary and "scene_cuts" not in summary else None
+    if not scene_block:
+        return None
+    count = scene_block.get("count")
+    if isinstance(count, int):
+        return f"Scene cuts: {count:,}"
+    return None
 
 
 def letterbox_thumb_url(url: str | None, size: int = 256) -> str | None:
@@ -712,7 +856,41 @@ def run_job_with_progress(
     max_log_lines = 25
     log_placeholder.code("Waiting for progress updates…", language="text")
 
+    dedupe_key = f"last_progress_event::{endpoint_path}"
+    run_id_key = f"current_run_id::{endpoint_path}"
+    st.session_state.pop(dedupe_key, None)
+
     def _cb(progress: Dict[str, Any]) -> None:
+        if not isinstance(progress, dict):
+            return
+
+        # Honor run_id: ignore events from stale runs
+        event_run_id = progress.get("run_id")
+        if event_run_id:
+            current_run_id = st.session_state.get(run_id_key)
+            if current_run_id and current_run_id != event_run_id:
+                # Stale event from a previous run, ignore it
+                return
+            if not current_run_id:
+                # First event from this run, record it
+                st.session_state[run_id_key] = event_run_id
+
+        event_key = (
+            progress.get("phase"),
+            progress.get("frames_done"),
+            progress.get("step"),
+            event_run_id,
+        )
+        if st.session_state.get(dedupe_key) == event_key:
+            return
+        st.session_state[dedupe_key] = event_key
+
+        # Clamp video_time to video_total on UI side as extra safety
+        video_time = progress.get("video_time")
+        video_total = progress.get("video_total")
+        if video_time is not None and video_total is not None and video_time > video_total:
+            progress = progress.copy()
+            progress["video_time"] = video_total
         if progress.get("detector"):
             remember_detector(progress.get("detector"))
         status_line, frames_line = update_progress_display(
@@ -729,27 +907,32 @@ def run_job_with_progress(
             del log_lines[0 : len(log_lines) - max_log_lines]
         log_placeholder.code("\n\n".join(log_lines), language="text")
 
-    summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
-    if (error_message or summary is None) and not error_message and async_endpoint:
-        summary, error_message = fallback_poll_progress(
-            ep_id,
-            payload,
-            update_cb=_cb,
-            status_placeholder=status_placeholder,
-            job_started=job_started,
-            async_endpoint=async_endpoint,
-        )
-    if summary and isinstance(summary, dict):
-        remember_detector(summary.get("detector"))
-        remember_tracker(summary.get("tracker"))
-    return summary, error_message
+    summary = None
+    error_message = None
+    try:
+        summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
+        if (error_message or summary is None) and not error_message and async_endpoint:
+            summary, error_message = fallback_poll_progress(
+                ep_id,
+                payload,
+                update_cb=_cb,
+                status_placeholder=status_placeholder,
+                job_started=job_started,
+                async_endpoint=async_endpoint,
+            )
+        if summary and isinstance(summary, dict):
+            remember_detector(summary.get("detector"))
+            remember_tracker(summary.get("tracker"))
+        return summary, error_message
+    finally:
+        st.session_state.pop(dedupe_key, None)
+        st.session_state.pop(run_id_key, None)
 
 
-def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_height: int = 200) -> str:
-    rail_id = f"rail-{track_id}"
+def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
     if not items:
         return (
-            "<div class=\"track-row empty\">"
+            "<div class=\"track-grid empty\">"
             "<span>No frames available for this track yet.</span>"
             "</div>"
         )
@@ -766,29 +949,52 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_height: int
         )
     if not thumbs:
         return (
-            "<div class=\"track-row empty\">"
+            "<div class=\"track-grid empty\">"
             "<span>No frames available for this track yet.</span>"
             "</div>"
         )
-    thumb_css = f"height:{thumb_height}px;"
     thumbs_html = "".join(thumbs)
     return f"""
     <style>
-      .track-row {{ display:flex; align-items:center; gap:8px; margin:8px 0; }}
-      .track-row button {{ border:1px solid #d0d7de; border-radius:4px; background:#fff; cursor:pointer; }}
-      .track-row button:focus {{ outline:2px solid #0b5fff; }}
-      .track-row .rail {{ overflow-x:auto; scroll-behavior:smooth; white-space:nowrap; border:1px solid #eee; border-radius:6px; padding:6px; flex:1; }}
-      .track-row .thumb {{ {thumb_css} aspect-ratio:4 / 5; object-fit:cover; display:inline-block; margin-right:6px; }}
+      .track-grid {{ 
+        display: grid;
+        grid-template-columns: repeat(5, {thumb_width}px);
+        gap: 12px;
+        margin: 16px 0;
+        padding: 12px;
+        border: 1px solid #eee;
+        border-radius: 8px;
+        background: #fafafa;
+      }}
+      .track-grid.empty {{ 
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100px;
+        color: #666;
+      }}
+      .track-grid .thumb {{ 
+        width: {thumb_width}px;
+        aspect-ratio: 4 / 5;
+        object-fit: cover;
+        border-radius: 6px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        transition: transform 0.2s, box-shadow 0.2s;
+      }}
+      .track-grid .thumb:hover {{ 
+        transform: scale(1.05);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        cursor: pointer;
+      }}
     </style>
-    <div class="track-row">
-      <button class="arrow" onclick="document.getElementById('{rail_id}').scrollBy({{left:-400, behavior:'smooth'}})">&larr;</button>
-      <div id="{rail_id}" class="rail">{thumbs_html}</div>
-      <button class="arrow" onclick="document.getElementById('{rail_id}').scrollBy({{left:400, behavior:'smooth'}})">&rarr;</button>
-    </div>
+    <div class="track-grid">{thumbs_html}</div>
     """
 
 
-def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_height: int = 200) -> None:
-    html_block = track_row_html(track_id, items, thumb_height=thumb_height)
-    row_height = thumb_height + 80
+def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> None:
+    html_block = track_row_html(track_id, items, thumb_width=thumb_width)
+    # Calculate height: rows of thumbs (200px * 5/4 for 4:5 aspect) + gaps + padding
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio means height = width * 5/4
+    num_rows = (len(items) + 4) // 5  # Round up to get number of rows
+    row_height = max(num_rows * thumb_height + (num_rows - 1) * 12 + 50, 150)  # thumbs + gaps + padding
     components.html(html_block, height=row_height, scrolling=False)

@@ -108,15 +108,13 @@ pnpm --filter workspace-ui dev               # UI
 ```bash
 source .venv/bin/activate
 ./tools/dev-up.sh
-# Add --stub for the fast path; omit it for the YOLOv8-face + StrongSORT(ReID) pipeline.
-python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 --stub
 # Export sampled frames/crops with RetinaFace + ByteTrack (face-only) and JPEG controls
 python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 \
   --detector retinaface --max-gap 30 \
   --save-frames --save-crops --jpeg-quality 90
-# Faces pipeline (stub paths shown below)
-python tools/episode_run.py --ep-id ep_demo --faces-embed --stub --save-crops
-python tools/episode_run.py --ep-id ep_demo --cluster --stub
+# Faces pipeline
+python tools/episode_run.py --ep-id ep_demo --faces-embed --save-crops
+python tools/episode_run.py --ep-id ep_demo --cluster
 ```
 
 Artifacts land under `data/` mirroring the future object-storage layout:
@@ -187,13 +185,13 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 
 4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
 5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
-6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, and decide whether to enable **Use stub (fast, no ML)** before submitting. Leave it unchecked to run the real YOLOv8 + ByteTrack pass, or check it for the light stub.
+6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, then submit to mirror the footage locally and kick off the full YOLOv8 + ByteTrack pass (using the same defaults as Episode Detail—frames + crops exports enabled, JPEG quality 85, scene-cut detection on).
 7. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and calls `POST /jobs/detect_track_async` (with a synchronous fallback button if you really need it). Progress is streamed from `/jobs/{job_id}/progress`, so you can cancel or watch counts materialize without blocking the page.
 
 **Episode Detail live progress & exports**
 
 - “Run detect/track” negotiates `text/event-stream` against `POST /jobs/detect_track`, so Streamlit renders a live bar (`mm:ss / MM:SS • phase=<detect|track> • device=<…> • fps=<…>`). If SSE isn’t available (corporate proxies, etc.) the button falls back to `/jobs/detect_track_async` and polls the new `GET /episodes/{ep_id}/progress` every 500 ms until the `phase:"done"` payload lands.
-- Detector dropdown toggles between **RetinaFace (recommended)** and **YOLOv8-face (alt)**—both wired to the CLI’s `--detector {retinaface,yolov8face}` flag—while the new Tracker dropdown lets you pick **ByteTrack (default)** or **StrongSORT (ReID)** before launching a run. ByteTrack parameters (e.g. `--max-gap`, JPEG export toggles) stay available alongside the frame/crop exporter controls. The live status bar now renders `mm:ss / MM:SS • phase=<…> • detector=<…> • tracker=<…> • device=<…> • fps=<…>` so it’s obvious which models are currently running. Successful runs summarize counts, exporter stats, v2 prefixes, **and** the track quality metrics surfaced by the runner (`tracks born/lost`, `id switches`, `top longest tracks`, highlighting any track that exceeds 500 frames). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
+- Detector dropdown toggles between **RetinaFace (recommended)** and **YOLOv8-face (alt)**—both wired to the CLI’s `--detector {retinaface,yolov8face}` flag—while the new Tracker dropdown lets you pick **ByteTrack (default)** or **StrongSORT (ReID)** before launching a run. ByteTrack parameters (e.g. `--max-gap`, JPEG export toggles) stay available alongside the frame/crop exporter controls, and both “Save frames to S3” + “Save face crops to S3” are pre-selected so exports always land unless you opt out. The live status bar now renders `mm:ss / MM:SS • phase=<…> • detector=<…> • tracker=<…> • device=<…> • fps=<…>` so it’s obvious which models are currently running. Successful runs summarize counts, exporter stats, v2 prefixes, **and** the track quality metrics surfaced by the runner (`tracks born/lost`, `id switches`, `top longest tracks`, highlighting any track that exceeds 500 frames). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
 
 Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
@@ -201,8 +199,6 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 - `data/manifests/{ep_id}/detections.jsonl`
 - `data/manifests/{ep_id}/tracks.jsonl`
 - `data/frames/{ep_id}/` (when jobs run with an `fps` override)
-
-**Note:** Stub mode (`Use stub (fast, no ML)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
 
 ### Live progress (async detect/track)
 
@@ -231,7 +227,7 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
    pip install -r requirements-ml.txt
    ```
 
-2. Run the episode helper without `--stub` (defaults to CPU):
+2. Run the episode helper (defaults to CPU):
 
    ```bash
    python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 --fps 8 --device cpu
@@ -240,6 +236,7 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
    - Lower `--stride` (for example `1` or `2`) and higher `--fps` increase recall but also GPU/CPU time.
    - Higher `--stride` or smaller `--fps` are useful for exploratory passes on long episodes.
    - Device selection order: `auto` → CUDA GPU → Apple `mps` → CPU. Override with `--device cpu` if you need to stay on CPU.
+   - `--scene-detect` (default `on`) runs a histogram prepass to detect hard cuts, resets ByteTrack at each cut, and forces `--scene-warmup-dets` consecutive detections to reacquire IDs. Tune `--scene-threshold` (0–2) and `--scene-min-len` (frames between cuts) when you need a stricter or looser cut detector.
    - Faces harvesting accepts `--face-detector`, `--min-face-size`, `--min-face-conf`, `--face-validate`, and `--thumb-size` so you can choose SCRFD (default), fall back to MTCNN, or run the YOLOv8 face head before embeddings are written.
 
 3. (Optional) Verify the real pipeline via the ML test:
@@ -248,7 +245,7 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
    RUN_ML_TESTS=1 pytest tests/ml/test_detect_track_real.py -q
    ```
 
-The CLI and UI both emit manifests under `data/manifests/{ep_id}/` with YOLO metadata, so you can diff stub vs. real outputs before pushing upstream.
+The CLI and UI both emit manifests under `data/manifests/{ep_id}/` with YOLO metadata, so you can diff runs before pushing upstream.
 
 #### Re-run on an existing episode
 
@@ -257,7 +254,7 @@ Already uploaded footage to S3 and just need to run detect/track again?
 1. Start the API + Streamlit UI, then choose **Existing Episode** in the sidebar.
 2. Browse the **S3 videos** list to pick any `raw/videos/{show}/s{season}/e{episode}/episode.mp4` object. If it isn’t in the EpisodeStore yet, hit **Create episode in store** – the UI parses the v2 key, POSTs `/episodes/upsert_by_id`, and immediately shows whether it created or reused the record (along with the derived `ep_id`).
 3. Click **Mirror from S3** to download the v2 object into `data/videos/{ep_id}/episode.mp4`. When only a legacy `raw/videos/{ep_id}/episode.mp4` exists, the UI falls back to it and shows a note until you migrate.
-4. Adjust `Stride`, optional `FPS` (set `0` to reuse the detected FPS shown in the UI), **Device**, frame/crop export toggles, and the **Use stub (fast, no ML)** toggle, then hit **Run detect/track**. The progress widget always renders `mm:ss / mm:ss`, device, FPS, and the target S3 prefixes (frames/crops/manifests) so you know exactly where artifacts land once the run completes.
+4. Adjust `Stride`, optional `FPS` (set `0` to reuse the detected FPS shown in the UI), **Device**, frame/crop export toggles (pre-checked to save frames + crops by default), and the advanced scene-cut settings, then hit **Run detect/track**. The progress widget always renders `mm:ss / mm:ss`, device, FPS, and the target S3 prefixes (frames/crops/manifests) so you know exactly where artifacts land once the run completes, and the completion toast now includes a `Scene cuts: N` pill so you can quickly gauge how many tracker resets fired.
 
  Manifest links for that episode stay visible so you can open `detections.jsonl` / `tracks.jsonl` directly after each pass.
 
@@ -281,7 +278,7 @@ The Streamlit workspace ships as a multipage app with sidebar navigation:
 1. **Upload & Run** — create/upload episodes, kick detect/track immediately.
 2. **Episodes** — searchable browser across all `ep_id` entries with quick detect/track controls.
 3. **Episode Detail** — hydrate from S3, re-run detect/track, launch faces/cluster/screentime jobs, and jump to local artifacts.
-4. **Faces Review** — trigger faces/cluster jobs (stub today) and inspect `faces.jsonl`/`identities.json`.
+4. **Faces Review** — trigger faces/cluster jobs and inspect `faces.jsonl`/`identities.json`.
 5. **Screentime** — run the screentime job and review/download analytics (`screentime.json` / `.csv`).
 6. **Health** — quick API/S3/disk checks plus context on the current backend + data root.
 
@@ -334,7 +331,7 @@ aws s3 ls s3://screenalytics/raw/videos/ --recursive | tail -n 5
 
 #### Troubleshooting (macOS / FFmpeg / PyAV)
 
-`faster-whisper` depends on PyAV, which may try to build against Homebrew’s FFmpeg 8.x headers on Apple Silicon. If you only need the API, UI, or stub detect/track flow, stick to `requirements-core.txt`—these features do **not** require PyAV or the rest of the ML stack. Install `requirements-ml.txt` only when you plan to run the full pipeline and have a working FFmpeg toolchain.
+`faster-whisper` depends on PyAV, which may try to build against Homebrew’s FFmpeg 8.x headers on Apple Silicon. Stick to `requirements-core.txt` unless you plan to run the full ML stack; install `requirements-ml.txt` when you need RetinaFace/ArcFace locally and have a working FFmpeg toolchain.
 
 #### macOS (Apple Silicon) Python environment
 

@@ -25,7 +25,7 @@ def test_detect_track_invalid_detector(tmp_path, monkeypatch):
     client = TestClient(app)
     response = client.post(
         "/jobs/detect_track",
-        json={"ep_id": ep_id, "stub": True, "detector": "not_a_real_detector"},
+        json={"ep_id": ep_id, "detector": "not_a_real_detector"},
     )
     assert response.status_code == 400
     assert "Unsupported detector" in response.json().get("detail", "")
@@ -46,7 +46,7 @@ def test_detect_track_invalid_tracker(tmp_path, monkeypatch):
     client = TestClient(app)
     response = client.post(
         "/jobs/detect_track",
-        json={"ep_id": ep_id, "stub": True, "tracker": "nope"},
+        json={"ep_id": ep_id, "tracker": "nope"},
     )
     assert response.status_code == 400
     assert "Unsupported tracker" in response.json().get("detail", "")
@@ -74,7 +74,7 @@ def test_detect_track_retinaface_missing_models_returns_400(tmp_path, monkeypatc
     client = TestClient(app)
     response = client.post(
         "/jobs/detect_track",
-        json={"ep_id": ep_id, "stub": False, "device": "cpu", "detector": "retinaface"},
+        json={"ep_id": ep_id, "device": "cpu", "detector": "retinaface"},
     )
     assert response.status_code == 400
     detail = response.json().get("detail", "")

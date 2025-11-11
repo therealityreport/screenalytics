@@ -73,7 +73,6 @@ def _register_async_job(
     label: str,
     stride: int,
     fps: float | None,
-    stub: bool,
     device: str,
 ) -> None:
     jobs = _job_state()
@@ -90,7 +89,6 @@ def _register_async_job(
         "requested_stride": stride,
         "requested_fps": fps,
         "requested_device": device,
-        "stub": stub,
         "artifacts": artifacts,
     }
 
@@ -200,7 +198,7 @@ def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[s
 
 
 def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | None:
-    payload = helpers.default_detect_track_payload(ep_id, stub=False)
+    payload = helpers.default_detect_track_payload(ep_id)
     payload["stride"] = helpers.DEFAULT_STRIDE
     payload["device"] = helpers.DEFAULT_DEVICE
     endpoint = "/jobs/detect_track_async"
@@ -231,7 +229,6 @@ def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | 
         label=label,
         stride=payload.get("stride", helpers.DEFAULT_STRIDE),
         fps=payload.get("fps"),
-        stub=payload.get("stub", False),
         device=payload.get("device", helpers.DEFAULT_DEVICE),
     )
     st.success(f"Job `{job_resp['job_id']}` queued; monitor progress above.")

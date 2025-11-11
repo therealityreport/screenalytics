@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_PATH = PROJECT_ROOT / "apps" / "workspace-ui" / "ui_helpers.py"
 
 
-def _ensure_streamlit_stubs() -> None:
+def _ensure_streamlit_shims() -> None:
     if "streamlit" not in sys.modules:
         streamlit_mod = types.ModuleType("streamlit")
         streamlit_mod.session_state = {}
@@ -59,15 +59,15 @@ def _ensure_streamlit_stubs() -> None:
     components_pkg.v1 = components_v1
 
 
-def _ensure_requests_stub() -> None:
+def _ensure_requests_shim() -> None:
     if "requests" not in sys.modules:
         sys.modules["requests"] = types.SimpleNamespace(RequestException=Exception, HTTPError=Exception)
 
 
 @lru_cache(maxsize=1)
 def load_ui_helpers_module():
-    _ensure_requests_stub()
-    _ensure_streamlit_stubs()
+    _ensure_requests_shim()
+    _ensure_streamlit_shims()
     spec = importlib.util.spec_from_file_location("workspace_ui_helpers_test", HELPERS_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader

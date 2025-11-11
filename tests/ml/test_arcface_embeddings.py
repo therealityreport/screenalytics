@@ -47,7 +47,7 @@ class _FakeArcFaceEmbedder:
         return np.vstack([base for _ in crops])
 
 
-def _write_stub_tracks(ep_id: str, frame_count: int = 3) -> None:
+def _write_sample_tracks(ep_id: str, frame_count: int = 3) -> None:
     track_path = get_path(ep_id, "tracks")
     rows = []
     for track_id in range(1, 3):
@@ -85,14 +85,13 @@ def test_arcface_embeddings_are_unit_norm(tmp_path, monkeypatch):
     video_path = get_path(ep_id, "video")
     video_path.parent.mkdir(parents=True, exist_ok=True)
     _make_sample_video(video_path)
-    _write_stub_tracks(ep_id)
+    _write_sample_tracks(ep_id)
 
     manifests_dir = get_path(ep_id, "detections").parent
     progress_path = manifests_dir / "progress.json"
 
     args = SimpleNamespace(
         ep_id=ep_id,
-        stub=False,
         device="cpu",
         save_frames=False,
         save_crops=False,

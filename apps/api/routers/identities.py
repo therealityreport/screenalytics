@@ -84,3 +84,4 @@ def drop_frame(ep_id: str, body: DropFrameRequest) -> dict:
         return identity_service.drop_frame(ep_id, body.track_id, body.frame_idx, body.delete_assets)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+

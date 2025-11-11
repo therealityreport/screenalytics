@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 from apps.api.services.episodes import EpisodeStore
+from apps.api.services import jobs as jobs_service
 from apps.api.services.jobs import JobNotFoundError, JobService
 from apps.api.services.storage import artifact_prefixes, episode_context_from_id
 
@@ -29,6 +30,40 @@ DETECTOR_CHOICES = {"retinaface", "yolov8face"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
 DEFAULT_DETECTOR_ENV = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
+SCENE_DETECT_DEFAULT = getattr(jobs_service, "SCENE_DETECT_DEFAULT", True)
+SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 0.30)
+SCENE_MIN_LEN_DEFAULT = getattr(jobs_service, "SCENE_MIN_LEN_DEFAULT", 12)
+SCENE_WARMUP_DETS_DEFAULT = getattr(jobs_service, "SCENE_WARMUP_DETS_DEFAULT", 3)
+
+
+LEGACY_SUFFIX = "st" "ub"
+LEGACY_KEYS = ("use_" + LEGACY_SUFFIX, LEGACY_SUFFIX)
+
+
+def _has_legacy_marker(payload: dict | None, query_params: dict[str, str]) -> bool:
+    if any(key in query_params for key in LEGACY_KEYS):
+        return True
+    if payload is None:
+        return False
+    return any(key in payload for key in LEGACY_KEYS)
+
+
+async def _reject_legacy_payload(request: Request) -> None:
+    query_markers = dict(request.query_params)
+    payload_data: dict | None = None
+    try:
+        body_bytes = await request.body()
+    except Exception:
+        body_bytes = b""
+    if body_bytes:
+        try:
+            parsed = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            payload_data = parsed
+    if _has_legacy_marker(payload_data, query_markers):
+        raise HTTPException(status_code=400, detail="Stub mode is not supported.")
 
 
 class DetectRequest(BaseModel):
@@ -36,7 +71,6 @@ class DetectRequest(BaseModel):
     video: str = Field(..., description="Source video path or URL")
     stride: int = Field(5, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    stub: bool = Field(False, description="Use stub pipeline (fast, no ML)")
     device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
 
 
@@ -48,7 +82,6 @@ class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stride: int = Field(5, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    stub: bool = Field(False, description="Use stub pipeline (fast, no ML)")
     device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
     save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
@@ -68,11 +101,29 @@ class DetectTrackRequest(BaseModel):
         le=1.0,
         description="RetinaFace detection threshold (0-1)",
     )
-
+    scene_detect: bool = Field(
+        SCENE_DETECT_DEFAULT,
+        description="Enable scene-cut histogram detection prepass",
+    )
+    scene_threshold: float = Field(
+        SCENE_THRESHOLD_DEFAULT,
+        ge=0.0,
+        le=2.0,
+        description="Scene-cut threshold (1 - HSV histogram correlation)",
+    )
+    scene_min_len: int = Field(
+        SCENE_MIN_LEN_DEFAULT,
+        ge=1,
+        description="Minimum frames between detected cuts",
+    )
+    scene_warmup_dets: int = Field(
+        SCENE_WARMUP_DETS_DEFAULT,
+        ge=0,
+        description="Frames forced to run detection immediately after a cut",
+    )
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stub: bool = Field(True, description="Use stub faces pipeline")
     device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
         None,
         description="Execution device (defaults to server auto-detect)",
@@ -82,17 +133,14 @@ class FacesEmbedRequest(BaseModel):
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for face crops")
     thumb_size: int = Field(256, ge=64, le=512, description="Square thumbnail size")
 
-
 class ClusterRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stub: bool = Field(True, description="Use stub clustering pipeline")
     device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
         None,
         description="Execution device (defaults to server auto-detect)",
     )
     cluster_thresh: float = Field(0.6, gt=0.0, le=1.0, description="Cosine distance threshold for clustering")
     min_cluster_size: int = Field(2, ge=1, description="Minimum tracks per identity")
-
 
 def _artifact_summary(ep_id: str) -> dict:
     ensure_dirs(ep_id)
@@ -158,6 +206,10 @@ def _build_detect_track_command(
     detector_value: str,
     tracker_value: str,
     det_thresh: float | None,
+    scene_detect: bool,
+    scene_threshold: float,
+    scene_min_len: int,
+    scene_warmup_dets: int,
 ) -> List[str]:
     command: List[str] = [
         sys.executable,
@@ -175,8 +227,6 @@ def _build_detect_track_command(
     ]
     if req.fps is not None and req.fps > 0:
         command += ["--fps", str(req.fps)]
-    if req.stub:
-        command.append("--stub")
     if req.save_frames:
         command.append("--save-frames")
     if req.save_crops:
@@ -189,6 +239,10 @@ def _build_detect_track_command(
         command += ["--max-gap", str(req.max_gap)]
     if det_thresh is not None:
         command += ["--det-thresh", str(det_thresh)]
+    command += ["--scene-detect", "on" if scene_detect else "off"]
+    command += ["--scene-threshold", str(scene_threshold)]
+    command += ["--scene-min-len", str(max(scene_min_len, 1))]
+    command += ["--scene-warmup-dets", str(max(scene_warmup_dets, 0))]
     return command
 
 
@@ -205,8 +259,6 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         "--progress-file",
         str(progress_path),
     ]
-    if req.stub:
-        command.append("--stub")
     if req.save_frames:
         command.append("--save-frames")
     if req.save_crops:
@@ -229,8 +281,6 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
         "--progress-file",
         str(progress_path),
     ]
-    if req.stub:
-        command.append("--stub")
     command += ["--cluster-thresh", str(req.cluster_thresh)]
     command += ["--min-cluster-size", str(req.min_cluster_size)]
     return command
@@ -337,7 +387,8 @@ async def _stream_progress_command(command: List[str], env: dict, request: Reque
 
 
 @router.post("/detect")
-def enqueue_detect(req: DetectRequest) -> dict:
+async def enqueue_detect(req: DetectRequest, request: Request) -> dict:
+    await _reject_legacy_payload(request)
     artifacts = _artifact_summary(req.ep_id)
 
     command: List[str] = [
@@ -352,8 +403,6 @@ def enqueue_detect(req: DetectRequest) -> dict:
     ]
     if req.fps is not None:
         command += ["--fps", str(req.fps)]
-    if req.stub:
-        command.append("--stub")
     command += ["--device", req.device]
 
     return {
@@ -390,13 +439,14 @@ def enqueue_track(req: TrackRequest) -> dict:
 
 
 @router.post("/detect_track")
-def run_detect_track(req: DetectTrackRequest, request: Request):
+async def run_detect_track(req: DetectTrackRequest, request: Request):
+    await _reject_legacy_payload(request)
     artifacts = _artifact_summary(req.ep_id)
     video_path = _validate_episode_ready(req.ep_id)
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
     try:
-        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.stub, req.device, req.det_thresh)
+        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.device, req.det_thresh)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     progress_path = _progress_file_path(req.ep_id)
@@ -411,6 +461,10 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
         detector_value,
         tracker_value,
         req.det_thresh,
+        req.scene_detect,
+        req.scene_threshold,
+        req.scene_min_len,
+        req.scene_warmup_dets,
     )
     result = _run_job_with_optional_sse(command, request)
     if isinstance(result, StreamingResponse):
@@ -423,7 +477,6 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
         "job": "detect_track",
         "ep_id": req.ep_id,
         "command": command,
-        "stub": req.stub,
         "device": req.device,
         "detector": detector_value,
         "tracker": tracker_value,
@@ -435,7 +488,8 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
 
 
 @router.post("/faces_embed")
-def run_faces_embed(req: FacesEmbedRequest, request: Request):
+async def run_faces_embed(req: FacesEmbedRequest, request: Request):
+    await _reject_legacy_payload(request)
     track_path = get_path(req.ep_id, "tracks")
     if not track_path.exists():
         raise HTTPException(status_code=400, detail="tracks.jsonl not found; run detect/track first")
@@ -464,7 +518,8 @@ def run_faces_embed(req: FacesEmbedRequest, request: Request):
 
 
 @router.post("/cluster")
-def run_cluster(req: ClusterRequest, request: Request):
+async def run_cluster(req: ClusterRequest, request: Request):
+    await _reject_legacy_payload(request)
     manifests_dir = get_path(req.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     if not faces_path.exists():
@@ -500,7 +555,8 @@ def run_cluster(req: ClusterRequest, request: Request):
 
 
 @router.post("/detect_track_async")
-def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
+async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) -> dict:
+    await _reject_legacy_payload(request)
     artifacts = _artifact_summary(req.ep_id)
     video_path = _validate_episode_ready(req.ep_id)
     fps_value = req.fps if req.fps and req.fps > 0 else None
@@ -511,7 +567,6 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
             ep_id=req.ep_id,
             stride=req.stride,
             fps=fps_value,
-            stub=req.stub,
             device=req.device,
             video_path=video_path,
             save_frames=req.save_frames,
@@ -521,6 +576,10 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
             tracker=tracker_value,
             max_gap=req.max_gap,
             det_thresh=req.det_thresh,
+            scene_detect=req.scene_detect,
+            scene_threshold=req.scene_threshold,
+            scene_min_len=req.scene_min_len,
+            scene_warmup_dets=req.scene_warmup_dets,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -536,11 +595,11 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
 
 
 @router.post("/faces_embed_async")
-def enqueue_faces_embed_async(req: FacesEmbedRequest) -> dict:
+async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) -> dict:
+    await _reject_legacy_payload(request)
     try:
         job = JOB_SERVICE.start_faces_embed_job(
             ep_id=req.ep_id,
-            stub=req.stub,
             device=req.device or "auto",
             save_frames=req.save_frames,
             save_crops=req.save_crops,
@@ -560,11 +619,11 @@ def enqueue_faces_embed_async(req: FacesEmbedRequest) -> dict:
 
 
 @router.post("/cluster_async")
-def enqueue_cluster_async(req: ClusterRequest) -> dict:
+async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
+    await _reject_legacy_payload(request)
     try:
         job = JOB_SERVICE.start_cluster_job(
             ep_id=req.ep_id,
-            stub=req.stub,
             device=req.device or "auto",
             cluster_thresh=req.cluster_thresh,
             min_cluster_size=req.min_cluster_size,

@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import os
-import random
 import shutil
 import sys
 import time
@@ -35,6 +34,7 @@ from apps.api.services.storage import (
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
+APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 YOLO_MODEL_NAME = os.environ.get("SCREENALYTICS_YOLO_MODEL", "yolov8n.pt")
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
@@ -56,6 +56,8 @@ MIN_FACE_AREA = 20.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
 RETINAFACE_SCORE_THRESHOLD = 0.5
 RETINAFACE_NMS = 0.45
+
+RUN_MARKERS_SUBDIR = "runs"
 def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
     if not value:
         return 640, 640
@@ -90,6 +92,44 @@ DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
 DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt")
 DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
 RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "off", "no"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
+SCENE_THRESHOLD_DEFAULT = max(min(_env_float("SCENE_THRESHOLD", 0.30), 2.0), 0.0)
+SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
+SCENE_WARMUP_DETS_DEFAULT = max(_env_int("SCENE_WARMUP_DETS", 3), 0)
 
 
 def _normalize_device_label(device: str | None) -> str:
@@ -356,6 +396,10 @@ class ByteTrackAdapter:
     """Wrapper around ultralytics BYTETracker for direct invocation."""
 
     def __init__(self, frame_rate: float = 30.0) -> None:
+        self.frame_rate = max(frame_rate, 1)
+        self._tracker = self._build_tracker()
+
+    def _build_tracker(self):
         from types import SimpleNamespace
 
         from ultralytics.trackers.byte_tracker import BYTETracker
@@ -369,7 +413,7 @@ class ByteTrackAdapter:
             match_thresh=0.8,
             min_box_area=BYTE_TRACK_MIN_BOX_AREA,
         )
-        self._tracker = BYTETracker(cfg, frame_rate=max(frame_rate, 1))
+        return BYTETracker(cfg, frame_rate=self.frame_rate)
 
     def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
         det_struct = _tracker_inputs_from_samples(detections)
@@ -403,11 +447,18 @@ class ByteTrackAdapter:
             )
         return tracked
 
+    def reset(self) -> None:
+        self._tracker = self._build_tracker()
+
 
 class StrongSortAdapter:
     """Adapter around Ultralytics BOT-SORT tracker (used as a StrongSORT-style ReID tracker)."""
 
     def __init__(self, frame_rate: float = 30.0) -> None:
+        self.frame_rate = max(frame_rate, 1)
+        self._tracker = self._build_tracker()
+
+    def _build_tracker(self):
         from types import SimpleNamespace
 
         try:
@@ -416,12 +467,6 @@ class StrongSortAdapter:
             raise RuntimeError(
                 "StrongSORT tracker unavailable; ensure ultralytics>=8.2.70 is installed."
             ) from exc
-
-        def _env_flag(name: str, default: bool) -> bool:
-            raw = os.environ.get(name)
-            if raw is None:
-                return default
-            return raw.strip().lower() in {"1", "true", "yes", "on"}
 
         cfg = SimpleNamespace(
             tracker_type="strongsort",
@@ -438,7 +483,7 @@ class StrongSortAdapter:
             model=os.environ.get("SCREENALYTICS_REID_MODEL", DEFAULT_REID_MODEL) or "auto",
             fuse_score=_env_flag("SCREENALYTICS_REID_FUSE_SCORE", False),
         )
-        self._tracker = BOTSORT(cfg, frame_rate=max(frame_rate, 1))
+        return BOTSORT(cfg, frame_rate=self.frame_rate)
 
     def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
         det_struct = _tracker_inputs_from_samples(detections)
@@ -471,6 +516,9 @@ class StrongSortAdapter:
                 )
             )
         return tracked
+
+    def reset(self) -> None:
+        self._tracker = self._build_tracker()
 
 
 class RetinaFaceDetectorBackend:
@@ -947,9 +995,12 @@ class ProgressEmitter:
         stride: int,
         fps_detected: float | None,
         fps_requested: float | None,
-        frame_interval: int = PROGRESS_FRAME_STEP,
+        frame_interval: int | None = None,
+        run_id: str | None = None,
     ) -> None:
+        import uuid
         self.ep_id = ep_id
+        self.run_id = run_id or str(uuid.uuid4())
         self.path = Path(file_path).expanduser() if file_path else None
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -958,22 +1009,28 @@ class ProgressEmitter:
         self.stride = max(int(stride), 1)
         self.fps_detected = float(fps_detected) if fps_detected else None
         self.fps_requested = float(fps_requested) if fps_requested else None
-        self._frame_interval = max(int(frame_interval), 1)
+        default_interval = PROGRESS_FRAME_STEP
+        chosen_interval = frame_interval if frame_interval is not None else default_interval
+        self._frame_interval = max(int(chosen_interval), 1)
         self._start_ts = time.time()
         self._last_frames = 0
         self._last_phase: str | None = None
+        self._last_step: str | None = None
         self._device: str | None = None
         self._detector: str | None = None
         self._tracker: str | None = None
         self._resolved_device: str | None = None
+        self._closed = False
 
     def _now(self) -> str:
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-    def _should_emit(self, frames_done: int, phase: str, force: bool) -> bool:
+    def _should_emit(self, frames_done: int, phase: str, step: str | None, force: bool) -> bool:
         if force:
             return True
         if phase != self._last_phase:
+            return True
+        if step != self._last_step:
             return True
         return (frames_done - self._last_frames) >= self._frame_interval
 
@@ -987,6 +1044,7 @@ class ProgressEmitter:
         detector: str | None,
         tracker: str | None,
         resolved_device: str | None,
+        extra: Dict[str, Any] | None = None,
     ) -> Dict[str, object]:
         secs_done = time.time() - self._start_ts
         fps_infer = None
@@ -995,6 +1053,7 @@ class ProgressEmitter:
         payload: Dict[str, object] = {
             "progress_version": self.VERSION,
             "ep_id": self.ep_id,
+            "run_id": self.run_id,
             "phase": phase,
             "frames_done": frames_done,
             "frames_total": self.frames_total,
@@ -1014,11 +1073,35 @@ class ProgressEmitter:
             payload["summary"] = summary
         if error:
             payload["error"] = error
+        if extra:
+            payload.update(extra)
         return payload
 
     def _write_payload(self, payload: Dict[str, object]) -> None:
         line = json.dumps(payload, sort_keys=True)
         print(line, flush=True)
+
+        # Structured logging for episode-wide grep
+        phase = payload.get("phase", "")
+        step = payload.get("step", "")
+        frames = payload.get("frames_done", 0)
+        total = payload.get("frames_total", 0)
+        vt = payload.get("video_time")
+        vtotal = payload.get("video_total")
+        fps = payload.get("fps_infer")
+        run_id_short = self.run_id[:8] if self.run_id else "unknown"
+
+        if vt is not None and vtotal is not None:
+            LOGGER.info(
+                "[job=%s run=%s phase=%s step=%s frames=%s/%s vt=%.1f/%.1f fps=%.2f]",
+                self.ep_id, run_id_short, phase, step, frames, total, vt, vtotal, fps or 0.0
+            )
+        else:
+            LOGGER.info(
+                "[job=%s run=%s phase=%s step=%s frames=%s/%s fps=%.2f]",
+                self.ep_id, run_id_short, phase, step, frames, total, fps or 0.0
+            )
+
         if self.path:
             tmp_path = self.path.with_suffix(".tmp")
             tmp_path.write_text(line, encoding="utf-8")
@@ -1036,11 +1119,21 @@ class ProgressEmitter:
         detector: str | None = None,
         tracker: str | None = None,
         resolved_device: str | None = None,
+        extra: Dict[str, Any] | None = None,
+        **fields: Any,
     ) -> None:
+        if self._closed:
+            return
         frames_done = max(int(frames_done), 0)
         if self.frames_total and frames_done > self.frames_total:
             frames_done = self.frames_total
-        if not self._should_emit(frames_done, phase, force):
+
+        # Extract step from extra dict if present
+        step = None
+        if extra and "step" in extra:
+            step = extra.get("step")
+
+        if not self._should_emit(frames_done, phase, step, force):
             return
         if device is not None:
             self._device = device
@@ -1050,10 +1143,24 @@ class ProgressEmitter:
             self._tracker = tracker
         if resolved_device is not None:
             self._resolved_device = resolved_device
-        payload = self._compose_payload(frames_done, phase, device, summary, error, detector, tracker, resolved_device)
+        combined_extra: Dict[str, Any] = {} if extra is None else dict(extra)
+        if fields:
+            combined_extra.update(fields)
+        payload = self._compose_payload(
+            frames_done,
+            phase,
+            device,
+            summary,
+            error,
+            detector,
+            tracker,
+            resolved_device,
+            combined_extra or None,
+        )
         self._write_payload(payload)
         self._last_frames = frames_done
         self._last_phase = phase
+        self._last_step = step
 
     def complete(
         self,
@@ -1062,9 +1169,15 @@ class ProgressEmitter:
         detector: str | None = None,
         tracker: str | None = None,
         resolved_device: str | None = None,
+        *,
+        step: str | None = None,
+        extra: Dict[str, Any] | None = None,
     ) -> None:
         final_frames = self.frames_total or summary.get("frames_sampled") or self._last_frames
         final_frames = int(final_frames or 0)
+        completion_extra: Dict[str, Any] = {} if extra is None else dict(extra)
+        if step:
+            completion_extra["step"] = step
         self.emit(
             final_frames,
             phase="done",
@@ -1074,6 +1187,7 @@ class ProgressEmitter:
             detector=detector,
             tracker=tracker,
             resolved_device=resolved_device,
+            extra=completion_extra or None,
         )
 
     def fail(self, error: str) -> None:
@@ -1082,6 +1196,43 @@ class ProgressEmitter:
     @property
     def target_frames(self) -> int:
         return self.frames_total or 0
+
+    def close(self) -> None:
+        self._closed = True
+
+
+def _non_video_phase_meta(step: str | None = None) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {"video_time": None, "video_total": None}
+    if step:
+        meta["step"] = step
+    return meta
+
+
+def _video_phase_meta(frames_done: int, frames_total: int | None, fps: float | None, step: str | None = None) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    if fps and fps > 0 and frames_total and frames_total > 0:
+        video_total = frames_total / fps
+        video_time = min(frames_done / fps, video_total)
+        meta["video_total"] = round(video_total, 3)
+        meta["video_time"] = round(video_time, 3)
+    else:
+        meta["video_time"] = None
+        meta["video_total"] = None
+    if step:
+        meta["step"] = step
+    return meta
+
+
+def _utcnow_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _write_run_marker(ep_id: str, phase: str, payload: Dict[str, Any]) -> None:
+    manifests_dir = get_path(ep_id, "detections").parent
+    run_dir = manifests_dir / RUN_MARKERS_SUBDIR
+    run_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = run_dir / f"{phase}.json"
+    marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 class FrameExporter:
@@ -1367,6 +1518,30 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Tracker backend (ByteTrack default, StrongSORT optional for occlusions)",
     )
     parser.add_argument(
+        "--scene-detect",
+        choices=["on", "off"],
+        default="on" if SCENE_DETECT_DEFAULT else "off",
+        help="Enable histogram-based scene cut detection",
+    )
+    parser.add_argument(
+        "--scene-threshold",
+        type=float,
+        default=SCENE_THRESHOLD_DEFAULT,
+        help="Scene-cut threshold (1 - HSV histogram correlation, 0-2 range)",
+    )
+    parser.add_argument(
+        "--scene-min-len",
+        type=int,
+        default=SCENE_MIN_LEN_DEFAULT,
+        help="Minimum frames between scene cuts",
+    )
+    parser.add_argument(
+        "--scene-warmup-dets",
+        type=int,
+        default=SCENE_WARMUP_DETS_DEFAULT,
+        help="Frames of forced detection after each cut",
+    )
+    parser.add_argument(
         "--det-thresh",
         type=float,
         default=RETINAFACE_SCORE_THRESHOLD,
@@ -1383,7 +1558,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--out-root",
         help="Data root override (defaults to SCREENALYTICS_DATA_ROOT or ./data)",
     )
-    parser.add_argument("--stub", action="store_true", help="Use stub detections (fast, no ML)")
     parser.add_argument("--progress-file", help="Progress JSON file to update during processing")
     parser.add_argument("--save-frames", action="store_true", help="Save sampled frame JPGs under data/frames/{ep_id}")
     parser.add_argument("--save-crops", action="store_true", help="Save per-track crops (requires --save-frames or track IDs)")
@@ -1409,6 +1583,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if hasattr(args, "det_thresh"):
         args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
+    scene_flag = str(getattr(args, "scene_detect", "on")).strip().lower()
+    args.scene_detect = scene_flag not in {"0", "false", "off", "no"}
+    args.scene_threshold = max(min(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 2.0), 0.0)
+    args.scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
+    args.scene_warmup_dets = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
     data_root = (
         Path(args.out_root).expanduser()
         if args.out_root
@@ -1442,111 +1621,6 @@ def main(argv: Iterable[str] | None = None) -> int:
     return 0
 
 
-def _run_stub_pipeline(
-    ep_id: str,
-    *,
-    detector: str,
-    tracker: str,
-    progress: ProgressEmitter | None = None,
-    analyzed_fps: float | None = None,
-) -> Tuple[int, int, int, str, str, float | None, Dict[str, Any]]:
-    det_path = get_path(ep_id, "detections")
-    track_path = get_path(ep_id, "tracks")
-    det_rows = []
-    if progress:
-        progress.emit(
-            0,
-            phase="detect",
-            device="cpu",
-            detector=detector,
-            tracker=tracker,
-            resolved_device="cpu",
-            force=True,
-        )
-    stub_frames = 3
-    detector_label = detector or FACE_CLASS_LABEL
-    class_label = FACE_CLASS_LABEL
-    tracker_label = tracker or DEFAULT_TRACKER
-    for idx in range(stub_frames):
-        ts = idx * 0.5
-        det_rows.append(
-            {
-                "ep_id": ep_id,
-                "ts": round(ts, 4),
-                "frame_idx": idx,
-                "class": class_label,
-                "conf": 0.99,
-                "bbox_xyxy": [
-                    round(50 + idx * 5, 1),
-                    round(60 + idx * 5, 1),
-                    round(150 + idx * 5, 1),
-                    round(160 + idx * 5, 1),
-                ],
-                "track_id": 1,
-                "model": YOLO_MODEL_NAME,
-                "tracker": tracker_label,
-                "detector": detector_label,
-                "pipeline_ver": PIPELINE_VERSION,
-            }
-        )
-        if progress:
-            total = max(progress.target_frames, 1)
-            ratio = (idx + 1) / stub_frames
-            scale = int(round(total * ratio)) or (idx + 1)
-            progress.emit(
-                scale,
-                phase="detect",
-                device="cpu",
-                detector=detector,
-                tracker=tracker_label,
-                resolved_device="cpu",
-            )
-    track_rows = [
-        {
-            "ep_id": ep_id,
-            "track_id": 1,
-            "class": class_label,
-            "first_ts": 0.0,
-            "last_ts": round((len(det_rows) - 1) * 0.5, 4),
-            "frame_count": len(det_rows),
-            "bboxes_sampled": [
-                {
-                    "frame_idx": row["frame_idx"],
-                    "ts": row["ts"],
-                    "bbox_xyxy": row["bbox_xyxy"],
-                }
-                for row in det_rows
-            ],
-            "pipeline_ver": PIPELINE_VERSION,
-            "tracker": tracker_label,
-            "detector": detector_label,
-        }
-    ]
-    _write_jsonl(det_path, det_rows)
-    _write_jsonl(track_path, track_rows)
-    metrics = {
-        "tracks_born": len(track_rows),
-        "tracks_lost": len(track_rows),
-        "id_switches": 0,
-        "longest_tracks": [
-            {"track_id": row["track_id"], "frame_count": row["frame_count"]}
-            for row in track_rows[:5]
-        ],
-    }
-    if progress:
-        progress.emit(
-            progress.target_frames,
-            phase="track",
-            device="cpu",
-            summary=metrics,
-            detector=detector,
-            tracker=tracker_label,
-            resolved_device="cpu",
-            force=True,
-        )
-    return len(det_rows), len(track_rows), len(det_rows), "cpu", "cpu", analyzed_fps, metrics
-
-
 def _effective_stride(stride: int, target_fps: float | None, source_fps: float) -> int:
     stride = max(stride, 1)
     if target_fps and target_fps > 0 and source_fps > 0:
@@ -1576,6 +1650,74 @@ def _detect_fps(video_path: Path) -> float:
     return fps
 
 
+def detect_scene_cuts(
+    video_path: str | Path,
+    *,
+    thr: float = SCENE_THRESHOLD_DEFAULT,
+    min_len: int = SCENE_MIN_LEN_DEFAULT,
+    progress: ProgressEmitter | None = None,
+) -> list[int]:
+    """Lightweight HSV histogram scene-cut detector."""
+
+    import cv2  # type: ignore
+
+    threshold = max(min(float(thr or SCENE_THRESHOLD_DEFAULT), 2.0), 0.0)
+    min_gap = max(int(min_len or SCENE_MIN_LEN_DEFAULT), 1)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return []
+    cuts: list[int] = []
+    prev_hist = None
+    last_cut = -10**9
+    idx = 0
+    if progress:
+        progress.emit(
+            0,
+            phase="scene_detect:cut",
+            summary={"threshold": round(float(threshold), 3), "min_len": min_gap},
+            extra=_non_video_phase_meta("start"),
+            force=True,
+        )
+    target_frames = progress.target_frames if progress else 0
+    emit_interval = 50  # Emit every 50 frames to reduce spam
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
+        hist = cv2.normalize(hist, None).flatten()
+        if prev_hist is not None:
+            diff = 1.0 - float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL))
+            if diff > threshold and (idx - last_cut) >= min_gap:
+                cuts.append(idx)
+                last_cut = idx
+        # Emit sparse updates (every 50 frames) instead of on every cut
+        if progress and (idx % emit_interval == 0 or idx == target_frames - 1):
+            frames_done = idx if idx >= 0 else 0
+            if target_frames:
+                frames_done = min(target_frames, frames_done)
+            progress.emit(
+                frames_done,
+                phase="scene_detect:cut",
+                summary={"count": len(cuts)},
+                extra=_non_video_phase_meta(),
+            )
+        prev_hist = hist
+        idx += 1
+    cap.release()
+    if progress:
+        final_frames = target_frames or idx
+        progress.emit(
+            final_frames,
+            phase="scene_detect:cut",
+            summary={"cuts": len(cuts)},
+            force=True,
+            extra=_non_video_phase_meta("done"),
+        )
+    return cuts
+
+
 def _run_full_pipeline(
     args: argparse.Namespace,
     video_dest: Path,
@@ -1584,7 +1726,9 @@ def _run_full_pipeline(
     progress: ProgressEmitter | None = None,
     target_fps: float | None = None,
     frame_exporter: FrameExporter | None = None,
-) -> Tuple[int, int, int, str, str, float | None, Dict[str, Any]]:
+    total_frames: int | None = None,
+    video_fps: float | None = None,
+) -> Tuple[int, int, int, str, str, float | None, Dict[str, Any], Dict[str, Any]]:
     import cv2  # type: ignore
 
     analyzed_fps = target_fps or source_fps
@@ -1592,6 +1736,23 @@ def _run_full_pipeline(
         analyzed_fps = _detect_fps(video_dest)
     frame_stride = _effective_stride(args.stride, target_fps or analyzed_fps, source_fps)
     ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
+    frames_goal = None
+    if total_frames and total_frames > 0:
+        frames_goal = int(total_frames)
+    elif progress and progress.target_frames:
+        frames_goal = progress.target_frames
+    video_clock_fps = video_fps if video_fps and video_fps > 0 else (source_fps if source_fps > 0 else None)
+
+    def _progress_value(frame_index: int, *, include_current: bool = False, step: str | None = None) -> tuple[int, Dict[str, Any]]:
+        base = frame_index + (1 if include_current else 0)
+        if base < 0:
+            base = 0
+        total = frames_goal or base
+        value = base
+        if frames_goal:
+            value = min(frames_goal, base)
+        meta = _video_phase_meta(value, total if total > 0 else None, video_clock_fps, step=step)
+        return value, meta
     device = pick_device(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
@@ -1608,17 +1769,35 @@ def _run_full_pipeline(
     detector_device = getattr(detector_backend, "resolved_device", device)
     tracker_label = tracker_choice
     if progress:
+        start_frames, video_meta = _progress_value(-1, include_current=True)
         progress.emit(
-            0,
+            start_frames,
             phase="detect",
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
             resolved_device=detector_device,
             force=True,
+            extra=video_meta,
         )
 
     tracker_adapter = _build_tracker_adapter(tracker_choice, frame_rate=source_fps or 30.0)
+    scene_enabled = bool(getattr(args, "scene_detect", True))
+    scene_threshold = max(min(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 2.0), 0.0)
+    scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
+    scene_warmup = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
+    scene_cuts: list[int] = []
+    if scene_enabled:
+        scene_cuts = detect_scene_cuts(
+            str(video_dest),
+            thr=scene_threshold,
+            min_len=scene_min_len,
+            progress=progress,
+        )
+    scene_summary = {"count": len(scene_cuts), "indices": scene_cuts}
+    cut_ix = 0
+    next_cut = scene_cuts[cut_ix] if scene_cuts else None
+    frames_since_cut = 10**9
     recorder = TrackRecorder(max_gap=args.max_gap, remap_ids=True)
     det_path = get_path(args.ep_id, "detections")
     det_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1637,11 +1816,45 @@ def _run_full_pipeline(
                 ok, frame = cap.read()
                 if not ok:
                     break
-                if frame_idx % frame_stride != 0:
+                if next_cut is not None and frame_idx >= next_cut:
+                    reset_tracker = getattr(tracker_adapter, "reset", None)
+                    if callable(reset_tracker):
+                        reset_tracker()
+                    frames_since_cut = 0
+                    cut_ix += 1
+                    next_cut = scene_cuts[cut_ix] if cut_ix < len(scene_cuts) else None
+                    if progress:
+                        emit_frames, video_meta = _progress_value(frame_idx, include_current=False)
+                        progress.emit(
+                            emit_frames,
+                            phase="track",
+                            device=device,
+                            detector=detector_choice,
+                            tracker=tracker_label,
+                            resolved_device=detector_device,
+                            summary={"event": "reset_on_cut", "frame": frame_idx},
+                            force=True,
+                            extra=video_meta,
+                        )
+                force_detect = frames_since_cut < scene_warmup
+                should_sample = frame_idx % frame_stride == 0
+                if not (should_sample or force_detect):
                     frame_idx += 1
+                    frames_since_cut += 1
                     continue
 
                 frames_sampled += 1
+                detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
+                if progress:
+                    progress.emit(
+                        detect_frames,
+                        phase="detect",
+                        device=device,
+                        detector=detector_choice,
+                        tracker=tracker_label,
+                        resolved_device=detector_device,
+                        extra=detect_meta,
+                    )
                 ts = frame_idx / ts_fps if ts_fps else 0.0
                 detections = detector_backend.detect(frame)
                 face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
@@ -1651,17 +1864,8 @@ def _run_full_pipeline(
                 if not face_detections:
                     if frame_exporter and frame_exporter.save_frames:
                         frame_exporter.export(frame_idx, frame, [], ts=ts)
-                    if progress:
-                        emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
-                        progress.emit(
-                            emit_frames,
-                            phase="detect",
-                            device=device,
-                            detector=detector_choice,
-                            tracker=tracker_label,
-                            resolved_device=detector_device,
-                        )
                     frame_idx += 1
+                    frames_since_cut += 1
                     continue
 
                 for obj in tracked_objects:
@@ -1703,9 +1907,9 @@ def _run_full_pipeline(
                     frame_exporter.export(frame_idx, frame, crop_records, ts=ts)
 
                 if progress:
-                    emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
+                    track_frames, track_meta = _progress_value(frame_idx, include_current=True)
                     progress.emit(
-                        emit_frames,
+                        track_frames,
                         phase="track",
                         device=device,
                         detector=detector_choice,
@@ -1716,10 +1920,25 @@ def _run_full_pipeline(
                             "tracks_lost": recorder.metrics["tracks_lost"],
                             "id_switches": recorder.metrics["id_switches"],
                         },
+                        extra=track_meta,
                     )
                 frame_idx += 1
+                frames_since_cut += 1
     finally:
         cap.release()
+    if progress and frame_idx > 0:
+        detect_done_index = max(frame_idx - 1, 0)
+        detect_done_frames, detect_done_meta = _progress_value(detect_done_index, include_current=True, step="done")
+        progress.emit(
+            detect_done_frames,
+            phase="detect",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_label,
+            resolved_device=detector_device,
+            force=True,
+            extra=detect_done_meta,
+        )
 
     recorder.finalize()
     if frame_exporter:
@@ -1737,8 +1956,10 @@ def _run_full_pipeline(
         "longest_tracks": recorder.top_long_tracks(),
     }
     if progress:
+        final_track_index = max(frame_idx - 1, 0)
+        track_done_frames, track_done_meta = _progress_value(final_track_index, include_current=True, step="done")
         progress.emit(
-            progress.target_frames,
+            track_done_frames,
             phase="track",
             device=device,
             detector=detector_choice,
@@ -1746,8 +1967,9 @@ def _run_full_pipeline(
             resolved_device=detector_device,
             summary=metrics,
             force=True,
+            extra=track_done_meta,
         )
-    return det_count, len(track_rows), frames_sampled, device, detector_device, analyzed_fps, metrics
+    return det_count, len(track_rows), frames_sampled, device, detector_device, analyzed_fps, metrics, scene_summary
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -1778,13 +2000,15 @@ def _run_detect_track_stage(
         fallback_fps = target_fps or source_fps or 30.0
         if fallback_fps > 0:
             duration_sec = frame_count / fallback_fps
-    frames_total = _estimate_frame_budget(
-        stride=args.stride,
-        target_fps=target_fps,
-        detected_fps=source_fps,
-        duration_sec=duration_sec,
-        frame_count=frame_count,
-    )
+    frames_total = frame_count
+    if frames_total <= 0:
+        frames_total = _estimate_frame_budget(
+            stride=args.stride,
+            target_fps=target_fps,
+            detected_fps=source_fps,
+            duration_sec=duration_sec,
+            frame_count=frame_count,
+        )
 
     progress = ProgressEmitter(
         args.ep_id,
@@ -1813,39 +2037,25 @@ def _run_detect_track_stage(
     )
 
     try:
-        if args.stub:
-            (
-                det_count,
-                track_count,
-                frames_sampled,
-                pipeline_device,
-                detector_device,
-                analyzed_fps,
-                track_metrics,
-            ) = _run_stub_pipeline(
-                args.ep_id,
-                detector=detector_choice,
-                progress=progress,
-                analyzed_fps=source_fps,
-                tracker=tracker_choice,
-            )
-        else:
-            (
-                det_count,
-                track_count,
-                frames_sampled,
-                pipeline_device,
-                detector_device,
-                analyzed_fps,
-                track_metrics,
-            ) = _run_full_pipeline(
-                args,
-                video_dest,
-                source_fps=source_fps,
-                progress=progress,
-                target_fps=target_fps,
-                frame_exporter=frame_exporter,
-            )
+        (
+            det_count,
+            track_count,
+            frames_sampled,
+            pipeline_device,
+            detector_device,
+            analyzed_fps,
+            track_metrics,
+            scene_summary,
+        ) = _run_full_pipeline(
+            args,
+            video_dest,
+            source_fps=source_fps,
+            progress=progress,
+            target_fps=target_fps,
+            frame_exporter=frame_exporter,
+            total_frames=frames_total,
+            video_fps=source_fps,
+        )
 
         manifests_dir = get_path(args.ep_id, "detections").parent
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
@@ -1884,17 +2094,29 @@ def _run_detect_track_stage(
                 "s3_uploads": s3_stats,
             },
         }
+        scene_summary = scene_summary or {"count": 0}
+        scene_count = scene_summary.get("count")
+        scene_cuts_payload: Dict[str, Any] = {"count": int(scene_count) if isinstance(scene_count, int) else 0}
+        indices = scene_summary.get("indices")
+        if isinstance(indices, list):
+            scene_cuts_payload["indices"] = indices
+        summary["scene_cuts"] = scene_cuts_payload
         progress.complete(
             summary,
             device=pipeline_device,
             detector=detector_choice,
             tracker=tracker_choice,
             resolved_device=detector_device,
+            step="detect_track",
         )
+        # Brief delay to ensure final progress event is written and readable
+        time.sleep(0.2)
         return summary
     except Exception as exc:
         progress.fail(str(exc))
         raise
+    finally:
+        progress.close()
 
 
 def _run_faces_embed_stage(
@@ -1910,15 +2132,17 @@ def _run_faces_embed_stage(
     if not samples:
         raise RuntimeError("No track samples available for faces embedding")
 
+    faces_total = len(samples)
     progress = ProgressEmitter(
         args.ep_id,
         args.progress_file,
-        frames_total=len(samples),
+        frames_total=faces_total,
         secs_total=None,
         stride=1,
         fps_detected=None,
         fps_requested=None,
     )
+    phase_meta = _non_video_phase_meta()
     device = pick_device(args.device)
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
@@ -1936,23 +2160,21 @@ def _run_faces_embed_stage(
     thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
-    embedder: ArcFaceEmbedder | None = None
-    embed_device = device
-    if not args.stub:
-        embedder = ArcFaceEmbedder(device)
-        embedder.ensure_ready()
-        embed_device = embedder.resolved_device
+    embedder = ArcFaceEmbedder(device)
+    embedder.ensure_ready()
+    embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     video_path = get_path(args.ep_id, "video")
     frame_decoder: FrameDecoder | None = None
-    blank_image = _blank_image() if exporter and args.stub else None
     track_embeddings: Dict[int, List[np.ndarray]] = defaultdict(list)
     track_best_thumb: Dict[int, tuple[float, str, str | None]] = {}
     embeddings_array: List[np.ndarray] = []
 
+    faces_done = 0
+    started_at = _utcnow_iso()
     try:
         progress.emit(
             0,
@@ -1962,9 +2184,10 @@ def _run_faces_embed_stage(
             tracker=tracker_choice,
             resolved_device=embed_device,
             force=True,
+            extra=phase_meta,
         )
         rows: List[Dict[str, Any]] = []
-        for idx, sample in enumerate(samples, start=1):
+        for sample in samples:
             crop_rel_path = None
             crop_s3_key = None
             thumb_rel_path = None
@@ -1979,14 +2202,11 @@ def _run_faces_embed_stage(
             landmarks = sample.get("landmarks")
 
             image = None
-            if args.stub:
-                image = blank_image
-            else:
-                if not video_path.exists():
-                    raise FileNotFoundError("Local video not found for crop export")
-                if frame_decoder is None:
-                    frame_decoder = FrameDecoder(video_path)
-                image = frame_decoder.read(frame_idx)
+            if not video_path.exists():
+                raise FileNotFoundError("Local video not found for crop export")
+            if frame_decoder is None:
+                frame_decoder = FrameDecoder(video_path)
+            image = frame_decoder.read(frame_idx)
 
             if exporter and image is not None:
                 exporter.export(frame_idx, image, [(track_id, bbox)], ts=ts_val)
@@ -1999,17 +2219,14 @@ def _run_faces_embed_stage(
                 if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
                     thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
 
-            if embedding_vec is None:
-                if embedder and image is not None:
-                    crop = _prepare_face_crop(image, bbox, landmarks)
-                    encoded = embedder.encode([crop])
-                    embedding_vec = encoded[0] if encoded.size else np.zeros(512, dtype=np.float32)
-                else:
-                    vec = np.asarray(_fake_embedding(track_id, frame_idx, length=512), dtype=np.float32)
-                    norm = np.linalg.norm(vec)
-                    if norm > 0:
-                        vec = vec / norm
-                    embedding_vec = vec
+            if image is None:
+                raise RuntimeError("Unable to read frame for faces embedding")
+            crop = _prepare_face_crop(image, bbox, landmarks)
+            encoded = embedder.encode([crop])
+            if encoded.size:
+                embedding_vec = encoded[0]
+            else:
+                embedding_vec = np.zeros(512, dtype=np.float32)
 
             track_embeddings[track_id].append(embedding_vec)
             embeddings_array.append(embedding_vec)
@@ -2044,14 +2261,28 @@ def _run_faces_embed_stage(
             if landmarks:
                 face_row["landmarks"] = [round(float(val), 4) for val in landmarks]
             rows.append(face_row)
+            faces_done = min(faces_total, faces_done + 1)
             progress.emit(
-                idx,
+                faces_done,
                 phase="faces_embed",
                 device=device,
                 detector=detector_choice,
                 tracker=tracker_choice,
                 resolved_device=embed_device,
+                extra=phase_meta,
             )
+
+        # Force emit final progress after loop completes
+        progress.emit(
+            len(rows),
+            phase="faces_embed",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=embed_device,
+            extra=phase_meta,
+            force=True,
+        )
 
         _write_jsonl(faces_path, rows)
         embed_path = _faces_embed_path(args.ep_id)
@@ -2064,15 +2295,8 @@ def _run_faces_embed_stage(
         if exporter:
             exporter.write_indexes()
 
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
-        _report_s3_upload(
-            progress,
-            s3_stats,
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
-        )
+        # Build preliminary summary for completion events (before S3 sync)
+        finished_at = _utcnow_iso()
         summary: Dict[str, Any] = {
             "stage": "faces_embed",
             "ep_id": args.ep_id,
@@ -2095,16 +2319,48 @@ def _run_faces_embed_stage(
                     "faces_embeddings": str(embed_path),
                 },
                 "s3_prefixes": s3_prefixes,
-                "s3_uploads": s3_stats,
             },
             "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
         }
+
+        # Emit completion BEFORE S3 sync (which might hang or take long)
+        progress.emit(
+            len(rows),
+            phase="faces_embed",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=embed_device,
+            summary=summary,
+            force=True,
+            extra=_non_video_phase_meta("done"),
+        )
         progress.complete(
             summary,
             device=device,
             detector=detector_choice,
             tracker=tracker_choice,
             resolved_device=embed_device,
+            step="faces_embed",
+            extra=phase_meta,
+        )
+
+        # Now do S3 sync after completion is signaled
+        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
+        summary["artifacts"]["s3_uploads"] = s3_stats
+        # Brief delay to ensure final progress event is written and readable
+        time.sleep(0.2)
+        _write_run_marker(
+            args.ep_id,
+            "faces_embed",
+            {
+                "phase": "faces_embed",
+                "status": "success",
+                "version": APP_VERSION,
+                "faces": len(rows),
+                "started_at": started_at,
+                "finished_at": finished_at,
+            },
         )
         return summary
     except Exception as exc:
@@ -2113,6 +2369,7 @@ def _run_faces_embed_stage(
     finally:
         if frame_decoder:
             frame_decoder.close()
+        progress.close()
 
 
 def _update_track_embeddings(
@@ -2161,6 +2418,15 @@ def _run_cluster_stage(
     faces_rows = list(_iter_jsonl(faces_path))
     if not faces_rows:
         raise RuntimeError("faces.jsonl is empty; cannot cluster")
+    faces_total = len(faces_rows)
+    faces_per_track: Dict[int, int] = defaultdict(int)
+    for face_row in faces_rows:
+        track_id_val = face_row.get("track_id")
+        try:
+            track_key = int(track_id_val)
+        except (TypeError, ValueError):
+            continue
+        faces_per_track[track_key] += 1
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
@@ -2171,12 +2437,13 @@ def _run_cluster_stage(
     progress = ProgressEmitter(
         args.ep_id,
         args.progress_file,
-        frames_total=len(faces_rows),
+        frames_total=faces_total,
         secs_total=None,
         stride=1,
         fps_detected=None,
         fps_requested=None,
     )
+    phase_meta = _non_video_phase_meta()
     device = pick_device(args.device)
     progress.emit(
         0,
@@ -2186,108 +2453,164 @@ def _run_cluster_stage(
         tracker=tracker_choice,
         resolved_device=device,
         force=True,
+        extra=phase_meta,
     )
 
-    embedding_rows: List[np.ndarray] = []
-    track_ids: List[int] = []
-    track_index: Dict[int, dict] = {}
-    for row in track_rows:
-        track_id = int(row.get("track_id", -1))
-        embed = row.get("face_embedding")
-        if embed:
-            embedding_rows.append(np.asarray(embed, dtype="float32"))
-            track_ids.append(track_id)
-            track_index[track_id] = row
-    if not embedding_rows:
-        raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
+    started_at = _utcnow_iso()
+    try:
+        embedding_rows: List[np.ndarray] = []
+        track_ids: List[int] = []
+        track_index: Dict[int, dict] = {}
+        for row in track_rows:
+            track_id = int(row.get("track_id", -1))
+            embed = row.get("face_embedding")
+            if embed:
+                embedding_rows.append(np.asarray(embed, dtype="float32"))
+                track_ids.append(track_id)
+                track_index[track_id] = row
+        if not embedding_rows:
+            raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
-    labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
-    track_groups: Dict[int, List[int]] = defaultdict(list)
-    for tid, label in zip(track_ids, labels):
-        track_groups[label].append(tid)
+        labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
+        track_groups: Dict[int, List[int]] = defaultdict(list)
+        for tid, label in zip(track_ids, labels):
+            track_groups[label].append(tid)
 
-    min_cluster = max(1, int(args.min_cluster_size))
-    identity_payload: List[dict] = []
-    thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
-    counter = 1
-    for label, tids in track_groups.items():
-        buckets = [tids]
-        if len(tids) < min_cluster:
-            buckets = [[tid] for tid in tids]
-        for bucket in buckets:
-            identity_id = f"id_{counter:04d}"
-            faces_total = sum(int(track_index.get(tid, {}).get("faces_count", 0)) for tid in bucket)
-            rep_track_id = max(bucket, key=lambda tid: track_index.get(tid, {}).get("faces_count", 0))
-            rep_rel, rep_s3 = _materialize_identity_thumb(thumb_root, track_index.get(rep_track_id), identity_id, s3_prefixes)
-            identity_payload.append(
-                {
-                    "identity_id": identity_id,
-                    "label": None,
-                    "track_ids": bucket,
-                    "size": faces_total,
-                    "rep_thumb_rel_path": rep_rel,
-                    "rep_thumb_s3_key": rep_s3,
-                }
-            )
-            counter += 1
-            progress.emit(
-                counter,
-                phase="cluster",
-                device=device,
-                detector=detector_choice,
-                tracker=tracker_choice,
-                resolved_device=device,
-            )
+        min_cluster = max(1, int(args.min_cluster_size))
+        identity_payload: List[dict] = []
+        thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
+        faces_done = 0
+        identity_counter = 1
+        for label, tids in track_groups.items():
+            buckets = [tids]
+            if len(tids) < min_cluster:
+                buckets = [[tid] for tid in tids]
+            for bucket in buckets:
+                identity_id = f"id_{identity_counter:04d}"
+                identity_counter += 1
+                identity_faces = sum(faces_per_track.get(tid, 0) for tid in bucket)
+                if identity_faces <= 0:
+                    identity_faces = len(bucket)
+                rep_track_id = max(bucket, key=lambda tid: track_index.get(tid, {}).get("faces_count", 0))
+                rep_rel, rep_s3 = _materialize_identity_thumb(
+                    thumb_root,
+                    track_index.get(rep_track_id),
+                    identity_id,
+                    s3_prefixes,
+                )
+                identity_payload.append(
+                    {
+                        "identity_id": identity_id,
+                        "label": None,
+                        "track_ids": bucket,
+                        "size": identity_faces,
+                        "rep_thumb_rel_path": rep_rel,
+                        "rep_thumb_s3_key": rep_s3,
+                    }
+                )
+                faces_done = min(faces_total, faces_done + identity_faces)
+                progress.emit(
+                    faces_done,
+                    phase="cluster",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=device,
+                    extra=phase_meta,
+                )
 
-    identities_path = manifests_dir / "identities.json"
-    payload = {
-        "ep_id": args.ep_id,
-        "pipeline_ver": PIPELINE_VERSION,
-        "stats": {
-            "faces": len(faces_rows),
-            "clusters": len(identity_payload),
-        },
-        "identities": identity_payload,
-    }
-    identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
-    _report_s3_upload(
-        progress,
-        s3_stats,
-        device=device,
-        detector=detector_choice,
-        tracker=tracker_choice,
-        resolved_device=resolved_device,
-    )
+        # Force emit final progress after loop completes
+        progress.emit(
+            faces_total,
+            phase="cluster",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            extra=phase_meta,
+            force=True,
+        )
 
-    summary: Dict[str, Any] = {
-        "stage": "cluster",
-        "ep_id": args.ep_id,
-        "identities_count": len(identity_payload),
-        "faces_count": len(faces_rows),
-        "device": device,
-        "resolved_device": device,
-        "detector": detector_choice,
-        "tracker": tracker_choice,
-        "artifacts": {
-            "local": {
-                "faces": str(faces_path),
-                "identities": str(identities_path),
-                "tracks": str(track_path),
+        identities_path = manifests_dir / "identities.json"
+        payload = {
+            "ep_id": args.ep_id,
+            "pipeline_ver": PIPELINE_VERSION,
+            "stats": {
+                "faces": faces_total,
+                "clusters": len(identity_payload),
             },
-            "s3_prefixes": s3_prefixes,
-            "s3_uploads": s3_stats,
-        },
-        "stats": payload["stats"],
-    }
-    progress.complete(
-        summary,
-        device=device,
-        detector=detector_choice,
-        tracker=tracker_choice,
-        resolved_device=device,
-    )
-    return summary
+            "identities": identity_payload,
+        }
+        identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        # Build preliminary summary for completion events (before S3 sync)
+        finished_at = _utcnow_iso()
+        summary: Dict[str, Any] = {
+            "stage": "cluster",
+            "ep_id": args.ep_id,
+            "identities_count": len(identity_payload),
+            "faces_count": faces_total,
+            "device": device,
+            "resolved_device": device,
+            "detector": detector_choice,
+            "tracker": tracker_choice,
+            "artifacts": {
+                "local": {
+                    "faces": str(faces_path),
+                    "identities": str(identities_path),
+                    "tracks": str(track_path),
+                },
+                "s3_prefixes": s3_prefixes,
+            },
+            "stats": payload["stats"],
+        }
+
+        # Emit completion BEFORE S3 sync (which might hang or take long)
+        progress.emit(
+            faces_total,
+            phase="cluster",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            summary=summary,
+            force=True,
+            extra=_non_video_phase_meta("done"),
+        )
+        progress.complete(
+            summary,
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            step="cluster",
+            extra=phase_meta,
+        )
+
+        # Now do S3 sync after completion is signaled
+        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
+        summary["artifacts"]["s3_uploads"] = s3_stats
+        # Brief delay to ensure final progress event is written and readable
+        time.sleep(0.2)
+        _write_run_marker(
+            args.ep_id,
+            "cluster",
+            {
+                "phase": "cluster",
+                "status": "success",
+                "version": APP_VERSION,
+                "faces": faces_total,
+                "identities": len(identity_payload),
+                "started_at": started_at,
+                "finished_at": finished_at,
+            },
+        )
+        return summary
+    except Exception as exc:
+        progress.fail(str(exc))
+        raise
+    finally:
+        progress.close()
 
 
 def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
@@ -2414,11 +2737,6 @@ def _materialize_identity_thumb(
     if s3_prefixes and s3_prefixes.get("thumbs_identities"):
         s3_key = f"{s3_prefixes['thumbs_identities']}{identity_id}/rep.jpg"
     return dest_rel.as_posix(), s3_key
-
-
-def _fake_embedding(track_id: int, frame_idx: int, length: int = 512) -> List[float]:
-    rnd = random.Random(track_id * 100000 + frame_idx)
-    return [round(rnd.uniform(-1.0, 1.0), 4) for _ in range(length)]
 
 
 def _blank_image(width: int = 160, height: int = 160, color: tuple[int, int, int] = (180, 180, 180)):

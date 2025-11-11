@@ -74,6 +74,22 @@ def _prompt_for_episode() -> None:
     st.stop()
 
 
+def _format_phase_status(label: str, status: Dict[str, Any], count_key: str) -> str:
+    status_value = str(status.get("status") or "missing").lower()
+    if status_value == "success":
+        count_val = status.get(count_key)
+        parts = [f"{label}: Complete"]
+        if isinstance(count_val, int):
+            parts.append(f"({count_val:,})")
+        finished = status.get("finished_at")
+        if finished:
+            parts.append(f"• finished {finished}")
+        return " ".join(parts)
+    if status_value == "missing":
+        return f"{label}: Not started"
+    return f"{label}: {status_value.title()}"
+
+
 ep_id = helpers.get_ep_id()
 if not ep_id:
     _prompt_for_episode()
@@ -94,6 +110,14 @@ except requests.HTTPError as exc:
 except requests.RequestException as exc:
     st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
     st.stop()
+
+status_payload = helpers.get_episode_status(ep_id)
+if status_payload is None:
+    faces_phase_status: Dict[str, Any] = {"status": "unknown"}
+    cluster_phase_status: Dict[str, Any] = {"status": "unknown"}
+else:
+    faces_phase_status = status_payload.get("faces_embed") or {}
+    cluster_phase_status = status_payload.get("cluster") or {}
 
 prefixes = helpers.episode_artifact_prefixes(ep_id)
 bucket_name = cfg.get("bucket")
@@ -144,22 +168,49 @@ default_device_label = helpers.device_default_label()
 with col_detect:
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
-    stub_toggle = st.checkbox("Use stub (fast, no ML)", value=False)
     st.caption(
         f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
         f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
         "Device: auto (falls back to CPU for RetinaFace/ArcFace)."
     )
-    save_frames = st.checkbox("Save frames to S3", value=False)
-    save_crops = st.checkbox("Save face crops to S3", value=False)
+    save_frames = st.checkbox("Save frames to S3", value=True)
+    save_crops = st.checkbox("Save face crops to S3", value=True)
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
     max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=30, step=1)
+    with st.expander("Advanced detect/track", expanded=False):
+        scene_detect_toggle = st.checkbox(
+            "Scene cut detection",
+            value=helpers.SCENE_DETECT_DEFAULT,
+            help="Detect hard scene transitions before tracking and reset ByteTrack per cut",
+        )
+        scene_threshold_value = st.number_input(
+            "Scene cut threshold",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(helpers.SCENE_THRESHOLD_DEFAULT),
+            step=0.05,
+            help="Higher values require bigger histogram differences before a cut is recorded",
+        )
+        scene_min_len_value = st.number_input(
+            "Minimum frames between cuts",
+            min_value=1,
+            max_value=600,
+            value=int(helpers.SCENE_MIN_LEN_DEFAULT),
+            step=1,
+        )
+        scene_warmup_value = st.number_input(
+            "Warmup detections after cut",
+            min_value=0,
+            max_value=25,
+            value=int(helpers.SCENE_WARMUP_DETS_DEFAULT),
+            step=1,
+            help="Force full detection on the first N frames after each cut",
+        )
     run_disabled = False
     run_label = "Run detect/track"
     if st.button(run_label, use_container_width=True, disabled=run_disabled):
         job_payload = helpers.default_detect_track_payload(
             ep_id,
-            stub=bool(stub_toggle),
             stride=int(stride_value),
             det_thresh=helpers.DEFAULT_DET_THRESH,
         )
@@ -169,6 +220,10 @@ with col_detect:
                 "save_crops": bool(save_crops),
                 "jpeg_quality": int(jpeg_quality),
                 "max_gap": int(max_gap_value),
+                "scene_detect": bool(scene_detect_toggle),
+                "scene_threshold": float(scene_threshold_value),
+                "scene_min_len": int(scene_min_len_value),
+                "scene_warmup_dets": int(scene_warmup_value),
             }
         )
         if fps_value > 0:
@@ -235,6 +290,9 @@ with col_detect:
                 st.code(helpers.s3_uri(s3_prefixes.get("frames"), bucket_name))
                 st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
                 st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
+            scene_badge = helpers.scene_cuts_badge_text(normalized)
+            if scene_badge:
+                st.caption(f"🎬 {scene_badge}")
             action_col1, action_col2 = st.columns(2)
             with action_col1:
                 st.button(
@@ -256,7 +314,7 @@ detector_face_only = helpers.detector_is_face_only(ep_id)
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
     st.markdown("### Faces Harvest")
-    faces_stub = st.checkbox("Use stub (fast)", value=True, key="faces_stub_detail")
+    st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
     faces_device_choice = st.selectbox(
         "Device",
         helpers.DEVICE_LABELS,
@@ -264,7 +322,7 @@ with col_faces:
         key="faces_device_choice",
     )
     faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
-    faces_save_frames = st.checkbox("Save sampled frames", value=False, key="faces_save_frames_detail")
+    faces_save_frames = st.checkbox("Save sampled frames", value=True, key="faces_save_frames_detail")
     faces_save_crops = st.checkbox("Save face crops to S3", value=True, key="faces_save_crops_detail")
     faces_jpeg_quality = st.number_input(
         "JPEG quality",
@@ -274,7 +332,7 @@ with col_faces:
         step=5,
         key="faces_jpeg_quality_detail",
     )
-    if faces_device_value == "mps" and not faces_stub:
+    if faces_device_value == "mps":
         st.caption(
             "ArcFace embeddings run on CPU when MPS is selected. Tracker/crop export still uses the requested device."
         )
@@ -286,7 +344,6 @@ with col_faces:
     if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
         payload = {
             "ep_id": ep_id,
-            "stub": bool(faces_stub),
             "device": faces_device_value,
             "save_frames": bool(faces_save_frames),
             "save_crops": bool(faces_save_crops),
@@ -329,7 +386,7 @@ with col_faces:
             )
 with col_cluster:
     st.markdown("### Cluster Identities")
-    cluster_stub = st.checkbox("Use stub (fast)", value=True, key="cluster_stub_detail")
+    st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
     cluster_device_choice = st.selectbox(
         "Device",
         helpers.DEVICE_LABELS,
@@ -345,7 +402,6 @@ with col_cluster:
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         payload = {
             "ep_id": ep_id,
-            "stub": bool(cluster_stub),
             "device": cluster_device_value,
         }
         with st.spinner("Clustering faces…"):

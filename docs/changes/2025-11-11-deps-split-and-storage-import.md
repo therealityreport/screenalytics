@@ -6,7 +6,7 @@
 - Tests default to `STORAGE_BACKEND=local` so CI and dev boxes no longer need the object-store SDK when running the API suite.
 
 ## Why
-PyAV builds pulled in by `faster-whisper` frequently fail on macOS because Homebrew ships FFmpeg 8.x headers. Core API + upload UI + stub flows do not need the ML stack, so splitting dependencies and gating boto3 keeps fresh installs and `pytest` green without heavy/native wheels.
+PyAV builds pulled in by `faster-whisper` frequently fail on macOS because Homebrew ships FFmpeg 8.x headers. Core API + upload UI do not need the ML stack, so splitting dependencies and gating boto3 keeps fresh installs and `pytest` green without heavy/native wheels.
 
 ## How to run now
 ```bash

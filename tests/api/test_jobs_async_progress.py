@@ -34,7 +34,7 @@ def test_progress_endpoint_tracks_updated_frames(tmp_path, monkeypatch) -> None:
         "started_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "ended_at": None,
         "progress_file": str(progress_path),
-        "requested": {"stride": 5, "fps": None, "stub": False, "device": "auto"},
+        "requested": {"stride": 5, "fps": None, "device": "auto"},
         "summary": None,
         "error": None,
         "return_code": None,

@@ -153,13 +153,11 @@ with col2:
     st.write("")
 
 st.subheader("Quick detect/track")
-col_stride, col_fps, col_stub = st.columns(3)
+col_stride, col_fps = st.columns(2)
 with col_stride:
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
 with col_fps:
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
-with col_stub:
-    stub_toggle = st.checkbox("Use stub", value=False)
 st.caption(
     f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
     f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
@@ -169,7 +167,6 @@ st.caption(
 if st.button("Run detect/track", use_container_width=True):
     job_payload = helpers.default_detect_track_payload(
         selected_ep_id,
-        stub=bool(stub_toggle),
         stride=int(stride_value),
         det_thresh=helpers.DEFAULT_DET_THRESH,
     )

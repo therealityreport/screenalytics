@@ -18,8 +18,6 @@ cfg = helpers.init_page("Faces & Tracks")
 st.title("Faces & Tracks Review")
 st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 
-TRACK_STRIP_LIMIT = 40
-TRACK_VIEW_LIMIT = 80
 
 
 def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
@@ -50,6 +48,89 @@ def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, A
     except requests.RequestException as exc:
         st.error(helpers.describe_error(f"{base}{path}", exc))
         return None
+
+
+def _episode_show_slug(ep_id: str) -> str | None:
+    parsed = helpers.parse_ep_id(ep_id) or {}
+    show = parsed.get("show")
+    if not show:
+        return None
+    return str(show).lower()
+
+
+def _roster_cache() -> Dict[str, List[str]]:
+    return st.session_state.setdefault("show_roster_names", {})
+
+
+def _fetch_roster_names(show: str | None) -> List[str]:
+    if not show:
+        return []
+    cache = _roster_cache()
+    if show in cache:
+        return cache[show]
+    payload = _safe_api_get(f"/shows/{show}/cast_names")
+    names = payload.get("names", []) if payload else []
+    cache[show] = names
+    return names
+
+
+def _refresh_roster_names(show: str | None) -> None:
+    if not show:
+        return
+    _roster_cache().pop(show, None)
+
+
+def _cluster_offsets() -> Dict[str, int]:
+    return st.session_state.setdefault("cluster_track_offsets", {})
+
+
+def _name_choice_widget(
+    *,
+    label: str,
+    key_prefix: str,
+    roster_names: List[str],
+    current_name: str = "",
+    text_label: str = "New name",
+) -> str:
+    names = roster_names[:]
+    if current_name and current_name not in names:
+        names = [current_name, *names]
+    options = ["<Add new name…>", *names]
+    default_idx = options.index(current_name) if current_name in names else 0
+    choice = st.selectbox(label, options, index=default_idx, key=f"{key_prefix}_select")
+    if choice == options[0]:
+        return st.text_input(text_label, value=current_name, key=f"{key_prefix}_input").strip()
+    return choice.strip()
+
+
+def _save_identity_name(ep_id: str, identity_id: str, name: str, show: str | None) -> None:
+    cleaned = name.strip()
+    if not cleaned:
+        st.warning("Provide a non-empty name before saving.")
+        return
+    payload: Dict[str, Any] = {"name": cleaned}
+    if show:
+        payload["show"] = show
+    resp = _api_post(f"/episodes/{ep_id}/identities/{identity_id}/name", payload)
+    if resp is None:
+        return
+    st.toast(f"Saved name '{cleaned}' for {identity_id}")
+    _refresh_roster_names(show)
+    st.session_state.get("track_detail_cache", {}).clear()
+    st.rerun()
+
+
+def _move_frames_api(ep_id: str, payload: Dict[str, Any], show: str | None, track_id: int) -> None:
+    resp = _api_post(f"/episodes/{ep_id}/faces/move_frames", payload)
+    if resp is None:
+        return
+    moved = resp.get("moved_frames", len(payload.get("frame_ids", [])))
+    name = resp.get("target_name") or resp.get("target_identity_id") or "target identity"
+    st.toast(f"Moved {moved} frames to {name}")
+    _refresh_roster_names(show)
+    st.session_state.get("track_detail_cache", {}).pop(track_id, None)
+    st.session_state.setdefault("track_frame_selection", {}).pop(track_id, None)
+    st.rerun()
 
 
 def _select_episode() -> str:
@@ -112,16 +193,37 @@ def _track_episode_from_s3(item: Dict[str, Any]) -> None:
     helpers.set_ep_id(resp["ep_id"])
 
 
+def _identity_name_controls(
+    *,
+    ep_id: str,
+    identity: Dict[str, Any],
+    show_slug: str | None,
+    roster_names: List[str],
+    prefix: str,
+) -> None:
+    if not show_slug:
+        st.info("Show slug missing; unable to assign roster names.")
+        return
+    current_name = identity.get("name") or ""
+    resolved = _name_choice_widget(
+        label="Assign name",
+        key_prefix=f"{prefix}_{identity['identity_id']}",
+        roster_names=roster_names,
+        current_name=current_name,
+    )
+    disabled = not resolved or resolved == current_name
+    if st.button("Save name", key=f"{prefix}_save_{identity['identity_id']}", disabled=disabled):
+        _save_identity_name(ep_id, identity["identity_id"], resolved, show_slug)
+
+
 def _initialize_state(ep_id: str) -> None:
     if st.session_state.get("facebank_ep") != ep_id:
         st.session_state["facebank_ep"] = ep_id
-        st.session_state["facebank_view"] = "grid"
+        st.session_state["facebank_view"] = "clusters"
         st.session_state["selected_identity"] = None
         st.session_state["selected_track"] = None
-        st.session_state["cluster_row_data"] = {}
-        st.session_state["track_view_cache"] = {}
-    st.session_state.setdefault("cluster_sample_every", 3)
-    st.session_state.setdefault("track_view_cache", {})
+    st.session_state.setdefault("cluster_track_offsets", {})
+    st.session_state.setdefault("track_detail_cache", {})
 
 
 def _set_view(view: str, identity_id: str | None = None, track_id: int | None = None) -> None:
@@ -129,59 +231,6 @@ def _set_view(view: str, identity_id: str | None = None, track_id: int | None = 
     st.session_state["selected_identity"] = identity_id
     st.session_state["selected_track"] = track_id
     st.rerun()
-
-
-def _cluster_cache(identity_id: str) -> Dict[int, Dict[str, Any]]:
-    cache = st.session_state.setdefault("cluster_row_data", {})
-    return cache.setdefault(identity_id, {})
-
-
-def _prepare_track_view_state(track_id: int, sample_every: int) -> None:
-    cache = st.session_state.setdefault("track_view_cache", {})
-    cache[track_id] = {
-        "items": [],
-        "cursor": None,
-        "sample": 1,
-        "exhausted": False,
-    }
-
-
-def _fetch_track_media(
-    ep_id: str,
-    track_id: int,
-    *,
-    sample: int,
-    limit: int,
-    cursor: str | None = None,
-    asset: str = "crops",
-) -> tuple[List[Dict[str, Any]], str | None]:
-    params = {"sample": max(1, int(sample)), "limit": max(1, int(limit))}
-    if cursor:
-        params["start_after"] = cursor
-    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/{asset}", params=params)
-    if not payload:
-        return [], None
-    if isinstance(payload, dict):
-        items = payload.get("items", []) or []
-        next_cursor = payload.get("next_start_after")
-        return _prepare_media_items(items), next_cursor
-    return _prepare_media_items(payload or []), None
-
-
-def _prepare_media_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    normalized: List[Dict[str, Any]] = []
-    for entry in items:
-        if not isinstance(entry, dict):
-            continue
-        url = entry.get("url")
-        normalized_url = helpers.ensure_media_url(url)
-        if normalized_url != url:
-            cloned = dict(entry)
-            cloned["url"] = normalized_url
-            normalized.append(cloned)
-        else:
-            normalized.append(entry)
-    return normalized
 
 
 def _episode_header(ep_id: str) -> Dict[str, Any] | None:
@@ -211,153 +260,127 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
     return detail
 
 
-def _render_identity_grid(ep_id: str, identities_data: Dict[str, Any]) -> None:
-    identities = identities_data.get("identities", [])
-    if not identities:
+def _render_cluster_rows(
+    ep_id: str,
+    cluster_payload: Dict[str, Any],
+    identities_payload: Dict[str, Any],
+) -> None:
+    clusters = cluster_payload.get("clusters", []) if cluster_payload else []
+    if not clusters:
         st.info("No identities yet. Run Faces Harvest and Cluster to populate the facebank.")
         return
-    cols = st.columns(3)
-    for idx, identity in enumerate(identities):
-        col = cols[idx % len(cols)]
-        with col:
-            def extra_actions(identity_id: str = identity["identity_id"], *, current_idx: int = idx):
-                if st.button("View cluster", key=f"view_cluster_{identity_id}"):
-                    _set_view("cluster", identity_id=identity_id)
-                new_label = st.text_input(
-                    "Rename",
-                    value=identity.get("label") or "",
-                    key=f"identity_label_{identity_id}",
-                )
-                if st.button("Save", key=f"save_label_{identity_id}"):
-                    _rename_identity(ep_id, identity_id, new_label)
-                merge_options = [item["identity_id"] for item in identities if item["identity_id"] != identity_id]
-                if merge_options:
-                    merge_target = st.selectbox(
-                        "Merge into…",
-                        merge_options,
-                        key=f"merge_target_{identity_id}",
-                    )
-                    if st.button("Merge", key=f"merge_btn_{identity_id}"):
-                        _api_merge(ep_id, identity_id, merge_target)
-                if st.button("Delete", key=f"delete_identity_{identity_id}"):
-                    _delete_identity(ep_id, identity_id)
-            helpers.identity_card(
-                title=f"{identity.get('label') or identity['identity_id']}",
-                subtitle=f"Tracks: {len(identity.get('track_ids', []))} · Faces: {identity.get('faces', 0)}",
-                image_url=helpers.letterbox_thumb_url(identity.get("rep_thumbnail_url")),
-                extra=extra_actions,
-            )
-
-    st.caption("Select an identity to see its tracks, or use the inline merge controls above.")
-
-
-def _render_cluster_view(ep_id: str, identity_id: str) -> None:
-    detail = _safe_api_get(f"/episodes/{ep_id}/identities/{identity_id}")
-    if not detail:
-        return
-    st.button("← Back to grid", key="facebank_back_grid", on_click=lambda: _set_view("grid"))
-    identity = detail["identity"]
-    st.markdown(f"### Identity `{identity_id}`")
-    st.caption(f"Tracks: {len(identity.get('track_ids', []))}")
-    tracks = detail.get("tracks", [])
-    if not tracks:
-        st.info("No tracks linked yet.")
-        return
-    all_identities = (_safe_api_get(f"/episodes/{ep_id}/identities") or {}).get("identities", [])
-    current_sample = int(st.session_state.get("cluster_sample_every", 5))
-    new_sample = int(
-        st.number_input(
-            "Sample every N crops (lower for denser previews)",
-            min_value=1,
-            max_value=20,
-            value=current_sample,
-            step=1,
+    show_slug = _episode_show_slug(ep_id)
+    roster_names = _fetch_roster_names(show_slug)
+    identity_index = {ident["identity_id"]: ident for ident in identities_payload.get("identities", [])}
+    filter_value = st.text_input(
+        "Filter clusters by name, label, or id",
+        key="cluster_filter",
+        placeholder="Start typing…",
+    ).strip()
+    if filter_value:
+        lowered = filter_value.lower()
+        clusters = [
+            cluster
+            for cluster in clusters
+            if lowered in str(cluster.get("identity_id", "")).lower()
+            or lowered in str(cluster.get("name", "") or "").lower()
+            or lowered in str(cluster.get("label", "") or "").lower()
+        ]
+        if not clusters:
+            st.warning("No clusters matched the filter.")
+            return
+    offsets = _cluster_offsets()
+    TRACK_WINDOW = 5
+    for cluster in clusters:
+        identity_id = cluster["identity_id"]
+        identity_meta = identity_index.get(identity_id, {})
+        header = f"{identity_id} · Tracks: {cluster['counts']['tracks']} · Faces: {cluster['counts']['faces']}"
+        st.subheader(header)
+        _identity_name_controls(
+            ep_id=ep_id,
+            identity={
+                "identity_id": identity_id,
+                "name": cluster.get("name") or identity_meta.get("name"),
+                "label": cluster.get("label") or identity_meta.get("label"),
+            },
+            show_slug=show_slug,
+            roster_names=roster_names,
+            prefix=f"cluster_row_{identity_id}",
         )
-    )
-    if new_sample != current_sample:
-        st.session_state["cluster_sample_every"] = new_sample
-        st.session_state.setdefault("cluster_row_data", {})[identity_id] = {}
-        st.rerun()
-    st.caption(
-        f"Showing every {new_sample}ᵗʰ crop (change the slider above to load fewer or more thumbnails)."
-    )
-    cluster_cache = _cluster_cache(identity_id)
-    for track in tracks:
-        track_id = track["track_id"]
-        cache_entry = cluster_cache.setdefault(
-            track_id,
-            {"items": [], "cursor": None, "exhausted": False},
-        )
-        if not cache_entry["items"] and not cache_entry.get("exhausted"):
-            fetched, cursor = _fetch_track_media(
-                ep_id,
-                track_id,
-                sample=new_sample,
-                limit=TRACK_STRIP_LIMIT,
-            )
-            cache_entry["items"] = fetched
-            cache_entry["cursor"] = cursor
-            cache_entry["exhausted"] = cursor is None or not fetched
-        st.markdown(f"#### Track {track_id} · {track.get('faces_count', 0)} frames")
-        action_cols = st.columns([1.0, 1.2, 1.2, 1.0])
-        with action_cols[0]:
-            if st.button("View track", key=f"cluster_view_track_{identity_id}_{track_id}"):
-                _prepare_track_view_state(track_id, new_sample)
-                _set_view("track", identity_id=identity_id, track_id=track_id)
-        with action_cols[1]:
-            target_options = [ident["identity_id"] for ident in all_identities if ident["identity_id"] != identity_id]
-            if target_options:
-                target_choice = st.selectbox(
-                    "Move to identity",
-                    target_options,
-                    key=f"track_move_{identity_id}_{track_id}",
-                )
-                if st.button("Move", key=f"track_move_btn_{identity_id}_{track_id}"):
-                    _move_track(ep_id, track_id, target_choice)
-        with action_cols[2]:
-            if st.button("Remove from identity", key=f"track_remove_{identity_id}_{track_id}"):
-                _move_track(ep_id, track_id, None)
-        with action_cols[3]:
-            if st.button("Delete track", key=f"cluster_delete_track_{identity_id}_{track_id}"):
-                _delete_track(ep_id, track_id)
-        row_items = cache_entry.get("items", [])
-        if row_items:
-            helpers.render_track_row(track_id, row_items, thumb_height=200)
-        else:
-            st.info("No crops available for this track yet. Try lowering the sampling interval.")
-        if not cache_entry.get("exhausted") and cache_entry.get("cursor"):
-            if st.button("Load more", key=f"cluster_load_more_{identity_id}_{track_id}"):
-                more, cursor = _fetch_track_media(
-                    ep_id,
-                    track_id,
-                    sample=new_sample,
-                    limit=TRACK_STRIP_LIMIT,
-                    cursor=cache_entry.get("cursor"),
-                )
-                if more:
-                    cache_entry["items"].extend(more)
-                cache_entry["cursor"] = cursor
-                cache_entry["exhausted"] = cursor is None or not more
+        tracks = cluster.get("tracks", [])
+        if not tracks:
+            st.info("No tracks linked to this identity yet.")
+            continue
+        start_idx = offsets.get(identity_id, 0)
+        start_idx = max(0, min(start_idx, max(0, len(tracks) - TRACK_WINDOW)))
+        offsets[identity_id] = start_idx
+        visible = tracks[start_idx : start_idx + TRACK_WINDOW]
+        arrow_cols = st.columns([0.5, 8, 0.5])
+        with arrow_cols[0]:
+            disabled = start_idx == 0
+            if st.button("←", key=f"cluster_left_{identity_id}", disabled=disabled):
+                offsets[identity_id] = max(0, start_idx - TRACK_WINDOW)
                 st.rerun()
+        with arrow_cols[2]:
+            disabled = start_idx + TRACK_WINDOW >= len(tracks)
+            if st.button("→", key=f"cluster_right_{identity_id}", disabled=disabled):
+                offsets[identity_id] = min(len(tracks) - 1, start_idx + TRACK_WINDOW)
+                st.rerun()
+        grid_cols = st.columns(len(visible))
+        for col, track in zip(grid_cols, visible):
+            with col:
+                if track.get("rep_thumb_url"):
+                    st.image(track["rep_thumb_url"], use_column_width=True)
+                faces_count = track.get("faces") or 0
+                st.caption(f"Track {track['track_id']} · {faces_count} faces")
+                if st.button("View track", key=f"view_track_{identity_id}_{track['track_id']}"):
+                    st.session_state["selected_identity"] = identity_id
+                    _set_view("track", identity_id=identity_id, track_id=track["track_id"])
+                move_targets = [
+                    ident_id
+                    for ident_id in identity_index
+                    if ident_id != identity_id
+                ]
+                if move_targets:
+                    target_choice = st.selectbox(
+                        "Move track to…",
+                        move_targets,
+                        key=f"cluster_move_select_{identity_id}_{track['track_id']}",
+                        format_func=lambda val: f"{val} · {identity_index.get(val, {}).get('name') or ''}".strip(" ·"),
+                    )
+                    if st.button("Move track", key=f"cluster_move_btn_{identity_id}_{track['track_id']}"):
+                        _move_track(ep_id, track["track_id"], target_choice)
         st.divider()
+
+
 
 
 def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, Any]) -> None:
     st.button(
-        "← Back to cluster",
-        key="facebank_back_cluster",
-        on_click=lambda: _set_view("cluster", st.session_state.get("selected_identity")),
+        "← Back to clusters",
+        key="facebank_back_clusters",
+        on_click=lambda: _set_view("clusters"),
     )
     st.markdown(f"### Track {track_id}")
     identities = identities_payload.get("identities", [])
     current_identity = st.session_state.get("selected_identity")
-    action_cols = st.columns([1.2, 1.2, 1.0])
+    show_slug = _episode_show_slug(ep_id)
+    roster_names = _fetch_roster_names(show_slug)
+    track_detail_cache = st.session_state.setdefault("track_detail_cache", {})
+    detail = track_detail_cache.get(track_id)
+    if detail is None:
+        detail = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}")
+        if detail is None:
+            return
+        track_detail_cache[track_id] = detail
+    frames = detail.get("frames", [])
+    action_cols = st.columns([1.0, 1.0, 1.0])
     with action_cols[0]:
-        target_options = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
-        if target_options:
+        targets = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
+        if targets:
             target_choice = st.selectbox(
-                "Move track to identity",
-                target_options,
+                "Move entire track",
+                targets,
                 key=f"track_view_move_{track_id}",
             )
             if st.button("Move track", key=f"track_view_move_btn_{track_id}"):
@@ -368,56 +391,67 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     with action_cols[2]:
         if st.button("Delete track", key=f"track_view_delete_{track_id}"):
             _delete_track(ep_id, track_id)
-    cache = st.session_state.setdefault("track_view_cache", {})
-    state = cache.setdefault(
-        track_id,
-        {
-            "items": [],
-            "cursor": None,
-            "sample": 1,
-            "exhausted": False,
-        },
-    )
-    current_sample = int(state.get("sample", 1))
-    if not state["items"] and not state.get("exhausted"):
-        fetched, cursor = _fetch_track_media(
-            ep_id,
-            track_id,
-            sample=current_sample,
-            limit=TRACK_VIEW_LIMIT,
-        )
-        state["items"] = fetched
-        state["cursor"] = cursor
-        state["exhausted"] = cursor is None or not fetched
-    items = state.get("items", [])
-    if items:
-        helpers.render_track_row(track_id, items, thumb_height=240)
+
+    selection_store: Dict[int, set[str]] = st.session_state.setdefault("track_frame_selection", {})
+    track_selection = selection_store.setdefault(track_id, set())
+    if frames:
+        st.caption("Select frames to move to another identity.")
+        cols_per_row = 4
+        for row_start in range(0, len(frames), cols_per_row):
+            row_frames = frames[row_start : row_start + cols_per_row]
+            row_cols = st.columns(len(row_frames))
+            for col, frame_meta in zip(row_cols, row_frames):
+                face_id = frame_meta.get("face_id")
+                frame_idx = frame_meta.get("frame_idx")
+                with col:
+                    if frame_meta.get("thumbnail_url"):
+                        st.image(frame_meta["thumbnail_url"], use_column_width=True, caption=f"Frame {frame_idx}")
+                    key = f"face_select_{track_id}_{face_id}"
+                    checked = st.checkbox(
+                        "Select",
+                        value=face_id in track_selection,
+                        key=key,
+                    )
+                    if checked:
+                        track_selection.add(face_id)
+                    else:
+                        track_selection.discard(face_id)
+        st.caption(f"{len(track_selection)} frame(s) selected.")
     else:
-        st.info(
-            "No crops saved for this track yet. Re-run Faces Harvest with 'Save face crops to S3' to populate S3 thumbnails."
-        )
-        if st.button("Run Faces Harvest (save crops to S3)", key=f"faces_rerun_{track_id}"):
-            payload = {"ep_id": ep_id, "stub": False, "save_crops": True}
-            try:
-                helpers.api_post("/jobs/faces_embed_async", payload)
-            except requests.RequestException as exc:
-                st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/faces_embed_async", exc))
-            else:
-                st.success("Faces Harvest queued; monitor progress in Episode Detail.")
-    if not state.get("exhausted") and state.get("cursor"):
-        if st.button("Load more", key=f"track_view_load_more_{track_id}"):
-            more, cursor = _fetch_track_media(
-                ep_id,
-                track_id,
-                sample=current_sample,
-                limit=TRACK_VIEW_LIMIT,
-                cursor=state.get("cursor"),
-            )
-            if more:
-                state["items"].extend(more)
-            state["cursor"] = cursor
-            state["exhausted"] = cursor is None or not more
-            st.rerun()
+        st.info("No frames recorded for this track yet.")
+
+    identity_values = [None] + [ident["identity_id"] for ident in identities]
+    identity_labels = ["Create new identity"] + [
+        f"{ident['identity_id']} · {(ident.get('name') or ident.get('label') or ident['identity_id'])}"
+        for ident in identities
+    ]
+    identity_idx = st.selectbox(
+        "Send selected frames to identity",
+        list(range(len(identity_values))),
+        format_func=lambda idx: identity_labels[idx],
+        key=f"track_identity_choice_{track_id}",
+    )
+    target_identity_id = identity_values[identity_idx]
+    target_name = _name_choice_widget(
+        label="Or assign roster name",
+        key_prefix=f"track_reassign_{track_id}",
+        roster_names=roster_names,
+        current_name="",
+        text_label="New roster name",
+    )
+    disabled = not track_selection or (target_identity_id is None and not target_name)
+    if st.button("Move selected frames", key=f"track_reassign_btn_{track_id}", disabled=disabled):
+        payload: Dict[str, Any] = {
+            "from_track_id": track_id,
+            "face_ids": sorted(track_selection),
+        }
+        if target_identity_id:
+            payload["target_identity_id"] = target_identity_id
+        if target_name:
+            payload["new_identity_name"] = target_name
+        if show_slug:
+            payload["show_id"] = show_slug
+        _move_frames_api(ep_id, payload, show_slug, track_id)
 
 
 def _rename_identity(ep_id: str, identity_id: str, label: str) -> None:
@@ -477,14 +511,13 @@ if not helpers.detector_is_face_only(ep_id):
         "Tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face for best results."
     )
 
-view_state = st.session_state.get("facebank_view", "grid")
+view_state = st.session_state.get("facebank_view", "clusters")
 identities_payload = _safe_api_get(f"/episodes/{ep_id}/identities")
 if not identities_payload:
     st.stop()
+cluster_payload = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks") or {"clusters": []}
 
-if view_state == "cluster" and st.session_state.get("selected_identity"):
-    _render_cluster_view(ep_id, st.session_state["selected_identity"])
-elif view_state == "track" and st.session_state.get("selected_track") is not None:
+if view_state == "track" and st.session_state.get("selected_track") is not None:
     _render_track_view(ep_id, st.session_state["selected_track"], identities_payload)
 else:
-    _render_identity_grid(ep_id, identities_payload)
+    _render_cluster_rows(ep_id, cluster_payload, identities_payload)

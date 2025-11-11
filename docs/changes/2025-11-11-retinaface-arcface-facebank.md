@@ -23,7 +23,7 @@
 3. **Jobs + validation**
    - `/jobs/detect_track( _async )` payloads include detector/tracker/device/stride/fps/save flags. The router checks that the `ep_id` exists in the EpisodeStore and that `data/videos/{ep_id}/episode.mp4` is readable before spawning `episode_run.py`.
    - JobService stores tracker metadata, appends `--tracker ...` to commands, and records requested settings in `data/jobs/{job_id}.json`.
-   - API tests cover detector/tracker validation, stub job behavior, remote crop listing, and the new deletion endpoints.
+   - API tests cover detector/tracker validation, remote crop listing, and the new deletion endpoints.
 
 4. **Episodes + deletion**
    - New `POST /episodes/{ep_id}/delete` always wipes local caches, with `include_s3` toggling S3 artifact deletion for that episode. `POST /episodes/delete_all` performs the same sweep across every tracked episode.

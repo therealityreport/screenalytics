@@ -31,7 +31,7 @@
 
 ## Acceptance
 
-1. Install the ML extras and run the CLI without `--stub`:
+1. Install the ML extras and run the CLI:
 
    ```bash
    pip install -r requirements-ml.txt

@@ -72,7 +72,6 @@ def test_detector_switch_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         "cpu",
         "--detector",
         detector,
-        "--stub",
     ]
     completed = subprocess.run(
         cmd,
@@ -93,7 +92,7 @@ def test_detector_switch_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert progress_path.exists()
 
     det_rows = _read_jsonl(detections_path)
-    assert det_rows, "expected stub detections"
+    assert det_rows, "expected detections"
     assert all(row["class"] == "face" for row in det_rows)
     assert all(row["detector"] == detector for row in det_rows)
 

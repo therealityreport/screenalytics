@@ -2,7 +2,7 @@
 
 ## Highlights
 - API now exposes `GET /episodes`, `GET /episodes/{ep_id}`, and `POST /episodes/{ep_id}/mirror` so the UI can list selectable episodes, inspect S3/local status, and download the source video from S3 when needed.
-- Streamlit UI adds an **Existing Episode** mode with a searchable dropdown, mirror button, and detect/track controls (stride, fps, stub toggle) for any `ep_id` that already lives in object storage.
+- Streamlit UI adds an **Existing Episode** mode with a searchable dropdown, mirror button, and detect/track controls (stride + fps) for any `ep_id` that already lives in object storage.
 - Storage service grows `ensure_local_mirror` + `s3_object_exists`, and new backend-aware tests cover local vs. S3 mirroring semantics.
 
 ## Why it matters
@@ -11,5 +11,5 @@ Operators can now revisit any uploaded episode, hydrate the local filesystem fro
 ## How to use it
 1. Run the API + Streamlit UI.
 2. In the sidebar, switch Mode → **Existing Episode**.
-3. Select an `ep_id`, click **Mirror from S3**, then **Run detect/track** (YOLO or stub).
+3. Select an `ep_id`, click **Mirror from S3**, then **Run detect/track** (always YOLO + ByteTrack).
 4. Manifests appear at `data/manifests/{ep_id}/` for inspection.

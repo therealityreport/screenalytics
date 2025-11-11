@@ -1,4 +1,4 @@
-# Optional ML stack; not needed for API tests or upload UI stub
+# Optional ML stack; not needed for API-only workflows
 numpy==1.26.4
 pandas==2.2.3
 torch==2.3.1

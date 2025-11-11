@@ -54,7 +54,7 @@ def test_run_detection_with_plan(tmp_path):
     manifest.write_text("\n".join(json.dumps(fr) for fr in frames))
 
     out_path = tmp_path / "detections.jsonl"
-    cfg = {"model_id": "retinaface_r50", "force_stub": True}
+    cfg = {"model_id": "retinaface_r50", "force_simulated": True}
     dummy_video = tmp_path / "dummy.mp4"
     dummy_video.write_bytes(b"not-a-video")  # never consumed because plan has image_path
     count = run_detection(

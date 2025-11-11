@@ -19,6 +19,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
+from apps.api.services import roster as roster_service
+from apps.api.services import identities as identity_service
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services.storage import (
     StorageService,
@@ -45,6 +47,10 @@ def _faces_path(ep_id: str) -> Path:
 
 def _identities_path(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "identities.json"
+
+
+def _runs_dir(ep_id: str) -> Path:
+    return _manifests_dir(ep_id) / "runs"
 
 
 def _tracks_path(ep_id: str) -> Path:
@@ -76,6 +82,100 @@ def _episode_local_dirs(ep_id: str) -> List[Path]:
         seen.add(resolved)
         unique.append(path)
     return unique
+
+
+def _safe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
+    marker_path = _runs_dir(ep_id) / f"{phase}.json"
+    if not marker_path.exists():
+        return None
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, Any]:
+    status_value = str(marker.get("status") or "unknown").lower()
+    return {
+        "phase": phase,
+        "status": status_value,
+        "faces": _safe_int(marker.get("faces")),
+        "identities": _safe_int(marker.get("identities")),
+        "started_at": marker.get("started_at"),
+        "finished_at": marker.get("finished_at"),
+        "version": marker.get("version"),
+        "source": "marker",
+    }
+
+
+def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
+    marker = _load_run_marker(ep_id, "faces_embed")
+    if marker:
+        return _phase_status_from_marker("faces_embed", marker)
+    faces_path = _faces_path(ep_id)
+    faces_count = _count_nonempty_lines(faces_path)
+    status_value = "success" if faces_count > 0 else "missing"
+    source = "output" if faces_path.exists() else "absent"
+    return {
+        "phase": "faces_embed",
+        "status": status_value,
+        "faces": faces_count,
+        "identities": None,
+        "started_at": None,
+        "finished_at": None,
+        "version": None,
+        "source": source,
+    }
+
+
+def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
+    marker = _load_run_marker(ep_id, "cluster")
+    if marker:
+        return _phase_status_from_marker("cluster", marker)
+    identities_path = _identities_path(ep_id)
+    faces_total = 0
+    identities_count = 0
+    if identities_path.exists():
+        try:
+            payload = json.loads(identities_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        identities = payload.get("identities") if isinstance(payload, dict) else None
+        if isinstance(identities, list):
+            identities_count = len(identities)
+        stats_block = payload.get("stats") if isinstance(payload, dict) else None
+        if isinstance(stats_block, dict):
+            faces_total = _safe_int(stats_block.get("faces")) or 0
+    status_value = "success" if identities_count > 0 else "missing"
+    source = "output" if identities_path.exists() else "absent"
+    return {
+        "phase": "cluster",
+        "status": status_value,
+        "faces": faces_total,
+        "identities": identities_count,
+        "started_at": None,
+        "finished_at": None,
+        "version": None,
+        "source": source,
+    }
 
 
 def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
@@ -410,8 +510,21 @@ class EpisodeUpsert(BaseModel):
     air_date: date | None = None
 
 
+class FaceMoveRequest(BaseModel):
+    from_track_id: int = Field(..., ge=0)
+    face_ids: List[str] = Field(..., min_length=1, description="Face identifiers to move")
+    target_identity_id: str | None = Field(None, description="Existing identity to receive frames")
+    new_identity_name: str | None = Field(None, description="Create a new identity with this name")
+    show_id: str | None = Field(None, description="Optional show slug for roster updates")
+
+
 class IdentityRenameRequest(BaseModel):
     label: str | None = Field(None, max_length=120)
+
+
+class IdentityNameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    show: str | None = Field(None, description="Optional show slug override")
 
 
 class IdentityMergeRequest(BaseModel):
@@ -431,6 +544,8 @@ class FrameDeleteRequest(BaseModel):
     track_id: int
     frame_idx: int
     delete_assets: bool = False
+
+
 
 
 class DeleteEpisodeIn(BaseModel):
@@ -496,6 +611,23 @@ class EpisodeDetailResponse(BaseModel):
     air_date: str | None
     s3: EpisodeS3Status
     local: EpisodeLocalStatus
+
+
+class PhaseStatus(BaseModel):
+    phase: str
+    status: str
+    faces: int | None = None
+    identities: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    version: str | None = None
+    source: str | None = None
+
+
+class EpisodeStatusResponse(BaseModel):
+    ep_id: str
+    faces_embed: PhaseStatus
+    cluster: PhaseStatus
 
 
 class AssetUploadResponse(BaseModel):
@@ -663,6 +795,13 @@ def episode_progress(ep_id: str) -> dict:
     return {"ep_id": ep_id, "progress": payload}
 
 
+@router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
+def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
+    faces_status = PhaseStatus(**_faces_phase_status(ep_id))
+    cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
+    return EpisodeStatusResponse(ep_id=ep_id, faces_embed=faces_status, cluster=cluster_status)
+
+
 @router.post("/episodes", response_model=EpisodeCreateResponse, tags=["episodes"])
 def create_episode(payload: EpisodeCreateRequest) -> EpisodeCreateResponse:
     record = EPISODE_STORE.upsert(
@@ -828,6 +967,7 @@ def list_identities(ep_id: str) -> dict:
             {
                 "identity_id": identity.get("identity_id"),
                 "label": identity.get("label"),
+                "name": identity.get("name"),
                 "track_ids": track_ids,
                 "faces": faces_total,
                 "rep_thumbnail_url": _resolve_thumb_url(
@@ -837,7 +977,31 @@ def list_identities(ep_id: str) -> dict:
                 ),
             }
         )
+    try:
+        ctx = episode_context_from_id(ep_id)
+        show_slug = ctx.show_slug
+    except ValueError:
+        show_slug = None
+    if show_slug:
+        for entry in payload.get("identities", []):
+            name = entry.get("name")
+            if isinstance(name, str) and name.strip():
+                try:
+                    roster_service.add_if_missing(show_slug, name)
+                except ValueError:
+                    pass
     return {"identities": identities, "stats": payload.get("stats", {})}
+
+
+@router.get("/episodes/{ep_id}/cluster_tracks")
+def list_cluster_tracks(
+    ep_id: str,
+    limit_per_cluster: int | None = Query(None, ge=1, description="Optional max tracks per cluster"),
+) -> dict:
+    try:
+        return identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/episodes/{ep_id}/faces_grid")
@@ -890,6 +1054,7 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
         "identity": {
             "identity_id": identity_id,
             "label": identity.get("label"),
+            "name": identity.get("name"),
             "track_ids": identity.get("track_ids", []),
             "rep_thumbnail_url": _resolve_thumb_url(
                 ep_id,
@@ -979,6 +1144,14 @@ def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -
     return {"identity_id": identity_id, "label": identity["label"]}
 
 
+@router.post("/episodes/{ep_id}/identities/{identity_id}/name")
+def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest) -> dict:
+    try:
+        return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/episodes/{ep_id}/identities/merge")
 def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
     payload = _load_identities(ep_id)
@@ -1024,6 +1197,23 @@ def move_track(ep_id: str, track_id: int, body: TrackMoveRequest) -> dict:
         "identity_id": body.target_identity_id,
         "track_ids": target_identity["track_ids"] if target_identity else [],
     }
+
+
+@router.post("/episodes/{ep_id}/faces/move_frames")
+def move_faces(ep_id: str, body: FaceMoveRequest) -> dict:
+    try:
+        return identity_service.move_frames(
+            ep_id,
+            body.from_track_id,
+            body.face_ids,
+            target_identity_id=body.target_identity_id,
+            new_identity_name=body.new_identity_name,
+            show_id=body.show_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 
 
 @router.delete("/episodes/{ep_id}/identities/{identity_id}")

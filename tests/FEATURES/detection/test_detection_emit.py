@@ -34,12 +34,12 @@ def _make_dummy_video(path: Path, frames: int = 4, size: tuple[int, int] = (48, 
 
 
 def test_detection_pipeline_emits_det_v1(tmp_path, monkeypatch):
-    monkeypatch.setenv("SCREENALYTICS_VISION_STUB", "1")
+    monkeypatch.setenv("SCREENALYTICS_VISION_SIM", "1")
     video_path = tmp_path / "sample.mp4"
     _make_dummy_video(video_path)
 
     cfg = load_config(Path("config/pipeline/detection.yaml"))
-    cfg["force_stub"] = True
+    cfg["force_simulated"] = True
     out_path = tmp_path / "detections.jsonl"
 
     count = run_detection(

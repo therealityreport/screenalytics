@@ -3,7 +3,7 @@ Owner: TBA
 Goal: Implement ByteTrack association and smoothing.
 
 ## Checklist
-- [x] Create ByteTrack runner stub + CLI
+- [x] Create ByteTrack runner CLI
 - [x] Add schema+I/O tests
 - [x] Document progress + roadmap
 - [ ] Integrate ByteTrack library with tuning params

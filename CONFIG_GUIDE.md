@@ -17,3 +17,5 @@ Version: 1.0
 - All thresholds and ids configured here; no magic numbers in code.
 - Code reads configs via helper `packages/py-screenalytics/config.py` with override support.
 - Promotion PR must include config diffs and doc updates.
+
+## Stub jobs

@@ -5,8 +5,8 @@ described in DATA_SCHEMA.md (`det_v1`).  It supports two execution modes:
 
 1. A real InsightFace-backed RetinaFace detector (default) that runs on CPU or
    GPU depending on `ctx_id`.
-2. A deterministic stub used by tests/CI via `SCREENALYTICS_VISION_STUB=1` or
-   `cfg["force_stub"]=True`.  The stub still exercises real I/O: frames are
+2. A deterministic simulated used by tests/CI via `SCREENALYTICS_VISION_SIM=1` or
+   `cfg["force_simulated"]=True`.  The simulated still exercises real I/O: frames are
    sampled with OpenCV and detections are emitted in `det_v1`.
 """
 
@@ -147,16 +147,16 @@ def _iter_plan_samples(
 
 
 class RetinaFaceDetector:
-    """Wrap InsightFace RetinaFace with a deterministic stub fallback."""
+    """Wrap InsightFace RetinaFace with a deterministic simulated fallback."""
 
     def __init__(self, cfg: Dict[str, object]):
         self.cfg = cfg
         self.model_id = str(cfg.get("model_id", "retinaface_r50"))
-        self.stub = bool(
-            cfg.get("force_stub") or os.getenv("SCREENALYTICS_VISION_STUB") == "1"
+        self.simulated = bool(
+            cfg.get("force_simulated") or os.getenv("SCREENALYTICS_VISION_SIM") == "1"
         )
         self._model = None
-        if not self.stub:
+        if not self.simulated:
             self._init_model()
 
     def _init_model(self) -> None:
@@ -175,13 +175,13 @@ class RetinaFaceDetector:
             ctx_id = int(self.cfg.get("ctx_id", -1))
             self._model.prepare(ctx_id=ctx_id, det_size=det_size)
         except Exception as exc:  # pragma: no cover - exercised in integration
-            LOGGER.warning("Falling back to stub RetinaFace detector: %s", exc)
-            self.stub = True
+            LOGGER.warning("Falling back to simulated RetinaFace detector: %s", exc)
+            self.simulated = True
             self._model = None
 
     def __call__(self, frame: np.ndarray) -> List[Dict[str, object]]:
-        if self.stub or not self._model:
-            return [self._stub_detection(frame)]
+        if self.simulated or not self._model:
+            return [self._simulated_detection(frame)]
 
         faces = self._model.get(frame)
         h, w = frame.shape[:2]
@@ -207,7 +207,7 @@ class RetinaFaceDetector:
             )
         return detections
 
-    def _stub_detection(self, frame: np.ndarray) -> Dict[str, object]:
+    def _simulated_detection(self, frame: np.ndarray) -> Dict[str, object]:
         """Generate a deterministic box centered on the brightest pixels."""
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

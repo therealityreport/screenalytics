@@ -29,6 +29,48 @@ TRACKER_CHOICES = {"bytetrack", "strongsort"}
 DEFAULT_DETECTOR_ENV = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "off", "no"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+SCENE_DETECT_DEFAULT = getattr(episode_run, "SCENE_DETECT_DEFAULT", _env_flag("SCENE_DETECT", True))
+SCENE_THRESHOLD_DEFAULT = getattr(episode_run, "SCENE_THRESHOLD_DEFAULT", _env_float("SCENE_THRESHOLD", 0.30))
+SCENE_MIN_LEN_DEFAULT = getattr(episode_run, "SCENE_MIN_LEN_DEFAULT", max(_env_int("SCENE_MIN_LEN", 12), 1))
+SCENE_WARMUP_DETS_DEFAULT = getattr(
+    episode_run,
+    "SCENE_WARMUP_DETS_DEFAULT",
+    max(_env_int("SCENE_WARMUP_DETS", 3), 0),
+)
+
 JobRecord = Dict[str, Any]
 
 
@@ -143,7 +185,6 @@ class JobService:
         ep_id: str,
         stride: int,
         fps: float | None,
-        stub: bool,
         device: str,
         video_path: Path,
         save_frames: bool,
@@ -153,13 +194,21 @@ class JobService:
         tracker: str,
         max_gap: int | None,
         det_thresh: float | None,
+        scene_detect: bool,
+        scene_threshold: float,
+        scene_min_len: int,
+        scene_warmup_dets: int,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
-        self.ensure_retinaface_ready(detector_value, stub, device, det_thresh)
+        self.ensure_retinaface_ready(detector_value, device, det_thresh)
         progress_path = self._progress_path(ep_id)
+        scene_min_len = max(int(scene_min_len), 1)
+        scene_warmup_dets = max(int(scene_warmup_dets), 0)
+        scene_detect_flag = "on" if scene_detect else "off"
+        scene_threshold = max(min(float(scene_threshold), 2.0), 0.0)
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -176,8 +225,6 @@ class JobService:
         ]
         if fps and fps > 0:
             command += ["--fps", str(fps)]
-        if stub:
-            command.append("--stub")
         if save_frames:
             command.append("--save-frames")
         if save_crops:
@@ -191,10 +238,13 @@ class JobService:
             command += ["--max-gap", str(max_gap)]
         if det_thresh is not None:
             command += ["--det-thresh", str(det_thresh)]
+        command += ["--scene-detect", scene_detect_flag]
+        command += ["--scene-threshold", str(scene_threshold)]
+        command += ["--scene-min-len", str(scene_min_len)]
+        command += ["--scene-warmup-dets", str(scene_warmup_dets)]
         requested = {
             "stride": stride,
             "fps": fps,
-            "stub": stub,
             "device": device,
             "save_frames": save_frames,
             "save_crops": save_crops,
@@ -203,6 +253,10 @@ class JobService:
             "tracker": tracker_value,
             "max_gap": max_gap,
             "det_thresh": det_thresh,
+            "scene_detect": scene_detect,
+            "scene_threshold": scene_threshold,
+            "scene_min_len": scene_min_len,
+            "scene_warmup_dets": scene_warmup_dets,
         }
         return self._launch_job(
             job_type="detect_track",
@@ -216,7 +270,6 @@ class JobService:
         self,
         *,
         ep_id: str,
-        stub: bool,
         device: str,
         save_frames: bool,
         save_crops: bool,
@@ -238,8 +291,6 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
-        if stub:
-            command.append("--stub")
         if save_frames:
             command.append("--save-frames")
         if save_crops:
@@ -249,7 +300,6 @@ class JobService:
             command += ["--jpeg-quality", str(jpeg_quality)]
         command += ["--thumb-size", str(thumb_size)]
         requested = {
-            "stub": stub,
             "device": device,
             "save_frames": save_frames,
             "save_crops": save_crops,
@@ -268,7 +318,6 @@ class JobService:
         self,
         *,
         ep_id: str,
-        stub: bool,
         device: str,
         cluster_thresh: float,
         min_cluster_size: int,
@@ -289,12 +338,9 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
-        if stub:
-            command.append("--stub")
         command += ["--cluster-thresh", str(cluster_thresh)]
         command += ["--min-cluster-size", str(min_cluster_size)]
         requested = {
-            "stub": stub,
             "device": device,
             "cluster_thresh": cluster_thresh,
             "min_cluster_size": min_cluster_size,
@@ -388,11 +434,10 @@ class JobService:
     def ensure_retinaface_ready(
         self,
         detector: str,
-        stub: bool,
         device: str,
         det_thresh: float | None,
     ) -> None:
-        if stub or detector != "retinaface":
+        if detector != "retinaface":
             return
         if episode_run is None:
             raise ValueError(
