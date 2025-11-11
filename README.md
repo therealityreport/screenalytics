@@ -194,6 +194,34 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 - `API_BASE_URL mismatch` — Export the correct `SCREENALYTICS_API_URL` (or update `.env`) so the UI hits the right host/port.
 - `File not found (Streamlit path)` — Ensure you launch commands from the repo root so `apps/workspace-ui/streamlit_app.py` resolves.
 
+### AWS S3 setup
+
+1. Confirm AWS CLI auth:
+
+   ```bash
+   aws sts get-caller-identity
+   ```
+
+2. Bootstrap buckets with lifecycle + encryption:
+
+   ```bash
+   bash scripts/s3_bootstrap.sh
+   ```
+
+3. Copy `.env.example`, set `STORAGE_BACKEND=s3`, update `AWS_S3_BUCKET`, `SCREENALYTICS_ENV`, and credentials, then source it.
+
+4. Run the dev flow (uploads will land in S3):
+
+   ```bash
+   STORAGE_BACKEND=s3 bash scripts/dev.sh
+   ```
+
+Artifacts live under the standardized prefixes:
+
+- `s3://screenalytics-dev-<ACCOUNT_ID>/raw/videos/{ep_id}/episode.mp4`
+- `s3://screenalytics-dev-<ACCOUNT_ID>/artifacts/manifests/{ep_id}/detections.jsonl`
+- `s3://screenalytics-dev-<ACCOUNT_ID>/artifacts/faces/{ep_id}/...`
+
 #### Troubleshooting (macOS / FFmpeg / PyAV)
 
 `faster-whisper` depends on PyAV, which may try to build against Homebrew’s FFmpeg 8.x headers on Apple Silicon. If you only need the API, UI, or stub detect/track flow, stick to `requirements-core.txt`—these features do **not** require PyAV or the rest of the ML stack. Install `requirements-ml.txt` only when you plan to run the full pipeline and have a working FFmpeg toolchain.

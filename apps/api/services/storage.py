@@ -40,14 +40,20 @@ class StorageService:
 
     def __init__(self) -> None:
         self.backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
-        self.bucket = os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET", DEFAULT_BUCKET)
         self.endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT", DEFAULT_ENDPOINT)
         self.region = os.environ.get("SCREENALYTICS_OBJECT_STORE_REGION", DEFAULT_REGION)
+        self.env_name = os.environ.get("SCREENALYTICS_ENV", "dev")
+        self.prefix = os.environ.get("AWS_S3_PREFIX", "raw/")
+        if self.prefix and not self.prefix.endswith("/"):
+            self.prefix += "/"
+        auto_create = os.environ.get("S3_AUTO_CREATE", "0")
+        self.auto_create = auto_create.lower() in {"1", "true", "yes"}
         self._client = None
 
         if self.backend in {"s3", "minio"}:
             boto3_mod = _boto3()
             from botocore.client import Config  # type: ignore
+            from botocore.exceptions import ClientError  # type: ignore
 
             access_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY", "minio")
             secret_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY", "miniosecret")
@@ -60,6 +66,18 @@ class StorageService:
                 aws_secret_access_key=secret_key,
                 config=Config(signature_version=signature_version),
             )
+
+            if self.backend == "s3":
+                env_bucket = os.environ.get("AWS_S3_BUCKET")
+                if env_bucket:
+                    self.bucket = env_bucket
+                else:
+                    sts_client = boto3_mod.client("sts")
+                    account_id = sts_client.get_caller_identity().get("Account", "dev")
+                    self.bucket = f"screenalytics-{self.env_name}-{account_id}"
+                self._ensure_s3_bucket(ClientError)
+            else:  # minio
+                self.bucket = os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET", DEFAULT_BUCKET)
         elif self.backend == "local":
             self.bucket = "local"
         else:
@@ -72,7 +90,8 @@ class StorageService:
         content_type: str = "video/mp4",
         expires_in: int = DEFAULT_EXPIRY,
     ) -> PresignedUpload:
-        object_key = f"videos/{ep_id}/episode.mp4"
+        prefix = self.prefix if self.backend == "s3" else ""
+        object_key = f"{prefix}videos/{ep_id}/episode.mp4"
         headers = {"Content-Type": content_type}
 
         if self.backend == "local":
@@ -101,6 +120,21 @@ class StorageService:
             method=method,
             path=path,
         )
+
+    def _ensure_s3_bucket(self, client_error_cls) -> None:
+        assert self._client is not None
+        try:
+            self._client.head_bucket(Bucket=self.bucket)
+        except client_error_cls as exc:  # pragma: no cover - network interaction
+            if self.auto_create:
+                create_kwargs = {"Bucket": self.bucket}
+                if self.region != "us-east-1":
+                    create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": self.region}
+                self._client.create_bucket(**create_kwargs)
+            else:
+                raise RuntimeError(
+                    f"Bucket {self.bucket} does not exist. Run scripts/s3_bootstrap.sh or set S3_AUTO_CREATE=1"
+                ) from exc
 
 
 __all__ = ["PresignedUpload", "StorageService"]

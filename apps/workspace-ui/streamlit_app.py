@@ -15,6 +15,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 API_BASE_URL = os.environ.get("SCREENALYTICS_API_URL", "http://localhost:8000")
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local" )
+STORAGE_BUCKET = (
+    os.environ.get("AWS_S3_BUCKET")
+    or os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET")
+    or ("local" if STORAGE_BACKEND == "local" else "")
+)
 DEFAULT_STRIDE = 5
 
 
@@ -77,6 +83,10 @@ if api_ready:
     st.sidebar.success("API reachable")
 else:
     st.sidebar.error(f"Health check failed: {api_error}")
+st.sidebar.write(f"Storage backend: {STORAGE_BACKEND}")
+if STORAGE_BUCKET:
+    st.sidebar.code(STORAGE_BUCKET)
+if not api_ready:
     st.error(
         f"API not reachable at {API_BASE_URL}. Verify it is running and that /healthz is accessible."
     )
@@ -143,11 +153,19 @@ if submit:
 
     raw_bytes = uploaded_file.getbuffer().tobytes()
     upload_url = presign_resp.get("upload_url")
+    st.info(
+        f"Uploading to s3://{presign_resp['bucket']}/{presign_resp['object_key']}"
+        if upload_url
+        else f"Writing to {presign_resp['local_video_path']}"
+    )
     if upload_url:
         try:
             _upload_file(upload_url, raw_bytes, presign_resp.get("headers"))
         except requests.RequestException as exc:
-            st.error(f"Upload failed: {_describe_error(upload_url, exc)}")
+            err = _describe_error(upload_url, exc)
+            st.error(f"Upload failed: {err}")
+            if "NoSuchBucket" in err:
+                st.info("Bucket not found. Run scripts/s3_bootstrap.sh or set S3_AUTO_CREATE=1.")
             st.stop()
 
     local_video = _mirror_local(ep_id, raw_bytes, presign_resp["local_video_path"])
