@@ -151,6 +151,11 @@ def _set_track_sample_limit(value: int | None) -> None:
 TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT"))
 
 
+# Seed-based detection boosting configuration
+SEED_BOOST_ENABLED = _env_flag("SEED_BOOST_ENABLED", False)
+SEED_BOOST_SCORE_DELTA = float(os.environ.get("SEED_BOOST_SCORE_DELTA", "0.15"))
+SEED_BOOST_MIN_SIM = float(os.environ.get("SEED_BOOST_MIN_SIM", "0.42"))
+
 SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
 SCENE_THRESHOLD_DEFAULT = max(min(_env_float("SCENE_THRESHOLD", 0.30), 2.0), 0.0)
 SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
@@ -380,6 +385,64 @@ class TrackedObject:
     det_index: int | None = None
     landmarks: np.ndarray | None = None
 
+
+
+
+def _parse_ep_id_for_show(ep_id: str) -> Optional[str]:
+    """Extract show_id from ep_id (e.g., 'rhobh-s05e01' -> 'rhobh')."""
+    import re
+    match = re.match(r'^(?P<show>.+)-s\d{2}e\d{2}$', ep_id, re.IGNORECASE)
+    if match:
+        return match.group('show').lower()
+    return None
+
+
+def _load_show_seeds(show_id: str) -> List[Dict[str, Any]]:
+    """Load all seed embeddings for a show from facebank."""
+    if not show_id:
+        return []
+    
+    try:
+        from apps.api.services.facebank import FacebankService
+        facebank_svc = FacebankService(data_root=DATA_ROOT)
+        seeds = facebank_svc.get_all_seeds_for_show(show_id)
+        return seeds
+    except Exception as exc:
+        LOGGER.debug("Failed to load seeds for show %s: %s", show_id, exc)
+        return []
+
+
+def _find_best_seed_match(
+    embedding: np.ndarray,
+    seeds: List[Dict[str, Any]],
+    min_sim: float = SEED_BOOST_MIN_SIM
+) -> Optional[Tuple[str, float]]:
+    """Find the best matching seed for an embedding.
+    
+    Returns (cast_id, similarity) if match found above threshold, else None.
+    """
+    if not seeds or embedding is None:
+        return None
+    
+    best_sim = -1.0
+    best_cast_id = None
+    
+    for seed in seeds:
+        seed_emb = np.array(seed.get('embedding', []), dtype=np.float32)
+        if seed_emb.size == 0:
+            continue
+        
+        # Cosine similarity
+        sim = float(np.dot(embedding, seed_emb) / (np.linalg.norm(embedding) * np.linalg.norm(seed_emb) + 1e-12))
+        
+        if sim > best_sim:
+            best_sim = sim
+            best_cast_id = seed.get('cast_id')
+    
+    if best_sim >= min_sim and best_cast_id:
+        return (best_cast_id, best_sim)
+    
+    return None
 
 class _TrackerDetections:
     """Lightweight structure that mimics ultralytics' Boxes for BYTETracker inputs."""
@@ -2342,6 +2405,16 @@ def _run_faces_embed_stage(
     track_best_thumb: Dict[int, tuple[float, str, str | None]] = {}
     embeddings_array: List[np.ndarray] = []
 
+    # Load seeds for seed-based face matching
+    show_seeds = []
+    seed_match_stats = {"enabled": SEED_BOOST_ENABLED, "matches": 0, "total": 0}
+    if SEED_BOOST_ENABLED:
+        show_id = _parse_ep_id_for_show(args.ep_id)
+        if show_id:
+            show_seeds = _load_show_seeds(show_id)
+            if show_seeds:
+                LOGGER.info("Loaded %d seed embeddings for show %s", len(show_seeds), show_id)
+
     faces_done = 0
     started_at = _utcnow_iso()
     try:
@@ -2455,6 +2528,16 @@ def _run_faces_embed_stage(
 
             track_embeddings[track_id].append(embedding_vec)
             embeddings_array.append(embedding_vec)
+
+            # Check for seed match
+            seed_cast_id = None
+            seed_similarity = None
+            if show_seeds and SEED_BOOST_ENABLED:
+                seed_match_stats["total"] += 1
+                match_result = _find_best_seed_match(embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM)
+                if match_result:
+                    seed_cast_id, seed_similarity = match_result
+                    seed_match_stats["matches"] += 1
             if thumb_rel_path:
                 prev = track_best_thumb.get(track_id)
                 score = quality
@@ -2485,6 +2568,9 @@ def _run_faces_embed_stage(
                 face_row["thumb_s3_key"] = thumb_s3_key
             if landmarks:
                 face_row["landmarks"] = [round(float(val), 4) for val in landmarks]
+            if seed_cast_id:
+                face_row["seed_cast_id"] = seed_cast_id
+                face_row["seed_similarity"] = round(float(seed_similarity), 4)
             rows.append(face_row)
             faces_done = min(faces_total, faces_done + 1)
             progress.emit(
@@ -2510,6 +2596,13 @@ def _run_faces_embed_stage(
         )
 
         _write_jsonl(faces_path, rows)
+        if SEED_BOOST_ENABLED and seed_match_stats["total"] > 0:
+            LOGGER.info(
+                "Seed matching: %d/%d faces matched seeds (%.1f%%)",
+                seed_match_stats["matches"],
+                seed_match_stats["total"],
+                100.0 * seed_match_stats["matches"] / seed_match_stats["total"],
+            )
         embed_path = _faces_embed_path(args.ep_id)
         if embeddings_array:
             np.save(embed_path, np.vstack(embeddings_array))
