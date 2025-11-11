@@ -134,6 +134,11 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 
 ### Upload via UI
 
+**Quickstart**
+
+- Default: `bash scripts/dev.sh` (runs API, waits on `/healthz`, then opens Streamlit).
+- With Make: `make dev`.
+
 1. Install dependencies:
 
    ```bash
@@ -185,8 +190,9 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
 **Common errors**
 
-- `Connection refused` — Start the API via `python -m uvicorn apps.api.main:app --reload` and confirm it responds: `curl http://localhost:8000/healthz`.
+- `Connection refused` — Start the API via `python -m uvicorn apps.api.main:app --reload` (or rerun `scripts/dev.sh`) and confirm it responds: `curl http://localhost:8000/healthz`.
 - `API_BASE_URL mismatch` — Export the correct `SCREENALYTICS_API_URL` (or update `.env`) so the UI hits the right host/port.
+- `File not found (Streamlit path)` — Ensure you launch commands from the repo root so `apps/workspace-ui/streamlit_app.py` resolves.
 
 #### Troubleshooting (macOS / FFmpeg / PyAV)
 

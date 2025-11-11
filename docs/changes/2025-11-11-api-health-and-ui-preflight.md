@@ -1,10 +1,15 @@
-# 2025-11-11 — API health endpoint & UI preflight
+# 2025-11-11 — API health endpoint, UI preflight, and one-command dev
 
 ## Summary
-- Added `GET /healthz` to the FastAPI app so external tools can quickly verify readiness alongside `/health`.
-- Streamlit uploader now surfaces the API base URL in the sidebar, runs a `/healthz` preflight before enabling uploads, and propagates exact request URLs + response bodies on failure.
-- README documents common connection errors and their fixes.
+- Added `GET /healthz` to the FastAPI app so the UI and scripts have a stable readiness probe.
+- Streamlit uploader now shows the configured API base URL, runs a `/healthz` preflight before enabling the form, and surfaces full request URLs and response bodies on error.
+- `scripts/dev.sh` (and `make dev`) spin up the API, wait for `/healthz`, and launch Streamlit in a single command.
+- README “Upload via UI” now highlights the new runner, common connection issues, and path/working-directory gotchas.
 
-## Notes
-- Run: `python -m uvicorn apps.api.main:app --reload` and `streamlit run apps/workspace-ui/streamlit_app.py`.
-- If the UI reports "Health check failed", confirm `curl $SCREENALYTICS_API_URL/healthz` succeeds or update `.env`.
+## Usage
+```bash
+bash scripts/dev.sh
+docker compose up  # (in another shell if you need MinIO/Postgres)
+```
+
+Troubleshooting hints now cover API connectivity and Streamlit path issues.
