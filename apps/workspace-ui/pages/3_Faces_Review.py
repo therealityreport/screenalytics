@@ -576,6 +576,54 @@ def _delete_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool
         st.rerun()
 
 
+def _render_people_view(ep_id: str, identities_payload: Dict[str, Any]) -> None:
+    """Render People view showing show-level person entities."""
+    ep_meta = helpers.parse_ep_id(ep_id)
+    if not ep_meta:
+        st.error("Unable to parse episode ID.")
+        return
+
+    show_id = ep_meta["show"].upper()
+    people_resp = _safe_api_get(f"/shows/{show_id}/people")
+    if not people_resp:
+        st.info("No people found for this show. Run 'Group Clusters (auto)' to create people.")
+        return
+
+    people = people_resp.get("people", [])
+    if not people:
+        st.info("No people found for this show. Run 'Group Clusters (auto)' to create people.")
+        return
+
+    # Build map of identity_id to identity metadata
+    identities = identities_payload.get("identities", [])
+    identity_map = {ident["identity_id"]: ident for ident in identities}
+
+    st.markdown(f"**{len(people)} People** across show {show_id}")
+
+    for person in people:
+        person_id = person["person_id"]
+        name = person.get("name") or "(unnamed)"
+        cluster_ids = person.get("cluster_ids", [])
+
+        # Filter clusters for this episode
+        ep_clusters = [cid for cid in cluster_ids if cid.startswith(f"{ep_id}:")]
+        ep_cluster_count = len(ep_clusters)
+
+        header = f"👤 {name} · ID: {person_id} · {ep_cluster_count} clusters in this episode · {len(cluster_ids)} total"
+        st.subheader(header)
+
+        # Show clusters for this episode
+        if ep_clusters:
+            st.caption(f"Clusters in {ep_id}:")
+            for full_cluster_id in ep_clusters:
+                cluster_id = full_cluster_id.split(":", 1)[1] if ":" in full_cluster_id else full_cluster_id
+                identity_meta = identity_map.get(cluster_id, {})
+                label = identity_meta.get("name") or identity_meta.get("label") or cluster_id
+                st.markdown(f"- {label} (`{cluster_id}`)")
+
+        st.divider()
+
+
 ep_id = _select_episode()
 _initialize_state(ep_id)
 episode_detail = _episode_header(ep_id)
@@ -586,13 +634,37 @@ if not helpers.detector_is_face_only(ep_id):
         "Tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face for best results."
     )
 
+# Group Clusters button and view switcher
+cols = st.columns([1, 1, 2])
+with cols[0]:
+    if st.button("Group Clusters (auto)", key="group_clusters_auto", type="primary"):
+        with st.spinner("Running cluster grouping..."):
+            result = _api_post(f"/episodes/{ep_id}/clusters/group", {"strategy": "auto"})
+            if result:
+                st.success(f"Grouping complete! {result.get('result', {}).get('across_episodes', {}).get('new_people_count', 0)} new people created.")
+                st.rerun()
+with cols[1]:
+    view_mode = st.radio(
+        "View mode",
+        options=["Clusters", "People"],
+        horizontal=True,
+        key="view_mode",
+        label_visibility="collapsed"
+    )
+with cols[2]:
+    st.caption("Auto-groups clusters within episode and matches to show-level People")
+
 view_state = st.session_state.get("facebank_view", "clusters")
 identities_payload = _safe_api_get(f"/episodes/{ep_id}/identities")
 if not identities_payload:
     st.stop()
-cluster_payload = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks") or {"clusters": []}
 
-if view_state == "track" and st.session_state.get("selected_track") is not None:
+# Determine which view to show
+if view_mode == "People":
+    _render_people_view(ep_id, identities_payload)
+elif view_state == "track" and st.session_state.get("selected_track") is not None:
     _render_track_view(ep_id, st.session_state["selected_track"], identities_payload)
 else:
+    # Clusters view
+    cluster_payload = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks") or {"clusters": []}
     _render_cluster_rows(ep_id, cluster_payload, identities_payload)
