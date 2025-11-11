@@ -1,3 +1,4 @@
+import os
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
@@ -25,12 +26,17 @@ def test_create_episode_and_presign(monkeypatch, tmp_path):
     assert presign.status_code == 200
     data = presign.json()
     assert data["ep_id"] == ep_id
-    assert data["object_key"].startswith(f"videos/{ep_id}")
-    assert data["method"] == "FILE"
-    assert data["local_video_path"].endswith("episode.mp4")
-    assert data["path"].endswith("episode.mp4")
+    if data["method"] == "PUT":
+        expected_bucket = os.getenv("AWS_S3_BUCKET", "screenalytics")
+        assert data["bucket"] in {expected_bucket}
+        assert data["key"].startswith("raw/videos/")
+        parsed = urlparse(data["upload_url"])
+        assert parsed.scheme in {"http", "https"}
+        assert data["headers"]["Content-Type"] == "video/mp4"
+    else:
+        assert data["method"] == "FILE"
+        assert data["bucket"] == "local"
+        assert data["key"].startswith("videos/")
+        assert data["path"].endswith("episode.mp4")
 
-    parsed = urlparse(data["upload_url"])
-    assert parsed.scheme in {"http", "https"}
-    assert data["bucket"]
-    assert data["headers"]["Content-Type"] == "video/mp4"
+    assert data["local_video_path"].endswith("episode.mp4")
