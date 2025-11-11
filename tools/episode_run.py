@@ -1576,6 +1576,7 @@ def _run_faces_embed_stage(
             "faces": len(rows),
             "device": device,
             "detector": detector_choice,
+            "embedding_model": embedding_model_name,
             "frames_exported": exporter.frames_written if exporter and exporter.save_frames else 0,
             "crops_exported": exporter.crops_written if exporter and exporter.save_crops else 0,
             "artifacts": {
@@ -1591,7 +1592,7 @@ def _run_faces_embed_stage(
                 "s3_prefixes": s3_prefixes,
                 "s3_uploads": s3_stats,
             },
-            "stats": {"faces": len(rows)},
+            "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
         }
         progress.complete(summary, device=device, detector=detector_choice)
         return summary
@@ -1851,7 +1852,7 @@ def _materialize_identity_thumb(
     return dest_rel.as_posix(), s3_key
 
 
-def _fake_embedding(track_id: int, frame_idx: int, length: int = 8) -> List[float]:
+def _fake_embedding(track_id: int, frame_idx: int, length: int = 512) -> List[float]:
     rnd = random.Random(track_id * 100000 + frame_idx)
     return [round(rnd.uniform(-1.0, 1.0), 4) for _ in range(length)]
 
