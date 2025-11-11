@@ -120,7 +120,7 @@ def _initialize_state(ep_id: str) -> None:
         st.session_state["selected_track"] = None
         st.session_state["cluster_row_data"] = {}
         st.session_state["track_view_cache"] = {}
-    st.session_state.setdefault("cluster_sample_every", 5)
+    st.session_state.setdefault("cluster_sample_every", 3)
     st.session_state.setdefault("track_view_cache", {})
 
 
@@ -141,7 +141,7 @@ def _prepare_track_view_state(track_id: int, sample_every: int) -> None:
     cache[track_id] = {
         "items": [],
         "cursor": None,
-        "sample": sample_every,
+        "sample": 1,
         "exhausted": False,
     }
 
@@ -283,7 +283,7 @@ def _render_cluster_view(ep_id: str, identity_id: str) -> None:
             cache_entry["cursor"] = cursor
             cache_entry["exhausted"] = cursor is None or not fetched
         st.markdown(f"#### Track {track_id} · {track.get('faces_count', 0)} frames")
-        action_cols = st.columns([1.1, 1.3, 1.2])
+        action_cols = st.columns([1.0, 1.2, 1.2, 1.0])
         with action_cols[0]:
             if st.button("View track", key=f"cluster_view_track_{identity_id}_{track_id}"):
                 _prepare_track_view_state(track_id, new_sample)
@@ -301,6 +301,9 @@ def _render_cluster_view(ep_id: str, identity_id: str) -> None:
         with action_cols[2]:
             if st.button("Remove from identity", key=f"track_remove_{identity_id}_{track_id}"):
                 _move_track(ep_id, track_id, None)
+        with action_cols[3]:
+            if st.button("Delete track", key=f"cluster_delete_track_{identity_id}_{track_id}"):
+                _delete_track(ep_id, track_id)
         row_items = cache_entry.get("items", [])
         if row_items:
             helpers.render_track_row(track_id, row_items, thumb_height=200)
@@ -323,47 +326,48 @@ def _render_cluster_view(ep_id: str, identity_id: str) -> None:
         st.divider()
 
 
-def _render_track_view(ep_id: str, track_id: int) -> None:
+def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, Any]) -> None:
     st.button(
         "← Back to cluster",
         key="facebank_back_cluster",
         on_click=lambda: _set_view("cluster", st.session_state.get("selected_identity")),
     )
     st.markdown(f"### Track {track_id}")
-    st.button(
-        "Delete track",
-        key="facebank_delete_track",
-        on_click=lambda: _delete_track(ep_id, track_id),
-    )
+    identities = identities_payload.get("identities", [])
+    current_identity = st.session_state.get("selected_identity")
+    action_cols = st.columns([1.2, 1.2, 1.0])
+    with action_cols[0]:
+        target_options = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
+        if target_options:
+            target_choice = st.selectbox(
+                "Move track to identity",
+                target_options,
+                key=f"track_view_move_{track_id}",
+            )
+            if st.button("Move track", key=f"track_view_move_btn_{track_id}"):
+                _move_track(ep_id, track_id, target_choice)
+    with action_cols[1]:
+        if st.button("Remove from identity", key=f"track_view_remove_{track_id}"):
+            _move_track(ep_id, track_id, None)
+    with action_cols[2]:
+        if st.button("Delete track", key=f"track_view_delete_{track_id}"):
+            _delete_track(ep_id, track_id)
     cache = st.session_state.setdefault("track_view_cache", {})
     state = cache.setdefault(
         track_id,
         {
             "items": [],
             "cursor": None,
-            "sample": st.session_state.get("cluster_sample_every", 5),
+            "sample": 1,
             "exhausted": False,
         },
     )
-    current_sample = int(state.get("sample", st.session_state.get("cluster_sample_every", 5)))
-    new_sample = int(
-        st.number_input(
-            "Sample every N crops",
-            min_value=1,
-            max_value=20,
-            value=current_sample,
-            step=1,
-        )
-    )
-    if new_sample != current_sample:
-        state.update({"sample": new_sample, "items": [], "cursor": None, "exhausted": False})
-        cache[track_id] = state
-        st.rerun()
+    current_sample = int(state.get("sample", 1))
     if not state["items"] and not state.get("exhausted"):
         fetched, cursor = _fetch_track_media(
             ep_id,
             track_id,
-            sample=new_sample,
+            sample=current_sample,
             limit=TRACK_VIEW_LIMIT,
         )
         state["items"] = fetched
@@ -373,13 +377,23 @@ def _render_track_view(ep_id: str, track_id: int) -> None:
     if items:
         helpers.render_track_row(track_id, items, thumb_height=240)
     else:
-        st.info("No crops available for this track. Try decreasing the sample interval.")
+        st.info(
+            "No crops saved for this track yet. Re-run Faces Harvest with 'Save face crops to S3' to populate S3 thumbnails."
+        )
+        if st.button("Run Faces Harvest (save crops to S3)", key=f"faces_rerun_{track_id}"):
+            payload = {"ep_id": ep_id, "stub": False, "save_crops": True}
+            try:
+                helpers.api_post("/jobs/faces_embed_async", payload)
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/faces_embed_async", exc))
+            else:
+                st.success("Faces Harvest queued; monitor progress in Episode Detail.")
     if not state.get("exhausted") and state.get("cursor"):
         if st.button("Load more", key=f"track_view_load_more_{track_id}"):
             more, cursor = _fetch_track_media(
                 ep_id,
                 track_id,
-                sample=new_sample,
+                sample=current_sample,
                 limit=TRACK_VIEW_LIMIT,
                 cursor=state.get("cursor"),
             )
@@ -455,6 +469,6 @@ if not identities_payload:
 if view_state == "cluster" and st.session_state.get("selected_identity"):
     _render_cluster_view(ep_id, st.session_state["selected_identity"])
 elif view_state == "track" and st.session_state.get("selected_track") is not None:
-    _render_track_view(ep_id, st.session_state["selected_track"])
+    _render_track_view(ep_id, st.session_state["selected_track"], identities_payload)
 else:
     _render_identity_grid(ep_id, identities_payload)

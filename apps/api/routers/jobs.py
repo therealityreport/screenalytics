@@ -18,12 +18,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
+from apps.api.services.episodes import EpisodeStore
 from apps.api.services.jobs import JobNotFoundError, JobService
 from apps.api.services.storage import artifact_prefixes, episode_context_from_id
 
 router = APIRouter()
 JOB_SERVICE = JobService()
+EPISODE_STORE = EpisodeStore()
 DETECTOR_CHOICES = {"retinaface", "yolov8face"}
+TRACKER_CHOICES = {"bytetrack", "strongsort"}
 
 
 class DetectRequest(BaseModel):
@@ -49,6 +52,7 @@ class DetectTrackRequest(BaseModel):
     save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
     detector: str = Field("retinaface", description="Face detector backend (retinaface or yolov8face)")
+    tracker: str = Field("bytetrack", description="Tracker backend (bytetrack or strongsort)")
     max_gap: int | None = Field(30, ge=1, description="Frame gap before forcing a new track")
 
 
@@ -86,6 +90,23 @@ def _artifact_summary(ep_id: str) -> dict:
     }
 
 
+def _validate_episode_ready(ep_id: str) -> Path:
+    record = EPISODE_STORE.get(ep_id)
+    if not record:
+        raise HTTPException(status_code=400, detail="Episode not tracked yet; create it via /episodes/upsert_by_id.")
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=400, detail="Episode video not mirrored locally; run Mirror from S3.")
+    if not video_path.is_file():
+        raise HTTPException(status_code=400, detail="Episode video path is invalid.")
+    try:
+        with video_path.open("rb"):
+            pass
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Episode video unreadable: {exc}") from exc
+    return video_path
+
+
 def _s3_prefixes(ep_id: str) -> dict | None:
     try:
         ctx = episode_context_from_id(ep_id)
@@ -107,11 +128,19 @@ def _normalize_detector(detector: str | None) -> str:
     return value
 
 
+def _normalize_tracker(tracker: str | None) -> str:
+    value = (tracker or "").strip().lower()
+    if value not in TRACKER_CHOICES:
+        raise HTTPException(status_code=400, detail=f"Unsupported tracker '{tracker}'")
+    return value
+
+
 def _build_detect_track_command(
     req: DetectTrackRequest,
     video_path: Path,
     progress_path: Path,
     detector_value: str,
+    tracker_value: str,
 ) -> List[str]:
     command: List[str] = [
         sys.executable,
@@ -138,6 +167,7 @@ def _build_detect_track_command(
     if req.jpeg_quality and req.jpeg_quality != 85:
         command += ["--jpeg-quality", str(req.jpeg_quality)]
     command += ["--detector", detector_value]
+    command += ["--tracker", tracker_value]
     if req.max_gap:
         command += ["--max-gap", str(req.max_gap)]
     return command
@@ -343,16 +373,19 @@ def enqueue_track(req: TrackRequest) -> dict:
 @router.post("/detect_track")
 def run_detect_track(req: DetectTrackRequest, request: Request):
     artifacts = _artifact_summary(req.ep_id)
-    video_path = Path(artifacts["video"])
-    if not video_path.exists():
-        raise HTTPException(status_code=400, detail="Episode video not uploaded yet.")
+    video_path = _validate_episode_ready(req.ep_id)
     detector_value = _normalize_detector(req.detector)
+    tracker_value = _normalize_tracker(req.tracker)
+    try:
+        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.stub, req.device)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     progress_path = _progress_file_path(req.ep_id)
     try:
         progress_path.unlink()
     except FileNotFoundError:
         pass
-    command = _build_detect_track_command(req, video_path, progress_path, detector_value)
+    command = _build_detect_track_command(req, video_path, progress_path, detector_value, tracker_value)
     result = _run_job_with_optional_sse(command, request)
     if isinstance(result, StreamingResponse):
         return result
@@ -367,6 +400,7 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
         "stub": req.stub,
         "device": req.device,
         "detector": detector_value,
+        "tracker": tracker_value,
         "detections_count": detections_count,
         "tracks_count": tracks_count,
         "artifacts": artifacts,
@@ -442,11 +476,10 @@ def run_cluster(req: ClusterRequest, request: Request):
 @router.post("/detect_track_async")
 def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
     artifacts = _artifact_summary(req.ep_id)
-    video_path = Path(artifacts["video"])
-    if not video_path.exists():
-        raise HTTPException(status_code=400, detail="Episode video not uploaded yet.")
+    video_path = _validate_episode_ready(req.ep_id)
     fps_value = req.fps if req.fps and req.fps > 0 else None
     detector_value = _normalize_detector(req.detector)
+    tracker_value = _normalize_tracker(req.tracker)
     try:
         job = JOB_SERVICE.start_detect_track_job(
             ep_id=req.ep_id,
@@ -459,9 +492,10 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
             save_crops=req.save_crops,
             jpeg_quality=req.jpeg_quality,
             detector=detector_value,
+            tracker=tracker_value,
             max_gap=req.max_gap,
         )
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {
         "job_id": job["job_id"],

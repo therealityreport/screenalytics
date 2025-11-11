@@ -18,13 +18,13 @@ cfg = helpers.init_page("Episodes")
 st.title("Episodes Browser")
 
 
-def _api_delete(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+def _api_post_json(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     base = st.session_state.get("api_base")
     if not base:
         st.error("API base URL missing; run init_page().")
         return None
     try:
-        resp = requests.delete(f"{base}{path}", json=payload, timeout=90)
+        resp = requests.post(f"{base}{path}", json=payload, timeout=90)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
     except requests.RequestException as exc:
@@ -46,24 +46,18 @@ def _show_single_delete(ep_id: str) -> None:
         st.session_state["episodes_delete_target"] = ep_id
     target = st.session_state.get("episodes_delete_target")
     if target != ep_id:
-        st.caption("Deletes the EpisodeStore entry, local manifests/frames, and S3 artifacts.")
+        st.caption("Removes the EpisodeStore entry plus local video/manifests/frames for this episode.")
         return
     with st.container(border=True):
         st.warning(
             f"You are about to delete `{ep_id}`. This removes the EpisodeStore record, manifests, frames/crops, and identities."
         )
-        delete_local = st.checkbox("Remove local data (videos/, manifests/, frames/, analytics/)", value=True)
-        delete_artifacts = st.checkbox("Remove S3 artifacts (frames, crops, manifests, analytics)", value=True)
-        delete_raw = st.checkbox("Also delete raw source video in raw/videos/...", value=False)
+        delete_s3 = st.checkbox("Also delete S3 artifacts (frames/crops/manifests)", value=False)
         cols = st.columns(2)
         with cols[0]:
             if st.button("Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"):
-                payload = {
-                    "delete_local": delete_local,
-                    "delete_artifacts": delete_artifacts,
-                    "delete_raw": delete_raw,
-                }
-                resp = _api_delete(f"/episodes/{ep_id}", payload)
+                payload = {"include_s3": delete_s3}
+                resp = _api_post_json(f"/episodes/{ep_id}/delete", payload)
                 if resp is not None:
                     deleted = resp.get("deleted", {})
                     st.success(
@@ -90,24 +84,21 @@ def _show_purge_section() -> None:
             "This action deletes every EpisodeStore entry plus optional local/S3 artifacts. "
             "Type DELETE ALL to confirm."
         )
-        delete_local = st.checkbox("Remove all local episode data", value=True, key="purge_local")
-        delete_artifacts = st.checkbox("Remove all S3 artifacts", value=True, key="purge_artifacts")
-        delete_raw = st.checkbox("Also delete every raw episode video", value=False, key="purge_raw")
+        delete_s3 = st.checkbox(
+            "Also delete S3 artifacts (frames/crops/manifests) for every episode",
+            value=False,
+            key="purge_include_s3",
+        )
         confirm_text = st.text_input("Type DELETE ALL to confirm", key="purge_confirm")
         cols = st.columns(2)
         with cols[0]:
             if st.button("Confirm purge", type="primary", key="purge_confirm_btn"):
                 payload = {
                     "confirm": confirm_text.strip(),
-                    "delete_local": delete_local,
-                    "delete_artifacts": delete_artifacts,
-                    "delete_raw": delete_raw,
+                    "include_s3": delete_s3,
                 }
-                try:
-                    resp = helpers.api_post("/episodes/purge_all", payload)
-                except requests.RequestException as exc:
-                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/purge_all", exc))
-                else:
+                resp = _api_post_json("/episodes/delete_all", payload)
+                if resp is not None:
                     totals = resp.get("deleted", {})
                     st.success(
                         "Purged episodes: "

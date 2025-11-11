@@ -18,13 +18,20 @@ DEFAULT_STRIDE = 3
 DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
 DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
 DETECTOR_OPTIONS = [
-    ("RetinaFace (default, higher quality)", "retinaface"),
-    ("YOLOv8-face (fast)", "yolov8face"),
+    ("RetinaFace (recommended)", "retinaface"),
+    ("YOLOv8-face (alt)", "yolov8face"),
 ]
 DETECTOR_LABELS = [label for label, _ in DETECTOR_OPTIONS]
 DETECTOR_VALUE_MAP = {label: value for label, value in DETECTOR_OPTIONS}
 DETECTOR_LABEL_MAP = {value: label for label, value in DETECTOR_OPTIONS}
 FACE_ONLY_DETECTORS = {"retinaface", "yolov8face"}
+TRACKER_OPTIONS = [
+    ("ByteTrack (default)", "bytetrack"),
+    ("StrongSORT (ReID)", "strongsort"),
+]
+TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
+TRACKER_VALUE_MAP = {label: value for label, value in TRACKER_OPTIONS}
+TRACKER_LABEL_MAP = {value: label for label, value in TRACKER_OPTIONS}
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 
 
@@ -76,6 +83,7 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     if "device_default_label" not in st.session_state:
         st.session_state["device_default_label"] = _guess_device_label()
     st.session_state.setdefault("detector_choice", "retinaface")
+    st.session_state.setdefault("tracker_choice", "bytetrack")
 
     sidebar = st.sidebar
     sidebar.header("API")
@@ -203,6 +211,36 @@ def remember_detector(value: str | None) -> None:
         st.session_state["detector_choice"] = key
 
 
+def tracker_default_value() -> str:
+    return st.session_state.get("tracker_choice", "bytetrack")
+
+
+def tracker_label_index(value: str | None) -> int:
+    key = str(value).lower() if value else "bytetrack"
+    label = TRACKER_LABEL_MAP.get(key)
+    if label in TRACKER_LABELS:
+        return TRACKER_LABELS.index(label)
+    return 0
+
+
+def tracker_label_from_value(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    return TRACKER_LABEL_MAP.get(value.lower(), value)
+
+
+def set_tracker_choice(value: str) -> None:
+    key = (value or "").lower()
+    if key in TRACKER_LABEL_MAP:
+        st.session_state["tracker_choice"] = key
+
+
+def remember_tracker(value: str | None) -> None:
+    key = (value or "").lower() if value else ""
+    if key in TRACKER_LABEL_MAP:
+        st.session_state["tracker_choice"] = key
+
+
 def _guess_device_label() -> str:
     try:
         import torch  # type: ignore
@@ -256,6 +294,28 @@ def tracks_detector_value(ep_id: str) -> str | None:
     return None
 
 
+def tracks_tracker_value(ep_id: str) -> str | None:
+    path = _manifest_path(ep_id, "tracks.jsonl")
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tracker = payload.get("tracker")
+                if tracker:
+                    return str(tracker).lower()
+    except OSError:
+        return None
+    return None
+
+
 def detector_is_face_only(ep_id: str) -> bool:
     detector = tracks_detector_value(ep_id)
     if detector is None:
@@ -266,6 +326,10 @@ def detector_is_face_only(ep_id: str) -> bool:
 
 def tracks_detector_label(ep_id: str) -> str:
     return detector_label_from_value(tracks_detector_value(ep_id))
+
+
+def tracks_tracker_label(ep_id: str) -> str:
+    return tracker_label_from_value(tracks_tracker_value(ep_id))
 
 
 def try_switch_page(page_path: str) -> None:
@@ -368,19 +432,26 @@ def update_progress_display(
     detail_placeholder,
     requested_device: str,
     requested_detector: str | None,
+    requested_tracker: str | None,
 ) -> None:
     ratio = progress_ratio(progress)
     progress_bar.progress(ratio)
     secs_total = total_seconds_hint(progress)
     secs_done = progress.get("secs_done") or progress.get("elapsed_sec")
     phase = progress.get("phase") or "detect"
-    device_label = progress.get("device") or requested_device
+    device_label = progress.get("device") or requested_device or "--"
+    resolved_detector_device = progress.get("resolved_device")
+    device_text = device_label
+    if resolved_detector_device and resolved_detector_device != device_label:
+        device_text = f"{device_label} (detector={resolved_detector_device})"
     raw_detector = progress.get("detector") or requested_detector
     detector_label = detector_label_from_value(raw_detector) if raw_detector else "--"
+    raw_tracker = progress.get("tracker") or requested_tracker
+    tracker_label = tracker_label_from_value(raw_tracker) if raw_tracker else "--"
     fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
     status_placeholder.write(
-        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • phase={phase} • detector={detector_label} • device={device_label} • fps={fps_text}"
+        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • phase={phase} • detector={detector_label} • tracker={tracker_label} • device={device_text} • fps={fps_text}"
     )
     detail_placeholder.caption(
         f"Frames {progress.get('frames_done', 0):,} / {progress.get('frames_total') or '?'}"
@@ -550,6 +621,7 @@ def run_job_with_progress(
     requested_device: str,
     async_endpoint: str | None,
     requested_detector: str | None = None,
+    requested_tracker: str | None = None,
 ):
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
@@ -565,6 +637,7 @@ def run_job_with_progress(
             detail_placeholder=detail_placeholder,
             requested_device=requested_device,
             requested_detector=requested_detector,
+            requested_tracker=requested_tracker,
         )
 
     summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
@@ -579,6 +652,7 @@ def run_job_with_progress(
         )
     if summary and isinstance(summary, dict):
         remember_detector(summary.get("detector"))
+        remember_tracker(summary.get("tracker"))
     return summary, error_message
 
 

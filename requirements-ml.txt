@@ -14,8 +14,8 @@ faiss-cpu==1.8.0
 pgvector==0.2.5
 pyyaml==6.0.1
 tomlkit==0.13.2
-insightface==0.7.3
-onnxruntime==1.18.0
-torchreid==0.2.5
-gdown==5.2.0
+insightface>=0.7.3  # run python scripts/fetch_models.py after installing
+onnxruntime>=1.17.0
+# Optional CUDA acceleration for ONNX Runtime:
+# onnxruntime-gpu==1.17.*
 tensorboard==2.20.0

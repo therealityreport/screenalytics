@@ -78,7 +78,7 @@ def _episode_local_dirs(ep_id: str) -> List[Path]:
     return unique
 
 
-def _delete_episode_assets(ep_id: str, options: DeleteEpisodeIn) -> Dict[str, Any]:
+def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
     record = EPISODE_STORE.get(ep_id)
     if not record:
         raise HTTPException(status_code=404, detail="Episode not found")
@@ -87,7 +87,8 @@ def _delete_episode_assets(ep_id: str, options: DeleteEpisodeIn) -> Dict[str, An
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid episode id") from exc
     local_deleted = 0
-    if options.delete_local:
+    delete_local = getattr(options, "delete_local", True)
+    if delete_local:
         for path in _episode_local_dirs(ep_id):
             if not path.exists():
                 continue
@@ -97,15 +98,17 @@ def _delete_episode_assets(ep_id: str, options: DeleteEpisodeIn) -> Dict[str, An
             except Exception as exc:  # pragma: no cover - best effort cleanup
                 LOGGER.warning("Failed to delete %s: %s", path, exc)
     s3_deleted = 0
+    include_s3 = bool(getattr(options, "include_s3", False) or getattr(options, "delete_artifacts", False))
+    delete_raw = bool(getattr(options, "delete_raw", False))
     prefixes: Dict[str, str] | None = None
-    if options.delete_artifacts or options.delete_raw:
+    if include_s3 or delete_raw:
         prefixes = v2_artifact_prefixes(ep_ctx)
-    if options.delete_artifacts and prefixes:
-        for key in ("frames", "crops", "manifests", "analytics"):
+    if include_s3 and prefixes:
+        for key in ("frames", "crops", "manifests", "analytics", "thumbs_tracks", "thumbs_identities"):
             prefix = prefixes.get(key)
             if prefix:
                 s3_deleted += delete_s3_prefix(STORAGE.bucket, prefix, storage=STORAGE)
-    if options.delete_raw and prefixes:
+    if delete_raw and prefixes:
         for key in ("raw_v2", "raw_v1"):
             prefix = prefixes.get(key)
             if prefix:
@@ -116,6 +119,18 @@ def _delete_episode_assets(ep_id: str, options: DeleteEpisodeIn) -> Dict[str, An
         "deleted": {"local_dirs": local_deleted, "s3_objects": s3_deleted},
         "removed_from_store": removed,
     }
+
+
+def _delete_all_records(options) -> Dict[str, Any]:
+    records = EPISODE_STORE.list()
+    deleted: List[str] = []
+    totals = {"local_dirs": 0, "s3_objects": 0}
+    for record in records:
+        result = _delete_episode_assets(record.ep_id, options)
+        deleted.append(result["ep_id"])
+        totals["local_dirs"] += result["deleted"]["local_dirs"]
+        totals["s3_objects"] += result["deleted"]["s3_objects"]
+    return {"deleted": totals, "episodes": deleted, "count": len(deleted)}
 
 
 FRAME_IDX_RE = re.compile(r"frame_(\d+)\.jpg$", re.IGNORECASE)
@@ -418,6 +433,28 @@ class FrameDeleteRequest(BaseModel):
     delete_assets: bool = False
 
 
+class DeleteEpisodeIn(BaseModel):
+    include_s3: bool = False
+
+
+class DeleteAllIn(BaseModel):
+    confirm: str
+    include_s3: bool = False
+
+
+class DeleteEpisodeLegacyIn(BaseModel):
+    delete_artifacts: bool = True
+    delete_raw: bool = False
+    delete_local: bool = True
+
+
+class PurgeAllLegacyIn(BaseModel):
+    confirm: str
+    delete_artifacts: bool = True
+    delete_raw: bool = False
+    delete_local: bool = True
+
+
 class S3VideoItem(BaseModel):
     bucket: str
     key: str
@@ -554,29 +591,34 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
     return S3VideosResponse(items=items, count=len(items))
 
 
+@router.post("/episodes/{ep_id}/delete")
+def delete_episode_new(ep_id: str, body: DeleteEpisodeIn = Body(default=DeleteEpisodeIn())) -> Dict[str, Any]:
+    return _delete_episode_assets(ep_id, body)
+
+
+@router.post("/episodes/delete_all")
+def delete_all(body: DeleteAllIn) -> Dict[str, Any]:
+    if body.confirm.strip() != "DELETE ALL":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch.")
+    delete_opts = DeleteEpisodeIn(include_s3=body.include_s3)
+    return _delete_all_records(delete_opts)
+
+
 @router.delete("/episodes/{ep_id}")
-def delete_episode(ep_id: str, body: DeleteEpisodeIn = Body(default=DeleteEpisodeIn())) -> Dict[str, Any]:
+def delete_episode(ep_id: str, body: DeleteEpisodeLegacyIn = Body(default=DeleteEpisodeLegacyIn())) -> Dict[str, Any]:
     return _delete_episode_assets(ep_id, body)
 
 
 @router.post("/episodes/purge_all")
-def purge_all(body: PurgeAllIn) -> Dict[str, Any]:
+def purge_all(body: PurgeAllLegacyIn) -> Dict[str, Any]:
     if body.confirm.strip() != "DELETE ALL":
         raise HTTPException(status_code=400, detail="Confirmation text mismatch.")
-    records = EPISODE_STORE.list()
-    deleted: List[str] = []
-    totals = {"local_dirs": 0, "s3_objects": 0}
-    delete_opts = DeleteEpisodeIn(
+    delete_opts = DeleteEpisodeLegacyIn(
         delete_artifacts=body.delete_artifacts,
         delete_raw=body.delete_raw,
         delete_local=body.delete_local,
     )
-    for record in records:
-        result = _delete_episode_assets(record.ep_id, delete_opts)
-        deleted.append(result["ep_id"])
-        totals["local_dirs"] += result["deleted"]["local_dirs"]
-        totals["s3_objects"] += result["deleted"]["s3_objects"]
-    return {"deleted": totals, "episodes": deleted, "count": len(deleted)}
+    return _delete_all_records(delete_opts)
 
 
 @router.get("/episodes/{ep_id}", response_model=EpisodeDetailResponse, tags=["episodes"])

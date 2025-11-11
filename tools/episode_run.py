@@ -15,7 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import logging
 from functools import lru_cache
@@ -47,8 +47,10 @@ LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DETECTOR_CHOICES = ("retinaface", "yolov8face")
 DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
-ARC_FACE_MODEL_NAME = "arcface_r100_v1"
-RETINAFACE_MODEL_NAME = "retinaface_r50_v1"
+TRACKER_CHOICES = ("bytetrack", "strongsort")
+DEFAULT_TRACKER = TRACKER_CHOICES[0]
+ARC_FACE_MODEL_NAME = os.environ.get("ARCFACE_MODEL", "arcface_r100_v1")
+RETINAFACE_MODEL_NAME = os.environ.get("RETINAFACE_MODEL", "retinaface_r50_v1")
 FACE_CLASS_LABEL = "face"
 MIN_FACE_AREA = 20.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
@@ -56,6 +58,87 @@ RETINAFACE_SCORE_THRESHOLD = 0.6
 RETINAFACE_NMS = 0.45
 YOLO_FACE_CONF = 0.5
 BYTE_TRACK_MIN_BOX_AREA = 20.0
+DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
+DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt")
+DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
+RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
+
+
+def _normalize_device_label(device: str | None) -> str:
+    normalized = (device or "cpu").lower()
+    if normalized in {"0", "cuda", "gpu"}:
+        return "cuda"
+    return normalized
+
+
+def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
+    normalized = (device or "auto").lower()
+    providers: list[str] = ["CPUExecutionProvider"]
+    resolved = "cpu"
+    if normalized in {"cuda", "0", "gpu", "auto"}:
+        try:
+            import onnxruntime as ort  # type: ignore
+
+            available = ort.get_available_providers()
+        except Exception:
+            available = []
+        if "CUDAExecutionProvider" in available:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            resolved = "cuda"
+            return providers, resolved
+        if normalized in {"cuda", "0", "gpu"}:
+            LOGGER.warning("CUDA requested for RetinaFace/ArcFace but CUDAExecutionProvider unavailable; falling back to CPU")
+    if normalized in {"mps", "metal", "apple"}:
+        return ["CPUExecutionProvider"], "cpu"
+    return providers, resolved
+
+
+def _init_retinaface(model_name: str, device: str) -> tuple[Any, str]:
+    try:
+        from insightface.model_zoo import get_model  # type: ignore
+    except ImportError as exc:  # pragma: no cover - runtime guard
+        raise RuntimeError("insightface is required for RetinaFace detection") from exc
+
+    providers, resolved = _onnx_providers_for(device)
+    model = get_model(model_name)
+    if model is None:
+        raise RuntimeError(
+            f"RetinaFace weights '{model_name}' not found. Install insightface models or run scripts/fetch_models.py."
+        )
+    ctx_id = 0 if resolved == "cuda" else -1
+    model.prepare(ctx_id=ctx_id, providers=providers, nms=RETINAFACE_NMS)
+    return model, resolved
+
+
+def _init_arcface(model_name: str, device: str):
+    try:
+        from insightface.model_zoo import get_model  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("insightface is required for ArcFace embeddings") from exc
+
+    providers, resolved = _onnx_providers_for(device)
+    model = get_model(model_name)
+    if model is None:
+        raise RuntimeError(
+            f"ArcFace weights '{model_name}' not found. Install insightface models or run scripts/fetch_models.py."
+        )
+    ctx_id = 0 if resolved == "cuda" else -1
+    model.prepare(ctx_id=ctx_id, providers=providers)
+    return model, resolved
+
+
+def ensure_retinaface_ready(device: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """Lightweight readiness probe for API preflight checks."""
+
+    model = None
+    try:
+        model, resolved = _init_retinaface(RETINAFACE_MODEL_NAME, device)
+    except Exception as exc:  # pragma: no cover - surfaced via API tests
+        return False, str(exc), None
+    finally:
+        if model is not None:
+            del model
+    return True, None, resolved
 
 
 def pick_device(explicit: str | None = None) -> str:
@@ -90,11 +173,12 @@ def _normalize_detector_choice(detector: str | None) -> str:
     return DEFAULT_DETECTOR
 
 
-def _onnx_context_and_providers(device: str) -> tuple[int, list[str]]:
-    normalized = (device or "cpu").lower()
-    if normalized in {"cuda", "0", "gpu"}:
-        return 0, ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return -1, ["CPUExecutionProvider"]
+def _normalize_tracker_choice(tracker: str | None) -> str:
+    if tracker:
+        value = tracker.strip().lower()
+        if value in TRACKER_CHOICES:
+            return value
+    return DEFAULT_TRACKER
 
 
 def _valid_face_box(bbox: np.ndarray, score: float, *, min_score: float, min_area: float) -> bool:
@@ -209,6 +293,19 @@ class _TrackerDetections:
         return self.xywh
 
 
+def _tracker_inputs_from_samples(detections: list[DetectionSample]) -> _TrackerDetections:
+    if detections:
+        boxes = np.vstack([sample.bbox for sample in detections]).astype(np.float32)
+        scores = np.asarray([sample.conf for sample in detections], dtype=np.float32)
+        classes = np.asarray([sample.class_idx for sample in detections], dtype=np.float32)
+        return _TrackerDetections(boxes, scores, classes)
+    return _TrackerDetections(
+        np.zeros((0, 4), dtype=np.float32),
+        np.zeros(0, dtype=np.float32),
+        np.zeros(0, dtype=np.float32),
+    )
+
+
 class ByteTrackAdapter:
     """Wrapper around ultralytics BYTETracker for direct invocation."""
 
@@ -229,17 +326,76 @@ class ByteTrackAdapter:
         self._tracker = BYTETracker(cfg, frame_rate=max(frame_rate, 1))
 
     def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
-        if detections:
-            boxes = np.vstack([sample.bbox for sample in detections]).astype(np.float32)
-            scores = np.asarray([sample.conf for sample in detections], dtype=np.float32)
-            classes = np.asarray([sample.class_idx for sample in detections], dtype=np.float32)
-            det_struct = _TrackerDetections(boxes, scores, classes)
-        else:
-            det_struct = _TrackerDetections(
-                np.zeros((0, 4), dtype=np.float32),
-                np.zeros(0, dtype=np.float32),
-                np.zeros(0, dtype=np.float32),
+        det_struct = _tracker_inputs_from_samples(detections)
+        tracks = self._tracker.update(det_struct, image)
+        tracked: list[TrackedObject] = []
+        if tracks.size == 0:
+            return tracked
+        for row in tracks:
+            bbox = np.asarray(row[:4], dtype=np.float32)
+            track_id = int(row[4])
+            score = float(row[5])
+            class_idx = int(row[6]) if len(row) > 6 else 0
+            det_index = int(row[7]) if len(row) > 7 else None
+            label = ""
+            landmarks = None
+            if det_index is not None and 0 <= det_index < len(detections):
+                det = detections[det_index]
+                label = det.class_label
+                class_idx = det.class_idx
+                landmarks = det.landmarks
+            tracked.append(
+                TrackedObject(
+                    track_id=track_id,
+                    bbox=bbox,
+                    conf=score,
+                    class_idx=class_idx,
+                    class_label=label,
+                    det_index=det_index,
+                    landmarks=landmarks,
+                )
             )
+        return tracked
+
+
+class StrongSortAdapter:
+    """Adapter around Ultralytics BOT-SORT tracker (used as a StrongSORT-style ReID tracker)."""
+
+    def __init__(self, frame_rate: float = 30.0) -> None:
+        from types import SimpleNamespace
+
+        try:
+            from ultralytics.trackers.bot_sort import BOTSORT
+        except ImportError as exc:  # pragma: no cover - dependency missing
+            raise RuntimeError(
+                "StrongSORT tracker unavailable; ensure ultralytics>=8.2.70 is installed."
+            ) from exc
+
+        def _env_flag(name: str, default: bool) -> bool:
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        cfg = SimpleNamespace(
+            tracker_type="strongsort",
+            track_high_thresh=0.6,
+            track_low_thresh=0.1,
+            new_track_thresh=0.6,
+            track_buffer=30,
+            match_thresh=0.8,
+            min_box_area=BYTE_TRACK_MIN_BOX_AREA,
+            gmc_method=os.environ.get("SCREENALYTICS_GMC_METHOD", DEFAULT_GMC_METHOD),
+            proximity_thresh=float(os.environ.get("SCREENALYTICS_REID_PROXIMITY", "0.6")),
+            appearance_thresh=float(os.environ.get("SCREENALYTICS_REID_APPEARANCE", "0.7")),
+            with_reid=_env_flag("SCREENALYTICS_REID_ENABLED", DEFAULT_REID_ENABLED),
+            model=os.environ.get("SCREENALYTICS_REID_MODEL", DEFAULT_REID_MODEL) or "auto",
+            fuse_score=_env_flag("SCREENALYTICS_REID_FUSE_SCORE", False),
+        )
+        self._tracker = BOTSORT(cfg, frame_rate=max(frame_rate, 1))
+
+    def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
+        det_struct = _tracker_inputs_from_samples(detections)
         tracks = self._tracker.update(det_struct, image)
         tracked: list[TrackedObject] = []
         if tracks.size == 0:
@@ -277,22 +433,31 @@ class RetinaFaceDetectorBackend:
         self.score_thresh = RETINAFACE_SCORE_THRESHOLD
         self.min_area = MIN_FACE_AREA
         self._model = None
+        self._resolved_device: Optional[str] = None
 
     def _lazy_model(self):
         if self._model is not None:
             return self._model
-        insightface = _try_import("insightface")
-        if insightface is None:
-            raise RuntimeError("insightface is required for RetinaFace detection")
-        ctx_id, providers = _onnx_context_and_providers(self.device)
-        model = insightface.model_zoo.get_model(RETINAFACE_MODEL_NAME)
-        model.prepare(ctx_id=ctx_id, providers=providers, nms=RETINAFACE_NMS)
+        try:
+            model, resolved = _init_retinaface(self.model_name, self.device)
+        except Exception as exc:
+            raise RuntimeError(f"{RETINAFACE_HELP} ({exc})") from exc
+        self._resolved_device = resolved
         self._model = model
         return self._model
 
     @property
     def model_name(self) -> str:
         return RETINAFACE_MODEL_NAME
+
+    @property
+    def resolved_device(self) -> str:
+        if self._resolved_device is None:
+            self.ensure_ready()
+        return self._resolved_device or "cpu"
+
+    def ensure_ready(self) -> None:
+        self._lazy_model()
 
     def detect(self, image) -> list[DetectionSample]:
         model = self._lazy_model()
@@ -332,10 +497,18 @@ class YoloFaceDetectorBackend:
         self.device = device
         self.model_path = os.environ.get("SCREENALYTICS_YOLO_FACE_MODEL", "yolov8n-face.pt")
         self._model = YOLO(self.model_path)
+        self._resolved_device = _normalize_device_label(device)
 
     @property
     def model_name(self) -> str:
         return self.model_path
+
+    @property
+    def resolved_device(self) -> str:
+        return self._resolved_device
+
+    def ensure_ready(self) -> None:
+        _ = self._model
 
     def detect(self, image) -> list[DetectionSample]:
         results = self._model.predict(
@@ -375,22 +548,37 @@ def _build_face_detector(detector: str, device: str):
     return RetinaFaceDetectorBackend(device)
 
 
+def _build_tracker_adapter(tracker: str, frame_rate: float) -> ByteTrackAdapter | StrongSortAdapter:
+    if tracker == "strongsort":
+        return StrongSortAdapter(frame_rate=frame_rate)
+    return ByteTrackAdapter(frame_rate=frame_rate)
+
+
 class ArcFaceEmbedder:
     def __init__(self, device: str) -> None:
         self.device = device
         self._model = None
+        self._resolved_device: Optional[str] = None
 
     def _lazy_model(self):
         if self._model is not None:
             return self._model
-        insightface = _try_import("insightface")
-        if insightface is None:
-            raise RuntimeError("insightface is required for ArcFace embeddings")
-        ctx_id, providers = _onnx_context_and_providers(self.device)
-        model = insightface.model_zoo.get_model(ARC_FACE_MODEL_NAME)
-        model.prepare(ctx_id=ctx_id, providers=providers)
+        try:
+            model, resolved = _init_arcface(ARC_FACE_MODEL_NAME, self.device)
+        except Exception as exc:
+            raise RuntimeError(f"ArcFace init failed: {exc}. Install insightface + models or run scripts/fetch_models.py.") from exc
+        self._resolved_device = resolved
         self._model = model
         return self._model
+
+    def ensure_ready(self) -> None:
+        self._lazy_model()
+
+    @property
+    def resolved_device(self) -> str:
+        if self._resolved_device is None:
+            self.ensure_ready()
+        return self._resolved_device or "cpu"
 
     def encode(self, crops: list[np.ndarray]) -> np.ndarray:
         if not crops:
@@ -645,6 +833,8 @@ class ProgressEmitter:
         self._last_phase: str | None = None
         self._device: str | None = None
         self._detector: str | None = None
+        self._tracker: str | None = None
+        self._resolved_device: str | None = None
 
     def _now(self) -> str:
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -664,6 +854,8 @@ class ProgressEmitter:
         summary: Dict[str, object] | None,
         error: str | None,
         detector: str | None,
+        tracker: str | None,
+        resolved_device: str | None,
     ) -> Dict[str, object]:
         secs_done = time.time() - self._start_ts
         fps_infer = None
@@ -684,6 +876,8 @@ class ProgressEmitter:
             "stride": self.stride,
             "updated_at": self._now(),
             "detector": detector or self._detector,
+            "tracker": tracker or self._tracker,
+            "resolved_device": resolved_device or self._resolved_device,
         }
         if summary:
             payload["summary"] = summary
@@ -709,6 +903,8 @@ class ProgressEmitter:
         error: str | None = None,
         force: bool = False,
         detector: str | None = None,
+        tracker: str | None = None,
+        resolved_device: str | None = None,
     ) -> None:
         frames_done = max(int(frames_done), 0)
         if self.frames_total and frames_done > self.frames_total:
@@ -719,18 +915,38 @@ class ProgressEmitter:
             self._device = device
         if detector is not None:
             self._detector = detector
-        payload = self._compose_payload(frames_done, phase, device, summary, error, detector)
+        if tracker is not None:
+            self._tracker = tracker
+        if resolved_device is not None:
+            self._resolved_device = resolved_device
+        payload = self._compose_payload(frames_done, phase, device, summary, error, detector, tracker, resolved_device)
         self._write_payload(payload)
         self._last_frames = frames_done
         self._last_phase = phase
 
-    def complete(self, summary: Dict[str, object], device: str | None = None, detector: str | None = None) -> None:
+    def complete(
+        self,
+        summary: Dict[str, object],
+        device: str | None = None,
+        detector: str | None = None,
+        tracker: str | None = None,
+        resolved_device: str | None = None,
+    ) -> None:
         final_frames = self.frames_total or summary.get("frames_sampled") or self._last_frames
         final_frames = int(final_frames or 0)
-        self.emit(final_frames, phase="done", device=device, summary=summary, force=True, detector=detector)
+        self.emit(
+            final_frames,
+            phase="done",
+            device=device,
+            summary=summary,
+            force=True,
+            detector=detector,
+            tracker=tracker,
+            resolved_device=resolved_device,
+        )
 
     def fail(self, error: str) -> None:
-        self.emit(self._last_frames, phase="error", error=error, force=True)
+        self.emit(self._last_frames, phase="error", error=error, force=True, tracker=self._tracker)
 
     @property
     def target_frames(self) -> int:
@@ -993,6 +1209,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Face detector backend (RetinaFace high quality, YOLOv8-face fast)",
     )
     parser.add_argument(
+        "--tracker",
+        choices=list(TRACKER_CHOICES),
+        default=DEFAULT_TRACKER,
+        help="Tracker backend (ByteTrack default, StrongSORT optional for occlusions)",
+    )
+    parser.add_argument(
         "--max-gap",
         type=int,
         default=30,
@@ -1064,18 +1286,27 @@ def _run_stub_pipeline(
     ep_id: str,
     *,
     detector: str,
+    tracker: str,
     progress: ProgressEmitter | None = None,
     analyzed_fps: float | None = None,
-) -> Tuple[int, int, int, str, float | None, Dict[str, Any]]:
+) -> Tuple[int, int, int, str, str, float | None, Dict[str, Any]]:
     det_path = get_path(ep_id, "detections")
     track_path = get_path(ep_id, "tracks")
     det_rows = []
     if progress:
-        progress.emit(0, phase="detect", device="cpu", detector=detector, force=True)
+        progress.emit(
+            0,
+            phase="detect",
+            device="cpu",
+            detector=detector,
+            tracker=tracker,
+            resolved_device="cpu",
+            force=True,
+        )
     stub_frames = 3
     detector_label = detector or FACE_CLASS_LABEL
     class_label = FACE_CLASS_LABEL
-    tracker_label = "bytetrack"
+    tracker_label = tracker or DEFAULT_TRACKER
     for idx in range(stub_frames):
         ts = idx * 0.5
         det_rows.append(
@@ -1102,7 +1333,14 @@ def _run_stub_pipeline(
             total = max(progress.target_frames, 1)
             ratio = (idx + 1) / stub_frames
             scale = int(round(total * ratio)) or (idx + 1)
-            progress.emit(scale, phase="detect", device="cpu", detector=detector)
+            progress.emit(
+                scale,
+                phase="detect",
+                device="cpu",
+                detector=detector,
+                tracker=tracker_label,
+                resolved_device="cpu",
+            )
     track_rows = [
         {
             "ep_id": ep_id,
@@ -1142,9 +1380,11 @@ def _run_stub_pipeline(
             device="cpu",
             summary=metrics,
             detector=detector,
+            tracker=tracker_label,
+            resolved_device="cpu",
             force=True,
         )
-    return len(det_rows), len(track_rows), len(det_rows), "cpu", analyzed_fps, metrics
+    return len(det_rows), len(track_rows), len(det_rows), "cpu", "cpu", analyzed_fps, metrics
 
 
 def _effective_stride(stride: int, target_fps: float | None, source_fps: float) -> int:
@@ -1184,7 +1424,7 @@ def _run_full_pipeline(
     progress: ProgressEmitter | None = None,
     target_fps: float | None = None,
     frame_exporter: FrameExporter | None = None,
-) -> Tuple[int, int, int, str, float | None]:
+) -> Tuple[int, int, int, str, str, float | None, Dict[str, Any]]:
     import cv2  # type: ignore
 
     analyzed_fps = target_fps or source_fps
@@ -1194,15 +1434,25 @@ def _run_full_pipeline(
     ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
     device = pick_device(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
-    detector_backend = _build_face_detector(
-        detector_choice,
-        device if detector_choice == "yolov8face" else ("cpu" if device == "mps" else device),
-    )
-    tracker_label = "bytetrack"
+    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
+    args.tracker = tracker_choice
+    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
+    detector_backend = _build_face_detector(detector_choice, device)
+    detector_backend.ensure_ready()
+    detector_device = getattr(detector_backend, "resolved_device", device)
+    tracker_label = tracker_choice
     if progress:
-        progress.emit(0, phase="detect", device=device, detector=detector_choice, force=True)
+        progress.emit(
+            0,
+            phase="detect",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_label,
+            resolved_device=detector_device,
+            force=True,
+        )
 
-    tracker_adapter = ByteTrackAdapter(frame_rate=source_fps or 30.0)
+    tracker_adapter = _build_tracker_adapter(tracker_choice, frame_rate=source_fps or 30.0)
     recorder = TrackRecorder(max_gap=args.max_gap, remap_ids=True)
     det_path = get_path(args.ep_id, "detections")
     det_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1228,10 +1478,11 @@ def _run_full_pipeline(
                 frames_sampled += 1
                 ts = frame_idx / ts_fps if ts_fps else 0.0
                 detections = detector_backend.detect(frame)
-                tracked_objects = tracker_adapter.update(detections, frame_idx, frame)
+                face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+                tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
                 crop_records: list[tuple[int, list[float]]] = []
 
-                if not detections:
+                if not face_detections:
                     if frame_exporter and frame_exporter.save_frames:
                         frame_exporter.export(frame_idx, frame, [], ts=ts)
                     if progress:
@@ -1241,6 +1492,8 @@ def _run_full_pipeline(
                             phase="detect",
                             device=device,
                             detector=detector_choice,
+                            tracker=tracker_label,
+                            resolved_device=detector_device,
                         )
                     frame_idx += 1
                     continue
@@ -1290,6 +1543,8 @@ def _run_full_pipeline(
                         phase="track",
                         device=device,
                         detector=detector_choice,
+                        tracker=tracker_label,
+                        resolved_device=detector_device,
                         summary={
                             "tracks_born": recorder.metrics["tracks_born"],
                             "tracks_lost": recorder.metrics["tracks_lost"],
@@ -1321,10 +1576,12 @@ def _run_full_pipeline(
             phase="track",
             device=device,
             detector=detector_choice,
+            tracker=tracker_label,
+            resolved_device=detector_device,
             summary=metrics,
             force=True,
         )
-    return det_count, len(track_rows), frames_sampled, device, analyzed_fps, metrics
+    return det_count, len(track_rows), frames_sampled, device, detector_device, analyzed_fps, metrics
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -1394,7 +1651,8 @@ def _run_detect_track_stage(
                 det_count,
                 track_count,
                 frames_sampled,
-                resolved_device,
+                pipeline_device,
+                detector_device,
                 analyzed_fps,
                 track_metrics,
             ) = _run_stub_pipeline(
@@ -1402,13 +1660,15 @@ def _run_detect_track_stage(
                 detector=detector_choice,
                 progress=progress,
                 analyzed_fps=source_fps,
+                tracker=tracker_choice,
             )
         else:
             (
                 det_count,
                 track_count,
                 frames_sampled,
-                resolved_device,
+                pipeline_device,
+                detector_device,
                 analyzed_fps,
                 track_metrics,
             ) = _run_full_pipeline(
@@ -1417,8 +1677,8 @@ def _run_detect_track_stage(
                 source_fps=source_fps,
                 progress=progress,
                 target_fps=target_fps,
-                    frame_exporter=frame_exporter,
-                )
+                frame_exporter=frame_exporter,
+            )
 
         manifests_dir = get_path(args.ep_id, "detections").parent
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
@@ -1431,9 +1691,11 @@ def _run_detect_track_stage(
             "frames_total": progress.target_frames,
             "frames_exported": frame_exporter.frames_written if frame_exporter else 0,
             "crops_exported": frame_exporter.crops_written if frame_exporter else 0,
-            "device": resolved_device,
+            "device": pipeline_device,
+            "resolved_device": detector_device,
             "analyzed_fps": analyzed_fps,
-             "detector": detector_choice,
+            "detector": detector_choice,
+            "tracker": tracker_choice,
             "metrics": track_metrics,
             "artifacts": {
                 "local": {
@@ -1447,7 +1709,13 @@ def _run_detect_track_stage(
                 "s3_uploads": s3_stats,
             },
         }
-        progress.complete(summary, device=resolved_device, detector=detector_choice)
+        progress.complete(
+            summary,
+            device=pipeline_device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=detector_device,
+        )
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -1492,9 +1760,13 @@ def _run_faces_embed_stage(
     )
     thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
+    tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
     embedder: ArcFaceEmbedder | None = None
+    embed_device = device
     if not args.stub:
-        embedder = ArcFaceEmbedder(device if device != "mps" else "cpu")
+        embedder = ArcFaceEmbedder(device)
+        embedder.ensure_ready()
+        embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
 
     manifests_dir = get_path(args.ep_id, "detections").parent
@@ -1507,7 +1779,15 @@ def _run_faces_embed_stage(
     embeddings_array: List[np.ndarray] = []
 
     try:
-        progress.emit(0, phase="faces_embed", device=device, detector=detector_choice, force=True)
+        progress.emit(
+            0,
+            phase="faces_embed",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=embed_device,
+            force=True,
+        )
         rows: List[Dict[str, Any]] = []
         for idx, sample in enumerate(samples, start=1):
             crop_rel_path = None
@@ -1589,7 +1869,14 @@ def _run_faces_embed_stage(
             if landmarks:
                 face_row["landmarks"] = [round(float(val), 4) for val in landmarks]
             rows.append(face_row)
-            progress.emit(idx, phase="faces_embed", device=device, detector=detector_choice)
+            progress.emit(
+                idx,
+                phase="faces_embed",
+                device=device,
+                detector=detector_choice,
+                tracker=tracker_choice,
+                resolved_device=embed_device,
+            )
 
         _write_jsonl(faces_path, rows)
         embed_path = _faces_embed_path(args.ep_id)
@@ -1608,7 +1895,9 @@ def _run_faces_embed_stage(
             "ep_id": args.ep_id,
             "faces": len(rows),
             "device": device,
+            "resolved_device": embed_device,
             "detector": detector_choice,
+            "tracker": tracker_choice,
             "embedding_model": embedding_model_name,
             "frames_exported": exporter.frames_written if exporter and exporter.save_frames else 0,
             "crops_exported": exporter.crops_written if exporter and exporter.save_crops else 0,
@@ -1627,7 +1916,13 @@ def _run_faces_embed_stage(
             },
             "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
         }
-        progress.complete(summary, device=device, detector=detector_choice)
+        progress.complete(
+            summary,
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=embed_device,
+        )
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -1688,6 +1983,7 @@ def _run_cluster_stage(
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
     track_rows = list(_iter_jsonl(track_path))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
+    tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
 
     progress = ProgressEmitter(
         args.ep_id,
@@ -1699,7 +1995,15 @@ def _run_cluster_stage(
         fps_requested=None,
     )
     device = pick_device(args.device)
-    progress.emit(0, phase="cluster", device=device, detector=detector_choice, force=True)
+    progress.emit(
+        0,
+        phase="cluster",
+        device=device,
+        detector=detector_choice,
+        tracker=tracker_choice,
+        resolved_device=device,
+        force=True,
+    )
 
     embedding_rows: List[np.ndarray] = []
     track_ids: List[int] = []
@@ -1743,7 +2047,14 @@ def _run_cluster_stage(
                 }
             )
             counter += 1
-            progress.emit(counter, phase="cluster", device=device, detector=detector_choice)
+            progress.emit(
+                counter,
+                phase="cluster",
+                device=device,
+                detector=detector_choice,
+                tracker=tracker_choice,
+                resolved_device=device,
+            )
 
     identities_path = manifests_dir / "identities.json"
     payload = {
@@ -1764,7 +2075,9 @@ def _run_cluster_stage(
         "identities_count": len(identity_payload),
         "faces_count": len(faces_rows),
         "device": device,
+        "resolved_device": device,
         "detector": detector_choice,
+        "tracker": tracker_choice,
         "artifacts": {
             "local": {
                 "faces": str(faces_path),
@@ -1776,7 +2089,13 @@ def _run_cluster_stage(
         },
         "stats": payload["stats"],
     }
-    progress.complete(summary, device=device, detector=detector_choice)
+    progress.complete(
+        summary,
+        device=device,
+        detector=detector_choice,
+        tracker=tracker_choice,
+        resolved_device=device,
+    )
     return summary
 
 
@@ -1841,6 +2160,27 @@ def _infer_detector_from_tracks(track_path: Path) -> str | None:
                 detector = row.get("detector")
                 if detector:
                     return str(detector)
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _infer_tracker_from_tracks(track_path: Path) -> str | None:
+    if not track_path.exists():
+        return None
+    try:
+        with track_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tracker = row.get("tracker")
+                if tracker:
+                    return str(tracker).lower()
     except FileNotFoundError:
         return None
     return None

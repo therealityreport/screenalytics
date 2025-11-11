@@ -120,6 +120,7 @@ if prefixes:
     )
 if tracks_path.exists():
     st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
+    st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
 
 col_hydrate, col_detect = st.columns(2)
 with col_hydrate:
@@ -152,6 +153,19 @@ with col_detect:
     )
     detector_value = helpers.DETECTOR_VALUE_MAP[detector_label]
     helpers.set_detector_choice(detector_value)
+    tracker_default_value = helpers.tracker_default_value()
+    tracker_label = st.selectbox(
+        "Tracker",
+        helpers.TRACKER_LABELS,
+        index=helpers.tracker_label_index(tracker_default_value),
+    )
+    tracker_value = helpers.TRACKER_VALUE_MAP[tracker_label]
+    helpers.set_tracker_choice(tracker_value)
+    if device_value == "mps" and detector_value == "retinaface":
+        st.info(
+            "RetinaFace + ArcFace run via ONNX Runtime on CPU when MPS is selected. "
+            "Detector/embeddings will use CPU; tracking still uses your chosen device."
+        )
     save_frames = st.checkbox("Save frames to S3", value=False)
     save_crops = st.checkbox("Save face crops to S3", value=False)
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
@@ -168,6 +182,7 @@ with col_detect:
             "save_crops": bool(save_crops),
             "jpeg_quality": int(jpeg_quality),
             "detector": detector_value,
+            "tracker": tracker_value,
             "max_gap": int(max_gap_value),
         }
         if fps_value > 0:
@@ -181,9 +196,14 @@ with col_detect:
                 requested_device=device_value,
                 async_endpoint="/jobs/detect_track_async",
                 requested_detector=detector_value,
+                requested_tracker=tracker_value,
             )
         if error_message:
-            st.error(error_message)
+            if "RetinaFace weights missing or could not initialize" in error_message:
+                st.error(error_message)
+                st.caption("Run `python scripts/fetch_models.py` then retry.")
+            else:
+                st.error(error_message)
         else:
             normalized = helpers.normalize_summary(ep_id, summary)
             detections = normalized.get("detections")
@@ -191,8 +211,11 @@ with col_detect:
             frames_exported = normalized.get("frames_exported")
             crops_exported = normalized.get("crops_exported")
             detector_summary = normalized.get("detector")
+            tracker_summary = normalized.get("tracker")
             if detector_summary:
                 helpers.set_detector_choice(str(detector_summary))
+            if tracker_summary:
+                helpers.set_tracker_choice(str(tracker_summary))
             details_line = [
                 f"detections: {detections:,}" if isinstance(detections, int) else "detections: ?",
                 f"tracks: {tracks:,}" if isinstance(tracks, int) else "tracks: ?",
@@ -203,6 +226,8 @@ with col_detect:
                 details_line.append(f"crops exported: {crops_exported:,}")
             if detector_summary:
                 details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
+            if tracker_summary:
+                details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
             st.success("Completed · " + " · ".join(details_line))
             metrics = normalized.get("metrics") or {}
             if metrics:
@@ -264,6 +289,10 @@ with col_faces:
         step=5,
         key="faces_jpeg_quality_detail",
     )
+    if faces_device_value == "mps" and not faces_stub:
+        st.caption(
+            "ArcFace embeddings run on CPU when MPS is selected. Tracker/crop export still uses the requested device."
+        )
     if not tracks_ready:
         st.caption("Run detect/track first.")
     elif not detector_face_only:
@@ -286,6 +315,7 @@ with col_faces:
                 requested_device=faces_device_value,
                 async_endpoint="/jobs/faces_embed_async",
                 requested_detector=helpers.tracks_detector_value(ep_id),
+                requested_tracker=helpers.tracks_tracker_value(ep_id),
             )
         if error_message:
             if "tracks.jsonl" in error_message.lower():
@@ -341,6 +371,7 @@ with col_cluster:
                 requested_device=cluster_device_value,
                 async_endpoint="/jobs/cluster_async",
                 requested_detector=helpers.tracks_detector_value(ep_id),
+                requested_tracker=helpers.tracks_tracker_value(ep_id),
             )
         if error_message:
             if "faces.jsonl" in error_message.lower():

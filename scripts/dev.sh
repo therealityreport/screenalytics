@@ -17,19 +17,24 @@ if [[ "$STORAGE_BACKEND" == "s3" && -z "$AWS_S3_BUCKET" ]]; then
   exit 1
 fi
 
-echo "API STORAGE_BACKEND=${STORAGE_BACKEND}  BUCKET=${AWS_S3_BUCKET:-local}"
+echo "[dev.sh] STORAGE_BACKEND=${STORAGE_BACKEND}  BUCKET=${AWS_S3_BUCKET:-local}  API=${API_BASE_URL}"
 
 python -m uvicorn apps.api.main:app --port 8000 & API_PID=$!
 trap 'kill $API_PID 2>/dev/null || true' EXIT
 
 HEALTH_URL="${API_BASE_URL%/}/healthz"
 echo "Waiting for ${HEALTH_URL} …"
+health_ok=false
 for _ in {1..50}; do
   if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
     echo "API ready → ${API_BASE_URL%/}"
+    health_ok=true
     break
   fi
   sleep 0.2
 done
+if [[ "$health_ok" != "true" ]]; then
+  echo "[dev.sh] Warning: API health check did not succeed" >&2
+fi
 
 streamlit run apps/workspace-ui/streamlit_app.py
