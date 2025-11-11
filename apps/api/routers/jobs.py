@@ -22,8 +22,8 @@ class DetectRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     video: str = Field(..., description="Source video path or URL")
     stride: int = Field(5, description="Frame stride for detection sampling")
-    fps: float | None = Field(None, description="Optional frame extraction FPS")
-    stub: bool = Field(False, description="Force stubbed RetinaFace")
+    fps: float | None = Field(None, description="Optional target FPS for sampling")
+    stub: bool = Field(False, description="Use stub pipeline (fast, no ML)")
 
 
 class TrackRequest(BaseModel):
@@ -33,8 +33,8 @@ class TrackRequest(BaseModel):
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stride: int = Field(5, description="Frame stride for detection sampling")
-    fps: float | None = Field(None, description="Optional frame extraction FPS")
-    stub: bool = Field(False, description="Run RetinaFace in stub mode")
+    fps: float | None = Field(None, description="Optional target FPS for sampling")
+    stub: bool = Field(False, description="Use stub pipeline (fast, no ML)")
 
 
 def _artifact_summary(ep_id: str) -> dict:

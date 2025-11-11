@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 API_BASE_URL = os.environ.get("SCREENALYTICS_API_URL", "http://localhost:8000")
-STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local" )
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local").lower()
 STORAGE_BUCKET = (
     os.environ.get("AWS_S3_BUCKET")
     or os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET")
@@ -72,9 +72,22 @@ def _artifact_paths(ep_id: str) -> Dict[str, Path]:
     }
 
 
+def _upload_target_hint(backend: str, bucket: str) -> str:
+    ep_placeholder = "<ep_id>"
+    if backend == "local":
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+        local_path = data_root / "videos" / ep_placeholder / "episode.mp4"
+        return f"{local_path}"
+
+    prefix = os.environ.get("AWS_S3_PREFIX", "raw/").strip("/")
+    prefix_part = f"{prefix}/" if prefix else ""
+    scheme = "s3"
+    return f"{scheme}://{bucket}/{prefix_part}videos/{ep_placeholder}/episode.mp4"
+
+
 st.set_page_config(page_title="Screenalytics Upload", page_icon="📺", layout="centered")
 st.title("Screenalytics Upload")
-st.caption("Create an episode, push footage to MinIO, and kick the detect/track stub.")
+st.caption("Create an episode, push footage to object storage, and kick the detect/track pipeline.")
 
 st.sidebar.header("API connection")
 st.sidebar.code(API_BASE_URL)
@@ -83,9 +96,11 @@ if api_ready:
     st.sidebar.success("API reachable")
 else:
     st.sidebar.error(f"Health check failed: {api_error}")
-st.sidebar.write(f"Storage backend: {STORAGE_BACKEND}")
+sidebar_storage = f"Storage backend: {STORAGE_BACKEND}"
 if STORAGE_BUCKET:
-    st.sidebar.code(STORAGE_BUCKET)
+    sidebar_storage += f" | Bucket: {STORAGE_BUCKET}"
+st.sidebar.write(sidebar_storage)
+st.sidebar.caption(f"Uploads land at: {_upload_target_hint(STORAGE_BACKEND, STORAGE_BUCKET or '<bucket>')}")
 if not api_ready:
     st.error(
         f"API not reachable at {API_BASE_URL}. Verify it is running and that /healthz is accessible."
@@ -107,8 +122,8 @@ with st.form("episode-upload"):
         help="Optional premiere date",
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
-    run_detect_track = st.checkbox(
-        "Run detect/track (stub)", value=True, key="run_detect_track_checkbox"
+    use_stub_detect = st.checkbox(
+        "Use stub (fast, no ML)", value=False, help="Handy for quick smoke tests without YOLOv8."
     )
     submit = st.form_submit_button("Upload episode")
 
@@ -153,10 +168,9 @@ if submit:
 
     raw_bytes = uploaded_file.getbuffer().tobytes()
     upload_url = presign_resp.get("upload_url")
+    key = presign_resp.get("key") or presign_resp.get("object_key")
     st.info(
-        f"Uploading to s3://{presign_resp['bucket']}/{presign_resp['object_key']}"
-        if upload_url
-        else f"Writing to {presign_resp['local_video_path']}"
+        f"Uploading to s3://{presign_resp['bucket']}/{key}" if upload_url else f"Writing to {presign_resp['local_video_path']}"
     )
     if upload_url:
         try:
@@ -169,31 +183,30 @@ if submit:
             st.stop()
 
     local_video = _mirror_local(ep_id, raw_bytes, presign_resp["local_video_path"])
-    st.success(f"Upload to MinIO + local mirror complete for `{ep_id}`.")
+    st.success(f"Upload to object storage + local mirror complete for `{ep_id}`.")
 
-    if run_detect_track:
-        st.write("Running detect/track stub…")
-        jobs_path = "/jobs/detect_track"
-        jobs_url = f"{API_BASE_URL}{jobs_path}"
+    jobs_path = "/jobs/detect_track"
+    jobs_url = f"{API_BASE_URL}{jobs_path}"
+    job_payload = {"ep_id": ep_id, "stub": bool(use_stub_detect), "stride": DEFAULT_STRIDE}
+    mode_label = "stub (no ML)" if use_stub_detect else "YOLOv8 + ByteTrack"
+    spinner_label = f"Running detect/track ({mode_label})…"
+    with st.spinner(spinner_label):
         try:
-            detect_resp = _post_json(
-                jobs_path,
-                {"ep_id": ep_id, "stub": True, "stride": DEFAULT_STRIDE},
-            )
-            st.success(
-                f"Detect/track complete → detections: {detect_resp['detections_count']}, "
-                f"tracks: {detect_resp['tracks_count']}"
-            )
+            detect_resp = _post_json(jobs_path, job_payload)
         except requests.RequestException as exc:
             job_error = _describe_error(jobs_url, exc)
-            st.error(f"Detect/track failed: {job_error}")
+    if detect_resp:
+        st.success(
+            f"Detect/track ({mode_label}) complete → detections: {detect_resp['detections_count']}, "
+            f"tracks: {detect_resp['tracks_count']}"
+        )
+    elif job_error:
+        st.error(f"Detect/track ({mode_label}) failed: {job_error}")
 
     artifacts = _artifact_paths(ep_id)
     st.subheader("Artifacts")
     st.code(str(local_video), language="bash")
     st.markdown(f"Detections → `{artifacts['detections']}`")
     st.markdown(f"Tracks → `{artifacts['tracks']}`")
-    if not run_detect_track:
-        st.caption("Run detect/track later via POST /jobs/detect_track.")
-    elif job_error:
-        st.caption(f"Detect/track stub failed: {job_error}")
+    if job_error:
+        st.caption("Re-run via POST /jobs/detect_track once the backend issue is resolved.")

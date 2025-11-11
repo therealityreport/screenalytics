@@ -108,6 +108,7 @@ pnpm --filter workspace-ui dev               # UI
 ```bash
 source .venv/bin/activate
 ./tools/dev-up.sh
+# Add --stub for the fast path; omit it for the YOLOv8+ByteTrack pipeline.
 python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 5 --stub
 ```
 
@@ -176,8 +177,8 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 
 4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
 5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
-6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, and choose whether to trigger the detect/track stub when the upload lands.
-4. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and (optionally) calls `POST /jobs/detect_track`.
+6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, and decide whether to enable **Use stub (fast, no ML)** before submitting. Leave it unchecked to run the real YOLOv8 + ByteTrack pass, or check it for the light stub.
+7. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and calls `POST /jobs/detect_track` with the selected mode, showing counts once the job finishes.
 
 Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
@@ -186,13 +187,41 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 - `data/manifests/{ep_id}/tracks.jsonl`
 - `data/frames/{ep_id}/` (when jobs run with an `fps` override)
 
-**Note:** Stub mode (`Run detect/track (stub)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
+**Note:** Stub mode (`Use stub (fast, no ML)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
+
+#### Run detection+tracking (real)
+
+Need the full YOLOv8 + ByteTrack pass outside the UI?
+
+1. Install the ML extras:
+
+   ```bash
+   pip install -r requirements-ml.txt
+   ```
+
+2. Run the episode helper without `--stub`:
+
+   ```bash
+   python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 --fps 8
+   ```
+
+   - Lower `--stride` (for example `1` or `2`) and higher `--fps` increase recall but also GPU/CPU time.
+   - Higher `--stride` or smaller `--fps` are useful for exploratory passes on long episodes.
+
+3. (Optional) Verify the real pipeline via the ML test:
+
+   ```bash
+   RUN_ML_TESTS=1 pytest tests/ml/test_detect_track_real.py -q
+   ```
+
+The CLI and UI both emit manifests under `data/manifests/{ep_id}/` with YOLO metadata, so you can diff stub vs. real outputs before pushing upstream.
 
 **Common errors**
 
 - `Connection refused` — Start the API via `python -m uvicorn apps.api.main:app --reload` (or rerun `scripts/dev.sh`) and confirm it responds: `curl http://localhost:8000/healthz`.
 - `API_BASE_URL mismatch` — Export the correct `SCREENALYTICS_API_URL` (or update `.env`) so the UI hits the right host/port.
 - `File not found (Streamlit path)` — Ensure you launch commands from the repo root so `apps/workspace-ui/streamlit_app.py` resolves.
+- `NoSuchBucket` — Run `bash scripts/s3_bootstrap.sh` or set `S3_AUTO_CREATE=1` before restarting the API.
 
 ### AWS S3 setup
 
@@ -202,13 +231,13 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
    aws sts get-caller-identity
    ```
 
-2. Bootstrap buckets with lifecycle + encryption:
+2. Bootstrap the global `screenalytics` bucket with lifecycle + encryption:
 
    ```bash
    bash scripts/s3_bootstrap.sh
    ```
 
-3. Copy `.env.example`, set `STORAGE_BACKEND=s3`, update `AWS_S3_BUCKET`, `SCREENALYTICS_ENV`, and credentials, then source it.
+3. Copy `.env.example`, keep `STORAGE_BACKEND=s3` (defaults to `AWS_S3_BUCKET=screenalytics`), and source it.
 
 4. Run the dev flow (uploads will land in S3):
 
@@ -218,9 +247,15 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
 Artifacts live under the standardized prefixes:
 
-- `s3://screenalytics-dev-<ACCOUNT_ID>/raw/videos/{ep_id}/episode.mp4`
-- `s3://screenalytics-dev-<ACCOUNT_ID>/artifacts/manifests/{ep_id}/detections.jsonl`
-- `s3://screenalytics-dev-<ACCOUNT_ID>/artifacts/faces/{ep_id}/...`
+- `s3://screenalytics/raw/videos/{ep_id}/episode.mp4`
+- `s3://screenalytics/artifacts/manifests/{ep_id}/detections.jsonl`
+- `s3://screenalytics/artifacts/faces/{ep_id}/...`
+
+Verify uploads:
+
+```bash
+aws s3 ls s3://screenalytics/raw/videos/ --recursive | tail -n 5
+```
 
 #### Troubleshooting (macOS / FFmpeg / PyAV)
 
