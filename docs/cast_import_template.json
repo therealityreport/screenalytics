@@ -1,0 +1,36 @@
+{
+  "members": [
+    {
+      "name": "Kyle Richards",
+      "role": "main",
+      "status": "active",
+      "aliases": ["Kyle", "Kyle R"],
+      "seasons": ["S01", "S02", "S03", "S04", "S05"],
+      "social": {
+        "instagram": "@kylerichards18",
+        "twitter": "@KyleRichards"
+      }
+    },
+    {
+      "name": "Lisa Vanderpump",
+      "role": "main",
+      "status": "past",
+      "aliases": ["LVP", "Lisa V"],
+      "seasons": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09"],
+      "social": {
+        "instagram": "@lisavanderpump"
+      }
+    },
+    {
+      "name": "Erika Jayne",
+      "role": "main",
+      "status": "active",
+      "aliases": ["Erika Girardi", "EJ"],
+      "seasons": ["S06", "S07", "S08", "S09", "S10"],
+      "social": {
+        "instagram": "@theprettymess"
+      }
+    }
+  ],
+  "force_new": false
+}

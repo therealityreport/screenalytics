@@ -1,0 +1,6 @@
+- name: codex:P0
+  color: "d73a4a"
+  description: Blocker issues found by Codex
+- name: codex:P1
+  color: "fbca04"
+  description: High-priority issues found by Codex

@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any, Dict
+
+import requests
+import streamlit as st
+
+PAGE_PATH = Path(__file__).resolve()
+WORKSPACE_DIR = PAGE_PATH.parents[1]
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.append(str(WORKSPACE_DIR))
+
+import ui_helpers as helpers  # noqa: E402
+
+from py_screenalytics.artifacts import get_path  # noqa: E402
+
+cfg = helpers.init_page("Episode Detail")
+st.title("Episode Detail")
+
+if "detector" in st.session_state:
+    del st.session_state["detector"]
+if "tracker" in st.session_state:
+    del st.session_state["tracker"]
+st.cache_data.clear()
+
+
+
+def _handle_missing_episode(ep_id: str) -> None:
+    st.warning("Episode not tracked yet.")
+    parsed = helpers.parse_ep_id(ep_id)
+    if not parsed:
+        st.info("Unable to parse show/season/episode. Use the S3 browser to create it.")
+        st.stop()
+    payload = {
+        "ep_id": ep_id,
+        "show_slug": str(parsed["show"]).lower(),
+        "season": int(parsed["season"]),
+        "episode": int(parsed["episode"]),
+    }
+    if st.button("Create episode in store", key="episode_detail_create"):
+        try:
+            helpers.api_post("/episodes/upsert_by_id", payload)
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/upsert_by_id", exc))
+        else:
+            st.success("Episode tracked. Reloading…")
+            helpers.set_ep_id(ep_id)
+            st.rerun()
+    st.stop()
+
+
+
+def _prompt_for_episode() -> None:
+    try:
+        payload = helpers.api_get("/episodes")
+    except requests.RequestException as exc:
+        st.error(helpers.describe_error(f"{cfg['api_base']}/episodes", exc))
+        st.stop()
+    episodes = payload.get("episodes", [])
+    if not episodes:
+        st.info("No episodes yet.")
+        st.stop()
+    option_lookup = {ep["ep_id"]: ep for ep in episodes}
+    selection = st.selectbox(
+        "Episode",
+        list(option_lookup.keys()),
+        format_func=lambda eid: f"{eid} ({option_lookup[eid]['show_slug']})",
+    )
+    if st.button("Load episode", use_container_width=True):
+        helpers.set_ep_id(selection)
+    st.stop()
+
+
+def _format_phase_status(label: str, status: Dict[str, Any], count_key: str) -> str:
+    status_value = str(status.get("status") or "missing").lower()
+    if status_value == "success":
+        count_val = status.get(count_key)
+        parts = [f"{label}: Complete"]
+        if isinstance(count_val, int):
+            parts.append(f"({count_val:,})")
+        finished = status.get("finished_at")
+        if finished:
+            parts.append(f"• finished {finished}")
+        return " ".join(parts)
+    if status_value == "missing":
+        return f"{label}: Not started"
+    return f"{label}: {status_value.title()}"
+
+
+ep_id = helpers.get_ep_id()
+if not ep_id:
+    _prompt_for_episode()
+ep_id = ep_id.strip()
+canonical_ep_id = ep_id.lower()
+if canonical_ep_id != ep_id:
+    helpers.set_ep_id(canonical_ep_id)
+    st.stop()
+ep_id = canonical_ep_id
+
+try:
+    details = helpers.api_get(f"/episodes/{ep_id}")
+except requests.HTTPError as exc:
+    if exc.response is not None and exc.response.status_code == 404:
+        _handle_missing_episode(ep_id)
+    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
+    st.stop()
+except requests.RequestException as exc:
+    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
+    st.stop()
+
+status_payload = helpers.get_episode_status(ep_id)
+if status_payload is None:
+    faces_phase_status: Dict[str, Any] = {"status": "unknown"}
+    cluster_phase_status: Dict[str, Any] = {"status": "unknown"}
+else:
+    faces_phase_status = status_payload.get("faces_embed") or {}
+    cluster_phase_status = status_payload.get("cluster") or {}
+
+prefixes = helpers.episode_artifact_prefixes(ep_id)
+bucket_name = cfg.get("bucket")
+tracks_path = get_path(ep_id, "tracks")
+manifests_dir = get_path(ep_id, "detections").parent
+faces_path = manifests_dir / "faces.jsonl"
+identities_path = manifests_dir / "identities.json"
+
+st.subheader(f"Episode `{ep_id}`")
+st.write(
+    f"Show `{details['show_slug']}` · Season {details['season_number']} Episode {details['episode_number']}"
+)
+st.write(
+    f"S3 v2 → `{details['s3']['v2_key']}` (exists={details['s3']['v2_exists']})"
+)
+st.write(
+    f"S3 v1 → `{details['s3']['v1_key']}` (exists={details['s3']['v1_exists']})"
+)
+if not details["s3"]["v2_exists"] and details["s3"]["v1_exists"]:
+    st.warning("Legacy v1 object detected; mirroring will use it until the v2 path is populated.")
+st.write(
+    f"Local → {helpers.link_local(details['local']['path'])} (exists={details['local']['exists']})"
+)
+if prefixes:
+    st.caption(
+        "S3 artifacts → "
+        f"Frames {helpers.s3_uri(prefixes['frames'], bucket_name)} | "
+        f"Crops {helpers.s3_uri(prefixes['crops'], bucket_name)} | "
+        f"Manifests {helpers.s3_uri(prefixes['manifests'], bucket_name)}"
+    )
+if tracks_path.exists():
+    st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
+    st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
+
+col_hydrate, col_detect = st.columns(2)
+with col_hydrate:
+    if st.button("Mirror from S3", use_container_width=True):
+        mirror_path = f"/episodes/{ep_id}/mirror"
+        try:
+            resp = helpers.api_post(mirror_path)
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error(f"{cfg['api_base']}{mirror_path}", exc))
+        else:
+            st.success(
+                f"Local: {helpers.link_local(resp['local_video_path'])} | size {helpers.human_size(resp.get('bytes'))}"
+            )
+default_device_label = helpers.device_default_label()
+with col_detect:
+    stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
+    fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
+    st.caption(
+        f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
+        f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
+        "Device: auto (falls back to CPU for RetinaFace/ArcFace)."
+    )
+    save_frames = st.checkbox("Save frames to S3", value=True)
+    save_crops = st.checkbox("Save face crops to S3", value=True)
+    jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
+    max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=30, step=1)
+    with st.expander("Advanced detect/track", expanded=False):
+        scene_detect_toggle = st.checkbox(
+            "Scene cut detection",
+            value=helpers.SCENE_DETECT_DEFAULT,
+            help="Detect hard scene transitions before tracking and reset ByteTrack per cut",
+        )
+        scene_threshold_value = st.number_input(
+            "Scene cut threshold",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(helpers.SCENE_THRESHOLD_DEFAULT),
+            step=0.05,
+            help="Higher values require bigger histogram differences before a cut is recorded",
+        )
+        scene_min_len_value = st.number_input(
+            "Minimum frames between cuts",
+            min_value=1,
+            max_value=600,
+            value=int(helpers.SCENE_MIN_LEN_DEFAULT),
+            step=1,
+        )
+        scene_warmup_value = st.number_input(
+            "Warmup detections after cut",
+            min_value=0,
+            max_value=25,
+            value=int(helpers.SCENE_WARMUP_DETS_DEFAULT),
+            step=1,
+            help="Force full detection on the first N frames after each cut",
+        )
+    run_disabled = False
+    run_label = "Run detect/track"
+    if st.button(run_label, use_container_width=True, disabled=run_disabled):
+        job_payload = helpers.default_detect_track_payload(
+            ep_id,
+            stride=int(stride_value),
+            det_thresh=helpers.DEFAULT_DET_THRESH,
+        )
+        job_payload.update(
+            {
+                "save_frames": bool(save_frames),
+                "save_crops": bool(save_crops),
+                "jpeg_quality": int(jpeg_quality),
+                "max_gap": int(max_gap_value),
+                "scene_detect": bool(scene_detect_toggle),
+                "scene_threshold": float(scene_threshold_value),
+                "scene_min_len": int(scene_min_len_value),
+                "scene_warmup_dets": int(scene_warmup_value),
+            }
+        )
+        if fps_value > 0:
+            job_payload["fps"] = fps_value
+        mode_label = (
+            f"{helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} + "
+            f"{helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)}"
+        )
+        with st.spinner(f"Running detect/track ({mode_label})…"):
+            summary, error_message = helpers.run_job_with_progress(
+                ep_id,
+                "/jobs/detect_track",
+                job_payload,
+                requested_device=helpers.DEFAULT_DEVICE,
+                async_endpoint="/jobs/detect_track_async",
+                requested_detector=helpers.DEFAULT_DETECTOR,
+                requested_tracker=helpers.DEFAULT_TRACKER,
+            )
+        if error_message:
+            if "RetinaFace weights missing or could not initialize" in error_message:
+                st.error(error_message)
+                st.caption("Run `python scripts/fetch_models.py` then retry.")
+            else:
+                st.error(error_message)
+        else:
+            normalized = helpers.normalize_summary(ep_id, summary)
+            detections = helpers.coerce_int(normalized.get("detections"))
+            tracks = helpers.coerce_int(normalized.get("tracks"))
+            frames_exported = helpers.coerce_int(normalized.get("frames_exported"))
+            crops_exported = helpers.coerce_int(normalized.get("crops_exported"))
+            detector_summary = normalized.get("detector")
+            tracker_summary = normalized.get("tracker")
+            details_line = [
+                f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
+                f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
+            ]
+            if frames_exported:
+                details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
+            if crops_exported:
+                details_line.append(f"crops exported: {helpers.format_count(crops_exported)}")
+            if detector_summary:
+                details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
+            if tracker_summary:
+                details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
+            st.success("Completed · " + " · ".join(details_line))
+            metrics = normalized.get("metrics") or {}
+            if metrics:
+                st.markdown("**Track quality**")
+                stat_cols = st.columns(3)
+                stat_cols[0].metric("tracks born", metrics.get("tracks_born", 0))
+                stat_cols[1].metric("tracks lost", metrics.get("tracks_lost", 0))
+                stat_cols[2].metric("ID switches", metrics.get("id_switches", 0))
+                longest = metrics.get("longest_tracks") or []
+                if longest:
+                    for entry in longest:
+                        label = f"Track {entry.get('track_id')} · {entry.get('frame_count', 0)} frames"
+                        if entry.get("frame_count", 0) >= 500:
+                            st.warning(label)
+                        else:
+                            st.caption(label)
+            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+            if s3_prefixes:
+                st.markdown("**S3 artifact prefixes**")
+                st.code(helpers.s3_uri(s3_prefixes.get("frames"), bucket_name))
+                st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
+                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
+            scene_badge = helpers.scene_cuts_badge_text(normalized)
+            if scene_badge:
+                st.caption(f"🎬 {scene_badge}")
+            action_col1, action_col2 = st.columns(2)
+            with action_col1:
+                st.button(
+                    "Open Faces Review",
+                    use_container_width=True,
+                    on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
+                )
+            with action_col2:
+                st.button(
+                    "Open Screentime",
+                    use_container_width=True,
+                    on_click=lambda: helpers.try_switch_page("pages/4_Screentime.py"),
+                )
+
+tracks_ready = tracks_path.exists()
+faces_ready = faces_path.exists()
+detector_face_only = helpers.detector_is_face_only(ep_id)
+
+col_faces, col_cluster, col_screen = st.columns(3)
+with col_faces:
+    st.markdown("### Faces Harvest")
+    st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
+    faces_device_choice = st.selectbox(
+        "Device",
+        helpers.DEVICE_LABELS,
+        index=helpers.device_label_index(default_device_label),
+        key="faces_device_choice",
+    )
+    faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
+    faces_save_frames = st.checkbox("Save sampled frames", value=True, key="faces_save_frames_detail")
+    faces_save_crops = st.checkbox("Save face crops to S3", value=True, key="faces_save_crops_detail")
+    faces_jpeg_quality = st.number_input(
+        "JPEG quality",
+        min_value=50,
+        max_value=100,
+        value=85,
+        step=5,
+        key="faces_jpeg_quality_detail",
+    )
+    if faces_device_value == "mps":
+        st.caption(
+            "ArcFace embeddings run on CPU when MPS is selected. Tracker/crop export still uses the requested device."
+        )
+    if not tracks_ready:
+        st.caption("Run detect/track first.")
+    elif not detector_face_only:
+        st.warning("Current tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face.")
+    faces_disabled = (not tracks_ready) or (not detector_face_only)
+    if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
+        payload = {
+            "ep_id": ep_id,
+            "device": faces_device_value,
+            "save_frames": bool(faces_save_frames),
+            "save_crops": bool(faces_save_crops),
+            "jpeg_quality": int(faces_jpeg_quality),
+        }
+        with st.spinner("Running faces harvest…"):
+            summary, error_message = helpers.run_job_with_progress(
+                ep_id,
+                "/jobs/faces_embed",
+                payload,
+                requested_device=faces_device_value,
+                async_endpoint="/jobs/faces_embed_async",
+                requested_detector=helpers.tracks_detector_value(ep_id),
+                requested_tracker=helpers.tracks_tracker_value(ep_id),
+            )
+        if error_message:
+            if "tracks.jsonl" in error_message.lower():
+                st.error("Run detect/track first.")
+            else:
+                st.error(error_message)
+        else:
+            normalized = helpers.normalize_summary(ep_id, summary)
+            faces_count = normalized.get("faces")
+            crops_exported = normalized.get("crops_exported")
+            details = []
+            if isinstance(faces_count, int):
+                details.append(f"faces: {faces_count:,}")
+            if crops_exported:
+                details.append(f"crops exported: {crops_exported:,}")
+            st.success("Faces harvest complete" + (" · " + ", ".join(details) if details else ""))
+            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+            if s3_prefixes:
+                st.markdown("**S3 prefixes**")
+                st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
+                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
+            st.button(
+                "Open Faces Review",
+                use_container_width=True,
+                on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
+            )
+with col_cluster:
+    st.markdown("### Cluster Identities")
+    st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
+    cluster_device_choice = st.selectbox(
+        "Device",
+        helpers.DEVICE_LABELS,
+        index=helpers.device_label_index(default_device_label),
+        key="cluster_device_choice",
+    )
+    cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
+    if not faces_ready:
+        st.caption("Run faces harvest first.")
+    elif not detector_face_only:
+        st.warning("Current tracks were generated with a legacy detector. Rerun detect/track first.")
+    cluster_disabled = (not faces_ready) or (not detector_face_only)
+    if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
+        payload = {
+            "ep_id": ep_id,
+            "device": cluster_device_value,
+        }
+        with st.spinner("Clustering faces…"):
+            summary, error_message = helpers.run_job_with_progress(
+                ep_id,
+                "/jobs/cluster",
+                payload,
+                requested_device=cluster_device_value,
+                async_endpoint="/jobs/cluster_async",
+                requested_detector=helpers.tracks_detector_value(ep_id),
+                requested_tracker=helpers.tracks_tracker_value(ep_id),
+            )
+        if error_message:
+            if "faces.jsonl" in error_message.lower():
+                st.error("Run faces harvest first.")
+            else:
+                st.error(error_message)
+        else:
+            normalized = helpers.normalize_summary(ep_id, summary)
+            identities_count = normalized.get("identities")
+            faces_count = normalized.get("faces")
+            details = []
+            if isinstance(identities_count, int):
+                details.append(f"identities: {identities_count:,}")
+            if isinstance(faces_count, int):
+                details.append(f"faces: {faces_count:,}")
+            st.success("Clustering complete" + (" · " + ", ".join(details) if details else ""))
+            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+            if s3_prefixes:
+                st.markdown("**Manifests prefix**")
+                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
+            st.button(
+                "Go to Facebank",
+                use_container_width=True,
+                on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
+            )
+with col_screen:
+    if st.button("Compute screentime", use_container_width=True):
+        try:
+            resp = helpers.api_post("/jobs/screentime", {"ep_id": ep_id})
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screentime", exc))
+        else:
+            st.success(resp.get("status", "screentime job queued"))
+
+st.subheader("Artifacts")
+st.write(f"Video → {helpers.link_local(get_path(ep_id, 'video'))}")
+st.write(f"Detections → {helpers.link_local(get_path(ep_id, 'detections'))}")
+st.write(f"Tracks → {helpers.link_local(get_path(ep_id, 'tracks'))}")
+prefixes = helpers.episode_artifact_prefixes(ep_id)
+if prefixes:
+    st.write(f"S3 Frames → `{helpers.s3_uri(prefixes['frames'], bucket_name)}`")
+    st.write(f"S3 Crops → `{helpers.s3_uri(prefixes['crops'], bucket_name)}`")
+    st.write(f"S3 Manifests → `{helpers.s3_uri(prefixes['manifests'], bucket_name)}`")
+st.write(f"Faces → {helpers.link_local(faces_path)}")
+st.write(f"Identities → {helpers.link_local(identities_path)}")
+analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
+st.write(f"Screentime (json) → {helpers.link_local(analytics_dir / 'screentime.json')}")
+st.write(f"Screentime (csv) → {helpers.link_local(analytics_dir / 'screentime.csv')}")
