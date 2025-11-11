@@ -9,8 +9,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-
 DEFAULT_DATA_ROOT = Path("data").expanduser()
 
 
