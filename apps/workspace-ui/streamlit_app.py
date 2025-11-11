@@ -1,6 +1,7 @@
 from __future__ import annotations
-import os
+
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict
@@ -12,42 +13,161 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from py_screenalytics.artifacts import ensure_dirs, get_path
+MODULE_DIR = Path(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.append(str(MODULE_DIR))
 
-API_BASE_URL = os.environ.get("SCREENALYTICS_API_URL", "http://localhost:8000")
-STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local").lower()
-STORAGE_BUCKET = (
-    os.environ.get("AWS_S3_BUCKET")
-    or os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET")
-    or ("local" if STORAGE_BACKEND == "local" else "")
-)
-DEFAULT_STRIDE = 5
+from py_screenalytics.artifacts import ensure_dirs, get_path  # noqa: E402
+
+import ui_helpers as helpers  # noqa: E402
 
 
-def _describe_error(url: str, exc: requests.RequestException) -> str:
-    detail = str(exc)
-    if isinstance(exc, requests.HTTPError) and exc.response is not None:
-        try:
-            detail = exc.response.text or exc.response.reason or detail
-        except Exception:  # pragma: no cover - best effort guard
-            detail = str(exc)
-    return f"{url} → {detail}"
-
-
-def _check_api_health(base_url: str) -> tuple[bool, str | None]:
-    url = f"{base_url}/healthz"
+def _get_video_meta(ep_id: str) -> Dict[str, Any] | None:
     try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        return True, None
+        return helpers.api_get(f"/episodes/{ep_id}/video_meta")
     except requests.RequestException as exc:
-        return False, _describe_error(url, exc)
+        st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/video_meta", exc))
+        return None
 
 
-def _post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    resp = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+ASYNC_JOBS_KEY = "async_jobs"
+
+
+def _job_state() -> Dict[str, Dict[str, Any]]:
+    return st.session_state.setdefault(ASYNC_JOBS_KEY, {})
+
+
+def _register_async_job(
+    job_resp: Dict[str, Any],
+    *,
+    ep_id: str,
+    label: str,
+    stride: int,
+    fps: float | None,
+    stub: bool,
+    device: str,
+) -> None:
+    jobs = _job_state()
+    job_id = job_resp["job_id"]
+    artifacts = job_resp.get("artifacts") or {
+        "video": str(get_path(ep_id, "video")),
+        "detections": str(get_path(ep_id, "detections")),
+        "tracks": str(get_path(ep_id, "tracks")),
+    }
+    jobs[job_id] = {
+        "job_id": job_id,
+        "ep_id": ep_id,
+        "label": label,
+        "requested_stride": stride,
+        "requested_fps": fps,
+        "requested_device": device,
+        "stub": stub,
+        "artifacts": artifacts,
+    }
+
+
+def _render_job_sections() -> bool:
+    jobs = _job_state()
+    if not jobs:
+        return False
+    st.subheader("Detect/track progress")
+    any_running = False
+    for job_id, meta in list(jobs.items()):
+        running = _render_single_job(job_id, meta, jobs)
+        any_running = any_running or running
+        st.divider()
+    return any_running
+
+
+def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[str, Any]]) -> bool:
+    st.markdown(f"**{meta.get('label', f'Job {job_id}')}**")
+    st.caption(f"Job ID: `{job_id}` · Episode `{meta.get('ep_id')}`")
+    try:
+        progress_resp = helpers.api_get(f"/jobs/{job_id}/progress", timeout=10)
+    except requests.RequestException as exc:
+        st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/{job_id}/progress", exc))
+        if st.button("Dismiss", key=f"dismiss-{job_id}"):
+            jobs.pop(job_id, None)
+            st.rerun()
+        return False
+    progress = progress_resp.get("progress") or {}
+    state = progress_resp.get("state", "unknown")
+    frames_done = progress.get("frames_done") or 0
+    frames_total = progress.get("frames_total") or 0
+    ratio = helpers.progress_ratio(progress)
+    st.progress(ratio)
+    total_seconds = helpers.total_seconds_hint(progress)
+    eta = helpers.eta_seconds(progress)
+    device_label = progress.get("device") or meta.get("requested_device", "auto")
+    fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
+    fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
+    elapsed_seconds = progress.get("secs_done") or progress.get("elapsed_sec")
+    info_text = (
+        f"Elapsed: {helpers.format_mmss(elapsed_seconds)} · "
+        f"Total: {helpers.format_mmss(total_seconds)} · "
+        f"ETA: {helpers.format_mmss(eta)} · "
+        f"Device: {device_label} · FPS: {fps_text}"
+    )
+    st.caption(info_text)
+    st.caption(f"Frames {frames_done:,} / {frames_total or '?'}")
+
+    if state == "running":
+        cancel_col, _ = st.columns([1, 3])
+        with cancel_col:
+            if st.button("Cancel job", key=f"cancel-{job_id}"):
+                try:
+                    helpers.api_post(f"/jobs/{job_id}/cancel")
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/{job_id}/cancel", exc))
+                else:
+                    st.info("Cancel requested…")
+                    st.rerun()
+        return True
+
+    detail = {}
+    try:
+        detail = helpers.api_get(f"/jobs/{job_id}", timeout=10)
+    except requests.RequestException as exc:
+        st.warning(helpers.describe_error(f"{cfg['api_base']}/jobs/{job_id}", exc))
+
+    summary = detail.get("summary") if detail else None
+    error_msg = detail.get("error") if detail else None
+    if state == "succeeded":
+        counts = []
+        if summary:
+            det_count = summary.get("detections_count")
+            trk_count = summary.get("tracks_count")
+            if det_count is not None and trk_count is not None:
+                counts.append(f"detections: {det_count:,}")
+                counts.append(f"tracks: {trk_count:,}")
+        msg = "Completed" + (" · " + ", ".join(counts) if counts else "")
+        st.success(msg or "Job succeeded")
+    elif state == "canceled":
+        st.warning("Job canceled.")
+    else:
+        fallback_err = error_msg or "Job failed without error detail."
+        st.error(f"Job failed: {fallback_err}")
+    artifacts = meta.get("artifacts") or {}
+    artifact_line = " | ".join(
+        [
+            f"Video → {helpers.link_local(artifacts.get('video', get_path(meta['ep_id'], 'video')))}",
+            f"Detections → {helpers.link_local(artifacts.get('detections', get_path(meta['ep_id'], 'detections')))}",
+            f"Tracks → {helpers.link_local(artifacts.get('tracks', get_path(meta['ep_id'], 'tracks')))}",
+        ]
+    )
+    st.caption(artifact_line)
+    if st.button("Dismiss result", key=f"dismiss-{job_id}"):
+        jobs.pop(job_id, None)
+        st.rerun()
+    return False
+
+cfg = helpers.init_page("Screenalytics Upload")
+st.title("Upload & Run")
+
+flash_message = st.session_state.pop("upload_flash", None)
+if flash_message:
+    st.success(flash_message)
+jobs_running = _render_job_sections()
 
 
 def _upload_file(url: str, data: bytes, headers: Dict[str, str] | None = None) -> None:
@@ -64,52 +184,8 @@ def _mirror_local(ep_id: str, data: bytes, local_path: str) -> Path:
     return dest
 
 
-def _artifact_paths(ep_id: str) -> Dict[str, Path]:
-    return {
-        "video": get_path(ep_id, "video"),
-        "detections": get_path(ep_id, "detections"),
-        "tracks": get_path(ep_id, "tracks"),
-    }
-
-
-def _upload_target_hint(backend: str, bucket: str) -> str:
-    ep_placeholder = "<ep_id>"
-    if backend == "local":
-        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-        local_path = data_root / "videos" / ep_placeholder / "episode.mp4"
-        return f"{local_path}"
-
-    prefix = os.environ.get("AWS_S3_PREFIX", "raw/").strip("/")
-    prefix_part = f"{prefix}/" if prefix else ""
-    scheme = "s3"
-    return f"{scheme}://{bucket}/{prefix_part}videos/{ep_placeholder}/episode.mp4"
-
-
-st.set_page_config(page_title="Screenalytics Upload", page_icon="📺", layout="centered")
-st.title("Screenalytics Upload")
-st.caption("Create an episode, push footage to object storage, and kick the detect/track pipeline.")
-
-st.sidebar.header("API connection")
-st.sidebar.code(API_BASE_URL)
-api_ready, api_error = _check_api_health(API_BASE_URL)
-if api_ready:
-    st.sidebar.success("API reachable")
-else:
-    st.sidebar.error(f"Health check failed: {api_error}")
-sidebar_storage = f"Storage backend: {STORAGE_BACKEND}"
-if STORAGE_BUCKET:
-    sidebar_storage += f" | Bucket: {STORAGE_BUCKET}"
-st.sidebar.write(sidebar_storage)
-st.sidebar.caption(f"Uploads land at: {_upload_target_hint(STORAGE_BACKEND, STORAGE_BUCKET or '<bucket>')}")
-if not api_ready:
-    st.error(
-        f"API not reachable at {API_BASE_URL}. Verify it is running and that /healthz is accessible."
-    )
-    if st.button("Retry health check"):
-        st.experimental_rerun()
-    st.stop()
-
 with st.form("episode-upload"):
+    st.subheader("Upload new episode")
     show_ref = st.text_input("Show", placeholder="rhoslc", help="Slug or ID")
     season_number = st.number_input("Season", min_value=0, max_value=999, value=1, step=1)
     episode_number = st.number_input("Episode #", min_value=0, max_value=999, value=1, step=1)
@@ -122,13 +198,22 @@ with st.form("episode-upload"):
         help="Optional premiere date",
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
-    use_stub_detect = st.checkbox(
-        "Use stub (fast, no ML)", value=False, help="Handy for quick smoke tests without YOLOv8."
-    )
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
+    with col2:
+        fps_value = st.number_input("FPS (optional)", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
+    with col3:
+        use_stub_detect = st.checkbox("Use stub (fast, no ML)", value=False)
+    default_device_label = helpers.device_default_label()
+    with col4:
+        device_choice = st.selectbox(
+            "Device",
+            helpers.DEVICE_LABELS,
+            index=helpers.device_label_index(default_device_label),
+        )
+    device_value = helpers.DEVICE_VALUE_MAP[device_choice]
     submit = st.form_submit_button("Upload episode")
-
-detect_resp: Dict[str, Any] | None = None
-job_error: str | None = None
 
 if submit:
     if not show_ref.strip():
@@ -147,23 +232,22 @@ if submit:
         "air_date": air_date_payload,
     }
 
-    episodes_path = "/episodes"
-    episodes_url = f"{API_BASE_URL}{episodes_path}"
     try:
-        create_resp = _post_json(episodes_path, payload)
+        create_resp = helpers.api_post("/episodes", payload)
     except requests.RequestException as exc:
-        st.error(f"Episode create failed: {_describe_error(episodes_url, exc)}")
+        endpoint = f"{cfg['api_base']}/episodes"
+        st.error(f"Episode create failed: {helpers.describe_error(endpoint, exc)}")
         st.stop()
 
     ep_id = create_resp["ep_id"]
-    st.info(f"Episode `{ep_id}` ready; requesting upload target…")
+    st.info(f"Episode `{ep_id}` created. Requesting upload target…")
 
     presign_path = f"/episodes/{ep_id}/assets"
-    presign_url = f"{API_BASE_URL}{presign_path}"
     try:
-        presign_resp = _post_json(presign_path, {})
+        presign_resp = helpers.api_post(presign_path)
     except requests.RequestException as exc:
-        st.error(f"Presign failed: {_describe_error(presign_url, exc)}")
+        endpoint = f"{cfg['api_base']}{presign_path}"
+        st.error(f"Presign failed: {helpers.describe_error(endpoint, exc)}")
         st.stop()
 
     raw_bytes = uploaded_file.getbuffer().tobytes()
@@ -176,37 +260,247 @@ if submit:
         try:
             _upload_file(upload_url, raw_bytes, presign_resp.get("headers"))
         except requests.RequestException as exc:
-            err = _describe_error(upload_url, exc)
+            err = helpers.describe_error(upload_url, exc)
             st.error(f"Upload failed: {err}")
-            if "NoSuchBucket" in err:
-                st.info("Bucket not found. Run scripts/s3_bootstrap.sh or set S3_AUTO_CREATE=1.")
             st.stop()
 
-    local_video = _mirror_local(ep_id, raw_bytes, presign_resp["local_video_path"])
-    st.success(f"Upload to object storage + local mirror complete for `{ep_id}`.")
+    _mirror_local(ep_id, raw_bytes, presign_resp["local_video_path"])
+    video_meta = _get_video_meta(ep_id)
+    detected_fps_value = video_meta.get("fps_detected") if video_meta else None
+    if detected_fps_value:
+        st.info(f"Detected FPS: {detected_fps_value:.3f}")
 
-    jobs_path = "/jobs/detect_track"
-    jobs_url = f"{API_BASE_URL}{jobs_path}"
-    job_payload = {"ep_id": ep_id, "stub": bool(use_stub_detect), "stride": DEFAULT_STRIDE}
+    jobs_path = "/jobs/detect_track_async"
+    job_payload: Dict[str, Any] = {
+        "ep_id": ep_id,
+        "stub": bool(use_stub_detect),
+        "stride": int(stride_value),
+        "device": device_value,
+    }
+    fps_override = float(fps_value) if fps_value > 0 else None
+    if fps_override:
+        job_payload["fps"] = fps_override
     mode_label = "stub (no ML)" if use_stub_detect else "YOLOv8 + ByteTrack"
-    spinner_label = f"Running detect/track ({mode_label})…"
-    with st.spinner(spinner_label):
+    job_error: str | None = None
+    job_resp: Dict[str, Any] | None = None
+    with st.spinner(f"Queueing detect/track ({mode_label})…"):
         try:
-            detect_resp = _post_json(jobs_path, job_payload)
+            job_resp = helpers.api_post(jobs_path, job_payload)
         except requests.RequestException as exc:
-            job_error = _describe_error(jobs_url, exc)
-    if detect_resp:
-        st.success(
-            f"Detect/track ({mode_label}) complete → detections: {detect_resp['detections_count']}, "
-            f"tracks: {detect_resp['tracks_count']}"
-        )
-    elif job_error:
-        st.error(f"Detect/track ({mode_label}) failed: {job_error}")
+            endpoint = f"{cfg['api_base']}{jobs_path}"
+            job_error = helpers.describe_error(endpoint, exc)
 
-    artifacts = _artifact_paths(ep_id)
-    st.subheader("Artifacts")
-    st.code(str(local_video), language="bash")
-    st.markdown(f"Detections → `{artifacts['detections']}`")
-    st.markdown(f"Tracks → `{artifacts['tracks']}`")
     if job_error:
-        st.caption("Re-run via POST /jobs/detect_track once the backend issue is resolved.")
+        st.error(f"Detect/track failed: {job_error}")
+        st.stop()
+    assert job_resp is not None
+    _register_async_job(
+        job_resp,
+        ep_id=ep_id,
+        label=f"Upload detect/track · {ep_id}",
+        stride=int(stride_value),
+        fps=fps_override,
+        stub=bool(use_stub_detect),
+        device=device_value,
+    )
+
+    artifacts = {
+        "video": get_path(ep_id, "video"),
+        "detections": get_path(ep_id, "detections"),
+        "tracks": get_path(ep_id, "tracks"),
+    }
+    flash_lines = [f"Episode `{ep_id}` upload complete."]
+    flash_lines.append(f"Video → {helpers.link_local(artifacts['video'])}")
+    flash_lines.append(f"Detections → {helpers.link_local(artifacts['detections'])}")
+    flash_lines.append(f"Tracks → {helpers.link_local(artifacts['tracks'])}")
+    flash_lines.append(f"Detect/track job `{job_resp['job_id']}` queued ({mode_label}); progress below.")
+    st.session_state["upload_flash"] = "\n".join(flash_lines)
+    helpers.set_ep_id(ep_id)
+
+st.button(
+    "Open Episode Detail",
+    on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
+)
+
+s3_loaded = True
+st.subheader("Existing Episode (browse S3)")
+try:
+    s3_payload = helpers.api_get("/episodes/s3_videos")
+    s3_items = s3_payload.get("items", [])
+except requests.RequestException as exc:
+    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/s3_videos", exc))
+    s3_items = []
+    s3_loaded = False
+
+if s3_items:
+    s3_search = st.text_input("Filter S3 videos", "").strip().lower()
+    filtered_items = [
+        item
+        for item in s3_items
+        if not s3_search or s3_search in item["ep_id"].lower()
+    ]
+    if filtered_items:
+        def _format_item(item: Dict[str, Any]) -> str:
+            size = item.get("size")
+            size_mb = f"{(size or 0) / (1024**2):.1f} MB" if size else "size ?"
+            last_mod = item.get("last_modified") or "unknown"
+            return f"{item['ep_id']} · {size_mb} · {last_mod}"
+
+        selected_index = st.selectbox(
+            "S3 videos",
+            list(range(len(filtered_items))),
+            format_func=lambda idx: _format_item(filtered_items[idx]),
+            key="s3_video_select",
+        )
+        selected_item = filtered_items[selected_index]
+        st.write(f"S3 key: `{selected_item['key']}`")
+        st.write(f"Tracked in store: {selected_item['exists_in_store']}")
+
+        ep_id_from_s3 = selected_item["ep_id"]
+        helpers.set_ep_id(ep_id_from_s3, rerun=False)
+
+        detail_data = None
+        try:
+            detail_data = helpers.api_get(f"/episodes/{ep_id_from_s3}")
+        except requests.RequestException as exc:
+            st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id_from_s3}", exc))
+        if detail_data:
+            s3_info = detail_data.get("s3", {})
+            st.write(f"V2 key: `{s3_info.get('v2_key')}` (exists={s3_info.get('v2_exists')})")
+            st.write(f"V1 key: `{s3_info.get('v1_key')}` (exists={s3_info.get('v1_exists')})")
+            if not s3_info.get("v2_exists") and s3_info.get("v1_exists"):
+                st.warning("Found legacy v1 object; mirror will fall back to v1 but new uploads use the v2 path.")
+
+        create_needed = not selected_item["exists_in_store"]
+        if create_needed:
+            st.warning("Episode not in local store yet.")
+            if st.button("Create episode in store", key=f"create_episode_{ep_id_from_s3}"):
+                parse_result = helpers.parse_ep_id(ep_id_from_s3)
+                if parse_result is None:
+                    st.error("Unable to parse ep_id into show/season/episode.")
+                else:
+                    payload = {
+                        "show_slug_or_id": parse_result["show"],
+                        "season_number": parse_result["season"],
+                        "episode_number": parse_result["episode"],
+                    }
+                    try:
+                        helpers.api_post("/episodes", payload)
+                    except requests.RequestException as exc:
+                        st.error(helpers.describe_error(f"{cfg['api_base']}/episodes", exc))
+                    else:
+                        st.success("Episode created in store. Refreshing…")
+                        st.rerun()
+        else:
+            if st.button("Mirror from S3", key=f"mirror_{ep_id_from_s3}"):
+                try:
+                    mirror_resp = helpers.api_post(f"/episodes/{ep_id_from_s3}/mirror")
+                except requests.RequestException as exc:
+                    st.error(
+                        helpers.describe_error(
+                            f"{cfg['api_base']}/episodes/{ep_id_from_s3}/mirror",
+                            exc,
+                        )
+                    )
+                else:
+                    st.success(
+                        f"Mirrored to {helpers.link_local(mirror_resp['local_video_path'])} "
+                        f"({helpers.human_size(mirror_resp.get('bytes'))})"
+                    )
+
+            with st.form("s3-detect-track"):
+                col_stride, col_fps, col_stub, col_device = st.columns(4)
+                with col_stride:
+                    stride_value = st.number_input(
+                        "Stride",
+                        min_value=1,
+                        max_value=50,
+                        value=helpers.DEFAULT_STRIDE,
+                        step=1,
+                        key="s3_stride",
+                    )
+                with col_fps:
+                    fps_value = st.number_input(
+                        "FPS",
+                        min_value=0.0,
+                        max_value=120.0,
+                        value=0.0,
+                        step=1.0,
+                        key="s3_fps",
+                    )
+                with col_stub:
+                    stub_toggle = st.checkbox("Use stub", value=False, key="s3_stub")
+                default_device_label = helpers.device_default_label()
+                with col_device:
+                    device_choice = st.selectbox(
+                        "Device",
+                        helpers.DEVICE_LABELS,
+                        index=helpers.device_label_index(default_device_label),
+                        key="s3_device",
+                    )
+                run_job = st.form_submit_button("Run detect/track (async)")
+                if run_job:
+                    device_value = helpers.DEVICE_VALUE_MAP[device_choice]
+                    fps_override = float(fps_value) if fps_value > 0 else None
+                    payload = {
+                        "ep_id": ep_id_from_s3,
+                        "stride": int(stride_value),
+                        "stub": bool(stub_toggle),
+                        "device": device_value,
+                    }
+                    if fps_override:
+                        payload["fps"] = fps_override
+                    try:
+                        job_resp = helpers.api_post("/jobs/detect_track_async", payload)
+                    except requests.RequestException as exc:
+                        st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track_async", exc))
+                    else:
+                        _register_async_job(
+                            job_resp,
+                            ep_id=ep_id_from_s3,
+                            label=f"S3 detect/track · {ep_id_from_s3}",
+                            stride=int(stride_value),
+                            fps=fps_override,
+                            stub=bool(stub_toggle),
+                            device=device_value,
+                        )
+                        st.success(f"Job `{job_resp['job_id']}` queued; monitor progress above.")
+                        st.rerun()
+
+            if st.button("Run synchronously (blocking)", key=f"sync_{ep_id_from_s3}"):
+                device_value = helpers.DEVICE_VALUE_MAP[device_choice]
+                payload = {
+                    "ep_id": ep_id_from_s3,
+                    "stride": int(stride_value),
+                    "stub": bool(stub_toggle),
+                    "device": device_value,
+                }
+                if fps_value > 0:
+                    payload["fps"] = float(fps_value)
+                try:
+                    resp = helpers.api_post("/jobs/detect_track", payload)
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track", exc))
+                else:
+                    st.success(
+                        f"detections: {resp['detections_count']}, tracks: {resp['tracks_count']}"
+                    )
+
+            artifacts = {
+                "video": get_path(ep_id_from_s3, "video"),
+                "detections": get_path(ep_id_from_s3, "detections"),
+                "tracks": get_path(ep_id_from_s3, "tracks"),
+            }
+            st.caption(
+                f"Video → {helpers.link_local(artifacts['video'])} | "
+                f"Detections → {helpers.link_local(artifacts['detections'])} | "
+                f"Tracks → {helpers.link_local(artifacts['tracks'])}"
+            )
+    elif s3_loaded:
+        st.warning("No S3 videos match that filter.")
+else:
+    st.info("No S3 videos found (or API error).")
+
+if jobs_running:
+    time.sleep(0.5)
+    st.rerun()

@@ -110,6 +110,12 @@ source .venv/bin/activate
 ./tools/dev-up.sh
 # Add --stub for the fast path; omit it for the YOLOv8+ByteTrack pipeline.
 python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 5 --stub
+# Export sampled frames/crops with JPEG quality control (mirrors to artifacts/* when STORAGE_BACKEND=s3)
+python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 5 \
+  --save-frames --save-crops --jpeg-quality 90
+# Faces pipeline (stub paths shown below)
+python tools/episode_run.py --ep-id ep_demo --faces-embed --stub --save-crops
+python tools/episode_run.py --ep-id ep_demo --cluster --stub
 ```
 
 Artifacts land under `data/` mirroring the future object-storage layout:
@@ -117,7 +123,10 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 - `data/videos/ep_demo/episode.mp4`
 - `data/manifests/ep_demo/detections.jsonl`
 - `data/manifests/ep_demo/tracks.jsonl`
-- `data/frames/ep_demo/` (only when `--fps` is provided)
+- `data/frames/ep_demo/frames/` + `crops/` (only when `--save-frames`/`--save-crops` are provided)
+- `data/manifests/ep_demo/progress.json` (live `phase`/ETA snapshots written every ~25 frames)
+
+`episode_run.py` now auto-detects FPS whenever `--fps` is unset/`0`, emits structured progress JSON (frames, seconds, inferred FPS, device, phase) to stdout **and** to `progress.json`, and finishes with a `phase:"done"` payload that includes stage-specific counts plus local + v2 S3 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). `--faces-embed` writes `faces.jsonl` (optionally exporting crops + S3 sync) and `--cluster` produces `identities.json` with per-identity stats so the Facebank can relabel/merge tracks.
 
 ### Dependency profiles
 
@@ -178,7 +187,12 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
 5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
 6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, and decide whether to enable **Use stub (fast, no ML)** before submitting. Leave it unchecked to run the real YOLOv8 + ByteTrack pass, or check it for the light stub.
-7. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and calls `POST /jobs/detect_track` with the selected mode, showing counts once the job finishes.
+7. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and calls `POST /jobs/detect_track_async` (with a synchronous fallback button if you really need it). Progress is streamed from `/jobs/{job_id}/progress`, so you can cancel or watch counts materialize without blocking the page.
+
+**Episode Detail live progress & exports**
+
+- “Run detect/track” negotiates `text/event-stream` against `POST /jobs/detect_track`, so Streamlit renders a live bar (`mm:ss / MM:SS • phase=<detect|track> • device=<…> • fps=<…>`). If SSE isn’t available (corporate proxies, etc.) the button falls back to `/jobs/detect_track_async` and polls the new `GET /episodes/{ep_id}/progress` every 500 ms until the `phase:"done"` payload lands.
+- Two checkboxes map to the runner’s new flags: **Save frames to S3** (`--save-frames`) and **Save face crops to S3** (`--save-crops`). A JPEG quality spinner (default 85) feeds `--jpeg-quality`. Successful runs summarize counts, exported frame/crop totals, and show the three v2 prefixes (`artifacts/frames/{show}/s{ss}/e{ee}/frames/`, `artifacts/crops/{show}/s{ss}/e{ee}/tracks/`, `artifacts/manifests/{show}/s{ss}/e{ee}/`). Quick links jump straight into Faces Review (page 3) and Screentime (page 4) for follow-up QA.
 
 Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 
@@ -188,6 +202,23 @@ Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
 - `data/frames/{ep_id}/` (when jobs run with an `fps` override)
 
 **Note:** Stub mode (`Use stub (fast, no ML)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
+
+### Live progress (async detect/track)
+
+![Live progress demo](docs/assets/live-progress.gif)
+
+- `POST /jobs/detect_track_async` launches `tools/episode_run.py` in the background and records a job file under `data/jobs/{job_id}.json`.
+- `GET /jobs/{job_id}/progress` streams the latest JSON snapshot (`frames_done`, `frames_total`, `elapsed_sec`, `fps_detected`, `analyzed_fps`), which the Streamlit UI renders as a progress bar with cancel + ETA controls.
+- **Elapsed** is the real wall-clock runtime, **Total** is derived from `frames_total / analyzed_fps` (falling back to the detected FPS when no override is provided), and **ETA** is computed from the remaining frames and the effective processing FPS (or the observed ratio of frames_done/elapsed as a fallback).
+- A `Cancel job` button wires into `POST /jobs/{job_id}/cancel`, cleanly SIGTERM-ing the worker and persisting `state=canceled`.
+- Once `state` flips to `succeeded` the UI surfaces detections/tracks counts plus direct links to `data/manifests/{ep_id}/detections.jsonl` and `tracks.jsonl`; failures bubble up the captured stderr/error message inline.
+
+**Faces pipeline + Facebank**
+
+- Use `Run Faces Harvest` (Episode Detail or the Facebank page) to trigger `POST /jobs/faces_embed` with SSE updates. The runner replays `tracks.jsonl`, emits per-sample progress JSON, writes `faces.jsonl`, exports optional crops under `data/frames/{ep_id}/crops/`, and mirrors everything to the v2 S3 prefixes.
+- `Run Cluster` streams `POST /jobs/cluster`, grouping tracks into `identities.json` with counts, samples, and representative crop metadata so downstream review tools can rename/merge tracks.
+- When SSE can’t be established the UI falls back to the corresponding `..._async` endpoint and polls `GET /episodes/{ep_id}/progress` every 500 ms until `phase:"done"` arrives.
+- The Facebank view surfaces the manifests, thumbnails (local or presigned from S3), rename/merge/move actions, and pushes edits back to `artifacts/manifests/{show}/s{ss}/e{ee}/` without blocking the review workflow.
 
 #### Run detection+tracking (real)
 
@@ -199,14 +230,15 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
    pip install -r requirements-ml.txt
    ```
 
-2. Run the episode helper without `--stub`:
+2. Run the episode helper without `--stub` (defaults to CPU):
 
    ```bash
-   python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 --fps 8
+   python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3 --fps 8 --device cpu
    ```
 
    - Lower `--stride` (for example `1` or `2`) and higher `--fps` increase recall but also GPU/CPU time.
    - Higher `--stride` or smaller `--fps` are useful for exploratory passes on long episodes.
+   - Device selection order: `auto` → CUDA GPU → Apple `mps` → CPU. Override with `--device cpu` if you need to stay on CPU.
 
 3. (Optional) Verify the real pipeline via the ML test:
 
@@ -216,12 +248,46 @@ Need the full YOLOv8 + ByteTrack pass outside the UI?
 
 The CLI and UI both emit manifests under `data/manifests/{ep_id}/` with YOLO metadata, so you can diff stub vs. real outputs before pushing upstream.
 
+#### Re-run on an existing episode
+
+Already uploaded footage to S3 and just need to run detect/track again?
+
+1. Start the API + Streamlit UI, then choose **Existing Episode** in the sidebar.
+2. Browse the **S3 videos** list to pick any `raw/videos/{show}/s{season}/e{episode}/episode.mp4` object. If it isn’t in the local EpisodeStore yet, click **Create episode in store** (the slug + `sXXeYY` is parsed automatically).
+3. Click **Mirror from S3** to download the v2 object into `data/videos/{ep_id}/episode.mp4`. When only a legacy `raw/videos/{ep_id}/episode.mp4` exists, the UI falls back to it and shows a note until you migrate.
+4. Adjust `Stride`, optional `FPS` (set `0` to reuse the detected FPS shown in the UI), **Device**, and the **Use stub (fast, no ML)** toggle, then hit **Run detect/track` without re-uploading.
+
+Manifest links for that episode stay visible so you can open `detections.jsonl` / `tracks.jsonl` directly after each pass.
+
 **Common errors**
 
 - `Connection refused` — Start the API via `python -m uvicorn apps.api.main:app --reload` (or rerun `scripts/dev.sh`) and confirm it responds: `curl http://localhost:8000/healthz`.
 - `API_BASE_URL mismatch` — Export the correct `SCREENALYTICS_API_URL` (or update `.env`) so the UI hits the right host/port.
 - `File not found (Streamlit path)` — Ensure you launch commands from the repo root so `apps/workspace-ui/streamlit_app.py` resolves.
 - `NoSuchBucket` — Run `bash scripts/s3_bootstrap.sh` or set `S3_AUTO_CREATE=1` before restarting the API.
+
+### Navigation and pages
+
+The Streamlit workspace ships as a multipage app with sidebar navigation:
+
+1. **Upload & Run** — create/upload episodes, kick detect/track immediately.
+2. **Episodes** — searchable browser across all `ep_id` entries with quick detect/track controls.
+3. **Episode Detail** — hydrate from S3, re-run detect/track, launch faces/cluster/screentime jobs, and jump to local artifacts.
+4. **Faces Review** — trigger faces/cluster jobs (stub today) and inspect `faces.jsonl`/`identities.json`.
+5. **Screentime** — run the screentime job and review/download analytics (`screentime.json` / `.csv`).
+6. **Health** — quick API/S3/disk checks plus context on the current backend + data root.
+
+Use the **Open in Episode Detail** buttons sprinkled throughout to sync the `ep_id` query param and jump between pages without re-entering the selection.
+
+> The Device selector defaults to **Auto**, which resolves to CUDA → MPS → CPU. Force **CPU**, **MPS**, or **CUDA** explicitly if you need to pin a device.
+
+### S3 layout (v2)
+
+Episode videos now land under `raw/videos/{show_slug}/s{season}/e{episode}/episode.mp4` (“v2”). The Episode Detail page shows whether v2 or the legacy v1 (`raw/videos/{ep_id}/episode.mp4`) exists, and mirroring/detect-track automatically falls back to v1 if needed. Use `scripts/s3_migrate_v1_to_v2.py --apply` to copy existing v1 objects over once you’re ready (dry-run by default).
+
+#### Deep links and state
+
+The UI keeps the selected episode ID in both `st.session_state` and the URL query params, so you can deep link directly: `http://localhost:8501/?ep_id=rhobh-s05e17`. Uploading an episode automatically sets this `ep_id` so when you switch to Episodes, Episode Detail, or Screentime, the context follows you.
 
 ### AWS S3 setup
 
