@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -111,6 +111,35 @@ def delete_cast_member(show_id: str, cast_id: str) -> dict:
     if not success:
         raise HTTPException(status_code=404, detail=f"Cast member {cast_id} not found")
     return {"status": "deleted", "cast_id": cast_id}
+
+
+class BulkImportRequest(BaseModel):
+    members: List[Dict[str, Any]] = Field(..., description="List of cast member data")
+    force_new: bool = Field(False, description="Always create new members (skip merge by name)")
+
+
+@router.post("/shows/{show_id}/cast/import")
+def bulk_import_cast(show_id: str, body: BulkImportRequest) -> dict:
+    """Bulk import cast members.
+
+    Members with matching names (case-insensitive) will be updated unless force_new=true.
+
+    Example JSON:
+    {
+      "members": [
+        {
+          "name": "Kyle Richards",
+          "role": "main",
+          "status": "active",
+          "aliases": ["Kyle", "Kyle R"],
+          "seasons": ["S01", "S02", "S03"]
+        }
+      ],
+      "force_new": false
+    }
+    """
+    result = cast_service.bulk_import_cast(show_id, body.members, force_new=body.force_new)
+    return result
 
 
 __all__ = ["router"]

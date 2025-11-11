@@ -174,5 +174,94 @@ class CastService:
 
         return False
 
+    def bulk_import_cast(
+        self,
+        show_id: str,
+        members: List[Dict[str, Any]],
+        force_new: bool = False,
+    ) -> Dict[str, Any]:
+        """Bulk import cast members from a list.
+
+        Args:
+            show_id: Show identifier
+            members: List of dicts with cast member data
+            force_new: If True, always create new members; if False, merge by name
+
+        Returns:
+            Audit summary with created/updated/skipped counts
+        """
+        data = self._load_cast(show_id)
+        cast_members = data.get("cast", [])
+
+        # Build name lookup (case-insensitive)
+        name_to_member = {m["name"].lower(): m for m in cast_members}
+
+        created = []
+        updated = []
+        skipped = []
+
+        for entry in members:
+            name = entry.get("name", "").strip()
+            if not name:
+                skipped.append({"name": entry.get("name"), "reason": "missing_name"})
+                continue
+
+            role = entry.get("role", "other")
+            status = entry.get("status", "active")
+            aliases = entry.get("aliases", [])
+            seasons = entry.get("seasons", [])
+            social = entry.get("social", {})
+
+            # Normalize aliases and seasons
+            if isinstance(aliases, str):
+                aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+            if isinstance(seasons, str):
+                seasons = [s.strip() for s in seasons.split(",") if s.strip()]
+
+            name_lower = name.lower()
+
+            if not force_new and name_lower in name_to_member:
+                # Update existing member
+                existing = name_to_member[name_lower]
+                existing["role"] = role
+                existing["status"] = status
+                existing["aliases"] = aliases
+                existing["seasons"] = seasons
+                existing["social"] = social
+                existing["updated_at"] = _now_iso()
+                updated.append({"name": name, "cast_id": existing["cast_id"]})
+            else:
+                # Create new member
+                cast_id = str(uuid.uuid4())
+                new_member = {
+                    "cast_id": cast_id,
+                    "show_id": show_id,
+                    "name": name,
+                    "role": role,
+                    "status": status,
+                    "aliases": aliases,
+                    "seasons": seasons,
+                    "social": social,
+                    "created_at": _now_iso(),
+                    "updated_at": _now_iso(),
+                }
+                cast_members.append(new_member)
+                name_to_member[name_lower] = new_member
+                created.append({"name": name, "cast_id": cast_id})
+
+        data["cast"] = cast_members
+        self._save_cast(show_id, data)
+
+        return {
+            "show_id": show_id,
+            "total": len(members),
+            "created": created,
+            "created_count": len(created),
+            "updated": updated,
+            "updated_count": len(updated),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+        }
+
 
 __all__ = ["CastService", "CastRole", "CastStatus", "FacebankEntryType"]
