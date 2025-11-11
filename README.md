@@ -86,19 +86,172 @@ docker compose -f infra/docker/compose.yaml up -d
 
 # Python deps (uv) and UI deps
 uv sync
+source .venv/bin/activate
 pnpm install
 
 # Seed env
 cp .env.example .env
 
-# Migrate DB
-psql "$DB_URL" -f db/migrations/0001_init_core.sql
+# Dev infra (DB/Redis/S3 + migrations + env exports)
+source ./tools/dev-up.sh
 
 # Run services
-uv run apps/api/main.py               # API
-uv run workers/orchestrator.py        # Workers (pipeline)
-pnpm --filter workspace-ui dev        # UI
+python -m uvicorn apps.api.main:app --reload  # API
+uv run workers/orchestrator.py               # Workers (pipeline)
+pnpm --filter workspace-ui dev               # UI
 ````
+
+> `tools/dev-up.sh` exports `DB_URL`, `REDIS_URL`, and `S3_*` for the current shell while bringing the Docker stack online. Source it (`source ./tools/dev-up.sh`) whenever you open a new terminal.
+
+### Dev quick run
+
+```bash
+source .venv/bin/activate
+./tools/dev-up.sh
+python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 5 --stub
+```
+
+Artifacts land under `data/` mirroring the future object-storage layout:
+
+- `data/videos/ep_demo/episode.mp4`
+- `data/manifests/ep_demo/detections.jsonl`
+- `data/manifests/ep_demo/tracks.jsonl`
+- `data/frames/ep_demo/` (only when `--fps` is provided)
+
+### Dependency profiles
+
+- **Core (API/UI/tests):**
+
+  ```bash
+  pip install -r requirements-core.txt
+  ```
+
+- **Full ML pipeline (optional / RetinaFace + ByteTrack + Whisper):**
+
+  ```bash
+  pip install -r requirements-ml.txt
+  ```
+
+### Upload via UI
+
+**Quickstart**
+
+- Default: `bash scripts/dev.sh` (runs API, waits on `/healthz`, then opens Streamlit).
+- With Make: `make dev`.
+
+1. Install dependencies:
+
+   ```bash
+   pip install -r requirements-core.txt
+   # Optional full ML stack
+   # pip install -r requirements-ml.txt
+   ```
+
+2. Copy and source env vars:
+
+   ```bash
+   cp .env.example .env
+   set -a && source .env && set +a
+   ```
+
+3. Set your environment (pick one):
+
+   **Local filesystem (default)**
+   ```bash
+   export STORAGE_BACKEND=local
+   export SCREENALYTICS_API_URL=http://localhost:8000
+   export UI_ORIGIN=http://localhost:8501
+   ```
+
+   **MinIO/S3-compatible**
+   ```bash
+   export STORAGE_BACKEND=s3
+   export SCREENALYTICS_OBJECT_STORE_ENDPOINT=http://localhost:9000
+   export SCREENALYTICS_OBJECT_STORE_BUCKET=screenalytics
+   export SCREENALYTICS_OBJECT_STORE_ACCESS_KEY=minio
+   export SCREENALYTICS_OBJECT_STORE_SECRET_KEY=miniosecret
+   export SCREENALYTICS_API_URL=http://localhost:8000
+   export UI_ORIGIN=http://localhost:8501
+   ```
+
+4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
+5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
+6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, and choose whether to trigger the detect/track stub when the upload lands.
+4. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and (optionally) calls `POST /jobs/detect_track`.
+
+Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
+
+- `data/videos/{ep_id}/episode.mp4`
+- `data/manifests/{ep_id}/detections.jsonl`
+- `data/manifests/{ep_id}/tracks.jsonl`
+- `data/frames/{ep_id}/` (when jobs run with an `fps` override)
+
+**Note:** Stub mode (`Run detect/track (stub)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
+
+**Common errors**
+
+- `Connection refused` — Start the API via `python -m uvicorn apps.api.main:app --reload` (or rerun `scripts/dev.sh`) and confirm it responds: `curl http://localhost:8000/healthz`.
+- `API_BASE_URL mismatch` — Export the correct `SCREENALYTICS_API_URL` (or update `.env`) so the UI hits the right host/port.
+- `File not found (Streamlit path)` — Ensure you launch commands from the repo root so `apps/workspace-ui/streamlit_app.py` resolves.
+
+### AWS S3 setup
+
+1. Confirm AWS CLI auth:
+
+   ```bash
+   aws sts get-caller-identity
+   ```
+
+2. Bootstrap buckets with lifecycle + encryption:
+
+   ```bash
+   bash scripts/s3_bootstrap.sh
+   ```
+
+3. Copy `.env.example`, set `STORAGE_BACKEND=s3`, update `AWS_S3_BUCKET`, `SCREENALYTICS_ENV`, and credentials, then source it.
+
+4. Run the dev flow (uploads will land in S3):
+
+   ```bash
+   STORAGE_BACKEND=s3 bash scripts/dev.sh
+   ```
+
+Artifacts live under the standardized prefixes:
+
+- `s3://screenalytics-dev-<ACCOUNT_ID>/raw/videos/{ep_id}/episode.mp4`
+- `s3://screenalytics-dev-<ACCOUNT_ID>/artifacts/manifests/{ep_id}/detections.jsonl`
+- `s3://screenalytics-dev-<ACCOUNT_ID>/artifacts/faces/{ep_id}/...`
+
+#### Troubleshooting (macOS / FFmpeg / PyAV)
+
+`faster-whisper` depends on PyAV, which may try to build against Homebrew’s FFmpeg 8.x headers on Apple Silicon. If you only need the API, UI, or stub detect/track flow, stick to `requirements-core.txt`—these features do **not** require PyAV or the rest of the ML stack. Install `requirements-ml.txt` only when you plan to run the full pipeline and have a working FFmpeg toolchain.
+
+#### macOS (Apple Silicon) Python environment
+
+If you're on Apple Silicon and rely on the system `zsh`, use `pyenv` to guarantee that `python` points at 3.11.9 before creating the virtual environment:
+
+```bash
+brew install pyenv
+
+# ~/.zshrc
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init --path)"
+fi
+case $- in *i*) : ;; *) return ;; esac  # keep existing guard if you have one
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init -)"
+fi
+
+# back in the repo
+pyenv install 3.11.9
+pyenv local 3.11.9
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+`pyenv local 3.11.9` writes `.python-version`, so new shells automatically pick up the right interpreter before activating `.venv`.
 
 ### Minimal .env example
 

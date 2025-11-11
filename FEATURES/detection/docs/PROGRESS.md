@@ -1,12 +1,12 @@
 # Detection Progress
 
 ## Current status
-- Scaffolded `run_retinaface.py` with `load_model` + `detect_frames`.
-- JSONL manifest → `detections.jsonl` schema stub implemented.
-- Config validation test ensures thresholds exist.
+- `run_retinaface.py` now samples frames (frame plan or OpenCV stride) and calls a RetinaFace-backed detector with a deterministic stub fallback.
+- Emits `detections.jsonl` in `det_v1` with frame_idx/ts metadata driven by config.
+- Added `tests/FEATURES/detection/test_detection_emit.py` to run the full pipeline on a dummy clip plus resolver-aware defaults in the CLI.
+- PROGRESS + TODOs synced with README/SETUP instructions.
 
 ## Next steps
-- Integrate actual RetinaFace weights and GPU inference.
-- Add MediaPipe fallback branch.
-- Emit quality metrics (magface, serfiq) into detections.
-- Wire detections stage into orchestration CLI.
+- Swap stub fallback for GPU-backed RetinaFace in CI (pre-warm weights, add caching).
+- Persist per-frame artifacts (chips, quality metrics) alongside detections.
+- Provide a CLI entry that consumes pipeline config + manifests directly from the DAG.
