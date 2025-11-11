@@ -18,6 +18,9 @@ cfg = helpers.init_page("Faces & Tracks")
 st.title("Faces & Tracks Review")
 st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 
+# Inject thumbnail CSS
+helpers.inject_thumb_css()
+
 
 
 def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
@@ -120,14 +123,40 @@ def _save_identity_name(ep_id: str, identity_id: str, name: str, show: str | Non
     st.rerun()
 
 
-def _move_frames_api(ep_id: str, payload: Dict[str, Any], show: str | None, track_id: int) -> None:
-    resp = _api_post(f"/episodes/{ep_id}/faces/move_frames", payload)
+def _move_frames_api(
+    ep_id: str,
+    track_id: int,
+    frame_ids: List[int],
+    target_identity_id: str | None,
+    new_identity_name: str | None,
+    show: str | None,
+) -> None:
+    payload: Dict[str, Any] = {"frame_ids": frame_ids}
+    if target_identity_id:
+        payload["target_identity_id"] = target_identity_id
+    if new_identity_name:
+        payload["new_identity_name"] = new_identity_name
+    if show:
+        payload["show_id"] = show
+    resp = _api_post(f"/episodes/{ep_id}/tracks/{track_id}/frames/move", payload)
     if resp is None:
         return
-    moved = resp.get("moved_frames", len(payload.get("frame_ids", [])))
-    name = resp.get("target_name") or resp.get("target_identity_id") or "target identity"
-    st.toast(f"Moved {moved} frames to {name}")
+    moved = resp.get("moved") or len(frame_ids)
+    name = resp.get("target_name") or resp.get("target_identity_id") or target_identity_id or "target identity"
+    st.toast(f"Moved {moved} frame(s) to {name}")
     _refresh_roster_names(show)
+    st.session_state.get("track_detail_cache", {}).pop(track_id, None)
+    st.session_state.setdefault("track_frame_selection", {}).pop(track_id, None)
+    st.rerun()
+
+
+def _delete_frames_api(ep_id: str, track_id: int, frame_ids: List[int], delete_assets: bool = True) -> None:
+    payload = {"frame_ids": frame_ids, "delete_assets": delete_assets}
+    resp = _api_delete(f"/episodes/{ep_id}/tracks/{track_id}/frames", payload)
+    if resp is None:
+        return
+    deleted = resp.get("deleted") or len(frame_ids)
+    st.toast(f"Deleted {deleted} frame(s)")
     st.session_state.get("track_detail_cache", {}).pop(track_id, None)
     st.session_state.setdefault("track_frame_selection", {}).pop(track_id, None)
     st.rerun()
@@ -326,11 +355,12 @@ def _render_cluster_rows(
             if st.button("→", key=f"cluster_right_{identity_id}", disabled=disabled):
                 offsets[identity_id] = min(len(tracks) - 1, start_idx + TRACK_WINDOW)
                 st.rerun()
-        grid_cols = st.columns(len(visible))
-        for col, track in zip(grid_cols, visible):
-            with col:
-                if track.get("rep_thumb_url"):
-                    st.image(track["rep_thumb_url"], use_column_width=True)
+        # Always use 5 columns for consistent sizing
+        grid_cols = st.columns(5)
+        for idx, track in enumerate(visible):
+            with grid_cols[idx]:
+                thumb_url = helpers.resolve_thumb(track.get("rep_thumb_url"))
+                st.markdown(helpers.thumb_html(thumb_url, alt=f"Track {track['track_id']}"), unsafe_allow_html=True)
                 faces_count = track.get("faces") or 0
                 st.caption(f"Track {track['track_id']} · {faces_count} faces")
                 if st.button("View track", key=f"view_track_{identity_id}_{track['track_id']}"):
@@ -350,6 +380,9 @@ def _render_cluster_rows(
                     )
                     if st.button("Move track", key=f"cluster_move_btn_{identity_id}_{track['track_id']}"):
                         _move_track(ep_id, track["track_id"], target_choice)
+                # Add delete button for each track in cluster view
+                if st.button("Delete track", key=f"cluster_delete_btn_{identity_id}_{track['track_id']}", type="secondary"):
+                    _delete_track(ep_id, track["track_id"])
         st.divider()
 
 
@@ -392,66 +425,99 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         if st.button("Delete track", key=f"track_view_delete_{track_id}"):
             _delete_track(ep_id, track_id)
 
-    selection_store: Dict[int, set[str]] = st.session_state.setdefault("track_frame_selection", {})
+    selection_store: Dict[int, set[int]] = st.session_state.setdefault("track_frame_selection", {})
     track_selection = selection_store.setdefault(track_id, set())
+    selected_frames: List[int] = []
     if frames:
-        st.caption("Select frames to move to another identity.")
-        cols_per_row = 4
+        st.caption("Select frames to move or delete.")
+        cols_per_row = 5
         for row_start in range(0, len(frames), cols_per_row):
             row_frames = frames[row_start : row_start + cols_per_row]
-            row_cols = st.columns(len(row_frames))
-            for col, frame_meta in zip(row_cols, row_frames):
+            row_cols = st.columns(cols_per_row)
+            for idx, frame_meta in enumerate(row_frames):
                 face_id = frame_meta.get("face_id")
                 frame_idx = frame_meta.get("frame_idx")
-                with col:
-                    if frame_meta.get("thumbnail_url"):
-                        st.image(frame_meta["thumbnail_url"], use_column_width=True, caption=f"Frame {frame_idx}")
-                    key = f"face_select_{track_id}_{face_id}"
+                try:
+                    frame_idx_int = int(frame_idx)
+                except (TypeError, ValueError):
+                    frame_idx_int = None
+                thumb_url = frame_meta.get("thumbnail_url")
+                skip_reason = frame_meta.get("skip")
+                with row_cols[idx]:
+                    caption = f"Frame {frame_idx}" if frame_idx is not None else (face_id or "frame")
+                    resolved_thumb = helpers.resolve_thumb(thumb_url)
+                    st.markdown(helpers.thumb_html(resolved_thumb, alt=caption), unsafe_allow_html=True)
+                    st.caption(caption)
+                    if skip_reason:
+                        st.markdown(f":red[⚠ invalid crop] {skip_reason}")
+                    if frame_idx_int is None:
+                        continue
+                    key = f"face_select_{track_id}_{frame_idx_int}"
                     checked = st.checkbox(
                         "Select",
-                        value=face_id in track_selection,
+                        value=frame_idx_int in track_selection,
                         key=key,
                     )
                     if checked:
-                        track_selection.add(face_id)
+                        track_selection.add(frame_idx_int)
                     else:
-                        track_selection.discard(face_id)
-        st.caption(f"{len(track_selection)} frame(s) selected.")
+                        track_selection.discard(frame_idx_int)
+        selected_frames = sorted(track_selection)
+        st.caption(f"{len(selected_frames)} frame(s) selected.")
     else:
         st.info("No frames recorded for this track yet.")
 
-    identity_values = [None] + [ident["identity_id"] for ident in identities]
-    identity_labels = ["Create new identity"] + [
-        f"{ident['identity_id']} · {(ident.get('name') or ident.get('label') or ident['identity_id'])}"
-        for ident in identities
-    ]
-    identity_idx = st.selectbox(
-        "Send selected frames to identity",
-        list(range(len(identity_values))),
-        format_func=lambda idx: identity_labels[idx],
-        key=f"track_identity_choice_{track_id}",
-    )
-    target_identity_id = identity_values[identity_idx]
-    target_name = _name_choice_widget(
-        label="Or assign roster name",
-        key_prefix=f"track_reassign_{track_id}",
-        roster_names=roster_names,
-        current_name="",
-        text_label="New roster name",
-    )
-    disabled = not track_selection or (target_identity_id is None and not target_name)
-    if st.button("Move selected frames", key=f"track_reassign_btn_{track_id}", disabled=disabled):
-        payload: Dict[str, Any] = {
-            "from_track_id": track_id,
-            "face_ids": sorted(track_selection),
-        }
-        if target_identity_id:
-            payload["target_identity_id"] = target_identity_id
-        if target_name:
-            payload["new_identity_name"] = target_name
-        if show_slug:
-            payload["show_id"] = show_slug
-        _move_frames_api(ep_id, payload, show_slug, track_id)
+    if selected_frames:
+        identity_values = [None] + [ident["identity_id"] for ident in identities]
+        identity_labels = ["Create new identity"] + [
+            f"{ident['identity_id']} · {(ident.get('name') or ident.get('label') or ident['identity_id'])}"
+            for ident in identities
+        ]
+        identity_idx = st.selectbox(
+            "Send selected frames to identity",
+            list(range(len(identity_values))),
+            format_func=lambda idx: identity_labels[idx],
+            key=f"track_identity_choice_{track_id}",
+        )
+        target_identity_id = identity_values[identity_idx]
+        target_name = _name_choice_widget(
+            label="Or assign roster name",
+            key_prefix=f"track_reassign_{track_id}",
+            roster_names=roster_names,
+            current_name="",
+            text_label="New roster name",
+        )
+        move_disabled = not (target_identity_id or target_name)
+        action_cols = st.columns([1, 1])
+        if action_cols[0].button("Move selected", key=f"track_move_selected_{track_id}", disabled=move_disabled):
+            _move_frames_api(
+                ep_id,
+                track_id,
+                selected_frames,
+                target_identity_id,
+                target_name,
+                show_slug,
+            )
+        if action_cols[1].button("Delete selected", key=f"track_delete_selected_{track_id}", type="secondary"):
+            _delete_frames_api(ep_id, track_id, selected_frames)
+    else:
+        action_cols = st.columns([1.0, 1.0, 1.0])
+        with action_cols[0]:
+            targets = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
+            if targets:
+                target_choice = st.selectbox(
+                    "Move entire track",
+                    targets,
+                    key=f"track_view_move_{track_id}",
+                )
+                if st.button("Move track", key=f"track_view_move_btn_{track_id}"):
+                    _move_track(ep_id, track_id, target_choice)
+        with action_cols[1]:
+            if st.button("Remove from identity", key=f"track_view_remove_{track_id}"):
+                _move_track(ep_id, track_id, None)
+        with action_cols[2]:
+            if st.button("Delete track", key=f"track_view_delete_{track_id}"):
+                _delete_track(ep_id, track_id)
 
 
 def _rename_identity(ep_id: str, identity_id: str, label: str) -> None:
@@ -486,6 +552,12 @@ def _move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> No
 
 def _delete_track(ep_id: str, track_id: int) -> None:
     if _api_post(f"/identities/{ep_id}/drop_track", {"track_id": track_id}):
+        # Clear track detail cache so deleted track doesn't reappear
+        st.session_state.get("track_detail_cache", {}).pop(track_id, None)
+        # Clear selection state for this track
+        st.session_state.get("track_frame_selection", {}).pop(track_id, None)
+        # Return to clusters view
+        _set_view("clusters")
         st.success("Track deleted.")
         st.rerun()
 
@@ -497,6 +569,9 @@ def _delete_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool
         "delete_assets": delete_assets,
     }
     if _api_post(f"/identities/{ep_id}/drop_frame", payload):
+        # Clear track detail cache for this specific track to reload fresh data
+        st.session_state.get("track_detail_cache", {}).pop(track_id, None)
+        # Stay on track view - don't navigate away
         st.success("Frame removed.")
         st.rerun()
 

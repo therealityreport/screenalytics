@@ -24,6 +24,11 @@ DEFAULT_DEVICE = "auto"
 DEFAULT_DEVICE_LABEL = "Auto"
 DEFAULT_DET_THRESH = 0.5
 _LOCAL_MEDIA_CACHE_SIZE = 256
+
+# Thumbnail constants
+THUMB_W, THUMB_H = 200, 250
+_PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
+
 LABEL = {
     DEFAULT_DETECTOR: "RetinaFace (recommended)",
     "yolov8face": "YOLOv8-face (alt)",
@@ -976,7 +981,7 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
       .track-grid .thumb {{ 
         width: {thumb_width}px;
         aspect-ratio: 4 / 5;
-        object-fit: cover;
+        object-fit: fill;
         border-radius: 6px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         transition: transform 0.2s, box-shadow 0.2s;
@@ -998,3 +1003,74 @@ def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_width: in
     num_rows = (len(items) + 4) // 5  # Round up to get number of rows
     row_height = max(num_rows * thumb_height + (num_rows - 1) * 12 + 50, 150)  # thumbs + gaps + padding
     components.html(html_block, height=row_height, scrolling=False)
+
+
+def inject_thumb_css() -> None:
+    """Inject CSS for fixed 200×250 thumbnail frames."""
+    st.markdown(f"""
+    <style>
+      .thumb {{
+        width:{THUMB_W}px;
+        height:{THUMB_H}px;
+        border-radius:8px;
+        background:#111;
+        overflow:hidden;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+      }}
+      .thumb img {{
+        width:100%;
+        height:100%;
+        object-fit:cover;
+      }}
+      .thumb-strip {{
+        display:flex;
+        gap:12px;
+        flex-wrap:nowrap;
+        align-items:center;
+      }}
+      .thumb-cell {{
+        flex:0 0 {THUMB_W}px;
+      }}
+      .thumb-skeleton {{
+        background:linear-gradient(90deg,#222 25%,#2b2b2b 37%,#222 63%);
+        background-size:400% 100%;
+        animation:pulse 1.2s ease-in-out infinite;
+      }}
+      @keyframes pulse {{
+        0%{{background-position:100% 0}}
+        100%{{background-position:-100% 0}}
+      }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def resolve_thumb(src: str | None) -> str | None:
+    """Resolve thumbnail source to valid path or None for placeholder.
+
+    Returns src if it's a valid HTTP URL or existing local file, else None.
+    """
+    try:
+        if src and src.startswith("http"):
+            return src  # presigned S3; let browser fetch
+        if src and Path(src).exists() and Path(src).stat().st_size > 1024:
+            return src
+    except Exception:
+        pass
+    return None
+
+
+def thumb_html(src: str | None, alt: str = "thumb") -> str:
+    """Generate HTML for a fixed 200×250 thumbnail frame.
+
+    Args:
+        src: Image source URL or path, or None for placeholder
+        alt: Alt text for the image
+
+    Returns:
+        HTML string for the thumbnail
+    """
+    img = src if src else _PLACEHOLDER
+    escaped_alt = html.escape(alt)
+    return f'<div class="thumb"><img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async"/></div>'
