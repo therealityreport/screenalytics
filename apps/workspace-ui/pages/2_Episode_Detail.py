@@ -250,20 +250,20 @@ with col_detect:
                 st.error(error_message)
         else:
             normalized = helpers.normalize_summary(ep_id, summary)
-            detections = normalized.get("detections")
-            tracks = normalized.get("tracks")
-            frames_exported = normalized.get("frames_exported")
-            crops_exported = normalized.get("crops_exported")
+            detections = helpers.coerce_int(normalized.get("detections"))
+            tracks = helpers.coerce_int(normalized.get("tracks"))
+            frames_exported = helpers.coerce_int(normalized.get("frames_exported"))
+            crops_exported = helpers.coerce_int(normalized.get("crops_exported"))
             detector_summary = normalized.get("detector")
             tracker_summary = normalized.get("tracker")
             details_line = [
-                f"detections: {detections:,}" if isinstance(detections, int) else "detections: ?",
-                f"tracks: {tracks:,}" if isinstance(tracks, int) else "tracks: ?",
+                f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
+                f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
             ]
             if frames_exported:
-                details_line.append(f"frames exported: {frames_exported:,}")
+                details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
             if crops_exported:
-                details_line.append(f"crops exported: {crops_exported:,}")
+                details_line.append(f"crops exported: {helpers.format_count(crops_exported)}")
             if detector_summary:
                 details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
             if tracker_summary:

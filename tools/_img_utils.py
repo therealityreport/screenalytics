@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterable
 
 import cv2  # type: ignore
 import numpy as np
+
+LOGGER = logging.getLogger(__name__)
 
 
 def clip_bbox(x1: float, y1: float, x2: float, y2: float, *, W: int, H: int) -> tuple[int, int, int, int] | None:
@@ -77,7 +80,12 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     jpeg_q = max(1, min(int(jpg_q or 85), 100))
-    variance = float(np.std(img))
+    variance = float(np.std(img)) if img.size else 0.0
+    range_val = (
+        float(np.nanmax(img)) - float(np.nanmin(img))
+        if img.size
+        else 0.0
+    )
     ok = cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
     if not ok:
         return False, "imwrite_failed"
@@ -91,10 +99,13 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
         except OSError:
             pass
         return False, "tiny_file"
-    if variance < 1.0:
+    if variance <= 0.05 and range_val <= 1.0:
         try:
             out_path.unlink()
         except OSError:
             pass
+        LOGGER.warning(
+            "Removed near-uniform image %s (std=%.5f range=%.3f)", out_path, variance, range_val
+        )
         return False, "near_uniform_gray"
     return True, None

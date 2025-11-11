@@ -411,12 +411,13 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     with action_cols[0]:
         targets = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
         if targets:
+            move_select_key = f"track_view_move_{ep_id}_{track_id}_{current_identity or 'none'}"
             target_choice = st.selectbox(
                 "Move entire track",
                 targets,
-                key=f"track_view_move_{track_id}",
+                key=move_select_key,
             )
-            if st.button("Move track", key=f"track_view_move_btn_{track_id}"):
+            if st.button("Move track", key=f"{move_select_key}_btn"):
                 _move_track(ep_id, track_id, target_choice)
     with action_cols[1]:
         if st.button("Remove from identity", key=f"track_view_remove_{track_id}"):

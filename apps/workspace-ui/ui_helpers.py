@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import html
+import json
+import math
+import numbers
 import os
 import re
-import json
 import time
-import html
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -89,6 +91,35 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return int(value)
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").strip()
+        if not cleaned:
+            return None
+        try:
+            return int(float(cleaned))
+        except ValueError:
+            return None
+    return None
+
+
+def format_count(value: Any) -> str | None:
+    numeric = coerce_int(value)
+    if numeric is None:
+        return None
+    return f"{numeric:,}"
 
 
 SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
@@ -680,6 +711,28 @@ def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
     return summary
 
 
+def _is_complete_summary(summary: Dict[str, Any] | None) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if isinstance(summary.get("stage"), str) and summary["stage"].strip():
+        return True
+    numeric_keys = (
+        "detections",
+        "tracks",
+        "faces",
+        "faces_count",
+        "identities",
+        "identities_count",
+    )
+    for key in numeric_keys:
+        if coerce_int(summary.get(key)) is not None:
+            return True
+    nested = summary.get("summary")
+    if isinstance(nested, dict):
+        return _is_complete_summary(nested)
+    return False
+
+
 def attempt_sse_run(
     endpoint_path: str,
     payload: Dict[str, Any],
@@ -703,30 +756,29 @@ def attempt_sse_run(
         summary = body if isinstance(body, dict) else {"raw": body}
         return summary, None, False
 
-    ep_id = str(payload.get("ep_id") or "")
-    phase_hint = _phase_from_endpoint(endpoint_path)
     final_summary: Dict[str, Any] | None = None
     try:
         for event_name, event_payload in iter_sse_events(response):
             if not isinstance(event_payload, dict):
                 continue
             update_cb(event_payload)
-            if isinstance(event_payload.get("summary"), dict):
-                final_summary = event_payload["summary"]
+            summary_candidate = event_payload.get("summary")
+            if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
+                final_summary = summary_candidate
             phase = str(event_payload.get("phase", "")).lower()
             if event_name == "error" or phase == "error":
                 return None, event_payload.get("error") or "Job failed", True
             if event_name == "done" or _is_phase_done(event_payload):
-                return final_summary or event_payload.get("summary"), None, True
+                if final_summary:
+                    return final_summary, None, True
+                if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
+                    return summary_candidate, None, True
+                return None, None, True
     finally:
         response.close()
     if final_summary:
         return final_summary, None, True
-    if ep_id and phase_hint:
-        status_summary = _summary_from_status(ep_id, phase_hint)
-        if status_summary:
-            return status_summary, None, True
-    return final_summary, None, True
+    return None, None, True
 
 
 def fallback_poll_progress(

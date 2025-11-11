@@ -43,7 +43,6 @@ TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
 YOLO_IMAGE_SIZE = int(os.environ.get("SCREENALYTICS_YOLO_IMGSZ", 640))
 YOLO_CONF_THRESHOLD = float(os.environ.get("SCREENALYTICS_YOLO_CONF", 0.25))
 YOLO_IOU_THRESHOLD = float(os.environ.get("SCREENALYTICS_YOLO_IOU", 0.45))
-TRACK_SAMPLE_LIMIT = int(os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT", 100))
 PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -126,6 +125,30 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_track_sample_limit(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "unlimited", "all", "off", "disable"}:
+            return None
+        try:
+            numeric = int(float(text))
+        except ValueError:
+            return None
+    else:
+        numeric = int(value)
+    return numeric if numeric > 0 else None
+
+
+def _set_track_sample_limit(value: int | None) -> None:
+    global TRACK_SAMPLE_LIMIT
+    TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(value)
+
+
+TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT"))
 
 
 SCENE_DETECT_DEFAULT = _env_flag("SCENE_DETECT", True)
@@ -312,7 +335,8 @@ class TrackAccumulator:
     def add(self, ts: float, frame_idx: int, bbox_xyxy: List[float], landmarks: List[float] | None = None) -> None:
         self.frame_count += 1
         self.last_ts = ts
-        if len(self.samples) < TRACK_SAMPLE_LIMIT:
+        limit = TRACK_SAMPLE_LIMIT
+        if limit is None or len(self.samples) < limit:
             self.samples.append(
                 {
                     "frame_idx": frame_idx,
@@ -1679,6 +1703,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=30,
         help="Maximum frame gap before splitting a track",
     )
+    parser.add_argument(
+        "--track-sample-limit",
+        type=int,
+        default=None,
+        help="Optional max samples stored per track (0→all detections, default)",
+    )
     parser.add_argument("--thumb-size", type=int, default=256, help="Square thumbnail size for faces")
     parser.add_argument(
         "--out-root",
@@ -1714,6 +1744,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     args.scene_threshold = max(min(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 2.0), 0.0)
     args.scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
     args.scene_warmup_dets = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
+    cli_track_limit = getattr(args, "track_sample_limit", None)
+    if cli_track_limit is not None:
+        _set_track_sample_limit(cli_track_limit)
+        if TRACK_SAMPLE_LIMIT is None:
+            LOGGER.info("Track sampling disabled; persisting all detections per track.")
+        else:
+            LOGGER.info("Track sampling limited to the first %s detections per track.", TRACK_SAMPLE_LIMIT)
     data_root = (
         Path(args.out_root).expanduser()
         if args.out_root

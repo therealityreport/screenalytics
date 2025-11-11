@@ -275,7 +275,7 @@ FRAME_IDX_RE = re.compile(r"frame_(\d+)\.jpg$", re.IGNORECASE)
 TRACK_LIST_MAX_LIMIT = 500
 
 
-def _load_faces(ep_id: str) -> List[Dict[str, Any]]:
+def _load_faces(ep_id: str, *, include_skipped: bool = True) -> List[Dict[str, Any]]:
     path = _faces_path(ep_id)
     if not path.exists():
         return []
@@ -290,6 +290,8 @@ def _load_faces(ep_id: str) -> List[Dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             if isinstance(obj, dict):
+                if not include_skipped and obj.get("skip"):
+                    continue
                 rows.append(obj)
     return rows
 
@@ -389,7 +391,7 @@ def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> 
 
 
 def _recount_track_faces(ep_id: str) -> None:
-    faces = _load_faces(ep_id)
+    faces = _load_faces(ep_id, include_skipped=False)
     counts: Dict[int, int] = defaultdict(int)
     for face in faces:
         try:
@@ -410,7 +412,7 @@ def _recount_track_faces(ep_id: str) -> None:
 
 
 def _update_identity_stats(ep_id: str, payload: Dict[str, Any]) -> None:
-    faces_count = len(_load_faces(ep_id))
+    faces_count = len(_load_faces(ep_id, include_skipped=False))
     payload.setdefault("stats", {})
     payload["stats"]["faces"] = faces_count
     payload["stats"]["clusters"] = len(payload.get("identities", []))
@@ -427,7 +429,7 @@ def _frame_idx_from_name(name: str) -> int | None:
 
 
 def _track_face_rows(ep_id: str, track_id: int) -> Dict[int, Dict[str, Any]]:
-    faces = _load_faces(ep_id)
+    faces = _load_faces(ep_id, include_skipped=False)
     rows: Dict[int, Dict[str, Any]] = {}
     for row in faces:
         try:
@@ -1056,7 +1058,7 @@ def list_cluster_tracks(
 
 @router.get("/episodes/{ep_id}/faces_grid")
 def faces_grid(ep_id: str, track_id: int | None = Query(None)) -> dict:
-    faces = _load_faces(ep_id)
+    faces = _load_faces(ep_id, include_skipped=False)
     identity_lookup = _identity_lookup(_load_identities(ep_id))
     items: List[dict] = []
     for row in faces:
@@ -1118,7 +1120,7 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
 
 @router.get("/episodes/{ep_id}/tracks/{track_id}")
 def track_detail(ep_id: str, track_id: int) -> dict:
-    faces = [row for row in _load_faces(ep_id) if int(row.get("track_id", -1)) == track_id]
+    faces = [row for row in _load_faces(ep_id, include_skipped=False) if int(row.get("track_id", -1)) == track_id]
     frames = [
         {
             "face_id": row.get("face_id"),
