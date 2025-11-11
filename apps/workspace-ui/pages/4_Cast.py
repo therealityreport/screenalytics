@@ -306,7 +306,10 @@ if selected_cast_id:
 
     with action_cols[1]:
         if st.button("View Detections", key=f"cast_view_detections_{selected_cast_id}"):
-            st.info("Navigation to Episode Review coming soon")
+            # Store cast filter in session state for Faces Review page
+            st.session_state["filter_cast_id"] = selected_cast_id
+            st.session_state["filter_cast_name"] = member["name"]
+            st.switch_page("pages/3_Faces_Review.py")
 
     with action_cols[2]:
         if st.button("Delete Cast Member", key=f"cast_delete_{selected_cast_id}", type="secondary"):

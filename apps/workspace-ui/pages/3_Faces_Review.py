@@ -324,6 +324,35 @@ def _clusters_by_identity(cluster_payload: Dict[str, Any] | None) -> Dict[str, D
     return lookup
 
 
+def _fetch_track_media(
+    ep_id: str,
+    track_id: int,
+    *,
+    sample: int = 5,
+    limit: int = 2,
+    cursor: str | None = None,
+) -> tuple[List[Dict[str, Any]], str | None]:
+    params: Dict[str, Any] = {"sample": int(sample), "limit": int(limit)}
+    if cursor:
+        # The backend returns pagination with a 'next_start_after' cursor
+        params["start_after"] = cursor
+    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/crops", params=params) or {}
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    next_cursor = payload.get("next_start_after") if isinstance(payload, dict) else None
+    normalized: List[Dict[str, Any]] = []
+    for item in items:
+        url = item.get("url") or item.get("thumbnail_url")
+        resolved = helpers.resolve_thumb(url)
+        if not resolved:
+            continue
+        normalized.append({
+            "url": resolved,
+            "frame_idx": item.get("frame_idx"),
+            "track_id": track_id,
+        })
+    return normalized, next_cursor
+
+
 def _render_people_view(
     ep_id: str,
     show_id: str | None,
@@ -334,6 +363,21 @@ def _render_people_view(
     if not show_id:
         st.error("Unable to determine show for this episode.")
         return
+
+    # Check for cast filter
+    filter_cast_id = st.session_state.get("filter_cast_id")
+    filter_cast_name = st.session_state.get("filter_cast_name")
+    if filter_cast_id and filter_cast_name:
+        with st.container(border=True):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.info(f"🔍 Filtering by cast: **{filter_cast_name}**")
+            with col2:
+                if st.button("Clear Filter", key="clear_cast_filter"):
+                    st.session_state.pop("filter_cast_id", None)
+                    st.session_state.pop("filter_cast_name", None)
+                    st.rerun()
+
     if not people:
         st.info("No people found for this show. Run 'Group Clusters (auto)' to create people.")
         return
@@ -483,6 +527,72 @@ def _render_cluster_tracks(
     if not tracks:
         st.info("No tracks linked to this identity yet.")
         return
+
+    # Build a horizontal strip: 2 thumbnails per track with arrows to scroll
+    strip_cache: Dict[str, List[Dict[str, Any]]] = st.session_state.setdefault("cluster_track_strip", {})
+    cache_key = f"{ep_id}:{identity_id}"
+    strip_items = strip_cache.get(cache_key)
+    if strip_items is None:
+        strip_items = []
+        for t in tracks:
+            tid = t.get("track_id")
+            try:
+                tid_int = int(tid)
+            except (TypeError, ValueError):
+                continue
+            thumbs, _ = _fetch_track_media(ep_id, tid_int, sample=5, limit=2, cursor=None)
+            # Fallback to rep thumb if no crops
+            if not thumbs:
+                rep = helpers.resolve_thumb(t.get("rep_thumb_url"))
+                if rep:
+                    thumbs = [{"url": rep, "track_id": tid_int}]
+            # Ensure exactly two per track if available (duplicate if only one)
+            if len(thumbs) == 1:
+                thumbs = thumbs * 2
+            elif len(thumbs) > 2:
+                thumbs = thumbs[:2]
+            for itm in thumbs:
+                strip_items.append({"url": itm.get("url"), "track_id": tid_int})
+        strip_cache[cache_key] = strip_items
+
+    if strip_items:
+        window = 10
+        offsets = st.session_state.setdefault("cluster_strip_offsets", {})
+        start_idx = int(offsets.get(identity_id, 0) or 0)
+        start_idx = max(0, min(start_idx, max(0, len(strip_items) - window)))
+        offsets[identity_id] = start_idx
+        nav_cols = st.columns([0.5, 9, 0.5])
+        with nav_cols[0]:
+            if st.button("←", key=f"cluster_strip_left_{identity_id}", disabled=start_idx == 0):
+                offsets[identity_id] = max(0, start_idx - window)
+                st.rerun()
+        with nav_cols[2]:
+            if st.button(
+                "→",
+                key=f"cluster_strip_right_{identity_id}",
+                disabled=start_idx + window >= len(strip_items),
+            ):
+                offsets[identity_id] = min(len(strip_items) - 1, start_idx + window)
+                st.rerun()
+        visible = strip_items[start_idx : start_idx + window]
+        row_cols = st.columns(len(visible)) if visible else []
+        for idx, itm in enumerate(visible):
+            with row_cols[idx]:
+                st.markdown(
+                    helpers.thumb_html(itm.get("url"), alt=f"Track {itm.get('track_id')}") or "",
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "View track",
+                    key=f"strip_view_{identity_id}_{itm.get('track_id')}_{start_idx+idx}",
+                ):
+                    _set_view(
+                        "track",
+                        person_id=person_id,
+                        identity_id=identity_id,
+                        track_id=int(itm.get("track_id")),
+                    )
+        st.caption(f"Showing {start_idx + 1}-{min(start_idx + window, len(strip_items))} of {len(strip_items)} thumbnails")
 
     move_targets = [ident_id for ident_id in identity_index if ident_id != identity_id]
     cols_per_row = 5
