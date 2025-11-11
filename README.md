@@ -96,9 +96,9 @@ cp .env.example .env
 source ./tools/dev-up.sh
 
 # Run services
-uv run apps/api/main.py               # API
-uv run workers/orchestrator.py        # Workers (pipeline)
-pnpm --filter workspace-ui dev        # UI
+python -m uvicorn apps.api.main:app --reload  # API
+uv run workers/orchestrator.py               # Workers (pipeline)
+pnpm --filter workspace-ui dev               # UI
 ````
 
 > `tools/dev-up.sh` exports `DB_URL`, `REDIS_URL`, and `S3_*` for the current shell while bringing the Docker stack online. Source it (`source ./tools/dev-up.sh`) whenever you open a new terminal.
@@ -117,6 +117,75 @@ Artifacts land under `data/` mirroring the future object-storage layout:
 - `data/manifests/ep_demo/detections.jsonl`
 - `data/manifests/ep_demo/tracks.jsonl`
 - `data/frames/ep_demo/` (only when `--fps` is provided)
+
+### Dependency profiles
+
+- **Core (API/UI/tests):**
+
+  ```bash
+  pip install -r requirements-core.txt
+  ```
+
+- **Full ML pipeline (optional / RetinaFace + ByteTrack + Whisper):**
+
+  ```bash
+  pip install -r requirements-ml.txt
+  ```
+
+### Upload via UI
+
+1. Install dependencies:
+
+   ```bash
+   pip install -r requirements-core.txt
+   # Optional full ML stack
+   # pip install -r requirements-ml.txt
+   ```
+
+2. Copy and source env vars:
+
+   ```bash
+   cp .env.example .env
+   set -a && source .env && set +a
+   ```
+
+3. Set your environment (pick one):
+
+   **Local filesystem (default)**
+   ```bash
+   export STORAGE_BACKEND=local
+   export SCREENALYTICS_API_URL=http://localhost:8000
+   export UI_ORIGIN=http://localhost:8501
+   ```
+
+   **MinIO/S3-compatible**
+   ```bash
+   export STORAGE_BACKEND=s3
+   export SCREENALYTICS_OBJECT_STORE_ENDPOINT=http://localhost:9000
+   export SCREENALYTICS_OBJECT_STORE_BUCKET=screenalytics
+   export SCREENALYTICS_OBJECT_STORE_ACCESS_KEY=minio
+   export SCREENALYTICS_OBJECT_STORE_SECRET_KEY=miniosecret
+   export SCREENALYTICS_API_URL=http://localhost:8000
+   export UI_ORIGIN=http://localhost:8501
+   ```
+
+4. Start the API: `python -m uvicorn apps.api.main:app --reload` (or `uv run apps/api/main.py` if you prefer `uv`).
+5. Launch the Streamlit upload helper: `streamlit run apps/workspace-ui/streamlit_app.py` (set `SCREENALYTICS_API_URL` if the API isn’t on `localhost:8000`).
+6. Fill in Show, Season, Episode #, Title, optional Air date, choose an `.mp4`, and choose whether to trigger the detect/track stub when the upload lands.
+4. The UI creates/returns the episode via the API, requests a presigned MinIO PUT for `videos/{ep_id}/episode.mp4`, mirrors the bytes locally, and (optionally) calls `POST /jobs/detect_track`.
+
+Artifacts for any uploaded `ep_id` are written via `py_screenalytics.artifacts`:
+
+- `data/videos/{ep_id}/episode.mp4`
+- `data/manifests/{ep_id}/detections.jsonl`
+- `data/manifests/{ep_id}/tracks.jsonl`
+- `data/frames/{ep_id}/` (when jobs run with an `fps` override)
+
+**Note:** Stub mode (`Run detect/track (stub)`) keeps the flow dependency-light and does not require the ML stack from `requirements-ml.txt`.
+
+#### Troubleshooting (macOS / FFmpeg / PyAV)
+
+`faster-whisper` depends on PyAV, which may try to build against Homebrew’s FFmpeg 8.x headers on Apple Silicon. If you only need the API, UI, or stub detect/track flow, stick to `requirements-core.txt`—these features do **not** require PyAV or the rest of the ML stack. Install `requirements-ml.txt` only when you plan to run the full pipeline and have a working FFmpeg toolchain.
 
 #### macOS (Apple Silicon) Python environment
 
