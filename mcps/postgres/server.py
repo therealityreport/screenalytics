@@ -45,18 +45,34 @@ def _conn():
     return psycopg.connect(os.getenv("DB_URL"))
 
 
-def presence_by_person(person_id: str, show_id: str | None = None):
+def presence_by_person(person_ref: str, show_ref: str | None = None):
     check()
-    q = """select ep_id,
-                  sum(visual_s) visual_s,
-                  sum(speaking_s) speaking_s,
-                  sum(both_s) both_s
-           from screen_time
-           where person_id = %s
-           group by ep_id
-           order by ep_id"""
+    q = """
+        select st.ep_id::text,
+               coalesce(sum(st.visual_s), 0),
+               coalesce(sum(st.speaking_s), 0),
+               coalesce(sum(st.both_s), 0)
+        from screen_time st
+        join person p on st.person_id = p.person_id
+        join episode e on st.ep_id = e.ep_id
+        join season s on e.season_id = s.season_id
+        join show sh on s.show_id = sh.show_id
+        where (
+            p.person_id::text = %(person)s
+            or p.canonical_name = %(person)s
+            or p.display_name = %(person)s
+            or %(person)s = any(p.aliases)
+        )
+        and (
+            %(show)s::text is null
+            or sh.slug = %(show)s
+            or sh.show_id::text = %(show)s
+        )
+        group by st.ep_id, s.number, e.number
+        order by s.number, e.number
+    """
     with _conn() as con, con.cursor() as cur:
-        cur.execute(q, (person_id,))
+        cur.execute(q, {"person": person_ref, "show": show_ref})
         rows = [
             {
                 "ep_id": r[0],
@@ -69,11 +85,19 @@ def presence_by_person(person_id: str, show_id: str | None = None):
     return {"rows": rows}
 
 
-def episodes_by_show(show_id: str):
+def episodes_by_show(show_ref: str):
     check()
-    q = "select ep_id from episode e join season s on e.season_id=s.season_id where s.show_id=%s order by ep_id"
+    q = """
+        select e.ep_id::text
+        from episode e
+        join season s on e.season_id = s.season_id
+        join show sh on s.show_id = sh.show_id
+        where sh.slug = %s
+           or sh.show_id::text = %s
+        order by s.number, e.number
+    """
     with _conn() as con, con.cursor() as cur:
-        cur.execute(q, (show_id,))
+        cur.execute(q, (show_ref, show_ref))
         rows = [r[0] for r in cur.fetchall()]
     return {"ep_ids": rows}
 

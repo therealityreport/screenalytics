@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_DIR = REPO_ROOT / "FEATURES" / "detection" / "src"
 sys.path.append(str(SRC_DIR))
 
-from run_retinaface import detect_frames  # noqa: E402
+from run_retinaface import run_detection  # noqa: E402
 
 
 def test_detection_config_keys_present():
@@ -38,17 +38,33 @@ def _fallback_parse(content: str):
     return data
 
 
-def test_detect_frames_emits_schema(tmp_path):
+def test_run_detection_with_plan(tmp_path):
+    import cv2  # type: ignore
+    import numpy as np
+
+    # fabricate frame images referenced by the plan
+    frames = []
+    for idx in range(2):
+        img = np.full((32, 32, 3), idx * 60, dtype=np.uint8)
+        frame_path = tmp_path / f"frame_{idx}.png"
+        cv2.imwrite(str(frame_path), img)
+        frames.append({"ep_id": "ep1", "frame_idx": idx, "ts_s": idx * 0.33, "image_path": str(frame_path)})
+
     manifest = tmp_path / "frames.jsonl"
-    frames = [
-        {"ep_id": "ep1", "ts_s": 0.0},
-        {"ep_id": "ep1", "ts_s": 0.5, "bbox": [0.1, 0.2, 0.8, 0.9]},
-    ]
     manifest.write_text("\n".join(json.dumps(fr) for fr in frames))
 
     out_path = tmp_path / "detections.jsonl"
-    cfg = {"model_id": "retinaface_r50", "confidence_th": 0.9}
-    count = detect_frames(manifest, out_path, cfg)
+    cfg = {"model_id": "retinaface_r50", "force_stub": True}
+    dummy_video = tmp_path / "dummy.mp4"
+    dummy_video.write_bytes(b"not-a-video")  # never consumed because plan has image_path
+    count = run_detection(
+        ep_id="ep1",
+        video_path=dummy_video,
+        output_path=out_path,
+        cfg=cfg,
+        frame_plan=manifest,
+        sample_stride=1,
+    )
 
     lines = [json.loads(line) for line in out_path.read_text().splitlines()]
     assert count == len(frames) == len(lines)

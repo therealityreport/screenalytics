@@ -98,6 +98,30 @@ API health check: [http://localhost:8000/health](http://localhost:8000/health) r
 
 ---
 
+## 🔍 Detection & Tracking Artifacts
+
+### det_v1 (`detections.jsonl`)
+- `ep_id` – episode id.
+- `frame_idx` – zero-based frame number.
+- `ts_s` – timestamp in seconds.
+- `bbox` – `[x1,y1,x2,y2]` normalized (0–1) coordinates.
+- `landmarks` – flattened `[x,y]*5` facial landmarks.
+- `conf` – detector confidence.
+- `model_id`, `schema_version`.
+
+### track_v1 (`tracks.jsonl`)
+- `track_id` – deterministic `track-00001` style id.
+- `ep_id` – episode id.
+- `start_s` / `end_s` – timestamps for the track span.
+- `frame_span` – `[start_frame,end_frame]`.
+- `sample_thumbs` – list of thumbnail paths (empty for now).
+- `stats` – `{detections, avg_conf}` summary.
+- `schema_version` – `"track_v1"`.
+
+These files are produced by the RetinaFace detection runner and ByteTrack-lite tracker under `FEATURES/detection` and `FEATURES/tracking`.
+
+---
+
 ## 7️⃣ Agents & automation
 * Codex config: `config/codex.config.toml`
 * Claude policy: `config/claude.policies.yaml`

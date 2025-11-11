@@ -86,21 +86,37 @@ docker compose -f infra/docker/compose.yaml up -d
 
 # Python deps (uv) and UI deps
 uv sync
+source .venv/bin/activate
 pnpm install
 
 # Seed env
 cp .env.example .env
 
-# Migrate DB
-for f in db/migrations/*.sql; do
-  psql "$DB_URL" -f "$f"
-done
+# Dev infra (DB/Redis/S3 + migrations + env exports)
+source ./tools/dev-up.sh
 
 # Run services
 uv run apps/api/main.py               # API
 uv run workers/orchestrator.py        # Workers (pipeline)
 pnpm --filter workspace-ui dev        # UI
 ````
+
+> `tools/dev-up.sh` exports `DB_URL`, `REDIS_URL`, and `S3_*` for the current shell while bringing the Docker stack online. Source it (`source ./tools/dev-up.sh`) whenever you open a new terminal.
+
+### Dev quick run
+
+```bash
+source .venv/bin/activate
+./tools/dev-up.sh
+python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 5 --stub
+```
+
+Artifacts land under `data/` mirroring the future object-storage layout:
+
+- `data/videos/ep_demo/episode.mp4`
+- `data/manifests/ep_demo/detections.jsonl`
+- `data/manifests/ep_demo/tracks.jsonl`
+- `data/frames/ep_demo/` (only when `--fps` is provided)
 
 #### macOS (Apple Silicon) Python environment
 
