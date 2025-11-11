@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
 import logging
+from functools import lru_cache
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -41,6 +44,18 @@ YOLO_IOU_THRESHOLD = float(os.environ.get("SCREENALYTICS_YOLO_IOU", 0.45))
 TRACK_SAMPLE_LIMIT = int(os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT", 5))
 PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
 LOGGER = logging.getLogger("episode_run")
+DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+DETECTOR_CHOICES = ("retinaface", "yolov8face")
+DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
+ARC_FACE_MODEL_NAME = "arcface_r100_v1"
+RETINAFACE_MODEL_NAME = "retinaface_r50_v1"
+FACE_CLASS_LABEL = "face"
+MIN_FACE_AREA = 20.0
+FACE_RATIO_BOUNDS = (0.5, 2.0)
+RETINAFACE_SCORE_THRESHOLD = 0.6
+RETINAFACE_NMS = 0.45
+YOLO_FACE_CONF = 0.5
+BYTE_TRACK_MIN_BOX_AREA = 20.0
 
 
 def pick_device(explicit: str | None = None) -> str:
@@ -67,16 +82,62 @@ def pick_device(explicit: str | None = None) -> str:
     return "cpu"
 
 
+def _normalize_detector_choice(detector: str | None) -> str:
+    if detector:
+        value = detector.strip().lower()
+        if value in DETECTOR_CHOICES:
+            return value
+    return DEFAULT_DETECTOR
+
+
+def _onnx_context_and_providers(device: str) -> tuple[int, list[str]]:
+    normalized = (device or "cpu").lower()
+    if normalized in {"cuda", "0", "gpu"}:
+        return 0, ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return -1, ["CPUExecutionProvider"]
+
+
+def _valid_face_box(bbox: np.ndarray, score: float, *, min_score: float, min_area: float) -> bool:
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    area = max(width, 0.0) * max(height, 0.0)
+    if score < min_score:
+        return False
+    if area < min_area:
+        return False
+    ratio = width / max(height, 1e-6)
+    return FACE_RATIO_BOUNDS[0] <= ratio <= FACE_RATIO_BOUNDS[1]
+
+
+def _nms_detections(
+    detections: list[tuple[np.ndarray, float, np.ndarray | None]],
+    thresh: float,
+) -> list[tuple[np.ndarray, float, np.ndarray | None]]:
+    ordered = sorted(range(len(detections)), key=lambda idx: detections[idx][1], reverse=True)
+    keep: list[tuple[np.ndarray, float, np.ndarray | None]] = []
+    while ordered:
+        current_idx = ordered.pop(0)
+        current = detections[current_idx]
+        keep.append(current)
+        remaining: list[int] = []
+        for idx in ordered:
+            iou = _bbox_iou(current[0].tolist(), detections[idx][0].tolist())
+            if iou < thresh:
+                remaining.append(idx)
+        ordered = remaining
+    return keep
+
+
 @dataclass
 class TrackAccumulator:
     track_id: int
-    class_id: int
+    class_id: int | str
     first_ts: float
     last_ts: float
     frame_count: int = 0
     samples: List[dict] = field(default_factory=list)
 
-    def add(self, ts: float, frame_idx: int, bbox_xyxy: List[float]) -> None:
+    def add(self, ts: float, frame_idx: int, bbox_xyxy: List[float], landmarks: List[float] | None = None) -> None:
         self.frame_count += 1
         self.last_ts = ts
         if len(self.samples) < TRACK_SAMPLE_LIMIT:
@@ -85,6 +146,7 @@ class TrackAccumulator:
                     "frame_idx": frame_idx,
                     "ts": round(float(ts), 4),
                     "bbox_xyxy": [round(float(coord), 4) for coord in bbox_xyxy],
+                    **({"landmarks": [round(float(val), 4) for val in landmarks]} if landmarks else {}),
                 }
             )
 
@@ -102,6 +164,455 @@ class TrackAccumulator:
         return row
 
 
+@dataclass
+class DetectionSample:
+    bbox: np.ndarray
+    conf: float
+    class_idx: int
+    class_label: str
+    landmarks: np.ndarray | None = None
+    embedding: np.ndarray | None = None
+
+
+@dataclass
+class TrackedObject:
+    track_id: int
+    bbox: np.ndarray
+    conf: float
+    class_idx: int
+    class_label: str
+    det_index: int | None = None
+    landmarks: np.ndarray | None = None
+
+
+class _TrackerDetections:
+    """Lightweight structure that mimics ultralytics' Boxes for BYTETracker inputs."""
+
+    def __init__(self, boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray) -> None:
+        self.xyxy = boxes.astype(np.float32)
+        self.conf = scores.astype(np.float32)
+        self.cls = classes.astype(np.float32)
+        self._xywh: np.ndarray | None = None
+
+    @property
+    def xywh(self) -> np.ndarray:
+        if self._xywh is None:
+            self._xywh = self.xyxy.copy()
+            self._xywh[:, 2] = self._xywh[:, 2] - self._xywh[:, 0]
+            self._xywh[:, 3] = self._xywh[:, 3] - self._xywh[:, 1]
+            self._xywh[:, 0] = self._xywh[:, 0] + self._xywh[:, 2] / 2
+            self._xywh[:, 1] = self._xywh[:, 1] + self._xywh[:, 3] / 2
+        return self._xywh
+
+    @property
+    def xywhr(self) -> np.ndarray:
+        return self.xywh
+
+
+class ByteTrackAdapter:
+    """Wrapper around ultralytics BYTETracker for direct invocation."""
+
+    def __init__(self, frame_rate: float = 30.0) -> None:
+        from types import SimpleNamespace
+
+        from ultralytics.trackers.byte_tracker import BYTETracker
+
+        cfg = SimpleNamespace(
+            tracker_type="bytetrack",
+            track_high_thresh=0.6,
+            track_low_thresh=0.1,
+            new_track_thresh=0.6,
+            track_buffer=30,
+            match_thresh=0.8,
+            min_box_area=BYTE_TRACK_MIN_BOX_AREA,
+        )
+        self._tracker = BYTETracker(cfg, frame_rate=max(frame_rate, 1))
+
+    def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
+        if detections:
+            boxes = np.vstack([sample.bbox for sample in detections]).astype(np.float32)
+            scores = np.asarray([sample.conf for sample in detections], dtype=np.float32)
+            classes = np.asarray([sample.class_idx for sample in detections], dtype=np.float32)
+            det_struct = _TrackerDetections(boxes, scores, classes)
+        else:
+            det_struct = _TrackerDetections(
+                np.zeros((0, 4), dtype=np.float32),
+                np.zeros(0, dtype=np.float32),
+                np.zeros(0, dtype=np.float32),
+            )
+        tracks = self._tracker.update(det_struct, image)
+        tracked: list[TrackedObject] = []
+        if tracks.size == 0:
+            return tracked
+        for row in tracks:
+            bbox = np.asarray(row[:4], dtype=np.float32)
+            track_id = int(row[4])
+            score = float(row[5])
+            class_idx = int(row[6]) if len(row) > 6 else 0
+            det_index = int(row[7]) if len(row) > 7 else None
+            label = ""
+            landmarks = None
+            if det_index is not None and 0 <= det_index < len(detections):
+                det = detections[det_index]
+                label = det.class_label
+                class_idx = det.class_idx
+                landmarks = det.landmarks
+            tracked.append(
+                TrackedObject(
+                    track_id=track_id,
+                    bbox=bbox,
+                    conf=score,
+                    class_idx=class_idx,
+                    class_label=label,
+                    det_index=det_index,
+                    landmarks=landmarks,
+                )
+            )
+        return tracked
+
+
+class RetinaFaceDetectorBackend:
+    def __init__(self, device: str) -> None:
+        self.device = device
+        self.score_thresh = RETINAFACE_SCORE_THRESHOLD
+        self.min_area = MIN_FACE_AREA
+        self._model = None
+
+    def _lazy_model(self):
+        if self._model is not None:
+            return self._model
+        insightface = _try_import("insightface")
+        if insightface is None:
+            raise RuntimeError("insightface is required for RetinaFace detection")
+        ctx_id, providers = _onnx_context_and_providers(self.device)
+        model = insightface.model_zoo.get_model(RETINAFACE_MODEL_NAME)
+        model.prepare(ctx_id=ctx_id, providers=providers, nms=RETINAFACE_NMS)
+        self._model = model
+        return self._model
+
+    @property
+    def model_name(self) -> str:
+        return RETINAFACE_MODEL_NAME
+
+    def detect(self, image) -> list[DetectionSample]:
+        model = self._lazy_model()
+        bboxes, landmarks = model.detect(image, threshold=self.score_thresh, scale=1.0)
+        if bboxes is None or len(bboxes) == 0:
+            return []
+        pending: list[tuple[np.ndarray, float, np.ndarray | None]] = []
+        for idx in range(len(bboxes)):
+            raw = bboxes[idx]
+            score = float(raw[4]) if raw.shape[0] >= 5 else float(self.score_thresh)
+            bbox = raw[:4].astype(np.float32)
+            if not _valid_face_box(bbox, score, min_score=self.score_thresh, min_area=self.min_area):
+                continue
+            kps = None
+            if landmarks is not None and idx < len(landmarks):
+                kps = landmarks[idx].astype(np.float32).reshape(-1)
+            pending.append((bbox, score, kps))
+        filtered = _nms_detections(pending, RETINAFACE_NMS) if pending else []
+        samples: list[DetectionSample] = []
+        for bbox, score, kps in filtered:
+            samples.append(
+                DetectionSample(
+                    bbox=bbox.astype(np.float32),
+                    conf=score,
+                    class_idx=0,
+                    class_label=FACE_CLASS_LABEL,
+                    landmarks=kps.copy() if isinstance(kps, np.ndarray) else None,
+                )
+            )
+        return samples
+
+
+class YoloFaceDetectorBackend:
+    def __init__(self, device: str) -> None:
+        from ultralytics import YOLO
+
+        self.device = device
+        self.model_path = os.environ.get("SCREENALYTICS_YOLO_FACE_MODEL", "yolov8n-face.pt")
+        self._model = YOLO(self.model_path)
+
+    @property
+    def model_name(self) -> str:
+        return self.model_path
+
+    def detect(self, image) -> list[DetectionSample]:
+        results = self._model.predict(
+            source=image,
+            imgsz=YOLO_IMAGE_SIZE,
+            conf=YOLO_FACE_CONF,
+            device=self.device,
+            verbose=False,
+        )
+        samples: list[DetectionSample] = []
+        if not results:
+            return samples
+        boxes = results[0].boxes
+        if boxes is None or boxes.data is None or len(boxes) == 0:
+            return samples
+        xyxy = boxes.xyxy.cpu().numpy()
+        scores = boxes.conf.cpu().numpy()
+        for idx in range(len(xyxy)):
+            bbox = xyxy[idx].astype(np.float32)
+            score = float(scores[idx])
+            if not _valid_face_box(bbox, score, min_score=YOLO_FACE_CONF, min_area=MIN_FACE_AREA):
+                continue
+            samples.append(
+                DetectionSample(
+                    bbox=bbox,
+                    conf=score,
+                    class_idx=0,
+                    class_label=FACE_CLASS_LABEL,
+                )
+            )
+        return samples
+
+
+def _build_face_detector(detector: str, device: str):
+    if detector == "yolov8face":
+        return YoloFaceDetectorBackend(device)
+    return RetinaFaceDetectorBackend(device)
+
+
+class ArcFaceEmbedder:
+    def __init__(self, device: str) -> None:
+        self.device = device
+        self._model = None
+
+    def _lazy_model(self):
+        if self._model is not None:
+            return self._model
+        insightface = _try_import("insightface")
+        if insightface is None:
+            raise RuntimeError("insightface is required for ArcFace embeddings")
+        ctx_id, providers = _onnx_context_and_providers(self.device)
+        model = insightface.model_zoo.get_model(ARC_FACE_MODEL_NAME)
+        model.prepare(ctx_id=ctx_id, providers=providers)
+        self._model = model
+        return self._model
+
+    def encode(self, crops: list[np.ndarray]) -> np.ndarray:
+        if not crops:
+            return np.zeros((0, 512), dtype=np.float32)
+        model = self._lazy_model()
+        embeddings: list[np.ndarray] = []
+        for crop in crops:
+            if crop is None or crop.size == 0:
+                embeddings.append(np.zeros(512, dtype=np.float32))
+                continue
+            resized = _resize_for_arcface(crop)
+            feat = model.get_feat(resized)
+            vec = np.asarray(feat, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            embeddings.append(vec)
+        return np.vstack(embeddings)
+
+
+def _resize_for_arcface(image):
+    import cv2  # type: ignore
+
+    target = (112, 112)
+    resized = cv2.resize(image, target)
+    return resized
+
+
+def _prepare_face_crop(image, bbox: list[float], landmarks: list[float] | None, margin: float = 0.15):
+    import cv2  # type: ignore
+    import numpy as _np
+
+    if landmarks and len(landmarks) >= 10:
+        try:
+            from insightface.utils import face_align  # type: ignore
+
+            pts = _np.asarray(landmarks, dtype=_np.float32).reshape(-1, 2)
+            return face_align.norm_crop(image, landmark=pts)
+        except Exception:
+            pass
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox
+    width = x2 - x1
+    height = y2 - y1
+    expand_x = width * margin
+    expand_y = height * margin
+    x1 = max(int(math.floor(x1 - expand_x)), 0)
+    y1 = max(int(math.floor(y1 - expand_y)), 0)
+    x2 = min(int(math.ceil(x2 + expand_x)), w)
+    y2 = min(int(math.ceil(y2 + expand_y)), h)
+    if x2 <= x1 or y2 <= y1:
+        return _blank_image()
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return _blank_image()
+    return crop
+
+
+class TrackRecorder:
+    """Maintains exported track ids, metrics, and sampled boxes."""
+
+    def __init__(self, *, max_gap: int, remap_ids: bool) -> None:
+        self.max_gap = max(1, int(max_gap))
+        self.remap_ids = remap_ids
+        self._next_export_id = 1
+        self._mapping: dict[int, dict[str, int]] = {}
+        self._active_exports: set[int] = set()
+        self._accumulators: dict[int, TrackAccumulator] = {}
+        self.metrics = {"tracks_born": 0, "tracks_lost": 0, "id_switches": 0}
+
+    def _spawn_export_id(self) -> int:
+        export_id = self._next_export_id
+        self._next_export_id += 1
+        self._active_exports.add(export_id)
+        self.metrics["tracks_born"] += 1
+        return export_id
+
+    def _complete_track(self, export_id: int) -> None:
+        if export_id in self._active_exports:
+            self._active_exports.remove(export_id)
+            self.metrics["tracks_lost"] += 1
+
+    def record(
+        self,
+        *,
+        tracker_track_id: int,
+        frame_idx: int,
+        ts: float,
+        bbox: list[float] | np.ndarray,
+        class_label: int | str,
+        landmarks: list[float] | None = None,
+    ) -> int:
+        if isinstance(bbox, np.ndarray):
+            bbox_values = bbox.tolist()
+        else:
+            bbox_values = bbox
+        export_id: int
+        mapping = self._mapping.get(tracker_track_id)
+        if self.remap_ids:
+            start_new = mapping is None
+            if mapping is not None:
+                gap = frame_idx - mapping.get("last_frame", frame_idx)
+                if gap > self.max_gap:
+                    self.metrics["id_switches"] += 1
+                    self._complete_track(mapping["export_id"])
+                    start_new = True
+            if start_new:
+                export_id = self._spawn_export_id()
+            else:
+                export_id = mapping["export_id"]
+            self._mapping[tracker_track_id] = {"export_id": export_id, "last_frame": frame_idx}
+        else:
+            if mapping is None:
+                export_id = tracker_track_id
+                self._active_exports.add(export_id)
+                self._mapping[tracker_track_id] = {"export_id": export_id, "last_frame": frame_idx}
+                self.metrics["tracks_born"] += 1
+            else:
+                export_id = mapping["export_id"]
+                mapping["last_frame"] = frame_idx
+        track = self._accumulators.get(export_id)
+        if track is None:
+            track = TrackAccumulator(track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts)
+            self._accumulators[export_id] = track
+        track.add(ts, frame_idx, bbox_values, landmarks=landmarks)
+        return export_id
+
+    def finalize(self) -> None:
+        for export_id in list(self._active_exports):
+            self._complete_track(export_id)
+        self._mapping.clear()
+
+    def rows(self) -> list[dict]:
+        payload: list[dict] = []
+        for track in sorted(self._accumulators.values(), key=lambda item: item.track_id):
+            payload.append(track.to_row())
+        return payload
+
+    def top_long_tracks(self, limit: int = 5) -> list[dict]:
+        longest = sorted(self._accumulators.values(), key=lambda item: item.frame_count, reverse=True)[:limit]
+        return [
+            {"track_id": track.track_id, "frame_count": track.frame_count}
+            for track in longest
+            if track.frame_count > 0
+        ]
+
+
+def _bbox_iou(box_a: List[float], box_b: List[float]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(inter_x2 - inter_x1, 0.0)
+    inter_h = max(inter_y2 - inter_y1, 0.0)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(ax2 - ax1, 0.0) * max(ay2 - ay1, 0.0)
+    area_b = max(bx2 - bx1, 0.0) * max(by2 - by1, 0.0)
+    denom = area_a + area_b - inter_area
+    if denom <= 0:
+        return 0.0
+    return inter_area / denom
+
+
+def _try_import(module: str):
+    try:
+        return __import__(module)
+    except ImportError:
+        return None
+
+
+class ThumbWriter:
+    def __init__(self, ep_id: str, size: int = 256) -> None:
+        self.ep_id = ep_id
+        self.size = size
+        self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            import cv2  # type: ignore
+
+            self._cv2 = cv2
+        except ImportError:
+            self._cv2 = None
+
+    def write(self, image, bbox: List[float], track_id: int, frame_idx: int) -> tuple[str | None, Path | None]:
+        if self._cv2 is None or image is None:
+            return None, None
+        x1, y1, x2, y2 = [int(max(coord, 0)) for coord in bbox]
+        x2 = max(x2, x1 + 1)
+        y2 = max(y2, y1 + 1)
+        crop = image[y1:y2, x1:x2]
+        thumb = self._letterbox(crop)
+        rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
+        abs_path = self.root_dir / rel_path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        self._cv2.imwrite(str(abs_path), thumb)
+        return rel_path.as_posix(), abs_path
+
+    def _letterbox(self, crop):
+        if self._cv2 is None:
+            return np.zeros((self.size, self.size, 3), dtype=np.uint8)
+        if crop.size == 0:
+            crop = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+        h, w = crop.shape[:2]
+        scale = min(self.size / max(w, 1), self.size / max(h, 1))
+        new_w = max(int(w * scale), 1)
+        new_h = max(int(h * scale), 1)
+        resized = self._cv2.resize(crop, (new_w, new_h))
+        canvas = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+        top = (self.size - new_h) // 2
+        left = (self.size - new_w) // 2
+        canvas[top : top + new_h, left : left + new_w] = resized
+        return canvas
+
+
+def _faces_embed_path(ep_id: str) -> Path:
+    embed_dir = DATA_ROOT / "embeds" / ep_id
+    embed_dir.mkdir(parents=True, exist_ok=True)
+    return embed_dir / "faces.npy"
 class ProgressEmitter:
     """Emit structured progress to stdout + optional file for SSE/polling."""
 
@@ -133,6 +644,7 @@ class ProgressEmitter:
         self._last_frames = 0
         self._last_phase: str | None = None
         self._device: str | None = None
+        self._detector: str | None = None
 
     def _now(self) -> str:
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -151,6 +663,7 @@ class ProgressEmitter:
         device: str | None,
         summary: Dict[str, object] | None,
         error: str | None,
+        detector: str | None,
     ) -> Dict[str, object]:
         secs_done = time.time() - self._start_ts
         fps_infer = None
@@ -170,6 +683,7 @@ class ProgressEmitter:
             "fps_requested": round(float(self.fps_requested), 3) if self.fps_requested else None,
             "stride": self.stride,
             "updated_at": self._now(),
+            "detector": detector or self._detector,
         }
         if summary:
             payload["summary"] = summary
@@ -194,6 +708,7 @@ class ProgressEmitter:
         summary: Dict[str, object] | None = None,
         error: str | None = None,
         force: bool = False,
+        detector: str | None = None,
     ) -> None:
         frames_done = max(int(frames_done), 0)
         if self.frames_total and frames_done > self.frames_total:
@@ -202,15 +717,17 @@ class ProgressEmitter:
             return
         if device is not None:
             self._device = device
-        payload = self._compose_payload(frames_done, phase, device, summary, error)
+        if detector is not None:
+            self._detector = detector
+        payload = self._compose_payload(frames_done, phase, device, summary, error, detector)
         self._write_payload(payload)
         self._last_frames = frames_done
         self._last_phase = phase
 
-    def complete(self, summary: Dict[str, object], device: str | None = None) -> None:
+    def complete(self, summary: Dict[str, object], device: str | None = None, detector: str | None = None) -> None:
         final_frames = self.frames_total or summary.get("frames_sampled") or self._last_frames
         final_frames = int(final_frames or 0)
-        self.emit(final_frames, phase="done", device=device, summary=summary, force=True)
+        self.emit(final_frames, phase="done", device=device, summary=summary, force=True, detector=detector)
 
     def fail(self, error: str) -> None:
         self.emit(self._last_frames, phase="error", error=error, force=True)
@@ -400,6 +917,7 @@ def _sync_artifacts_to_s3(
     storage: StorageService | None,
     ep_ctx: EpisodeContext | None,
     exporter: FrameExporter | None,
+    thumb_dir: Path | None = None,
 ) -> Dict[str, int]:
     stats = {"manifests": 0, "frames": 0, "crops": 0}
     if storage is None or ep_ctx is None:
@@ -418,6 +936,8 @@ def _sync_artifacts_to_s3(
         stats["frames"] = storage.sync_tree_to_s3(ep_ctx, exporter.frames_dir, prefixes["frames"])
     if exporter and exporter.save_crops and exporter.crops_dir.exists():
         stats["crops"] = storage.sync_tree_to_s3(ep_ctx, exporter.crops_dir, prefixes["crops"])
+    if thumb_dir is not None and thumb_dir.exists():
+        stats["thumbs"] = storage.sync_tree_to_s3(ep_ctx, thumb_dir, prefixes.get("thumbs_tracks", ""))
     return stats
 
 
@@ -438,6 +958,19 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Execution device override (auto→CUDA/MPS/CPU)",
     )
     parser.add_argument(
+        "--detector",
+        choices=list(DETECTOR_CHOICES),
+        default=DEFAULT_DETECTOR,
+        help="Face detector backend (RetinaFace high quality, YOLOv8-face fast)",
+    )
+    parser.add_argument(
+        "--max-gap",
+        type=int,
+        default=30,
+        help="Maximum frame gap before splitting a track",
+    )
+    parser.add_argument("--thumb-size", type=int, default=256, help="Square thumbnail size for faces")
+    parser.add_argument(
         "--out-root",
         help="Data root override (defaults to SCREENALYTICS_DATA_ROOT or ./data)",
     )
@@ -448,6 +981,18 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality for frame exports (1-100)")
     parser.add_argument("--faces-embed", action="store_true", help="Run faces embedding stage only")
     parser.add_argument("--cluster", action="store_true", help="Run clustering stage only")
+    parser.add_argument(
+        "--cluster-thresh",
+        type=float,
+        default=0.6,
+        help="Agglomerative cosine distance threshold for clustering",
+    )
+    parser.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=2,
+        help="Minimum tracks per identity before splitting into singletons",
+    )
     return parser.parse_args(argv)
 
 
@@ -489,15 +1034,19 @@ def main(argv: Iterable[str] | None = None) -> int:
 def _run_stub_pipeline(
     ep_id: str,
     *,
+    detector: str,
     progress: ProgressEmitter | None = None,
     analyzed_fps: float | None = None,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int, int, str, float | None, Dict[str, Any]]:
     det_path = get_path(ep_id, "detections")
     track_path = get_path(ep_id, "tracks")
     det_rows = []
     if progress:
-        progress.emit(0, phase="detect", device="cpu", force=True)
+        progress.emit(0, phase="detect", device="cpu", detector=detector, force=True)
     stub_frames = 3
+    detector_label = detector or FACE_CLASS_LABEL
+    class_label = FACE_CLASS_LABEL
+    tracker_label = "bytetrack"
     for idx in range(stub_frames):
         ts = idx * 0.5
         det_rows.append(
@@ -505,7 +1054,7 @@ def _run_stub_pipeline(
                 "ep_id": ep_id,
                 "ts": round(ts, 4),
                 "frame_idx": idx,
-                "class": 0,
+                "class": class_label,
                 "conf": 0.99,
                 "bbox_xyxy": [
                     round(50 + idx * 5, 1),
@@ -515,7 +1064,8 @@ def _run_stub_pipeline(
                 ],
                 "track_id": 1,
                 "model": YOLO_MODEL_NAME,
-                "tracker": TRACKER_NAME,
+                "tracker": tracker_label,
+                "detector": detector_label,
                 "pipeline_ver": PIPELINE_VERSION,
             }
         )
@@ -523,12 +1073,12 @@ def _run_stub_pipeline(
             total = max(progress.target_frames, 1)
             ratio = (idx + 1) / stub_frames
             scale = int(round(total * ratio)) or (idx + 1)
-            progress.emit(scale, phase="detect", device="cpu")
+            progress.emit(scale, phase="detect", device="cpu", detector=detector)
     track_rows = [
         {
             "ep_id": ep_id,
             "track_id": 1,
-            "class": 0,
+            "class": class_label,
             "first_ts": 0.0,
             "last_ts": round((len(det_rows) - 1) * 0.5, 4),
             "frame_count": len(det_rows),
@@ -541,13 +1091,31 @@ def _run_stub_pipeline(
                 for row in det_rows
             ],
             "pipeline_ver": PIPELINE_VERSION,
+            "tracker": tracker_label,
+            "detector": detector_label,
         }
     ]
     _write_jsonl(det_path, det_rows)
     _write_jsonl(track_path, track_rows)
+    metrics = {
+        "tracks_born": len(track_rows),
+        "tracks_lost": len(track_rows),
+        "id_switches": 0,
+        "longest_tracks": [
+            {"track_id": row["track_id"], "frame_count": row["frame_count"]}
+            for row in track_rows[:5]
+        ],
+    }
     if progress:
-        progress.emit(progress.target_frames, phase="track", device="cpu", force=True)
-    return len(det_rows), len(track_rows), len(det_rows)
+        progress.emit(
+            progress.target_frames,
+            phase="track",
+            device="cpu",
+            summary=metrics,
+            detector=detector,
+            force=True,
+        )
+    return len(det_rows), len(track_rows), len(det_rows), "cpu", analyzed_fps, metrics
 
 
 def _effective_stride(stride: int, target_fps: float | None, source_fps: float) -> int:
@@ -588,111 +1156,144 @@ def _run_full_pipeline(
     target_fps: float | None = None,
     frame_exporter: FrameExporter | None = None,
 ) -> Tuple[int, int, int, str, float | None]:
-    from ultralytics import YOLO  # type: ignore
+    import cv2  # type: ignore
 
     analyzed_fps = target_fps or source_fps
     if not analyzed_fps or analyzed_fps <= 0:
         analyzed_fps = _detect_fps(video_dest)
     frame_stride = _effective_stride(args.stride, target_fps or analyzed_fps, source_fps)
-    ts_fps = analyzed_fps if analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
+    ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
     device = pick_device(args.device)
+    detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
+    detector_backend = _build_face_detector(
+        detector_choice,
+        device if detector_choice == "yolov8face" else ("cpu" if device == "mps" else device),
+    )
+    tracker_label = "bytetrack"
+    if progress:
+        progress.emit(0, phase="detect", device=device, detector=detector_choice, force=True)
+
+    tracker_adapter = ByteTrackAdapter(frame_rate=source_fps or 30.0)
+    recorder = TrackRecorder(max_gap=args.max_gap, remap_ids=True)
     det_path = get_path(args.ep_id, "detections")
+    det_path.parent.mkdir(parents=True, exist_ok=True)
     track_path = get_path(args.ep_id, "tracks")
-    track_acc: Dict[int, TrackAccumulator] = {}
     det_count = 0
     frames_sampled = 0
-    if progress:
-        progress.emit(0, phase="detect", device=device, force=True)
+    frame_idx = 0
 
-    def detection_rows() -> Iterator[dict]:
-        nonlocal det_count, frames_sampled
-        model = YOLO(YOLO_MODEL_NAME)
-        results = model.track(
-            source=str(video_dest),
-            stream=True,
-            tracker=TRACKER_CONFIG,
-            imgsz=YOLO_IMAGE_SIZE,
-            conf=YOLO_CONF_THRESHOLD,
-            iou=YOLO_IOU_THRESHOLD,
-            device=device,
-            vid_stride=frame_stride,
-            persist=True,
-        )
-        for processed_idx, result in enumerate(results):
-            frames_sampled = processed_idx + 1
-            frame_idx = int(processed_idx * frame_stride)
-            ts = frame_idx / ts_fps
-            if progress:
-                emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
-                progress.emit(emit_frames, phase="detect", device=device)
-            boxes = getattr(result, "boxes", None)
-            if boxes is None or boxes.data is None:
-                if frame_exporter and frame_exporter.save_frames:
-                    orig = getattr(result, "orig_img", None)
-                    if orig is not None:
-                        frame_exporter.export(frame_idx, orig, [])
-                continue
-            num_boxes = len(boxes)
-            if num_boxes == 0:
-                if frame_exporter and frame_exporter.save_frames:
-                    orig = getattr(result, "orig_img", None)
-                    if orig is not None:
-                        frame_exporter.export(frame_idx, orig, [])
-                continue
-            track_ids = getattr(boxes, "id", None)
-            crop_records: List[Tuple[int, List[float]]] = []
-            for box_idx in range(num_boxes):
-                bbox_xyxy = boxes.xyxy[box_idx].tolist()
-                conf = float(boxes.conf[box_idx].item())
-                class_id = int(boxes.cls[box_idx].item())
-                track_id_val = None
-                if track_ids is not None and len(track_ids) > box_idx:
-                    tid_float = float(track_ids[box_idx].item())
-                    if not math.isnan(tid_float):
-                        track_id_val = int(tid_float)
-                row = {
-                    "ep_id": args.ep_id,
-                    "ts": round(float(ts), 4),
-                    "frame_idx": frame_idx,
-                    "class": class_id,
-                    "conf": conf,
-                    "bbox_xyxy": [round(float(coord), 4) for coord in bbox_xyxy],
-                    "track_id": track_id_val,
-                    "model": YOLO_MODEL_NAME,
-                    "tracker": TRACKER_NAME,
-                    "pipeline_ver": PIPELINE_VERSION,
-                    "fps": round(float(analyzed_fps), 4) if analyzed_fps else None,
-                }
-                det_count += 1
-                if track_id_val is not None:
-                    track = track_acc.get(track_id_val)
-                    if track is None:
-                        track = TrackAccumulator(
-                            track_id=track_id_val,
-                            class_id=class_id,
-                            first_ts=ts,
-                            last_ts=ts,
+    cap = cv2.VideoCapture(str(video_dest))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Unable to open video {video_dest}")
+
+    try:
+        with det_path.open("w", encoding="utf-8") as det_handle:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if frame_idx % frame_stride != 0:
+                    frame_idx += 1
+                    continue
+
+                frames_sampled += 1
+                ts = frame_idx / ts_fps if ts_fps else 0.0
+                detections = detector_backend.detect(frame)
+                tracked_objects = tracker_adapter.update(detections, frame_idx, frame)
+                crop_records: list[tuple[int, list[float]]] = []
+
+                if not detections:
+                    if frame_exporter and frame_exporter.save_frames:
+                        frame_exporter.export(frame_idx, frame, [])
+                    if progress:
+                        emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
+                        progress.emit(
+                            emit_frames,
+                            phase="detect",
+                            device=device,
+                            detector=detector_choice,
                         )
-                        track_acc[track_id_val] = track
-                    track.add(ts, frame_idx, bbox_xyxy)
-                if track_id_val is not None and frame_exporter and frame_exporter.save_crops:
-                    crop_records.append((track_id_val, bbox_xyxy))
-                yield row
-            if frame_exporter and (frame_exporter.save_frames or crop_records):
-                orig = getattr(result, "orig_img", None)
-                if orig is not None:
-                    frame_exporter.export(frame_idx, orig, crop_records)
+                    frame_idx += 1
+                    continue
 
-    _write_jsonl(det_path, detection_rows())
-    track_rows = []
-    for track in sorted(track_acc.values(), key=lambda t: t.track_id):
-        row = track.to_row()
+                for obj in tracked_objects:
+                    class_value = FACE_CLASS_LABEL
+                    landmarks = None
+                    if obj.landmarks is not None:
+                        landmarks = obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                    export_id = recorder.record(
+                        tracker_track_id=obj.track_id,
+                        frame_idx=frame_idx,
+                        ts=ts,
+                        bbox=obj.bbox,
+                        class_label=class_value,
+                        landmarks=landmarks,
+                    )
+                    bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
+                    row = {
+                        "ep_id": args.ep_id,
+                        "ts": round(float(ts), 4),
+                        "frame_idx": frame_idx,
+                        "class": class_value,
+                        "conf": round(float(obj.conf), 4),
+                        "bbox_xyxy": bbox_list,
+                        "track_id": export_id,
+                        "model": detector_backend.model_name,
+                        "detector": detector_choice,
+                        "tracker": tracker_label,
+                        "pipeline_ver": PIPELINE_VERSION,
+                        "fps": round(float(analyzed_fps), 4) if analyzed_fps else None,
+                    }
+                    if landmarks:
+                        row["landmarks"] = [round(float(val), 4) for val in landmarks]
+                    det_handle.write(json.dumps(row) + "\n")
+                    det_count += 1
+                    if frame_exporter and frame_exporter.save_crops:
+                        crop_records.append((export_id, bbox_list))
+
+                if frame_exporter and (frame_exporter.save_frames or crop_records):
+                    frame_exporter.export(frame_idx, frame, crop_records)
+
+                if progress:
+                    emit_frames = min(frames_sampled, progress.target_frames or frames_sampled)
+                    progress.emit(
+                        emit_frames,
+                        phase="track",
+                        device=device,
+                        detector=detector_choice,
+                        summary={
+                            "tracks_born": recorder.metrics["tracks_born"],
+                            "tracks_lost": recorder.metrics["tracks_lost"],
+                            "id_switches": recorder.metrics["id_switches"],
+                        },
+                    )
+                frame_idx += 1
+    finally:
+        cap.release()
+
+    recorder.finalize()
+    track_rows = recorder.rows()
+    for row in track_rows:
         row["ep_id"] = args.ep_id
-        track_rows.append(row)
+        row["detector"] = detector_choice
+        row["tracker"] = tracker_label
     _write_jsonl(track_path, track_rows)
+    metrics = {
+        "tracks_born": recorder.metrics["tracks_born"],
+        "tracks_lost": recorder.metrics["tracks_lost"],
+        "id_switches": recorder.metrics["id_switches"],
+        "longest_tracks": recorder.top_long_tracks(),
+    }
     if progress:
-        progress.emit(progress.target_frames, phase="track", device=device, force=True)
-    return det_count, len(track_rows), frames_sampled, device, analyzed_fps
+        progress.emit(
+            progress.target_frames,
+            phase="track",
+            device=device,
+            detector=detector_choice,
+            summary=metrics,
+            force=True,
+        )
+    return det_count, len(track_rows), frames_sampled, device, analyzed_fps, metrics
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -744,6 +1345,7 @@ def _run_detect_track_stage(
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
+    detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     frame_exporter = (
         FrameExporter(
             args.ep_id,
@@ -757,13 +1359,19 @@ def _run_detect_track_stage(
 
     try:
         if args.stub:
-            det_count, track_count, frames_sampled = _run_stub_pipeline(
+            (
+                det_count,
+                track_count,
+                frames_sampled,
+                resolved_device,
+                analyzed_fps,
+                track_metrics,
+            ) = _run_stub_pipeline(
                 args.ep_id,
+                detector=detector_choice,
                 progress=progress,
                 analyzed_fps=source_fps,
             )
-            resolved_device = "cpu"
-            analyzed_fps = source_fps
         else:
             (
                 det_count,
@@ -771,14 +1379,15 @@ def _run_detect_track_stage(
                 frames_sampled,
                 resolved_device,
                 analyzed_fps,
+                track_metrics,
             ) = _run_full_pipeline(
                 args,
                 video_dest,
                 source_fps=source_fps,
                 progress=progress,
                 target_fps=target_fps,
-                frame_exporter=frame_exporter,
-            )
+                    frame_exporter=frame_exporter,
+                )
 
         manifests_dir = get_path(args.ep_id, "detections").parent
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
@@ -793,6 +1402,8 @@ def _run_detect_track_stage(
             "crops_exported": frame_exporter.crops_written if frame_exporter else 0,
             "device": resolved_device,
             "analyzed_fps": analyzed_fps,
+             "detector": detector_choice,
+            "metrics": track_metrics,
             "artifacts": {
                 "local": {
                     "detections": str(get_path(args.ep_id, "detections")),
@@ -805,7 +1416,7 @@ def _run_detect_track_stage(
                 "s3_uploads": s3_stats,
             },
         }
-        progress.complete(summary, device=resolved_device)
+        progress.complete(summary, device=resolved_device, detector=detector_choice)
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -835,80 +1446,149 @@ def _run_faces_embed_stage(
         fps_requested=None,
     )
     device = pick_device(args.device)
+    save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
-    exporter = FrameExporter(
-        args.ep_id,
-        save_frames=False,
-        save_crops=save_crops,
-        jpeg_quality=jpeg_quality,
-    ) if save_crops else None
+    exporter = (
+        FrameExporter(
+            args.ep_id,
+            save_frames=save_frames,
+            save_crops=save_crops,
+            jpeg_quality=jpeg_quality,
+        )
+        if (save_frames or save_crops)
+        else None
+    )
+    thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
+    detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
+    embedder: ArcFaceEmbedder | None = None
+    if not args.stub:
+        embedder = ArcFaceEmbedder(device if device != "mps" else "cpu")
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     video_path = get_path(args.ep_id, "video")
     frame_decoder: FrameDecoder | None = None
     blank_image = _blank_image() if exporter and args.stub else None
+    track_embeddings: Dict[int, List[np.ndarray]] = defaultdict(list)
+    track_best_thumb: Dict[int, tuple[float, str, str | None]] = {}
+    embeddings_array: List[np.ndarray] = []
 
     try:
-        progress.emit(0, phase="faces_embed", device=device, force=True)
+        progress.emit(0, phase="faces_embed", device=device, detector=detector_choice, force=True)
         rows: List[Dict[str, Any]] = []
         for idx, sample in enumerate(samples, start=1):
             crop_rel_path = None
             crop_s3_key = None
-            if exporter:
-                image = None
-                if args.stub:
-                    image = blank_image
-                else:
-                    if not video_path.exists():
-                        raise FileNotFoundError("Local video not found for crop export")
-                    if frame_decoder is None:
-                        frame_decoder = FrameDecoder(video_path)
-                    image = frame_decoder.read(sample["frame_idx"])
-                if image is not None:
-                    exporter.export(sample["frame_idx"], image, [(sample["track_id"], sample["bbox_xyxy"])])
-                    crop_rel_path = exporter.crop_rel_path(sample["track_id"], sample["frame_idx"])
+            thumb_rel_path = None
+            thumb_s3_key = None
+            embedding_vec: np.ndarray | None = None
+            conf = 1.0
+            quality = 1.0
+            bbox = sample["bbox_xyxy"]
+            track_id = sample["track_id"]
+            frame_idx = sample["frame_idx"]
+            ts_val = round(float(sample["ts"]), 4)
+            landmarks = sample.get("landmarks")
+
+            image = None
+            if args.stub:
+                image = blank_image
+            else:
+                if not video_path.exists():
+                    raise FileNotFoundError("Local video not found for crop export")
+                if frame_decoder is None:
+                    frame_decoder = FrameDecoder(video_path)
+                image = frame_decoder.read(frame_idx)
+
+            if exporter and image is not None:
+                exporter.export(frame_idx, image, [(track_id, bbox)])
+                if exporter.save_crops:
+                    crop_rel_path = exporter.crop_rel_path(track_id, frame_idx)
                     if s3_prefixes and s3_prefixes.get("crops"):
-                        crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(sample['track_id'], sample['frame_idx'])}"
+                        crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
+            if image is not None:
+                thumb_rel_path, thumb_abs = thumb_writer.write(image, bbox, track_id, frame_idx)
+                if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
+                    thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
+
+            if embedding_vec is None:
+                if embedder and image is not None:
+                    crop = _prepare_face_crop(image, bbox, landmarks)
+                    encoded = embedder.encode([crop])
+                    embedding_vec = encoded[0] if encoded.size else np.zeros(512, dtype=np.float32)
+                else:
+                    embedding_vec = np.asarray(_fake_embedding(track_id, frame_idx, length=512), dtype="float32")
+
+            track_embeddings[track_id].append(embedding_vec)
+            embeddings_array.append(embedding_vec)
+            if thumb_rel_path:
+                prev = track_best_thumb.get(track_id)
+                score = quality
+                if not prev or score > prev[0]:
+                    track_best_thumb[track_id] = (score, thumb_rel_path, thumb_s3_key)
 
             face_row = {
                 "ep_id": args.ep_id,
-                "face_id": f"face_{sample['track_id']:04d}_{sample['frame_idx']:06d}",
-                "track_id": sample["track_id"],
-                "frame_idx": sample["frame_idx"],
-                "ts": round(float(sample["ts"]), 4),
-                "bbox_xyxy": [round(float(val), 4) for val in sample["bbox_xyxy"]],
-                "embedding": _fake_embedding(sample["track_id"], sample["frame_idx"]),
+                "face_id": f"face_{track_id:04d}_{frame_idx:06d}",
+                "track_id": track_id,
+                "frame_idx": frame_idx,
+                "ts": ts_val,
+                "bbox_xyxy": bbox,
+                "conf": round(float(conf), 4),
+                "quality": round(float(quality), 4),
+                "embedding": embedding_vec.tolist(),
+                "embedding_model": ARC_FACE_MODEL_NAME,
+                "detector": detector_choice,
                 "pipeline_ver": PIPELINE_VERSION,
             }
             if crop_rel_path:
                 face_row["crop_rel_path"] = crop_rel_path
             if crop_s3_key:
                 face_row["crop_s3_key"] = crop_s3_key
+            if thumb_rel_path:
+                face_row["thumb_rel_path"] = thumb_rel_path
+            if thumb_s3_key:
+                face_row["thumb_s3_key"] = thumb_s3_key
+            if landmarks:
+                face_row["landmarks"] = [round(float(val), 4) for val in landmarks]
             rows.append(face_row)
-            progress.emit(idx, phase="faces_embed", device=device)
+            progress.emit(idx, phase="faces_embed", device=device, detector=detector_choice)
 
         _write_jsonl(faces_path, rows)
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter)
+        embed_path = _faces_embed_path(args.ep_id)
+        if embeddings_array:
+            np.save(embed_path, np.vstack(embeddings_array))
+        else:
+            np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
+
+        _update_track_embeddings(track_path, track_embeddings, track_best_thumb)
+
+        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
         summary: Dict[str, Any] = {
             "stage": "faces_embed",
             "ep_id": args.ep_id,
             "faces": len(rows),
             "device": device,
-            "crops_exported": exporter.crops_written if exporter else 0,
+            "detector": detector_choice,
+            "frames_exported": exporter.frames_written if exporter and exporter.save_frames else 0,
+            "crops_exported": exporter.crops_written if exporter and exporter.save_crops else 0,
             "artifacts": {
                 "local": {
                     "faces": str(faces_path),
                     "tracks": str(track_path),
                     "manifests_dir": str(manifests_dir),
+                    "frames_dir": str(exporter.frames_dir) if exporter and exporter.save_frames else None,
+                    "crops_dir": str(exporter.crops_dir) if exporter and exporter.save_crops else None,
+                    "thumbs_dir": str(thumb_writer.root_dir),
+                    "faces_embeddings": str(embed_path),
                 },
                 "s3_prefixes": s3_prefixes,
                 "s3_uploads": s3_stats,
             },
             "stats": {"faces": len(rows)},
         }
-        progress.complete(summary, device=device)
+        progress.complete(summary, device=device, detector=detector_choice)
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -916,6 +1596,38 @@ def _run_faces_embed_stage(
     finally:
         if frame_decoder:
             frame_decoder.close()
+
+
+def _update_track_embeddings(
+    track_path: Path,
+    track_embeddings: Dict[int, List[np.ndarray]],
+    track_best_thumb: Dict[int, tuple[float, str, str | None]],
+) -> None:
+    if not track_path.exists():
+        return
+    rows = list(_iter_jsonl(track_path))
+    updated: List[dict] = []
+    for row in rows:
+        track_id = int(row.get("track_id", -1))
+        embeds = track_embeddings.get(track_id)
+        if embeds:
+            stacked = np.vstack(embeds)
+            mean_vec = stacked.mean(axis=0)
+            norm = np.linalg.norm(mean_vec)
+            if norm > 0:
+                mean_vec = mean_vec / norm
+            row["faces_count"] = len(embeds)
+            row["face_embedding"] = mean_vec.tolist()
+            row["face_embedding_model"] = ARC_FACE_MODEL_NAME
+        thumb_info = track_best_thumb.get(track_id)
+        if thumb_info:
+            _, rel_path, s3_key = thumb_info
+            row["thumb_rel_path"] = rel_path
+            if s3_key:
+                row["thumb_s3_key"] = s3_key
+        updated.append(row)
+    if updated:
+        _write_jsonl(track_path, updated)
 
 
 def _run_cluster_stage(
@@ -931,6 +1643,11 @@ def _run_cluster_stage(
     faces_rows = list(_iter_jsonl(faces_path))
     if not faces_rows:
         raise RuntimeError("faces.jsonl is empty; cannot cluster")
+    track_path = get_path(args.ep_id, "tracks")
+    if not track_path.exists():
+        raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
+    track_rows = list(_iter_jsonl(track_path))
+    detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
 
     progress = ProgressEmitter(
         args.ep_id,
@@ -942,46 +1659,84 @@ def _run_cluster_stage(
         fps_requested=None,
     )
     device = pick_device(args.device)
-    progress.emit(0, phase="cluster", device=device, force=True)
+    progress.emit(0, phase="cluster", device=device, detector=detector_choice, force=True)
 
-    faces_by_track: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for idx, row in enumerate(faces_rows, start=1):
+    embedding_rows: List[np.ndarray] = []
+    track_ids: List[int] = []
+    track_index: Dict[int, dict] = {}
+    for row in track_rows:
         track_id = int(row.get("track_id", -1))
-        faces_by_track[track_id].append(row)
-        progress.emit(idx, phase="cluster", device=device)
+        embed = row.get("face_embedding")
+        if embed:
+            embedding_rows.append(np.asarray(embed, dtype="float32"))
+            track_ids.append(track_id)
+            track_index[track_id] = row
+    if not embedding_rows:
+        raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
-    identities = _build_identity_clusters(faces_by_track, s3_prefixes)
+    labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
+    track_groups: Dict[int, List[int]] = defaultdict(list)
+    for tid, label in zip(track_ids, labels):
+        track_groups[label].append(tid)
+
+    min_cluster = max(1, int(args.min_cluster_size))
+    identity_payload: List[dict] = []
+    thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
+    counter = 1
+    for label, tids in track_groups.items():
+        buckets = [tids]
+        if len(tids) < min_cluster:
+            buckets = [[tid] for tid in tids]
+        for bucket in buckets:
+            identity_id = f"id_{counter:04d}"
+            faces_total = sum(int(track_index.get(tid, {}).get("faces_count", 0)) for tid in bucket)
+            rep_track_id = max(bucket, key=lambda tid: track_index.get(tid, {}).get("faces_count", 0))
+            rep_rel, rep_s3 = _materialize_identity_thumb(thumb_root, track_index.get(rep_track_id), identity_id, s3_prefixes)
+            identity_payload.append(
+                {
+                    "identity_id": identity_id,
+                    "label": None,
+                    "track_ids": bucket,
+                    "size": faces_total,
+                    "rep_thumb_rel_path": rep_rel,
+                    "rep_thumb_s3_key": rep_s3,
+                }
+            )
+            counter += 1
+            progress.emit(counter, phase="cluster", device=device, detector=detector_choice)
+
     identities_path = manifests_dir / "identities.json"
     payload = {
         "ep_id": args.ep_id,
         "pipeline_ver": PIPELINE_VERSION,
         "stats": {
             "faces": len(faces_rows),
-            "clusters": len(identities),
+            "clusters": len(identity_payload),
         },
-        "identities": identities,
+        "identities": identity_payload,
     }
     identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None)
+    s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
 
     summary: Dict[str, Any] = {
         "stage": "cluster",
         "ep_id": args.ep_id,
-        "identities_count": len(identities),
+        "identities_count": len(identity_payload),
         "faces_count": len(faces_rows),
         "device": device,
+        "detector": detector_choice,
         "artifacts": {
             "local": {
                 "faces": str(faces_path),
                 "identities": str(identities_path),
-                "manifests_dir": str(manifests_dir),
+                "tracks": str(track_path),
             },
             "s3_prefixes": s3_prefixes,
             "s3_uploads": s3_stats,
         },
         "stats": payload["stats"],
     }
-    progress.complete(summary, device=device)
+    progress.complete(summary, device=device, detector=detector_choice)
     return summary
 
 
@@ -1017,15 +1772,77 @@ def _load_track_samples(track_path: Path) -> List[Dict[str, Any]]:
             bbox = sample.get("bbox_xyxy") or [0, 0, 10, 10]
             if not isinstance(bbox, list) or len(bbox) != 4:
                 bbox = [0, 0, 10, 10]
-            samples.append(
-                {
-                    "track_id": track_id,
-                    "frame_idx": frame_idx,
-                    "ts": ts,
-                    "bbox_xyxy": [float(val) for val in bbox],
-                }
-            )
+            row = {
+                "track_id": track_id,
+                "frame_idx": frame_idx,
+                "ts": ts,
+                "bbox_xyxy": [float(val) for val in bbox],
+            }
+            landmarks = sample.get("landmarks")
+            if isinstance(landmarks, list) and landmarks:
+                row["landmarks"] = [float(val) for val in landmarks]
+            samples.append(row)
     return samples
+
+
+def _infer_detector_from_tracks(track_path: Path) -> str | None:
+    if not track_path.exists():
+        return None
+    try:
+        with track_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                detector = row.get("detector")
+                if detector:
+                    return str(detector)
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
+    if matrix.shape[0] == 1:
+        return np.array([0], dtype=int)
+    from sklearn.cluster import AgglomerativeClustering
+
+    distance_threshold = max(float(threshold or 0.6), 0.01)
+    model = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=distance_threshold,
+    )
+    return model.fit_predict(matrix)
+
+
+def _materialize_identity_thumb(
+    thumb_root: Path,
+    track_row: dict | None,
+    identity_id: str,
+    s3_prefixes: Dict[str, str] | None,
+) -> tuple[str | None, str | None]:
+    if not track_row:
+        return None, None
+    rel = track_row.get("thumb_rel_path")
+    if not rel:
+        return None, None
+    source = thumb_root / rel
+    if not source.exists():
+        return None, None
+    dest_rel = Path("identities") / identity_id / "rep.jpg"
+    dest = thumb_root / dest_rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(source, dest)
+    s3_key = None
+    if s3_prefixes and s3_prefixes.get("thumbs_identities"):
+        s3_key = f"{s3_prefixes['thumbs_identities']}{identity_id}/rep.jpg"
+    return dest_rel.as_posix(), s3_key
 
 
 def _fake_embedding(track_id: int, frame_idx: int, length: int = 8) -> List[float]:

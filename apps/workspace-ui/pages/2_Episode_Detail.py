@@ -22,6 +22,30 @@ st.title("Episode Detail")
 
 
 
+def _handle_missing_episode(ep_id: str) -> None:
+    st.warning("Episode not tracked yet.")
+    parsed = helpers.parse_ep_id(ep_id)
+    if not parsed:
+        st.info("Unable to parse show/season/episode. Use the S3 browser to create it.")
+        st.stop()
+    payload = {
+        "ep_id": ep_id,
+        "show_slug": str(parsed["show"]).lower(),
+        "season": int(parsed["season"]),
+        "episode": int(parsed["episode"]),
+    }
+    if st.button("Create episode in store", key="episode_detail_create"):
+        try:
+            helpers.api_post("/episodes/upsert_by_id", payload)
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/upsert_by_id", exc))
+        else:
+            st.success("Episode tracked. Reloading…")
+            helpers.set_ep_id(ep_id)
+            st.rerun()
+    st.stop()
+
+
 
 def _prompt_for_episode() -> None:
     try:
@@ -47,12 +71,30 @@ def _prompt_for_episode() -> None:
 ep_id = helpers.get_ep_id()
 if not ep_id:
     _prompt_for_episode()
+ep_id = ep_id.strip()
+canonical_ep_id = ep_id.lower()
+if canonical_ep_id != ep_id:
+    helpers.set_ep_id(canonical_ep_id)
+    st.stop()
+ep_id = canonical_ep_id
 
 try:
     details = helpers.api_get(f"/episodes/{ep_id}")
+except requests.HTTPError as exc:
+    if exc.response is not None and exc.response.status_code == 404:
+        _handle_missing_episode(ep_id)
+    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
+    st.stop()
 except requests.RequestException as exc:
     st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
     st.stop()
+
+prefixes = helpers.episode_artifact_prefixes(ep_id)
+bucket_name = cfg.get("bucket")
+tracks_path = get_path(ep_id, "tracks")
+manifests_dir = get_path(ep_id, "detections").parent
+faces_path = manifests_dir / "faces.jsonl"
+identities_path = manifests_dir / "identities.json"
 
 st.subheader(f"Episode `{ep_id}`")
 st.write(
@@ -69,6 +111,13 @@ if not details["s3"]["v2_exists"] and details["s3"]["v1_exists"]:
 st.write(
     f"Local → {helpers.link_local(details['local']['path'])} (exists={details['local']['exists']})"
 )
+if prefixes:
+    st.caption(
+        "S3 artifacts → "
+        f"Frames {helpers.s3_uri(prefixes['frames'], bucket_name)} | "
+        f"Crops {helpers.s3_uri(prefixes['crops'], bucket_name)} | "
+        f"Manifests {helpers.s3_uri(prefixes['manifests'], bucket_name)}"
+    )
 
 col_hydrate, col_detect = st.columns(2)
 with col_hydrate:
@@ -93,10 +142,63 @@ with col_detect:
         index=helpers.device_label_index(default_device_label),
     )
     device_value = helpers.DEVICE_VALUE_MAP[device_choice]
+    detector_map = {
+        "Face (YOLOv8-face, recommended)": "face",
+        "Person (legacy person detector)": "person",
+    }
+    detector_label = st.selectbox("Detector", list(detector_map.keys()), index=0)
+    detector_value = detector_map[detector_label]
+    tracker_map = {
+        "StrongSORT (ReID)": "strongsort",
+        "ByteTrack (fast)": "bytetrack",
+    }
+    tracker_label = st.selectbox("Tracker", list(tracker_map.keys()), index=0)
+    tracker_value = tracker_map[tracker_label]
+    if detector_value == "person":
+        st.warning("Higher risk of ID switches; prefer the face detector when possible.")
     save_frames = st.checkbox("Save frames to S3", value=False)
     save_crops = st.checkbox("Save face crops to S3", value=False)
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
-    if st.button("Run detect/track", use_container_width=True):
+    with st.expander("Advanced tracking gates", expanded=False):
+        conf_face = st.slider(
+            "Face confidence",
+            min_value=0.1,
+            max_value=0.95,
+            value=0.5,
+            step=0.05,
+            disabled=detector_value != "face",
+        )
+        min_face_px = st.number_input(
+            "Min face size (px)",
+            min_value=32,
+            max_value=512,
+            value=64,
+            step=4,
+            disabled=detector_value != "face",
+        )
+        ratio_min = st.number_input(
+            "Min ratio (width/height)",
+            min_value=0.3,
+            max_value=1.5,
+            value=0.75,
+            step=0.05,
+            disabled=detector_value != "face",
+        )
+        ratio_max = st.number_input(
+            "Max ratio (width/height)",
+            min_value=0.6,
+            max_value=3.0,
+            value=1.5,
+            step=0.05,
+            disabled=detector_value != "face",
+        )
+        max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=30, step=1)
+    invalid_ratio = detector_value == "face" and ratio_max <= ratio_min
+    run_disabled = invalid_ratio
+    run_label = "Run detect/track"
+    if run_disabled:
+        st.error("Face ratio max must be greater than min.")
+    if st.button(run_label, use_container_width=True, disabled=run_disabled):
         job_payload: Dict[str, Any] = {
             "ep_id": ep_id,
             "stub": bool(stub_toggle),
@@ -105,10 +207,22 @@ with col_detect:
             "save_frames": bool(save_frames),
             "save_crops": bool(save_crops),
             "jpeg_quality": int(jpeg_quality),
+            "detector": detector_value,
+            "tracker": tracker_value,
+            "max_gap": int(max_gap_value),
         }
+        if detector_value == "face":
+            job_payload["conf_face"] = float(conf_face)
+            job_payload["min_face"] = int(min_face_px)
+            job_payload["ratio_face"] = [round(float(ratio_min), 3), round(float(ratio_max), 3)]
+        else:
+            job_payload["conf_face"] = None
+            job_payload["min_face"] = None
+            job_payload["ratio_face"] = None
         if fps_value > 0:
             job_payload["fps"] = fps_value
-        mode_label = "stub (no ML)" if stub_toggle else "YOLOv8 + ByteTrack"
+        tracker_human = tracker_label if not stub_toggle else ""
+        mode_label = "stub (no ML)" if stub_toggle else f"{detector_label.split('(')[0].strip()} + {tracker_human}"
         with st.spinner(f"Running detect/track ({mode_label})…"):
             summary, error_message = helpers.run_job_with_progress(
                 ep_id,
@@ -134,12 +248,27 @@ with col_detect:
             if crops_exported:
                 details_line.append(f"crops exported: {crops_exported:,}")
             st.success("Completed · " + " · ".join(details_line))
-            prefixes = helpers.episode_artifact_prefixes(ep_id)
-            if prefixes:
+            metrics = normalized.get("metrics") or {}
+            if metrics:
+                st.markdown("**Track quality**")
+                stat_cols = st.columns(3)
+                stat_cols[0].metric("tracks born", metrics.get("tracks_born", 0))
+                stat_cols[1].metric("tracks lost", metrics.get("tracks_lost", 0))
+                stat_cols[2].metric("ID switches", metrics.get("id_switches", 0))
+                longest = metrics.get("longest_tracks") or []
+                if longest:
+                    for entry in longest:
+                        label = f"Track {entry.get('track_id')} · {entry.get('frame_count', 0)} frames"
+                        if entry.get("frame_count", 0) >= 500:
+                            st.warning(label)
+                        else:
+                            st.caption(label)
+            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+            if s3_prefixes:
                 st.markdown("**S3 artifact prefixes**")
-                st.code(prefixes["frames"])
-                st.code(prefixes["crops"])
-                st.code(prefixes["manifests"])
+                st.code(helpers.s3_uri(s3_prefixes.get("frames"), bucket_name))
+                st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
+                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
             action_col1, action_col2 = st.columns(2)
             with action_col1:
                 st.button(
@@ -154,6 +283,9 @@ with col_detect:
                     on_click=lambda: helpers.try_switch_page("pages/4_Screentime.py"),
                 )
 
+tracks_ready = tracks_path.exists()
+faces_ready = faces_path.exists()
+
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
     st.markdown("### Faces Harvest")
@@ -165,6 +297,7 @@ with col_faces:
         key="faces_device_choice",
     )
     faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
+    faces_save_frames = st.checkbox("Save sampled frames", value=False, key="faces_save_frames_detail")
     faces_save_crops = st.checkbox("Save face crops to S3", value=True, key="faces_save_crops_detail")
     faces_jpeg_quality = st.number_input(
         "JPEG quality",
@@ -174,11 +307,14 @@ with col_faces:
         step=5,
         key="faces_jpeg_quality_detail",
     )
-    if st.button("Run Faces Harvest", use_container_width=True):
+    if not tracks_ready:
+        st.caption("Run detect/track first.")
+    if st.button("Run Faces Harvest", use_container_width=True, disabled=not tracks_ready):
         payload = {
             "ep_id": ep_id,
             "stub": bool(faces_stub),
             "device": faces_device_value,
+            "save_frames": bool(faces_save_frames),
             "save_crops": bool(faces_save_crops),
             "jpeg_quality": int(faces_jpeg_quality),
         }
@@ -191,7 +327,10 @@ with col_faces:
                 async_endpoint="/jobs/faces_embed_async",
             )
         if error_message:
-            st.error(error_message)
+            if "tracks.jsonl" in error_message.lower():
+                st.error("Run detect/track first.")
+            else:
+                st.error(error_message)
         else:
             normalized = helpers.normalize_summary(ep_id, summary)
             faces_count = normalized.get("faces")
@@ -202,11 +341,11 @@ with col_faces:
             if crops_exported:
                 details.append(f"crops exported: {crops_exported:,}")
             st.success("Faces harvest complete" + (" · " + ", ".join(details) if details else ""))
-            prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or helpers.episode_artifact_prefixes(ep_id)
-            if prefixes:
+            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+            if s3_prefixes:
                 st.markdown("**S3 prefixes**")
-                st.code(prefixes.get("crops"))
-                st.code(prefixes.get("manifests"))
+                st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
+                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
             st.button(
                 "Open Faces Review",
                 use_container_width=True,
@@ -222,7 +361,9 @@ with col_cluster:
         key="cluster_device_choice",
     )
     cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
-    if st.button("Run Cluster", use_container_width=True):
+    if not faces_ready:
+        st.caption("Run faces harvest first.")
+    if st.button("Run Cluster", use_container_width=True, disabled=not faces_ready):
         payload = {
             "ep_id": ep_id,
             "stub": bool(cluster_stub),
@@ -237,7 +378,10 @@ with col_cluster:
                 async_endpoint="/jobs/cluster_async",
             )
         if error_message:
-            st.error(error_message)
+            if "faces.jsonl" in error_message.lower():
+                st.error("Run faces harvest first.")
+            else:
+                st.error(error_message)
         else:
             normalized = helpers.normalize_summary(ep_id, summary)
             identities_count = normalized.get("identities")
@@ -248,10 +392,10 @@ with col_cluster:
             if isinstance(faces_count, int):
                 details.append(f"faces: {faces_count:,}")
             st.success("Clustering complete" + (" · " + ", ".join(details) if details else ""))
-            prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or helpers.episode_artifact_prefixes(ep_id)
-            if prefixes:
+            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+            if s3_prefixes:
                 st.markdown("**Manifests prefix**")
-                st.code(prefixes.get("manifests"))
+                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
             st.button(
                 "Go to Facebank",
                 use_container_width=True,
@@ -272,12 +416,11 @@ st.write(f"Detections → {helpers.link_local(get_path(ep_id, 'detections'))}")
 st.write(f"Tracks → {helpers.link_local(get_path(ep_id, 'tracks'))}")
 prefixes = helpers.episode_artifact_prefixes(ep_id)
 if prefixes:
-    st.write(f"S3 Frames → `{prefixes['frames']}`")
-    st.write(f"S3 Crops → `{prefixes['crops']}`")
-    st.write(f"S3 Manifests → `{prefixes['manifests']}`")
-manifests_dir = helpers.DATA_ROOT / "manifests" / ep_id
-st.write(f"Faces → {helpers.link_local(manifests_dir / 'faces.jsonl')}")
-st.write(f"Identities → {helpers.link_local(manifests_dir / 'identities.json')}")
+    st.write(f"S3 Frames → `{helpers.s3_uri(prefixes['frames'], bucket_name)}`")
+    st.write(f"S3 Crops → `{helpers.s3_uri(prefixes['crops'], bucket_name)}`")
+    st.write(f"S3 Manifests → `{helpers.s3_uri(prefixes['manifests'], bucket_name)}`")
+st.write(f"Faces → {helpers.link_local(faces_path)}")
+st.write(f"Identities → {helpers.link_local(identities_path)}")
 analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
 st.write(f"Screentime (json) → {helpers.link_local(analytics_dir / 'screentime.json')}")
 st.write(f"Screentime (csv) → {helpers.link_local(analytics_dir / 'screentime.csv')}")

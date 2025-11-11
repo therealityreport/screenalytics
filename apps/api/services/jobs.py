@@ -17,6 +17,7 @@ from py_screenalytics.artifacts import ensure_dirs, get_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+DETECTOR_CHOICES = {"retinaface", "yolov8face"}
 
 JobRecord = Dict[str, Any]
 
@@ -138,9 +139,12 @@ class JobService:
         save_frames: bool,
         save_crops: bool,
         jpeg_quality: int,
+        detector: str,
+        max_gap: int | None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
+        detector_value = self._normalize_detector(detector)
         progress_path = self._progress_path(ep_id)
         command = [
             sys.executable,
@@ -167,6 +171,9 @@ class JobService:
         jpeg_quality = max(1, min(int(jpeg_quality), 100))
         if jpeg_quality != 85:
             command += ["--jpeg-quality", str(jpeg_quality)]
+        command += ["--detector", detector_value]
+        if max_gap is not None:
+            command += ["--max-gap", str(max_gap)]
         requested = {
             "stride": stride,
             "fps": fps,
@@ -175,6 +182,8 @@ class JobService:
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
+            "detector": detector_value,
+            "max_gap": max_gap,
         }
         return self._launch_job(
             job_type="detect_track",
@@ -190,8 +199,10 @@ class JobService:
         ep_id: str,
         stub: bool,
         device: str,
+        save_frames: bool,
         save_crops: bool,
         jpeg_quality: int,
+        thumb_size: int,
     ) -> JobRecord:
         track_path = get_path(ep_id, "tracks")
         if not track_path.exists():
@@ -210,16 +221,21 @@ class JobService:
         ]
         if stub:
             command.append("--stub")
+        if save_frames:
+            command.append("--save-frames")
         if save_crops:
             command.append("--save-crops")
         jpeg_quality = max(1, min(int(jpeg_quality), 100))
         if jpeg_quality != 85:
             command += ["--jpeg-quality", str(jpeg_quality)]
+        command += ["--thumb-size", str(thumb_size)]
         requested = {
             "stub": stub,
             "device": device,
+            "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
+            "thumb_size": thumb_size,
         }
         return self._launch_job(
             job_type="faces_embed",
@@ -235,6 +251,8 @@ class JobService:
         ep_id: str,
         stub: bool,
         device: str,
+        cluster_thresh: float,
+        min_cluster_size: int,
     ) -> JobRecord:
         manifests_dir = get_path(ep_id, "detections").parent
         faces_path = manifests_dir / "faces.jsonl"
@@ -254,7 +272,14 @@ class JobService:
         ]
         if stub:
             command.append("--stub")
-        requested = {"stub": stub, "device": device}
+        command += ["--cluster-thresh", str(cluster_thresh)]
+        command += ["--min-cluster-size", str(min_cluster_size)]
+        requested = {
+            "stub": stub,
+            "device": device,
+            "cluster_thresh": cluster_thresh,
+            "min_cluster_size": min_cluster_size,
+        }
         return self._launch_job(
             job_type="cluster",
             ep_id=ep_id,
@@ -326,6 +351,12 @@ class JobService:
                 record["summary"] = progress_data
 
         return self._mutate_job(job_id, _apply)
+
+    def _normalize_detector(self, detector: str | None) -> str:
+        value = (detector or "").strip().lower()
+        if value not in DETECTOR_CHOICES:
+            raise ValueError(f"Unsupported detector '{detector}'")
+        return value
 
 
 __all__ = ["JobService", "JobNotFoundError", "JobRecord"]

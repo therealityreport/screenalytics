@@ -23,6 +23,7 @@ from apps.api.services.storage import artifact_prefixes, episode_context_from_id
 
 router = APIRouter()
 JOB_SERVICE = JobService()
+DETECTOR_CHOICES = {"retinaface", "yolov8face"}
 
 
 class DetectRequest(BaseModel):
@@ -47,20 +48,32 @@ class DetectTrackRequest(BaseModel):
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
     save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
+    detector: str = Field("retinaface", description="Face detector backend (retinaface or yolov8face)")
+    max_gap: int | None = Field(30, ge=1, description="Frame gap before forcing a new track")
 
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stub: bool = Field(True, description="Use stub faces pipeline")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
+        None,
+        description="Execution device (defaults to server auto-detect)",
+    )
+    save_frames: bool = Field(False, description="Export sampled frames alongside crops")
     save_crops: bool = Field(False, description="Export crops to data/frames + S3")
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for face crops")
+    thumb_size: int = Field(256, ge=64, le=512, description="Square thumbnail size")
 
 
 class ClusterRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stub: bool = Field(True, description="Use stub clustering pipeline")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
+        None,
+        description="Execution device (defaults to server auto-detect)",
+    )
+    cluster_thresh: float = Field(0.6, gt=0.0, le=1.0, description="Cosine distance threshold for clustering")
+    min_cluster_size: int = Field(2, ge=1, description="Minimum tracks per identity")
 
 
 def _artifact_summary(ep_id: str) -> dict:
@@ -87,7 +100,19 @@ def _progress_file_path(ep_id: str) -> Path:
     return manifests_dir / "progress.json"
 
 
-def _build_detect_track_command(req: DetectTrackRequest, video_path: Path, progress_path: Path) -> List[str]:
+def _normalize_detector(detector: str | None) -> str:
+    value = (detector or "").strip().lower()
+    if value not in DETECTOR_CHOICES:
+        raise HTTPException(status_code=400, detail=f"Unsupported detector '{detector}'")
+    return value
+
+
+def _build_detect_track_command(
+    req: DetectTrackRequest,
+    video_path: Path,
+    progress_path: Path,
+    detector_value: str,
+) -> List[str]:
     command: List[str] = [
         sys.executable,
         str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -112,10 +137,14 @@ def _build_detect_track_command(req: DetectTrackRequest, video_path: Path, progr
         command.append("--save-crops")
     if req.jpeg_quality and req.jpeg_quality != 85:
         command += ["--jpeg-quality", str(req.jpeg_quality)]
+    command += ["--detector", detector_value]
+    if req.max_gap:
+        command += ["--max-gap", str(req.max_gap)]
     return command
 
 
 def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[str]:
+    device_value = req.device or "auto"
     command: List[str] = [
         sys.executable,
         str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -123,12 +152,14 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         req.ep_id,
         "--faces-embed",
         "--device",
-        req.device,
+        device_value,
         "--progress-file",
         str(progress_path),
     ]
     if req.stub:
         command.append("--stub")
+    if req.save_frames:
+        command.append("--save-frames")
     if req.save_crops:
         command.append("--save-crops")
     if req.jpeg_quality and req.jpeg_quality != 85:
@@ -137,6 +168,7 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
 
 
 def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str]:
+    device_value = req.device or "auto"
     command: List[str] = [
         sys.executable,
         str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -144,12 +176,14 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
         req.ep_id,
         "--cluster",
         "--device",
-        req.device,
+        device_value,
         "--progress-file",
         str(progress_path),
     ]
     if req.stub:
         command.append("--stub")
+    command += ["--cluster-thresh", str(req.cluster_thresh)]
+    command += ["--min-cluster-size", str(req.min_cluster_size)]
     return command
 
 
@@ -312,12 +346,13 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
     video_path = Path(artifacts["video"])
     if not video_path.exists():
         raise HTTPException(status_code=400, detail="Episode video not uploaded yet.")
+    detector_value = _normalize_detector(req.detector)
     progress_path = _progress_file_path(req.ep_id)
     try:
         progress_path.unlink()
     except FileNotFoundError:
         pass
-    command = _build_detect_track_command(req, video_path, progress_path)
+    command = _build_detect_track_command(req, video_path, progress_path, detector_value)
     result = _run_job_with_optional_sse(command, request)
     if isinstance(result, StreamingResponse):
         return result
@@ -331,6 +366,7 @@ def run_detect_track(req: DetectTrackRequest, request: Request):
         "command": command,
         "stub": req.stub,
         "device": req.device,
+        "detector": detector_value,
         "detections_count": detections_count,
         "tracks_count": tracks_count,
         "artifacts": artifacts,
@@ -352,6 +388,7 @@ def run_faces_embed(req: FacesEmbedRequest, request: Request):
     manifests_dir = get_path(req.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     faces_count = _count_lines(faces_path)
+    frames_dir = get_path(req.ep_id, "frames_root") / "frames"
     return {
         "job": "faces_embed",
         "ep_id": req.ep_id,
@@ -359,6 +396,7 @@ def run_faces_embed(req: FacesEmbedRequest, request: Request):
         "artifacts": {
             "faces": str(faces_path),
             "tracks": str(track_path),
+            "frames": str(frames_dir) if req.save_frames else None,
             "s3_prefixes": _s3_prefixes(req.ep_id),
         },
         "progress_file": str(progress_path),
@@ -408,6 +446,7 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
     if not video_path.exists():
         raise HTTPException(status_code=400, detail="Episode video not uploaded yet.")
     fps_value = req.fps if req.fps and req.fps > 0 else None
+    detector_value = _normalize_detector(req.detector)
     try:
         job = JOB_SERVICE.start_detect_track_job(
             ep_id=req.ep_id,
@@ -419,6 +458,8 @@ def enqueue_detect_track_async(req: DetectTrackRequest) -> dict:
             save_frames=req.save_frames,
             save_crops=req.save_crops,
             jpeg_quality=req.jpeg_quality,
+            detector=detector_value,
+            max_gap=req.max_gap,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -439,9 +480,11 @@ def enqueue_faces_embed_async(req: FacesEmbedRequest) -> dict:
         job = JOB_SERVICE.start_faces_embed_job(
             ep_id=req.ep_id,
             stub=req.stub,
-            device=req.device,
+            device=req.device or "auto",
+            save_frames=req.save_frames,
             save_crops=req.save_crops,
             jpeg_quality=req.jpeg_quality,
+            thumb_size=req.thumb_size,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -461,7 +504,9 @@ def enqueue_cluster_async(req: ClusterRequest) -> dict:
         job = JOB_SERVICE.start_cluster_job(
             ep_id=req.ep_id,
             stub=req.stub,
-            device=req.device,
+            device=req.device or "auto",
+            cluster_thresh=req.cluster_thresh,
+            min_cluster_size=req.min_cluster_size,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

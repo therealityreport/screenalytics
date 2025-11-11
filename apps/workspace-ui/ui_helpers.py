@@ -4,17 +4,27 @@ import os
 import re
 import json
 import time
+import html
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DEFAULT_STRIDE = 5
+DEFAULT_STRIDE = 3
 DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
 DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
+DETECTOR_OPTIONS = [
+    ("RetinaFace (default, higher quality)", "retinaface"),
+    ("YOLOv8-face (fast)", "yolov8face"),
+]
+DETECTOR_LABELS = [label for label, _ in DETECTOR_OPTIONS]
+DETECTOR_VALUE_MAP = {label: value for label, value in DETECTOR_OPTIONS}
+DETECTOR_LABEL_MAP = {value: label for label, value in DETECTOR_OPTIONS}
+FACE_ONLY_DETECTORS = {"retinaface", "yolov8face"}
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 
 
@@ -65,6 +75,7 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
 
     if "device_default_label" not in st.session_state:
         st.session_state["device_default_label"] = _guess_device_label()
+    st.session_state.setdefault("detector_choice", "retinaface")
 
     sidebar = st.sidebar
     sidebar.header("API")
@@ -161,6 +172,34 @@ def device_label_index(label: str) -> int:
         return 0
 
 
+def detector_default_value() -> str:
+    return st.session_state.get("detector_choice", "retinaface")
+
+
+def detector_label_index(value: str | None) -> int:
+    label = DETECTOR_LABEL_MAP.get(str(value).lower())
+    if label in DETECTOR_LABELS:
+        return DETECTOR_LABELS.index(label)
+    return 0
+
+
+def detector_label_from_value(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    value = value.lower()
+    return DETECTOR_LABEL_MAP.get(value, value)
+
+
+def set_detector_choice(value: str) -> None:
+    if value in FACE_ONLY_DETECTORS:
+        st.session_state["detector_choice"] = value
+
+
+def remember_detector(value: str | None) -> None:
+    if value and value in FACE_ONLY_DETECTORS:
+        st.session_state["detector_choice"] = value
+
+
 def _guess_device_label() -> str:
     try:
         import torch  # type: ignore
@@ -186,6 +225,43 @@ def parse_ep_id(ep_id: str) -> Optional[Dict[str, int | str]]:
     except ValueError:
         return None
     return {"show": show, "season": season, "episode": episode}
+
+
+def _manifest_path(ep_id: str, filename: str) -> Path:
+    return DATA_ROOT / "manifests" / ep_id / filename
+
+
+def tracks_detector_value(ep_id: str) -> str | None:
+    path = _manifest_path(ep_id, "tracks.jsonl")
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                detector = payload.get("detector")
+                if detector:
+                    return str(detector).lower()
+    except OSError:
+        return None
+    return None
+
+
+def detector_is_face_only(ep_id: str) -> bool:
+    detector = tracks_detector_value(ep_id)
+    if detector is None:
+        return True
+    return detector.lower() in FACE_ONLY_DETECTORS
+
+
+def tracks_detector_label(ep_id: str) -> str:
+    return detector_label_from_value(tracks_detector_value(ep_id))
 
 
 def try_switch_page(page_path: str) -> None:
@@ -287,6 +363,7 @@ def update_progress_display(
     status_placeholder,
     detail_placeholder,
     requested_device: str,
+    requested_detector: str | None,
 ) -> None:
     ratio = progress_ratio(progress)
     progress_bar.progress(ratio)
@@ -294,10 +371,12 @@ def update_progress_display(
     secs_done = progress.get("secs_done") or progress.get("elapsed_sec")
     phase = progress.get("phase") or "detect"
     device_label = progress.get("device") or requested_device
+    raw_detector = progress.get("detector") or requested_detector
+    detector_label = detector_label_from_value(raw_detector) if raw_detector else "--"
     fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
     status_placeholder.write(
-        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • phase={phase} • device={device_label} • fps={fps_text}"
+        f"{format_mmss(secs_done)} / {format_mmss(secs_total)} • phase={phase} • detector={detector_label} • device={device_label} • fps={fps_text}"
     )
     detail_placeholder.caption(
         f"Frames {progress.get('frames_done', 0):,} / {progress.get('frames_total') or '?'}"
@@ -365,7 +444,7 @@ def fallback_poll_progress(
         try:
             resp = requests.get(progress_url, timeout=5)
             if resp.status_code == 404:
-                status_placeholder.info("Initializing…")
+                status_placeholder.info("initializing...")
                 time.sleep(0.5)
                 continue
             resp.raise_for_status()
@@ -407,6 +486,58 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
     return summary
 
 
+def letterbox_thumb_url(url: str | None, size: int = 256) -> str | None:
+    """Placeholder hook for thumbnail sizing (S3 URLs already return square crops)."""
+
+    return url
+
+
+def identity_card(title: str, subtitle: str, image_url: str | None, extra=None):
+    card = st.container(border=True)
+    with card:
+        if image_url:
+            st.image(image_url, use_column_width=True)
+        st.markdown(f"**{title}**")
+        if subtitle:
+            st.caption(subtitle)
+        if extra:
+            extra()
+    return card
+
+
+def track_card(title: str, caption: str, image_url: str | None, extra=None):
+    card = st.container(border=True)
+    with card:
+        if image_url:
+            st.image(image_url, use_column_width=True)
+        st.markdown(f"**{title}**")
+        st.caption(caption)
+        if extra:
+            extra()
+    return card
+
+
+def frame_card(title: str, image_url: str | None, extra=None):
+    card = st.container(border=True)
+    with card:
+        if image_url:
+            st.image(image_url, use_column_width=True)
+        st.caption(title)
+        if extra:
+            extra()
+    return card
+
+
+def s3_uri(prefix: str | None, bucket: str | None = None) -> str:
+    if not prefix:
+        return ""
+    bucket_name = bucket or st.session_state.get("bucket") or "screenalytics"
+    cleaned = prefix.lstrip("/")
+    if not bucket_name:
+        return cleaned
+    return f"s3://{bucket_name}/{cleaned}"
+
+
 def run_job_with_progress(
     ep_id: str,
     endpoint_path: str,
@@ -414,18 +545,22 @@ def run_job_with_progress(
     *,
     requested_device: str,
     async_endpoint: str | None,
+    requested_detector: str | None = None,
 ):
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
     detail_placeholder = st.empty()
 
     def _cb(progress: Dict[str, Any]) -> None:
+        if progress.get("detector"):
+            remember_detector(progress.get("detector"))
         update_progress_display(
             progress,
             progress_bar=progress_bar,
             status_placeholder=status_placeholder,
             detail_placeholder=detail_placeholder,
             requested_device=requested_device,
+            requested_detector=requested_detector,
         )
 
     summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
@@ -438,4 +573,55 @@ def run_job_with_progress(
             job_started=job_started,
             async_endpoint=async_endpoint,
         )
+    if summary and isinstance(summary, dict):
+        remember_detector(summary.get("detector"))
     return summary, error_message
+
+
+def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_height: int = 200) -> str:
+    rail_id = f"rail-{track_id}"
+    if not items:
+        return (
+            "<div class=\"track-row empty\">"
+            "<span>No frames available for this track yet.</span>"
+            "</div>"
+        )
+    thumbs: List[str] = []
+    for item in items:
+        url = item.get("url")
+        if not url:
+            continue
+        frame_idx = item.get("frame_idx", "?")
+        alt_text = html.escape(f"Track {track_id} frame {frame_idx}")
+        src = html.escape(str(url))
+        thumbs.append(
+            f'<img class="thumb" loading="lazy" src="{src}" alt="{alt_text}" />'
+        )
+    if not thumbs:
+        return (
+            "<div class=\"track-row empty\">"
+            "<span>No frames available for this track yet.</span>"
+            "</div>"
+        )
+    thumb_css = f"height:{thumb_height}px;"
+    thumbs_html = "".join(thumbs)
+    return f"""
+    <style>
+      .track-row {{ display:flex; align-items:center; gap:8px; margin:8px 0; }}
+      .track-row button {{ border:1px solid #d0d7de; border-radius:4px; background:#fff; cursor:pointer; }}
+      .track-row button:focus {{ outline:2px solid #0b5fff; }}
+      .track-row .rail {{ overflow-x:auto; scroll-behavior:smooth; white-space:nowrap; border:1px solid #eee; border-radius:6px; padding:6px; flex:1; }}
+      .track-row .thumb {{ {thumb_css} aspect-ratio:4 / 5; object-fit:cover; display:inline-block; margin-right:6px; }}
+    </style>
+    <div class="track-row">
+      <button class="arrow" onclick="document.getElementById('{rail_id}').scrollBy({{left:-400, behavior:'smooth'}})">&larr;</button>
+      <div id="{rail_id}" class="rail">{thumbs_html}</div>
+      <button class="arrow" onclick="document.getElementById('{rail_id}').scrollBy({{left:400, behavior:'smooth'}})">&rarr;</button>
+    </div>
+    """
+
+
+def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_height: int = 200) -> None:
+    html_block = track_row_html(track_id, items, thumb_height=thumb_height)
+    row_height = thumb_height + 80
+    components.html(html_block, height=row_height, scrolling=False)

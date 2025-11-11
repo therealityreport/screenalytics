@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import sys
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import json
+import re
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -17,11 +19,308 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.storage import StorageService
+from apps.api.services.storage import StorageService, artifact_prefixes, episode_context_from_id
 
 router = APIRouter()
 EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
+
+
+def _manifests_dir(ep_id: str) -> Path:
+    return get_path(ep_id, "detections").parent
+
+
+def _faces_path(ep_id: str) -> Path:
+    return _manifests_dir(ep_id) / "faces.jsonl"
+
+
+def _identities_path(ep_id: str) -> Path:
+    return _manifests_dir(ep_id) / "identities.json"
+
+
+def _tracks_path(ep_id: str) -> Path:
+    return get_path(ep_id, "tracks")
+
+
+def _thumbs_root(ep_id: str) -> Path:
+    return get_path(ep_id, "frames_root") / "thumbs"
+
+
+FRAME_IDX_RE = re.compile(r"frame_(\d+)\.jpg$", re.IGNORECASE)
+TRACK_LIST_MAX_LIMIT = 500
+
+
+def _load_faces(ep_id: str) -> List[Dict[str, Any]]:
+    path = _faces_path(ep_id)
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def _write_faces(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
+    path = _faces_path(ep_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    return path
+
+
+def _load_tracks(ep_id: str) -> List[Dict[str, Any]]:
+    path = _tracks_path(ep_id)
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def _write_tracks(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
+    path = _tracks_path(ep_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    return path
+
+
+def _load_identities(ep_id: str) -> Dict[str, Any]:
+    path = _identities_path(ep_id)
+    if not path.exists():
+        return {"ep_id": ep_id, "identities": [], "stats": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"ep_id": ep_id, "identities": [], "stats": {}}
+
+
+def _write_identities(ep_id: str, payload: Dict[str, Any]) -> Path:
+    path = _identities_path(ep_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def _sync_manifests(ep_id: str, *paths: Path) -> None:
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+    except ValueError:
+        return
+    for path in paths:
+        if path and path.exists():
+            try:
+                STORAGE.put_artifact(ep_ctx, "manifests", path, path.name)
+            except Exception:
+                continue
+
+
+def _identity_lookup(data: Dict[str, Any]) -> Dict[int, str]:
+    lookup: Dict[int, str] = {}
+    for identity in data.get("identities", []):
+        identity_id = identity.get("identity_id")
+        if not identity_id:
+            continue
+        for track_id in identity.get("track_ids", []) or []:
+            try:
+                lookup[int(track_id)] = identity_id
+            except (TypeError, ValueError):
+                continue
+    return lookup
+
+
+def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    if s3_key:
+        url = STORAGE.presign_get(s3_key)
+        if url:
+            return url
+    if not rel_path:
+        return None
+    local = _thumbs_root(ep_id) / rel_path
+    if local.exists():
+        return str(local)
+    return None
+
+
+def _recount_track_faces(ep_id: str) -> None:
+    faces = _load_faces(ep_id)
+    counts: Dict[int, int] = defaultdict(int)
+    for face in faces:
+        try:
+            counts[int(face.get("track_id", -1))] += 1
+        except (TypeError, ValueError):
+            continue
+    track_rows = _load_tracks(ep_id)
+    if not track_rows:
+        return
+    for row in track_rows:
+        try:
+            track_id = int(row.get("track_id", -1))
+        except (TypeError, ValueError):
+            track_id = -1
+        row["faces_count"] = counts.get(track_id, 0)
+    path = _write_tracks(ep_id, track_rows)
+    _sync_manifests(ep_id, path)
+
+
+def _update_identity_stats(ep_id: str, payload: Dict[str, Any]) -> None:
+    faces_count = len(_load_faces(ep_id))
+    payload.setdefault("stats", {})
+    payload["stats"]["faces"] = faces_count
+    payload["stats"]["clusters"] = len(payload.get("identities", []))
+
+
+def _frame_idx_from_name(name: str) -> int | None:
+    match = FRAME_IDX_RE.search(name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _track_face_rows(ep_id: str, track_id: int) -> Dict[int, Dict[str, Any]]:
+    faces = _load_faces(ep_id)
+    rows: Dict[int, Dict[str, Any]] = {}
+    for row in faces:
+        try:
+            tid = int(row.get("track_id", -1))
+            frame_idx = int(row.get("frame_idx", -1))
+        except (TypeError, ValueError):
+            continue
+        if tid != track_id:
+            continue
+        rows.setdefault(frame_idx, row)
+    return rows
+
+
+def _max_candidate_count(limit: int, offset: int, sample: int) -> int:
+    limit = max(1, limit)
+    offset = max(0, offset)
+    sample = max(1, sample)
+    return max(1, (offset + limit) * sample)
+
+
+def _apply_sampling(entries: List[Dict[str, Any]], sample: int, offset: int, limit: int) -> List[Dict[str, Any]]:
+    sample = max(1, sample)
+    offset = max(0, offset)
+    limit = max(1, limit)
+    downsampled = [item for idx, item in enumerate(entries) if idx % sample == 0]
+    if offset >= len(downsampled):
+        return []
+    end = offset + limit if limit else None
+    return downsampled[offset:end]
+
+
+def _require_episode_context(ep_id: str):
+    try:
+        ctx = episode_context_from_id(ep_id)
+    except ValueError as exc:  # pragma: no cover - invalid ids rejected upstream
+        raise HTTPException(status_code=400, detail="Invalid episode id") from exc
+    return ctx, artifact_prefixes(ctx)
+
+
+def _media_entry(track_id: int, frame_idx: int, key: str, url: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "track_id": track_id,
+        "frame_idx": frame_idx,
+        "key": key,
+        "url": url,
+        "w": meta.get("crop_width") or meta.get("width"),
+        "h": meta.get("crop_height") or meta.get("height"),
+        "ts": meta.get("ts"),
+    }
+
+
+def _list_track_crop_media(ep_id: str, track_id: int, sample: int, limit: int, offset: int) -> List[Dict[str, Any]]:
+    sample = max(1, sample)
+    limit = max(1, min(limit, TRACK_LIST_MAX_LIMIT))
+    offset = max(0, offset)
+    face_rows = _track_face_rows(ep_id, track_id)
+    max_candidates = _max_candidate_count(limit, offset, sample)
+    entries: List[Dict[str, Any]] = []
+    if STORAGE.backend == "local":
+        crops_dir = get_path(ep_id, "frames_root") / "crops" / f"track_{track_id:04d}"
+        if crops_dir.exists():
+            files = sorted(crops_dir.glob("frame_*.jpg"))[:max_candidates]
+            for path in files:
+                frame_idx = _frame_idx_from_name(path.name)
+                if frame_idx is None:
+                    continue
+                meta = face_rows.get(frame_idx, {})
+                path_str = path.as_posix()
+                entries.append(_media_entry(track_id, frame_idx, path_str, path_str, meta))
+    else:
+        _, prefixes = _require_episode_context(ep_id)
+        base_prefix = f"{prefixes['crops']}track_{track_id:04d}/"
+        keys = STORAGE.list_objects(base_prefix, suffix=".jpg", max_items=max_candidates)
+        for key in keys:
+            frame_idx = _frame_idx_from_name(key)
+            if frame_idx is None:
+                continue
+            url = STORAGE.presign_get(key)
+            if not url:
+                continue
+            meta = face_rows.get(frame_idx, {})
+            entries.append(_media_entry(track_id, frame_idx, key, url, meta))
+    entries.sort(key=lambda item: item["frame_idx"])
+    return _apply_sampling(entries, sample, offset, limit)
+
+
+def _list_track_frame_media(ep_id: str, track_id: int, sample: int, limit: int, offset: int) -> List[Dict[str, Any]]:
+    sample = max(1, sample)
+    limit = max(1, min(limit, TRACK_LIST_MAX_LIMIT))
+    offset = max(0, offset)
+    face_rows = _track_face_rows(ep_id, track_id)
+    if not face_rows:
+        return []
+    frame_indices = sorted(face_rows.keys())
+    max_candidates = _max_candidate_count(limit, offset, sample)
+    frame_indices = frame_indices[:max_candidates]
+    entries: List[Dict[str, Any]] = []
+    if STORAGE.backend == "local":
+        frames_dir = get_path(ep_id, "frames_root") / "frames"
+        for idx in frame_indices:
+            path = frames_dir / f"frame_{idx:06d}.jpg"
+            if not path.exists():
+                continue
+            path_str = path.as_posix()
+            meta = face_rows.get(idx, {})
+            entries.append(_media_entry(track_id, idx, path_str, path_str, meta))
+    else:
+        _, prefixes = _require_episode_context(ep_id)
+        base_prefix = prefixes["frames"]
+        for idx in frame_indices:
+            key = f"{base_prefix}frame_{idx:06d}.jpg"
+            url = STORAGE.presign_get(key)
+            if not url:
+                continue
+            meta = face_rows.get(idx, {})
+            entries.append(_media_entry(track_id, idx, key, url, meta))
+    entries.sort(key=lambda item: item["frame_idx"])
+    return _apply_sampling(entries, sample, offset, limit)
 
 
 class EpisodeCreateRequest(BaseModel):
@@ -47,6 +346,38 @@ class EpisodeSummary(BaseModel):
 
 class EpisodeListResponse(BaseModel):
     episodes: List[EpisodeSummary]
+
+
+class EpisodeUpsert(BaseModel):
+    ep_id: str = Field(..., min_length=3, description="Deterministic ep_id (slug-sXXeYY)")
+    show_slug: str = Field(..., min_length=1)
+    season: int = Field(..., ge=0, le=999)
+    episode: int = Field(..., ge=0, le=999)
+    title: str | None = Field(None, max_length=200)
+    air_date: date | None = None
+
+
+class IdentityRenameRequest(BaseModel):
+    label: str | None = Field(None, max_length=120)
+
+
+class IdentityMergeRequest(BaseModel):
+    source_id: str
+    target_id: str
+
+
+class TrackMoveRequest(BaseModel):
+    target_identity_id: str | None = None
+
+
+class TrackDeleteRequest(BaseModel):
+    delete_faces: bool = True
+
+
+class FrameDeleteRequest(BaseModel):
+    track_id: int
+    frame_idx: int
+    delete_assets: bool = False
 
 
 class S3VideoItem(BaseModel):
@@ -226,6 +557,30 @@ def create_episode(payload: EpisodeCreateRequest) -> EpisodeCreateResponse:
     return EpisodeCreateResponse(ep_id=record.ep_id)
 
 
+@router.post("/episodes/upsert_by_id", tags=["episodes"])
+def upsert_by_id(payload: EpisodeUpsert) -> dict:
+    try:
+        record, created = EPISODE_STORE.upsert_ep_id(
+            ep_id=payload.ep_id,
+            show_slug=payload.show_slug,
+            season=payload.season,
+            episode=payload.episode,
+            title=payload.title,
+            air_date=payload.air_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ep_id": record.ep_id,
+        "created": created,
+        "show_slug": record.show_ref,
+        "season": record.season_number,
+        "episode": record.episode_number,
+        "title": record.title,
+        "air_date": record.air_date,
+    }
+
+
 @router.post("/episodes/{ep_id}/assets", response_model=AssetUploadResponse, tags=["episodes"])
 def presign_episode_assets(ep_id: str) -> AssetUploadResponse:
     record = EPISODE_STORE.get(ep_id)
@@ -334,3 +689,282 @@ def episode_video_meta(ep_id: str) -> EpisodeVideoMeta:
         duration_sec=duration_sec,
         fps_detected=fps_detected,
     )
+
+
+@router.get("/episodes/{ep_id}/identities")
+def list_identities(ep_id: str) -> dict:
+    payload = _load_identities(ep_id)
+    track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id)}
+    identities = []
+    for identity in payload.get("identities", []):
+        track_ids = []
+        for raw_tid in identity.get("track_ids", []) or []:
+            try:
+                track_ids.append(int(raw_tid))
+            except (TypeError, ValueError):
+                continue
+        faces_total = identity.get("size")
+        if faces_total is None:
+            faces_total = sum(int(track_lookup.get(tid, {}).get("faces_count", 0)) for tid in track_ids)
+        identities.append(
+            {
+                "identity_id": identity.get("identity_id"),
+                "label": identity.get("label"),
+                "track_ids": track_ids,
+                "faces": faces_total,
+                "rep_thumbnail_url": _resolve_thumb_url(
+                    ep_id,
+                    identity.get("rep_thumb_rel_path"),
+                    identity.get("rep_thumb_s3_key"),
+                ),
+            }
+        )
+    return {"identities": identities, "stats": payload.get("stats", {})}
+
+
+@router.get("/episodes/{ep_id}/faces_grid")
+def faces_grid(ep_id: str, track_id: int | None = Query(None)) -> dict:
+    faces = _load_faces(ep_id)
+    identity_lookup = _identity_lookup(_load_identities(ep_id))
+    items: List[dict] = []
+    for row in faces:
+        try:
+            tid = int(row.get("track_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if track_id is not None and tid != track_id:
+            continue
+        items.append(
+            {
+                "face_id": row.get("face_id"),
+                "track_id": tid,
+                "frame_idx": row.get("frame_idx"),
+                "ts": row.get("ts"),
+                "thumbnail_url": _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key")),
+                "identity_id": identity_lookup.get(tid),
+            }
+        )
+    return {"faces": items, "count": len(items)}
+
+
+@router.get("/episodes/{ep_id}/identities/{identity_id}")
+def identity_detail(ep_id: str, identity_id: str) -> dict:
+    payload = _load_identities(ep_id)
+    identity = next((item for item in payload.get("identities", []) if item.get("identity_id") == identity_id), None)
+    if not identity:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id)}
+    tracks_payload = []
+    for raw_tid in identity.get("track_ids", []) or []:
+        try:
+            tid = int(raw_tid)
+        except (TypeError, ValueError):
+            continue
+        track_row = track_lookup.get(tid, {})
+        tracks_payload.append(
+            {
+                "track_id": tid,
+                "faces_count": track_row.get("faces_count", 0),
+                "thumbnail_url": _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key")),
+            }
+        )
+    return {
+        "identity": {
+            "identity_id": identity_id,
+            "label": identity.get("label"),
+            "track_ids": identity.get("track_ids", []),
+            "rep_thumbnail_url": _resolve_thumb_url(
+                ep_id,
+                identity.get("rep_thumb_rel_path"),
+                identity.get("rep_thumb_s3_key"),
+            ),
+        },
+        "tracks": tracks_payload,
+    }
+
+
+@router.get("/episodes/{ep_id}/tracks/{track_id}")
+def track_detail(ep_id: str, track_id: int) -> dict:
+    faces = [row for row in _load_faces(ep_id) if int(row.get("track_id", -1)) == track_id]
+    frames = [
+        {
+            "face_id": row.get("face_id"),
+            "frame_idx": row.get("frame_idx"),
+            "ts": row.get("ts"),
+            "thumbnail_url": _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key")),
+        }
+        for row in faces
+    ]
+    track_row = next((row for row in _load_tracks(ep_id) if int(row.get("track_id", -1)) == track_id), None)
+    return {
+        "track_id": track_id,
+        "faces_count": len(frames),
+        "thumbnail_url": _resolve_thumb_url(
+            ep_id,
+            (track_row or {}).get("thumb_rel_path"),
+            (track_row or {}).get("thumb_s3_key"),
+        ),
+        "frames": frames,
+    }
+
+
+@router.get("/episodes/{ep_id}/tracks/{track_id}/crops")
+def list_track_crops(
+    ep_id: str,
+    track_id: int,
+    sample: int = Query(5, ge=1, le=100, description="Return every Nth crop"),
+    limit: int = Query(200, ge=1, le=TRACK_LIST_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> List[Dict[str, Any]]:
+    return _list_track_crop_media(ep_id, track_id, sample, limit, offset)
+
+
+@router.get("/episodes/{ep_id}/tracks/{track_id}/frames")
+def list_track_frames(
+    ep_id: str,
+    track_id: int,
+    sample: int = Query(5, ge=1, le=100, description="Return every Nth frame"),
+    limit: int = Query(200, ge=1, le=TRACK_LIST_MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> List[Dict[str, Any]]:
+    return _list_track_frame_media(ep_id, track_id, sample, limit, offset)
+
+
+@router.post("/episodes/{ep_id}/identities/{identity_id}/rename")
+def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -> dict:
+    payload = _load_identities(ep_id)
+    identity = next((item for item in payload.get("identities", []) if item.get("identity_id") == identity_id), None)
+    if not identity:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    label = (body.label or "").strip()
+    identity["label"] = label or None
+    _update_identity_stats(ep_id, payload)
+    path = _write_identities(ep_id, payload)
+    _sync_manifests(ep_id, path)
+    return {"identity_id": identity_id, "label": identity["label"]}
+
+
+@router.post("/episodes/{ep_id}/identities/merge")
+def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
+    payload = _load_identities(ep_id)
+    identities = payload.get("identities", [])
+    source = next((item for item in identities if item.get("identity_id") == body.source_id), None)
+    target = next((item for item in identities if item.get("identity_id") == body.target_id), None)
+    if not source or not target:
+        raise HTTPException(status_code=404, detail="Source or target identity not found")
+    merged_track_ids = set(target.get("track_ids", []) or [])
+    for tid in source.get("track_ids", []) or []:
+        merged_track_ids.add(tid)
+    target["track_ids"] = sorted({int(x) for x in merged_track_ids})
+    payload["identities"] = [item for item in identities if item.get("identity_id") != body.source_id]
+    _update_identity_stats(ep_id, payload)
+    path = _write_identities(ep_id, payload)
+    _sync_manifests(ep_id, path)
+    return {"target_id": body.target_id, "track_ids": target["track_ids"]}
+
+
+@router.post("/episodes/{ep_id}/tracks/{track_id}/move")
+def move_track(ep_id: str, track_id: int, body: TrackMoveRequest) -> dict:
+    payload = _load_identities(ep_id)
+    identities = payload.get("identities", [])
+    source_identity = None
+    target_identity = None
+    for identity in identities:
+        if body.target_identity_id and identity.get("identity_id") == body.target_identity_id:
+            target_identity = identity
+        if track_id in identity.get("track_ids", []):
+            source_identity = identity
+    if body.target_identity_id and target_identity is None:
+        raise HTTPException(status_code=404, detail="Target identity not found")
+    if source_identity and track_id in source_identity.get("track_ids", []):
+        source_identity["track_ids"] = [tid for tid in source_identity["track_ids"] if tid != track_id]
+    if target_identity is not None:
+        if track_id not in target_identity.get("track_ids", []):
+            target_identity.setdefault("track_ids", []).append(track_id)
+            target_identity["track_ids"] = sorted(target_identity["track_ids"])
+    _update_identity_stats(ep_id, payload)
+    path = _write_identities(ep_id, payload)
+    _sync_manifests(ep_id, path)
+    return {
+        "identity_id": body.target_identity_id,
+        "track_ids": target_identity["track_ids"] if target_identity else [],
+    }
+
+
+@router.delete("/episodes/{ep_id}/identities/{identity_id}")
+def delete_identity(ep_id: str, identity_id: str) -> dict:
+    payload = _load_identities(ep_id)
+    identities = payload.get("identities", [])
+    before = len(identities)
+    payload["identities"] = [item for item in identities if item.get("identity_id") != identity_id]
+    if len(payload["identities"]) == before:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    _update_identity_stats(ep_id, payload)
+    path = _write_identities(ep_id, payload)
+    _sync_manifests(ep_id, path)
+    return {"deleted": identity_id, "remaining": len(payload["identities"])}
+
+
+@router.delete("/episodes/{ep_id}/tracks/{track_id}")
+def delete_track(ep_id: str, track_id: int, payload: TrackDeleteRequest = Body(default=TrackDeleteRequest())) -> dict:
+    faces = _load_faces(ep_id)
+    if payload.delete_faces:
+        faces = [row for row in faces if int(row.get("track_id", -1)) != track_id]
+        faces_path = _write_faces(ep_id, faces)
+    else:
+        faces_path = _faces_path(ep_id)
+    track_rows = _load_tracks(ep_id)
+    kept_tracks = [row for row in track_rows if int(row.get("track_id", -1)) != track_id]
+    if len(kept_tracks) == len(track_rows):
+        raise HTTPException(status_code=404, detail="Track not found")
+    tracks_path = _write_tracks(ep_id, kept_tracks)
+    identities = _load_identities(ep_id)
+    for identity in identities.get("identities", []):
+        identity["track_ids"] = [tid for tid in identity.get("track_ids", []) if tid != track_id]
+    _update_identity_stats(ep_id, identities)
+    identities_path = _write_identities(ep_id, identities)
+    _recount_track_faces(ep_id)
+    _sync_manifests(ep_id, faces_path, tracks_path, identities_path)
+    return {"track_id": track_id, "faces_deleted": payload.delete_faces}
+
+
+@router.delete("/episodes/{ep_id}/frames")
+def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
+    faces = _load_faces(ep_id)
+    removed_rows = [
+        row
+        for row in faces
+        if int(row.get("track_id", -1)) == payload.track_id and int(row.get("frame_idx", -1)) == payload.frame_idx
+    ]
+    if not removed_rows:
+        raise HTTPException(status_code=404, detail="Face frame not found")
+    faces = [row for row in faces if row not in removed_rows]
+    faces_path = _write_faces(ep_id, faces)
+    if payload.delete_assets:
+        frames_root = get_path(ep_id, "frames_root")
+        for row in removed_rows:
+            thumb_rel = row.get("thumb_rel_path")
+            if isinstance(thumb_rel, str):
+                thumb_file = _thumbs_root(ep_id) / thumb_rel
+                try:
+                    thumb_file.unlink()
+                except FileNotFoundError:
+                    pass
+            crop_rel = row.get("crop_rel_path")
+            if isinstance(crop_rel, str):
+                crop_file = frames_root / crop_rel
+                try:
+                    crop_file.unlink()
+                except FileNotFoundError:
+                    pass
+    _recount_track_faces(ep_id)
+    identities = _load_identities(ep_id)
+    _update_identity_stats(ep_id, identities)
+    identities_path = _write_identities(ep_id, identities)
+    _sync_manifests(ep_id, faces_path, identities_path)
+    return {
+        "track_id": payload.track_id,
+        "frame_idx": payload.frame_idx,
+        "removed": len(removed_rows),
+        "remaining": len(faces),
+    }

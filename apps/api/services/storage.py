@@ -16,7 +16,9 @@ DEFAULT_REGION = "us-east-1"
 DEFAULT_EXPIRY = 900  # 15 minutes
 LOCAL_UPLOAD_BASE = "http://localhost/_local-storage"
 ARTIFACT_ROOT = "artifacts"
-_V2_KEY_RE = re.compile(r"raw/videos/(?P<show>[^/]+)/s(?P<season>\d{2})/e(?P<episode>\d{2})/episode\.mp4")
+_V2_KEY_RE = re.compile(
+    r"raw/videos/(?P<show>[^/]+)/s(?P<season>\d{2})/e(?P<episode>\d{2})/episode\.mp4"
+)
 _V1_KEY_RE = re.compile(r"raw/videos/(?P<ep_id>[^/]+)/episode\.mp4")
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 LOGGER = logging.getLogger(__name__)
@@ -73,6 +75,28 @@ def artifact_prefixes(ep_ctx: EpisodeContext) -> Dict[str, str]:
         "frames": f"{ARTIFACT_ROOT}/frames/{show}/s{season:02d}/e{episode:02d}/frames/",
         "crops": f"{ARTIFACT_ROOT}/crops/{show}/s{season:02d}/e{episode:02d}/tracks/",
         "manifests": f"{ARTIFACT_ROOT}/manifests/{show}/s{season:02d}/e{episode:02d}/",
+        "thumbs_tracks": f"{ARTIFACT_ROOT}/thumbs/{show}/s{season:02d}/e{episode:02d}/tracks/",
+        "thumbs_identities": f"{ARTIFACT_ROOT}/thumbs/{show}/s{season:02d}/e{episode:02d}/identities/",
+    }
+
+
+def parse_v2_episode_key(key: str) -> Dict[str, object] | None:
+    """Parse a v2 episode key (raw/videos/{show}/s{ss}/e{ee}/episode.mp4)."""
+
+    match = _V2_KEY_RE.search(key)
+    if not match:
+        return None
+    show = match.group("show")
+    season = int(match.group("season"))
+    episode = int(match.group("episode"))
+    ep_id = f"{show.lower()}-s{season:02d}e{episode:02d}"
+    return {
+        "ep_id": ep_id,
+        "show": show,
+        "show_slug": show,
+        "season": season,
+        "episode": episode,
+        "key_version": "v2",
     }
 
 
@@ -166,7 +190,7 @@ class StorageService:
             backend=self.backend,
         )
 
-    def presign_get(self, key: str, expires_in: int = DEFAULT_EXPIRY) -> str | None:
+    def presign_get(self, key: str, expires_in: int = 3600) -> str | None:
         if self.backend not in {"s3", "minio"} or self._client is None:
             return None
         params = {"Bucket": self.bucket, "Key": key}
@@ -289,6 +313,43 @@ class StorageService:
                 )
         return uploaded
 
+    def list_objects(self, prefix: str, suffix: str | None = None, max_items: int = 1000) -> List[str]:
+        """Return up to `max_items` object keys under the provided prefix."""
+
+        if self.backend not in {"s3", "minio"} or self._client is None or max_items <= 0:
+            return []
+        results: List[str] = []
+        continuation_token: str | None = None
+        while len(results) < max_items:
+            kwargs: Dict[str, object] = {
+                "Bucket": self.bucket,
+                "Prefix": prefix,
+                "MaxKeys": min(1000, max_items - len(results)),
+            }
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = self._client.list_objects_v2(**kwargs)
+            contents: Iterable[Dict[str, object]] = response.get("Contents", [])
+            if not contents:
+                break
+            for obj in contents:
+                key = obj.get("Key")
+                if not isinstance(key, str):
+                    continue
+                if suffix and not key.endswith(suffix):
+                    continue
+                results.append(key)
+                if len(results) >= max_items:
+                    break
+            if len(results) >= max_items:
+                break
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                break
+        return results
+
     def list_episode_videos_s3(
         self,
         prefix: str = "raw/videos/",
@@ -341,19 +402,9 @@ class StorageService:
         return results
 
     def _parse_s3_key_metadata(self, key: str) -> Dict[str, object]:
-        match_v2 = _V2_KEY_RE.search(key)
-        if match_v2:
-            show = match_v2.group("show")
-            season = int(match_v2.group("season"))
-            episode = int(match_v2.group("episode"))
-            ep_id = f"{show}-s{season:02d}e{episode:02d}"
-            return {
-                "ep_id": ep_id,
-                "show": show,
-                "season": season,
-                "episode": episode,
-                "key_version": "v2",
-            }
+        parsed_v2 = parse_v2_episode_key(key)
+        if parsed_v2:
+            return parsed_v2
         match_v1 = _V1_KEY_RE.search(key)
         if match_v1:
             ep_id = match_v1.group("ep_id")
@@ -388,4 +439,5 @@ __all__ = [
     "StorageService",
     "artifact_prefixes",
     "episode_context_from_id",
+    "parse_v2_episode_key",
 ]

@@ -36,7 +36,7 @@ def test_faces_embed_and_cluster_stub(tmp_path, monkeypatch) -> None:
         "/jobs/faces_embed",
         json={"ep_id": ep_id, "stub": True, "save_crops": False},
     )
-    assert faces_resp.status_code == 200
+    assert faces_resp.status_code == 200, faces_resp.json()
     faces_payload = faces_resp.json()
     assert faces_payload["faces_count"] > 0
 
@@ -58,6 +58,7 @@ def test_faces_embed_requires_tracks(tmp_path, monkeypatch) -> None:
     client = TestClient(app)
     resp = client.post("/jobs/faces_embed", json={"ep_id": ep_id, "stub": True})
     assert resp.status_code == 400
+    assert resp.json()["detail"] == "tracks.jsonl not found; run detect/track first"
 
 
 def test_cluster_requires_faces(tmp_path, monkeypatch) -> None:
@@ -68,3 +69,4 @@ def test_cluster_requires_faces(tmp_path, monkeypatch) -> None:
     client = TestClient(app)
     resp = client.post("/jobs/cluster", json={"ep_id": ep_id, "stub": True})
     assert resp.status_code == 400
+    assert resp.json()["detail"] == "faces.jsonl not found; run faces_embed first"

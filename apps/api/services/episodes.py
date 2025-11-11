@@ -102,6 +102,43 @@ class EpisodeStore:
         self._write(content)
         return EpisodeRecord(**stored)  # type: ignore[arg-type]
 
+    def upsert_ep_id(
+        self,
+        *,
+        ep_id: str,
+        show_slug: str,
+        season: int,
+        episode: int,
+        title: Optional[str] = None,
+        air_date: Optional[date | str] = None,
+    ) -> tuple[EpisodeRecord, bool]:
+        ep_id = ep_id.strip()
+        if not ep_id:
+            raise ValueError("ep_id is required")
+        expected = self.make_ep_id(show_slug, season, episode)
+        if ep_id.lower() != expected.lower():
+            raise ValueError(f"ep_id '{ep_id}' does not match show/season/episode ({expected})")
+
+        content = self._read()
+        existing = content.get(ep_id)
+        if existing:
+            return EpisodeRecord(**existing), False  # type: ignore[arg-type]
+
+        now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        stored = {
+            "ep_id": ep_id,
+            "show_ref": show_slug,
+            "season_number": season,
+            "episode_number": episode,
+            "title": title,
+            "air_date": air_date.isoformat() if isinstance(air_date, date) else air_date,
+            "created_at": now,
+            "updated_at": now,
+        }
+        content[ep_id] = stored
+        self._write(content)
+        return EpisodeRecord(**stored), True  # type: ignore[arg-type]
+
     def get(self, ep_id: str) -> Optional[EpisodeRecord]:
         content = self._read()
         data = content.get(ep_id)
