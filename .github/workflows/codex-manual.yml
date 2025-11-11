@@ -1,0 +1,79 @@
+name: codex-manual
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run a freeform prompt or a playbook"
+        required: true
+        default: prompt
+        type: choice
+        options:
+          - prompt
+          - playbook
+      prompt:
+        description: "Prompt text when mode=prompt"
+        required: false
+        type: string
+      playbook:
+        description: "Playbook path when mode=playbook (e.g. agents/playbooks/update-docs-on-change.yaml)"
+        required: false
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run Codex with prompt
+        if: ${{ inputs.mode == 'prompt' && inputs.prompt != '' }}
+        id: codex_prompt
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: ${{ inputs.prompt }}
+
+      - name: Run Codex playbook
+        if: ${{ inputs.mode == 'playbook' && inputs.playbook != '' }}
+        id: codex_playbook
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-args: |
+            [
+              "exec",
+              "--config","./config/codex.config.toml",
+              "--playbook","${{ inputs.playbook }}"
+            ]
+
+      - name: Post result as a comment (if on PR/Issue)
+        if: ${{ (steps.codex_prompt.outputs.final-message != '' || steps.codex_playbook.outputs.final-message != '') && (github.event_name == 'workflow_dispatch') }}
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ steps.codex_prompt.outputs.final-message }}${{ steps.codex_playbook.outputs.final-message }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const msg = process.env.CODEX_FINAL_MESSAGE || '';
+            if (!msg.trim()) {
+              core.info('No Codex output to post.');
+              return;
+            }
+            const isPR = !!context.payload.pull_request;
+            const isIssue = !!context.payload.issue;
+            if (isPR || isIssue) {
+              const number = (context.payload.pull_request || context.payload.issue).number;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: number,
+                body: msg,
+              });
+            } else {
+              core.info('Not an issue/PR context; skipping comment.');
+            }
+

@@ -676,7 +676,7 @@ def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
 
     # For detect_track, count files directly since status API doesn't include it
     if phase == "detect_track":
-        from py_screanalytics.artifacts import get_path
+        from py_screenalytics.artifacts import get_path
         det_path = get_path(ep_id, "detections")
         track_path = get_path(ep_id, "tracks")
         if det_path.exists() and track_path.exists():
@@ -825,6 +825,7 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
     summary = raw or {}
     if "summary" in summary and isinstance(summary["summary"], dict):
         summary = summary["summary"]
+    result_block = summary.get("result") if isinstance(summary.get("result"), dict) else None
     artifacts = summary.setdefault("artifacts", {})
     local = artifacts.setdefault("local", {})
     manifests_dir = DATA_ROOT / "manifests" / ep_id
@@ -832,14 +833,26 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
     local.setdefault("tracks", str(manifests_dir / "tracks.jsonl"))
     local.setdefault("faces", str(manifests_dir / "faces.jsonl"))
     local.setdefault("identities", str(manifests_dir / "identities.json"))
-    if "detections" not in summary and summary.get("detections_count") is not None:
-        summary["detections"] = summary.get("detections_count")
-    if "tracks" not in summary and summary.get("tracks_count") is not None:
-        summary["tracks"] = summary.get("tracks_count")
-    if "faces" not in summary and summary.get("faces_count") is not None:
-        summary["faces"] = summary.get("faces_count")
-    if "identities" not in summary and summary.get("identities_count") is not None:
-        summary["identities"] = summary.get("identities_count")
+    counts_candidates = [summary]
+    if result_block:
+        counts_candidates.append(result_block)
+        counts = result_block.get("counts") if isinstance(result_block.get("counts"), dict) else None
+        if counts:
+            counts_candidates.append(counts)
+    for key in ("detections", "tracks", "faces", "identities"):
+        if key in summary and summary[key] is not None:
+            continue
+        value = None
+        for candidate in counts_candidates:
+            if key in candidate and candidate.get(key) is not None:
+                value = candidate.get(key)
+                break
+            count_key = f"{key}_count"
+            if candidate.get(count_key) is not None:
+                value = candidate.get(count_key)
+                break
+        if value is not None:
+            summary[key] = value
     return summary
 
 
@@ -932,6 +945,7 @@ def run_job_with_progress(
     dedupe_key = f"last_progress_event::{endpoint_path}"
     run_id_key = f"current_run_id::{endpoint_path}"
     st.session_state.pop(dedupe_key, None)
+    phase_hint = _phase_from_endpoint(endpoint_path) or "detect_track"
 
     def _cb(progress: Dict[str, Any]) -> None:
         if not isinstance(progress, dict):
@@ -996,6 +1010,10 @@ def run_job_with_progress(
         if summary and isinstance(summary, dict):
             remember_detector(summary.get("detector"))
             remember_tracker(summary.get("tracker"))
+        if summary is None and not error_message and phase_hint:
+            status_summary = _summary_from_status(ep_id, phase_hint)
+            if status_summary:
+                summary = status_summary
         return summary, error_message
     finally:
         st.session_state.pop(dedupe_key, None)
@@ -1115,17 +1133,28 @@ def inject_thumb_css() -> None:
 
 
 def resolve_thumb(src: str | None) -> str | None:
-    """Resolve thumbnail source to valid path or None for placeholder.
+    """Resolve thumbnail source to a browser-safe URL or None for placeholder.
 
-    Returns src if it's a valid HTTP URL or existing local file, else None.
+    If the source is an HTTP(S) URL or a data: URL, it is returned as-is.
+    For existing local files, a data URL is generated via ensure_media_url.
     """
+    if not src:
+        return None
+    safe_url = ensure_media_url(src)
+    if not safe_url:
+        return None
+    if safe_url.startswith(("http://", "https://", "data:")):
+        return safe_url
+    if safe_url != src:
+        return safe_url
     try:
-        if src and src.startswith("http"):
-            return src  # presigned S3; let browser fetch
-        if src and Path(src).exists() and Path(src).stat().st_size > 1024:
-            return src
-    except Exception:
-        pass
+        path = Path(src)
+        if path.exists() and path.is_file():
+            converted = ensure_media_url(path)
+            if converted and converted.startswith("data:"):
+                return converted
+    except OSError:
+        return None
     return None
 
 

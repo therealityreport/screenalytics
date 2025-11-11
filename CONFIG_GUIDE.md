@@ -19,3 +19,10 @@ Version: 1.0
 - Promotion PR must include config diffs and doc updates.
 
 ## Stub jobs
+
+## Codex Actions (CI)
+- Required secret: add `OPENAI_API_KEY` in GitHub > Settings > Secrets and variables > Actions.
+- Workflows:
+  - `.github/workflows/on-push-doc-sync.yml` — runs Codex playbook to sync docs on push.
+  - `.github/workflows/codex-manual.yml` — run Codex on demand via the Actions tab.
+- Manual run: choose `codex-manual` workflow, set `mode` to `prompt` (enter freeform text) or `playbook` (e.g. `agents/playbooks/update-docs-on-change.yaml`).

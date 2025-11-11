@@ -18,7 +18,7 @@ jobs:
   sync-docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compute changed files
         id: diff
@@ -28,13 +28,30 @@ jobs:
           git diff --name-only HEAD~1..HEAD >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Run Codex playbook (update-docs-on-change)
-        uses: openai/codex-action@v1
+      - name: Prepare changed_files JSON
+        id: prep
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CHANGED: ${{ steps.diff.outputs.changed }}
+        run: |
+          python - <<'PY' > changed.json
+          import os, json
+          changed = os.environ.get('CHANGED', '')
+          files = [p for p in (changed.splitlines()) if p.strip()]
+          print(json.dumps(files))
+          PY
+          echo "changed_json<<EOF" >> "$GITHUB_OUTPUT"
+          cat changed.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex playbook (update-docs-on-change)
+        id: run_codex
+        uses: openai/codex-action@v1
         with:
-          args: >
-            exec
-            --config ./config/codex.config.toml
-            --playbook ./agents/playbooks/update-docs-on-change.yaml
-            --input.changed_files "${{ steps.diff.outputs.changed }}"
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-args: |
+            [
+              "exec",
+              "--config","./config/codex.config.toml",
+              "--playbook","./agents/playbooks/update-docs-on-change.yaml",
+              "--input.changed_files","${{ steps.prep.outputs.changed_json }}"
+            ]
