@@ -642,6 +642,22 @@ def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
     payload = _episode_status_payload(ep_id)
     if not payload:
         return None
+
+    # For detect_track, count files directly since status API doesn't include it
+    if phase == "detect_track":
+        from py_screanalytics.artifacts import get_path
+        det_path = get_path(ep_id, "detections")
+        track_path = get_path(ep_id, "tracks")
+        if det_path.exists() and track_path.exists():
+            det_count = sum(1 for line in det_path.open("r", encoding="utf-8") if line.strip())
+            track_count = sum(1 for line in track_path.open("r", encoding="utf-8") if line.strip())
+            return {
+                "stage": "detect_track",
+                "detections": det_count,
+                "tracks": track_count,
+            }
+        return None
+
     phase_block = payload.get(phase)
     if not isinstance(phase_block, dict):
         return None
