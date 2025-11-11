@@ -64,7 +64,11 @@ with st.form("episode-upload"):
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
     run_detect_track = st.checkbox("Run detect/track (stub)", value=True)
+    run_detect_track = st.checkbox("Run detect/track (stub)", value=True)
     submit = st.form_submit_button("Upload episode")
+
+detect_resp: Dict[str, Any] | None = None
+job_error: str | None = None
 
 if submit:
     if not show_ref.strip():
@@ -117,7 +121,6 @@ if submit:
     local_video = _mirror_local(ep_id, raw_bytes, presign_resp["local_video_path"])
     st.success(f"Upload to MinIO + local mirror complete for `{ep_id}`.")
 
-    detect_resp: Dict[str, Any] | None = None
     if run_detect_track:
         st.write("Running detect/track stub…")
         try:
@@ -130,8 +133,10 @@ if submit:
                 f"tracks: {detect_resp['tracks_count']}"
             )
         except requests.HTTPError as exc:
+            job_error = exc.response.text
             st.error(f"Detect/track failed: {exc.response.text}")
         except requests.RequestException as exc:
+            job_error = str(exc)
             st.error(f"Detect/track failed: {exc}")
 
     artifacts = _artifact_paths(ep_id)
@@ -139,5 +144,7 @@ if submit:
     st.code(str(local_video), language="bash")
     st.markdown(f"Detections → `{artifacts['detections']}`")
     st.markdown(f"Tracks → `{artifacts['tracks']}`")
-if detect_resp is None:
-    st.caption("Run detect/track later via POST /jobs/detect_track.")
+    if not run_detect_track:
+        st.caption("Run detect/track later via POST /jobs/detect_track.")
+    elif job_error:
+        st.caption("Detect/track stub failed; see errors above.")
