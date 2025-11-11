@@ -175,6 +175,7 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
         st.markdown(
             f"**Episode:** `{ep_id}` · Show `{detail['show_slug']}` · S{detail['season_number']:02d}E{detail['episode_number']:02d}"
         )
+        st.caption(f"Detector: {helpers.tracks_detector_label(ep_id)}")
     with cols[1]:
         st.caption(f"S3 v2: `{detail['s3']['v2_key']}`")
     with cols[2]:
@@ -440,6 +441,10 @@ _initialize_state(ep_id)
 episode_detail = _episode_header(ep_id)
 if not episode_detail:
     st.stop()
+if not helpers.detector_is_face_only(ep_id):
+    st.warning(
+        "Tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face for best results."
+    )
 
 view_state = st.session_state.get("facebank_view", "grid")
 identities_payload = _safe_api_get(f"/episodes/{ep_id}/identities")

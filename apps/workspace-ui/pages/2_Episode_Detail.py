@@ -118,6 +118,8 @@ if prefixes:
         f"Crops {helpers.s3_uri(prefixes['crops'], bucket_name)} | "
         f"Manifests {helpers.s3_uri(prefixes['manifests'], bucket_name)}"
     )
+if tracks_path.exists():
+    st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
 
 col_hydrate, col_detect = st.columns(2)
 with col_hydrate:
@@ -142,62 +144,20 @@ with col_detect:
         index=helpers.device_label_index(default_device_label),
     )
     device_value = helpers.DEVICE_VALUE_MAP[device_choice]
-    detector_map = {
-        "Face (YOLOv8-face, recommended)": "face",
-        "Person (legacy person detector)": "person",
-    }
-    detector_label = st.selectbox("Detector", list(detector_map.keys()), index=0)
-    detector_value = detector_map[detector_label]
-    tracker_map = {
-        "StrongSORT (ReID)": "strongsort",
-        "ByteTrack (fast)": "bytetrack",
-    }
-    tracker_label = st.selectbox("Tracker", list(tracker_map.keys()), index=0)
-    tracker_value = tracker_map[tracker_label]
-    if detector_value == "person":
-        st.warning("Higher risk of ID switches; prefer the face detector when possible.")
+    detector_default_value = helpers.detector_default_value()
+    detector_label = st.selectbox(
+        "Detector",
+        helpers.DETECTOR_LABELS,
+        index=helpers.detector_label_index(detector_default_value),
+    )
+    detector_value = helpers.DETECTOR_VALUE_MAP[detector_label]
+    helpers.set_detector_choice(detector_value)
     save_frames = st.checkbox("Save frames to S3", value=False)
     save_crops = st.checkbox("Save face crops to S3", value=False)
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
-    with st.expander("Advanced tracking gates", expanded=False):
-        conf_face = st.slider(
-            "Face confidence",
-            min_value=0.1,
-            max_value=0.95,
-            value=0.5,
-            step=0.05,
-            disabled=detector_value != "face",
-        )
-        min_face_px = st.number_input(
-            "Min face size (px)",
-            min_value=32,
-            max_value=512,
-            value=64,
-            step=4,
-            disabled=detector_value != "face",
-        )
-        ratio_min = st.number_input(
-            "Min ratio (width/height)",
-            min_value=0.3,
-            max_value=1.5,
-            value=0.75,
-            step=0.05,
-            disabled=detector_value != "face",
-        )
-        ratio_max = st.number_input(
-            "Max ratio (width/height)",
-            min_value=0.6,
-            max_value=3.0,
-            value=1.5,
-            step=0.05,
-            disabled=detector_value != "face",
-        )
-        max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=30, step=1)
-    invalid_ratio = detector_value == "face" and ratio_max <= ratio_min
-    run_disabled = invalid_ratio
+    max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=30, step=1)
+    run_disabled = False
     run_label = "Run detect/track"
-    if run_disabled:
-        st.error("Face ratio max must be greater than min.")
     if st.button(run_label, use_container_width=True, disabled=run_disabled):
         job_payload: Dict[str, Any] = {
             "ep_id": ep_id,
@@ -208,21 +168,11 @@ with col_detect:
             "save_crops": bool(save_crops),
             "jpeg_quality": int(jpeg_quality),
             "detector": detector_value,
-            "tracker": tracker_value,
             "max_gap": int(max_gap_value),
         }
-        if detector_value == "face":
-            job_payload["conf_face"] = float(conf_face)
-            job_payload["min_face"] = int(min_face_px)
-            job_payload["ratio_face"] = [round(float(ratio_min), 3), round(float(ratio_max), 3)]
-        else:
-            job_payload["conf_face"] = None
-            job_payload["min_face"] = None
-            job_payload["ratio_face"] = None
         if fps_value > 0:
             job_payload["fps"] = fps_value
-        tracker_human = tracker_label if not stub_toggle else ""
-        mode_label = "stub (no ML)" if stub_toggle else f"{detector_label.split('(')[0].strip()} + {tracker_human}"
+        mode_label = "stub (no ML)" if stub_toggle else detector_label
         with st.spinner(f"Running detect/track ({mode_label})…"):
             summary, error_message = helpers.run_job_with_progress(
                 ep_id,
@@ -230,6 +180,7 @@ with col_detect:
                 job_payload,
                 requested_device=device_value,
                 async_endpoint="/jobs/detect_track_async",
+                requested_detector=detector_value,
             )
         if error_message:
             st.error(error_message)
@@ -239,6 +190,9 @@ with col_detect:
             tracks = normalized.get("tracks")
             frames_exported = normalized.get("frames_exported")
             crops_exported = normalized.get("crops_exported")
+            detector_summary = normalized.get("detector")
+            if detector_summary:
+                helpers.set_detector_choice(str(detector_summary))
             details_line = [
                 f"detections: {detections:,}" if isinstance(detections, int) else "detections: ?",
                 f"tracks: {tracks:,}" if isinstance(tracks, int) else "tracks: ?",
@@ -247,6 +201,8 @@ with col_detect:
                 details_line.append(f"frames exported: {frames_exported:,}")
             if crops_exported:
                 details_line.append(f"crops exported: {crops_exported:,}")
+            if detector_summary:
+                details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
             st.success("Completed · " + " · ".join(details_line))
             metrics = normalized.get("metrics") or {}
             if metrics:
@@ -285,6 +241,7 @@ with col_detect:
 
 tracks_ready = tracks_path.exists()
 faces_ready = faces_path.exists()
+detector_face_only = helpers.detector_is_face_only(ep_id)
 
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
@@ -309,7 +266,10 @@ with col_faces:
     )
     if not tracks_ready:
         st.caption("Run detect/track first.")
-    if st.button("Run Faces Harvest", use_container_width=True, disabled=not tracks_ready):
+    elif not detector_face_only:
+        st.warning("Current tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face.")
+    faces_disabled = (not tracks_ready) or (not detector_face_only)
+    if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
         payload = {
             "ep_id": ep_id,
             "stub": bool(faces_stub),
@@ -325,6 +285,7 @@ with col_faces:
                 payload,
                 requested_device=faces_device_value,
                 async_endpoint="/jobs/faces_embed_async",
+                requested_detector=helpers.tracks_detector_value(ep_id),
             )
         if error_message:
             if "tracks.jsonl" in error_message.lower():
@@ -363,7 +324,10 @@ with col_cluster:
     cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
     if not faces_ready:
         st.caption("Run faces harvest first.")
-    if st.button("Run Cluster", use_container_width=True, disabled=not faces_ready):
+    elif not detector_face_only:
+        st.warning("Current tracks were generated with a legacy detector. Rerun detect/track first.")
+    cluster_disabled = (not faces_ready) or (not detector_face_only)
+    if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         payload = {
             "ep_id": ep_id,
             "stub": bool(cluster_stub),
@@ -376,6 +340,7 @@ with col_cluster:
                 payload,
                 requested_device=cluster_device_value,
                 async_endpoint="/jobs/cluster_async",
+                requested_detector=helpers.tracks_detector_value(ep_id),
             )
         if error_message:
             if "faces.jsonl" in error_message.lower():

@@ -177,7 +177,8 @@ def detector_default_value() -> str:
 
 
 def detector_label_index(value: str | None) -> int:
-    label = DETECTOR_LABEL_MAP.get(str(value).lower())
+    key = str(value).lower() if value else "retinaface"
+    label = DETECTOR_LABEL_MAP.get(key)
     if label in DETECTOR_LABELS:
         return DETECTOR_LABELS.index(label)
     return 0
@@ -191,13 +192,15 @@ def detector_label_from_value(value: str | None) -> str:
 
 
 def set_detector_choice(value: str) -> None:
-    if value in FACE_ONLY_DETECTORS:
-        st.session_state["detector_choice"] = value
+    key = (value or "").lower()
+    if key in FACE_ONLY_DETECTORS:
+        st.session_state["detector_choice"] = key
 
 
 def remember_detector(value: str | None) -> None:
-    if value and value in FACE_ONLY_DETECTORS:
-        st.session_state["detector_choice"] = value
+    key = (value or "").lower() if value else ""
+    if key in FACE_ONLY_DETECTORS:
+        st.session_state["detector_choice"] = key
 
 
 def _guess_device_label() -> str:
@@ -256,7 +259,8 @@ def tracks_detector_value(ep_id: str) -> str | None:
 def detector_is_face_only(ep_id: str) -> bool:
     detector = tracks_detector_value(ep_id)
     if detector is None:
-        return True
+        path = _manifest_path(ep_id, "tracks.jsonl")
+        return not path.exists()
     return detector.lower() in FACE_ONLY_DETECTORS
 
 

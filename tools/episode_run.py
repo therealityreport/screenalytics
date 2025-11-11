@@ -1464,6 +1464,7 @@ def _run_faces_embed_stage(
     embedder: ArcFaceEmbedder | None = None
     if not args.stub:
         embedder = ArcFaceEmbedder(device if device != "mps" else "cpu")
+    embedding_model_name = ARC_FACE_MODEL_NAME
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
@@ -1518,7 +1519,11 @@ def _run_faces_embed_stage(
                     encoded = embedder.encode([crop])
                     embedding_vec = encoded[0] if encoded.size else np.zeros(512, dtype=np.float32)
                 else:
-                    embedding_vec = np.asarray(_fake_embedding(track_id, frame_idx, length=512), dtype="float32")
+                    vec = np.asarray(_fake_embedding(track_id, frame_idx, length=512), dtype=np.float32)
+                    norm = np.linalg.norm(vec)
+                    if norm > 0:
+                        vec = vec / norm
+                    embedding_vec = vec
 
             track_embeddings[track_id].append(embedding_vec)
             embeddings_array.append(embedding_vec)
@@ -1538,7 +1543,7 @@ def _run_faces_embed_stage(
                 "conf": round(float(conf), 4),
                 "quality": round(float(quality), 4),
                 "embedding": embedding_vec.tolist(),
-                "embedding_model": ARC_FACE_MODEL_NAME,
+                "embedding_model": embedding_model_name,
                 "detector": detector_choice,
                 "pipeline_ver": PIPELINE_VERSION,
             }
@@ -1562,7 +1567,7 @@ def _run_faces_embed_stage(
         else:
             np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
 
-        _update_track_embeddings(track_path, track_embeddings, track_best_thumb)
+        _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
 
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
         summary: Dict[str, Any] = {
@@ -1602,6 +1607,7 @@ def _update_track_embeddings(
     track_path: Path,
     track_embeddings: Dict[int, List[np.ndarray]],
     track_best_thumb: Dict[int, tuple[float, str, str | None]],
+    embedding_model: str,
 ) -> None:
     if not track_path.exists():
         return
@@ -1618,7 +1624,7 @@ def _update_track_embeddings(
                 mean_vec = mean_vec / norm
             row["faces_count"] = len(embeds)
             row["face_embedding"] = mean_vec.tolist()
-            row["face_embedding_model"] = ARC_FACE_MODEL_NAME
+            row["face_embedding_model"] = embedding_model
         thumb_info = track_best_thumb.get(track_id)
         if thumb_info:
             _, rel_path, s3_key = thumb_info
