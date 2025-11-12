@@ -30,6 +30,23 @@ _CURSOR_SEP = "|"
 LOGGER = logging.getLogger(__name__)
 
 
+def _infer_mime_from_key(key: str) -> str | None:
+    """Best-effort MIME inference from an S3 key/file name."""
+    mime, _ = guess_type(key)
+    if mime:
+        return mime
+    lowered = key.lower()
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".jsonl") or lowered.endswith(".ndjson"):
+        return "application/json"
+    return None
+
+
 def _frame_idx_from_key(key: str) -> int | None:
     match = _FRAME_NAME_RE.search(key)
     if not match:
@@ -171,6 +188,9 @@ class StorageService:
         self._client = None
         self._client_error_cls = None
         self.write_enabled = True
+        self._facebank_client = None
+        self._facebank_bucket = None
+        self._facebank_write_enabled = False
 
         if self.backend == "s3":
             boto3_mod = _boto3()
@@ -215,12 +235,71 @@ class StorageService:
         if flag is not None:
             default_enabled = flag.lower() in {"1", "true", "yes"}
         self.write_enabled = default_enabled and self.backend in {"s3", "minio"} and self._client is not None
+        self._init_facebank_storage()
+
+    def _init_facebank_storage(self) -> None:
+        """Initialise optional S3 client for facebank seeds.
+
+        Environments frequently run with STORAGE_BACKEND=local for frame assets
+        while still needing globally-accessible facebank previews. When
+        FACEBANK_S3_BUCKET (or compatible vars) is configured we mirror facebank
+        assets there even if the primary backend stays local."""
+
+        # Reuse the primary client when it's already S3/MinIO
+        if self.backend in {"s3", "minio"} and self._client is not None:
+            self._facebank_client = self._client
+            self._facebank_bucket = self.bucket
+            self._facebank_write_enabled = self.write_enabled
+            return
+
+        bucket = (
+            os.environ.get("FACEBANK_S3_BUCKET")
+            or os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET")
+            or os.environ.get("AWS_S3_BUCKET")
+        )
+        if not bucket:
+            return
+
+        endpoint = os.environ.get("FACEBANK_S3_ENDPOINT") or os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT")
+        region = os.environ.get("FACEBANK_S3_REGION") or self.region or DEFAULT_REGION
+        access_key = os.environ.get("FACEBANK_S3_ACCESS_KEY") or os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY")
+        secret_key = os.environ.get("FACEBANK_S3_SECRET_KEY") or os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY")
+        signature_version = os.environ.get("FACEBANK_S3_SIGNATURE", "s3v4")
+
+        try:
+            boto3_mod = _boto3()
+        except RuntimeError:
+            return
+
+        client_kwargs: Dict[str, Any] = {"region_name": region}
+        if endpoint:
+            client_kwargs["endpoint_url"] = endpoint
+        if access_key and secret_key:
+            client_kwargs["aws_access_key_id"] = access_key
+            client_kwargs["aws_secret_access_key"] = secret_key
+        if signature_version:
+            from botocore.client import Config  # type: ignore
+
+            client_kwargs["config"] = Config(signature_version=signature_version)
+
+        try:
+            self._facebank_client = boto3_mod.client("s3", **client_kwargs)
+            self._facebank_bucket = bucket
+            flag = os.environ.get("FACEBANK_S3_WRITE")
+            self._facebank_write_enabled = True if flag is None else flag.lower() in {"1", "true", "yes"}
+        except Exception as exc:  # pragma: no cover - optional feature
+            LOGGER.warning("Failed to initialise facebank S3 client: %s", exc)
+            self._facebank_client = None
+            self._facebank_bucket = None
+            self._facebank_write_enabled = False
 
     def s3_enabled(self) -> bool:
         return self.backend in {"s3", "minio"} and self._client is not None
 
     def _object_extra_args(self, local_path: Path, *, content_type_hint: str | None = None) -> Dict[str, str]:
         mime = content_type_hint or guess_type(str(local_path))[0]
+        if not mime:
+            mime = _infer_mime_from_key(local_path.name)
         suffix = local_path.suffix.lower()
         if suffix in {".jsonl", ".ndjson"}:
             mime = "application/json"
@@ -267,11 +346,26 @@ class StorageService:
             backend=self.backend,
         )
 
-    def presign_get(self, key: str, expires_in: int = 3600) -> str | None:
-        if self.backend not in {"s3", "minio"} or self._client is None:
+    def presign_get(self, key: str, expires_in: int = 3600, *, content_type: str | None = None) -> str | None:
+        client = None
+        bucket = None
+        if self.backend in {"s3", "minio"} and self._client is not None:
+            client = self._client
+            bucket = self.bucket
+        elif (
+            self._facebank_client is not None
+            and self._facebank_bucket
+            and key.startswith(f"{ARTIFACT_ROOT}/facebank/")
+        ):
+            client = self._facebank_client
+            bucket = self._facebank_bucket
+        if client is None or not bucket:
             return None
-        params = {"Bucket": self.bucket, "Key": key}
-        return self._client.generate_presigned_url(  # type: ignore[union-attr]
+        params = {"Bucket": bucket, "Key": key}
+        response_mime = content_type or _infer_mime_from_key(key)
+        if response_mime:
+            params["ResponseContentType"] = response_mime
+        return client.generate_presigned_url(  # type: ignore[union-attr]
             "get_object",
             Params=params,
             ExpiresIn=expires_in,
@@ -372,6 +466,82 @@ class StorageService:
         """Sync an entire directory tree to the configured bucket (best effort)."""
 
         return self.upload_dir(local_dir, s3_prefix)
+
+    def upload_facebank_seed(
+        self,
+        show_id: str,
+        cast_id: str,
+        seed_id: str,
+        local_path: Path | str,
+        *,
+        object_name: str | None = None,
+        content_type_hint: str | None = None,
+    ) -> str | None:
+        """Upload a facebank seed derivative to the shared artifacts bucket."""
+        client = None
+        bucket = None
+        write_ok = False
+        if self.backend in {"s3", "minio"} and self._client is not None and self.write_enabled:
+            client = self._client
+            bucket = self.bucket
+            write_ok = True
+        elif self._facebank_client is not None and self._facebank_bucket and self._facebank_write_enabled:
+            client = self._facebank_client
+            bucket = self._facebank_bucket
+            write_ok = True
+        if client is None or not bucket or not write_ok:
+            return None
+        path = Path(local_path)
+        if not path.exists():
+            return None
+        suffix = path.suffix or ".png"
+        if object_name:
+            filename = object_name.strip("/\\")
+        else:
+            filename = f"{seed_id}{suffix}"
+            if not filename.lower().endswith(suffix.lower()):
+                filename = f"{filename}{suffix}"
+        key = f"{ARTIFACT_ROOT}/facebank/{show_id}/{cast_id}/{filename}"
+        extra_args = self._object_extra_args(path, content_type_hint=content_type_hint)
+        data = path.read_bytes()
+        try:
+            put_kwargs = {
+                "Bucket": bucket,
+                "Key": key,
+                "Body": data,
+                "ContentLength": len(data),
+            }
+            put_kwargs.update(extra_args)
+            client.put_object(**put_kwargs)  # type: ignore[union-attr]
+            if key.endswith(("_d.png", "_d.jpg", "_d.jpeg")):
+                self._log_display_object_size(client, bucket, key, len(data))
+            return key
+        except Exception as exc:  # pragma: no cover - best effort
+            LOGGER.warning(
+                "Failed to upload facebank seed %s/%s to s3://%s/%s: %s",
+                show_id,
+                cast_id,
+                bucket,
+                key,
+                exc,
+            )
+            return None
+
+    def _log_display_object_size(self, client, bucket: str, key: str, fallback_size: int) -> None:
+        try:
+            head = client.head_object(Bucket=bucket, Key=key)
+            size = head.get("ContentLength", fallback_size)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            LOGGER.debug("head_object failed for %s: %s", key, exc)
+            size = fallback_size
+        try:
+            size_int = int(size)
+        except (TypeError, ValueError):
+            size_int = fallback_size
+        if size_int < 10_000:
+            LOGGER.warning("Facebank display object small: key=%s bytes=%s", key, size_int)
+        else:
+            LOGGER.info("Facebank display object uploaded: key=%s bytes=%s", key, size_int)
 
     def upload_dir(
         self,

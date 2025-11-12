@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Literal
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -18,12 +21,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
+from apps.api.routers import facebank as facebank_router
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services import jobs as jobs_service
 from apps.api.services.jobs import JobNotFoundError, JobService
-from apps.api.services.storage import artifact_prefixes, episode_context_from_id
+from apps.api.services.storage import StorageService, artifact_prefixes, episode_context_from_id
 
 router = APIRouter()
+LOGGER = logging.getLogger(__name__)
 JOB_SERVICE = JobService()
 EPISODE_STORE = EpisodeStore()
 DETECTOR_CHOICES = {"retinaface"}
@@ -36,6 +41,7 @@ SCENE_DETECTOR_DEFAULT = getattr(jobs_service, "SCENE_DETECTOR_DEFAULT", "pyscen
 SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 27.0)
 SCENE_MIN_LEN_DEFAULT = getattr(jobs_service, "SCENE_MIN_LEN_DEFAULT", 12)
 SCENE_WARMUP_DETS_DEFAULT = getattr(jobs_service, "SCENE_WARMUP_DETS_DEFAULT", 3)
+DEFAULT_CLUSTER_SIMILARITY = float(os.getenv("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
 CleanupAction = Literal["split_tracks", "reembed", "recluster", "group_clusters"]
 
@@ -138,7 +144,12 @@ class ClusterRequest(BaseModel):
         None,
         description="Execution device (defaults to server auto-detect)",
     )
-    cluster_thresh: float = Field(0.6, gt=0.0, le=1.0, description="Cosine distance threshold for clustering")
+    cluster_thresh: float = Field(
+        DEFAULT_CLUSTER_SIMILARITY,
+        ge=0.2,
+        le=0.99,
+        description="Minimum cosine similarity for clustering (converted to 1-sim distance)",
+    )
     min_cluster_size: int = Field(2, ge=1, description="Minimum tracks per identity")
 
 
@@ -159,11 +170,24 @@ class CleanupJobRequest(BaseModel):
     scene_threshold: float = Field(SCENE_THRESHOLD_DEFAULT, ge=0.0)
     scene_min_len: int = Field(SCENE_MIN_LEN_DEFAULT, ge=1)
     scene_warmup_dets: int = Field(SCENE_WARMUP_DETS_DEFAULT, ge=0)
-    cluster_thresh: float = Field(0.6, ge=0.05, le=1.0)
+    cluster_thresh: float = Field(DEFAULT_CLUSTER_SIMILARITY, ge=0.2, le=0.99)
     min_cluster_size: int = Field(2, ge=1, le=50)
     thumb_size: int = Field(256, ge=64, le=512)
     actions: List[CleanupAction] = Field(default_factory=lambda: list(CLEANUP_ACTIONS))
     write_back: bool = Field(True, description="Update people.json with grouping assignments")
+
+
+class FacebankBackfillRequest(BaseModel):
+    show_id: str = Field(..., description="Show identifier (e.g., RHOBH)")
+    cast_id: str | None = Field(None, description="Optional cast id to limit reprocessing")
+    dry_run: bool = Field(False, description="When True, report actions without writing files or uploading to S3")
+
+
+@router.post("/jobs/facebank/backfill_display")
+def backfill_facebank_display(req: FacebankBackfillRequest) -> dict:
+    """Regenerate missing or low-resolution facebank display derivatives."""
+    stats = _run_facebank_backfill(req.show_id, cast_id=req.cast_id, dry_run=req.dry_run)
+    return stats
 
 def _artifact_summary(ep_id: str) -> dict:
     ensure_dirs(ep_id)
@@ -778,3 +802,227 @@ def cancel_job(job_id: str) -> dict:
         "ended_at": job.get("ended_at"),
         "error": job.get("error"),
     }
+
+
+def _run_facebank_backfill(show_id: str, *, cast_id: str | None, dry_run: bool) -> dict:
+    service = facebank_router.facebank_service
+    show_dir = service.facebank_dir / show_id
+    if not show_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Show '{show_id}' has no facebank data")
+
+    if cast_id:
+        cast_dirs = [show_dir / cast_id]
+        if not cast_dirs[0].exists():
+            raise HTTPException(status_code=404, detail=f"Cast '{cast_id}' has no facebank data")
+    else:
+        cast_dirs = sorted(path for path in show_dir.iterdir() if path.is_dir())
+
+    storage = StorageService()
+    stats = {"updated": 0, "skipped": 0, "failed": 0, "low_res": 0}
+
+    for cast_path in cast_dirs:
+        cid = cast_path.name
+        data = service._load_facebank(show_id, cid)
+        seeds = data.get("seeds", [])
+        if not seeds:
+            continue
+        changed = False
+        seeds_dir = service._seeds_dir(show_id, cid)
+        for seed in seeds:
+            status, low_res = _rebuild_seed_display(
+                show_id,
+                cid,
+                seed,
+                seeds_dir,
+                storage,
+                dry_run=dry_run,
+            )
+            if status == "skipped":
+                stats["skipped"] += 1
+                continue
+            if status == "failed":
+                stats["failed"] += 1
+                continue
+            stats["updated"] += 1
+            if low_res:
+                stats["low_res"] += 1
+            if not dry_run:
+                changed = True
+        if changed and not dry_run:
+            service._save_facebank(show_id, cid, data)
+    return stats
+
+
+def _rebuild_seed_display(
+    show_id: str,
+    cast_id: str,
+    seed: dict,
+    seeds_dir: Path,
+    storage: StorageService,
+    *,
+    dry_run: bool,
+) -> tuple[str, bool]:
+    storage_id = seed.get("storage_seed_id") or _guess_storage_id(seed)
+    if not storage_id:
+        storage_id = seed.get("fb_id")
+    if not storage_id:
+        LOGGER.warning("Seed %s/%s missing identifier; skipping", show_id, seed.get("fb_id"))
+        return "failed", False
+
+    display_path = _resolve_seed_path(seed, "image_uri", seeds_dir, storage_id, "_d")
+    long_side = _display_long_side(seed, display_path)
+    has_key = bool(seed.get("display_s3_key") or seed.get("image_s3_key"))
+    if long_side is not None and long_side > 128 and has_key:
+        return "skipped", bool(seed.get("display_low_res"))
+
+    orig_path = _resolve_seed_path(seed, "orig_uri", seeds_dir, storage_id, "_o")
+    embed_path = _resolve_seed_path(seed, "embed_uri", seeds_dir, storage_id, "_e")
+
+    display_bgr = None
+    display_dims: list[int] | None = None
+    low_res = False
+
+    if orig_path and orig_path.exists():
+        source_bgr = _load_image_bgr(orig_path)
+        bbox = (seed.get("quality") or {}).get("display_bbox")
+        cropped = _crop_with_bbox(source_bgr, bbox)
+        try:
+            resized, dims, low_res = facebank_router._resize_display_image(cropped)
+        except ValueError:
+            resized, dims, low_res = facebank_router._resize_display_image(source_bgr)
+        display_bgr = resized
+        display_dims = dims
+    elif embed_path and embed_path.exists():
+        display_bgr, display_dims = _upscale_embed_display(embed_path)
+        low_res = True
+    else:
+        LOGGER.warning(
+            "Seed %s/%s missing orig/embed derivatives; cannot rebuild display",
+            show_id,
+            seed.get("fb_id"),
+        )
+        return "failed", False
+
+    if dry_run:
+        return "updated", low_res
+
+    target_path = display_path
+    if target_path is None:
+        target_path = seeds_dir / f"{storage_id}_d.{facebank_router.SEED_DISPLAY_FORMAT}"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    facebank_router._save_derivative(display_bgr.astype(np.uint8, copy=False), target_path, facebank_router.SEED_DISPLAY_FORMAT)
+
+    key = storage.upload_facebank_seed(
+        show_id,
+        cast_id,
+        storage_id,
+        target_path,
+        object_name=f"seeds/{target_path.name}",
+        content_type_hint=facebank_router.DISPLAY_MIME,
+    )
+
+    seed["storage_seed_id"] = storage_id
+    seed["image_uri"] = str(target_path)
+    seed["display_uri"] = str(target_path)
+    seed["display_dims"] = display_dims
+    seed["display_low_res"] = low_res
+    quality = seed.get("quality") or {}
+    quality["display_dims"] = display_dims
+    quality["display_low_res"] = low_res
+    seed["quality"] = quality
+    if key:
+        seed["display_s3_key"] = key
+        seed["image_s3_key"] = key
+        seed["display_key"] = key
+    return "updated", low_res
+
+
+def _guess_storage_id(seed: dict) -> str | None:
+    for key in ("image_uri", "display_s3_key", "image_s3_key", "display_key"):
+        value = seed.get(key)
+        if not value:
+            continue
+        stem = Path(value).stem
+        if "_" in stem:
+            return stem.split("_", 1)[0]
+    return seed.get("fb_id")
+
+
+def _resolve_seed_path(seed: dict, field: str, seeds_dir: Path, storage_id: str | None, suffix: str) -> Path | None:
+    candidates: list[Path] = []
+    raw = seed.get(field)
+    if raw:
+        candidates.append(Path(raw))
+    if storage_id:
+        for ext in (".png", ".jpg", ".jpeg"):
+            candidates.append(seeds_dir / f"{storage_id}{suffix}{ext}")
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.exists():
+            return path
+        if not path.is_absolute():
+            alt = (facebank_router.facebank_service.data_root / path).resolve()
+            if alt.exists():
+                return alt
+            alt2 = (seeds_dir / path.name)
+            if alt2.exists():
+                return alt2
+    return None
+
+
+def _display_long_side(seed: dict, display_path: Path | None) -> int | None:
+    dims = seed.get("display_dims")
+    if isinstance(dims, (list, tuple)) and len(dims) == 2 and all(isinstance(v, (int, float)) for v in dims):
+        width, height = int(dims[0]), int(dims[1])
+        if width > 0 and height > 0:
+            return max(width, height)
+    if display_path and display_path.exists():
+        with Image.open(display_path) as img:
+            return max(img.size)
+    return None
+
+
+def _load_image_bgr(path: Path) -> np.ndarray:
+    with Image.open(path) as img:
+        corrected = ImageOps.exif_transpose(img)
+        rgb = np.asarray(corrected.convert("RGB"))
+    return np.ascontiguousarray(rgb[..., ::-1])
+
+
+def _crop_with_bbox(image_bgr: np.ndarray, bbox: list[float] | None) -> np.ndarray:
+    if not bbox or len(bbox) != 4:
+        return image_bgr
+    x1, y1, x2, y2 = [int(round(val)) for val in bbox]
+    h, w = image_bgr.shape[:2]
+    x1 = max(x1, 0)
+    y1 = max(y1, 0)
+    x2 = min(max(x2, x1 + 1), w)
+    y2 = min(max(y2, y1 + 1), h)
+    crop = image_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return image_bgr
+    return crop
+
+
+def _upscale_embed_display(embed_path: Path) -> tuple[np.ndarray, list[int]]:
+    with Image.open(embed_path) as img:
+        rgb = np.asarray(img.convert("RGB"))
+    bgr = np.ascontiguousarray(rgb[..., ::-1])
+    h, w = bgr.shape[:2]
+    long_side = max(h, w)
+    target = max(256, long_side)
+    if long_side == 0:
+        return bgr, [w, h]
+    if long_side >= target:
+        return bgr, [w, h]
+    scale = target / long_side
+    new_w = max(int(round(w * scale)), 1)
+    new_h = max(int(round(h * scale)), 1)
+    resample_attr = getattr(Image, "Resampling", Image)
+    resample_filter = getattr(resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST))
+    pil_img = Image.fromarray(bgr[..., ::-1])
+    resized = pil_img.resize((new_w, new_h), resample=resample_filter)
+    pil_img.close()
+    arr = np.asarray(resized)[..., ::-1]
+    resized.close()
+    return np.ascontiguousarray(arr), [new_w, new_h]

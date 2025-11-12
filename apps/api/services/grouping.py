@@ -18,6 +18,9 @@ except ImportError:
 
 from py_screenalytics.artifacts import get_path
 
+from apps.api.services.facebank import FacebankService, SEED_ATTACH_SIM
+from apps.api.services.cast import CastService
+
 from .people import PeopleService, l2_normalize, cosine_distance
 
 # Config from environment
@@ -53,6 +56,8 @@ class GroupingService:
     def __init__(self, data_root: Path | str | None = None):
         self.data_root = Path(data_root) if data_root else DEFAULT_DATA_ROOT
         self.people_service = PeopleService(data_root)
+        self.facebank_service = FacebankService(data_root)
+        self.cast_service = CastService(data_root)
 
     def _cluster_centroids_path(self, ep_id: str) -> Path:
         """Get path to cluster_centroids.json for an episode."""
@@ -459,6 +464,107 @@ class GroupingService:
             "person_id": target_person_id,
             "cluster_ids": cluster_ids,
             "ep_id": ep_id,
+        }
+
+    def group_using_facebank(
+        self,
+        ep_id: str,
+        min_similarity: float = SEED_ATTACH_SIM,
+    ) -> Dict[str, Any]:
+        """Assign clusters to known cast members using facebank seeds."""
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
+
+        seeds = self.facebank_service.get_all_seeds_for_show(show_id)
+        if not seeds:
+            raise ValueError(f"No facebank seeds available for show {show_id}")
+
+        centroids_data = self.load_cluster_centroids(ep_id)
+        centroids_list = centroids_data.get("centroids", [])
+        if not centroids_list:
+            raise ValueError(f"No cluster centroids found for {ep_id}")
+
+        cast_members = self.cast_service.list_cast(show_id)
+        cast_lookup = {member["cast_id"]: member for member in cast_members if member.get("cast_id")}
+        people = self.people_service.list_people(show_id)
+        cast_person_map = {person.get("cast_id"): person for person in people if person.get("cast_id")}
+
+        assignments = []
+        matched_clusters: List[Dict[str, Any]] = []
+        unmatched_clusters: List[str] = []
+
+        for centroid_entry in centroids_list:
+            cluster_id = centroid_entry["cluster_id"]
+            centroid_vec = np.array(centroid_entry["centroid"], dtype=np.float32)
+            match = self.facebank_service.find_matching_seed(show_id, centroid_vec, min_similarity)
+            if not match:
+                unmatched_clusters.append(cluster_id)
+                continue
+
+            cast_id, seed_id, similarity = match
+            person = cast_person_map.get(cast_id)
+            if not person:
+                cast_meta = cast_lookup.get(cast_id, {})
+                name = cast_meta.get("name")
+                person = self.people_service.create_person(
+                    show_id,
+                    name=name,
+                    prototype=centroid_vec.tolist(),
+                    cluster_ids=[],
+                    cast_id=cast_id,
+                )
+                cast_person_map[cast_id] = person
+
+            person_id = person["person_id"]
+            full_cluster_id = f"{ep_id}:{cluster_id}"
+            updated = self.people_service.add_cluster_to_person(
+                show_id,
+                person_id,
+                full_cluster_id,
+                update_prototype=True,
+                cluster_centroid=centroid_vec,
+                momentum=PEOPLE_PROTO_MOMENTUM,
+            )
+            if updated:
+                cast_person_map[cast_id] = updated
+
+            assignments.append({"cluster_id": cluster_id, "person_id": person_id})
+            matched_clusters.append({
+                "cluster_id": cluster_id,
+                "person_id": person_id,
+                "cast_id": cast_id,
+                "seed_id": seed_id,
+                "similarity": round(float(similarity), 4) if similarity is not None else None,
+            })
+
+        if assignments:
+            self._update_identities_with_people(ep_id, assignments)
+
+        log = {
+            "ep_id": ep_id,
+            "strategy": "facebank",
+            "started_at": _now_iso(),
+            "steps": [
+                {"step": "load_seeds", "status": "success", "seeds": len(seeds)},
+                {
+                    "step": "match_clusters",
+                    "status": "success",
+                    "matched": len(matched_clusters),
+                    "unmatched": len(unmatched_clusters),
+                },
+            ],
+            "finished_at": _now_iso(),
+        }
+        self._save_group_log(ep_id, log)
+
+        return {
+            "ep_id": ep_id,
+            "matched_clusters": len(matched_clusters),
+            "unmatched_clusters": unmatched_clusters,
+            "assigned": matched_clusters,
+            "log": log,
         }
 
 

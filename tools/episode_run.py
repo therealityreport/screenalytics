@@ -88,12 +88,19 @@ DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt"
 DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
 RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
-GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.50"))
-GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.60"))
-GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "3")), 1)
-GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.10"))
+GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.60"))
+GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.70"))
+GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1)
+GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.35"))
 GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
 GATE_EMB_EVERY_DEFAULT = max(int(os.environ.get("TRACK_GATE_EMB_EVERY", "0")), 0)
+BYTE_TRACK_BUFFER_DEFAULT = max(int(os.environ.get("BYTE_TRACK_BUFFER", "12")), 1)
+BYTE_TRACK_MATCH_THRESH_DEFAULT = float(os.environ.get("BYTE_TRACK_MATCH_THRESH", "0.75"))
+TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
+TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
+TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
+TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
+DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
@@ -247,20 +254,30 @@ def _init_arcface(model_name: str, device: str):
 
 
 def ensure_retinaface_ready(device: str, det_thresh: float | None = None) -> tuple[bool, Optional[str], Optional[str]]:
-    """Lightweight readiness probe for API preflight checks."""
+    """Lightweight readiness probe for API/CLI preflight checks."""
 
-    model = None
     try:
-        model, resolved = _init_retinaface(
-            RETINAFACE_MODEL_NAME,
-            device,
-            det_thresh if det_thresh is not None else RETINAFACE_SCORE_THRESHOLD,
+        from insightface.app import FaceAnalysis  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        return False, f"insightface import failed: {exc}", None
+
+    providers, resolved = _onnx_providers_for(device)
+    ctx_id = 0 if resolved == "cuda" else -1
+    profile = os.environ.get("RETINAFACE_PROFILE", "buffalo_l")
+    detector = None
+    try:
+        try:
+            detector = FaceAnalysis(name=profile, providers=providers)
+        except TypeError:
+            detector = FaceAnalysis(name=profile)
+        detector.prepare(
+            ctx_id=ctx_id,
+            det_size=RETINAFACE_DET_SIZE or (640, 640),
         )
     except Exception as exc:  # pragma: no cover - surfaced via API tests
-        return False, str(exc), None
+        return False, str(exc), resolved
     finally:
-        if model is not None:
-            del model
+        detector = None
     return True, None, resolved
 
 
@@ -453,6 +470,9 @@ class GateTrackState:
     low_sim_streak: int = 0
 
 
+TrackEmbeddingSample = Tuple[float, np.ndarray]
+
+
 def _l2_normalize(vec: np.ndarray | None) -> np.ndarray | None:
     if vec is None:
         return None
@@ -511,7 +531,7 @@ class AppearanceGate:
                 reason = "streak"
         else:
             state.low_sim_streak = 0
-        if not split and iou < self.config.gate_iou and (similarity is None or similarity < 0.65):
+        if not split and iou < self.config.gate_iou:
             split = True
             reason = "iou"
         if split:
@@ -668,8 +688,8 @@ class ByteTrackAdapter:
             track_high_thresh=0.6,
             track_low_thresh=0.1,
             new_track_thresh=0.6,
-            track_buffer=30,
-            match_thresh=0.8,
+            track_buffer=BYTE_TRACK_BUFFER_DEFAULT,
+            match_thresh=BYTE_TRACK_MATCH_THRESH_DEFAULT,
             min_box_area=BYTE_TRACK_MIN_BOX_AREA,
         )
         return BYTETracker(cfg, frame_rate=self.frame_rate)
@@ -913,21 +933,59 @@ def _resize_for_arcface(image):
     return resized
 
 
+def _letterbox_square(image, size: int = 112, pad_value: int = 127):
+    """Resize with aspect preservation and center pad to a square canvas."""
+    import cv2  # type: ignore
+
+    arr = to_u8_bgr(image)
+    if arr is None or arr.size == 0:
+        return np.full((size, size, 3), pad_value, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.full((size, size, 3), pad_value, dtype=np.uint8)
+    scale = min(size / max(w, 1), size / max(h, 1))
+    new_w = max(int(round(w * scale)), 1)
+    new_h = max(int(round(h * scale)), 1)
+    resized = cv2.resize(arr, (new_w, new_h))
+    canvas = np.full((size, size, 3), pad_value, dtype=resized.dtype)
+    top = (size - new_h) // 2
+    left = (size - new_w) // 2
+    canvas[top : top + new_h, left : left + new_w] = resized
+    return canvas
+
+
 def _prepare_face_crop(
-    image, bbox: list[float], landmarks: list[float] | None, margin: float = 0.15
+    image,
+    bbox: list[float],
+    landmarks: list[float] | None,
+    margin: float = 0.15,
+    *,
+    align: bool = True,
+    detector_mode: str = "retinaface",
 ) -> tuple[np.ndarray | None, str | None]:
     import numpy as _np
 
-    if landmarks and len(landmarks) >= 10:
-        try:
-            from insightface.utils import face_align  # type: ignore
+    normalized_mode = (detector_mode or "retinaface").lower()
+    if normalized_mode == "simulated":
+        # Skip bbox expansion/landmark alignment—seed uploads provide the whole
+        # image as the bounding box when RetinaFace is unavailable.
+        return _letterbox_square(image), None
 
-            pts = _np.asarray(landmarks, dtype=_np.float32).reshape(-1, 2)
-            aligned = face_align.norm_crop(image, landmark=pts)
-            return to_u8_bgr(aligned), None
-        except Exception:
-            # If alignment fails, fall back to bbox-based cropping.
-            pass
+    if align and landmarks and len(landmarks) >= 10:
+        pts = _np.asarray(landmarks, dtype=_np.float32).reshape(-1, 2)
+        # Some detectors (simulated RetinaFace fallback) emit duplicated
+        # landmarks, which breaks the InsightFace alignment helper and results
+        # in uniform crops. Require a minimum spread before attempting
+        # landmark-based alignment.
+        if _np.all(_np.isfinite(pts)) and _np.max(_np.ptp(pts, axis=0)) >= 1.0:
+            try:
+                from insightface.utils import face_align  # type: ignore
+
+                aligned = face_align.norm_crop(image, landmark=pts)
+                return to_u8_bgr(aligned), None
+            except Exception:
+                # If alignment fails, fall back to bbox-based cropping.
+                pass
     x1, y1, x2, y2 = bbox
     width = max(x2 - x1, 1.0)
     height = max(y2 - y1, 1.0)
@@ -987,6 +1045,14 @@ def _make_skip_face_row(
     if thumb_s3_key:
         row["thumb_s3_key"] = thumb_s3_key
     return row
+
+
+def _resolved_max_gap(configured_gap: int, analyzed_fps: float | None) -> int:
+    configured = max(1, int(configured_gap))
+    if analyzed_fps and analyzed_fps > 0 and TRACK_MAX_GAP_SEC > 0:
+        cadence_cap = int(max(1, round(analyzed_fps * TRACK_MAX_GAP_SEC)))
+        return max(1, min(configured, cadence_cap))
+    return configured
 
 
 class TrackRecorder:
@@ -1937,8 +2003,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cluster-thresh",
         type=float,
-        default=0.6,
-        help="Agglomerative cosine distance threshold for clustering",
+        default=DEFAULT_CLUSTER_SIMILARITY,
+        help="Minimum cosine similarity for merging tracks (converted to 1-sim distance)",
     )
     parser.add_argument(
         "--min-cluster-size",
@@ -1951,25 +2017,25 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--gate-appear-hard",
         type=float,
         default=GATE_APPEAR_T_HARD_DEFAULT,
-        help="Force split when cosine similarity drops below this hard threshold (default 0.50)",
+        help="Force split when cosine similarity drops below this hard threshold (default 0.60)",
     )
     gate_group.add_argument(
         "--gate-appear-soft",
         type=float,
         default=GATE_APPEAR_T_SOFT_DEFAULT,
-        help="Begin streak counting when similarity drops below this soft threshold (default 0.60)",
+        help="Begin streak counting when similarity drops below this soft threshold (default 0.70)",
     )
     gate_group.add_argument(
         "--gate-appear-streak",
         type=int,
         default=GATE_APPEAR_STREAK_DEFAULT,
-        help="Consecutive soft violations before forcing a split",
+        help="Consecutive soft violations before forcing a split (default 2)",
     )
     gate_group.add_argument(
         "--gate-iou",
         type=float,
         default=GATE_IOU_THRESHOLD_DEFAULT,
-        help="Minimum IoU to keep extending a track when appearance is uncertain",
+        help="Minimum IoU to keep extending a track when appearance is uncertain (default 0.35)",
     )
     gate_group.add_argument(
         "--gate-proto-momentum",
@@ -2309,8 +2375,10 @@ def _run_full_pipeline(
             gate_embedder = ArcFaceEmbedder(device)
             gate_embedder.ensure_ready()
         except Exception as exc:
-            LOGGER.warning("Appearance gate embeddings disabled (ArcFace init failed): %s", exc)
-            gate_embedder = None
+            raise RuntimeError(
+                "ArcFace gate embedder is required for ByteTrack gating. "
+                "Install the ArcFace weights via scripts/fetch_models.py or rerun with --tracker strongsort."
+            ) from exc
     scene_detector_choice = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
     args.scene_detector = scene_detector_choice
     scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
@@ -2329,7 +2397,15 @@ def _run_full_pipeline(
     cut_ix = 0
     next_cut = scene_cuts[cut_ix] if scene_cuts else None
     frames_since_cut = 10**9
-    recorder = TrackRecorder(max_gap=args.max_gap, remap_ids=True)
+    max_gap_frames = _resolved_max_gap(args.max_gap, analyzed_fps)
+    if max_gap_frames != max(1, int(args.max_gap)):
+        LOGGER.info(
+            "Track max_gap capped to %s frames (configured=%s analyzed_fps=%.2f)",
+            max_gap_frames,
+            args.max_gap,
+            analyzed_fps or 0.0,
+        )
+    recorder = TrackRecorder(max_gap=max_gap_frames, remap_ids=True)
     det_path = get_path(args.ep_id, "detections")
     det_path.parent.mkdir(parents=True, exist_ok=True)
     track_path = get_path(args.ep_id, "tracks")
@@ -2407,8 +2483,20 @@ def _run_full_pipeline(
                         embed_inputs: list[np.ndarray] = []
                         embed_track_ids: list[int] = []
                         for obj in tracked_objects:
-                            crop, _, err = safe_crop(frame, obj.bbox.tolist())
+                            landmarks_list = None
+                            if obj.landmarks is not None:
+                                landmarks_list = (
+                                    obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                                )
+                            crop, crop_err = _prepare_face_crop(
+                                frame,
+                                obj.bbox.tolist(),
+                                landmarks_list,
+                                margin=0.2,
+                            )
                             if crop is None:
+                                if crop_err:
+                                    LOGGER.debug("Gate crop failed for track %s: %s", obj.track_id, crop_err)
                                 continue
                             aligned = _resize_for_arcface(crop)
                             embed_inputs.append(aligned)
@@ -2531,6 +2619,7 @@ def _run_full_pipeline(
         "id_switches": recorder.metrics["id_switches"],
         "forced_splits": recorder.metrics.get("forced_splits", 0),
         "longest_tracks": recorder.top_long_tracks(),
+        "max_gap_frames": recorder.max_gap,
     }
     if appearance_gate:
         metrics["appearance_gate"] = appearance_gate.summary()
@@ -2769,7 +2858,7 @@ def _run_faces_embed_stage(
     faces_path = manifests_dir / "faces.jsonl"
     video_path = get_path(args.ep_id, "video")
     frame_decoder: FrameDecoder | None = None
-    track_embeddings: Dict[int, List[np.ndarray]] = defaultdict(list)
+    track_embeddings: Dict[int, List[TrackEmbeddingSample]] = defaultdict(list)
     track_best_thumb: Dict[int, tuple[float, str, str | None]] = {}
     embeddings_array: List[np.ndarray] = []
 
@@ -2939,7 +3028,7 @@ def _run_faces_embed_stage(
             else:
                 embedding_vec = np.zeros(512, dtype=np.float32)
 
-            track_embeddings[track_id].append(embedding_vec)
+            track_embeddings[track_id].append((float(quality), embedding_vec.copy()))
             embeddings_array.append(embedding_vec)
 
             # Check for seed match
@@ -3105,9 +3194,70 @@ def _run_faces_embed_stage(
         progress.close()
 
 
+def _max_pairwise_cosine_distance(vectors: np.ndarray) -> float:
+    if vectors.ndim != 2 or vectors.shape[0] < 2:
+        return 0.0
+    max_dist = 0.0
+    count = vectors.shape[0]
+    for i in range(count):
+        vi = vectors[i]
+        for j in range(i + 1, count):
+            vj = vectors[j]
+            sim = float(np.dot(vi, vj))
+            sim = max(min(sim, 1.0), -1.0)
+            dist = 1.0 - sim
+            if dist > max_dist:
+                max_dist = dist
+    return max_dist
+
+
+def _select_track_prototype(samples: List[TrackEmbeddingSample]) -> tuple[np.ndarray | None, int, float | None]:
+    if not samples:
+        return None, 0, None
+    ranked = sorted(samples, key=lambda item: item[0], reverse=True)
+    capped = ranked[:TRACK_PROTO_MAX_SAMPLES]
+    vectors: list[np.ndarray] = []
+    weights: list[float] = []
+    for score, vec in capped:
+        normed = _l2_normalize(vec)
+        if normed is None:
+            continue
+        vectors.append(normed)
+        weights.append(max(float(score), 1e-3))
+    if not vectors:
+        return None, 0, None
+    stack = np.vstack(vectors)
+    weight_arr = np.asarray(weights, dtype=np.float32)
+    weight_sum = float(weight_arr.sum())
+    if weight_sum <= 0:
+        weight_arr = np.ones(len(vectors), dtype=np.float32) / len(vectors)
+    else:
+        weight_arr = weight_arr / weight_sum
+    proto = np.sum(stack * weight_arr[:, None], axis=0)
+    proto = _l2_normalize(proto)
+    if proto is None:
+        return None, stack.shape[0], None
+    sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
+    sims = np.clip(sims, -1.0, 1.0)
+    if stack.shape[0] > 2:
+        median_sim = float(np.median(sims))
+        cutoff = max(TRACK_PROTO_SIM_MIN, median_sim - TRACK_PROTO_SIM_DELTA)
+        keep_mask = sims >= cutoff
+        if keep_mask.any() and keep_mask.sum() < stack.shape[0]:
+            stack = stack[keep_mask]
+            weight_arr = weight_arr[keep_mask]
+            weight_arr = weight_arr / max(float(weight_arr.sum()), 1e-6)
+            proto = np.sum(stack * weight_arr[:, None], axis=0)
+            proto = _l2_normalize(proto)
+            sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
+            sims = np.clip(sims, -1.0, 1.0)
+    spread = _max_pairwise_cosine_distance(stack)
+    return proto, stack.shape[0], spread
+
+
 def _update_track_embeddings(
     track_path: Path,
-    track_embeddings: Dict[int, List[np.ndarray]],
+    track_embeddings: Dict[int, List[TrackEmbeddingSample]],
     track_best_thumb: Dict[int, tuple[float, str, str | None]],
     embedding_model: str,
 ) -> None:
@@ -3117,16 +3267,16 @@ def _update_track_embeddings(
     updated: List[dict] = []
     for row in rows:
         track_id = int(row.get("track_id", -1))
-        embeds = track_embeddings.get(track_id)
-        if embeds:
-            stacked = np.vstack(embeds)
-            mean_vec = stacked.mean(axis=0)
-            norm = np.linalg.norm(mean_vec)
-            if norm > 0:
-                mean_vec = mean_vec / norm
-            row["faces_count"] = len(embeds)
-            row["face_embedding"] = mean_vec.tolist()
-            row["face_embedding_model"] = embedding_model
+        samples = track_embeddings.get(track_id) or []
+        if samples:
+            proto_vec, sample_count, spread = _select_track_prototype(samples)
+            row["faces_count"] = len(samples)
+            if proto_vec is not None:
+                row["face_embedding"] = proto_vec.tolist()
+                row["face_embedding_model"] = embedding_model
+                row["face_embedding_samples"] = sample_count
+                if spread is not None:
+                    row["face_embedding_spread"] = round(float(spread), 4)
         thumb_info = track_best_thumb.get(track_id)
         if thumb_info:
             _, rel_path, s3_key = thumb_info
@@ -3166,6 +3316,29 @@ def _run_cluster_stage(
     track_rows = list(_iter_jsonl(track_path))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
+    distance_threshold = _cluster_distance_threshold(args.cluster_thresh)
+    flagged_tracks: set[int] = set()
+    for row in track_rows:
+        track_id_val = row.get("track_id")
+        try:
+            track_id = int(track_id_val)
+        except (TypeError, ValueError):
+            continue
+        spread_val = row.get("face_embedding_spread")
+        if spread_val is None:
+            continue
+        try:
+            spread = float(spread_val)
+        except (TypeError, ValueError):
+            continue
+        if spread >= distance_threshold:
+            flagged_tracks.add(track_id)
+    if flagged_tracks:
+        LOGGER.info(
+            "Pre-cluster sanity: %s tracks flagged as mixed (spread>=%.3f)",
+            len(flagged_tracks),
+            distance_threshold,
+        )
 
     progress = ProgressEmitter(
         args.ep_id,
@@ -3194,27 +3367,34 @@ def _run_cluster_stage(
         embedding_rows: List[np.ndarray] = []
         track_ids: List[int] = []
         track_index: Dict[int, dict] = {}
+        forced_singletons: List[List[int]] = []
         for row in track_rows:
             track_id = int(row.get("track_id", -1))
+            track_index[track_id] = row
+            if track_id in flagged_tracks:
+                forced_singletons.append([track_id])
+                continue
             embed = row.get("face_embedding")
             if embed:
                 embedding_rows.append(np.asarray(embed, dtype="float32"))
                 track_ids.append(track_id)
-                track_index[track_id] = row
-        if not embedding_rows:
+        if not embedding_rows and not forced_singletons:
             raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
-        labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
         track_groups: Dict[int, List[int]] = defaultdict(list)
-        for tid, label in zip(track_ids, labels):
-            track_groups[label].append(tid)
+        if embedding_rows:
+            labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
+            for tid, label in zip(track_ids, labels):
+                track_groups[label].append(tid)
 
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
         thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
         faces_done = 0
         identity_counter = 1
-        for label, tids in track_groups.items():
+        candidate_groups: List[List[int]] = list(track_groups.values())
+        candidate_groups.extend(forced_singletons)
+        for tids in candidate_groups:
             buckets = [tids]
             if len(tids) < min_cluster:
                 buckets = [[tid] for tid in tids]
@@ -3271,10 +3451,24 @@ def _run_cluster_stage(
             "stats": {
                 "faces": faces_total,
                 "clusters": len(identity_payload),
+                "mixed_tracks": len(flagged_tracks),
             },
             "identities": identity_payload,
         }
         identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        # Generate track representatives and cluster centroids
+        try:
+            from apps.api.services.track_reps import generate_track_reps_and_centroids
+            LOGGER.info("Generating track representatives and cluster centroids for %s", args.ep_id)
+            track_reps_summary = generate_track_reps_and_centroids(args.ep_id)
+            LOGGER.info(
+                "Generated %d track reps and %d cluster centroids",
+                track_reps_summary.get("track_reps_count", 0),
+                track_reps_summary.get("cluster_centroids_count", 0),
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to generate track representatives: %s", exc)
 
         # Build preliminary summary for completion events (before S3 sync)
         finished_at = _utcnow_iso()
@@ -3433,12 +3627,18 @@ def _infer_tracker_from_tracks(track_path: Path) -> str | None:
     return None
 
 
+def _cluster_distance_threshold(similarity: float) -> float:
+    sim = min(max(float(similarity if similarity is not None else DEFAULT_CLUSTER_SIMILARITY), 0.0), 0.999)
+    distance = 1.0 - sim
+    return max(distance, 0.01)
+
+
 def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
     if matrix.shape[0] == 1:
         return np.array([0], dtype=int)
     from sklearn.cluster import AgglomerativeClustering
 
-    distance_threshold = max(float(threshold or 0.6), 0.01)
+    distance_threshold = _cluster_distance_threshold(threshold)
     model = AgglomerativeClustering(
         n_clusters=None,
         metric="cosine",

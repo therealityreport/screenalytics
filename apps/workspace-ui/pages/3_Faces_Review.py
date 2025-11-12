@@ -23,6 +23,23 @@ st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 # Inject thumbnail CSS
 helpers.inject_thumb_css()
 
+MAX_TRACKS_PER_ROW = 6
+
+
+def _render_similarity_badge(similarity: float | None) -> str:
+    """Render a similarity score as a percentage badge."""
+    if similarity is None:
+        return ""
+    pct = int(similarity * 100)
+    # Color coding: green for high similarity, yellow for medium, red for low
+    if similarity >= 0.75:
+        color = "green"
+    elif similarity >= 0.60:
+        color = "orange"
+    else:
+        color = "red"
+    return f'<div style="background-color: {color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: bold; display: inline-block;">{pct}%</div>'
+
 
 
 def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
@@ -116,6 +133,27 @@ def _save_identity_name(ep_id: str, identity_id: str, name: str, show: str | Non
     if resp is None:
         return
     st.toast(f"Saved name '{cleaned}' for {identity_id}")
+    _refresh_roster_names(show)
+    st.rerun()
+
+
+def _assign_track_name(ep_id: str, track_id: int, name: str, show: str | None) -> None:
+    cleaned = name.strip()
+    if not cleaned:
+        st.warning("Provide a non-empty name before saving.")
+        return
+    payload: Dict[str, Any] = {"name": cleaned}
+    if show:
+        payload["show"] = show
+    resp = _api_post(f"/episodes/{ep_id}/tracks/{track_id}/name", payload)
+    if resp is None:
+        return
+    split_flag = resp.get("split")
+    suffix = " (moved into a new cluster)" if split_flag else ""
+    st.toast(f"Saved name '{cleaned}' for track {track_id}{suffix}")
+    new_identity_id = resp.get("identity_id")
+    if new_identity_id:
+        st.session_state["selected_identity"] = new_identity_id
     _refresh_roster_names(show)
     st.rerun()
 
@@ -291,10 +329,50 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
     with action_cols[1]:
         if st.button("Cluster Cleanup", key="facebank_cleanup_button"):
             payload = helpers.default_cleanup_payload(ep_id)
-            with st.spinner("Starting cleanup job…"):
-                resp = _api_post("/jobs/episode_cleanup_async", payload)
-            if resp:
-                st.success(f"Cleanup job {resp.get('job_id', 'queued')} started.")
+            with st.spinner("Running cleanup…"):
+                summary, error_message = helpers.run_job_with_progress(
+                    ep_id,
+                    "/jobs/episode_cleanup_async",
+                    payload,
+                    requested_device=helpers.DEFAULT_DEVICE,
+                    async_endpoint="/jobs/episode_cleanup_async",
+                    requested_detector=helpers.DEFAULT_DETECTOR,
+                    requested_tracker=helpers.DEFAULT_TRACKER,
+                    use_async_only=True,
+                )
+            if error_message:
+                st.error(error_message)
+            else:
+                report = summary or {}
+                if isinstance(report.get("summary"), dict):
+                    report = report["summary"]
+                details: List[str] = []
+                tb = helpers.coerce_int(report.get("tracks_before"))
+                ta = helpers.coerce_int(report.get("tracks_after"))
+                cbefore = helpers.coerce_int(report.get("clusters_before"))
+                cafter = helpers.coerce_int(report.get("clusters_after"))
+                faces_after = helpers.coerce_int(report.get("faces_after"))
+                if tb is not None and ta is not None:
+                    details.append(
+                        f"tracks {helpers.format_count(tb) or tb} → {helpers.format_count(ta) or ta}"
+                    )
+                if cbefore is not None and cafter is not None:
+                    details.append(
+                        f"clusters {helpers.format_count(cbefore) or cbefore} → {helpers.format_count(cafter) or cafter}"
+                    )
+                if faces_after is not None:
+                    details.append(f"faces {helpers.format_count(faces_after) or faces_after}")
+                grouping = (report.get("grouping") or {}) if isinstance(report, dict) else {}
+                across = grouping.get("across_episodes") or {}
+                assigned = across.get("assigned") or []
+                new_people = helpers.coerce_int(across.get("new_people_count"))
+                if assigned:
+                    details.append(f"matched {len(assigned)} cluster(s) to people")
+                if new_people:
+                    details.append(f"created {new_people} new people")
+                summary_line = " · ".join(details) if details else "Cleanup complete."
+                st.success(summary_line or "Cleanup complete.")
+                st.caption(f"Report written to data/manifests/{ep_id}/cleanup_report.json")
     return detail
 
 
@@ -349,12 +427,13 @@ def _fetch_track_media(
     for item in items:
         url = item.get("media_url") or item.get("url") or item.get("thumbnail_url")
         resolved = helpers.resolve_thumb(url)
-        if not resolved:
-            continue
+        # Include all crops, even if URL resolution fails temporarily
+        # The UI can handle missing images gracefully
         normalized.append({
-            "url": resolved,
+            "url": resolved or url,  # Use original URL if resolution fails
             "frame_idx": item.get("frame_idx"),
             "track_id": track_id,
+            "s3_key": item.get("s3_key"),  # Preserve S3 key for debugging
         })
     return normalized, next_cursor
 
@@ -442,6 +521,9 @@ def _render_people_view(
         name = person.get("name") or "(unnamed)"
         total_clusters = len(person.get("cluster_ids", []) or [])
         with st.container(border=True):
+            featured_crop = helpers.resolve_thumb(person.get("rep_crop"))
+            if featured_crop:
+                st.image(featured_crop, caption="Featured image", width=180)
             st.markdown(f"### 👤 {name}")
             st.caption(
                 f"ID: {person_id or 'n/a'} · {total_clusters} cluster(s) overall · "
@@ -490,19 +572,33 @@ def _render_person_clusters(
     total_clusters = len(person.get("cluster_ids", []) or [])
     episode_clusters = _episode_cluster_ids(person, ep_id)
     st.subheader(f"👤 {name} · ID: {person_id}")
+    featured_crop = helpers.resolve_thumb(person.get("rep_crop"))
+    if featured_crop:
+        st.image(featured_crop, caption="Featured image", width=220)
     st.caption(f"{len(episode_clusters)} cluster(s) in this episode · {total_clusters} overall")
     if not episode_clusters:
         st.info("No clusters assigned to this person in this episode yet.")
         return
+
+    # Fetch clusters summary with track representatives from new endpoint
+    clusters_summary = _safe_api_get(f"/episodes/{ep_id}/people/{person_id}/clusters_summary")
+    if not clusters_summary:
+        st.error("Failed to load cluster representatives.")
+        return
+
     identity_index = {ident["identity_id"]: ident for ident in identities_payload.get("identities", [])}
-    for identity_id in episode_clusters:
-        cluster = cluster_lookup.get(identity_id, {})
+
+    for cluster_data in clusters_summary.get("clusters", []):
+        identity_id = cluster_data["cluster_id"]
         identity_meta = identity_index.get(identity_id, {})
-        counts = cluster.get("counts", {}) if isinstance(cluster, dict) else {}
-        tracks_count = counts.get("tracks") or len(identity_meta.get("track_ids", []) or [])
-        faces_count = counts.get("faces") or identity_meta.get("faces") or 0
-        display_name = cluster.get("name") or identity_meta.get("name")
-        label = cluster.get("label") or identity_meta.get("label")
+        tracks_count = cluster_data.get("tracks", 0)
+        faces_count = cluster_data.get("faces", 0)
+        cohesion = cluster_data.get("cohesion")
+        track_reps = cluster_data.get("track_reps", [])
+
+        display_name = identity_meta.get("name")
+        label = identity_meta.get("label")
+
         with st.container(border=True):
             title = f"Cluster {identity_id}"
             if display_name:
@@ -510,7 +606,13 @@ def _render_person_clusters(
             if label and label != display_name:
                 title += f" · {label}"
             st.markdown(f"**{title}**")
-            st.caption(f"Tracks: {tracks_count} · Faces: {faces_count}")
+
+            # Display metrics
+            metrics_parts = [f"Tracks: {tracks_count}", f"Faces: {faces_count}"]
+            if cohesion is not None:
+                metrics_parts.append(f"Cohesion: {int(cohesion * 100)}%")
+            st.caption(" · ".join(metrics_parts))
+
             _identity_name_controls(
                 ep_id=ep_id,
                 identity={
@@ -522,6 +624,38 @@ def _render_person_clusters(
                 roster_names=roster_names,
                 prefix=f"person_cluster_{person_id}_{identity_id}",
             )
+
+            # Render all track representatives with similarity badges
+            if track_reps:
+                st.markdown(f"**All {len(track_reps)} Track(s):**")
+                # Render in rows of MAX_TRACKS_PER_ROW
+                for row_start in range(0, len(track_reps), MAX_TRACKS_PER_ROW):
+                    row_tracks = track_reps[row_start : row_start + MAX_TRACKS_PER_ROW]
+                    cols = st.columns(len(row_tracks))
+                    for idx, track_rep in enumerate(row_tracks):
+                        with cols[idx]:
+                            crop_url = track_rep.get("crop_url")
+                            track_id = track_rep.get("track_id", "")
+                            similarity = track_rep.get("similarity")
+
+                            # Parse numeric track_id for display
+                            track_num = track_id.replace("track_", "") if isinstance(track_id, str) else track_id
+
+                            resolved = helpers.resolve_thumb(crop_url)
+                            thumb_markup = helpers.thumb_html(
+                                resolved, alt=f"Track {track_num}", hide_if_missing=True
+                            )
+                            if thumb_markup:
+                                st.markdown(thumb_markup, unsafe_allow_html=True)
+                            else:
+                                st.caption("Missing crop")
+
+                            # Display track ID and similarity badge
+                            badge_html = _render_similarity_badge(similarity)
+                            st.markdown(f"Track {track_num} {badge_html}", unsafe_allow_html=True)
+            else:
+                st.info("No track representatives available.")
+
             st.button(
                 "View tracks",
                 key=f"view_tracks_{person_id}_{identity_id}",
@@ -545,21 +679,31 @@ def _render_cluster_tracks(
         key="facebank_back_person_clusters",
         on_click=lambda: _set_view("person_clusters", person_id=person_id),
     )
-    cluster = cluster_lookup.get(identity_id, {})
-    identity_meta = identity_index.get(identity_id, {})
-    if not cluster and not identity_meta:
-        st.warning("Cluster not found. Returning to people list.")
-        _set_view("people")
+
+    # Fetch track representatives from new endpoint
+    track_reps_data = _safe_api_get(f"/episodes/{ep_id}/clusters/{identity_id}/track_reps")
+    if not track_reps_data:
+        st.error("Failed to load track representatives.")
         return
-    counts = cluster.get("counts", {}) if isinstance(cluster, dict) else {}
-    tracks_count = counts.get("tracks") or len(identity_meta.get("track_ids", []) or [])
-    faces_count = counts.get("faces") or identity_meta.get("faces") or 0
-    display_name = cluster.get("name") or identity_meta.get("name")
-    label = cluster.get("label") or identity_meta.get("label")
-    header = f"{identity_id} · Tracks: {tracks_count} · Faces: {faces_count}"
-    st.subheader(header)
+
+    identity_meta = identity_index.get(identity_id, {})
+    display_name = identity_meta.get("name")
+    label = identity_meta.get("label")
+
+    tracks_count = track_reps_data.get("total_tracks", 0)
+    cohesion = track_reps_data.get("cohesion")
+    faces_count = identity_meta.get("size") or 0
+    track_reps = track_reps_data.get("tracks", [])
+
+    # Header
+    header_parts = [identity_id, f"Tracks: {tracks_count}", f"Faces: {faces_count}"]
+    if cohesion is not None:
+        header_parts.append(f"Cohesion: {int(cohesion * 100)}%")
+    st.subheader(" · ".join(header_parts))
+
     if display_name or label:
         st.caption(" · ".join([part for part in [display_name, label] if part]))
+
     _identity_name_controls(
         ep_id=ep_id,
         identity={
@@ -572,112 +716,83 @@ def _render_cluster_tracks(
         prefix=f"cluster_tracks_{identity_id}",
     )
 
-    tracks = cluster.get("tracks", []) if isinstance(cluster, dict) else []
-    if not tracks:
-        st.info("No tracks linked to this identity yet.")
+    # Display all track representatives with similarity badges
+    if not track_reps:
+        st.info("No track representatives available.")
         return
 
-    # Build a crop gallery sampled from every track
-    strip_cache: Dict[str, List[Dict[str, Any]]] = st.session_state.setdefault("cluster_track_strip", {})
-    cache_key = f"{ep_id}:{identity_id}"
-    strip_items = strip_cache.get(cache_key)
-    if strip_items is None:
-        strip_items = []
-        for t in tracks:
-            tid = t.get("track_id")
-            try:
-                tid_int = int(tid)
-            except (TypeError, ValueError):
-                continue
-            crops, _ = _fetch_track_media(ep_id, tid_int, sample=5, limit=5, cursor=None)
-            for itm in crops:
-                if not itm.get("url"):
-                    continue
-                strip_items.append({"url": itm.get("url"), "track_id": tid_int})
-        strip_cache[cache_key] = strip_items
-
-    track_previews: Dict[int, str] = {}
-    if strip_items:
-        st.caption(f"{len(strip_items)} crop(s) sampled across {len(tracks)} track(s)")
-        cols_per_row = 6
-        for row_start in range(0, len(strip_items), cols_per_row):
-            chunk = strip_items[row_start : row_start + cols_per_row]
-            row_cols = st.columns(len(chunk))
-            for idx, itm in enumerate(chunk):
-                with row_cols[idx]:
-                    tid = itm.get("track_id")
-                    url = itm.get("url")
-                    thumb_markup = helpers.thumb_html(url, alt=f"Track {tid}", hide_if_missing=True)
-                    if thumb_markup:
-                        st.markdown(thumb_markup, unsafe_allow_html=True)
-                    else:
-                        st.caption("Crop unavailable.")
-                    if tid is not None:
-                        try:
-                            tid_int = int(tid)
-                            if url:
-                                track_previews.setdefault(tid_int, url)
-                        except (TypeError, ValueError):
-                            tid_int = None
-                        if tid_int is not None and st.button(
-                            "View track",
-                            key=f"strip_view_{identity_id}_{tid_int}_{row_start+idx}",
-                        ):
-                            _set_view(
-                                "track",
-                                person_id=person_id,
-                                identity_id=identity_id,
-                                track_id=tid_int,
-                            )
-
+    st.markdown(f"**All {len(track_reps)} Track(s) with Similarity Scores:**")
     move_targets = [ident_id for ident_id in identity_index if ident_id != identity_id]
-    cols_per_row = 6
-    for row_start in range(0, len(tracks), cols_per_row):
-        row_tracks = tracks[row_start : row_start + cols_per_row]
-        row_cols = st.columns(min(cols_per_row, len(row_tracks)))
-        for idx, track in enumerate(row_tracks):
-            with row_cols[idx]:
-                track_id = track.get("track_id")
-                preview_url = None
-                try:
-                    preview_url = track_previews.get(int(track_id))
-                except (TypeError, ValueError):
-                    preview_url = None
-                thumb_markup = helpers.thumb_html(preview_url, alt=f"Track {track_id}", hide_if_missing=True)
+
+    # Render tracks in grid
+    for row_start in range(0, len(track_reps), MAX_TRACKS_PER_ROW):
+        row_tracks = track_reps[row_start : row_start + MAX_TRACKS_PER_ROW]
+        cols = st.columns(len(row_tracks))
+
+        for idx, track_rep in enumerate(row_tracks):
+            with cols[idx]:
+                track_id_str = track_rep.get("track_id", "")
+                similarity = track_rep.get("similarity")
+                crop_url = track_rep.get("crop_url")
+
+                # Parse track ID for display and operations
+                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                    track_num = track_id_str.replace("track_", "")
+                    try:
+                        track_id_int = int(track_num)
+                    except (TypeError, ValueError):
+                        track_id_int = None
+                else:
+                    track_num = track_id_str
+                    try:
+                        track_id_int = int(track_id_str)
+                    except (TypeError, ValueError):
+                        track_id_int = None
+
+                # Display thumbnail
+                resolved = helpers.resolve_thumb(crop_url)
+                thumb_markup = helpers.thumb_html(resolved, alt=f"Track {track_num}", hide_if_missing=True)
                 if thumb_markup:
                     st.markdown(thumb_markup, unsafe_allow_html=True)
                 else:
-                    st.caption("No crops sampled yet.")
-                faces_count = track.get("faces") or 0
-                st.caption(f"Track {track_id} · {faces_count} faces")
-                if st.button(
-                    "View frames",
-                    key=f"view_track_{identity_id}_{track_id}",
-                ):
-                    _set_view(
-                        "track",
-                        person_id=person_id,
-                        identity_id=identity_id,
-                        track_id=int(track_id),
-                    )
-                if move_targets and track_id is not None:
-                    target_choice = st.selectbox(
-                        "Move track to…",
-                        move_targets,
-                        key=f"cluster_move_select_{identity_id}_{track_id}",
-                        format_func=lambda val: f"{val} · {identity_index.get(val, {}).get('name') or ''}".strip(" ·"),
-                    )
+                    st.caption("Missing crop")
+
+                # Display track ID and similarity badge
+                badge_html = _render_similarity_badge(similarity)
+                st.markdown(f"Track {track_num} {badge_html}", unsafe_allow_html=True)
+
+                # Actions
+                if track_id_int is not None:
                     if st.button(
-                        "Move track",
-                        key=f"cluster_move_btn_{identity_id}_{track_id}",
+                        "View frames",
+                        key=f"view_track_{identity_id}_{track_id_int}",
                     ):
-                        _move_track(ep_id, int(track_id), target_choice)
-                if track_id is not None and st.button(
-                    "Delete track",
-                    key=f"cluster_delete_btn_{identity_id}_{track_id}",
-                    type="secondary",
-                ):
-                    _delete_track(ep_id, int(track_id))
+                        _set_view(
+                            "track",
+                            person_id=person_id,
+                            identity_id=identity_id,
+                            track_id=track_id_int,
+                        )
+
+                    if move_targets:
+                        target_choice = st.selectbox(
+                            "Move to",
+                            move_targets,
+                            key=f"cluster_move_select_{identity_id}_{track_id_int}",
+                            format_func=lambda val: f"{val}",
+                        )
+                        if st.button(
+                            "Move",
+                            key=f"cluster_move_btn_{identity_id}_{track_id_int}",
+                        ):
+                            _move_track(ep_id, track_id_int, target_choice)
+
+                    if st.button(
+                        "Delete",
+                        key=f"cluster_delete_btn_{identity_id}_{track_id_int}",
+                        type="secondary",
+                    ):
+                        _delete_track(ep_id, track_id_int)
 
 
 
@@ -694,6 +809,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     )
     st.markdown(f"### Track {track_id}")
     identities = identities_payload.get("identities", [])
+    identity_lookup = {identity.get("identity_id"): identity for identity in identities}
     current_identity = st.session_state.get("selected_identity")
     show_slug = _episode_show_slug(ep_id)
     roster_names = _fetch_roster_names(show_slug)
@@ -749,6 +865,28 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     if total_frames:
         summary += f" · Faces tracked: {total_frames}"
     nav_cols[2].caption(summary)
+    if current_identity:
+        assign_container = st.container(border=True)
+        with assign_container:
+            st.markdown(f"**Assign Track {track_id} to Cast Name**")
+            identity_meta = identity_lookup.get(current_identity, {})
+            current_name = identity_meta.get("name") or ""
+            if not show_slug:
+                st.info("Show slug missing; unable to assign roster names.")
+            else:
+                resolved = _name_choice_widget(
+                    label="Cast name",
+                    key_prefix=f"track_assign_{current_identity}_{track_id}",
+                    roster_names=roster_names,
+                    current_name=current_name,
+                )
+                disabled = not resolved or resolved == current_name
+                if st.button(
+                    "Save cast name",
+                    key=f"track_assign_save_{current_identity}_{track_id}",
+                    disabled=disabled,
+                ):
+                    _assign_track_name(ep_id, track_id, resolved, show_slug)
     integrity = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/integrity")
     if integrity and not integrity.get("ok"):
         st.warning(
@@ -923,19 +1061,54 @@ if not helpers.detector_is_face_only(ep_id):
         "Tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face for best results."
     )
 
-# Group Clusters action and context hint
-cols = st.columns([1, 3])
-with cols[0]:
-    if st.button("Group Clusters (auto)", key="group_clusters_auto", type="primary"):
-        with st.spinner("Running cluster grouping..."):
-            result = _api_post(f"/episodes/{ep_id}/clusters/group", {"strategy": "auto"})
-            if result:
+strategy_labels = {
+    "Auto (episode regroup + show match)": "auto",
+    "Use existing face bank": "facebank",
+}
+selected_label = st.selectbox(
+    "Grouping strategy",
+    options=list(strategy_labels.keys()),
+    key="faces_review_grouping_strategy",
+)
+selected_strategy = strategy_labels[selected_label]
+facebank_ready = True
+if selected_strategy == "facebank":
+    confirm = st.text_input(
+        "Confirm show slug before regrouping",
+        value=show_slug or "",
+        key="facebank_show_confirm",
+        help="Protect against grouping the wrong show",
+    ).strip()
+    expected_slug = (show_slug or "").lower()
+    facebank_ready = bool(expected_slug and confirm.lower() == expected_slug)
+    if not facebank_ready:
+        st.info(f"Enter '{show_slug}' to enable facebank regrouping.")
+
+button_label = "Group Clusters (facebank)" if selected_strategy == "facebank" else "Group Clusters (auto)"
+caption_text = (
+    "Auto-groups clusters within episode and matches to show-level People"
+    if selected_strategy == "auto"
+    else "Uses existing facebank seeds to align clusters to known cast members"
+)
+if st.button(
+    button_label,
+    key="group_clusters_action",
+    type="primary",
+    disabled=(selected_strategy == "facebank" and not facebank_ready),
+):
+    payload = {"strategy": selected_strategy}
+    with st.spinner("Running cluster grouping..."):
+        result = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+        if result:
+            if selected_strategy == "auto":
                 st.success(
                     f"Grouping complete! {result.get('result', {}).get('across_episodes', {}).get('new_people_count', 0)} new people created."
                 )
-                st.rerun()
-with cols[1]:
-    st.caption("Auto-groups clusters within episode and matches to show-level People")
+            else:
+                matched = result.get("result", {}).get("matched_clusters", 0)
+                st.success(f"Facebank regroup complete! {matched} clusters matched to seeds.")
+            st.rerun()
+st.caption(caption_text)
 
 view_state = st.session_state.get("facebank_view", "people")
 identities_payload = _safe_api_get(f"/episodes/{ep_id}/identities")

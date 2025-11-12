@@ -36,6 +36,14 @@ EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
 LOGGER = logging.getLogger(__name__)
 
+DIAG = os.getenv("DIAG_LOG", "0") == "1"
+
+
+def _diag(tag: str, **kw) -> None:
+    """Diagnostic logger enabled via DIAG_LOG=1."""
+    if DIAG:
+        LOGGER.info("[DIAG:%s] %s", tag, json.dumps(kw, ensure_ascii=False))
+
 
 def _manifests_dir(ep_id: str) -> Path:
     return get_path(ep_id, "detections").parent
@@ -483,17 +491,26 @@ def _track_face_rows(ep_id: str, track_id: int) -> Dict[int, Dict[str, Any]]:
 
 
 def _first_face_lookup(ep_id: str) -> Dict[int, Dict[str, Any]]:
-    faces = _load_faces(ep_id, include_skipped=False)
+    """Return the best candidate face row for each track.
+
+    We prefer non-skipped faces when available, but fall back to skipped rows so
+    that every track can expose a preview thumbnail in the UI."""
+
+    faces = _load_faces(ep_id, include_skipped=True)
     lookup: Dict[int, Dict[str, Any]] = {}
+    scores: Dict[int, tuple[int, int]] = {}
     for row in faces:
         try:
             tid = int(row.get("track_id", -1))
             frame_idx = int(row.get("frame_idx", 10**9))
         except (TypeError, ValueError):
             continue
-        existing = lookup.get(tid)
-        if existing is None or frame_idx < int(existing.get("frame_idx", 10**9)):
+        skip_flag = 1 if row.get("skip") else 0
+        candidate_score = (skip_flag, frame_idx)
+        best_score = scores.get(tid)
+        if best_score is None or candidate_score < best_score:
             lookup[tid] = row
+            scores[tid] = candidate_score
     return lookup
 
 
@@ -1265,6 +1282,112 @@ def list_cluster_tracks(
     return payload
 
 
+@router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
+def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
+    """Get representative frames with similarity scores for all tracks in a cluster."""
+    try:
+        from apps.api.services.track_reps import build_cluster_track_reps, load_track_reps, load_cluster_centroids
+
+        track_reps = load_track_reps(ep_id)
+        cluster_centroids = load_cluster_centroids(ep_id)
+
+        result = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+
+        # Resolve crop URLs
+        for track in result.get("tracks", []):
+            crop_key = track.get("crop_key")
+            if crop_key:
+                # Use existing _resolve_crop_url helper
+                url = _resolve_crop_url(ep_id, crop_key, None)
+                track["crop_url"] = url
+
+        return result
+    except Exception as exc:
+        LOGGER.error(f"Failed to load track reps for cluster {cluster_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to load track representatives: {exc}") from exc
+
+
+@router.get("/episodes/{ep_id}/people/{person_id}/clusters_summary")
+def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
+    """Get clusters summary with track representatives for a person in an episode."""
+    try:
+        from apps.api.services.track_reps import build_cluster_track_reps, load_track_reps, load_cluster_centroids
+
+        # Parse episode to get show
+        ep_ctx = episode_context_from_id(ep_id)
+        show_slug = ep_ctx.show_slug.upper()
+
+        # Load people data
+        from apps.api.services.people import PeopleService
+        people_service = PeopleService()
+        person = people_service.get_person(show_slug, person_id)
+
+        if not person:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+        # Filter cluster IDs for this episode
+        cluster_ids = person.get("cluster_ids", [])
+        episode_clusters = [
+            cid.split(":", 1)[1] if ":" in cid else cid
+            for cid in cluster_ids
+            if cid.startswith(f"{ep_id}:")
+        ]
+
+        if not episode_clusters:
+            return {
+                "person_id": person_id,
+                "clusters": [],
+                "total_clusters": 0,
+                "total_tracks": 0,
+            }
+
+        # Load track reps and centroids once
+        track_reps = load_track_reps(ep_id)
+        cluster_centroids = load_cluster_centroids(ep_id)
+
+        # Load identities for face counts
+        identities_data = _load_identities(ep_id)
+        identity_index = {ident["identity_id"]: ident for ident in identities_data.get("identities", [])}
+
+        clusters_output = []
+        total_tracks = 0
+
+        for cluster_id in episode_clusters:
+            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+
+            # Resolve crop URLs
+            for track in cluster_data.get("tracks", []):
+                crop_key = track.get("crop_key")
+                if crop_key:
+                    url = _resolve_crop_url(ep_id, crop_key, None)
+                    track["crop_url"] = url
+
+            # Get face count from identities
+            identity = identity_index.get(cluster_id, {})
+            faces_count = identity.get("size") or 0
+
+            clusters_output.append({
+                "cluster_id": cluster_id,
+                "tracks": len(cluster_data.get("tracks", [])),
+                "faces": faces_count,
+                "cohesion": cluster_data.get("cohesion"),
+                "track_reps": cluster_data.get("tracks", []),
+            })
+            total_tracks += len(cluster_data.get("tracks", []))
+
+        return {
+            "person_id": person_id,
+            "clusters": clusters_output,
+            "total_clusters": len(clusters_output),
+            "total_tracks": total_tracks,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        LOGGER.error(f"Failed to load clusters summary for person {person_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to load clusters summary: {exc}") from exc
+
+
 @router.get("/episodes/{ep_id}/faces_grid")
 def faces_grid(ep_id: str, track_id: int | None = Query(None)) -> dict:
     faces = _load_faces(ep_id, include_skipped=False)
@@ -1402,6 +1525,25 @@ def list_track_crops(
             if "h" not in item and "crop_height" in meta:
                 item["h"] = meta.get("crop_height") or meta.get("height")
             item.setdefault("ts", meta.get("ts"))
+            # Include quality metrics for sorting/filtering in UI
+            item.setdefault("quality", meta.get("quality"))
+            item.setdefault("conf", meta.get("conf"))
+
+    if items:
+        keys = [item.get("key") for item in items if item.get("key")]
+        first_three = keys[:3]
+        last_three = keys[-3:] if len(keys) > 3 else []
+        _diag(
+            "TILE_LIST",
+            ep_id=ep_id,
+            track_id=track_id,
+            total_items=len(items),
+            first_keys=first_three,
+            last_keys=last_three,
+            sample=sample,
+            limit=limit,
+        )
+
     return payload
 
 
@@ -1554,6 +1696,14 @@ def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -
 def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest) -> dict:
     try:
         return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/episodes/{ep_id}/tracks/{track_id}/name")
+def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> dict:
+    try:
+        return identity_service.assign_track_name(ep_id, track_id, body.name, body.show)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

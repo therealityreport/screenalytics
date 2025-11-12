@@ -501,16 +501,13 @@ def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = 
     return {"track_id": track_id, "frame_idx": frame_idx, "removed": len(removed)}
 
 
-def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None) -> Dict[str, Any]:
-    payload = load_identities(ep_id)
-    entries = _identity_rows(payload)
-    target = next((entry for entry in entries if (entry.get("identity_id") or entry.get("id")) == identity_id), None)
-    if target is None:
-        raise ValueError("identity_not_found")
-    trimmed = (name or "").strip()
-    if not trimmed:
-        raise ValueError("name_required")
-    target["name"] = trimmed
+def _persist_identity_name(
+    ep_id: str,
+    payload: Dict[str, Any],
+    identity_id: str,
+    trimmed_name: str,
+    show: str | None,
+) -> Dict[str, Any]:
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
     sync_manifests(ep_id, identities_path)
@@ -527,11 +524,83 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
         show_slug = show or ""
     if show_slug:
         try:
-            roster_service.add_if_missing(show_slug, trimmed)
+            roster_service.add_if_missing(show_slug, trimmed_name)
         except ValueError:
             # Duplicate roster seeds are normal when multiple queues run.
             pass
-    return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed}
+    return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
+
+
+def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None) -> Dict[str, Any]:
+    payload = load_identities(ep_id)
+    entries = _identity_rows(payload)
+    target = next((entry for entry in entries if (entry.get("identity_id") or entry.get("id")) == identity_id), None)
+    if target is None:
+        raise ValueError("identity_not_found")
+    trimmed = (name or "").strip()
+    if not trimmed:
+        raise ValueError("name_required")
+    target["name"] = trimmed
+    return _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
+
+
+def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None) -> Dict[str, Any]:
+    trimmed = (name or "").strip()
+    if not trimmed:
+        raise ValueError("name_required")
+    try:
+        track_id_int = int(track_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_track_id") from exc
+
+    payload = load_identities(ep_id)
+    entries = _identity_rows(payload)
+    target_identity = None
+    track_ids_for_identity: List[int] = []
+    for entry in entries:
+        raw_ids = entry.get("track_ids", []) or []
+        normalized: List[int] = []
+        for raw in raw_ids:
+            try:
+                normalized.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        if track_id_int in normalized:
+            target_identity = entry
+            track_ids_for_identity = normalized
+            break
+    if target_identity is None:
+        raise ValueError("track_not_found")
+
+    identity_id = target_identity.get("identity_id") or target_identity.get("id")
+    if not identity_id:
+        identity_id = _next_identity_id(entries)
+        target_identity["identity_id"] = identity_id
+
+    if len(track_ids_for_identity) <= 1:
+        target_identity["name"] = trimmed
+        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
+        result["track_id"] = track_id_int
+        result["split"] = False
+        return result
+
+    remaining_ids = [tid for tid in track_ids_for_identity if tid != track_id_int]
+    target_identity["track_ids"] = remaining_ids
+
+    new_identity_id = _next_identity_id(entries)
+    new_identity = {
+        "identity_id": new_identity_id,
+        "label": None,
+        "track_ids": [track_id_int],
+        "name": trimmed,
+    }
+    payload.setdefault("identities", []).append(new_identity)
+
+    result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show)
+    result["track_id"] = track_id_int
+    result["split"] = True
+    result["source_identity_id"] = identity_id
+    return result
 
 
 def move_frames(

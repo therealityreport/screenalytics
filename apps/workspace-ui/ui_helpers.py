@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
 import math
 import mimetypes
 import numbers
@@ -27,7 +28,18 @@ DEFAULT_DEVICE = "auto"
 DEFAULT_DEVICE_LABEL = "Auto"
 DEFAULT_DET_THRESH = 0.5
 DEFAULT_MAX_GAP = 30
+DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
+
+LOGGER = logging.getLogger(__name__)
+DIAG = os.getenv("DIAG_LOG", "0") == "1"
+
+
+def _diag(tag: str, **kw) -> None:
+    """Diagnostic logger enabled via DIAG_LOG=1."""
+    if DIAG:
+        LOGGER.info("[DIAG:%s] %s", tag, json.dumps(kw, ensure_ascii=False))
+
 
 # Thumbnail constants
 THUMB_W, THUMB_H = 200, 250
@@ -283,6 +295,21 @@ def _data_url_cache(path_str: str) -> str | None:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def seed_display_source(seed: Dict[str, Any] | None) -> str | None:
+    """Return the preferred image reference for a facebank seed."""
+    if not seed:
+        return None
+    for key in ("display_s3_key", "display_key", "image_s3_key"):
+        value = seed.get(key)
+        if value:
+            return value
+    for key in ("orig_s3_key", "orig_uri", "display_url", "image_uri"):
+        value = seed.get(key)
+        if value:
+            return value
+    return None
+
+
 def ensure_media_url(path_or_url: str | Path | None) -> str | None:
     """Return a browser-safe URL for local artifacts, falling back to the original string."""
     if not path_or_url:
@@ -455,7 +482,7 @@ def default_cleanup_payload(ep_id: str) -> Dict[str, Any]:
         "scene_threshold": SCENE_THRESHOLD_DEFAULT,
         "scene_min_len": SCENE_MIN_LEN_DEFAULT,
         "scene_warmup_dets": SCENE_WARMUP_DETS_DEFAULT,
-        "cluster_thresh": 0.6,
+        "cluster_thresh": DEFAULT_CLUSTER_SIMILARITY,
         "min_cluster_size": 2,
         "thumb_size": 256,
         "actions": ["split_tracks", "reembed", "recluster", "group_clusters"],
@@ -1018,9 +1045,10 @@ def run_job_with_progress(
     payload: Dict[str, Any],
     *,
     requested_device: str,
-    async_endpoint: str | None,
+    async_endpoint: str | None = None,
     requested_detector: str | None = None,
     requested_tracker: str | None = None,
+    use_async_only: bool = False,
 ):
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
@@ -1085,16 +1113,27 @@ def run_job_with_progress(
     summary = None
     error_message = None
     try:
-        summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
-        if (error_message or summary is None) and not error_message and async_endpoint:
+        if use_async_only:
+            target_endpoint = async_endpoint or endpoint_path
             summary, error_message = fallback_poll_progress(
                 ep_id,
                 payload,
                 update_cb=_cb,
                 status_placeholder=status_placeholder,
-                job_started=job_started,
-                async_endpoint=async_endpoint,
+                job_started=False,
+                async_endpoint=target_endpoint,
             )
+        else:
+            summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
+            if (error_message or summary is None) and not error_message and async_endpoint:
+                summary, error_message = fallback_poll_progress(
+                    ep_id,
+                    payload,
+                    update_cb=_cb,
+                    status_placeholder=status_placeholder,
+                    job_started=job_started,
+                    async_endpoint=async_endpoint,
+                )
         if summary and isinstance(summary, dict):
             remember_detector(summary.get("detector"))
             remember_tracker(summary.get("tracker"))
@@ -1226,30 +1265,101 @@ def inject_thumb_css() -> None:
 def resolve_thumb(src: str | None) -> str | None:
     """Resolve thumbnail source to a browser-safe URL or None for placeholder.
 
-    If the source is an HTTP(S) URL or a data: URL, it is returned as-is.
-    For existing local files, a data URL is generated via ensure_media_url.
+    Resolution order:
+    1. Already a data URL → return as-is
+    2. HTTPS URL (S3 presigned) → return as-is (CORS-safe)
+    3. HTTP localhost API URL → fetch and convert to data URL
+    4. Local file path exists → convert to data URL
+    5. S3 key (artifacts/**) → presign via API → fetch and convert to data URL
+    6. None → return None for placeholder
     """
     if not src:
         return None
-    safe_url = ensure_media_url(src)
-    if not safe_url:
-        return None
-    if safe_url.startswith(("http://", "https://", "data:")):
-        return safe_url
+    
+    # Already a data URL? Return as-is
+    if isinstance(src, str) and src.startswith("data:"):
+        return src
+    
+    # HTTPS URLs (S3 presigned) can be loaded directly - return as-is
+    if isinstance(src, str) and src.startswith("https://"):
+        return src
+    
+    # HTTP localhost API URLs need to be fetched and converted to data URLs
+    # (Streamlit at :8501 can't load images from :8000 without CORS)
+    if isinstance(src, str) and src.startswith("http://localhost:"):
+        try:
+            response = requests.get(src, timeout=2)
+            if response.ok and response.content:
+                encoded = base64.b64encode(response.content).decode("ascii")
+                content_type = response.headers.get("content-type") or _infer_mime(src) or "image/jpeg"
+                return f"data:{content_type};base64,{encoded}"
+        except Exception as exc:
+            _diag("UI_RESOLVE_FAIL", src=src, reason="localhost_fetch_error", error=str(exc))
+    
+    # Try as local file path
     try:
         path = Path(src)
         if path.exists() and path.is_file():
-            converted = ensure_media_url(path)
-            if converted and converted.startswith("data:"):
+            converted = _data_url_cache(str(path))
+            if converted:
                 return converted
-    except OSError:
-        return None
+    except (OSError, ValueError) as exc:
+        _diag("UI_RESOLVE_FAIL", src=src, reason="local_file_error", error=str(exc))
+    
+    # Try as S3 key - call presign endpoint and then fetch
+    if isinstance(src, str) and (
+        src.startswith("artifacts/") or 
+        src.startswith("raw/") or
+        ("/" in src and not src.startswith("/") and not src.startswith("http"))
+    ):
+        try:
+            api_base = st.session_state.get("api_base") or "http://localhost:8000"
+            params = {"key": src, "ttl": 3600}
+            inferred_mime = _infer_mime(src)
+            response = requests.get(f"{api_base}/files/presign", params=params, timeout=2)
+            if response.ok:
+                data = response.json()
+                presigned_url = data.get("url")
+                resolved_mime = data.get("content_type") or inferred_mime
+                if presigned_url:
+                    # For HTTPS presigned URLs, return directly
+                    if presigned_url.startswith("https://"):
+                        return presigned_url
+                    # For HTTP URLs, fetch and convert to data URL
+                    img_response = requests.get(presigned_url, timeout=5)
+                    if img_response.ok and img_response.content:
+                        encoded = base64.b64encode(img_response.content).decode("ascii")
+                        content_type = img_response.headers.get("content-type") or resolved_mime or "image/jpeg"
+                        return f"data:{content_type};base64,{encoded}"
+        except Exception as exc:
+            _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=str(exc))
+
+    _diag("UI_RESOLVE_FAIL", src=src, reason="all_methods_failed")
     return None
 
 
 @lru_cache(maxsize=1)
 def _placeholder_thumb_url() -> str:
     return resolve_thumb(_PLACEHOLDER) or ensure_media_url(_PLACEHOLDER) or _PLACEHOLDER
+
+
+def _infer_mime(name: str | None) -> str | None:
+    if not name:
+        return None
+    lowered = name.lower()
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".avif"):
+        return "image/avif"
+    if lowered.endswith(".gif"):
+        return "image/gif"
+    if lowered.endswith(".bmp"):
+        return "image/bmp"
+    if lowered.endswith(".tif") or lowered.endswith(".tiff"):
+        return "image/tiff"
+    return "image/jpeg"
 
 
 def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = False) -> str:

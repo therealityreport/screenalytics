@@ -6,9 +6,11 @@ cd "$ROOT"
 : "${STORAGE_BACKEND:=s3}"
 : "${AWS_S3_BUCKET:=screenalytics}"
 : "${AWS_DEFAULT_REGION:=us-east-1}"
+: "${FACEBANK_S3_BUCKET:=$AWS_S3_BUCKET}"
 export STORAGE_BACKEND
 export AWS_S3_BUCKET
 export AWS_DEFAULT_REGION
+export FACEBANK_S3_BUCKET
 export API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8000}"
 export UI_ORIGIN="${UI_ORIGIN:-http://localhost:8501}"
 

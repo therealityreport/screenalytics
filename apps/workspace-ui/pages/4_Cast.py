@@ -23,6 +23,98 @@ st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 # Inject thumbnail CSS
 helpers.inject_thumb_css()
 
+SUPPORTED_IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "avif", "heic", "heif"]
+SUPPORTED_IMAGE_DESC = "Supported: JPG, PNG, WebP, AVIF, HEIC/HEIF"
+SIMULATED_DETECTOR_WARNING = (
+    "Seed uploads are using the simulated detector. Install RetinaFace (insightface + buffalo_l) for aligned crops."
+)
+_CAST_EDIT_FIELDS = ["name", "role", "status", "aliases", "seasons"]
+
+
+def _reset_cast_edit_state() -> None:
+    st.session_state.pop("cast_edit_id", None)
+    for field in _CAST_EDIT_FIELDS:
+        st.session_state.pop(f"cast_edit_{field}", None)
+
+
+def _prime_cast_edit_state(member: Dict[str, Any]) -> None:
+    st.session_state["cast_edit_id"] = member["cast_id"]
+    st.session_state["cast_edit_name"] = member.get("name", "")
+    st.session_state["cast_edit_role"] = member.get("role", "other")
+    st.session_state["cast_edit_status"] = member.get("status", "active")
+    st.session_state["cast_edit_aliases"] = ", ".join(member.get("aliases", []))
+    st.session_state["cast_edit_seasons"] = ", ".join(member.get("seasons", []))
+
+
+def _parse_csv_field(raw: str) -> List[str]:
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+
+def _render_cast_edit_form(member: Dict[str, Any], show_id: str) -> None:
+    cast_id = member["cast_id"]
+    if "cast_edit_name" not in st.session_state:
+        _prime_cast_edit_state(member)
+
+    st.markdown("**Edit Cast Member**")
+    st.caption("Update metadata and click Save to persist changes.")
+    with st.form(f"cast_edit_form_{cast_id}"):
+        name = st.text_input("Name*", key="cast_edit_name")
+        form_cols = st.columns(2)
+        with form_cols[0]:
+            role = st.selectbox("Role", options=["main", "friend", "guest", "other"], key="cast_edit_role")
+        with form_cols[1]:
+            status = st.selectbox("Status", options=["active", "past", "inactive"], key="cast_edit_status")
+        aliases_raw = st.text_input("Aliases (comma-separated)", key="cast_edit_aliases")
+        seasons_raw = st.text_input("Seasons (comma-separated)", key="cast_edit_seasons")
+
+        button_cols = st.columns([1, 1])
+        submit = button_cols[0].form_submit_button("Save changes", type="primary")
+        cancel = button_cols[1].form_submit_button("Cancel")
+
+        if cancel:
+            _reset_cast_edit_state()
+            st.rerun()
+
+        if submit:
+            if not name.strip():
+                st.error("Name is required.")
+            else:
+                payload = {
+                    "name": name.strip(),
+                    "role": role,
+                    "status": status,
+                    "aliases": _parse_csv_field(aliases_raw),
+                    "seasons": _parse_csv_field(seasons_raw),
+                }
+                result = _api_patch(f"/shows/{show_id}/cast/{cast_id}", payload)
+                if result:
+                    st.success("Cast member updated.")
+                    _reset_cast_edit_state()
+                    st.session_state["selected_cast_id"] = cast_id
+                    st.rerun()
+
+
+def _mark_featured_seed(show_id: str, cast_id: str, seed_id: str) -> None:
+    path = f"/cast/{cast_id}/seeds/{seed_id}/feature?show_id={show_id}"
+    resp = _api_post(path)
+    if resp:
+        st.success("Featured image updated.")
+        st.rerun()
+
+
+def _resolve_api_url(url: str | None) -> str | None:
+    """Convert relative API URLs to full URLs, or return HTTP(S) URLs as-is."""
+    if not url:
+        return None
+    # If it's already a full URL or data URL, return as-is
+    if url.startswith(("http://", "https://", "data:")):
+        return url
+    # If it's a relative API path, prepend the API base
+    if url.startswith("/"):
+        api_base = cfg.get("api_base") or st.session_state.get("api_base") or "http://localhost:8000"
+        return f"{api_base}{url}"
+    return url
+
 
 def _api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
     try:
@@ -40,6 +132,20 @@ def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any
         return None
 
 
+def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    base = st.session_state.get("api_base")
+    if not base:
+        st.error("API base URL missing; re-run init_page().")
+        return None
+    try:
+        resp = requests.patch(f"{base}{path}", json=payload or {}, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        st.error(helpers.describe_error(f"{base}{path}", exc))
+        return None
+
+
 def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
     base = st.session_state.get("api_base")
     if not base:
@@ -52,6 +158,15 @@ def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, A
     except requests.RequestException as exc:
         st.error(helpers.describe_error(f"{base}{path}", exc))
         return None
+
+
+def _warn_if_simulated(payload: Dict[str, Any] | None) -> None:
+    if not payload:
+        return
+    detector = (payload.get("detector") or "").lower()
+    if detector and detector != "retinaface":
+        message = payload.get("detector_message") or SIMULATED_DETECTOR_WARNING
+        st.warning(message)
 
 
 # Show and season filters
@@ -180,10 +295,10 @@ if show_add_form:
             with st.form("upload_seeds_after_create_form"):
                 uploaded_files = st.file_uploader(
                     "Choose seed images",
-                    type=["jpg", "jpeg", "png"],
+                    type=SUPPORTED_IMAGE_TYPES,
                     accept_multiple_files=True,
                     key="new_cast_upload_files",
-                    help="Select one or more photos of this person"
+                    help=f"Select one or more photos ({SUPPORTED_IMAGE_DESC})"
                 )
 
                 cols = st.columns([1, 1, 1])
@@ -198,6 +313,7 @@ if show_add_form:
                             resp = requests.post(url, files=files, timeout=120)
                             resp.raise_for_status()
                             result = resp.json()
+                            _warn_if_simulated(result)
 
                             uploaded_count = result.get("uploaded", 0)
                             failed_count = result.get("failed", 0)
@@ -284,6 +400,9 @@ if selected_cast_id:
 
     member = member_resp
 
+    if st.session_state.get("cast_edit_id") and st.session_state["cast_edit_id"] != selected_cast_id:
+        _reset_cast_edit_state()
+
     st.subheader(f"Cast Detail: {member['name']}")
 
     # Basic info
@@ -299,6 +418,10 @@ if selected_cast_id:
         if member.get("seasons"):
             st.markdown(f"**Seasons:** {', '.join(member['seasons'])}")
 
+    edit_mode = st.session_state.get("cast_edit_id") == selected_cast_id
+    if edit_mode:
+        _render_cast_edit_form(member, show_id)
+
     # Facebank section
     st.markdown("---")
     st.markdown("### Facebank")
@@ -310,12 +433,22 @@ if selected_cast_id:
     if facebank_resp:
         seeds = facebank_resp.get("seeds", [])
         stats = facebank_resp.get("stats", {})
+        featured_seed_id = facebank_resp.get("featured_seed_id")
 
         # Stats chips
         stat_cols = st.columns(3)
         stat_cols[0].metric("Seed Images", stats.get("total_seeds", 0))
         stat_cols[1].metric("Exemplars", stats.get("total_exemplars", 0))
         stat_cols[2].caption(f"Updated: {stats.get('updated_at', 'never')[:10]}")
+
+        featured_seed = next((seed for seed in seeds if seed.get("fb_id") == featured_seed_id), None)
+        if featured_seed:
+            st.markdown("**⭐ Featured Image**")
+            image_uri = _resolve_api_url(helpers.seed_display_source(featured_seed))
+            featured_thumb = helpers.resolve_thumb(image_uri)
+            if featured_thumb:
+                st.image(featured_thumb, width=220)
+            st.caption("Select another seed below to change the featured image.")
 
         # Seed images grid
         if seeds:
@@ -327,11 +460,16 @@ if selected_cast_id:
                 row_cols = st.columns(cols_per_row)
                 for idx, seed in enumerate(row_seeds):
                     with row_cols[idx]:
-                        image_uri = seed.get("image_uri")
+                        image_uri = _resolve_api_url(helpers.seed_display_source(seed))
                         fb_id = seed.get("fb_id")
                         resolved_thumb = helpers.resolve_thumb(image_uri)
                         st.markdown(helpers.thumb_html(resolved_thumb, alt=f"Seed {fb_id}"), unsafe_allow_html=True)
-                        st.caption(f"Seed {fb_id[:8]}...")
+                        if seed.get("featured"):
+                            st.caption("⭐ Featured")
+                        else:
+                            st.caption(f"Seed {fb_id[:8]}...")
+                            if st.button("☆ Feature", key=f"feature_seed_{fb_id}"):
+                                _mark_featured_seed(show_id, selected_cast_id, fb_id)
 
         # Upload seeds button
         if st.button("Upload Seed Images", key=f"cast_upload_seeds_{selected_cast_id}"):
@@ -342,11 +480,11 @@ if selected_cast_id:
         if st.session_state.get("cast_show_upload_form"):
             with st.form("upload_seeds_form"):
                 st.markdown("**Upload Seed Images**")
-                st.caption("Images must contain exactly 1 face. Supported: JPG, PNG")
+                st.caption(f"Images must contain exactly 1 face. {SUPPORTED_IMAGE_DESC}")
 
                 uploaded_files = st.file_uploader(
                     "Choose images",
-                    type=["jpg", "jpeg", "png"],
+                    type=SUPPORTED_IMAGE_TYPES,
                     accept_multiple_files=True,
                     key="cast_upload_files",
                 )
@@ -366,6 +504,7 @@ if selected_cast_id:
                             resp = requests.post(url, files=files, timeout=120)
                             resp.raise_for_status()
                             result = resp.json()
+                            _warn_if_simulated(result)
 
                             uploaded_count = result.get("uploaded", 0)
                             failed_count = result.get("failed", 0)
@@ -394,8 +533,12 @@ if selected_cast_id:
     action_cols = st.columns([1, 1, 1])
 
     with action_cols[0]:
-        if st.button("Edit Cast Member", key=f"cast_edit_{selected_cast_id}"):
-            st.info("Edit functionality coming soon")
+        if edit_mode:
+            st.button("Editing…", key=f"cast_edit_disabled_{selected_cast_id}", disabled=True)
+        else:
+            if st.button("Edit Cast Member", key=f"cast_edit_{selected_cast_id}"):
+                _prime_cast_edit_state(member)
+                st.rerun()
 
     with action_cols[1]:
         if st.button("View Detections", key=f"cast_view_detections_{selected_cast_id}"):

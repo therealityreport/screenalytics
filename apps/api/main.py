@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from apps.api.routers import cast, episodes, facebank, grouping, identities, jobs, people, roster
+from apps.api.routers import cast, episodes, facebank, files, grouping, identities, jobs, people, roster
+from tools import episode_run
 
 app = FastAPI(title="Screenalytics API", version="0.1.0")
+LOGGER = logging.getLogger(__name__)
 
 ui_origin = os.environ.get("UI_ORIGIN", "http://localhost:8501")
 origins = {ui_origin, "http://localhost:8501"}
@@ -23,9 +26,17 @@ app.include_router(identities.router)
 app.include_router(roster.router)
 app.include_router(cast.router, tags=["cast"])
 app.include_router(facebank.router, tags=["facebank"])
+app.include_router(files.router, tags=["files"])
 app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
+
+
+@app.on_event("startup")
+async def _warmup_retinaface() -> None:
+    ready, detail, _ = episode_run.ensure_retinaface_ready("cpu")
+    if not ready:
+        LOGGER.warning("RetinaFace detector not ready: %s", detail)
 
 
 @app.get("/health")

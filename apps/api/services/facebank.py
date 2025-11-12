@@ -50,24 +50,49 @@ class FacebankService:
     def _load_facebank(self, show_id: str, cast_id: str) -> Dict[str, Any]:
         """Load facebank.json or create empty structure."""
         path = self._facebank_path(show_id, cast_id)
+        default_payload = {
+            "show_id": show_id,
+            "cast_id": cast_id,
+            "seeds": [],
+            "exemplars": [],
+            "updated_at": _now_iso(),
+            "featured_seed_id": None,
+        }
         if not path.exists():
-            return {
-                "show_id": show_id,
-                "cast_id": cast_id,
-                "seeds": [],
-                "exemplars": [],
-                "updated_at": _now_iso(),
-            }
+            return default_payload
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return {
-                "show_id": show_id,
-                "cast_id": cast_id,
-                "seeds": [],
-                "exemplars": [],
-                "updated_at": _now_iso(),
-            }
+            return default_payload
+        if not isinstance(data, dict):
+            return default_payload
+        data.setdefault("featured_seed_id", None)
+        seeds = data.get("seeds")
+        if isinstance(seeds, list):
+            for seed in seeds:
+                if isinstance(seed, dict) and "image_s3_key" not in seed:
+                    seed["image_s3_key"] = None
+                if isinstance(seed, dict) and "display_s3_key" not in seed:
+                    seed["display_s3_key"] = seed.get("image_s3_key")
+                if isinstance(seed, dict) and "embed_s3_key" not in seed:
+                    seed["embed_s3_key"] = None
+                if isinstance(seed, dict) and "embed_uri" not in seed:
+                    seed["embed_uri"] = None
+                if isinstance(seed, dict) and "orig_uri" not in seed:
+                    seed["orig_uri"] = None
+                if isinstance(seed, dict) and "orig_s3_key" not in seed:
+                    seed["orig_s3_key"] = None
+                if isinstance(seed, dict) and "storage_seed_id" not in seed:
+                    seed["storage_seed_id"] = None
+                if isinstance(seed, dict) and "display_dims" not in seed:
+                    seed["display_dims"] = None
+                if isinstance(seed, dict) and "embed_dims" not in seed:
+                    seed["embed_dims"] = None
+                if isinstance(seed, dict) and "display_low_res" not in seed:
+                    seed["display_low_res"] = False
+                if isinstance(seed, dict) and "display_key" not in seed:
+                    seed["display_key"] = seed.get("display_s3_key") or seed.get("image_s3_key")
+        return data
 
     def _save_facebank(self, show_id: str, cast_id: str, data: Dict[str, Any]) -> None:
         """Save facebank.json."""
@@ -100,12 +125,20 @@ class FacebankService:
             "updated_at": data.get("updated_at"),
         }
 
+        featured_id = data.get("featured_seed_id")
+        seeds_with_flag = []
+        for seed in seeds:
+            entry = seed.copy()
+            entry["featured"] = entry.get("fb_id") == featured_id
+            seeds_with_flag.append(entry)
+
         return {
             "show_id": show_id,
             "cast_id": cast_id,
-            "seeds": seeds,
+            "seeds": seeds_with_flag,
             "exemplars": exemplars,
             "stats": stats,
+            "featured_seed_id": featured_id,
         }
 
     def add_seed(
@@ -115,12 +148,27 @@ class FacebankService:
         image_path: str,
         embedding: np.ndarray,
         quality: Optional[Dict[str, Any]] = None,
+        image_s3_key: Optional[str] = None,
+        embed_image_path: Optional[str] = None,
+        embed_s3_key: Optional[str] = None,
+        *,
+        seed_id: str | None = None,
+        seed_storage_id: str | None = None,
+        display_uri: str | None = None,
+        embed_uri: str | None = None,
+        orig_image_path: str | None = None,
+        orig_s3_key: str | None = None,
+        display_dims: Optional[List[int]] = None,
+        embed_dims: Optional[List[int]] = None,
+        display_low_res: bool = False,
+        detector_mode: str | None = None,
     ) -> Dict[str, Any]:
         """Add a seed image with its embedding."""
         data = self._load_facebank(show_id, cast_id)
         seeds = data.get("seeds", [])
 
-        seed_id = str(uuid.uuid4())
+        seed_id = seed_id or str(uuid.uuid4())
+        storage_seed_id = seed_storage_id or seed_id
 
         seed_entry = {
             "fb_id": seed_id,
@@ -130,12 +178,27 @@ class FacebankService:
             "embedding_dim": len(embedding),
             "quality": quality or {},
             "source": "upload",
-            "image_uri": image_path,
+            "image_uri": display_uri or image_path,
             "created_at": _now_iso(),
+            "image_s3_key": image_s3_key,
+            "display_s3_key": image_s3_key,
+            "display_key": image_s3_key,
+            "display_uri": display_uri or image_path,
+            "embed_uri": embed_uri or embed_image_path,
+            "embed_s3_key": embed_s3_key,
+            "orig_uri": orig_image_path,
+            "orig_s3_key": orig_s3_key,
+            "storage_seed_id": storage_seed_id,
+            "display_dims": list(display_dims) if display_dims else None,
+            "embed_dims": list(embed_dims) if embed_dims else None,
+            "display_low_res": bool(display_low_res),
+            "detector_mode": detector_mode,
         }
 
         seeds.append(seed_entry)
         data["seeds"] = seeds
+        if not data.get("featured_seed_id"):
+            data["featured_seed_id"] = seed_id
         self._save_facebank(show_id, cast_id, data)
 
         return seed_entry
@@ -151,9 +214,22 @@ class FacebankService:
 
         if deleted_count > 0:
             data["seeds"] = seeds
+            if data.get("featured_seed_id") in seed_ids:
+                data["featured_seed_id"] = seeds[0]["fb_id"] if seeds else None
             self._save_facebank(show_id, cast_id, data)
 
         return deleted_count
+
+    def set_featured_seed(self, show_id: str, cast_id: str, seed_id: str) -> Dict[str, Any]:
+        """Mark a specific seed as featured."""
+        data = self._load_facebank(show_id, cast_id)
+        seeds = data.get("seeds", [])
+        for seed in seeds:
+            if seed.get("fb_id") == seed_id:
+                data["featured_seed_id"] = seed_id
+                self._save_facebank(show_id, cast_id, data)
+                return seed
+        raise ValueError(f"Seed {seed_id} not found for {show_id}/{cast_id}")
 
     def get_all_seeds_for_show(self, show_id: str) -> List[Dict[str, Any]]:
         """Get all seed embeddings for a show (for detection boosting)."""

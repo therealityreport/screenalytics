@@ -8,4 +8,5 @@ def test_facebank_page_compiles() -> None:
     path = project_root / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
     source = path.read_text(encoding="utf-8")
     compile(source, str(path), "exec")
-    assert "_render_identity_grid" in source
+    assert "_render_people_view" in source
+    assert "Use existing face bank" in source

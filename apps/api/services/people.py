@@ -47,9 +47,15 @@ class PeopleService:
         if not path.exists():
             return {"show_id": show_id, "people": []}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {"show_id": show_id, "people": []}
+        people = data.get("people")
+        if isinstance(people, list):
+            for person in people:
+                if isinstance(person, dict) and "rep_crop_s3_key" not in person:
+                    person["rep_crop_s3_key"] = None
+        return data
 
     def _save_people(self, show_id: str, data: Dict[str, Any]) -> None:
         """Save people.json."""
@@ -76,6 +82,8 @@ class PeopleService:
         prototype: Optional[List[float]] = None,
         cluster_ids: Optional[List[str]] = None,
         rep_crop: Optional[str] = None,
+        rep_crop_s3_key: Optional[str] = None,
+        cast_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a new person."""
         data = self._load_people(show_id)
@@ -95,7 +103,9 @@ class PeopleService:
             "prototype": prototype or [],
             "cluster_ids": cluster_ids or [],
             "rep_crop": rep_crop,
+            "rep_crop_s3_key": rep_crop_s3_key,
             "created_at": _now_iso(),
+            "cast_id": cast_id,
         }
 
         people.append(person)
@@ -111,6 +121,8 @@ class PeopleService:
         prototype: Optional[List[float]] = None,
         cluster_ids: Optional[List[str]] = None,
         rep_crop: Optional[str] = None,
+        rep_crop_s3_key: Optional[str] = None,
+        cast_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update an existing person."""
         data = self._load_people(show_id)
@@ -126,6 +138,10 @@ class PeopleService:
                     person["cluster_ids"] = cluster_ids
                 if rep_crop is not None:
                     person["rep_crop"] = rep_crop
+                if rep_crop_s3_key is not None:
+                    person["rep_crop_s3_key"] = rep_crop_s3_key
+                if cast_id is not None:
+                    person["cast_id"] = cast_id
 
                 data["people"] = people
                 self._save_people(show_id, data)
@@ -197,6 +213,14 @@ class PeopleService:
         if best_person_id and best_distance <= max_distance:
             return (best_person_id, best_distance)
 
+        return None
+
+    def find_person_by_cast_id(self, show_id: str, cast_id: str) -> Optional[Dict[str, Any]]:
+        """Find a person record linked to a given cast member."""
+        people = self.list_people(show_id)
+        for person in people:
+            if person.get("cast_id") == cast_id:
+                return person
         return None
 
     def delete_person(self, show_id: str, person_id: str) -> bool:

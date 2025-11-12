@@ -14,9 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from apps.api.services.people import PeopleService
+from apps.api.services.storage import StorageService
 
 router = APIRouter()
 people_service = PeopleService()
+storage_service = StorageService()
 
 
 class PersonResponse(BaseModel):
@@ -26,26 +28,40 @@ class PersonResponse(BaseModel):
     prototype: List[float]
     cluster_ids: List[str]
     rep_crop: Optional[str]
+    rep_crop_s3_key: Optional[str] = None
     created_at: str
+    cast_id: Optional[str] = None
 
 
 class PersonUpdateRequest(BaseModel):
     name: Optional[str] = None
     rep_crop: Optional[str] = None
+    rep_crop_s3_key: Optional[str] = None
 
 
 class PersonCreateRequest(BaseModel):
     name: Optional[str] = None
 
 
+def _hydrate_rep_crop(person: dict) -> dict:
+    record = dict(person)
+    key = record.get("rep_crop_s3_key")
+    if key:
+        url = storage_service.presign_get(key)
+        if url:
+            record["rep_crop"] = url
+    return record
+
+
 @router.get("/shows/{show_id}/people")
 def list_people(show_id: str) -> dict:
     """Get all people for a show."""
     people = people_service.list_people(show_id)
+    hydrated = [_hydrate_rep_crop(person) for person in people]
     return {
         "show_id": show_id,
-        "people": people,
-        "count": len(people),
+        "people": hydrated,
+        "count": len(hydrated),
     }
 
 
@@ -55,14 +71,14 @@ def get_person(show_id: str, person_id: str) -> PersonResponse:
     person = people_service.get_person(show_id, person_id)
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-    return PersonResponse(**person)
+    return PersonResponse(**_hydrate_rep_crop(person))
 
 
 @router.post("/shows/{show_id}/people")
 def create_person(show_id: str, body: PersonCreateRequest) -> PersonResponse:
     """Create a new person."""
     person = people_service.create_person(show_id, name=body.name)
-    return PersonResponse(**person)
+    return PersonResponse(**_hydrate_rep_crop(person))
 
 
 @router.patch("/shows/{show_id}/people/{person_id}")
@@ -73,10 +89,11 @@ def update_person(show_id: str, person_id: str, body: PersonUpdateRequest) -> Pe
         person_id,
         name=body.name,
         rep_crop=body.rep_crop,
+        rep_crop_s3_key=body.rep_crop_s3_key,
     )
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-    return PersonResponse(**person)
+    return PersonResponse(**_hydrate_rep_crop(person))
 
 
 @router.delete("/shows/{show_id}/people/{person_id}")

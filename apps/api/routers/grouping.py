@@ -20,7 +20,7 @@ grouping_service = GroupingService()
 
 
 class GroupClustersRequest(BaseModel):
-    strategy: Literal["auto", "manual"] = Field("auto", description="Grouping strategy")
+    strategy: Literal["auto", "manual", "facebank"] = Field("auto", description="Grouping strategy")
     cluster_ids: Optional[List[str]] = Field(None, description="Cluster IDs for manual grouping")
     target_person_id: Optional[str] = Field(None, description="Target person ID for manual grouping")
 
@@ -53,6 +53,14 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
             return {
                 "status": "success",
                 "strategy": "manual",
+                "ep_id": ep_id,
+                "result": result,
+            }
+        elif body.strategy == "facebank":
+            result = grouping_service.group_using_facebank(ep_id)
+            return {
+                "status": "success",
+                "strategy": "facebank",
                 "ep_id": ep_id,
                 "result": result,
             }
