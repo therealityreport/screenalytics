@@ -126,12 +126,20 @@ def _load_faces_for_track(ep_id: str, track_id: int) -> List[Dict[str, Any]]:
 def _passes_quality_gates(face: Dict[str, Any], crop_path: Optional[str]) -> bool:
     """Check if a face passes quality gates for representative selection."""
     # Detection confidence
-    det_score = face.get("det_score") or face.get("conf") or face.get("quality", {}).get("det") or 0.0
+    det_score = face.get("det_score") or face.get("conf") or 0.0
+    if not det_score:
+        quality = face.get("quality")
+        if isinstance(quality, dict):
+            det_score = quality.get("det") or 0.0
     if det_score < REP_DET_MIN:
         return False
 
     # Crop standard deviation (sharpness)
-    std = face.get("crop_std") or face.get("quality", {}).get("std") or 0.0
+    std = face.get("crop_std") or 0.0
+    if not std:
+        quality = face.get("quality")
+        if isinstance(quality, dict):
+            std = quality.get("std") or 0.0
     if std < REP_STD_MIN:
         return False
 
@@ -227,8 +235,17 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     track_centroid = l2_normalize(mean_embed)
 
     # Extract quality metrics
-    det_score = rep_face.get("det_score") or rep_face.get("conf") or rep_face.get("quality", {}).get("det") or 0.0
-    std = rep_face.get("crop_std") or rep_face.get("quality", {}).get("std") or 0.0
+    det_score = rep_face.get("det_score") or rep_face.get("conf") or 0.0
+    if not det_score:
+        quality = rep_face.get("quality")
+        if isinstance(quality, dict):
+            det_score = quality.get("det") or 0.0
+
+    std = rep_face.get("crop_std") or 0.0
+    if not std:
+        quality = rep_face.get("quality")
+        if isinstance(quality, dict):
+            std = quality.get("std") or 0.0
 
     return {
         "track_id": f"track_{track_id:04d}",
@@ -424,16 +441,58 @@ def write_cluster_centroids(ep_id: str, centroids: Dict[str, Any]) -> Path:
 
 
 def load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
-    """Load cluster centroids from cluster_centroids.json."""
+    """Load cluster centroids from cluster_centroids.json.
+
+    For legacy formats, derives track lists from identities.json.
+    """
     path = _cluster_centroids_path(ep_id)
     if not path.exists():
+        LOGGER.warning(f"cluster_centroids.json does not exist for {ep_id}")
         return {}
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data.get("centroids", {})
-    except json.JSONDecodeError:
-        LOGGER.warning(f"Failed to parse cluster centroids for {ep_id}")
+        centroids = data.get("centroids") if isinstance(data, dict) else None
+
+        # Handle old format (list) vs new format (dict)
+        if isinstance(centroids, list):
+            LOGGER.warning(f"cluster_centroids.json has old list format for {ep_id}, converting...")
+
+            # Load identities to get track_ids for each cluster
+            from apps.api.services.identities import load_identities
+            identities_data = load_identities(ep_id)
+            identity_tracks_map = {}
+            for identity in identities_data.get("identities", []):
+                identity_id = identity.get("identity_id")
+                if identity_id:
+                    track_ids = identity.get("track_ids", [])
+                    # Convert to track_XXXX format
+                    identity_tracks_map[identity_id] = [f"track_{int(tid):04d}" for tid in track_ids]
+
+            # Convert old format to new format
+            centroids_dict = {}
+            for item in centroids:
+                if isinstance(item, dict) and "cluster_id" in item:
+                    cluster_id = item["cluster_id"]
+                    tracks = identity_tracks_map.get(cluster_id, [])
+                    centroids_dict[cluster_id] = {
+                        "centroid": item.get("centroid", []),
+                        "tracks": tracks,  # Derived from identities.json
+                        "cohesion": item.get("cohesion"),  # Preserve if available
+                    }
+
+            LOGGER.info(f"Converted {len(centroids_dict)} legacy centroids with tracks from identities.json")
+            return centroids_dict
+        elif isinstance(centroids, dict):
+            return centroids
+        else:
+            LOGGER.error(f"Unexpected centroids type: {type(centroids)}")
+            return {}
+    except json.JSONDecodeError as e:
+        LOGGER.warning(f"Failed to parse cluster centroids for {ep_id}: {e}")
+        return {}
+    except Exception as e:
+        LOGGER.error(f"Unexpected error loading cluster centroids for {ep_id}: {e}")
         return {}
 
 

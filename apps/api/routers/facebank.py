@@ -26,6 +26,7 @@ from apps.api.services.jobs import JobService
 from apps.api.services.people import PeopleService
 from apps.api.services.storage import StorageService
 from tools import episode_run
+from tools._img_utils import safe_crop
 
 router = APIRouter()
 cast_service = CastService()
@@ -191,8 +192,20 @@ def _prepare_display_crop(
     bbox: list[float],
     detector_mode: str,
 ) -> tuple[np.ndarray, list[int]]:
+    """Crop image to detected face bbox with margin, or fall back to full frame."""
     h, w = image_bgr.shape[:2]
     full_box = [0, 0, w, h]
+
+    # Try to crop to detected face with margin
+    try:
+        expanded_box = _expand_square_bbox(bbox, SEED_FACE_MARGIN, w, h)
+        crop, clipped_box, err = safe_crop(image_bgr, expanded_box)
+        if crop is not None and crop.size > 0:
+            return crop, expanded_box
+    except Exception:
+        pass
+
+    # Fall back to full frame if cropping fails
     return np.ascontiguousarray(image_bgr.copy()), full_box
 
 
@@ -350,14 +363,6 @@ async def upload_seeds(
             image = np.ascontiguousarray(image_rgb[..., ::-1])
 
             detections = detector(image)
-            if detector_simulated:
-                detections = [
-                    {
-                        "bbox": [0.0, 0.0, 1.0, 1.0],
-                        "landmarks": [],
-                        "conf": 0.0,
-                    }
-                ]
 
             if len(detections) == 0:
                 errors.append({"file": file.filename, "error": "No face detected"})

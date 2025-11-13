@@ -102,6 +102,20 @@ def _mark_featured_seed(show_id: str, cast_id: str, seed_id: str) -> None:
         st.rerun()
 
 
+def _delete_seed(show_id: str, cast_id: str, seed_id: str) -> None:
+    """Delete a single seed from the facebank."""
+    path = f"/cast/{cast_id}/seeds?show_id={show_id}"
+    payload = {"seed_ids": [seed_id]}
+    resp = _api_delete(path, payload)
+    if resp:
+        deleted = resp.get("deleted", 0)
+        if deleted > 0:
+            st.success(f"Deleted seed {seed_id[:8]}...")
+        else:
+            st.warning("Seed not found or already deleted")
+        st.rerun()
+
+
 def _resolve_api_url(url: str | None) -> str | None:
     """Convert relative API URLs to full URLs, or return HTTP(S) URLs as-is."""
     if not url:
@@ -470,6 +484,19 @@ if selected_cast_id:
                             st.caption(f"Seed {fb_id[:8]}...")
                             if st.button("☆ Feature", key=f"feature_seed_{fb_id}"):
                                 _mark_featured_seed(show_id, selected_cast_id, fb_id)
+
+                        # Delete button for all seeds (including featured)
+                        confirm_key = f"confirm_delete_seed_{fb_id}"
+                        if st.button("🗑️ Delete", key=f"delete_seed_{fb_id}", type="secondary"):
+                            if st.session_state.get(confirm_key):
+                                _delete_seed(show_id, selected_cast_id, fb_id)
+                                st.session_state.pop(confirm_key, None)
+                            else:
+                                st.session_state[confirm_key] = True
+                                st.rerun()
+
+                        if st.session_state.get(confirm_key):
+                            st.caption("⚠️ Click again to confirm")
 
         # Upload seeds button
         if st.button("Upload Seed Images", key=f"cast_upload_seeds_{selected_cast_id}"):

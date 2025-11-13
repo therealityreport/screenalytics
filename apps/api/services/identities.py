@@ -528,6 +528,47 @@ def _persist_identity_name(
         except ValueError:
             # Duplicate roster seeds are normal when multiple queues run.
             pass
+
+        # Create or update People record for immediate visibility in People view
+        try:
+            from apps.api.services.people import PeopleService
+            people_service = PeopleService()
+
+            # Build cluster_id with episode prefix
+            cluster_id_with_prefix = f"{ep_id}:{identity_id}"
+
+            # Check if person with this name already exists
+            people = people_service.list_people(show_slug)
+            existing_person = next(
+                (p for p in people if p.get("name") and p["name"].strip().lower() == trimmed_name.lower()),
+                None
+            )
+
+            if existing_person:
+                # Add cluster to existing person (if not already present)
+                person_id = existing_person["person_id"]
+                cluster_ids = existing_person.get("cluster_ids", [])
+                if cluster_id_with_prefix not in cluster_ids:
+                    people_service.add_cluster_to_person(
+                        show_slug,
+                        person_id,
+                        cluster_id_with_prefix,
+                        update_prototype=False,  # Don't update prototype from manual naming
+                    )
+                    LOGGER.info(f"Added cluster {identity_id} to existing person {person_id} ({trimmed_name})")
+            else:
+                # Create new person
+                person = people_service.create_person(
+                    show_slug,
+                    name=trimmed_name,
+                    cluster_ids=[cluster_id_with_prefix],
+                )
+                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id}")
+
+        except Exception as exc:
+            # Don't fail the naming operation if People service fails
+            LOGGER.warning(f"Failed to create/update People record for {trimmed_name}: {exc}")
+
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
 
 

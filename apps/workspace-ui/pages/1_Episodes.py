@@ -144,59 +144,9 @@ selected_ep_id = st.selectbox(
     format_func=lambda eid: f"{eid} ({option_lookup[eid]['show_slug']})",
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("Open details", use_container_width=True):
-        helpers.set_ep_id(selected_ep_id)
-        helpers.try_switch_page("pages/2_Episode_Detail.py")
-with col2:
-    st.write("")
-
-st.subheader("Quick detect/track")
-col_stride, col_fps = st.columns(2)
-with col_stride:
-    stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
-with col_fps:
-    fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
-st.caption(
-    f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
-    f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
-    "Device: auto"
-)
-
-if st.button("Run detect/track", use_container_width=True):
-    job_payload = helpers.default_detect_track_payload(
-        selected_ep_id,
-        stride=int(stride_value),
-        det_thresh=helpers.DEFAULT_DET_THRESH,
-    )
-    if fps_value > 0:
-        job_payload["fps"] = fps_value
-    mode_label = (
-        f"{helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} + "
-        f"{helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)}"
-    )
-    with st.spinner(f"Running detect/track ({mode_label})…"):
-        summary, error_message = helpers.run_job_with_progress(
-            selected_ep_id,
-            "/jobs/detect_track",
-            job_payload,
-            requested_device=helpers.DEFAULT_DEVICE,
-            async_endpoint="/jobs/detect_track_async",
-            requested_detector=helpers.DEFAULT_DETECTOR,
-            requested_tracker=helpers.DEFAULT_TRACKER,
-        )
-    if error_message:
-        st.error(error_message)
-    else:
-        normalized = helpers.normalize_summary(selected_ep_id, summary)
-        detections = normalized.get("detections")
-        tracks = normalized.get("tracks")
-        details_line = [
-            f"detections: {detections:,}" if isinstance(detections, int) else "detections: ?",
-            f"tracks: {tracks:,}" if isinstance(tracks, int) else "tracks: ?",
-        ]
-        st.success("Completed · " + " · ".join(details_line))
+if st.button("Open Episode Detail", use_container_width=True, type="primary"):
+    helpers.set_ep_id(selected_ep_id)
+    st.switch_page("pages/2_Episode_Detail.py")
 
 st.divider()
 _show_single_delete(selected_ep_id)

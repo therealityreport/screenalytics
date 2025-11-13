@@ -966,12 +966,11 @@ def _prepare_face_crop(
     import numpy as _np
 
     normalized_mode = (detector_mode or "retinaface").lower()
-    if normalized_mode == "simulated":
-        # Skip bbox expansion/landmark alignment—seed uploads provide the whole
-        # image as the bounding box when RetinaFace is unavailable.
-        return _letterbox_square(image), None
+    # For simulated detector, use the bbox it computed (centered on brightest pixels)
+    # instead of letterboxing the full image. This preserves the useful crop.
+    # Fall through to bbox-based cropping logic below.
 
-    if align and landmarks and len(landmarks) >= 10:
+    if align and landmarks and len(landmarks) >= 10 and normalized_mode != "simulated":
         pts = _np.asarray(landmarks, dtype=_np.float32).reshape(-1, 2)
         # Some detectors (simulated RetinaFace fallback) emit duplicated
         # landmarks, which breaks the InsightFace alignment helper and results

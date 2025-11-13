@@ -616,6 +616,17 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     crops = _discover_crop_entries(ep_id, track_id)
     ctx, prefixes = _require_episode_context(ep_id)
     crops_prefix = (prefixes or {}).get("crops") if prefixes else None
+
+    # Load track centroid for similarity computation
+    try:
+        from apps.api.services.track_reps import load_track_reps
+        import numpy as np
+        track_reps = load_track_reps(ep_id)
+        track_rep = track_reps.get(f"track_{track_id:04d}", {})
+        track_centroid = np.array(track_rep.get("embed", []), dtype=np.float32) if track_rep else None
+    except Exception:
+        track_centroid = None
+
     if not crops and not face_rows:
         return {
             "items": [],
@@ -638,6 +649,17 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
             media_url = _resolve_face_media_url(ep_id, meta)
             fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
             url = media_url or fallback
+
+            # Compute similarity to track centroid
+            similarity = None
+            if track_centroid is not None and track_centroid.size > 0:
+                embedding = meta.get("embedding")
+                if embedding:
+                    import numpy as np
+                    frame_embed = np.array(embedding, dtype=np.float32)
+                    if frame_embed.size == track_centroid.size:
+                        similarity = float(np.dot(frame_embed, track_centroid))
+
             items.append(
                 {
                     "track_id": track_id,
@@ -651,6 +673,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     "h": meta.get("crop_height") or meta.get("height"),
                     "skip": meta.get("skip"),
                     "face_id": meta.get("face_id"),
+                    "similarity": similarity,
                 }
             )
         return {
@@ -682,6 +705,17 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         media_url = local_url or _resolve_crop_url(ep_id, rel_path, s3_key if not local_url else None)
         fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
         url = media_url or fallback
+
+        # Compute similarity to track centroid
+        similarity = None
+        if track_centroid is not None and track_centroid.size > 0:
+            embedding = meta.get("embedding") if meta else None
+            if embedding:
+                import numpy as np
+                frame_embed = np.array(embedding, dtype=np.float32)
+                if frame_embed.size == track_centroid.size:
+                    similarity = float(np.dot(frame_embed, track_centroid))
+
         items.append(
             {
                 "track_id": track_id,
@@ -695,6 +729,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 "h": meta.get("crop_height") or meta.get("height"),
                 "skip": meta.get("skip"),
                 "face_id": meta.get("face_id"),
+                "similarity": similarity,
             }
         )
     return {
@@ -846,6 +881,30 @@ class S3VideosResponse(BaseModel):
     count: int
 
 
+class S3Show(BaseModel):
+    show: str
+    episode_count: int
+
+
+class S3ShowsResponse(BaseModel):
+    shows: List[S3Show]
+    count: int
+
+
+class S3EpisodeForShow(BaseModel):
+    ep_id: str
+    season: int
+    episode: int
+    key: str
+    exists_in_store: bool
+
+
+class S3EpisodesForShowResponse(BaseModel):
+    show: str
+    episodes: List[S3EpisodeForShow]
+    count: int
+
+
 class EpisodeS3Status(BaseModel):
     bucket: str
     v2_key: str | None = None
@@ -978,6 +1037,55 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
         if len(items) >= limit:
             break
     return S3VideosResponse(items=items, count=len(items))
+
+
+@router.get("/episodes/s3_shows", response_model=S3ShowsResponse, tags=["episodes"])
+def list_s3_shows() -> S3ShowsResponse:
+    """List all shows available in S3 with episode counts."""
+    raw_items = STORAGE.list_episode_videos_s3(limit=10000)
+
+    # Group by show
+    show_episodes: Dict[str, int] = {}
+    for obj in raw_items:
+        show = obj.get("show")
+        if show and isinstance(show, str):
+            show_episodes[show] = show_episodes.get(show, 0) + 1
+
+    # Convert to sorted list
+    shows = [
+        S3Show(show=show, episode_count=count)
+        for show, count in sorted(show_episodes.items())
+    ]
+    return S3ShowsResponse(shows=shows, count=len(shows))
+
+
+@router.get("/episodes/s3_shows/{show}/episodes", response_model=S3EpisodesForShowResponse, tags=["episodes"])
+def list_s3_episodes_for_show(show: str) -> S3EpisodesForShowResponse:
+    """List all episodes for a specific show from S3."""
+    raw_items = STORAGE.list_episode_videos_s3(limit=10000)
+
+    # Filter by show and collect episodes
+    episodes: List[S3EpisodeForShow] = []
+    for obj in raw_items:
+        obj_show = obj.get("show")
+        if obj_show and isinstance(obj_show, str) and obj_show.lower() == show.lower():
+            ep_id = obj.get("ep_id")
+            season = obj.get("season")
+            episode = obj.get("episode")
+            if ep_id and isinstance(season, int) and isinstance(episode, int):
+                episodes.append(
+                    S3EpisodeForShow(
+                        ep_id=str(ep_id),
+                        season=season,
+                        episode=episode,
+                        key=str(obj.get("key", "")),
+                        exists_in_store=EPISODE_STORE.exists(str(ep_id)),
+                    )
+                )
+
+    # Sort by season and episode
+    episodes.sort(key=lambda x: (x.season, x.episode))
+    return S3EpisodesForShowResponse(show=show, episodes=episodes, count=len(episodes))
 
 
 @router.post("/episodes/{ep_id}/delete")
@@ -1326,11 +1434,15 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Person not found")
 
         # Filter cluster IDs for this episode
-        cluster_ids = person.get("cluster_ids", [])
+        cluster_ids = person.get("cluster_ids", []) if isinstance(person, dict) else []
+        if not isinstance(cluster_ids, list):
+            LOGGER.warning(f"cluster_ids is not a list: {type(cluster_ids)}, value: {cluster_ids}")
+            cluster_ids = []
+
         episode_clusters = [
             cid.split(":", 1)[1] if ":" in cid else cid
             for cid in cluster_ids
-            if cid.startswith(f"{ep_id}:")
+            if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
         ]
 
         if not episode_clusters:
@@ -1347,30 +1459,48 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
 
         # Load identities for face counts
         identities_data = _load_identities(ep_id)
-        identity_index = {ident["identity_id"]: ident for ident in identities_data.get("identities", [])}
+        LOGGER.info(f"identities_data type: {type(identities_data)}, keys: {list(identities_data.keys()) if isinstance(identities_data, dict) else 'not a dict'}")
+        identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
+        LOGGER.info(f"identities_list type: {type(identities_list)}, length: {len(identities_list) if isinstance(identities_list, list) else 'not a list'}")
+        identity_index = {}
+        for ident in identities_list:
+            if isinstance(ident, dict) and "identity_id" in ident:
+                identity_index[ident["identity_id"]] = ident
+            else:
+                LOGGER.warning(f"Skipping malformed identity: {type(ident)}")
 
         clusters_output = []
         total_tracks = 0
 
         for cluster_id in episode_clusters:
+            LOGGER.info(f"Processing cluster {cluster_id}")
             cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+            LOGGER.info(f"cluster_data type: {type(cluster_data)}, keys: {list(cluster_data.keys()) if isinstance(cluster_data, dict) else 'not a dict'}")
 
             # Resolve crop URLs
-            for track in cluster_data.get("tracks", []):
-                crop_key = track.get("crop_key")
-                if crop_key:
-                    url = _resolve_crop_url(ep_id, crop_key, None)
-                    track["crop_url"] = url
+            tracks_list = cluster_data.get("tracks", []) if isinstance(cluster_data, dict) else []
+            for track in tracks_list:
+                if isinstance(track, dict):
+                    crop_key = track.get("crop_key")
+                    if crop_key:
+                        url = _resolve_crop_url(ep_id, crop_key, None)
+                        track["crop_url"] = url
 
             # Get face count from identities
             identity = identity_index.get(cluster_id, {})
-            faces_count = identity.get("size") or 0
+            LOGGER.info(f"identity for {cluster_id}: type={type(identity)}")
+            if isinstance(identity, dict):
+                faces_count = identity.get("size") or 0
+            else:
+                LOGGER.error(f"identity is not a dict for cluster {cluster_id}: {type(identity)}")
+                faces_count = 0
 
             clusters_output.append({
                 "cluster_id": cluster_id,
                 "tracks": len(cluster_data.get("tracks", [])),
                 "faces": faces_count,
                 "cohesion": cluster_data.get("cohesion"),
+                "centroid": cluster_data.get("cluster_centroid"),  # Include centroid vector
                 "track_reps": cluster_data.get("tracks", []),
             })
             total_tracks += len(cluster_data.get("tracks", []))

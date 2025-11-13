@@ -298,7 +298,7 @@ with st.form("episode-upload"):
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
     st.caption(
-        "Detect/track runs automatically after upload using RetinaFace + ByteTrack (det_thresh=0.5, device=auto)."
+        "Video will be uploaded to S3. Go to Episode Detail to run detect/track processing."
     )
     submit = st.form_submit_button("Upload episode")
 
@@ -357,33 +357,12 @@ if submit:
     if detected_fps_value:
         st.info(f"Detected FPS: {detected_fps_value:.3f}")
 
-    with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
-        job_result = _launch_default_detect_track(ep_id, label=f"Upload detect/track · {ep_id}")
-    if job_result is None:
-        st.stop()
-
     artifacts = {
         "video": get_path(ep_id, "video"),
-        "detections": get_path(ep_id, "detections"),
-        "tracks": get_path(ep_id, "tracks"),
     }
-    flash_lines = [f"Episode `{ep_id}` upload complete."]
+    flash_lines = [f"Episode `{ep_id}` uploaded to S3 successfully."]
     flash_lines.append(f"Video → {helpers.link_local(artifacts['video'])}")
-    flash_lines.append(f"Detections → {helpers.link_local(artifacts['detections'])}")
-    flash_lines.append(f"Tracks → {helpers.link_local(artifacts['tracks'])}")
-    if job_result.get("job"):
-        job_resp = job_result["job"]
-        flash_lines.append(
-            f"Detect/track job `{job_resp['job_id']}` queued (RetinaFace + ByteTrack, auto device)."
-        )
-    elif job_result.get("sync"):
-        sync_resp = job_result["sync"]
-        dets = sync_resp.get("detections_count")
-        trks = sync_resp.get("tracks_count")
-        flash_lines.append(
-            "Detect/track ran synchronously (RetinaFace + ByteTrack). "
-            f"detections={dets if dets is not None else '?'} tracks={trks if trks is not None else '?'}"
-        )
+    flash_lines.append("Go to Episode Detail to run processing.")
     st.session_state["upload_flash"] = "\n".join(flash_lines)
     helpers.set_ep_id(ep_id)
 

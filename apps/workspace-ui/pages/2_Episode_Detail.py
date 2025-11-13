@@ -53,23 +53,86 @@ def _handle_missing_episode(ep_id: str) -> None:
 
 
 def _prompt_for_episode() -> None:
+    st.subheader("Select Episode from S3")
+
+    # Fetch shows from S3
     try:
-        payload = helpers.api_get("/episodes")
+        shows_payload = helpers.api_get("/episodes/s3_shows")
     except requests.RequestException as exc:
-        st.error(helpers.describe_error(f"{cfg['api_base']}/episodes", exc))
+        st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/s3_shows", exc))
         st.stop()
-    episodes = payload.get("episodes", [])
-    if not episodes:
-        st.info("No episodes yet.")
+
+    shows = shows_payload.get("shows", [])
+    if not shows:
+        st.info("No shows found in S3. Upload an episode first.")
         st.stop()
-    option_lookup = {ep["ep_id"]: ep for ep in episodes}
-    selection = st.selectbox(
-        "Episode",
-        list(option_lookup.keys()),
-        format_func=lambda eid: f"{eid} ({option_lookup[eid]['show_slug']})",
+
+    # Show dropdown
+    show_options = {show["show"]: show for show in shows}
+    selected_show = st.selectbox(
+        "Show",
+        list(show_options.keys()),
+        format_func=lambda s: f"{s} ({show_options[s]['episode_count']} episodes)",
+        key="episode_detail_show_select",
     )
-    if st.button("Load episode", use_container_width=True):
-        helpers.set_ep_id(selection)
+
+    if not selected_show:
+        st.stop()
+
+    # Fetch episodes for selected show
+    try:
+        episodes_payload = helpers.api_get(f"/episodes/s3_shows/{selected_show}/episodes")
+    except requests.RequestException as exc:
+        st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/s3_shows/{selected_show}/episodes", exc))
+        st.stop()
+
+    episodes = episodes_payload.get("episodes", [])
+    if not episodes:
+        st.warning(f"No episodes found for show '{selected_show}'")
+        st.stop()
+
+    # Episode dropdown
+    episode_options = {ep["ep_id"]: ep for ep in episodes}
+    selected_ep_id = st.selectbox(
+        "Episode",
+        list(episode_options.keys()),
+        format_func=lambda eid: f"S{episode_options[eid]['season']:02d}E{episode_options[eid]['episode']:02d} ({eid}) {'✓' if episode_options[eid]['exists_in_store'] else '⚠'}",
+        key="episode_detail_ep_select",
+    )
+
+    if not selected_ep_id:
+        st.stop()
+
+    selected_episode = episode_options[selected_ep_id]
+
+    # Show episode info
+    st.caption(f"S3 key: `{selected_episode['key']}`")
+    if selected_episode['exists_in_store']:
+        st.caption("✓ Tracked in episode store")
+    else:
+        st.warning("⚠ Not tracked in episode store yet. Click 'Load Episode' to create it.")
+
+    if st.button("Load Episode", use_container_width=True, type="primary"):
+        # If not in store, create it first
+        if not selected_episode['exists_in_store']:
+            parsed = helpers.parse_ep_id(selected_ep_id)
+            if parsed:
+                payload = {
+                    "ep_id": selected_ep_id,
+                    "show_slug": str(parsed["show"]).lower(),
+                    "season": int(parsed["season"]),
+                    "episode": int(parsed["episode"]),
+                }
+                try:
+                    helpers.api_post("/episodes/upsert_by_id", payload)
+                    st.success(f"Episode `{selected_ep_id}` created in store.")
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/upsert_by_id", exc))
+                    st.stop()
+
+        helpers.set_ep_id(selected_ep_id)
+        st.rerun()
+
     st.stop()
 
 

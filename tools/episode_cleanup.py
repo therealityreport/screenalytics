@@ -260,12 +260,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     grouping_result = None
     if "group_clusters" in data_actions:
+        LOGGER.info("[cleanup] Starting cluster grouping...")
         grouping = GroupingService()
-        centroids = grouping.compute_cluster_centroids(args.ep_id)
-        within = grouping.group_within_episode(args.ep_id)
+
+        # Compute centroids with progress logging
+        def log_progress(current, total, status):
+            LOGGER.info(f"[cleanup] centroid progress: {current}/{total} - {status}")
+
+        centroids = grouping.compute_cluster_centroids(args.ep_id, progress_callback=log_progress)
+
+        # Group within episode
+        def log_within_progress(current, total, status):
+            LOGGER.info(f"[cleanup] within-episode grouping: {current}/{total} - {status}")
+
+        within = grouping.group_within_episode(args.ep_id, progress_callback=log_within_progress)
+
+        # Group across episodes
         across = None
         if args.write_back:
+            LOGGER.info("[cleanup] Matching clusters to show-level people...")
             across = grouping.group_across_episodes(args.ep_id)
+
         grouping_result = {
             "centroids": centroids,
             "within_episode": within,
