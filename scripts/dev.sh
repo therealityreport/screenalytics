@@ -39,4 +39,4 @@ if [[ "$health_ok" != "true" ]]; then
   echo "[dev.sh] Warning: API health check did not succeed" >&2
 fi
 
-streamlit run apps/workspace-ui/streamlit_app.py
+streamlit run apps/workspace-ui/Upload_Video.py
