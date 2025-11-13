@@ -259,6 +259,16 @@ def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[st
     return resp.json()
 
 
+def api_delete(path: str, **kwargs) -> Dict[str, Any]:
+    base = st.session_state.get("api_base")
+    if not base:
+        raise RuntimeError("init_page() must be called before API access")
+    timeout = kwargs.pop("timeout", 60)
+    resp = requests.delete(f"{base}{path}", timeout=timeout, **kwargs)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
     url = f"{_api_base()}/episodes/{ep_id}/status"
     try:

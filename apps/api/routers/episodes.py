@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Set
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -422,6 +422,156 @@ def _identity_lookup(data: Dict[str, Any]) -> Dict[int, str]:
             except (TypeError, ValueError):
                 continue
     return lookup
+
+
+def _refresh_similarity_indexes(
+    ep_id: str,
+    *,
+    track_ids: Iterable[int] | None = None,
+    identity_ids: Iterable[str] | None = None,
+) -> None:
+    """Regenerate track reps/centroids and refresh people prototypes if impacted."""
+    track_set: Set[int] = set()
+    for raw in track_ids or []:
+        try:
+            track_set.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+
+    identity_set: Set[str] = set()
+    for raw in identity_ids or []:
+        if not raw:
+            continue
+        identity_set.add(str(raw))
+
+    identities_payload = _load_identities(ep_id)
+    if track_set:
+        track_lookup = _identity_lookup(identities_payload)
+        for tid in track_set:
+            identity = track_lookup.get(tid)
+            if identity:
+                identity_set.add(identity)
+
+    try:
+        from apps.api.services.track_reps import generate_track_reps_and_centroids, load_cluster_centroids
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.warning("Cannot refresh track reps for %s: %s", ep_id, exc)
+        return
+
+    try:
+        result = generate_track_reps_and_centroids(ep_id)
+    except Exception as exc:  # pragma: no cover - surface but don't fail request
+        LOGGER.error("Track rep regeneration failed for %s: %s", ep_id, exc)
+        return
+
+    sync_paths = []
+    for path_key in ("track_reps_path", "cluster_centroids_path"):
+        raw_path = result.get(path_key)
+        if not raw_path:
+            continue
+        path_obj = Path(raw_path)
+        if path_obj.exists():
+            sync_paths.append(path_obj)
+    if sync_paths:
+        _sync_manifests(ep_id, *sync_paths)
+
+    if not identity_set:
+        return
+
+    try:
+        from apps.api.services.people import PeopleService, l2_normalize
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - best-effort prototype refresh
+        LOGGER.warning("PeopleService unavailable for %s similarity refresh: %s", ep_id, exc)
+        return
+
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+    except ValueError as exc:  # pragma: no cover - invalid IDs already filtered upstream
+        LOGGER.warning("Unable to parse episode id %s for similarity refresh: %s", ep_id, exc)
+        return
+
+    show_id = ep_ctx.show_slug.upper()
+    people_service = PeopleService()
+    people = people_service.list_people(show_id)
+    if not people:
+        return
+
+    cluster_refs = {f"{ep_id}:{identity_id}" for identity_id in identity_set}
+
+    touched_person_ids: Set[str] = set()
+    for identity in identities_payload.get("identities", []):
+        if identity.get("identity_id") in identity_set and identity.get("person_id"):
+            touched_person_ids.add(identity["person_id"])
+
+    people_by_id = {person.get("person_id"): person for person in people if person.get("person_id")}
+
+    if cluster_refs:
+        for person in people:
+            person_id = person.get("person_id")
+            if not person_id:
+                continue
+            for cluster_id in person.get("cluster_ids") or []:
+                if cluster_id in cluster_refs:
+                    touched_person_ids.add(person_id)
+                    break
+
+    if not touched_person_ids:
+        return
+
+    centroid_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _centroid_vec(ep_slug: str, cluster_id: str):
+        if ep_slug not in centroid_cache:
+            try:
+                centroids = load_cluster_centroids(ep_slug)
+            except Exception as exc:  # pragma: no cover - best effort
+                LOGGER.warning("Failed to load centroids for %s: %s", ep_slug, exc)
+                centroid_cache[ep_slug] = {}
+            else:
+                centroid_cache[ep_slug] = centroids if isinstance(centroids, dict) else {}
+        centroids = centroid_cache.get(ep_slug, {})
+        record = centroids.get(cluster_id) if isinstance(centroids, dict) else None
+        if not isinstance(record, dict):
+            return None
+        vector = record.get("centroid")
+        if not isinstance(vector, list):
+            return None
+        return np.array(vector, dtype=np.float32)
+
+    for person_id in touched_person_ids:
+        person = people_by_id.get(person_id)
+        if not person:
+            continue
+        original_clusters = list(person.get("cluster_ids") or [])
+        updated_clusters: List[str] = []
+        vectors = []
+        for cluster_ref in original_clusters:
+            if not isinstance(cluster_ref, str) or ":" not in cluster_ref:
+                updated_clusters.append(cluster_ref)
+                continue
+            ep_slug, cluster_id = cluster_ref.split(":", 1)
+            vec = _centroid_vec(ep_slug, cluster_id)
+            if vec is None:
+                if cluster_ref not in cluster_refs:
+                    updated_clusters.append(cluster_ref)
+                continue
+            vectors.append(vec)
+            updated_clusters.append(cluster_ref)
+
+        updates: Dict[str, Any] = {}
+        if vectors:
+            stacked = np.stack(vectors, axis=0)
+            proto = l2_normalize(np.mean(stacked, axis=0)).tolist()
+            updates["prototype"] = proto
+        elif not updated_clusters:
+            updates["prototype"] = []
+
+        if updated_clusters != original_clusters:
+            updates["cluster_ids"] = updated_clusters
+
+        if updates:
+            people_service.update_person(show_id, person_id, **updates)
 
 
 def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
@@ -1707,6 +1857,9 @@ def move_track_frames(ep_id: str, track_id: int, body: TrackFrameMoveRequest) ->
     frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
     if not frame_ids:
         raise HTTPException(status_code=400, detail="frame_ids_required")
+    identities_payload = _load_identities(ep_id)
+    track_identity_map = _identity_lookup(identities_payload)
+    source_identity_id = track_identity_map.get(track_id)
     face_rows = _track_face_rows(ep_id, track_id)
     if not face_rows:
         raise HTTPException(status_code=404, detail="track_not_found")
@@ -1746,6 +1899,16 @@ def move_track_frames(ep_id: str, track_id: int, body: TrackFrameMoveRequest) ->
             for entry in ops
         ],
     )
+    touched_tracks = [track_id]
+    new_track_id = result.get("new_track_id")
+    if isinstance(new_track_id, int):
+        touched_tracks.append(new_track_id)
+    touched_identity_ids = [
+        source_identity_id,
+        result.get("target_identity_id"),
+        body.target_identity_id,
+    ]
+    _refresh_similarity_indexes(ep_id, track_ids=touched_tracks, identity_ids=touched_identity_ids)
     return {
         "moved": len(selected_faces),
         "frame_ids": frame_ids,
@@ -1761,6 +1924,9 @@ def delete_track_frames(ep_id: str, track_id: int, body: TrackFrameDeleteRequest
     frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
     if not frame_ids:
         raise HTTPException(status_code=400, detail="frame_ids_required")
+    identities_payload = _load_identities(ep_id)
+    track_identity_map = _identity_lookup(identities_payload)
+    source_identity_id = track_identity_map.get(track_id)
     faces = _load_faces(ep_id)
     removed: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
@@ -1797,10 +1963,10 @@ def delete_track_frames(ep_id: str, track_id: int, body: TrackFrameDeleteRequest
         ],
     )
     _recount_track_faces(ep_id)
-    identities = _load_identities(ep_id)
-    _update_identity_stats(ep_id, identities)
-    identities_path = _write_identities(ep_id, identities)
+    _update_identity_stats(ep_id, identities_payload)
+    identities_path = _write_identities(ep_id, identities_payload)
     _sync_manifests(ep_id, faces_path, identities_path)
+    _refresh_similarity_indexes(ep_id, track_ids=[track_id], identity_ids=[source_identity_id])
     return {
         "track_id": track_id,
         "deleted": len(removed),
@@ -1854,6 +2020,7 @@ def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
     _update_identity_stats(ep_id, payload)
     path = _write_identities(ep_id, payload)
     _sync_manifests(ep_id, path)
+    _refresh_similarity_indexes(ep_id, identity_ids=[body.source_id, body.target_id])
     return {"target_id": body.target_id, "track_ids": target["track_ids"]}
 
 
@@ -1879,6 +2046,11 @@ def move_track(ep_id: str, track_id: int, body: TrackMoveRequest) -> dict:
     _update_identity_stats(ep_id, payload)
     path = _write_identities(ep_id, payload)
     _sync_manifests(ep_id, path)
+    touched_identity_ids = [
+        (source_identity or {}).get("identity_id"),
+        body.target_identity_id,
+    ]
+    _refresh_similarity_indexes(ep_id, track_ids=[track_id], identity_ids=touched_identity_ids)
     return {
         "identity_id": body.target_identity_id,
         "track_ids": target_identity["track_ids"] if target_identity else [],
@@ -1887,8 +2059,11 @@ def move_track(ep_id: str, track_id: int, body: TrackMoveRequest) -> dict:
 
 @router.post("/episodes/{ep_id}/faces/move_frames")
 def move_faces(ep_id: str, body: FaceMoveRequest) -> dict:
+    identities_payload = _load_identities(ep_id)
+    track_identity_map = _identity_lookup(identities_payload)
+    source_identity_id = track_identity_map.get(body.from_track_id)
     try:
-        return identity_service.move_frames(
+        result = identity_service.move_frames(
             ep_id,
             body.from_track_id,
             body.face_ids,
@@ -1898,6 +2073,17 @@ def move_faces(ep_id: str, body: FaceMoveRequest) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    touched_tracks = [body.from_track_id]
+    new_track_id = result.get("new_track_id")
+    if isinstance(new_track_id, int):
+        touched_tracks.append(new_track_id)
+    touched_identity_ids = [
+        source_identity_id,
+        result.get("target_identity_id"),
+        body.target_identity_id,
+    ]
+    _refresh_similarity_indexes(ep_id, track_ids=touched_tracks, identity_ids=touched_identity_ids)
+    return result
 
 
 
@@ -1918,6 +2104,9 @@ def delete_identity(ep_id: str, identity_id: str) -> dict:
 
 @router.delete("/episodes/{ep_id}/tracks/{track_id}")
 def delete_track(ep_id: str, track_id: int, payload: TrackDeleteRequest = Body(default=TrackDeleteRequest())) -> dict:
+    identities_payload = _load_identities(ep_id)
+    track_identity_map = _identity_lookup(identities_payload)
+    source_identity_id = track_identity_map.get(track_id)
     faces = _load_faces(ep_id)
     if payload.delete_faces:
         faces = [row for row in faces if int(row.get("track_id", -1)) != track_id]
@@ -1929,18 +2118,21 @@ def delete_track(ep_id: str, track_id: int, payload: TrackDeleteRequest = Body(d
     if len(kept_tracks) == len(track_rows):
         raise HTTPException(status_code=404, detail="Track not found")
     tracks_path = _write_tracks(ep_id, kept_tracks)
-    identities = _load_identities(ep_id)
-    for identity in identities.get("identities", []):
+    for identity in identities_payload.get("identities", []):
         identity["track_ids"] = [tid for tid in identity.get("track_ids", []) if tid != track_id]
-    _update_identity_stats(ep_id, identities)
-    identities_path = _write_identities(ep_id, identities)
+    _update_identity_stats(ep_id, identities_payload)
+    identities_path = _write_identities(ep_id, identities_payload)
     _recount_track_faces(ep_id)
     _sync_manifests(ep_id, faces_path, tracks_path, identities_path)
+    _refresh_similarity_indexes(ep_id, track_ids=[track_id], identity_ids=[source_identity_id])
     return {"track_id": track_id, "faces_deleted": payload.delete_faces}
 
 
 @router.delete("/episodes/{ep_id}/frames")
 def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
+    identities_payload = _load_identities(ep_id)
+    track_identity_map = _identity_lookup(identities_payload)
+    source_identity_id = track_identity_map.get(payload.track_id)
     faces = _load_faces(ep_id)
     removed_rows = [
         row
@@ -1971,10 +2163,10 @@ def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
                     # It's fine if the crop file does not exist.
                     pass
     _recount_track_faces(ep_id)
-    identities = _load_identities(ep_id)
-    _update_identity_stats(ep_id, identities)
-    identities_path = _write_identities(ep_id, identities)
+    _update_identity_stats(ep_id, identities_payload)
+    identities_path = _write_identities(ep_id, identities_payload)
     _sync_manifests(ep_id, faces_path, identities_path)
+    _refresh_similarity_indexes(ep_id, track_ids=[payload.track_id], identity_ids=[source_identity_id])
     return {
         "track_id": payload.track_id,
         "frame_idx": payload.frame_idx,

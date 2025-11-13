@@ -466,6 +466,90 @@ class JobService:
             requested=requested,
         )
 
+    def start_screen_time_job(
+        self,
+        *,
+        ep_id: str,
+        quality_min: float | None = None,
+        gap_tolerance_s: float | None = None,
+        use_video_decode: bool | None = None,
+    ) -> JobRecord:
+        """Start a screen time analysis job for an episode.
+
+        Args:
+            ep_id: Episode identifier
+            quality_min: Optional minimum face quality threshold (0.0-1.0)
+            gap_tolerance_s: Optional gap tolerance in seconds
+            use_video_decode: Optional flag to use video decode for timestamps
+
+        Returns:
+            JobRecord with job metadata
+
+        Raises:
+            FileNotFoundError: If required artifacts are missing
+        """
+        # Validate that required artifacts exist
+        manifests_dir = get_path(ep_id, "detections").parent
+        faces_path = manifests_dir / "faces.jsonl"
+        tracks_path = get_path(ep_id, "tracks")
+        identities_path = manifests_dir / "identities.json"
+
+        missing = []
+        if not faces_path.exists():
+            missing.append("faces.jsonl")
+        if not tracks_path.exists():
+            missing.append("tracks.jsonl")
+        if not identities_path.exists():
+            missing.append("identities.json")
+
+        if missing:
+            raise FileNotFoundError(
+                f"Required artifacts missing for screen time analysis: {', '.join(missing)}"
+            )
+
+        # Validate people.json exists for the show
+        parts = ep_id.split("-")
+        if len(parts) < 2:
+            raise ValueError(f"Invalid episode ID format: {ep_id}")
+        show_id = parts[0].upper()
+        people_path = self.data_root / "shows" / show_id / "people.json"
+
+        if not people_path.exists():
+            raise FileNotFoundError(
+                f"people.json not found for show {show_id}: {people_path}"
+            )
+
+        # Build command
+        progress_path = self._progress_path(ep_id)
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "analyze_screen_time.py"),
+            "--ep-id",
+            ep_id,
+            "--progress-file",
+            str(progress_path),
+        ]
+
+        # Add optional overrides
+        requested = {}
+        if quality_min is not None:
+            command += ["--quality-min", str(quality_min)]
+            requested["quality_min"] = quality_min
+        if gap_tolerance_s is not None:
+            command += ["--gap-tolerance-s", str(gap_tolerance_s)]
+            requested["gap_tolerance_s"] = gap_tolerance_s
+        if use_video_decode is not None:
+            command += ["--use-video-decode", str(use_video_decode).lower()]
+            requested["use_video_decode"] = use_video_decode
+
+        return self._launch_job(
+            job_type="screen_time_analyze",
+            ep_id=ep_id,
+            command=command,
+            progress_path=progress_path,
+            requested=requested,
+        )
+
     def _monitor_process(self, job_id: str, proc: subprocess.Popen) -> None:
         error_msg: str | None = None
         try:
@@ -531,6 +615,40 @@ class JobService:
                 record["summary"] = progress_data
 
         return self._mutate_job(job_id, _apply)
+
+    def list_jobs(
+        self,
+        *,
+        ep_id: str | None = None,
+        job_type: str | None = None,
+        limit: int = 50,
+    ) -> list[JobRecord]:
+        """List all jobs, optionally filtered by episode and/or job type."""
+        jobs_dir = self.data_root / "jobs"
+        if not jobs_dir.exists():
+            return []
+
+        all_jobs: list[JobRecord] = []
+        for job_file in jobs_dir.glob("*.json"):
+            try:
+                job = self._read_job(job_file.stem)
+                # Apply filters
+                if ep_id and job.get("ep_id") != ep_id:
+                    continue
+                if job_type and job.get("job_type") != job_type:
+                    continue
+                all_jobs.append(job)
+            except Exception:
+                # Skip corrupted job files
+                continue
+
+        # Sort by started_at descending (most recent first)
+        all_jobs.sort(
+            key=lambda j: j.get("started_at", ""),
+            reverse=True
+        )
+
+        return all_jobs[:limit]
 
     def _normalize_detector(self, detector: str | None) -> str:
         fallback = DEFAULT_DETECTOR_ENV or "retinaface"

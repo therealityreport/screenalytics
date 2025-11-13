@@ -27,6 +27,60 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 
+def _compute_similarity_stats(seeds: List[Dict[str, Any]]) -> Dict[str, Any]:
+    stats = {
+        "sampled": 0,
+        "summary": None,
+        "per_seed": {},
+    }
+    embeddings: List[np.ndarray] = []
+    seed_ids: List[str] = []
+    for seed in seeds:
+        embedding = seed.get("embedding")
+        seed_id = seed.get("fb_id")
+        if embedding is None or seed_id is None:
+            continue
+        vec = np.array(embedding, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm == 0:
+            continue
+        embeddings.append(vec / (norm + 1e-12))
+        seed_ids.append(seed_id)
+    stats["sampled"] = len(seed_ids)
+    if not seed_ids:
+        return stats
+
+    matrix = np.dot(np.stack(embeddings), np.stack(embeddings).T)
+    matrix = np.clip(matrix, -1.0, 1.0)
+    np.fill_diagonal(matrix, 1.0)
+
+    per_seed: Dict[str, Dict[str, float]] = {}
+    for idx, seed_id in enumerate(seed_ids):
+        others = np.delete(matrix[idx], idx)
+        if others.size:
+            per_seed[seed_id] = {
+                "mean": round(float(np.mean(others)), 3),
+                "min": round(float(np.min(others)), 3),
+                "max": round(float(np.max(others)), 3),
+            }
+        else:
+            per_seed[seed_id] = {"mean": 1.0, "min": 1.0, "max": 1.0}
+    stats["per_seed"] = per_seed
+
+    pairwise = matrix[np.triu_indices(len(seed_ids), k=1)]
+    if pairwise.size:
+        stats["summary"] = {
+            "mean": round(float(np.mean(pairwise)), 3),
+            "median": round(float(np.median(pairwise)), 3),
+            "min": round(float(np.min(pairwise)), 3),
+            "max": round(float(np.max(pairwise)), 3),
+        }
+    else:
+        stats["summary"] = {"mean": 1.0, "median": 1.0, "min": 1.0, "max": 1.0}
+
+    return stats
+
+
 class FacebankService:
     """Manage facebank seeds and exemplars with embeddings."""
 
@@ -124,6 +178,7 @@ class FacebankService:
             "total_exemplars": len(exemplars),
             "updated_at": data.get("updated_at"),
         }
+        similarity = _compute_similarity_stats(seeds)
 
         featured_id = data.get("featured_seed_id")
         seeds_with_flag = []
@@ -139,6 +194,7 @@ class FacebankService:
             "exemplars": exemplars,
             "stats": stats,
             "featured_seed_id": featured_id,
+            "similarity": similarity,
         }
 
     def add_seed(

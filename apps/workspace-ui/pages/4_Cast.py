@@ -230,6 +230,7 @@ if not cast_members and not show_add_form:
     # Add new cast member button
     if st.button("Add Cast Member", key="cast_add_new"):
         st.session_state["cast_show_add_form"] = True
+        st.session_state.pop("selected_cast_id", None)
         st.rerun()
 
     st.stop()
@@ -241,6 +242,7 @@ st.subheader(f"Cast Members ({len(cast_members)})" if cast_members else "Cast Me
 # Add new cast member button
 if st.button("Add Cast Member", key="cast_add_new_btn"):
     st.session_state["cast_show_add_form"] = True
+    st.session_state.pop("selected_cast_id", None)
     st.rerun()
 
 # Add cast member form (appears when button is clicked)
@@ -315,7 +317,7 @@ if show_add_form:
                     help=f"Select one or more photos ({SUPPORTED_IMAGE_DESC})"
                 )
 
-                cols = st.columns([1, 1, 1])
+                cols = st.columns([1, 1, 1, 1])
                 if cols[0].form_submit_button("Upload Seeds", type="primary"):
                     if uploaded_files:
                         # Upload via API
@@ -351,16 +353,23 @@ if show_add_form:
                     else:
                         st.warning("No files selected")
 
-                if cols[1].form_submit_button("Skip & Finish"):
-                    # Skip upload, just finish
+                if cols[1].form_submit_button("Add Another"):
+                    # Reset form to add another cast member
+                    st.session_state.pop("new_cast_created", None)
+                    st.session_state.pop("new_cast_name", None)
+                    # Keep cast_show_add_form True to stay in add mode
+                    st.rerun()
+
+                if cols[2].form_submit_button("View Member"):
+                    # Skip upload and view the new member
                     st.session_state.pop("cast_show_add_form", None)
                     st.session_state.pop("new_cast_created", None)
                     st.session_state.pop("new_cast_name", None)
                     st.session_state["selected_cast_id"] = new_cast_id
                     st.rerun()
 
-                if cols[2].form_submit_button("Cancel"):
-                    # Cancel and clean up
+                if cols[3].form_submit_button("Done"):
+                    # Cancel and return to list
                     st.session_state.pop("cast_show_add_form", None)
                     st.session_state.pop("new_cast_created", None)
                     st.session_state.pop("new_cast_name", None)
@@ -379,28 +388,52 @@ if search:
         or any(search_lower in alias.lower() for alias in m.get("aliases", []))
     ]
 
-# Cast list
-for member in cast_members:
-    cast_id = member["cast_id"]
-    name = member["name"]
-    role = member.get("role", "other")
-    status = member.get("status", "active")
-    seasons = member.get("seasons", [])
-    aliases = member.get("aliases", [])
+# Cast gallery view
+cols_per_row = 3
+for row_start in range(0, len(cast_members), cols_per_row):
+    row_members = cast_members[row_start : row_start + cols_per_row]
+    row_cols = st.columns(cols_per_row)
 
-    # Build display string
-    display_parts = [f"**{name}**", role.upper()]
-    if aliases:
-        display_parts.append(f"({', '.join(aliases[:2])})")
-    if seasons:
-        display_parts.append(f"Seasons: {', '.join(seasons)}")
+    for idx, member in enumerate(row_members):
+        with row_cols[idx]:
+            cast_id = member["cast_id"]
+            name = member["name"]
+            role = member.get("role", "other")
+            status = member.get("status", "active")
+            seasons = member.get("seasons", [])
 
-    status_emoji = "✅" if status == "active" else ("⏸️" if status == "past" else "❌")
-    display = f"{status_emoji} {' · '.join(display_parts)}"
+            # Fetch facebank for featured image
+            facebank_resp = _api_get(f"/cast/{cast_id}/facebank?show_id={show_id}")
+            featured_seed_id = facebank_resp.get("featured_seed_id") if facebank_resp else None
+            featured_seed = None
+            if facebank_resp and featured_seed_id:
+                seeds = facebank_resp.get("seeds", [])
+                featured_seed = next((seed for seed in seeds if seed.get("fb_id") == featured_seed_id), None)
 
-    if st.button(display, key=f"cast_select_{cast_id}", use_container_width=True):
-        st.session_state["selected_cast_id"] = cast_id
-        st.rerun()
+            # Get featured image URL
+            image_url = None
+            if featured_seed:
+                image_url = _resolve_api_url(helpers.seed_display_source(featured_seed))
+                resolved_thumb = helpers.resolve_thumb(image_url)
+            else:
+                resolved_thumb = None
+
+            # Render 4:5 portrait frame
+            thumb_markup = helpers.thumb_html(resolved_thumb, alt=name, hide_if_missing=False)
+            st.markdown(thumb_markup, unsafe_allow_html=True)
+
+            # Name and seasons
+            status_emoji = "✅" if status == "active" else ("⏸️" if status == "past" else "❌")
+            st.markdown(f"**{status_emoji} {name}**")
+            if seasons:
+                st.caption(f"Seasons: {', '.join(seasons)}")
+            else:
+                st.caption(role.upper())
+
+            # Select button
+            if st.button("View Details", key=f"cast_select_{cast_id}", use_container_width=True):
+                st.session_state["selected_cast_id"] = cast_id
+                st.rerun()
 
 # Cast detail panel
 if selected_cast_id:
@@ -448,12 +481,21 @@ if selected_cast_id:
         seeds = facebank_resp.get("seeds", [])
         stats = facebank_resp.get("stats", {})
         featured_seed_id = facebank_resp.get("featured_seed_id")
+        similarity_stats = facebank_resp.get("similarity") or {}
+        summary_stats = similarity_stats.get("summary") if isinstance(similarity_stats, dict) else None
+        avg_similarity = summary_stats.get("mean") if isinstance(summary_stats, dict) else None
+        per_seed_similarity = similarity_stats.get("per_seed") if isinstance(similarity_stats, dict) else {}
 
         # Stats chips
-        stat_cols = st.columns(3)
+        stat_cols = st.columns(4)
         stat_cols[0].metric("Seed Images", stats.get("total_seeds", 0))
         stat_cols[1].metric("Exemplars", stats.get("total_exemplars", 0))
-        stat_cols[2].caption(f"Updated: {stats.get('updated_at', 'never')[:10]}")
+        if avg_similarity is not None:
+            stat_cols[2].metric("Avg Similarity", f"{int(round(avg_similarity * 100))}%")
+        else:
+            stat_cols[2].metric("Avg Similarity", "n/a")
+        updated_label = stats.get("updated_at", "never") or "never"
+        stat_cols[3].caption(f"Updated: {updated_label[:10]}")
 
         featured_seed = next((seed for seed in seeds if seed.get("fb_id") == featured_seed_id), None)
         if featured_seed:
@@ -484,6 +526,10 @@ if selected_cast_id:
                             st.caption(f"Seed {fb_id[:8]}...")
                             if st.button("☆ Feature", key=f"feature_seed_{fb_id}"):
                                 _mark_featured_seed(show_id, selected_cast_id, fb_id)
+                        sim_info = per_seed_similarity.get(fb_id) if isinstance(per_seed_similarity, dict) else None
+                        if isinstance(sim_info, dict) and sim_info.get("mean") is not None:
+                            sim_pct = int(round(sim_info["mean"] * 100))
+                            st.caption(f"{sim_pct}% avg similarity")
 
                         # Delete button for all seeds (including featured)
                         confirm_key = f"confirm_delete_seed_{fb_id}"

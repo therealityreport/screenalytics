@@ -754,6 +754,60 @@ async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request
     }
 
 
+class AnalyzeScreenTimeRequest(BaseModel):
+    ep_id: str = Field(..., description="Episode identifier")
+    quality_min: float | None = Field(None, ge=0.0, le=1.0, description="Minimum face quality threshold")
+    gap_tolerance_s: float | None = Field(None, ge=0.0, description="Gap tolerance in seconds")
+    use_video_decode: bool | None = Field(None, description="Use video decode for precise timestamps")
+
+
+@router.post("/screen_time/analyze")
+async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -> dict:
+    """Analyze per-cast screen time from assigned faces and tracks."""
+    await _reject_legacy_payload(request)
+    try:
+        job = JOB_SERVICE.start_screen_time_job(
+            ep_id=req.ep_id,
+            quality_min=req.quality_min,
+            gap_tolerance_s=req.gap_tolerance_s,
+            use_video_decode=req.use_video_decode,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "job_id": job["job_id"],
+        "ep_id": req.ep_id,
+        "state": job["state"],
+        "started_at": job["started_at"],
+        "progress_file": job.get("progress_file"),
+        "requested": job.get("requested"),
+    }
+
+
+@router.get("")
+def list_jobs(
+    ep_id: str | None = None,
+    job_type: str | None = None,
+    limit: int = 50
+) -> dict:
+    """List all jobs, optionally filtered by episode and/or job type."""
+    jobs = JOB_SERVICE.list_jobs(ep_id=ep_id, job_type=job_type, limit=limit)
+    # Return simplified job records
+    simplified_jobs = []
+    for job in jobs:
+        simplified_jobs.append({
+            "job_id": job["job_id"],
+            "job_type": job.get("job_type"),
+            "ep_id": job["ep_id"],
+            "state": job["state"],
+            "started_at": job["started_at"],
+            "ended_at": job.get("ended_at"),
+            "error": job.get("error"),
+        })
+    return {"jobs": simplified_jobs, "count": len(simplified_jobs)}
+
+
 @router.get("/{job_id}/progress")
 def get_job_progress(job_id: str) -> dict:
     try:

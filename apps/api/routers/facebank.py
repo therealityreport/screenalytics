@@ -192,20 +192,9 @@ def _prepare_display_crop(
     bbox: list[float],
     detector_mode: str,
 ) -> tuple[np.ndarray, list[int]]:
-    """Crop image to detected face bbox with margin, or fall back to full frame."""
+    """Return full frame for display (cropping happens at render time)."""
     h, w = image_bgr.shape[:2]
     full_box = [0, 0, w, h]
-
-    # Try to crop to detected face with margin
-    try:
-        expanded_box = _expand_square_bbox(bbox, SEED_FACE_MARGIN, w, h)
-        crop, clipped_box, err = safe_crop(image_bgr, expanded_box)
-        if crop is not None and crop.size > 0:
-            return crop, expanded_box
-    except Exception:
-        pass
-
-    # Fall back to full frame if cropping fails
     return np.ascontiguousarray(image_bgr.copy()), full_box
 
 
@@ -226,6 +215,7 @@ class FacebankResponse(BaseModel):
     exemplars: List[dict]
     stats: dict
     featured_seed_id: str | None = None
+    similarity: dict | None = None
 
 
 class SeedUploadResponse(BaseModel):

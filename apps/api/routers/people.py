@@ -25,6 +25,7 @@ class PersonResponse(BaseModel):
     person_id: str
     show_id: str
     name: Optional[str]
+    aliases: List[str] = []
     prototype: List[float]
     cluster_ids: List[str]
     rep_crop: Optional[str]
@@ -37,10 +38,21 @@ class PersonUpdateRequest(BaseModel):
     name: Optional[str] = None
     rep_crop: Optional[str] = None
     rep_crop_s3_key: Optional[str] = None
+    aliases: Optional[List[str]] = None
 
 
 class PersonCreateRequest(BaseModel):
     name: Optional[str] = None
+    aliases: Optional[List[str]] = None
+
+
+class PersonMergeRequest(BaseModel):
+    source_person_id: str
+    target_person_id: str
+
+
+class PersonAddAliasRequest(BaseModel):
+    alias: str
 
 
 def _hydrate_rep_crop(person: dict) -> dict:
@@ -50,6 +62,9 @@ def _hydrate_rep_crop(person: dict) -> dict:
         url = storage_service.presign_get(key)
         if url:
             record["rep_crop"] = url
+    # Ensure backwards compatibility
+    if "aliases" not in record:
+        record["aliases"] = []
     return record
 
 
@@ -103,6 +118,31 @@ def delete_person(show_id: str, person_id: str) -> dict:
     if not success:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
     return {"status": "deleted", "person_id": person_id}
+
+
+@router.post("/shows/{show_id}/people/merge")
+def merge_people(show_id: str, body: PersonMergeRequest) -> PersonResponse:
+    """Merge source person into target person."""
+    if body.source_person_id == body.target_person_id:
+        raise HTTPException(status_code=400, detail="Source and target must be different")
+
+    result = people_service.merge_people(show_id, body.source_person_id, body.target_person_id)
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Source ({body.source_person_id}) or target ({body.target_person_id}) not found"
+        )
+
+    return PersonResponse(**_hydrate_rep_crop(result))
+
+
+@router.post("/shows/{show_id}/people/{person_id}/add_alias")
+def add_alias(show_id: str, person_id: str, body: PersonAddAliasRequest) -> PersonResponse:
+    """Add an alias to a person."""
+    person = people_service.add_alias_to_person(show_id, person_id, body.alias)
+    if not person:
+        raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
+    return PersonResponse(**_hydrate_rep_crop(person))
 
 
 __all__ = ["router"]

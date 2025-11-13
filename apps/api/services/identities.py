@@ -537,12 +537,8 @@ def _persist_identity_name(
             # Build cluster_id with episode prefix
             cluster_id_with_prefix = f"{ep_id}:{identity_id}"
 
-            # Check if person with this name already exists
-            people = people_service.list_people(show_slug)
-            existing_person = next(
-                (p for p in people if p.get("name") and p["name"].strip().lower() == trimmed_name.lower()),
-                None
-            )
+            # Use alias-aware lookup to find existing person
+            existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
 
             if existing_person:
                 # Add cluster to existing person (if not already present)
@@ -555,13 +551,20 @@ def _persist_identity_name(
                         cluster_id_with_prefix,
                         update_prototype=False,  # Don't update prototype from manual naming
                     )
-                    LOGGER.info(f"Added cluster {identity_id} to existing person {person_id} ({trimmed_name})")
+                    LOGGER.info(f"Added cluster {identity_id} to existing person {person_id} ({existing_person.get('name')})")
+
+                # Add the input name as an alias if it's different from the primary name
+                primary_name = existing_person.get("name") or ""
+                if people_service.normalize_name(trimmed_name) != people_service.normalize_name(primary_name):
+                    people_service.add_alias_to_person(show_slug, person_id, trimmed_name)
+                    LOGGER.info(f"Added alias '{trimmed_name}' to person {person_id}")
             else:
                 # Create new person
                 person = people_service.create_person(
                     show_slug,
                     name=trimmed_name,
                     cluster_ids=[cluster_id_with_prefix],
+                    aliases=[],
                 )
                 LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id}")
 

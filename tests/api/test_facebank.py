@@ -198,6 +198,9 @@ def test_get_facebank_empty(tmp_path, monkeypatch):
     assert facebank["cast_id"] == cast_id
     assert len(facebank["seeds"]) == 0
     assert len(facebank["exemplars"]) == 0
+    similarity = facebank.get("similarity")
+    assert similarity is not None
+    assert similarity["sampled"] == 0
     assert facebank["stats"]["total_seeds"] == 0
 
 
@@ -269,6 +272,34 @@ def test_facebank_service_integration(tmp_path, monkeypatch):
     # Verify deletion
     facebank = service.get_facebank(show_id, cast_id)
     assert len(facebank["seeds"]) == 0
+
+
+def test_facebank_similarity_stats_multiple_seeds(tmp_path):
+    from apps.api.services.facebank import FacebankService
+
+    data_root = tmp_path / "data"
+    service = FacebankService(data_root)
+    show_id = "rhobh"
+    cast_id = "cast_similarity"
+    image_path = data_root / "seed.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(b"x")
+
+    emb_a = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    emb_b = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    service.add_seed(show_id, cast_id, str(image_path), emb_a)
+    service.add_seed(show_id, cast_id, str(image_path), emb_b)
+
+    facebank = service.get_facebank(show_id, cast_id)
+    similarity = facebank["similarity"]
+    assert similarity["sampled"] == 2
+    summary = similarity["summary"]
+    assert summary is not None
+    assert summary["mean"] == pytest.approx(0.0, abs=1e-6)
+    per_seed = similarity["per_seed"]
+    assert len(per_seed) == 2
+    for stats in per_seed.values():
+        assert stats["mean"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_seed_matching(tmp_path, monkeypatch):

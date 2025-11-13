@@ -1,0 +1,15 @@
+# Screen time analysis configuration
+#
+# This config controls how per-cast screen time is computed from assigned faces and tracks.
+
+# Minimum face quality/confidence threshold (0.0-1.0)
+# Faces below this threshold are excluded from screen time calculations
+quality_min: 0.7
+
+# Gap tolerance in seconds
+# Face detections within this gap are considered part of the same continuous appearance
+gap_tolerance_s: 0.5
+
+# Whether to use video decode for precise timestamps
+# If false, falls back to frame_idx-based estimation
+use_video_decode: true

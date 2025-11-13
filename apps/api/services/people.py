@@ -84,6 +84,7 @@ class PeopleService:
         rep_crop: Optional[str] = None,
         rep_crop_s3_key: Optional[str] = None,
         cast_id: Optional[str] = None,
+        aliases: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Create a new person."""
         data = self._load_people(show_id)
@@ -100,6 +101,7 @@ class PeopleService:
             "person_id": person_id,
             "show_id": show_id,
             "name": name,
+            "aliases": aliases or [],
             "prototype": prototype or [],
             "cluster_ids": cluster_ids or [],
             "rep_crop": rep_crop,
@@ -123,6 +125,7 @@ class PeopleService:
         rep_crop: Optional[str] = None,
         rep_crop_s3_key: Optional[str] = None,
         cast_id: Optional[str] = None,
+        aliases: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update an existing person."""
         data = self._load_people(show_id)
@@ -142,6 +145,8 @@ class PeopleService:
                     person["rep_crop_s3_key"] = rep_crop_s3_key
                 if cast_id is not None:
                     person["cast_id"] = cast_id
+                if aliases is not None:
+                    person["aliases"] = aliases
 
                 data["people"] = people
                 self._save_people(show_id, data)
@@ -237,6 +242,146 @@ class PeopleService:
             return True
 
         return False
+
+    def normalize_name(self, name: str) -> str:
+        """Normalize a name for matching: lowercase, strip whitespace, remove extra spaces."""
+        if not name:
+            return ""
+        return " ".join(name.strip().lower().split())
+
+    def find_person_by_name_or_alias(
+        self,
+        show_id: str,
+        name: str,
+        *,
+        cast_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Find a person by name or alias (case-insensitive, normalized).
+
+        If cast_id is provided, prefer people with matching cast_id.
+        """
+        normalized = self.normalize_name(name)
+        if not normalized:
+            return None
+
+        people = self.list_people(show_id)
+
+        # First pass: try to match by cast_id if provided
+        if cast_id:
+            for person in people:
+                if person.get("cast_id") == cast_id:
+                    return person
+
+        # Second pass: match by name or aliases
+        matches = []
+        for person in people:
+            # Ensure backwards compatibility: add aliases field if missing
+            if "aliases" not in person:
+                person["aliases"] = []
+
+            # Check primary name
+            person_name = person.get("name")
+            if person_name and self.normalize_name(person_name) == normalized:
+                matches.append(person)
+                continue
+
+            # Check aliases
+            aliases = person.get("aliases") or []
+            for alias in aliases:
+                if self.normalize_name(alias) == normalized:
+                    matches.append(person)
+                    break
+
+        if not matches:
+            return None
+
+        # If multiple matches, prefer the one with a cast_id
+        for match in matches:
+            if match.get("cast_id"):
+                return match
+
+        return matches[0]
+
+    def add_alias_to_person(
+        self,
+        show_id: str,
+        person_id: str,
+        alias: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Add an alias to a person (if not already present)."""
+        person = self.get_person(show_id, person_id)
+        if not person:
+            return None
+
+        normalized_alias = alias.strip()
+        if not normalized_alias:
+            return person
+
+        # Ensure backwards compatibility
+        aliases = person.get("aliases") or []
+
+        # Check if alias already exists (normalized comparison)
+        normalized_new = self.normalize_name(normalized_alias)
+        for existing in aliases:
+            if self.normalize_name(existing) == normalized_new:
+                return person  # Already exists
+
+        # Add the alias
+        aliases.append(normalized_alias)
+        return self.update_person(show_id, person_id, aliases=aliases)
+
+    def merge_people(
+        self,
+        show_id: str,
+        source_person_id: str,
+        target_person_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Merge source person into target person.
+
+        Moves all clusters, merges aliases, and deletes the source person.
+        """
+        source = self.get_person(show_id, source_person_id)
+        target = self.get_person(show_id, target_person_id)
+
+        if not source or not target:
+            return None
+
+        # Merge cluster_ids
+        target_clusters = set(target.get("cluster_ids") or [])
+        source_clusters = source.get("cluster_ids") or []
+        for cluster_id in source_clusters:
+            target_clusters.add(cluster_id)
+
+        # Merge aliases
+        target_aliases = list(target.get("aliases") or [])
+        source_aliases = source.get("aliases") or []
+
+        # Add source's primary name as alias if different from target's name
+        source_name = source.get("name")
+        target_name = target.get("name")
+        if source_name and self.normalize_name(source_name) != self.normalize_name(target_name or ""):
+            source_aliases.append(source_name)
+
+        # Merge unique aliases (normalized comparison)
+        existing_normalized = {self.normalize_name(a) for a in target_aliases}
+        for alias in source_aliases:
+            normalized = self.normalize_name(alias)
+            if normalized and normalized not in existing_normalized:
+                target_aliases.append(alias)
+                existing_normalized.add(normalized)
+
+        # Update target with merged data
+        updated = self.update_person(
+            show_id,
+            target_person_id,
+            cluster_ids=sorted(target_clusters),
+            aliases=target_aliases,
+        )
+
+        # Delete source person
+        self.delete_person(show_id, source_person_id)
+
+        return updated
 
 
 __all__ = ["PeopleService", "l2_normalize", "cosine_distance"]
