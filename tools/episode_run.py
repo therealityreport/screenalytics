@@ -962,7 +962,22 @@ def _prepare_face_crop(
     *,
     align: bool = True,
     detector_mode: str = "retinaface",
+    adaptive_margin: bool = True,
 ) -> tuple[np.ndarray | None, str | None]:
+    """Prepare face crop with optional adaptive margins.
+    
+    Args:
+        image: Source image
+        bbox: Face bounding box [x1, y1, x2, y2]
+        landmarks: Optional facial landmarks
+        margin: Base margin ratio (default 0.15 = 15%)
+        align: Whether to use landmark-based alignment
+        detector_mode: Detector name for mode-specific handling
+        adaptive_margin: Scale margin based on bbox size (default True)
+        
+    Returns:
+        (cropped_image, error_message) tuple
+    """
     import numpy as _np
 
     normalized_mode = (detector_mode or "retinaface").lower()
@@ -985,11 +1000,30 @@ def _prepare_face_crop(
             except Exception:
                 # If alignment fails, fall back to bbox-based cropping.
                 pass
+
     x1, y1, x2, y2 = bbox
     width = max(x2 - x1, 1.0)
     height = max(y2 - y1, 1.0)
-    expand_x = width * margin
-    expand_y = height * margin
+    
+    # Adaptive margin: smaller faces get more margin to capture context
+    # Larger faces get less margin to avoid over-cropping
+    if adaptive_margin:
+        bbox_area = width * height
+        # Scale factor: smaller faces (< 5000 px²) get +20% margin
+        #               medium faces (5000-15000 px²) get base margin
+        #               larger faces (> 15000 px²) get -20% margin
+        if bbox_area < 5000:
+            margin_scale = 1.2  # +20% for small faces
+        elif bbox_area > 15000:
+            margin_scale = 0.8  # -20% for large faces
+        else:
+            margin_scale = 1.0  # base margin for medium faces
+        effective_margin = margin * margin_scale
+    else:
+        effective_margin = margin
+    
+    expand_x = width * effective_margin
+    expand_y = height * effective_margin
     expanded_box = [
         x1 - expand_x,
         y1 - expand_y,
@@ -1800,9 +1834,27 @@ class FrameDecoder:
 
 
 def _copy_video(src: Path, dest: Path) -> None:
+    """Copy video from source to destination, skipping if unchanged.
+    
+    Compares file size and modification time to avoid unnecessary copies
+    of large video files when running detect multiple times.
+    
+    Args:
+        src: Source video path
+        dest: Destination video path
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.resolve() == dest.resolve():
         return
+    
+    # Skip copy if dest exists and matches source (size + mtime)
+    if dest.exists():
+        src_stat = src.stat()
+        dest_stat = dest.stat()
+        if src_stat.st_size == dest_stat.st_size and abs(src_stat.st_mtime - dest_stat.st_mtime) < 1.0:
+            LOGGER.info("Skipping video copy; destination matches source (size=%d)", src_stat.st_size)
+            return
+    
     shutil.copy2(src, dest)
 
 
