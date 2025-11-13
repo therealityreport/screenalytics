@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import logging
 
@@ -1606,8 +1606,8 @@ class FrameExporter:
         self._stat_limit = 10
         self._crop_attempts = 0
         self._crop_error_counts: Counter[str] = Counter()
-        self._fail_fast_threshold = 0.10
-        self._fail_fast_min_attempts = 10
+        self._fail_fast_threshold = 0.40  # Require 40% failure rate before aborting
+        self._fail_fast_min_attempts = 50  # Require at least 50 attempts before checking
         self._fail_fast_reasons = {"near_uniform_gray", "tiny_file"}
         self.debug_logger = debug_logger
 
@@ -1869,14 +1869,13 @@ def _sync_artifacts_to_s3(
     frames_root = get_path(ep_id, "frames_root")
     frames_dir = frames_root / "frames"
     crops_dir = frames_root / "crops"
+    # Only upload frames/crops if they were actually produced in this run
+    # The elif branches that uploaded stale artifacts have been removed to prevent
+    # publishing old frames/crops from prior runs when exports are disabled
     if exporter and exporter.save_frames and exporter.frames_dir.exists():
         stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
-    elif frames_dir.exists():
-        stats["frames"] = storage.upload_dir(frames_dir, prefixes["frames"])
     if exporter and exporter.save_crops and exporter.crops_dir.exists():
         stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
-    elif crops_dir.exists():
-        stats["crops"] = storage.upload_dir(crops_dir, prefixes["crops"])
     if thumb_dir is not None and thumb_dir.exists():
         identities_dir = thumb_dir / "identities"
         stats["thumbs_tracks"] = storage.upload_dir(
@@ -2906,14 +2905,23 @@ def _run_faces_embed_stage(
                 raise FileNotFoundError("Local video not found for crop export")
             if frame_decoder is None:
                 frame_decoder = FrameDecoder(video_path)
-            image = frame_decoder.read(frame_idx)
-            frame_std = float(np.std(image)) if image is not None else 0.0
-            if image is None or frame_std < 1.0:
-                LOGGER.warning(
-                    "Low-variance frame %s std=%.4f; retrying decode for track %s", frame_idx, frame_std, track_id
-                )
+
+            # Wrap decode in try/except to handle corrupted frames gracefully
+            image = None
+            try:
                 image = frame_decoder.read(frame_idx)
                 frame_std = float(np.std(image)) if image is not None else 0.0
+                if image is None or frame_std < 1.0:
+                    LOGGER.warning(
+                        "Low-variance frame %s std=%.4f; retrying decode for track %s", frame_idx, frame_std, track_id
+                    )
+                    image = frame_decoder.read(frame_idx)
+                    frame_std = float(np.std(image)) if image is not None else 0.0
+            except (RuntimeError, Exception) as decode_exc:
+                LOGGER.error("Decode failure on frame %s for track %s: %s", frame_idx, track_id, decode_exc)
+                image = None
+                frame_std = 0.0
+
             if image is None or frame_std < 1.0:
                 LOGGER.error("Skipping frame %s for track %s due to bad_source_frame", frame_idx, track_id)
                 rows.append(
@@ -3024,8 +3032,63 @@ def _run_faces_embed_stage(
             encoded = embedder.encode([crop])
             if encoded.size:
                 embedding_vec = encoded[0]
+                # Check for zero-norm embedding (invalid)
+                embedding_norm = float(np.linalg.norm(embedding_vec))
+                if embedding_norm < 1e-6:
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox,
+                            detector_choice,
+                            "zero_norm_embedding",
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=thumb_rel_path,
+                            thumb_s3_key=thumb_s3_key,
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
+                    progress.emit(
+                        faces_done,
+                        phase="faces_embed",
+                        device=device,
+                        detector=detector_choice,
+                        tracker=tracker_choice,
+                        resolved_device=embed_device,
+                        extra=phase_meta,
+                    )
+                    continue
             else:
-                embedding_vec = np.zeros(512, dtype=np.float32)
+                # Encoder returned empty array - skip this face
+                rows.append(
+                    _make_skip_face_row(
+                        args.ep_id,
+                        track_id,
+                        frame_idx,
+                        ts_val,
+                        bbox,
+                        detector_choice,
+                        "embedding_failed",
+                        crop_rel_path=crop_rel_path,
+                        crop_s3_key=crop_s3_key,
+                        thumb_rel_path=thumb_rel_path,
+                        thumb_s3_key=thumb_s3_key,
+                    )
+                )
+                faces_done = min(faces_total, faces_done + 1)
+                progress.emit(
+                    faces_done,
+                    phase="faces_embed",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=embed_device,
+                    extra=phase_meta,
+                )
+                continue
 
             track_embeddings[track_id].append((float(quality), embedding_vec.copy()))
             embeddings_array.append(embedding_vec)
@@ -3367,6 +3430,8 @@ def _run_cluster_stage(
         track_ids: List[int] = []
         track_index: Dict[int, dict] = {}
         forced_singletons: List[List[int]] = []
+        tracks_with_embeddings: Set[int] = set()
+
         for row in track_rows:
             track_id = int(row.get("track_id", -1))
             track_index[track_id] = row
@@ -3377,6 +3442,22 @@ def _run_cluster_stage(
             if embed:
                 embedding_rows.append(np.asarray(embed, dtype="float32"))
                 track_ids.append(track_id)
+                tracks_with_embeddings.add(track_id)
+
+        # Add tracks with no accepted embeddings as forced singletons
+        # This ensures tracks whose faces were all skipped still appear in identities.json
+        for track_id, row in track_index.items():
+            if track_id not in tracks_with_embeddings and track_id not in flagged_tracks:
+                # Track has no embedding and wasn't already flagged
+                faces_count = faces_per_track.get(track_id, 0)
+                if faces_count > 0:  # Only if we saw faces for this track (even if skipped)
+                    forced_singletons.append([track_id])
+                    LOGGER.info(
+                        "Track %d has no accepted embeddings (%d faces seen but all skipped); adding as forced singleton",
+                        track_id,
+                        faces_count,
+                    )
+
         if not embedding_rows and not forced_singletons:
             raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
