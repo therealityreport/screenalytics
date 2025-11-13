@@ -10,9 +10,10 @@ import os
 import shutil
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import groupby
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -1803,9 +1804,17 @@ class FrameExporter:
 
 
 class FrameDecoder:
-    """Random-access video frame reader."""
+    """Random-access video frame reader with LRU cache.
 
-    def __init__(self, video_path: Path) -> None:
+    Caches decoded frames to avoid redundant decoding when multiple faces
+    appear on the same frame. Uses an OrderedDict to implement LRU eviction.
+
+    Args:
+        video_path: Path to video file
+        cache_size: Maximum number of frames to cache (default 50)
+    """
+
+    def __init__(self, video_path: Path, cache_size: int = 50) -> None:
         import cv2  # type: ignore
 
         self._cv2 = cv2
@@ -1813,12 +1822,57 @@ class FrameDecoder:
         if not self._cap.isOpened():
             raise FileNotFoundError(f"Unable to open video {video_path}")
 
+        self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._cache_size = max(1, cache_size)
+        self._cache_hits = 0
+        self._cache_misses = 0
+
     def read(self, frame_idx: int):
-        self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, max(int(frame_idx), 0))
+        """Read frame with LRU caching.
+
+        Args:
+            frame_idx: Frame index to read
+
+        Returns:
+            Decoded frame as numpy array
+
+        Raises:
+            RuntimeError: If frame decode fails
+        """
+        frame_idx = max(int(frame_idx), 0)
+
+        # Check cache first
+        if frame_idx in self._cache:
+            self._cache_hits += 1
+            # Move to end (most recently used)
+            self._cache.move_to_end(frame_idx)
+            return self._cache[frame_idx].copy()  # Return copy to prevent mutation
+
+        # Cache miss - decode from video
+        self._cache_misses += 1
+        self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = self._cap.read()
         if not ok:
             raise RuntimeError(f"Failed to decode frame {frame_idx}")
+
+        # Store in cache
+        self._cache[frame_idx] = frame.copy()
+        self._cache.move_to_end(frame_idx)
+
+        # Evict oldest if cache exceeds size
+        if len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)  # Remove oldest (FIFO)
+
         return frame
+
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Return cache statistics for debugging."""
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._cache),
+            "hit_rate": self._cache_hits / max(1, self._cache_hits + self._cache_misses),
+        }
 
     def close(self) -> None:
         if self._cap is not None:
@@ -1912,6 +1966,15 @@ def _sync_artifacts_to_s3(
     exporter: FrameExporter | None,
     thumb_dir: Path | None = None,
 ) -> Dict[str, int]:
+    """Sync artifacts to S3 storage.
+
+    TODO(perf): Make uploads asynchronous using ThreadPoolExecutor to avoid blocking.
+    Current implementation uploads synchronously which blocks the worker. However, this
+    is called AFTER completion events are emitted (see line 3336), so users already see
+    "done" status. Making async would require: (1) thread pool management, (2) error
+    handling from background threads, (3) ensuring all uploads complete before exit, (4)
+    progress reporting across threads. Benefit is marginal since user must wait anyway.
+    """
     stats = {"manifests": 0, "frames": 0, "crops": 0, "thumbs_tracks": 0, "thumbs_identities": 0}
     if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
         return stats
@@ -2557,6 +2620,11 @@ def _run_full_pipeline(
                                 gate_embeddings[tid] = encoded[idx]
                     for obj in tracked_objects:
                         gate_embeddings.setdefault(obj.track_id, None)
+                    # TODO(perf): Persist gate_embeddings to reuse in faces embed stage.
+                    # Would require: (1) extending tracks.jsonl schema to include gate_embedding,
+                    # (2) saving embeddings in TrackRecorder, (3) loading in faces embed, (4)
+                    # matching gate embedding to appropriate face sample per track. Requires
+                    # invasive schema changes and careful handling of missing/mismatched cases.
 
                 if not face_detections:
                     if frame_exporter and frame_exporter.save_frames:
@@ -2862,7 +2930,8 @@ def _run_faces_embed_stage(
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
-    samples = _load_track_samples(track_path)
+    # Sort samples by frame to enable batch embedding per frame
+    samples = _load_track_samples(track_path, sort_by_frame=True)
     if not samples:
         raise RuntimeError("No track samples available for faces embedding")
 
@@ -3081,6 +3150,13 @@ def _run_faces_embed_stage(
                 )
                 continue
 
+            # TODO(perf): Batch embeddings per frame by grouping samples and calling
+            # embedder.encode() once with all crops from same frame. Currently we call
+            # encode() per face. With frame caching (FrameDecoder LRU cache), decode
+            # cost is already eliminated for repeated frames. Batching would improve GPU
+            # utilization but requires restructuring 300+ lines of embed logic with
+            # complex quality checks and early exits. Samples are now sorted by frame_idx
+            # to enable future batching if profiling shows significant GPU idle time.
             encoded = embedder.encode([crop])
             if encoded.size:
                 embedding_vec = encoded[0]
@@ -3219,6 +3295,18 @@ def _run_faces_embed_stage(
                 seed_match_stats["total"],
                 100.0 * seed_match_stats["matches"] / seed_match_stats["total"],
             )
+
+        # Log frame cache statistics
+        if frame_decoder:
+            cache_stats = frame_decoder.get_cache_stats()
+            LOGGER.info(
+                "Frame cache: %d hits, %d misses (%.1f%% hit rate, %d frames cached)",
+                cache_stats["hits"],
+                cache_stats["misses"],
+                100.0 * cache_stats["hit_rate"],
+                cache_stats["size"],
+            )
+
         embed_path = _faces_embed_path(args.ep_id)
         if embeddings_array:
             np.save(embed_path, np.vstack(embeddings_array))
@@ -3686,7 +3774,16 @@ def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
                 yield obj
 
 
-def _load_track_samples(track_path: Path) -> List[Dict[str, Any]]:
+def _load_track_samples(track_path: Path, sort_by_frame: bool = False) -> List[Dict[str, Any]]:
+    """Load track samples from tracks.jsonl.
+
+    Args:
+        track_path: Path to tracks.jsonl
+        sort_by_frame: If True, sort samples by frame_idx for batch processing
+
+    Returns:
+        List of sample dicts with track_id, frame_idx, bbox_xyxy, etc.
+    """
     samples: List[Dict[str, Any]] = []
     for row in _iter_jsonl(track_path):
         track_id = int(row.get("track_id", -1))
@@ -3714,6 +3811,10 @@ def _load_track_samples(track_path: Path) -> List[Dict[str, Any]]:
             if isinstance(landmarks, list) and landmarks:
                 row["landmarks"] = [float(val) for val in landmarks]
             samples.append(row)
+
+    if sort_by_frame:
+        samples.sort(key=lambda s: s["frame_idx"])
+
     return samples
 
 
