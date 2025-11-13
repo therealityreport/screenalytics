@@ -240,6 +240,11 @@ def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | 
 cfg = helpers.init_page("Screenalytics Upload")
 st.title("Upload & Run")
 
+# Handle deferred navigation after state flush
+if st.session_state.get("navigate_to_detail"):
+    st.session_state.pop("navigate_to_detail")
+    helpers.try_switch_page("pages/2_Episode_Detail.py")
+
 if "detector" in st.session_state:
     del st.session_state["detector"]
 if "tracker" in st.session_state:
@@ -252,18 +257,82 @@ if flash_message:
 jobs_running = _render_job_sections()
 
 
-def _upload_file(url: str, data: bytes, headers: Dict[str, str] | None = None) -> None:
-    resp = requests.put(url, data=data, headers=headers, timeout=120)
+def _upload_file(url: str, file_obj, headers: Dict[str, str] | None = None, chunk_size: int = 8 * 1024 * 1024) -> None:
+    """Upload file to URL using streaming to avoid memory buffering.
+
+    Args:
+        url: Upload URL (e.g., S3 presigned URL)
+        file_obj: File-like object supporting read()
+        headers: Optional HTTP headers
+        chunk_size: Chunk size for streaming (default: 8 MB)
+    """
+    def chunk_generator():
+        """Generator that yields chunks from file object."""
+        while True:
+            chunk = file_obj.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+    resp = requests.put(url, data=chunk_generator(), headers=headers, timeout=300)
     resp.raise_for_status()
 
 
-def _mirror_local(ep_id: str, data: bytes, local_path: str) -> Path:
-    ensure_dirs(ep_id)
-    dest = Path(local_path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("wb") as handle:
-        handle.write(data)
-    return dest
+def _mirror_local(ep_id: str, file_obj, local_path: str, chunk_size: int = 8 * 1024 * 1024) -> Path | None:
+    """Mirror file to local disk using streaming to avoid memory buffering.
+
+    Args:
+        ep_id: Episode identifier
+        file_obj: File-like object supporting read()
+        local_path: Destination path
+        chunk_size: Chunk size for streaming (default: 8 MB)
+
+    Returns:
+        Path to written file, or None if write failed
+
+    Raises:
+        OSError: If directory creation or file write fails (disk full, permissions, etc.)
+    """
+    try:
+        ensure_dirs(ep_id)
+        dest = Path(local_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as handle:
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        return dest
+    except (OSError, IOError) as exc:
+        error_msg = f"Failed to write to {local_path}: {exc}"
+        raise OSError(error_msg) from exc
+
+
+def _rollback_episode_creation(ep_id: str) -> None:
+    """Delete episode from store after upload failure.
+
+    Args:
+        ep_id: Episode ID to delete
+    """
+    try:
+        helpers.api_delete(f"/episodes/{ep_id}")
+        st.info(f"Rolled back episode `{ep_id}` from store.")
+    except requests.RequestException as rollback_exc:
+        st.warning(f"Failed to roll back episode: {rollback_exc}. You may need to manually delete `{ep_id}`.")
+
+
+def _navigate_to_detail_with_ep(ep_id: str) -> None:
+    """Navigate to Episode Detail page with proper state flush.
+
+    This ensures the ep_id is set in session state and flushed via rerun
+    before switching pages, preventing navigation sync issues.
+
+    Args:
+        ep_id: Episode ID to set before navigation
+    """
+    st.session_state["navigate_to_detail"] = True
+    helpers.set_ep_id(ep_id, rerun=True)
 
 
 def _s3_item_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -297,8 +366,14 @@ with st.form("episode-upload"):
         help="Optional premiere date",
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
+    auto_start_processing = st.checkbox(
+        "Automatically start detect/track after upload",
+        value=False,
+        help="Queue detect+track job immediately after successful upload (uses default RetinaFace + ByteTrack)"
+    )
     st.caption(
-        "Video will be uploaded to S3. Go to Episode Detail to run detect/track processing."
+        "Video will be uploaded to S3. " +
+        ("Processing will start automatically after upload." if auto_start_processing else "Go to Episode Detail to run detect/track processing.")
     )
     submit = st.form_submit_button("Upload episode")
 
@@ -308,6 +383,20 @@ if submit:
         st.stop()
     if uploaded_file is None:
         st.error("Attach an .mp4 before submitting.")
+        st.stop()
+
+    # Preflight validation: check file size
+    file_size = uploaded_file.size
+    MIN_FILE_SIZE = 1 * 1024 * 1024  # 1 MB minimum
+    if file_size == 0:
+        st.error("Uploaded file is empty (0 bytes). Please select a valid video file.")
+        st.stop()
+    if file_size < MIN_FILE_SIZE:
+        st.warning(
+            f"Uploaded file is suspiciously small ({file_size / 1024:.1f} KB). "
+            "This may be corrupted or incomplete. Minimum recommended size is 1 MB."
+        )
+        st.error("Upload cancelled. Please verify your video file.")
         st.stop()
 
     air_date_payload = air_date_value.isoformat() if include_air_date else None
@@ -337,7 +426,6 @@ if submit:
         st.error(f"Presign failed: {helpers.describe_error(endpoint, exc)}")
         st.stop()
 
-    raw_bytes = uploaded_file.getbuffer().tobytes()
     upload_url = presign_resp.get("upload_url")
     key = presign_resp.get("key") or presign_resp.get("object_key")
     st.info(
@@ -345,13 +433,23 @@ if submit:
     )
     if upload_url:
         try:
-            _upload_file(upload_url, raw_bytes, presign_resp.get("headers"))
+            _upload_file(upload_url, uploaded_file, presign_resp.get("headers"))
         except requests.RequestException as exc:
             err = helpers.describe_error(upload_url, exc)
             st.error(f"Upload failed: {err}")
+            _rollback_episode_creation(ep_id)
             st.stop()
+        # Seek back to beginning for local mirror after S3 upload
+        uploaded_file.seek(0)
 
-    _mirror_local(ep_id, raw_bytes, presign_resp["local_video_path"])
+    try:
+        _mirror_local(ep_id, uploaded_file, presign_resp["local_video_path"])
+    except OSError as exc:
+        st.error(f"Failed to write local copy: {exc}")
+        st.warning("Video uploaded to S3 successfully, but local mirror failed. Check disk space and permissions.")
+        _rollback_episode_creation(ep_id)
+        st.stop()
+
     video_meta = _get_video_meta(ep_id)
     detected_fps_value = video_meta.get("fps_detected") if video_meta else None
     if detected_fps_value:
@@ -362,7 +460,21 @@ if submit:
     }
     flash_lines = [f"Episode `{ep_id}` uploaded to S3 successfully."]
     flash_lines.append(f"Video → {helpers.link_local(artifacts['video'])}")
-    flash_lines.append("Go to Episode Detail to run processing.")
+
+    # Auto-start detect/track if requested
+    if auto_start_processing:
+        with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
+            result = _launch_default_detect_track(
+                ep_id,
+                label=f"Upload auto-start · {ep_id}",
+            )
+        if result and result.get("job"):
+            flash_lines.append(f"✓ Detect/track job `{result['job']['job_id']}` started.")
+        else:
+            flash_lines.append("⚠ Failed to auto-start detect/track. Start manually from Episode Detail.")
+    else:
+        flash_lines.append("Go to Episode Detail to run processing.")
+
     st.session_state["upload_flash"] = "\n".join(flash_lines)
     helpers.set_ep_id(ep_id)
 
@@ -384,21 +496,62 @@ except requests.RequestException as exc:
 
 if s3_items:
     s3_search = st.text_input("Filter S3 videos", "").strip().lower()
-    filtered_items = [item for item in s3_items if not s3_search or s3_search in item["ep_id"].lower()]
+
+    # Expand filter to search ep_id, show, season, episode, and S3 key
+    def _matches_filter(item: Dict[str, Any], search_term: str) -> bool:
+        if not search_term:
+            return True
+        meta = _s3_item_metadata(item)
+        search_fields = [
+            str(item.get("ep_id", "")),
+            str(meta.get("show", "")),
+            str(meta.get("season", "")),
+            str(meta.get("episode", "")),
+            str(item.get("key", "")),
+        ]
+        return any(search_term in field.lower() for field in search_fields)
+
+    filtered_items = [item for item in s3_items if _matches_filter(item, s3_search)]
+
+    # Reset selectbox selection when filter changes to avoid stale index
+    prev_filter = st.session_state.get("s3_prev_filter", "")
+    if s3_search != prev_filter:
+        st.session_state["s3_prev_filter"] = s3_search
+        if "s3_video_select" in st.session_state:
+            del st.session_state["s3_video_select"]
+
     if filtered_items:
+        # Sort by show (alphabetically), then season (descending), then episode (descending)
+        def _sort_key(item: Dict[str, Any]) -> tuple:
+            meta = _s3_item_metadata(item)
+            show = meta.get("show") or ""
+            season = meta.get("season")
+            episode = meta.get("episode")
+            # Use negative values for descending sort, fallback to 0 if None
+            season_val = -int(season) if season is not None else 0
+            episode_val = -int(episode) if episode is not None else 0
+            return (show.lower(), season_val, episode_val)
+
+        sorted_items = sorted(filtered_items, key=_sort_key)
+
         def _format_item(item: Dict[str, Any]) -> str:
             size = item.get("size")
             size_mb = f"{(size or 0) / (1024**2):.1f} MB" if size else "size ?"
-            last_mod = item.get("last_modified") or "unknown"
+            last_mod_raw = item.get("last_modified")
+            # Format timestamp: extract date portion (YYYY-MM-DD) from ISO timestamp
+            if last_mod_raw and len(last_mod_raw) >= 10:
+                last_mod = last_mod_raw[:10]  # Take first 10 chars: YYYY-MM-DD
+            else:
+                last_mod = last_mod_raw or "unknown"
             return f"{item['ep_id']} · {size_mb} · {last_mod}"
 
         selected_index = st.selectbox(
             "S3 videos",
-            list(range(len(filtered_items))),
-            format_func=lambda idx: _format_item(filtered_items[idx]),
+            list(range(len(sorted_items))),
+            format_func=lambda idx: _format_item(sorted_items[idx]),
             key="s3_video_select",
         )
-        selected_item = filtered_items[selected_index]
+        selected_item = sorted_items[selected_index]
         selected_meta = _s3_item_metadata(selected_item)
         ep_id_from_s3 = selected_meta.get("ep_id") or selected_item.get("ep_id")
         show_label = selected_meta.get("show")
@@ -463,24 +616,25 @@ if s3_items:
                     "Open Episode Detail",
                     key=f"open_detail_{ep_id_from_s3}",
                     use_container_width=True,
-                    on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
+                    on_click=lambda ep=ep_id_from_s3: _navigate_to_detail_with_ep(ep),
                 )
             with action_cols[1]:
                 if st.button("Mirror from S3", key=f"mirror_{ep_id_from_s3}", use_container_width=True):
-                    try:
-                        mirror_resp = helpers.api_post(f"/episodes/{ep_id_from_s3}/mirror")
-                    except requests.RequestException as exc:
-                        st.error(
-                            helpers.describe_error(
-                                f"{cfg['api_base']}/episodes/{ep_id_from_s3}/mirror",
-                                exc,
+                    with st.spinner(f"Mirroring video from S3 for {ep_id_from_s3}..."):
+                        try:
+                            mirror_resp = helpers.api_post(f"/episodes/{ep_id_from_s3}/mirror")
+                        except requests.RequestException as exc:
+                            st.error(
+                                helpers.describe_error(
+                                    f"{cfg['api_base']}/episodes/{ep_id_from_s3}/mirror",
+                                    exc,
+                                )
                             )
-                        )
-                    else:
-                        st.success(
-                            f"Mirrored to {helpers.link_local(mirror_resp['local_video_path'])} "
-                            f"({helpers.human_size(mirror_resp.get('bytes'))})"
-                        )
+                        else:
+                            st.success(
+                                f"Mirrored to {helpers.link_local(mirror_resp['local_video_path'])} "
+                                f"({helpers.human_size(mirror_resp.get('bytes'))})"
+                            )
             with action_cols[2]:
                 if st.button(
                     "Queue detect/track (defaults)",

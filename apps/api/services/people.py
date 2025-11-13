@@ -35,8 +35,18 @@ class PeopleService:
         self.shows_dir = self.data_root / "shows"
         self.shows_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def normalize_show_id(show_id: str) -> str:
+        """Normalize show_id to uppercase for consistent directory structure.
+
+        All show-level data (people.json, cast.json, facebank/) uses uppercase
+        show slugs (e.g., RHOBH, DEMO) regardless of how episode IDs are specified.
+        """
+        return show_id.upper()
+
     def _people_path(self, show_id: str) -> Path:
         """Get path to people.json for a show."""
+        show_id = self.normalize_show_id(show_id)  # Normalize to uppercase
         show_dir = self.shows_dir / show_id
         show_dir.mkdir(parents=True, exist_ok=True)
         return show_dir / "people.json"

@@ -99,7 +99,7 @@ class Track:
     def to_record(self) -> Dict[str, object]:
         avg_conf = self.conf_sum / self.hits if self.hits else 0.0
         return {
-            "track_id": f"track-{self.track_id:05d}",
+            "track_id": self.track_id,  # Numeric ID for downstream int() parsing
             "ep_id": self.ep_id,
             "start_s": self.start_s,
             "end_s": self.end_s,
