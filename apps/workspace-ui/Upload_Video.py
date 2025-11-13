@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict
 
+import boto3
 import requests
 import streamlit as st
 
@@ -257,25 +258,23 @@ if flash_message:
 jobs_running = _render_job_sections()
 
 
-def _upload_file(url: str, file_obj, headers: Dict[str, str] | None = None, chunk_size: int = 8 * 1024 * 1024) -> None:
-    """Upload file to URL using streaming to avoid memory buffering.
+def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4") -> None:
+    """Upload file to S3 using boto3 to avoid SSL issues with presigned URLs.
 
     Args:
-        url: Upload URL (e.g., S3 presigned URL)
+        bucket: S3 bucket name
+        key: S3 object key
         file_obj: File-like object supporting read()
-        headers: Optional HTTP headers
-        chunk_size: Chunk size for streaming (default: 8 MB)
+        content_type: MIME type for the uploaded file (default: video/mp4)
     """
-    def chunk_generator():
-        """Generator that yields chunks from file object."""
-        while True:
-            chunk = file_obj.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
-
-    resp = requests.put(url, data=chunk_generator(), headers=headers, timeout=300)
-    resp.raise_for_status()
+    # Use boto3 for reliable uploads without SSL issues
+    s3_client = boto3.client('s3', region_name='us-east-1')
+    s3_client.upload_fileobj(
+        file_obj,
+        bucket,
+        key,
+        ExtraArgs={'ContentType': content_type}
+    )
 
 
 def _mirror_local(ep_id: str, file_obj, local_path: str, chunk_size: int = 8 * 1024 * 1024) -> Path | None:
@@ -426,17 +425,16 @@ if submit:
         st.error(f"Presign failed: {helpers.describe_error(endpoint, exc)}")
         st.stop()
 
-    upload_url = presign_resp.get("upload_url")
+    bucket = presign_resp.get("bucket")
     key = presign_resp.get("key") or presign_resp.get("object_key")
     st.info(
-        f"Uploading to s3://{presign_resp['bucket']}/{key}" if upload_url else f"Writing to {presign_resp['local_video_path']}"
+        f"Uploading to s3://{bucket}/{key}" if bucket else f"Writing to {presign_resp['local_video_path']}"
     )
-    if upload_url:
+    if bucket and key:
         try:
-            _upload_file(upload_url, uploaded_file, presign_resp.get("headers"))
-        except requests.RequestException as exc:
-            err = helpers.describe_error(upload_url, exc)
-            st.error(f"Upload failed: {err}")
+            _upload_file(bucket, key, uploaded_file)
+        except Exception as exc:
+            st.error(f"Upload failed: {type(exc).__name__}: {exc}")
             _rollback_episode_creation(ep_id)
             st.stop()
         # Seek back to beginning for local mirror after S3 upload
