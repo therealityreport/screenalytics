@@ -210,6 +210,10 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
 
+    # Render global episode selector in sidebar
+    sidebar.divider()
+    render_sidebar_episode_selector()
+
     return {
         "api_base": api_base,
         "backend": backend,
@@ -237,6 +241,81 @@ def set_ep_id(ep_id: str, rerun: bool = True) -> None:
 
 def get_ep_id() -> str:
     return st.session_state.get("ep_id", "")
+
+
+def render_sidebar_episode_selector() -> str | None:
+    """Render a global episode selector in the sidebar.
+
+    Returns the selected ep_id, or None if no episodes exist.
+
+    Behavior:
+    - Defaults to most recently uploaded episode when no ep_id is set
+    - Persists selection in st.session_state across page changes
+    - Falls back to newest episode if previously selected ep_id no longer exists
+    """
+    try:
+        episodes_payload = api_get("/episodes")
+    except requests.RequestException:
+        st.sidebar.info("API unavailable")
+        return None
+
+    episodes = episodes_payload.get("episodes", [])
+
+    if not episodes:
+        st.sidebar.info("No episodes yet — upload one to get started.")
+        return None
+
+    # Sort by created_at descending (most recent first)
+    # Fallback to ep_id sorting if created_at is missing
+    def sort_key(ep: Dict[str, Any]) -> tuple:
+        created_at = ep.get("created_at", "")
+        return (created_at, ep.get("ep_id", ""))
+
+    episodes = sorted(episodes, key=sort_key, reverse=True)
+
+    # Determine current ep_id
+    current_ep_id = st.session_state.get("ep_id", "")
+    ep_ids = [ep["ep_id"] for ep in episodes]
+
+    # If current ep_id doesn't exist in list, fallback to most recent
+    if current_ep_id and current_ep_id not in ep_ids:
+        current_ep_id = ep_ids[0]  # Most recent episode
+    elif not current_ep_id:
+        current_ep_id = ep_ids[0]  # Default to most recent
+
+    # Build labels for selectbox
+    def format_label(ep: Dict[str, Any]) -> str:
+        ep_id = ep["ep_id"]
+        parsed = parse_ep_id(ep_id)
+        if parsed:
+            show = parsed["show"].upper()
+            season = parsed["season"]
+            episode = parsed["episode"]
+            return f"{show} S{season:02d}E{episode:02d}"
+        return ep_id
+
+    labels = {ep["ep_id"]: format_label(ep) for ep in episodes}
+
+    # Determine index for selectbox
+    try:
+        current_index = ep_ids.index(current_ep_id)
+    except ValueError:
+        current_index = 0
+
+    # Render selectbox in sidebar
+    selected_ep_id = st.sidebar.selectbox(
+        "Episode",
+        options=ep_ids,
+        format_func=lambda eid: labels.get(eid, eid),
+        index=current_index,
+        key="global_episode_selector",
+    )
+
+    # Update session state if selection changed
+    if selected_ep_id != current_ep_id:
+        set_ep_id(selected_ep_id, rerun=False)
+
+    return selected_ep_id
 
 
 def api_get(path: str, **kwargs) -> Dict[str, Any]:
