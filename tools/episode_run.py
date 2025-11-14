@@ -2036,7 +2036,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run detection + tracking locally.")
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
-    parser.add_argument("--stride", type=int, default=3, help="Frame stride for detection sampling")
+    parser.add_argument("--stride", type=int, default=1, help="Frame stride for detection (default: 1 = every frame)")
     parser.add_argument(
         "--fps",
         type=float,
@@ -2101,6 +2101,24 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional max samples stored per track (0→all detections, default)",
+    )
+    parser.add_argument(
+        "--max-samples-per-track",
+        type=int,
+        default=16,
+        help="Maximum samples per track for embedding/export (default: 16)",
+    )
+    parser.add_argument(
+        "--min-samples-per-track",
+        type=int,
+        default=4,
+        help="Minimum samples per track if track is long enough (default: 4)",
+    )
+    parser.add_argument(
+        "--sample-every-n-frames",
+        type=int,
+        default=4,
+        help="Sample interval for per-track sampling (default: 4)",
     )
     parser.add_argument("--thumb-size", type=int, default=256, help="Square thumbnail size for faces")
     parser.add_argument(
@@ -2432,6 +2450,11 @@ def _run_full_pipeline(
     analyzed_fps = target_fps or source_fps
     if not analyzed_fps or analyzed_fps <= 0:
         analyzed_fps = _detect_fps(video_dest)
+
+    # Detection/tracking stride (default: 1 = every frame for 24fps Bravo episodes)
+    # This controls how often detection runs, NOT how many samples get embedded/exported.
+    # Per-track sampling for embedding/export is controlled separately via
+    # --max-samples-per-track, --min-samples-per-track, --sample-every-n-frames
     frame_stride = _effective_stride(args.stride, target_fps or analyzed_fps, source_fps)
     ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
     frames_goal = None
@@ -2931,7 +2954,14 @@ def _run_faces_embed_stage(
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
     # Sort samples by frame to enable batch embedding per frame
-    samples = _load_track_samples(track_path, sort_by_frame=True)
+    # Apply per-track sampling to limit embedding/export volume
+    samples = _load_track_samples(
+        track_path,
+        sort_by_frame=True,
+        max_samples_per_track=getattr(args, "max_samples_per_track", 16),
+        min_samples_per_track=getattr(args, "min_samples_per_track", 4),
+        sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
+    )
     if not samples:
         raise RuntimeError("No track samples available for faces embedding")
 
@@ -3774,17 +3804,90 @@ def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
                 yield obj
 
 
-def _load_track_samples(track_path: Path, sort_by_frame: bool = False) -> List[Dict[str, Any]]:
-    """Load track samples from tracks.jsonl.
+def _sample_track_uniformly(
+    track_samples: List[Dict[str, Any]],
+    max_samples: int,
+    min_samples: int,
+    sample_interval: int,
+) -> List[Dict[str, Any]]:
+    """Sample track uniformly to limit number of samples per track.
+
+    Args:
+        track_samples: All samples for a single track, sorted by frame_idx
+        max_samples: Maximum number of samples to keep
+        min_samples: Minimum number of samples if track is long enough
+        sample_interval: Fallback interval for uniform sampling
+
+    Returns:
+        Sampled subset of track_samples
+    """
+    if len(track_samples) <= max_samples:
+        return track_samples
+
+    # Uniform sampling across the track's frame range
+    sampled = []
+    n = len(track_samples)
+
+    # Calculate step size for uniform sampling
+    if max_samples >= 2:
+        step = (n - 1) / (max_samples - 1)
+        indices = [int(round(i * step)) for i in range(max_samples)]
+    else:
+        indices = [n // 2]  # Take middle frame if max_samples == 1
+
+    # Ensure we don't duplicate indices
+    indices = sorted(set(indices))
+
+    for idx in indices:
+        if 0 <= idx < n:
+            sampled.append(track_samples[idx])
+
+    # Ensure we meet min_samples if the track is long enough
+    if len(sampled) < min_samples and len(track_samples) >= min_samples:
+        # Add more samples uniformly
+        additional_needed = min_samples - len(sampled)
+        step = n / (min_samples + 1)
+        additional_indices = [int(round((i + 1) * step)) for i in range(additional_needed)]
+        for idx in additional_indices:
+            if 0 <= idx < n and track_samples[idx] not in sampled:
+                sampled.append(track_samples[idx])
+
+        # Re-sort by frame_idx
+        sampled.sort(key=lambda s: s["frame_idx"])
+
+    return sampled[:max_samples]
+
+
+def _load_track_samples(
+    track_path: Path,
+    sort_by_frame: bool = False,
+    max_samples_per_track: int | None = None,
+    min_samples_per_track: int | None = None,
+    sample_every_n_frames: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Load track samples from tracks.jsonl with optional per-track sampling.
 
     Args:
         track_path: Path to tracks.jsonl
         sort_by_frame: If True, sort samples by frame_idx for batch processing
+        max_samples_per_track: Maximum samples per track (None = no limit)
+        min_samples_per_track: Minimum samples per track if track is long enough
+        sample_every_n_frames: Fallback interval for uniform sampling
 
     Returns:
         List of sample dicts with track_id, frame_idx, bbox_xyxy, etc.
     """
-    samples: List[Dict[str, Any]] = []
+    # Default sampling parameters
+    if max_samples_per_track is None:
+        max_samples_per_track = 16
+    if min_samples_per_track is None:
+        min_samples_per_track = 4
+    if sample_every_n_frames is None:
+        sample_every_n_frames = 4
+
+    # Group samples by track_id first
+    tracks_samples: Dict[int, List[Dict[str, Any]]] = {}
+
     for row in _iter_jsonl(track_path):
         track_id = int(row.get("track_id", -1))
         bbox_samples = row.get("bboxes_sampled") or []
@@ -3795,13 +3898,15 @@ def _load_track_samples(track_path: Path, sort_by_frame: bool = False) -> List[D
                 "bbox_xyxy": row.get("bbox_xyxy") or [0, 0, 10, 10],
             }
             bbox_samples = [fallback]
+
+        track_samples_list = []
         for sample in bbox_samples:
             frame_idx = int(sample.get("frame_idx") or 0)
             ts = float(sample.get("ts") or 0.0)
             bbox = sample.get("bbox_xyxy") or [0, 0, 10, 10]
             if not isinstance(bbox, list) or len(bbox) != 4:
                 bbox = [0, 0, 10, 10]
-            row = {
+            sample_dict = {
                 "track_id": track_id,
                 "frame_idx": frame_idx,
                 "ts": ts,
@@ -3809,8 +3914,23 @@ def _load_track_samples(track_path: Path, sort_by_frame: bool = False) -> List[D
             }
             landmarks = sample.get("landmarks")
             if isinstance(landmarks, list) and landmarks:
-                row["landmarks"] = [float(val) for val in landmarks]
-            samples.append(row)
+                sample_dict["landmarks"] = [float(val) for val in landmarks]
+            track_samples_list.append(sample_dict)
+
+        # Sort by frame_idx within this track
+        track_samples_list.sort(key=lambda s: s["frame_idx"])
+        tracks_samples[track_id] = track_samples_list
+
+    # Apply per-track sampling
+    samples: List[Dict[str, Any]] = []
+    for track_id, track_samples_list in tracks_samples.items():
+        sampled = _sample_track_uniformly(
+            track_samples_list,
+            max_samples_per_track,
+            min_samples_per_track,
+            sample_every_n_frames,
+        )
+        samples.extend(sampled)
 
     if sort_by_frame:
         samples.sort(key=lambda s: s["frame_idx"])
