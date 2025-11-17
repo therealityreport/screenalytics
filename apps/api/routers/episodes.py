@@ -264,7 +264,11 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
 
 
 def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
-    """Get detect/track phase status including detector/tracker info."""
+    """Get detect/track phase status including detector/tracker info.
+
+    IMPORTANT: Returns the FACE detector (e.g., retinaface), NOT the scene detector.
+    Scene detection (pyscenedetect) is a preliminary step, not the main detect/track operation.
+    """
     from py_screenalytics.artifacts import get_path
 
     tracks_path = get_path(ep_id, "tracks")
@@ -274,6 +278,7 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     tracks_count = _count_nonempty_lines(tracks_path)
 
     # Infer detector/tracker from tracks.jsonl if available
+    # Only accept FACE detectors (retinaface, yolov8-face, etc.), NOT scene detectors
     detector = None
     tracker = None
     if tracks_path.exists():
@@ -286,7 +291,10 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
                     try:
                         row = json.loads(line)
                         if not detector and "detector" in row:
-                            detector = row["detector"]
+                            det_value = row["detector"]
+                            # Filter out scene detectors - only accept face detectors
+                            if det_value and det_value.lower() not in ("pyscenedetect", "internal", "off"):
+                                detector = det_value
                         if not tracker and "tracker" in row:
                             tracker = row["tracker"]
                         if detector and tracker:
