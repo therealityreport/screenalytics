@@ -118,10 +118,10 @@ def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> s
 def _resolve_face_media_url(ep_id: str, row: Dict[str, Any] | None) -> str | None:
     if not row:
         return None
-    media = _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
-    if media:
-        return media
-    return _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
+    thumb = _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
+    if thumb:
+        return thumb
+    return _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
 
 
 def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
@@ -715,7 +715,7 @@ def _first_face_lookup(ep_id: str) -> Dict[int, Dict[str, Any]]:
 
     faces = _load_faces(ep_id, include_skipped=True)
     lookup: Dict[int, Dict[str, Any]] = {}
-    scores: Dict[int, tuple[int, int]] = {}
+    scores: Dict[int, tuple[int, int, float, int]] = {}
     for row in faces:
         try:
             tid = int(row.get("track_id", -1))
@@ -723,7 +723,15 @@ def _first_face_lookup(ep_id: str) -> Dict[int, Dict[str, Any]]:
         except (TypeError, ValueError):
             continue
         skip_flag = 1 if row.get("skip") else 0
-        candidate_score = (skip_flag, frame_idx)
+        has_thumb = 0 if (row.get("thumb_rel_path") or row.get("thumb_s3_key")) else 1
+        quality_value = row.get("quality")
+        if quality_value is None:
+            quality_value = row.get("conf") or row.get("confidence")
+        try:
+            quality_score = float(quality_value) if quality_value is not None else 0.0
+        except (TypeError, ValueError):
+            quality_score = 0.0
+        candidate_score = (skip_flag, has_thumb, -quality_score, frame_idx)
         best_score = scores.get(tid)
         if best_score is None or candidate_score < best_score:
             lookup[tid] = row

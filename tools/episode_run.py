@@ -1312,15 +1312,48 @@ class ThumbWriter:
             self._cv2 = cv2
         except ImportError:
             self._cv2 = None
+        self._last_thumb_meta: Dict[str, Any] = {}
 
-    def write(self, image, bbox: List[float], track_id: int, frame_idx: int) -> tuple[str | None, Path | None]:
+    def write(
+        self,
+        image,
+        bbox: List[float],
+        track_id: int,
+        frame_idx: int,
+        *,
+        prepared_crop: np.ndarray | None = None,
+    ) -> tuple[str | None, Path | None]:
+        self._last_thumb_meta = {"source_shape": None, "source_kind": None}
         if self._cv2 is None or image is None:
             return None, None
-        crop, clipped_bbox, err = safe_crop(image, bbox)
-        if crop is None:
-            LOGGER.debug("Skipping thumb track=%s frame=%s reason=%s", track_id, frame_idx, err)
+        source = None
+        source_kind = None
+        if prepared_crop is not None:
+            arr = np.asarray(prepared_crop)
+            if arr.size > 0:
+                source = prepared_crop
+                source_kind = "prepared"
+        if source is None:
+            crop, clipped_bbox, err = safe_crop(image, bbox)
+            if crop is None:
+                LOGGER.debug("Skipping thumb track=%s frame=%s reason=%s", track_id, frame_idx, err)
+                return None, None
+            source = crop
+            source_kind = "fallback"
+        arr = np.asarray(source)
+        if arr.size == 0:
             return None, None
-        thumb = self._letterbox(crop)
+        variance = float(np.var(arr))
+        if variance < FACE_MIN_STD:
+            LOGGER.debug(
+                "Skipping thumb track=%s frame=%s low_variance=%.4f source=%s",
+                track_id,
+                frame_idx,
+                variance,
+                source_kind,
+            )
+            return None, None
+        thumb = self._letterbox(source)
         if self._stat_samples < self._stat_limit:
             mn, mx, mean = _image_stats(thumb)
             LOGGER.info("thumb stats track=%s frame=%s min=%.3f max=%.3f mean=%.3f", track_id, frame_idx, mn, mx, mean)
@@ -1333,6 +1366,10 @@ class ThumbWriter:
         if not ok:
             LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
             return None, None
+        self._last_thumb_meta = {
+            "source_shape": tuple(int(x) for x in source.shape[:2]),
+            "source_kind": source_kind,
+        }
         return rel_path.as_posix(), abs_path
 
     def _letterbox(self, crop):
@@ -3171,12 +3208,18 @@ def _run_faces_embed_stage(
                     crop_rel_path = exporter.crop_rel_path(track_id, frame_idx)
                     if s3_prefixes and s3_prefixes.get("crops"):
                         crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
-            if image is not None:
-                thumb_rel_path, _ = thumb_writer.write(image, bbox, track_id, frame_idx)
-                if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
-                    thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
 
             crop, crop_err = _prepare_face_crop(image, bbox, landmarks)
+            if image is not None:
+                thumb_rel_path, _ = thumb_writer.write(
+                    image,
+                    bbox,
+                    track_id,
+                    frame_idx,
+                    prepared_crop=crop,
+                )
+                if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
+                    thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
             if crop is None:
                 rows.append(
                     _make_skip_face_row(
