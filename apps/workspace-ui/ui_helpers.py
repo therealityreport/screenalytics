@@ -1195,10 +1195,15 @@ def run_job_with_progress(
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
     detail_placeholder = st.empty()
-    log_placeholder = st.empty()
+    log_expander = st.expander("Detailed log", expanded=False)
+    with log_expander:
+        log_placeholder = st.empty()
+        log_placeholder.code("Waiting for progress updates…", language="text")
     log_lines: List[str] = []
     max_log_lines = 25
-    log_placeholder.code("Waiting for progress updates…", language="text")
+    last_logged_frame: int | None = None
+    last_logged_phase: str | None = None
+    frame_log_interval = 100
 
     dedupe_key = f"last_progress_event::{endpoint_path}"
     run_id_key = f"current_run_id::{endpoint_path}"
@@ -1206,6 +1211,7 @@ def run_job_with_progress(
     phase_hint = _phase_from_endpoint(endpoint_path) or "detect_track"
 
     def _cb(progress: Dict[str, Any]) -> None:
+        nonlocal last_logged_frame, last_logged_phase
         if not isinstance(progress, dict):
             return
 
@@ -1247,10 +1253,25 @@ def run_job_with_progress(
             requested_detector=requested_detector,
             requested_tracker=requested_tracker,
         )
-        log_lines.append(f"{status_line}\n{frames_line}")
-        if len(log_lines) > max_log_lines:
-            del log_lines[0 : len(log_lines) - max_log_lines]
-        log_placeholder.code("\n\n".join(log_lines), language="text")
+        frames_done_val = coerce_int(progress.get("frames_done"))
+        current_phase = str(progress.get("phase") or "")
+        log_event = False
+        if last_logged_phase is None or current_phase != last_logged_phase:
+            log_event = True
+        elif frames_done_val is not None:
+            previous = last_logged_frame or 0
+            if frames_done_val - previous >= frame_log_interval:
+                log_event = True
+        elif last_logged_frame is None:
+            log_event = True
+        if log_event:
+            log_lines.append(f"{status_line}\n{frames_line}")
+            if len(log_lines) > max_log_lines:
+                del log_lines[0 : len(log_lines) - max_log_lines]
+            log_placeholder.code("\n\n".join(log_lines), language="text")
+            last_logged_phase = current_phase
+            if frames_done_val is not None:
+                last_logged_frame = frames_done_val
 
     summary = None
     error_message = None

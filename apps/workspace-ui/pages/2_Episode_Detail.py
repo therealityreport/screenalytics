@@ -45,6 +45,9 @@ def _format_timestamp(value: str | None) -> str | None:
 
 cfg = helpers.init_page("Episode Detail")
 st.title("Episode Detail")
+flash_message = st.session_state.pop("episode_detail_flash", None)
+if flash_message:
+    st.success(flash_message)
 
 if "detector" in st.session_state:
     del st.session_state["detector"]
@@ -183,6 +186,30 @@ def _format_phase_status(label: str, status: Dict[str, Any], count_key: str) -> 
     if status.get("error"):
         base += f" • {status['error']}"
     return base
+
+
+def _ensure_local_artifacts(ep_id: str, details: Dict[str, Any]) -> bool:
+    local_block = details.setdefault("local", {})
+    if local_block.get("exists"):
+        return True
+    s3_meta = details.get("s3") or {}
+    if not (s3_meta.get("v2_exists") or s3_meta.get("v1_exists")):
+        st.error("Episode is not mirrored in S3; mirror/upload the video before running this job.")
+        return False
+    mirror_path = f"/episodes/{ep_id}/mirror"
+    with st.spinner("Mirroring artifacts from S3…"):
+        try:
+            resp = helpers.api_post(mirror_path)
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error(f"{cfg['api_base']}{mirror_path}", exc))
+            return False
+        st.success(
+            f"Mirrored to {helpers.link_local(resp['local_video_path'])} "
+            f"({helpers.human_size(resp.get('bytes'))})"
+        )
+        local_block["path"] = resp.get("local_video_path") or local_block.get("path")
+        local_block["exists"] = True
+        return True
 
 
 ep_id = helpers.get_ep_id()
@@ -501,44 +528,8 @@ with col_detect:
                     details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
                 if tracker_summary:
                     details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
-                st.success("Completed · " + " · ".join(details_line))
-                metrics = normalized.get("metrics") or {}
-                if metrics:
-                    st.markdown("**Track quality**")
-                    stat_cols = st.columns(3)
-                    stat_cols[0].metric("tracks born", metrics.get("tracks_born", 0))
-                    stat_cols[1].metric("tracks lost", metrics.get("tracks_lost", 0))
-                    stat_cols[2].metric("ID switches", metrics.get("id_switches", 0))
-                    longest = metrics.get("longest_tracks") or []
-                    if longest:
-                        for entry in longest:
-                            label = f"Track {entry.get('track_id')} · {entry.get('frame_count', 0)} frames"
-                            if entry.get("frame_count", 0) >= 500:
-                                st.warning(label)
-                            else:
-                                st.caption(label)
-                s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
-                if s3_prefixes:
-                    st.markdown("**S3 artifact prefixes**")
-                    st.code(helpers.s3_uri(s3_prefixes.get("frames"), bucket_name))
-                    st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
-                    st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
-                scene_badge = helpers.scene_cuts_badge_text(normalized)
-                if scene_badge:
-                    st.caption(f"🎬 {scene_badge}")
-                action_col1, action_col2 = st.columns(2)
-                with action_col1:
-                    st.button(
-                        "Open Faces Review",
-                        use_container_width=True,
-                        on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
-                    )
-                with action_col2:
-                    st.button(
-                        "Open Screentime",
-                        use_container_width=True,
-                        on_click=lambda: helpers.try_switch_page("pages/4_Screentime.py"),
-                    )
+                st.session_state["episode_detail_flash"] = "Detect/track complete · " + " · ".join(details_line)
+                st.rerun()
 
 tracks_ready = bool(status_payload and status_payload.get("tracks_ready"))
 faces_ready = bool(status_payload and status_payload.get("faces_harvested"))
@@ -581,7 +572,7 @@ with col_faces:
 
     # Improved messaging for when Harvest Faces is disabled
     if not local_video_exists:
-        st.warning("Mirror the episode locally before running Faces Harvest.")
+        st.info("Local mirror missing; video will be mirrored from S3 automatically when Faces Harvest starts.")
     elif not tracks_ready:
         st.warning(
             "**Harvest Faces is unavailable**: Face detection/tracking has not run yet.\n\n"
@@ -596,50 +587,48 @@ with col_faces:
     elif not detector_face_only:
         st.warning("Current tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face.")
 
-    faces_disabled = (not tracks_ready) or (not detector_face_only) or (not local_video_exists)
+    faces_disabled = (not tracks_ready) or (not detector_face_only)
     if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
-        payload = {
-            "ep_id": ep_id,
-            "device": faces_device_value,
-            "save_frames": bool(faces_save_frames),
-            "save_crops": bool(faces_save_crops),
-            "jpeg_quality": int(faces_jpeg_quality),
-        }
-        with st.spinner("Running faces harvest…"):
-            summary, error_message = helpers.run_job_with_progress(
-                ep_id,
-                "/jobs/faces_embed",
-                payload,
-                requested_device=faces_device_value,
-                async_endpoint="/jobs/faces_embed_async",
-                requested_detector=helpers.tracks_detector_value(ep_id),
-                requested_tracker=helpers.tracks_tracker_value(ep_id),
-            )
-        if error_message:
-            if "tracks.jsonl" in error_message.lower():
-                st.error("Run detect/track first.")
+        can_run_faces = True
+        if not local_video_exists:
+            can_run_faces = _ensure_local_artifacts(ep_id, details)
+            if can_run_faces:
+                local_video_exists = True
+        if can_run_faces:
+            payload = {
+                "ep_id": ep_id,
+                "device": faces_device_value,
+                "save_frames": bool(faces_save_frames),
+                "save_crops": bool(faces_save_crops),
+                "jpeg_quality": int(faces_jpeg_quality),
+            }
+            with st.spinner("Running faces harvest…"):
+                summary, error_message = helpers.run_job_with_progress(
+                    ep_id,
+                    "/jobs/faces_embed",
+                    payload,
+                    requested_device=faces_device_value,
+                    async_endpoint="/jobs/faces_embed_async",
+                    requested_detector=helpers.tracks_detector_value(ep_id),
+                    requested_tracker=helpers.tracks_tracker_value(ep_id),
+                )
+            if error_message:
+                if "tracks.jsonl" in error_message.lower():
+                    st.error("Run detect/track first.")
+                else:
+                    st.error(error_message)
             else:
-                st.error(error_message)
-        else:
-            normalized = helpers.normalize_summary(ep_id, summary)
-            faces_count = normalized.get("faces")
-            crops_exported = normalized.get("crops_exported")
-            details = []
-            if isinstance(faces_count, int):
-                details.append(f"faces: {faces_count:,}")
-            if crops_exported:
-                details.append(f"crops exported: {crops_exported:,}")
-            st.success("Faces harvest complete" + (" · " + ", ".join(details) if details else ""))
-            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
-            if s3_prefixes:
-                st.markdown("**S3 prefixes**")
-                st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
-                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
-            st.button(
-                "Open Faces Review",
-                use_container_width=True,
-                on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
-            )
+                normalized = helpers.normalize_summary(ep_id, summary)
+                faces_count = normalized.get("faces")
+                crops_exported = normalized.get("crops_exported")
+                details = []
+                if isinstance(faces_count, int):
+                    details.append(f"faces: {faces_count:,}")
+                if crops_exported:
+                    details.append(f"crops exported: {crops_exported:,}")
+                flash_msg = "Faces harvest complete" + (" · " + ", ".join(details) if details else "")
+                st.session_state["episode_detail_flash"] = flash_msg
+                st.rerun()
 with col_cluster:
     st.markdown("### Cluster Identities")
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
@@ -651,68 +640,73 @@ with col_cluster:
     )
     cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
     if not local_video_exists:
-        st.warning("Mirror the episode locally before clustering identities.")
+        st.info("Local mirror missing; artifacts will be mirrored automatically when clustering starts.")
     elif not faces_ready:
         st.caption("Run faces harvest first.")
     elif not detector_face_only:
         st.warning("Current tracks were generated with a legacy detector. Rerun detect/track first.")
-    cluster_disabled = (not faces_ready) or (not detector_face_only) or (not local_video_exists)
+    cluster_disabled = (not faces_ready) or (not detector_face_only)
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
-        payload = {
-            "ep_id": ep_id,
-            "device": cluster_device_value,
-        }
-        with st.spinner("Clustering faces…"):
-            summary, error_message = helpers.run_job_with_progress(
-                ep_id,
-                "/jobs/cluster",
-                payload,
-                requested_device=cluster_device_value,
-                async_endpoint="/jobs/cluster_async",
-                requested_detector=helpers.tracks_detector_value(ep_id),
-                requested_tracker=helpers.tracks_tracker_value(ep_id),
-            )
-        if error_message:
-            if "faces.jsonl" in error_message.lower():
-                st.error("Run faces harvest first.")
+        can_run_cluster = True
+        if not local_video_exists:
+            can_run_cluster = _ensure_local_artifacts(ep_id, details)
+            if can_run_cluster:
+                local_video_exists = True
+        if can_run_cluster:
+            payload = {
+                "ep_id": ep_id,
+                "device": cluster_device_value,
+            }
+            with st.spinner("Clustering faces…"):
+                summary, error_message = helpers.run_job_with_progress(
+                    ep_id,
+                    "/jobs/cluster",
+                    payload,
+                    requested_device=cluster_device_value,
+                    async_endpoint="/jobs/cluster_async",
+                    requested_detector=helpers.tracks_detector_value(ep_id),
+                    requested_tracker=helpers.tracks_tracker_value(ep_id),
+                )
+            if error_message:
+                if "faces.jsonl" in error_message.lower():
+                    st.error("Run faces harvest first.")
+                else:
+                    st.error(error_message)
             else:
-                st.error(error_message)
-        else:
-            normalized = helpers.normalize_summary(ep_id, summary)
-            identities_count = normalized.get("identities")
-            faces_count = normalized.get("faces")
-            details = []
-            if isinstance(identities_count, int):
-                details.append(f"identities: {identities_count:,}")
-            if isinstance(faces_count, int):
-                details.append(f"faces: {faces_count:,}")
-            st.success("Clustering complete" + (" · " + ", ".join(details) if details else ""))
-            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
-            if s3_prefixes:
-                st.markdown("**Manifests prefix**")
-                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
-            st.button(
-                "Go to Facebank",
-                use_container_width=True,
-                on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
-            )
+                normalized = helpers.normalize_summary(ep_id, summary)
+                identities_count = normalized.get("identities")
+                faces_count = normalized.get("faces")
+                details = []
+                if isinstance(identities_count, int):
+                    details.append(f"identities: {identities_count:,}")
+                if isinstance(faces_count, int):
+                    details.append(f"faces: {faces_count:,}")
+                flash_msg = "Clustering complete" + (" · " + ", ".join(details) if details else "")
+                st.session_state["episode_detail_flash"] = flash_msg
+                st.rerun()
 with col_screen:
     st.markdown("### Screentime")
-    screentime_disabled = not local_video_exists
-    if screentime_disabled:
-        st.warning("Mirror the episode locally before computing screentime.")
+    screentime_disabled = False
+    if not local_video_exists:
+        st.info("Local mirror missing; video will be mirrored automatically when screentime starts.")
     if st.button("Compute screentime", use_container_width=True, disabled=screentime_disabled):
-        with st.spinner("Starting screentime analysis…"):
-            try:
-                resp = helpers.api_post("/jobs/screen_time/analyze", {"ep_id": ep_id})
-            except requests.RequestException as exc:
-                st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screen_time/analyze", exc))
-            else:
-                job_id = resp.get("job_id")
-                if job_id:
-                    st.session_state[SCREENTIME_JOB_KEY] = job_id
-                st.success("Screen time job queued.")
-                st.rerun()
+        can_run_screen = True
+        if not local_video_exists:
+            can_run_screen = _ensure_local_artifacts(ep_id, details)
+            if can_run_screen:
+                local_video_exists = True
+        if can_run_screen:
+            with st.spinner("Starting screentime analysis…"):
+                try:
+                    resp = helpers.api_post("/jobs/screen_time/analyze", {"ep_id": ep_id})
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screen_time/analyze", exc))
+                else:
+                    job_id = resp.get("job_id")
+                    if job_id:
+                        st.session_state[SCREENTIME_JOB_KEY] = job_id
+                    st.success("Screen time job queued.")
+                    st.rerun()
 
     screentime_job_id = st.session_state.get(SCREENTIME_JOB_KEY)
     if screentime_job_id:
