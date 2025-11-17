@@ -61,12 +61,20 @@ def test_start_screen_time_job_happy_path(tmp_path, monkeypatch):
         quality_min=0.8,
         gap_tolerance_s=1.0,
         use_video_decode=False,
+        screen_time_mode="tracks",
+        edge_padding_s=0.15,
+        track_coverage_min=0.3,
+        preset="bravo_default",
     )
 
     assert job["job_type"] == "screen_time_analyze"
     assert captured["requested"]["quality_min"] == 0.8
     assert captured["requested"]["gap_tolerance_s"] == 1.0
     assert captured["requested"]["use_video_decode"] is False
+    assert captured["requested"]["screen_time_mode"] == "tracks"
+    assert captured["requested"]["edge_padding_s"] == 0.15
+    assert captured["requested"]["track_coverage_min"] == 0.3
+    assert captured["requested"]["preset"] == "bravo_default"
 
     command = captured["command"]
     assert "--ep-id" in command
@@ -75,6 +83,12 @@ def test_start_screen_time_job_happy_path(tmp_path, monkeypatch):
     assert "--gap-tolerance-s" in command
     assert "--use-video-decode" in command
     assert "false" in command  # use_video_decode=False
+    assert "--screen-time-mode" in command
+    assert "tracks" in command
+    assert "--edge-padding-s" in command
+    assert "0.15" in command
+    assert "--track-coverage-min" in command
+    assert "--preset" in command
 
 
 def test_start_screen_time_job_default_params(tmp_path, monkeypatch):
@@ -270,6 +284,10 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
             "ep_id": ep_id,
             "quality_min": 0.75,
             "gap_tolerance_s": 0.8,
+            "screen_time_mode": "tracks",
+            "edge_padding_s": 0.1,
+            "track_coverage_min": 0.25,
+            "preset": "bravo_default",
         }
     )
 
@@ -280,6 +298,10 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
     assert data["state"] == "running"
     assert "job_id" in data
     assert "started_at" in data
+    assert data["requested"]["screen_time_mode"] == "tracks"
+    assert data["requested"]["edge_padding_s"] == 0.1
+    assert data["requested"]["track_coverage_min"] == 0.25
+    assert data["requested"]["preset"] == "bravo_default"
 
 
 def test_analyze_screen_time_endpoint_missing_artifacts(tmp_path, monkeypatch):

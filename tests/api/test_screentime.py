@@ -64,9 +64,39 @@ def temp_episode_data(tmp_path: Path, monkeypatch) -> tuple[str, Path]:
 
     # Create synthetic tracks.jsonl
     tracks_data = [
-        {"track_id": 1, "start_frame": 30, "end_frame": 60},
-        {"track_id": 2, "start_frame": 150, "end_frame": 180},
-        {"track_id": 3, "start_frame": 300, "end_frame": 330},
+        {
+            "track_id": 1,
+            "start_frame": 30,
+            "end_frame": 60,
+            "first_frame_idx": 30,
+            "last_frame_idx": 60,
+            "frame_count": 3,
+            "faces_count": 3,
+            "first_ts": 1.0,
+            "last_ts": 2.0,
+        },
+        {
+            "track_id": 2,
+            "start_frame": 150,
+            "end_frame": 180,
+            "first_frame_idx": 150,
+            "last_frame_idx": 180,
+            "frame_count": 2,
+            "faces_count": 2,
+            "first_ts": 5.0,
+            "last_ts": 6.0,
+        },
+        {
+            "track_id": 3,
+            "start_frame": 300,
+            "end_frame": 330,
+            "first_frame_idx": 300,
+            "last_frame_idx": 330,
+            "frame_count": 2,
+            "faces_count": 2,
+            "first_ts": 10.0,
+            "last_ts": 11.0,
+        },
     ]
 
     tracks_path = manifests_dir / "tracks.jsonl"
@@ -244,11 +274,75 @@ def test_screentime_gap_tolerance(temp_episode_data: tuple[str, Path], monkeypat
     assert len(metrics) == 1
     alice_metrics = metrics[0]
 
-    # With large gap tolerance (10.0s), both tracks become continuous intervals
-    # Track 1: 1.0s -> 2.0s = 1.0s
-    # Track 2: 5.0s -> 6.0s = 1.0s (gap now within tolerance)
-    # Total: 2.0s
-    assert alice_metrics["visual_s"] == 2.0
+    # With large gap tolerance (10.0s), both tracks merge (1.0s -> 6.0s)
+    assert alice_metrics["visual_s"] == 5.0
+
+
+def test_screentime_track_mode_uses_track_spans(temp_episode_data: tuple[str, Path]):
+    """Track-based mode should use track spans plus padding."""
+    ep_id, _ = temp_episode_data
+
+    config = ScreenTimeConfig(
+        quality_min=0.48,
+        gap_tolerance_s=1.2,
+        use_video_decode=True,
+        screen_time_mode="tracks",
+        edge_padding_s=0.2,
+        track_coverage_min=0.0,
+    )
+    analyzer = ScreenTimeAnalyzer(config)
+
+    result = analyzer.analyze_episode(ep_id)
+    metrics = result["metrics"]
+
+    assert len(metrics) == 1
+    alice_metrics = metrics[0]
+
+    # Track spans are 1.0s each, plus 0.2s padding on both ends => 1.4s per track.
+    assert alice_metrics["visual_s"] == pytest.approx(2.8, rel=0.01)
+
+
+def test_screentime_track_mode_honors_coverage_gate(temp_episode_data: tuple[str, Path]):
+    """Track-based mode should drop tracks with low coverage."""
+    ep_id, data_root = temp_episode_data
+    manifests_dir = data_root / "manifests" / ep_id
+    tracks_path = manifests_dir / "tracks.jsonl"
+
+    tracks = []
+    with tracks_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            tracks.append(json.loads(line))
+
+    for track in tracks:
+        if track["track_id"] == 2:
+            track["frame_count"] = 200  # artificially inflate duration to reduce coverage
+            track["last_frame_idx"] = track["first_frame_idx"] + 200
+
+    with tracks_path.open("w", encoding="utf-8") as f:
+        for track in tracks:
+            f.write(json.dumps(track) + "\n")
+
+    config = ScreenTimeConfig(
+        quality_min=0.48,
+        gap_tolerance_s=1.2,
+        use_video_decode=True,
+        screen_time_mode="tracks",
+        edge_padding_s=0.0,
+        track_coverage_min=0.2,
+    )
+    analyzer = ScreenTimeAnalyzer(config)
+
+    result = analyzer.analyze_episode(ep_id)
+    metrics = result["metrics"]
+
+    assert len(metrics) == 1
+    alice_metrics = metrics[0]
+
+    # Track 2 fails the coverage gate, so only Track 1 contributes (~1.0s).
+    assert alice_metrics["visual_s"] == pytest.approx(1.0, rel=0.01)
 
 
 def test_screentime_write_outputs(temp_episode_data: tuple[str, Path], monkeypatch):

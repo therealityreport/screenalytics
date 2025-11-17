@@ -1214,8 +1214,8 @@ def run_job_with_progress(
             )
         else:
             summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
-            if (error_message or summary is None) and not error_message and async_endpoint:
-                summary, error_message = fallback_poll_progress(
+            if async_endpoint and (summary is None or error_message):
+                fallback_summary, fallback_error = fallback_poll_progress(
                     ep_id,
                     payload,
                     update_cb=_cb,
@@ -1223,6 +1223,9 @@ def run_job_with_progress(
                     job_started=job_started,
                     async_endpoint=async_endpoint,
                 )
+                if fallback_summary is not None or fallback_error is None:
+                    summary = fallback_summary
+                    error_message = fallback_error
         if summary and isinstance(summary, dict):
             remember_detector(summary.get("detector"))
             remember_tracker(summary.get("tracker"))

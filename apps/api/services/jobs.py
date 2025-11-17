@@ -11,7 +11,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -473,6 +473,10 @@ class JobService:
         quality_min: float | None = None,
         gap_tolerance_s: float | None = None,
         use_video_decode: bool | None = None,
+        screen_time_mode: Literal["faces", "tracks"] | None = None,
+        edge_padding_s: float | None = None,
+        track_coverage_min: float | None = None,
+        preset: str | None = None,
     ) -> JobRecord:
         """Start a screen time analysis job for an episode.
 
@@ -481,6 +485,10 @@ class JobService:
             quality_min: Optional minimum face quality threshold (0.0-1.0)
             gap_tolerance_s: Optional gap tolerance in seconds
             use_video_decode: Optional flag to use video decode for timestamps
+            screen_time_mode: Optional override for interval calculation
+            edge_padding_s: Optional edge padding override for intervals
+            track_coverage_min: Optional coverage gate when using track mode
+            preset: Optional named preset from the pipeline config
 
         Returns:
             JobRecord with job metadata
@@ -541,6 +549,18 @@ class JobService:
         if use_video_decode is not None:
             command += ["--use-video-decode", str(use_video_decode).lower()]
             requested["use_video_decode"] = use_video_decode
+        if screen_time_mode is not None:
+            command += ["--screen-time-mode", screen_time_mode]
+            requested["screen_time_mode"] = screen_time_mode
+        if edge_padding_s is not None:
+            command += ["--edge-padding-s", str(edge_padding_s)]
+            requested["edge_padding_s"] = edge_padding_s
+        if track_coverage_min is not None:
+            command += ["--track-coverage-min", str(track_coverage_min)]
+            requested["track_coverage_min"] = track_coverage_min
+        if preset:
+            command += ["--preset", preset]
+            requested["preset"] = preset
 
         return self._launch_job(
             job_type="screen_time_analyze",

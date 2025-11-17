@@ -759,6 +759,22 @@ class AnalyzeScreenTimeRequest(BaseModel):
     quality_min: float | None = Field(None, ge=0.0, le=1.0, description="Minimum face quality threshold")
     gap_tolerance_s: float | None = Field(None, ge=0.0, description="Gap tolerance in seconds")
     use_video_decode: bool | None = Field(None, description="Use video decode for precise timestamps")
+    screen_time_mode: Literal["faces", "tracks"] | None = Field(
+        None, description="How to derive intervals for screen time aggregation"
+    )
+    edge_padding_s: float | None = Field(
+        None, ge=0.0, description="Edge padding (seconds) applied to each interval"
+    )
+    track_coverage_min: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Minimum detection coverage when using track mode",
+    )
+    preset: str | None = Field(
+        None,
+        description="Named preset defined in config/pipeline/screen_time_v2.yaml",
+    )
 
 
 @router.post("/screen_time/analyze")
@@ -771,6 +787,10 @@ async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -
             quality_min=req.quality_min,
             gap_tolerance_s=req.gap_tolerance_s,
             use_video_decode=req.use_video_decode,
+            screen_time_mode=req.screen_time_mode,
+            edge_padding_s=req.edge_padding_s,
+            track_coverage_min=req.track_coverage_min,
+            preset=req.preset,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

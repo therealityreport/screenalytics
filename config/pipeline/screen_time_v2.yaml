@@ -1,15 +1,37 @@
 # Screen time analysis configuration
 #
-# This config controls how per-cast screen time is computed from assigned faces and tracks.
+# This config now supports named presets so we can have a "screen-time friendly"
+# profile without affecting stricter facebank/identity runs.
 
-# Minimum face quality/confidence threshold (0.0-1.0)
-# Faces below this threshold are excluded from screen time calculations
-quality_min: 0.7
+# Default preset to use when running `tools/analyze_screen_time.py`
+preset: bravo_default
 
-# Gap tolerance in seconds
-# Face detections within this gap are considered part of the same continuous appearance
-gap_tolerance_s: 0.5
+screen_time_presets:
+  # Bravo-style reality footage with lots of quick cuts and partial faces.
+  bravo_default:
+    # Lower confidence threshold so we keep motion-blurred / profile detections.
+    quality_min: 0.48
 
-# Whether to use video decode for precise timestamps
-# If false, falls back to frame_idx-based estimation
-use_video_decode: true
+    # Merge detector gaps up to ~1.2s so we don't fragment heavily edited scenes.
+    gap_tolerance_s: 1.2
+
+    # Prefer decoded timestamps from the video container when available.
+    use_video_decode: true
+
+    # Use full track spans for temporal coverage once a track is linked to a cast member.
+    screen_time_mode: tracks
+
+    # Pad each interval slightly to better match the human "in/out" perception.
+    edge_padding_s: 0.2
+
+    # Require at least ~35% detection coverage so we don't over-count sloppy tracks.
+    track_coverage_min: 0.35
+
+  # Stricter preset that stays closer to the original defaults.
+  stricter:
+    quality_min: 0.65
+    gap_tolerance_s: 0.6
+    use_video_decode: true
+    screen_time_mode: faces
+    edge_padding_s: 0.05
+    track_coverage_min: 0.5

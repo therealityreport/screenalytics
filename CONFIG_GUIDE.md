@@ -13,6 +13,11 @@ Version: 1.0
 - `config/codex.config.toml` — models, MCP servers, write policies
 - `config/agents/policies.yaml` + `config/claude.policies.yaml` — doc/write rules
 
+## Screen time presets
+- `config/pipeline/screen_time_v2.yaml` now exposes `screen_time_presets` with a default `bravo_default` profile for track-based aggregation plus a stricter fallback.
+- Update the `preset` key (or pass `--preset` / API overrides) to switch between presets without editing code.
+- Each preset can set `quality_min`, `gap_tolerance_s`, `screen_time_mode`, `edge_padding_s`, `track_coverage_min`, and `use_video_decode`; keep unrelated flows (facebank, embeddings) on their own presets if the thresholds diverge.
+
 ## Conventions
 - All thresholds and ids configured here; no magic numbers in code.
 - Code reads configs via helper `packages/py-screenalytics/config.py` with override support.

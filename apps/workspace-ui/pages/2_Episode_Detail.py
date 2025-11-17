@@ -336,6 +336,9 @@ with col_detect:
             help="Force full detection on the first N frames after each cut",
         )
     run_disabled = False
+    if not details["local"].get("exists"):
+        st.warning("Mirror the episode locally before running detect/track.")
+        run_disabled = True
     run_label = "Run detect/track"
     if st.button(run_label, use_container_width=True, disabled=run_disabled):
         job_payload = helpers.default_detect_track_payload(
