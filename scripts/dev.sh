@@ -21,6 +21,9 @@ fi
 
 echo "[dev.sh] STORAGE_BACKEND=${STORAGE_BACKEND}  BUCKET=${AWS_S3_BUCKET:-local}  API=${API_BASE_URL}"
 
+# Activate virtual environment
+source .venv/bin/activate
+
 python -m uvicorn apps.api.main:app --port 8000 & API_PID=$!
 trap 'kill $API_PID 2>/dev/null || true' EXIT
 
