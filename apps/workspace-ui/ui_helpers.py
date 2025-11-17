@@ -79,6 +79,7 @@ SCENE_DETECTOR_DEFAULT = (
     _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
 )
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
+_CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
 
 
 def _env(key: str, default: str = "") -> str:
@@ -115,6 +116,52 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def known_shows(include_session: bool = True) -> List[str]:
+    """Return a sorted list of known show identifiers from episodes + S3 (plus session state)."""
+    shows: set[str] = set()
+
+    def _remember(show_value: Any) -> None:
+        if not show_value or not isinstance(show_value, str):
+            return
+        cleaned = show_value.strip()
+        if cleaned:
+            shows.add(cleaned)
+
+    try:
+        episodes_payload = api_get("/episodes")
+    except requests.RequestException:
+        episodes_payload = {}
+    for record in episodes_payload.get("episodes", []):
+        show_value = record.get("show_slug")
+        if not show_value:
+            parsed = parse_ep_id(record.get("ep_id", ""))
+            show_value = parsed["show"] if parsed else None
+        _remember(show_value)
+
+    try:
+        s3_payload = api_get("/episodes/s3_shows")
+    except requests.RequestException:
+        s3_payload = {}
+    for entry in s3_payload.get("shows", []):
+        _remember(entry.get("show"))
+
+    if include_session:
+        for entry in st.session_state.get(_CUSTOM_SHOWS_SESSION_KEY, []):
+            _remember(entry)
+
+    return sorted(shows, key=lambda value: value.lower())
+
+
+def remember_custom_show(show_id: str) -> None:
+    """Persist a show identifier in session state so dropdowns include it immediately."""
+    cleaned = (show_id or "").strip()
+    if not cleaned:
+        return
+    custom: List[str] = st.session_state.setdefault(_CUSTOM_SHOWS_SESSION_KEY, [])
+    if cleaned not in custom:
+        custom.append(cleaned)
 
 
 def coerce_int(value: Any) -> int | None:

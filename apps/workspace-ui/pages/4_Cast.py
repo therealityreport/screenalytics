@@ -185,11 +185,24 @@ def _warn_if_simulated(payload: Dict[str, Any] | None) -> None:
 
 # Show and season filters
 st.subheader("Filters")
-cols = st.columns([2, 2, 1])
+show_options = helpers.known_shows()
+if not show_options:
+    st.info("No shows available yet. Add a show via the Upload page first.")
+    st.stop()
+cols = st.columns([3, 2, 1])
 
 with cols[0]:
-    # Show selector
-    show_id = st.text_input("Show ID", value="RHOBH", key="cast_show_id", help="Show ID (e.g., RHOBH)")
+    show_id = st.selectbox(
+        "Show",
+        options=show_options,
+        key="cast_show_select",
+        help="Select a show to manage cast and seed faces",
+    )
+    prev_show = st.session_state.get("cast_active_show")
+    if prev_show and prev_show != show_id:
+        _reset_cast_edit_state()
+        st.session_state.pop("selected_cast_id", None)
+    st.session_state["cast_active_show"] = show_id
 
 with cols[1]:
     # Season selector
@@ -205,11 +218,6 @@ with cols[1]:
 with cols[2]:
     if st.button("Refresh", key="cast_refresh", use_container_width=True):
         st.rerun()
-
-# Fetch cast list
-if not show_id:
-    st.info("Enter a Show ID to view cast")
-    st.stop()
 
 params = {}
 if season_filter:

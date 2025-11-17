@@ -61,6 +61,7 @@ def _get_video_meta(ep_id: str) -> Dict[str, Any] | None:
 
 
 ASYNC_JOBS_KEY = "async_jobs"
+ADD_SHOW_OPTION = "➕ Add new show…"
 
 
 def _job_state() -> Dict[str, Dict[str, Any]]:
@@ -351,9 +352,33 @@ def _s3_item_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+new_show_name = ""
+add_show_clicked = False
+show_choice = None
+
 with st.form("episode-upload"):
     st.subheader("Upload new episode")
-    show_ref = st.text_input("Show", placeholder="rhoslc", help="Slug or ID")
+    show_options = helpers.known_shows()
+    select_options = list(show_options) if show_options else []
+    if ADD_SHOW_OPTION not in select_options:
+        select_options.append(ADD_SHOW_OPTION)
+    show_choice = st.selectbox(
+        "Show",
+        options=select_options or [ADD_SHOW_OPTION],
+        key="upload_show_choice",
+        help="Select an existing show or add a new one",
+    )
+    if show_choice == ADD_SHOW_OPTION:
+        st.caption("Add a new show slug/ID to track episodes for.")
+        new_show_name = st.text_input(
+            "New show slug or ID",
+            key="upload_new_show_input",
+            placeholder="rhoslc",
+            help="This becomes the show slug used for new episodes",
+        )
+        add_show_clicked = st.form_submit_button("Add show", key="upload_add_show_btn")
+    else:
+        st.session_state.pop("upload_new_show_input", None)
     season_number = st.number_input("Season", min_value=0, max_value=999, value=1, step=1)
     episode_number = st.number_input("Episode #", min_value=0, max_value=999, value=1, step=1)
     title = st.text_input("Title", placeholder="Don't Ice Me Bro", help="Optional episode title")
@@ -365,18 +390,27 @@ with st.form("episode-upload"):
         help="Optional premiere date",
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
-    auto_start_processing = st.checkbox(
-        "Automatically start detect/track after upload",
-        value=False,
-        help="Queue detect+track job immediately after successful upload (uses default RetinaFace + ByteTrack)"
-    )
-    st.caption(
-        "Video will be uploaded to S3. " +
-        ("Processing will start automatically after upload." if auto_start_processing else "Go to Episode Detail to run detect/track processing.")
-    )
-    submit = st.form_submit_button("Upload episode")
+    st.caption("Video will be uploaded to S3. After upload, open Episode Detail to run detect/track.")
+    submit = st.form_submit_button("Upload episode", type="primary")
+
+if add_show_clicked:
+    pending_show = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
+    if not pending_show:
+        st.error("Enter a new show slug/ID before adding.")
+    else:
+        helpers.remember_custom_show(pending_show)
+        st.session_state["upload_show_choice"] = pending_show
+        st.session_state["upload_new_show_input"] = ""
+        st.success(f"Added show `{pending_show}` to the dropdown.")
+        st.rerun()
 
 if submit:
+    show_ref = show_choice or ""
+    if show_ref == ADD_SHOW_OPTION:
+        show_ref = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
+        if show_ref:
+            helpers.remember_custom_show(show_ref)
+            st.session_state["upload_show_choice"] = show_ref
     if not show_ref.strip():
         st.error("Show is required.")
         st.stop()
@@ -458,20 +492,7 @@ if submit:
     }
     flash_lines = [f"Episode `{ep_id}` uploaded to S3 successfully."]
     flash_lines.append(f"Video → {helpers.link_local(artifacts['video'])}")
-
-    # Auto-start detect/track if requested
-    if auto_start_processing:
-        with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
-            result = _launch_default_detect_track(
-                ep_id,
-                label=f"Upload auto-start · {ep_id}",
-            )
-        if result and result.get("job"):
-            flash_lines.append(f"✓ Detect/track job `{result['job']['job_id']}` started.")
-        else:
-            flash_lines.append("⚠ Failed to auto-start detect/track. Start manually from Episode Detail.")
-    else:
-        flash_lines.append("Go to Episode Detail to run processing.")
+    flash_lines.append("Go to Episode Detail to run detect/track processing.")
 
     st.session_state["upload_flash"] = "\n".join(flash_lines)
     helpers.set_ep_id(ep_id)
