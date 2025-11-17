@@ -52,6 +52,7 @@ LABEL = {
 }
 DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
 DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
+DEVICE_VALUE_TO_LABEL = {value.lower(): label for label, value in DEVICE_VALUE_MAP.items()}
 DETECTOR_OPTIONS = [
     ("RetinaFace (recommended)", DEFAULT_DETECTOR),
 ]
@@ -503,6 +504,15 @@ def device_label_index(label: str) -> int:
         return DEVICE_LABELS.index(label)
     except ValueError:
         return 0
+
+
+def device_label_from_value(value: str | None) -> str:
+    if not value:
+        return device_default_label()
+    label = DEVICE_VALUE_TO_LABEL.get(value.lower())
+    if label:
+        return label
+    return device_default_label()
 
 
 def detector_default_value() -> str:
