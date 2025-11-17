@@ -192,7 +192,7 @@ ep_id = ep_id.strip()
 canonical_ep_id = ep_id.lower()
 if canonical_ep_id != ep_id:
     helpers.set_ep_id(canonical_ep_id)
-    st.experimental_rerun()
+    st.rerun()
 ep_id = canonical_ep_id
 
 try:
@@ -259,7 +259,7 @@ if status_payload:
         st.subheader("Pipeline Status")
     with header_cols[1]:
         if st.button("Refresh status", key="episode_status_refresh", use_container_width=True):
-            st.experimental_rerun()
+            st.rerun()
     st.caption(f"Status refreshed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     col1, col2, col3 = st.columns(3)
 
@@ -712,7 +712,7 @@ with col_screen:
                 if job_id:
                     st.session_state[SCREENTIME_JOB_KEY] = job_id
                 st.success("Screen time job queued.")
-                st.experimental_rerun()
+                st.rerun()
 
     screentime_job_id = st.session_state.get(SCREENTIME_JOB_KEY)
     if screentime_job_id:
@@ -730,24 +730,24 @@ with col_screen:
                 st.progress(min(frames_done / frames_total, 1.0))
                 st.caption(f"Frames {frames_done:,} / {frames_total:,}")
                 time.sleep(2)
-                st.experimental_rerun()
+                st.rerun()
             elif job_state == "succeeded":
                 st.success("Screentime analysis complete.")
                 st.caption(f"JSON → {helpers.link_local(helpers.DATA_ROOT / 'analytics' / ep_id / 'screentime.json')}")
                 st.caption(f"CSV → {helpers.link_local(helpers.DATA_ROOT / 'analytics' / ep_id / 'screentime.csv')}")
                 if st.button("Dismiss screentime status", key="dismiss_screentime_job_success"):
                     st.session_state.pop(SCREENTIME_JOB_KEY, None)
-                    st.experimental_rerun()
+                    st.rerun()
             elif job_state == "failed":
                 st.error(f"Screentime job failed: {job_progress_resp.get('error') or 'unknown error'}")
                 if st.button("Dismiss screentime status", key="dismiss_screentime_job_failed"):
                     st.session_state.pop(SCREENTIME_JOB_KEY, None)
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.info(f"Screentime job status: {job_state or 'unknown'}")
                 if st.button("Dismiss screentime status", key="dismiss_screentime_job_other"):
                     st.session_state.pop(SCREENTIME_JOB_KEY, None)
-                    st.experimental_rerun()
+                    st.rerun()
 
 st.subheader("Artifacts")
 
