@@ -223,6 +223,7 @@ manifests_dir = get_path(ep_id, "detections").parent
 faces_path = manifests_dir / "faces.jsonl"
 identities_path = manifests_dir / "identities.json"
 detect_job_defaults = _load_job_defaults(ep_id, "detect_track")
+local_video_exists = bool(details["local"].get("exists"))
 
 st.subheader(f"Episode `{ep_id}`")
 st.write(
@@ -542,7 +543,6 @@ with col_detect:
 tracks_ready = bool(status_payload and status_payload.get("tracks_ready"))
 faces_ready = bool(status_payload and status_payload.get("faces_harvested"))
 detector_face_only = helpers.detector_is_face_only(ep_id)
-local_video_exists = bool(details["local"].get("exists"))
 
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
