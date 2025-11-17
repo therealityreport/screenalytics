@@ -829,8 +829,8 @@ def _is_phase_done(progress: Dict[str, Any]) -> bool:
     if phase == "done":
         return True
     step = str(progress.get("step", "")).lower()
-    # Any phase with step="done" indicates completion
-    if step == "done":
+    # Treat scene_detect completion as non-terminal so fallback polling keeps waiting
+    if step == "done" and not phase.startswith("scene_detect"):
         return True
     return False
 
@@ -955,6 +955,12 @@ def attempt_sse_run(
         response.close()
     if final_summary:
         return final_summary, None, True
+    ep_id_value = payload.get("ep_id")
+    if isinstance(ep_id_value, str):
+        phase_hint = _phase_from_endpoint(endpoint_path) or "detect_track"
+        status_summary = _summary_from_status(ep_id_value, phase_hint)
+        if status_summary:
+            return status_summary, None, True
     return None, None, True
 
 

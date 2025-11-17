@@ -388,56 +388,78 @@ with col_detect:
             crops_exported = helpers.coerce_int(normalized.get("crops_exported"))
             detector_summary = normalized.get("detector")
             tracker_summary = normalized.get("tracker")
-            details_line = [
-                f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
-                f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
-            ]
-            if frames_exported:
-                details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
-            if crops_exported:
-                details_line.append(f"crops exported: {helpers.format_count(crops_exported)}")
-            if detector_summary:
-                details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
-            if tracker_summary:
-                details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
-            st.success("Completed · " + " · ".join(details_line))
-            metrics = normalized.get("metrics") or {}
-            if metrics:
-                st.markdown("**Track quality**")
-                stat_cols = st.columns(3)
-                stat_cols[0].metric("tracks born", metrics.get("tracks_born", 0))
-                stat_cols[1].metric("tracks lost", metrics.get("tracks_lost", 0))
-                stat_cols[2].metric("ID switches", metrics.get("id_switches", 0))
-                longest = metrics.get("longest_tracks") or []
-                if longest:
-                    for entry in longest:
-                        label = f"Track {entry.get('track_id')} · {entry.get('frame_count', 0)} frames"
-                        if entry.get("frame_count", 0) >= 500:
-                            st.warning(label)
-                        else:
-                            st.caption(label)
-            s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
-            if s3_prefixes:
-                st.markdown("**S3 artifact prefixes**")
-                st.code(helpers.s3_uri(s3_prefixes.get("frames"), bucket_name))
-                st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
-                st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
-            scene_badge = helpers.scene_cuts_badge_text(normalized)
-            if scene_badge:
-                st.caption(f"🎬 {scene_badge}")
-            action_col1, action_col2 = st.columns(2)
-            with action_col1:
-                st.button(
-                    "Open Faces Review",
-                    use_container_width=True,
-                    on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
+            detector_is_scene = (
+                isinstance(detector_summary, str) and detector_summary in helpers.SCENE_DETECTOR_LABEL_MAP
+            )
+            has_detections = detections is not None and detections > 0
+            has_tracks = tracks is not None and tracks > 0
+            issue_messages: list[str] = []
+            if detector_is_scene:
+                detector_label = helpers.SCENE_DETECTOR_LABEL_MAP.get(detector_summary, detector_summary)
+                issue_messages.append(
+                    f"Pipeline stopped after scene detection ({detector_label}); detect/track never ran."
                 )
-            with action_col2:
-                st.button(
-                    "Open Screentime",
-                    use_container_width=True,
-                    on_click=lambda: helpers.try_switch_page("pages/4_Screentime.py"),
+            if not has_detections or not has_tracks:
+                det_label = helpers.format_count(detections) or "0"
+                track_label = helpers.format_count(tracks) or "0"
+                issue_messages.append(
+                    f"No detections/tracks were created (detections={det_label}, tracks={track_label})."
                 )
+            if issue_messages:
+                st.error(
+                    " ".join(issue_messages) + " Please rerun **Detect/Track Faces** to generate the manifests."
+                )
+            else:
+                details_line = [
+                    f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
+                    f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
+                ]
+                if frames_exported:
+                    details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
+                if crops_exported:
+                    details_line.append(f"crops exported: {helpers.format_count(crops_exported)}")
+                if detector_summary:
+                    details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
+                if tracker_summary:
+                    details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
+                st.success("Completed · " + " · ".join(details_line))
+                metrics = normalized.get("metrics") or {}
+                if metrics:
+                    st.markdown("**Track quality**")
+                    stat_cols = st.columns(3)
+                    stat_cols[0].metric("tracks born", metrics.get("tracks_born", 0))
+                    stat_cols[1].metric("tracks lost", metrics.get("tracks_lost", 0))
+                    stat_cols[2].metric("ID switches", metrics.get("id_switches", 0))
+                    longest = metrics.get("longest_tracks") or []
+                    if longest:
+                        for entry in longest:
+                            label = f"Track {entry.get('track_id')} · {entry.get('frame_count', 0)} frames"
+                            if entry.get("frame_count", 0) >= 500:
+                                st.warning(label)
+                            else:
+                                st.caption(label)
+                s3_prefixes = normalized.get("artifacts", {}).get("s3_prefixes") or prefixes
+                if s3_prefixes:
+                    st.markdown("**S3 artifact prefixes**")
+                    st.code(helpers.s3_uri(s3_prefixes.get("frames"), bucket_name))
+                    st.code(helpers.s3_uri(s3_prefixes.get("crops"), bucket_name))
+                    st.code(helpers.s3_uri(s3_prefixes.get("manifests"), bucket_name))
+                scene_badge = helpers.scene_cuts_badge_text(normalized)
+                if scene_badge:
+                    st.caption(f"🎬 {scene_badge}")
+                action_col1, action_col2 = st.columns(2)
+                with action_col1:
+                    st.button(
+                        "Open Faces Review",
+                        use_container_width=True,
+                        on_click=lambda: helpers.try_switch_page("pages/3_Faces_Review.py"),
+                    )
+                with action_col2:
+                    st.button(
+                        "Open Screentime",
+                        use_container_width=True,
+                        on_click=lambda: helpers.try_switch_page("pages/4_Screentime.py"),
+                    )
 
 tracks_ready = tracks_path.exists()
 faces_ready = faces_path.exists()
