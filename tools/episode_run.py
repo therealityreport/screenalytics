@@ -2561,6 +2561,12 @@ def _run_full_pipeline(
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video {video_dest}")
 
+    # NOV17-DETECT-ENTER: Loud logging to verify detect loop entry
+    LOGGER.error(
+        "NOV17-DETECT-ENTER: ep_id=%s video=%s total_frames=%d stride=%d detector=%s tracker=%s",
+        args.ep_id, video_dest, total_frames, frame_stride, detector_choice, tracker_label
+    )
+
     try:
         with det_path.open("w", encoding="utf-8") as det_handle:
             while True:
@@ -2610,8 +2616,23 @@ def _run_full_pipeline(
                         extra=detect_meta,
                     )
                 ts = frame_idx / ts_fps if ts_fps else 0.0
+
+                # NOV17-DETECT-CALL: Log before detector call (first frame only to reduce spam)
+                if frames_sampled == 0:
+                    LOGGER.error(
+                        "NOV17-DETECT-CALL: About to call detector.detect() frame_idx=%d ep_id=%s",
+                        frame_idx, args.ep_id
+                    )
+
                 try:
                     detections = detector_backend.detect(frame)
+
+                    # NOV17-DETECT-RESULT: Log result (first frame only)
+                    if frames_sampled == 0:
+                        LOGGER.error(
+                            "NOV17-DETECT-RESULT: detector.detect() returned %d detections for frame_idx=%d",
+                            len(detections) if detections else 0, frame_idx
+                        )
                 except Exception as exc:
                     LOGGER.error(
                         "Face detection failed at frame %d for %s: %s",
@@ -2749,6 +2770,12 @@ def _run_full_pipeline(
                 frames_since_cut += 1
     finally:
         cap.release()
+
+    # NOV17-DETECT-GUARD: Loud logging before guard check
+    LOGGER.error(
+        "NOV17-DETECT-GUARD: ep_id=%s frames_sampled=%d frame_idx=%d total_frames=%d det_count=%d",
+        args.ep_id, frames_sampled, frame_idx, total_frames, det_count
+    )
 
     # Guard: Ensure detect loop actually processed frames
     if frames_sampled == 0:
