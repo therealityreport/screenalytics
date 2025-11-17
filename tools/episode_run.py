@@ -1426,6 +1426,14 @@ class ProgressEmitter:
         fps_infer = None
         if secs_done > 0 and frames_done >= 0:
             fps_infer = frames_done / secs_done
+
+        # Scene detection phases should NOT inherit face detector/tracker values
+        # Scene detector is only in summary, not top-level fields
+        is_scene_phase = phase.startswith("scene_detect")
+        detector_value = None if is_scene_phase else (detector or self._detector)
+        tracker_value = None if is_scene_phase else (tracker or self._tracker)
+        resolved_device_value = None if is_scene_phase else (resolved_device or self._resolved_device)
+
         payload: Dict[str, object] = {
             "progress_version": self.VERSION,
             "ep_id": self.ep_id,
@@ -1441,9 +1449,9 @@ class ProgressEmitter:
             "fps_requested": round(float(self.fps_requested), 3) if self.fps_requested else None,
             "stride": self.stride,
             "updated_at": self._now(),
-            "detector": detector or self._detector,
-            "tracker": tracker or self._tracker,
-            "resolved_device": resolved_device or self._resolved_device,
+            "detector": detector_value,
+            "tracker": tracker_value,
+            "resolved_device": resolved_device_value,
         }
         if summary:
             payload["summary"] = summary
@@ -2602,7 +2610,17 @@ def _run_full_pipeline(
                         extra=detect_meta,
                     )
                 ts = frame_idx / ts_fps if ts_fps else 0.0
-                detections = detector_backend.detect(frame)
+                try:
+                    detections = detector_backend.detect(frame)
+                except Exception as exc:
+                    LOGGER.error(
+                        "Face detection failed at frame %d for %s: %s",
+                        frame_idx,
+                        args.ep_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
                 face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
                 tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
                 crop_records: list[tuple[int, list[float]]] = []
@@ -2731,6 +2749,17 @@ def _run_full_pipeline(
                 frames_since_cut += 1
     finally:
         cap.release()
+
+    # Guard: Ensure detect loop actually processed frames
+    if frames_sampled == 0:
+        error_msg = (
+            f"Detect phase completed with 0 frames processed for {args.ep_id}. "
+            f"This indicates video read failure, immediate loop exit, or misconfiguration. "
+            f"Video path: {video_dest}, frame_idx reached: {frame_idx}, total_frames: {total_frames}"
+        )
+        LOGGER.error(error_msg)
+        raise RuntimeError(error_msg)
+
     if progress and frame_idx > 0:
         detect_done_index = max(frame_idx - 1, 0)
         detect_done_frames, detect_done_meta = _progress_value(detect_done_index, include_current=True, step="done")
@@ -2868,6 +2897,17 @@ def _run_detect_track_stage(
         )
 
         manifests_dir = get_path(args.ep_id, "detections").parent
+
+        # Guard: Verify artifacts exist with non-zero content before reporting success
+        if det_count == 0 or track_count == 0:
+            error_msg = (
+                f"Detect/track pipeline completed but artifacts are missing or empty for {args.ep_id}: "
+                f"detections={det_count}, tracks={track_count}, frames_sampled={frames_sampled}. "
+                f"This indicates the detect loop ran but produced no output, which should be impossible."
+            )
+            LOGGER.error(error_msg)
+            raise RuntimeError(error_msg)
+
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
         _report_s3_upload(
             progress,
