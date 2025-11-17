@@ -214,6 +214,63 @@ if tracks_path.exists():
     st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
     st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
 
+# Add pipeline state indicators
+if status_payload:
+    st.divider()
+    st.subheader("Pipeline Status")
+    col1, col2, col3 = st.columns(3)
+
+    scenes_ready = status_payload.get("scenes_ready", False)
+    tracks_ready_status = status_payload.get("tracks_ready", False)
+    faces_harvested_status = status_payload.get("faces_harvested", False)
+
+    with col1:
+        if scenes_ready and tracks_ready_status:
+            st.success("✅ **Detect/Track**: Complete")
+            detect_info = status_payload.get("detect_track", {})
+            if detect_info:
+                det = detect_info.get("detector", "?")
+                trk = detect_info.get("tracker", "?")
+                st.caption(f"{det} + {trk}")
+                detections = detect_info.get("detections", 0)
+                tracks = detect_info.get("tracks", 0)
+                st.caption(f"{detections:,} detections, {tracks:,} tracks")
+        elif scenes_ready:
+            st.warning("⚠️ **Detect/Track**: Scene detection only")
+            st.caption("Run full detect/track with RetinaFace")
+        else:
+            st.info("⏳ **Detect/Track**: Not started")
+            st.caption("Run detect/track first")
+
+    with col2:
+        if faces_harvested_status:
+            st.success("✅ **Faces Harvest**: Complete")
+            faces_info = status_payload.get("faces_embed", {})
+            if faces_info:
+                face_count = faces_info.get("faces", 0)
+                st.caption(f"{face_count:,} faces embedded")
+        elif tracks_ready_status:
+            st.info("⏳ **Faces Harvest**: Ready to run")
+            st.caption("Click 'Run Faces Harvest' below")
+        else:
+            st.info("⏳ **Faces Harvest**: Waiting for tracks")
+            st.caption("Complete detect/track first")
+
+    with col3:
+        cluster_info = status_payload.get("cluster", {})
+        identities_count = cluster_info.get("identities", 0) if cluster_info else 0
+        if identities_count > 0:
+            st.success("✅ **Cluster**: Complete")
+            st.caption(f"{identities_count:,} identities found")
+        elif faces_harvested_status:
+            st.info("⏳ **Cluster**: Ready to run")
+            st.caption("Click 'Run Cluster' below")
+        else:
+            st.info("⏳ **Cluster**: Waiting for faces")
+            st.caption("Complete faces harvest first")
+
+    st.divider()
+
 col_hydrate, col_detect = st.columns(2)
 with col_hydrate:
     if st.button("Mirror from S3", use_container_width=True):
@@ -228,13 +285,20 @@ with col_hydrate:
             )
 default_device_label = helpers.device_default_label()
 with col_detect:
+    st.markdown("### Detect/Track Faces")
+
+    # Show current detector/tracker configuration prominently
+    st.info(
+        f"**Configuration**: This will run **full face detection + tracking** on every frame.\n\n"
+        f"- **Face Detector**: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} (RetinaFace)\n"
+        f"- **Tracker**: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} (ByteTrack)\n"
+        f"- **Stride**: {helpers.DEFAULT_STRIDE} (every frame for 24fps episodes)\n"
+        f"- **Device**: auto (falls back to CPU)\n\n"
+        f"This will generate `detections.jsonl` and `tracks.jsonl` for the episode."
+    )
+
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=helpers.DEFAULT_STRIDE, step=1)
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=0.0, step=1.0)
-    st.caption(
-        f"Detector: {helpers.LABEL.get(helpers.DEFAULT_DETECTOR, helpers.DEFAULT_DETECTOR)} · "
-        f"Tracker: {helpers.LABEL.get(helpers.DEFAULT_TRACKER, helpers.DEFAULT_TRACKER)} · "
-        "Device: auto (falls back to CPU for RetinaFace/ArcFace)."
-    )
     save_frames = st.checkbox("Save frames to S3", value=True)
     save_crops = st.checkbox("Save face crops to S3", value=True)
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=85, step=5)
@@ -380,6 +444,15 @@ col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
     st.markdown("### Faces Harvest")
     st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
+
+    # Add pipeline state indicator
+    detect_track_info = status_payload.get("detect_track") if status_payload else {}
+    if detect_track_info:
+        detector_name = detect_track_info.get("detector")
+        tracker_name = detect_track_info.get("tracker")
+        if detector_name and tracker_name:
+            st.caption(f"📊 Current pipeline: {detector_name} + {tracker_name}")
+
     faces_device_choice = st.selectbox(
         "Device",
         helpers.DEVICE_LABELS,
@@ -401,10 +474,22 @@ with col_faces:
         st.caption(
             "ArcFace embeddings run on CPU when MPS is selected. Tracker/crop export still uses the requested device."
         )
+
+    # Improved messaging for when Harvest Faces is disabled
     if not tracks_ready:
-        st.caption("Run detect/track first.")
+        st.warning(
+            "**Harvest Faces is unavailable**: Face detection/tracking has not run yet.\n\n"
+            "Run **Detect/Track Faces** first to generate `tracks.jsonl` for this episode. "
+            "The detect/track job must complete successfully with RetinaFace + ByteTrack before you can harvest faces."
+        )
+        if detect_track_info and detect_track_info.get("detector") == "pyscenedetect":
+            st.error(
+                "⚠️ **Scene detection only**: Your last run only executed scene detection (PySceneDetect), "
+                "not full face detection + tracking. Please run **Detect/Track Faces** again to generate tracks."
+            )
     elif not detector_face_only:
         st.warning("Current tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face.")
+
     faces_disabled = (not tracks_ready) or (not detector_face_only)
     if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
         payload = {

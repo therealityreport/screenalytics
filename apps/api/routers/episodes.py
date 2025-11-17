@@ -263,6 +263,65 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
     }
 
 
+def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
+    """Get detect/track phase status including detector/tracker info."""
+    from py_screenalytics.artifacts import get_path
+
+    tracks_path = get_path(ep_id, "tracks")
+    detections_path = get_path(ep_id, "detections")
+
+    detections_count = _count_nonempty_lines(detections_path)
+    tracks_count = _count_nonempty_lines(tracks_path)
+
+    # Infer detector/tracker from tracks.jsonl if available
+    detector = None
+    tracker = None
+    if tracks_path.exists():
+        try:
+            with tracks_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        if not detector and "detector" in row:
+                            detector = row["detector"]
+                        if not tracker and "tracker" in row:
+                            tracker = row["tracker"]
+                        if detector and tracker:
+                            break
+                    except json.JSONDecodeError:
+                        continue
+        except (OSError, IOError):
+            pass
+
+    # Determine status
+    if tracks_count > 0:
+        status_value = "success"
+    elif detections_count > 0:
+        status_value = "partial"  # Has detections but no tracks
+    else:
+        status_value = "missing"
+
+    source = "output" if tracks_path.exists() or detections_path.exists() else "absent"
+
+    return {
+        "phase": "detect_track",
+        "status": status_value,
+        "detections": detections_count,
+        "tracks": tracks_count,
+        "detector": detector,
+        "tracker": tracker,
+        "faces": None,
+        "identities": None,
+        "started_at": None,
+        "finished_at": None,
+        "version": None,
+        "source": source,
+    }
+
+
 def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
     record = EPISODE_STORE.get(ep_id)
     if not record:
@@ -1084,6 +1143,10 @@ class PhaseStatus(BaseModel):
     status: str
     faces: int | None = None
     identities: int | None = None
+    detections: int | None = None
+    tracks: int | None = None
+    detector: str | None = None
+    tracker: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     version: str | None = None
@@ -1092,8 +1155,13 @@ class PhaseStatus(BaseModel):
 
 class EpisodeStatusResponse(BaseModel):
     ep_id: str
+    detect_track: PhaseStatus
     faces_embed: PhaseStatus
     cluster: PhaseStatus
+    # Pipeline state indicators
+    scenes_ready: bool
+    tracks_ready: bool
+    faces_harvested: bool
 
 
 class AssetUploadResponse(BaseModel):
@@ -1312,9 +1380,35 @@ def episode_progress(ep_id: str) -> dict:
 
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
+    detect_track_status = PhaseStatus(**_detect_track_phase_status(ep_id))
     faces_status = PhaseStatus(**_faces_phase_status(ep_id))
     cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
-    return EpisodeStatusResponse(ep_id=ep_id, faces_embed=faces_status, cluster=cluster_status)
+
+    # Compute pipeline state indicators
+    from py_screenalytics.artifacts import get_path
+
+    tracks_path = get_path(ep_id, "tracks")
+    manifests_dir = get_path(ep_id, "detections").parent
+    faces_path = manifests_dir / "faces.jsonl"
+
+    # scenes_ready: True if scene detection has run (we consider this always true if tracks exist)
+    scenes_ready = tracks_path.exists() or detect_track_status.detections is not None and detect_track_status.detections > 0
+
+    # tracks_ready: True if tracks.jsonl exists and has content
+    tracks_ready = detect_track_status.tracks is not None and detect_track_status.tracks > 0
+
+    # faces_harvested: True if faces.jsonl exists and has content
+    faces_harvested = faces_status.faces is not None and faces_status.faces > 0
+
+    return EpisodeStatusResponse(
+        ep_id=ep_id,
+        detect_track=detect_track_status,
+        faces_embed=faces_status,
+        cluster=cluster_status,
+        scenes_ready=scenes_ready,
+        tracks_ready=tracks_ready,
+        faces_harvested=faces_harvested,
+    )
 
 
 @router.post("/episodes", response_model=EpisodeCreateResponse, tags=["episodes"])
