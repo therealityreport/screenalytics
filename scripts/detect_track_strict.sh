@@ -21,10 +21,14 @@ fi
 
 EP_ID="$1"
 
-# Force embedding extraction every frame (only difference from default)
-export TRACK_GATE_EMB_EVERY=1        # Extract embeddings EVERY frame (default is 5)
+# Source strict tracking settings
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source "$SCRIPT_DIR/set_strict_tracking.sh"
 
-# Run detect/track with default config (which is already strict)
+# Force embedding extraction every frame (only difference from default strict)
+export TRACK_GATE_EMB_EVERY=1        # Extract embeddings EVERY frame (default strict is 5)
+
+# Run detect/track with strict config
 python3 tools/episode_run.py \
     --ep-id "$EP_ID" \
     detect track

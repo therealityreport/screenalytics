@@ -682,8 +682,9 @@ with col_detect:
 
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=stride_default, step=1)
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=fps_default, step=1.0)
-    save_frames = st.checkbox("Save frames to S3", value=bool(save_frames_default))
-    save_crops = st.checkbox("Save face crops to S3", value=bool(save_crops_default))
+    # Automatically save to S3
+    save_frames = True
+    save_crops = True
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=jpeg_quality_default, step=5)
 
     session_prefix = f"episode_detail_detect::{ep_id}"
@@ -967,7 +968,7 @@ with col_faces:
     )
     faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
     faces_save_frames = st.checkbox(
-        "Save sampled frames", value=bool(faces_save_frames_default), key="faces_save_frames_detail"
+        "Save sampled frames (auto-enabled)", value=True, disabled=True, key="faces_save_frames_detail"
     )
     faces_save_crops = st.checkbox(
         "Save face crops to S3", value=bool(faces_save_crops_default), key="faces_save_crops_detail"

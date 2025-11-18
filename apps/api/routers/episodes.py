@@ -151,12 +151,18 @@ def _analytics_root(ep_id: str) -> Path:
     return data_root / "analytics" / ep_id
 
 
+def _embeds_root(ep_id: str) -> Path:
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+    return data_root / "embeds" / ep_id
+
+
 def _episode_local_dirs(ep_id: str) -> List[Path]:
     dirs = [
         get_path(ep_id, "video").parent,
         get_path(ep_id, "frames_root"),
         _manifests_dir(ep_id),
         _analytics_root(ep_id),
+        _embeds_root(ep_id),
     ]
     unique: List[Path] = []
     seen = set()
@@ -364,6 +370,43 @@ def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
         ep_ctx = episode_context_from_id(ep_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid episode id") from exc
+    
+    # Clean up people data BEFORE deleting local/S3 artifacts
+    # This removes orphaned cluster_ids from people.json for this show
+    people_cleanup = {"people_modified": 0, "clusters_removed": 0, "empty_people_removed": 0}
+    try:
+        from apps.api.services.people import PeopleService
+        people_service = PeopleService()
+        show_id = record.show_ref  # Use show_ref from episode record
+        people_cleanup = people_service.remove_episode_clusters(show_id, ep_id)
+        LOGGER.info(
+            "Cleaned up people data for %s: %d people modified, %d clusters removed, %d empty people removed",
+            ep_id, people_cleanup["people_modified"], people_cleanup["clusters_removed"],
+            people_cleanup["empty_people_removed"]
+        )
+    except Exception as exc:  # pragma: no cover - best effort cleanup
+        LOGGER.warning("Failed to clean up people data for %s: %s", ep_id, exc)
+    
+    # Also clear person_id assignments from identities.json
+    identities_cleared = 0
+    try:
+        from pathlib import Path
+        identities_path = Path(f"data/manifests/{ep_id}/identities.json")
+        if identities_path.exists():
+            import json
+            data = json.loads(identities_path.read_text(encoding="utf-8"))
+            identities = data.get("identities", [])
+            for identity in identities:
+                if "person_id" in identity:
+                    del identity["person_id"]
+                    identities_cleared += 1
+            if identities_cleared > 0:
+                data["identities"] = identities
+                identities_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                LOGGER.info("Cleared %d person_id assignment(s) from identities.json for %s", identities_cleared, ep_id)
+    except Exception as exc:  # pragma: no cover - best effort cleanup
+        LOGGER.warning("Failed to clear identities.json for %s: %s", ep_id, exc)
+    
     local_deleted = 0
     delete_local = getattr(options, "delete_local", True)
     if delete_local:
@@ -394,7 +437,11 @@ def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
     removed = EPISODE_STORE.delete(ep_id)
     return {
         "ep_id": ep_id,
-        "deleted": {"local_dirs": local_deleted, "s3_objects": s3_deleted},
+        "deleted": {
+            "local_dirs": local_deleted,
+            "s3_objects": s3_deleted,
+            "people_cleanup": people_cleanup,
+        },
         "removed_from_store": removed,
     }
 
@@ -1306,7 +1353,7 @@ class EpisodeVideoMeta(BaseModel):
 
 
 class DeleteEpisodeIn(BaseModel):
-    delete_artifacts: bool = True
+    include_s3: bool = True
     delete_raw: bool = False
     delete_local: bool = True
 
@@ -1627,6 +1674,26 @@ def hydrate_episode_video(ep_id: str) -> EpisodeMirrorResponse:
     return mirror_episode_video(ep_id)
 
 
+@router.post("/episodes/{ep_id}/refresh_similarity", tags=["episodes"])
+def refresh_similarity_values(ep_id: str) -> dict:
+    """Recompute all similarity scores for the episode.
+    
+    This regenerates track representatives, cluster centroids, and updates
+    all similarity scores at the track and frame level.
+    """
+    try:
+        # Refresh all track reps and centroids for all identities
+        _refresh_similarity_indexes(ep_id, identity_ids=None, track_ids=None)
+        
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "message": "Similarity values refreshed successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh similarity values: {str(e)}")
+
+
 @router.get(
     "/episodes/{ep_id}/video_meta",
     response_model=EpisodeVideoMeta,
@@ -1702,6 +1769,7 @@ def list_identities(ep_id: str) -> dict:
                 "identity_id": identity.get("identity_id"),
                 "label": identity.get("label"),
                 "name": identity.get("name"),
+                "person_id": identity.get("person_id"),
                 "track_ids": track_ids,
                 "faces": faces_total,
                 "rep_thumbnail_url": preview_url,
@@ -1970,6 +2038,7 @@ def track_detail(ep_id: str, track_id: int) -> dict:
                 "skip": row.get("skip"),
                 "crop_rel_path": row.get("crop_rel_path"),
                 "crop_s3_key": row.get("crop_s3_key"),
+                "similarity": row.get("similarity"),  # Include frame similarity score
             }
         )
     track_row = next((row for row in _load_tracks(ep_id) if int(row.get("track_id", -1)) == track_id), None)

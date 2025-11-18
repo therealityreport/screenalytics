@@ -16,10 +16,11 @@ from py_screenalytics.artifacts import get_path
 LOGGER = logging.getLogger(__name__)
 
 # Quality gates for representative frames
-REP_DET_MIN = float(os.getenv("REP_DET_MIN", "0.60"))
+REP_DET_MIN = float(os.getenv("REP_DET_MIN", "0.50"))  # Lowered from 0.60 to accept more frames
 REP_STD_MIN = float(os.getenv("REP_STD_MIN", "1.0"))
 REP_MAX_FRAMES_PER_TRACK = int(os.getenv("REP_MAX_FRAMES_PER_TRACK", "50"))
 REP_MIN_SIM_TO_CENTROID = float(os.getenv("REP_MIN_SIM_TO_CENTROID", "0.50"))
+REP_HIGH_SIM_THRESHOLD = float(os.getenv("REP_HIGH_SIM_THRESHOLD", "0.85"))  # Accept lower quality if similarity is excellent
 
 
 def _now_iso() -> str:
@@ -317,35 +318,54 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         high_quality_candidates.sort(key=lambda x: x[2], reverse=True)
         rep_face, rep_crop_key, rep_quality_score, rep_similarity = high_quality_candidates[0]
     else:
-        # Second pass: find best frame that passes quality gates (ignore similarity)
-        quality_only_candidates = [
+        # Second pass: prioritize high-similarity frames even if they fail quality gates
+        # If similarity is excellent (≥0.85), accept lower quality frames
+        high_sim_candidates = [
             (face, crop_path, quality_score, similarity)
             for face, crop_path, quality_score, similarity in candidates
-            if _passes_quality_gates(face, crop_path)
+            if similarity >= REP_HIGH_SIM_THRESHOLD
         ]
 
-        if quality_only_candidates:
-            quality_only_candidates.sort(key=lambda x: x[2], reverse=True)
-            rep_face, rep_crop_key, rep_quality_score, rep_similarity = quality_only_candidates[0]
-            low_confidence = True
+        if high_sim_candidates:
+            # Sort by similarity first, then quality
+            high_sim_candidates.sort(key=lambda x: (x[3], x[2]), reverse=True)
+            rep_face, rep_crop_key, rep_quality_score, rep_similarity = high_sim_candidates[0]
             LOGGER.info(
-                "Track %d: using quality-only rep with sim %.3f < %.3f",
+                "Track %d: using high-similarity rep (sim=%.3f, score=%.3f)",
                 track_id,
                 rep_similarity,
-                REP_MIN_SIM_TO_CENTROID,
+                rep_quality_score,
             )
         else:
-            # Final fallback: pick best available frame by quality score (no gates)
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            rep_face, rep_crop_key, rep_quality_score, rep_similarity = candidates[0]
-            low_confidence = True
-            rep_low_quality = True
-            LOGGER.warning(
-                "Track %d: using low-quality fallback rep (score=%.3f, sim=%.3f)",
-                track_id,
-                rep_quality_score,
-                rep_similarity,
-            )
+            # Third pass: find best frame that passes quality gates (ignore similarity)
+            quality_only_candidates = [
+                (face, crop_path, quality_score, similarity)
+                for face, crop_path, quality_score, similarity in candidates
+                if _passes_quality_gates(face, crop_path)
+            ]
+
+            if quality_only_candidates:
+                quality_only_candidates.sort(key=lambda x: x[2], reverse=True)
+                rep_face, rep_crop_key, rep_quality_score, rep_similarity = quality_only_candidates[0]
+                low_confidence = True
+                LOGGER.info(
+                    "Track %d: using quality-only rep with sim %.3f < %.3f",
+                    track_id,
+                    rep_similarity,
+                    REP_MIN_SIM_TO_CENTROID,
+                )
+            else:
+                # Final fallback: pick best available frame by quality score (no gates)
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                rep_face, rep_crop_key, rep_quality_score, rep_similarity = candidates[0]
+                low_confidence = True
+                rep_low_quality = True
+                LOGGER.warning(
+                    "Track %d: using low-quality fallback rep (score=%.3f, sim=%.3f)",
+                    track_id,
+                    rep_quality_score,
+                    rep_similarity,
+                )
 
     if not rep_face:
         LOGGER.warning(f"No representative found for track {track_id} in {ep_id}")

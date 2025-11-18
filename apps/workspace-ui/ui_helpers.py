@@ -166,6 +166,13 @@ def known_shows(include_session: bool = True) -> List[str]:
     for entry in s3_payload.get("shows", []):
         _remember(entry.get("show"))
 
+    try:
+        registry_payload = api_get("/shows")
+    except requests.RequestException:
+        registry_payload = {}
+    for entry in registry_payload.get("shows", []):
+        _remember(entry.get("show_id"))
+
     if include_session:
         for entry in st.session_state.get(_CUSTOM_SHOWS_SESSION_KEY, []):
             _remember(entry)

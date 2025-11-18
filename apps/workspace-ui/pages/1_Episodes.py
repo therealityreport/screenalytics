@@ -46,24 +46,33 @@ def _show_single_delete(ep_id: str) -> None:
         st.session_state["episodes_delete_target"] = ep_id
     target = st.session_state.get("episodes_delete_target")
     if target != ep_id:
-        st.caption("Removes the EpisodeStore entry plus local video/manifests/frames for this episode.")
+        st.caption("Removes the EpisodeStore entry, local video/manifests/frames/embeddings, and cleans up people cluster references.")
         return
     with st.container(border=True):
         st.warning(
-            f"You are about to delete `{ep_id}`. This removes the EpisodeStore record, manifests, frames/crops, and identities."
+            f"You are about to delete `{ep_id}`. This removes the EpisodeStore record, "
+            f"local data (video, manifests, frames/crops, embeddings, analytics), "
+            f"and cleans up orphaned people cluster references. "
+            f"S3 artifacts (frames/crops/manifests) will also be deleted."
         )
-        delete_s3 = st.checkbox("Also delete S3 artifacts (frames/crops/manifests)", value=False)
         cols = st.columns(2)
         with cols[0]:
             if st.button("Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"):
-                payload = {"include_s3": delete_s3}
+                payload = {"include_s3": True}
                 resp = _api_post_json(f"/episodes/{ep_id}/delete", payload)
                 if resp is not None:
                     deleted = resp.get("deleted", {})
-                    st.success(
-                        f"Deleted {ep_id}: local dirs removed={deleted.get('local_dirs', 0)}, "
-                        f"S3 objects deleted={deleted.get('s3_objects', 0)}."
-                    )
+                    people_cleanup = deleted.get("people_cleanup", {})
+                    msg_parts = [
+                        f"Deleted {ep_id}:",
+                        f"local dirs={deleted.get('local_dirs', 0)}",
+                        f"S3 objects={deleted.get('s3_objects', 0)}",
+                    ]
+                    if people_cleanup.get("clusters_removed", 0) > 0:
+                        msg_parts.append(
+                            f"people clusters cleaned={people_cleanup.get('clusters_removed', 0)}"
+                        )
+                    st.success(" · ".join(msg_parts))
                     _reset_delete_state()
                     st.rerun()
         with cols[1]:

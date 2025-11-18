@@ -260,7 +260,7 @@ jobs_running = _render_job_sections()
 
 
 def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4") -> None:
-    """Upload file to S3 using boto3 to avoid SSL issues with presigned URLs.
+    """Upload file to S3 using boto3 with progress tracking.
 
     Args:
         bucket: S3 bucket name
@@ -268,14 +268,43 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
         file_obj: File-like object supporting read()
         content_type: MIME type for the uploaded file (default: video/mp4)
     """
-    # Use boto3 for reliable uploads without SSL issues
+    # Get file size for progress tracking
+    file_obj.seek(0, 2)  # Seek to end
+    file_size = file_obj.tell()
+    file_obj.seek(0)  # Reset to beginning
+    
+    # Create progress bar and status
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text(f"Uploading to S3: 0 MB / {file_size / (1024**2):.1f} MB (0%)")
+    
+    # Track upload progress
+    uploaded_bytes = [0]  # Use list to allow mutation in callback
+    
+    def upload_callback(bytes_amount):
+        uploaded_bytes[0] += bytes_amount
+        progress = uploaded_bytes[0] / file_size
+        progress_bar.progress(min(progress, 1.0))
+        mb_uploaded = uploaded_bytes[0] / (1024**2)
+        mb_total = file_size / (1024**2)
+        status_text.text(f"Uploading to S3: {mb_uploaded:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)")
+    
+    # Use boto3 for reliable uploads with progress tracking
     s3_client = boto3.client('s3', region_name='us-east-1')
     s3_client.upload_fileobj(
         file_obj,
         bucket,
         key,
-        ExtraArgs={'ContentType': content_type}
+        ExtraArgs={'ContentType': content_type},
+        Callback=upload_callback
     )
+    
+    # Complete the progress bar
+    progress_bar.progress(1.0)
+    status_text.text(f"✅ Upload complete: {file_size / (1024**2):.1f} MB")
+    time.sleep(0.5)  # Brief pause to show completion
+    progress_bar.empty()
+    status_text.empty()
 
 
 def _mirror_local(ep_id: str, file_obj, local_path: str, chunk_size: int = 8 * 1024 * 1024) -> Path | None:

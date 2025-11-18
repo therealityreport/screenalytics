@@ -432,5 +432,60 @@ class PeopleService:
 
         return updated
 
+    def remove_episode_clusters(self, show_id: str, ep_id: str) -> Dict[str, Any]:
+        """Remove all cluster_ids for a specific episode from all people.
+
+        Called during episode deletion to clean up orphaned cluster references.
+        Cluster IDs are formatted as {ep_id}:{cluster_id}, so we filter by prefix.
+
+        Returns a summary of the cleanup operation.
+        """
+        data = self._load_people(show_id)
+        people = data.get("people", [])
+
+        cluster_prefix = f"{ep_id}:"
+        modified_count = 0
+        removed_cluster_count = 0
+        empty_people_removed = 0
+
+        # Clean cluster_ids from each person
+        cleaned_people = []
+        for person in people:
+            original_clusters = person.get("cluster_ids") or []
+            # Filter out clusters belonging to the deleted episode
+            cleaned_clusters = [
+                cid for cid in original_clusters
+                if not str(cid).startswith(cluster_prefix)
+            ]
+
+            removed_count = len(original_clusters) - len(cleaned_clusters)
+            if removed_count > 0:
+                modified_count += 1
+                removed_cluster_count += removed_count
+
+            # Keep person if they have remaining clusters, cast_id, or manual name
+            has_clusters = len(cleaned_clusters) > 0
+            has_cast_id = bool(person.get("cast_id"))
+            has_manual_name = bool(person.get("name"))
+
+            if has_clusters or has_cast_id or has_manual_name:
+                person["cluster_ids"] = cleaned_clusters
+                cleaned_people.append(person)
+            else:
+                # Auto-generated person with no clusters left - can be removed
+                empty_people_removed += 1
+
+        # Save cleaned data
+        data["people"] = cleaned_people
+        self._save_people(show_id, data)
+
+        return {
+            "show_id": show_id,
+            "ep_id": ep_id,
+            "people_modified": modified_count,
+            "clusters_removed": removed_cluster_count,
+            "empty_people_removed": empty_people_removed,
+        }
+
 
 __all__ = ["PeopleService", "l2_normalize", "cosine_distance"]

@@ -183,6 +183,38 @@ def _warn_if_simulated(payload: Dict[str, Any] | None) -> None:
         st.warning(message)
 
 
+# Show creation form
+with st.expander("➕ Add New Show", expanded=False):
+    st.caption("Create a show slug before adding cast members. Use lowercase letters/numbers/dashes (e.g., rhobh).")
+    with st.form("cast_new_show_form"):
+        new_show_id = st.text_input("Show slug*", key="cast_new_show_slug", placeholder="e.g., rhobh")
+        new_show_title = st.text_input("Display name", key="cast_new_show_title", placeholder="e.g., RHOBH")
+        new_show_full_name = st.text_input("Full name", key="cast_new_show_full_name", placeholder="e.g., The Real Housewives of Beverly Hills")
+        new_show_imdb = st.text_input("IMDb Series ID", key="cast_new_show_imdb", placeholder="e.g., tt1720601")
+        create_show = st.form_submit_button("Create show", type="primary")
+
+        if create_show:
+            slug = (new_show_id or "").strip()
+            title = (new_show_title or "").strip()
+            full_name = (new_show_full_name or "").strip()
+            imdb_series_id = (new_show_imdb or "").strip()
+            if not slug:
+                st.error("Show slug is required")
+            else:
+                payload = {
+                    "show_id": slug,
+                    "title": title or None,
+                    "full_name": full_name or None,
+                    "imdb_series_id": imdb_series_id or None,
+                }
+                result = _api_post("/shows", payload)
+                if result:
+                    show_slug = result.get("show_id", slug)
+                    helpers.remember_custom_show(show_slug)
+                    st.success(f"Registered show {show_slug}")
+                    st.session_state["cast_show_select"] = show_slug
+                    st.rerun()
+
 # Show and season filters
 st.subheader("Filters")
 show_options = helpers.known_shows()

@@ -80,6 +80,53 @@ def test_cast_crud(tmp_path, monkeypatch):
     assert resp.status_code == 404
 
 
+def test_cast_list_include_featured_thumbnail(tmp_path, monkeypatch):
+    """Ensure include_featured returns featured thumbnail URLs."""
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    client = TestClient(app)
+    show_id = "rhobh"
+
+    # Create a cast member
+    payload = {
+        "name": "Brandi Glanville",
+        "role": "main",
+        "status": "active",
+    }
+    resp = client.post(f"/shows/{show_id}/cast", json=payload)
+    assert resp.status_code == 200
+    cast_id = resp.json()["cast_id"]
+
+    # Create facebank payload with a featured seed
+    facebank_dir = data_root / "facebank" / show_id / cast_id
+    facebank_dir.mkdir(parents=True, exist_ok=True)
+    featured_seed_id = "seed-123"
+    facebank_payload = {
+        "show_id": show_id,
+        "cast_id": cast_id,
+        "seeds": [
+            {
+                "fb_id": featured_seed_id,
+                "display_uri": "local/thumbs/featured.png",
+                "image_uri": "local/thumbs/featured.png",
+            }
+        ],
+        "exemplars": [],
+        "featured_seed_id": featured_seed_id,
+        "updated_at": "2024-01-01T00:00:00Z",
+    }
+    (facebank_dir / "facebank.json").write_text(json.dumps(facebank_payload))
+
+    resp = client.get(f"/shows/{show_id}/cast", params={"include_featured": "1"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["count"] == 1
+    entry = data["cast"][0]
+    assert entry["featured_thumbnail_url"] == "local/thumbs/featured.png"
+
+
 def test_cast_bulk_import(tmp_path, monkeypatch):
     """Test bulk import with merge by name."""
     data_root = tmp_path / "data"
@@ -215,3 +262,48 @@ def test_cast_season_filter(tmp_path, monkeypatch):
     data = resp.json()
     assert data["count"] == 1
     assert data["cast"][0]["name"] == "Erika Jayne"
+
+
+def test_show_registry(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    client = TestClient(app)
+
+    resp = client.post(
+        "/shows",
+        json={
+            "show_id": "newshow",
+            "title": "RHOBH",
+            "full_name": "The Real Housewives of Beverly Hills",
+            "imdb_series_id": "tt1720601",
+        },
+    )
+    assert resp.status_code == 200
+    created = resp.json()
+    assert created["show_id"] == "newshow"
+    assert created["title"] == "RHOBH"
+    assert created["full_name"] == "The Real Housewives of Beverly Hills"
+    assert created["imdb_series_id"] == "tt1720601"
+    assert created["created"] is True
+    assert created["cast_count"] == 0
+
+    resp = client.get("/shows")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["count"] == 1
+    assert payload["shows"][0]["show_id"] == "newshow"
+    assert payload["shows"][0]["full_name"] == "The Real Housewives of Beverly Hills"
+    assert payload["shows"][0]["imdb_series_id"] == "tt1720601"
+
+    resp = client.post(
+        "/shows",
+        json={"show_id": "newshow", "title": "Updated", "imdb_series_id": "tt9999999"},
+    )
+    assert resp.status_code == 200
+    updated = resp.json()
+    assert updated["created"] is False
+    assert updated["title"] == "Updated"
+    assert updated["full_name"] == "The Real Housewives of Beverly Hills"
+    assert updated["imdb_series_id"] == "tt9999999"

@@ -35,6 +35,27 @@ from py_screenalytics.artifacts import ensure_dirs, get_path
 from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
 from tools.debug_thumbs import init_debug_logger, debug_thumbs_enabled, NullLogger, JsonlLogger
 
+
+def _load_tracking_config_yaml() -> dict[str, Any]:
+    """Load tracking configuration from YAML file if available."""
+    config_path = REPO_ROOT / "config" / "pipeline" / "tracking.yaml"
+    if not config_path.exists():
+        LOGGER.debug("Tracking config YAML not found at %s, using defaults", config_path)
+        return {}
+    
+    try:
+        import yaml
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        if config:
+            LOGGER.info("Loaded tracking config from %s", config_path)
+            return config
+    except Exception as exc:
+        LOGGER.warning("Failed to load tracking config YAML: %s", exc)
+    
+    return {}
+
+
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
@@ -128,30 +149,48 @@ DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt"
 DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
 RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
+# Strict tracking defaults (matching config/pipeline/tracking.yaml)
 GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.75"))
 GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.82"))
 GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1)
-GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.40"))
+GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.50"))  # Increased to prevent spatial jumps
 GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
-GATE_EMB_EVERY_DEFAULT = max(int(os.environ.get("TRACK_GATE_EMB_EVERY", "5")), 0)
+GATE_EMB_EVERY_DEFAULT = max(int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0)  # Reduced from 5 to 10 for better thermal performance
+# ByteTrack spatial matching - strict defaults
 TRACK_BUFFER_BASE_DEFAULT = max(
-    _env_int("SCREENALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 30)),
+    _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
     1,
 )
-BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.75)
+BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.85)
 TRACK_HIGH_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_TRACK_HIGH_THRESH",
-    _env_float("BYTE_TRACK_HIGH_THRESH", 0.5),
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.65),
 )
 TRACK_NEW_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_NEW_TRACK_THRESH",
-    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.5),
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.65),
 )
 TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
-DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
+DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75"))  # Increased to prevent multiple people in same cluster
+
+# Load and apply YAML config overrides if available (only if env vars not set)
+_YAML_CONFIG = _load_tracking_config_yaml()
+if _YAML_CONFIG and "BYTE_TRACK_BUFFER" not in os.environ and "SCREANALYTICS_TRACK_BUFFER" not in os.environ:
+    if "track_buffer" in _YAML_CONFIG:
+        TRACK_BUFFER_BASE_DEFAULT = max(int(_YAML_CONFIG["track_buffer"]), 1)
+        LOGGER.info("Applied track_buffer=%s from YAML config", TRACK_BUFFER_BASE_DEFAULT)
+if _YAML_CONFIG and "BYTE_TRACK_MATCH_THRESH" not in os.environ:
+    if "match_thresh" in _YAML_CONFIG:
+        BYTE_TRACK_MATCH_THRESH_DEFAULT = float(_YAML_CONFIG["match_thresh"])
+        LOGGER.info("Applied match_thresh=%.2f from YAML config", BYTE_TRACK_MATCH_THRESH_DEFAULT)
+if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTICS_TRACK_HIGH_THRESH" not in os.environ:
+    if "track_thresh" in _YAML_CONFIG:
+        TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
+        TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
+        LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
 MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
@@ -1199,7 +1238,7 @@ def _prepare_face_crop(
     image,
     bbox: list[float],
     landmarks: list[float] | None,
-    margin: float = 0.15,
+    margin: float = 0.20,
     *,
     align: bool = True,
     detector_mode: str = "retinaface",
@@ -4072,16 +4111,6 @@ def _run_faces_embed_stage(
                 continue
 
             crop, crop_err = _prepare_face_crop(image, validated_bbox, landmarks)
-            if image is not None:
-                thumb_rel_path, _ = thumb_writer.write(
-                    image,
-                    validated_bbox,
-                    track_id,
-                    frame_idx,
-                    prepared_crop=crop,
-                )
-                if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
-                    thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
             if crop is None:
                 rows.append(
                     _make_skip_face_row(
@@ -4094,8 +4123,8 @@ def _run_faces_embed_stage(
                         crop_err or "crop_failed",
                         crop_rel_path=crop_rel_path,
                         crop_s3_key=crop_s3_key,
-                        thumb_rel_path=thumb_rel_path,
-                        thumb_s3_key=thumb_s3_key,
+                        thumb_rel_path=None,
+                        thumb_s3_key=None,
                     )
                 )
                 faces_done = min(faces_total, faces_done + 1)
@@ -4136,8 +4165,8 @@ def _run_faces_embed_stage(
                         reason,
                         crop_rel_path=crop_rel_path,
                         crop_s3_key=crop_s3_key,
-                        thumb_rel_path=thumb_rel_path,
-                        thumb_s3_key=thumb_s3_key,
+                        thumb_rel_path=None,
+                        thumb_s3_key=None,
                     )
                 )
                 faces_done = min(faces_total, faces_done + 1)
@@ -4151,6 +4180,18 @@ def _run_faces_embed_stage(
                     extra=_phase_meta(),
                 )
                 continue
+
+            # Quality checks passed - now create thumbnail for this valid face
+            if image is not None:
+                thumb_rel_path, _ = thumb_writer.write(
+                    image,
+                    validated_bbox,
+                    track_id,
+                    frame_idx,
+                    prepared_crop=crop,
+                )
+                if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
+                    thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
 
             # TODO(perf): Batch embeddings per frame by grouping samples and calling
             # embedder.encode() once with all crops from same frame. Currently we call

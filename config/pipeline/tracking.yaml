@@ -3,12 +3,12 @@
 
 # ByteTrack spatial matching
 track_thresh: 0.65      # Min confidence to track (was 0.5) - filters low-quality detections
-match_thresh: 0.85      # IoU threshold for bbox matching (was 0.8) - tighter spatial matching
-track_buffer: 15        # Frames to keep track alive (was 30) - reduces incorrect associations
+match_thresh: 0.90      # IoU threshold for bbox matching (was 0.85) - prevents track jumping
+track_buffer: 25        # Frames to keep track alive (was 15) - reduces track fragmentation
 
 # Appearance gate thresholds set via environment variables in episode_run.py:
 # - TRACK_GATE_APPEAR_HARD: default 0.75 (was 0.60) - hard split if similarity < 75%
 # - TRACK_GATE_APPEAR_SOFT: default 0.82 (was 0.70) - soft split if similarity < 82%
 # - TRACK_GATE_APPEAR_STREAK: default 2 - consecutive low-sim frames before split
-# - TRACK_GATE_IOU: default 0.40 (was 0.35) - split if spatial jump (IoU < 40%)
-# - TRACK_GATE_EMB_EVERY: default 5 - extract embeddings every 5 frames
+# - TRACK_GATE_IOU: default 0.50 (was 0.40) - split if spatial jump (IoU < 50%)
+# - TRACK_GATE_EMB_EVERY: default 10 - extract embeddings every 10 frames (reduced from 5 for thermal performance)
