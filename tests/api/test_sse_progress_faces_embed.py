@@ -28,7 +28,7 @@ def test_sse_faces_embed_done_and_close(tmp_path, monkeypatch) -> None:
         for payload in events_to_emit:
             yield f"data: {json.dumps(payload)}\n\n"
 
-    def _fake_run(command, request):
+    def _fake_run(command, request, progress_file=None):
         return StreamingResponse(_fake_event_stream(), media_type="text/event-stream")
 
     monkeypatch.setattr("apps.api.routers.jobs._run_job_with_optional_sse", _fake_run)

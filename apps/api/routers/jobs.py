@@ -370,10 +370,10 @@ def _wants_sse(request: Request) -> bool:
     return "text/event-stream" in accept
 
 
-def _run_job_with_optional_sse(command: List[str], request: Request):
+def _run_job_with_optional_sse(command: List[str], request: Request, progress_file: Path | None = None):
     env = os.environ.copy()
     if _wants_sse(request):
-        generator = _stream_progress_command(command, env, request)
+        generator = _stream_progress_command(command, env, request, progress_file=progress_file)
         return StreamingResponse(generator, media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
     completed = subprocess.run(
         command,
@@ -394,7 +394,9 @@ def _run_job_with_optional_sse(command: List[str], request: Request):
     return completed
 
 
-async def _stream_progress_command(command: List[str], env: dict, request: Request):
+async def _stream_progress_command(
+    command: List[str], env: dict, request: Request, *, progress_file: Path | None = None
+):
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(PROJECT_ROOT),
@@ -403,6 +405,7 @@ async def _stream_progress_command(command: List[str], env: dict, request: Reque
         env=env,
     )
     saw_terminal = False
+    last_payload: dict[str, Any] | None = None
     last_run_id: str | None = None
     stdout_task: asyncio.Task | None = None
     stderr_task: asyncio.Task | None = None
@@ -433,6 +436,7 @@ async def _stream_progress_command(command: List[str], env: dict, request: Reque
                                 log_payload["run_id"] = last_run_id
                             yield _format_sse("log", log_payload)
                         else:
+                            last_payload = payload
                             run_id_value = payload.get("run_id")
                             if isinstance(run_id_value, str):
                                 last_run_id = run_id_value
@@ -484,6 +488,21 @@ async def _stream_progress_command(command: List[str], env: dict, request: Reque
                 "return_code": proc.returncode,
             }
             yield _format_sse("error", payload)
+        elif proc.returncode in (0, None) and not saw_terminal:
+            synthesized: dict[str, Any] | None = None
+            if last_payload and isinstance(last_payload.get("summary"), dict):
+                synthesized = dict(last_payload)
+            elif progress_file and progress_file.exists():
+                try:
+                    file_payload = json.loads(progress_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    file_payload = None
+                if isinstance(file_payload, dict):
+                    synthesized = file_payload
+            if synthesized is None:
+                synthesized = {}
+            synthesized["phase"] = "done"
+            yield _format_sse("done", synthesized)
     finally:
         for task in (stdout_task, stderr_task):
             if task:
@@ -574,7 +593,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         req.scene_min_len,
         req.scene_warmup_dets,
     )
-    result = _run_job_with_optional_sse(command, request)
+    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
     if isinstance(result, StreamingResponse):
         return result
 
@@ -609,7 +628,7 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     progress_path = _progress_file_path(req.ep_id)
     command = _build_faces_command(req, progress_path)
-    result = _run_job_with_optional_sse(command, request)
+    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
     if isinstance(result, StreamingResponse):
         return result
 
@@ -640,7 +659,7 @@ async def run_cluster(req: ClusterRequest, request: Request):
         raise HTTPException(status_code=400, detail="faces.jsonl not found; run faces_embed first")
     progress_path = _progress_file_path(req.ep_id)
     command = _build_cluster_command(req, progress_path)
-    result = _run_job_with_optional_sse(command, request)
+    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
     if isinstance(result, StreamingResponse):
         return result
 
