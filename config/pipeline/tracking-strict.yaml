@@ -1,0 +1,13 @@
+# Strict tracking configuration for accurate single-person tracks
+# Use with: python tools/episode_run.py --config config/pipeline/tracking-strict.yaml
+
+# ByteTrack spatial matching
+track_thresh: 0.65      # Higher min confidence (was 0.5) - filters low-quality detections
+match_thresh: 0.85      # Higher IoU required for matching (was 0.8) - more precise spatial matching
+track_buffer: 15        # Shorter persistence (was 30) - reduces incorrect associations
+
+# Appearance gate thresholds (set via env vars, documented here)
+# TRACK_GATE_APPEAR_HARD=0.75   # Hard split threshold (was 0.60) - more aggressive
+# TRACK_GATE_APPEAR_SOFT=0.82   # Soft split threshold (was 0.70) - more aggressive
+# TRACK_GATE_APPEAR_STREAK=2    # Consecutive low-sim frames (was 2) - unchanged
+# TRACK_GATE_IOU=0.40           # Spatial continuity (was 0.35) - require tighter spatial continuity
