@@ -1103,15 +1103,31 @@ def _prepare_face_crop(
 
     x1, y1, x2, y2 = bbox
 
-    # Validate bbox coordinates before computing dimensions
+    # Validate and convert bbox coordinates to floats
+    try:
+        x1 = float(x1) if x1 is not None else None
+        y1 = float(y1) if y1 is not None else None
+        x2 = float(x2) if x2 is not None else None
+        y2 = float(y2) if y2 is not None else None
+    except (TypeError, ValueError) as e:
+        return None, f"invalid_bbox_type_{e}"
+
+    # Check for None values after conversion attempt
     if x1 is None or y1 is None or x2 is None or y2 is None:
         return None, f"invalid_bbox_none_values_{x1}_{y1}_{x2}_{y2}"
 
+    # Compute dimensions
     try:
-        width = max(float(x2) - float(x1), 1.0)
-        height = max(float(y2) - float(y1), 1.0)
+        width = max(x2 - x1, 1.0)
+        height = max(y2 - y1, 1.0)
     except (TypeError, ValueError) as e:
         return None, f"invalid_bbox_coordinates_{e}"
+
+    # Validate margin factor to prevent None multiplication errors
+    try:
+        margin = max(float(margin), 0.0)
+    except (TypeError, ValueError):
+        margin = 0.15  # Default fallback
 
     # Adaptive margin: smaller faces get more margin to capture context
     # Larger faces get less margin to avoid over-cropping
