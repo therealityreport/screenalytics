@@ -3023,6 +3023,18 @@ def _run_full_pipeline(
                 ok, frame = cap.read()
                 if not ok:
                     break
+
+                # Guard against empty/None frames before detection
+                if frame is None or frame.size == 0:
+                    LOGGER.warning(
+                        "Skipping frame %d for %s: empty or None frame from video capture",
+                        frame_idx,
+                        args.ep_id,
+                    )
+                    frame_idx += 1
+                    frames_since_cut += 1
+                    continue
+
                 if next_cut is not None and frame_idx >= next_cut:
                     reset_tracker = getattr(tracker_adapter, "reset", None)
                     if callable(reset_tracker):
@@ -3213,6 +3225,9 @@ def _run_full_pipeline(
                     quarantine_stage = "gate_and_crop"
 
                     diag_stats = _diagnostic_stats(len(validated_detections), len(tracked_objects))
+                    # Preserve skipped_none_multiply counter from previous iterations
+                    if last_diag_stats and "skipped_none_multiply" in last_diag_stats:
+                        diag_stats["skipped_none_multiply"] = last_diag_stats["skipped_none_multiply"]
                     last_diag_stats = diag_stats
                     if progress:
                         detect_extra = dict(detect_meta)
@@ -3427,13 +3442,14 @@ def _run_full_pipeline(
                             "tracks_count": len(quarantine_tracks),
                         }
 
-                        # Log detailed quarantine information
+                        # Log detailed quarantine information with full traceback
                         LOGGER.error(
                             "[QUARANTINE] ❌ NoneType multiply at frame %d (stage=%s) for %s: %s",
                             frame_idx,
                             quarantine_stage,
                             args.ep_id,
                             msg,
+                            exc_info=True,
                         )
 
                         # Log detection bboxes that were in play
@@ -3477,8 +3493,8 @@ def _run_full_pipeline(
                                 for tid, bbox, conf in quarantine_tracks[:5]
                             ]
 
-                        # Log full traceback
-                        LOGGER.error("[QUARANTINE] Full traceback:\n%s", tb_str)
+                        # Traceback already logged via exc_info=True above, but also log formatted version
+                        LOGGER.error("[QUARANTINE] Formatted traceback:\n%s", tb_str)
 
                         # Track crop errors for diagnostics
                         if last_diag_stats is None:
@@ -3503,6 +3519,17 @@ def _run_full_pipeline(
                                 force=True,
                                 extra=quarantine_extra,
                             )
+
+                        # Reset tracker state to clear corrupted state (similar to scene-cut reset)
+                        LOGGER.warning(
+                            "[QUARANTINE] Resetting tracker and appearance gate state at frame %d to clear corrupted state",
+                            frame_idx,
+                        )
+                        reset_tracker = getattr(tracker_adapter, "reset", None)
+                        if callable(reset_tracker):
+                            reset_tracker()
+                        if appearance_gate:
+                            appearance_gate.reset_all()
 
                         frame_idx += 1
                         frames_since_cut += 1
