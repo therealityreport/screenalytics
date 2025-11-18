@@ -241,7 +241,7 @@ def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | 
     return {"job": job_resp, "payload": payload}
 
 
-cfg = helpers.init_page("Screenalytics Upload")
+cfg = helpers.init_page("Screenalytics Upload", skip_episode_selector=True)
 st.title("Upload & Run")
 
 # Handle deferred navigation after state flush

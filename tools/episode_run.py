@@ -2523,8 +2523,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--stride",
         type=int,
-        default=1,
-        help="Frame stride for detection (default: 1 = every frame)",
+        default=4,
+        help="Frame stride for detection (default: 4)",
     )
     parser.add_argument(
         "--fps",
@@ -2618,14 +2618,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-samples-per-track",
         type=int,
-        default=16,
-        help="Maximum samples per track for embedding/export (default: 16)",
+        default=12,
+        help="Maximum samples per track for embedding/export (default: 12)",
     )
     parser.add_argument(
         "--min-samples-per-track",
         type=int,
-        default=4,
-        help="Minimum samples per track if track is long enough (default: 4)",
+        default=6,
+        help="Minimum samples per track if track is long enough (default: 6)",
     )
     parser.add_argument(
         "--sample-every-n-frames",
@@ -4111,9 +4111,9 @@ def _run_faces_embed_stage(
     samples = _load_track_samples(
         track_path,
         sort_by_frame=True,
-        max_samples_per_track=getattr(args, "max_samples_per_track", 16),
-        min_samples_per_track=getattr(args, "min_samples_per_track", 4),
-        sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
+        max_samples_per_track=getattr(args, "max_samples_per_track", 12),
+        min_samples_per_track=getattr(args, "min_samples_per_track", 6),
+        sample_every_n_frames=getattr(args, "sample_every_n_frames", 8),
     )
     if not samples:
         raise RuntimeError("No track samples available for faces embedding")
@@ -5166,11 +5166,11 @@ def _load_track_samples(
     """
     # Default sampling parameters
     if max_samples_per_track is None:
-        max_samples_per_track = 16
+        max_samples_per_track = 12
     if min_samples_per_track is None:
-        min_samples_per_track = 4
+        min_samples_per_track = 6
     if sample_every_n_frames is None:
-        sample_every_n_frames = 4
+        sample_every_n_frames = 8
 
     # Group samples by track_id first
     tracks_samples: Dict[int, List[Dict[str, Any]]] = {}

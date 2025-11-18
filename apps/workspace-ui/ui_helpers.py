@@ -259,7 +259,7 @@ def _api_base() -> str:
     return base
 
 
-def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
+def init_page(title: str = DEFAULT_TITLE, skip_episode_selector: bool = False) -> Dict[str, str]:
     st.set_page_config(page_title=title, layout="wide")
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
     st.session_state.setdefault("api_base", api_base)
@@ -299,9 +299,10 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
 
-    # Render global episode selector in sidebar
-    sidebar.divider()
-    render_sidebar_episode_selector()
+    # Render locked episode selector in sidebar (skip only for Upload Video)
+    if not skip_episode_selector:
+        sidebar.divider()
+        render_sidebar_episode_selector()
 
     return {
         "api_base": api_base,
@@ -333,104 +334,135 @@ def get_ep_id() -> str:
 
 
 def render_sidebar_episode_selector() -> str | None:
-    """Render a global episode selector in the sidebar.
+    """Render locked episode selector with unlock mechanism in sidebar.
 
     Returns the selected ep_id, or None if no episodes exist.
 
     Behavior:
-    - Defaults to most recently uploaded episode when no ep_id is set
-    - Persists selection in st.session_state across page changes
-    - Falls back to newest episode if previously selected ep_id no longer exists
+    - Shows locked episode by default with unlock button
+    - When unlocked, shows full selector with tracked episodes and S3 browser
+    - Episode only changes when explicitly confirmed via Load button
     """
-    try:
-        episodes_payload = api_get("/episodes")
-    except requests.RequestException:
-        st.sidebar.info("API unavailable")
-        return None
+    st.sidebar.markdown("### Episode")
 
-    episodes = episodes_payload.get("episodes", [])
+    current = st.session_state.get("ep_id", "")
 
-    if not episodes:
-        st.sidebar.info("No episodes yet — upload one to get started.")
-        return None
+    # Check if selector is locked (default is locked)
+    is_locked = not st.session_state.get("episode_selector_unlocked", False)
 
-    # Sort by created_at descending (most recent first)
-    # Fallback to ep_id sorting if created_at is missing
-    def sort_key(ep: Dict[str, Any]) -> tuple:
-        created_at = ep.get("created_at", "")
-        return (created_at, ep.get("ep_id", ""))
+    if current and is_locked:
+        # Show locked state - just display current episode
+        ep_meta = parse_ep_id(current) or {}
+        show = ep_meta.get("show", "").upper()
+        season = ep_meta.get("season", 0)
+        episode = ep_meta.get("episode", 0)
+        display_text = f"{show} S{season:02d}E{episode:02d}" if show and season and episode else current
 
-    episodes = sorted(episodes, key=sort_key, reverse=True)
+        st.sidebar.info(f"🔒 **{display_text}**")
 
-    # Determine current ep_id
-    current_ep_id = st.session_state.get("ep_id", "")
-    ep_ids = [ep["ep_id"] for ep in episodes]
+        if st.sidebar.button(
+            "🔓 Change Episode",
+            key="unlock_episode_selector",
+            use_container_width=True,
+        ):
+            st.session_state["episode_selector_unlocked"] = True
+            st.rerun()
 
-    # If current ep_id doesn't exist in list, fallback to most recent
-    if current_ep_id and current_ep_id not in ep_ids:
-        current_ep_id = ep_ids[0]  # Most recent episode
-    elif not current_ep_id:
-        current_ep_id = ep_ids[0]  # Default to most recent
+        return current
 
-    # Build labels for selectbox
-    def format_label(ep: Dict[str, Any]) -> str:
-        ep_id = ep["ep_id"]
-        parsed = parse_ep_id(ep_id)
-        if parsed:
-            show = parsed["show"].upper()
-            season = parsed["season"]
-            episode = parsed["episode"]
-            return f"{show} S{season:02d}E{episode:02d}"
-        return ep_id
+    # Show unlocked state - full selector
+    st.session_state["episode_selector_unlocked"] = True
 
-    labels = {ep["ep_id"]: format_label(ep) for ep in episodes}
+    tracked_tab, s3_tab = st.sidebar.tabs(["Tracked", "Browse S3"])
 
-    # Determine index for selectbox
-    try:
-        current_index = ep_ids.index(current_ep_id)
-    except ValueError:
-        current_index = 0
-
-    # Render selectbox in sidebar
-    selected_ep_id = st.sidebar.selectbox(
-        "Episode",
-        options=ep_ids,
-        format_func=lambda eid: labels.get(eid, eid),
-        index=current_index,
-        key="global_episode_selector",
-    )
-
-    # Update session state if selection changed
-    if selected_ep_id != current_ep_id:
-        set_ep_id(selected_ep_id, rerun=False)
-
-    # Cache clear button
-    st.sidebar.divider()
-    if st.sidebar.button("🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"):
-        import shutil
-        from pathlib import Path
-
+    with tracked_tab:
         try:
-            # Get the project root (3 levels up from ui_helpers.py)
-            project_root = Path(__file__).resolve().parents[2]
+            episodes_payload = api_get("/episodes")
+        except Exception:
+            st.sidebar.info("API unavailable")
+            return current
+            
+        options = episodes_payload.get("episodes", []) if episodes_payload else []
+        if options:
+            ep_ids = [item["ep_id"] for item in options]
+            default_idx = ep_ids.index(current) if current in ep_ids else 0
 
-            # Clear __pycache__ directories
-            pycache_count = 0
-            for pycache_dir in project_root.rglob("__pycache__"):
-                shutil.rmtree(pycache_dir, ignore_errors=True)
-                pycache_count += 1
+            selection = st.sidebar.selectbox(
+                "Select episode",
+                ep_ids,
+                format_func=lambda eid: f"{eid} ({options[ep_ids.index(eid)]['show_slug']})",
+                index=default_idx if ep_ids else 0,
+                key="global_tracked_select",
+            )
 
-            # Clear .pyc files
-            pyc_count = 0
-            for pyc_file in project_root.rglob("*.pyc"):
-                pyc_file.unlink(missing_ok=True)
-                pyc_count += 1
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                if col1.button(
+                    "✓ Load",
+                    key="global_load_tracked",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    st.session_state["episode_selector_unlocked"] = False
+                    set_ep_id(selection)
+            with col2:
+                if col2.button(
+                    "✗ Cancel",
+                    key="cancel_episode_change",
+                    use_container_width=True,
+                ):
+                    st.session_state["episode_selector_unlocked"] = False
+                    st.rerun()
+        else:
+            st.sidebar.info("No tracked episodes yet.")
 
-            st.sidebar.success(f"✅ Cleared {pycache_count} cache dirs, {pyc_count} .pyc files")
-        except Exception as exc:
-            st.sidebar.error(f"Cache clear failed: {exc}")
+    with s3_tab:
+        try:
+            s3_payload = api_get("/episodes/s3_videos")
+        except Exception:
+            st.sidebar.info("API unavailable")
+            return current
+            
+        items = s3_payload.get("items", []) if s3_payload else []
+        if items:
+            labels = [f"{item['ep_id']} · {item.get('last_modified') or 'unknown'}" for item in items]
+            idx = st.sidebar.selectbox(
+                "S3 videos",
+                list(range(len(items))),
+                format_func=lambda i: labels[i],
+                key="global_s3_select",
+            )
+            selected_item = items[idx]
+            if st.sidebar.button("Create & Load", key="global_track_s3", use_container_width=True):
+                st.session_state["episode_selector_unlocked"] = False
+                # Track episode from S3
+                ep_id = str(selected_item.get("ep_id", "")).lower()
+                ep_meta_s3 = parse_ep_id(ep_id) or {}
+                show_slug = selected_item.get("show") or ep_meta_s3.get("show")
+                season = selected_item.get("season") or ep_meta_s3.get("season")
+                episode = selected_item.get("episode") or ep_meta_s3.get("episode")
+                
+                if ep_id and show_slug and season is not None and episode is not None:
+                    payload = {
+                        "ep_id": ep_id,
+                        "show_slug": str(show_slug),
+                        "season": int(season),
+                        "episode": int(episode),
+                    }
+                    try:
+                        resp = api_post("/episodes/upsert_by_id", payload)
+                        set_ep_id(resp["ep_id"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.sidebar.error(f"Failed to track episode: {exc}")
+        else:
+            st.sidebar.info("No S3 videos exposed by the API.")
 
-    return selected_ep_id
+    if not current:
+        st.sidebar.warning("Choose an episode to continue.")
+        
+    return current
+
 
 
 def api_get(path: str, **kwargs) -> Dict[str, Any]:

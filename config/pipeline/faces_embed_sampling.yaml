@@ -4,14 +4,14 @@
 
 detect_track_presets:
   bravo_24fps_default:
-    # Detection/tracking runs on EVERY frame (stride=1)
-    detector_frame_stride: 1
+    # Detection/tracking runs every 4 frames (stride=4)
+    detector_frame_stride: 4
 
     # Per-track sampling for embedding/export
     faces_embed_sampling:
-      max_samples_per_track: 16  # Hard cap per track
-      min_samples_per_track: 4   # Minimum if track is long enough
-      sample_every_n_frames: 4   # Fallback interval for uniform sampling
+      max_samples_per_track: 12  # Hard cap per track
+      min_samples_per_track: 6   # Minimum if track is long enough
+      sample_every_n_frames: 8   # Fallback interval for uniform sampling
 
       # Export controls
       save_frames: false          # Don't export full frames by default

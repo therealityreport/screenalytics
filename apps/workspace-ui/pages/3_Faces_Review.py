@@ -226,6 +226,22 @@ def _roster_cache() -> Dict[str, List[str]]:
     return st.session_state.setdefault("show_roster_names", {})
 
 
+def _people_cache() -> Dict[str, List[Dict[str, Any]]]:
+    return st.session_state.setdefault("show_people_cache", {})
+
+
+def _clusters_summary_cache() -> Dict[str, Dict[str, Dict[str, Any] | None]]:
+    return st.session_state.setdefault("person_clusters_summary", {})
+
+
+def _unassigned_suggestions_cache() -> Dict[str, Dict[str, Any]]:
+    return st.session_state.setdefault("unassigned_cluster_suggestions", {})
+
+
+def _track_media_errors() -> Dict[tuple[str, int], str]:
+    return st.session_state.setdefault("track_media_errors", {})
+
+
 def _fetch_roster_names(show: str | None) -> List[str]:
     """Fetch all cast names from both roster.json and cast.json (facebank)."""
     if not show:
@@ -263,6 +279,164 @@ def _refresh_roster_names(show: str | None) -> None:
     if not show:
         return
     _roster_cache().pop(show, None)
+
+
+def _refresh_show_people(show: str | None) -> None:
+    if not show:
+        return
+    _people_cache().pop(show, None)
+
+
+def _fetch_show_people(show: str | None) -> List[Dict[str, Any]]:
+    if not show:
+        return []
+    cache = _people_cache()
+    if show in cache:
+        return cache[show]
+    resp = _safe_api_get(f"/shows/{show}/people")
+    people = resp.get("people", []) if resp else []
+    cache[show] = people
+    return people
+
+
+def _get_person_clusters_summary(ep_id: str, person_id: str | None) -> Dict[str, Any] | None:
+    if not ep_id or not person_id:
+        return None
+    cache = _clusters_summary_cache().setdefault(ep_id, {})
+    if person_id in cache:
+        return cache[person_id]
+    summary = _safe_api_get(f"/episodes/{ep_id}/people/{person_id}/clusters_summary")
+    cache[person_id] = summary
+    return summary
+
+
+def _invalidate_person_clusters_summary(ep_id: str, person_id: str | None = None) -> None:
+    if not ep_id:
+        return
+    cache = _clusters_summary_cache()
+    if ep_id not in cache:
+        return
+    if person_id:
+        cache[ep_id].pop(person_id, None)
+    else:
+        cache.pop(ep_id, None)
+
+
+def _load_unassigned_suggestions(ep_id: str, *, refresh: bool = False) -> Dict[str, Any]:
+    cache = _unassigned_suggestions_cache()
+    if not refresh and ep_id in cache:
+        return cache[ep_id]
+    resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
+    cache[ep_id] = resp or {}
+    return cache[ep_id]
+
+
+def _invalidate_unassigned_suggestions(ep_id: str) -> None:
+    _unassigned_suggestions_cache().pop(ep_id, None)
+
+
+def _flag_track_media_error(ep_id: str, track_id: int, message: str) -> None:
+    _track_media_errors()[(ep_id, track_id)] = message
+
+
+def _consume_track_media_error(ep_id: str, track_id: int) -> str | None:
+    return _track_media_errors().pop((ep_id, track_id), None)
+
+
+def _record_frame_operation_summary(
+    ep_id: str,
+    track_id: int,
+    operation: str,
+    frame_ids: List[int],
+    resp: Dict[str, Any] | None,
+) -> None:
+    attempted = {int(idx) for idx in frame_ids}
+    response_ids = resp.get("frame_ids") if isinstance(resp, dict) else []
+    if isinstance(response_ids, list):
+        for value in response_ids:
+            try:
+                attempted.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+    def _coerce_failure_map(data: Any) -> Dict[int, str]:
+        failure_map: Dict[int, str] = {}
+        if not data:
+            return failure_map
+        if isinstance(data, dict):
+            for key, reason in data.items():
+                try:
+                    idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                failure_map[idx] = str(reason)
+        elif isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, dict):
+                    frame_idx = entry.get("frame_idx") or entry.get("frame_id")
+                    try:
+                        idx = int(frame_idx)
+                    except (TypeError, ValueError):
+                        continue
+                    reason = entry.get("error") or entry.get("reason") or entry.get("detail") or "Failed"
+                    failure_map[idx] = str(reason)
+                else:
+                    try:
+                        idx = int(entry)
+                    except (TypeError, ValueError):
+                        continue
+                    failure_map[idx] = "Failed"
+        elif isinstance(data, str):
+            failure_map[-1] = data
+        return failure_map
+
+    failure_sources: List[Any] = []
+    if isinstance(resp, dict):
+        for key in ("failures", "errors", "failed", "failed_frame_ids"):
+            failure_sources.append(resp.get(key))
+    failure_map: Dict[int, str] = {}
+    for source in failure_sources:
+        failure_map.update(_coerce_failure_map(source))
+
+    if failure_map:
+        attempted.update(failure_map.keys())
+
+    rows = []
+    if not attempted:
+        attempted = {int(idx) for idx in frame_ids}
+    for idx in sorted(attempted):
+        note = failure_map.get(idx, "")
+        status = "⚠️ Failed" if idx in failure_map else "✅ Success"
+        rows.append({"Frame": idx, "Status": status, "Notes": note})
+
+    st.session_state["frame_operation_summary"] = {
+        "ep_id": ep_id,
+        "track_id": track_id,
+        "operation": operation,
+        "rows": rows,
+    }
+
+
+def _render_frame_operation_summary(ep_id: str) -> None:
+    summary = st.session_state.get("frame_operation_summary")
+    if not summary or summary.get("ep_id") != ep_id:
+        if summary and summary.get("ep_id") != ep_id:
+            st.session_state.pop("frame_operation_summary", None)
+        return
+    rows = summary.get("rows") or []
+    if not rows:
+        st.session_state.pop("frame_operation_summary", None)
+        return
+    container = st.container(border=True)
+    with container:
+        op = summary.get("operation", "Frame update")
+        track_id = summary.get("track_id")
+        title = f"{op} result"
+        if track_id is not None:
+            title += f" · Track {track_id}"
+        st.markdown(f"**{title}**")
+        st.table(rows)
+    st.session_state.pop("frame_operation_summary", None)
 
 
 def _name_choice_widget(
@@ -340,6 +514,7 @@ def _move_frames_api(
     if resp is None:
         st.error("Failed to move frames - API returned no response")
         return
+    _record_frame_operation_summary(ep_id, track_id, "Move frames", frame_ids, resp)
     moved = resp.get("moved") or len(frame_ids)
     name = resp.get("target_name") or resp.get("target_identity_id") or target_identity_id or "target identity"
     st.toast(f"Moved {moved} frame(s) to {name}")
@@ -355,6 +530,7 @@ def _delete_frames_api(ep_id: str, track_id: int, frame_ids: List[int], delete_a
     if resp is None:
         st.error("Failed to delete frames - API returned no response")
         return
+    _record_frame_operation_summary(ep_id, track_id, "Delete frames", frame_ids, resp)
     deleted = resp.get("deleted") or len(frame_ids)
     st.toast(f"Deleted {deleted} frame(s)")
     # Only clear selection after successful delete
@@ -363,100 +539,12 @@ def _delete_frames_api(ep_id: str, track_id: int, frame_ids: List[int], delete_a
 
 
 def _select_episode() -> str:
-    """Episode selector in sidebar with lock/unlock mechanism."""
-    with st.sidebar:
-        st.markdown("### Episode")
-
-        current = helpers.get_ep_id()
-
-        # Check if selector is locked (default is locked)
-        is_locked = not st.session_state.get("episode_selector_unlocked", False)
-
-        if current and is_locked:
-            # Show locked state - just display current episode
-            ep_meta = helpers.parse_ep_id(current) or {}
-            show = ep_meta.get("show", "").upper()
-            season = ep_meta.get("season", 0)
-            episode = ep_meta.get("episode", 0)
-            display_text = f"{show} S{season:02d}E{episode:02d}" if show and season and episode else current
-
-            st.info(f"🔒 **{display_text}**")
-
-            if st.button(
-                "🔓 Change Episode",
-                key="unlock_episode_selector",
-                use_container_width=True,
-            ):
-                st.session_state["episode_selector_unlocked"] = True
-                st.rerun()
-
-            return current
-
-        # Show unlocked state - full selector
-        st.session_state["episode_selector_unlocked"] = True
-
-        tracked_tab, s3_tab = st.tabs(["Tracked", "Browse S3"])
-
-        with tracked_tab:
-            payload = _safe_api_get("/episodes")
-            options = payload.get("episodes", []) if payload else []
-            if options:
-                ep_ids = [item["ep_id"] for item in options]
-                default_idx = ep_ids.index(current) if current in ep_ids else 0
-
-                selection = st.selectbox(
-                    "Select episode",
-                    ep_ids,
-                    format_func=lambda eid: f"{eid} ({options[ep_ids.index(eid)]['show_slug']})",
-                    index=default_idx if ep_ids else 0,
-                    key="facebank_tracked_select",
-                )
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button(
-                        "✓ Load",
-                        key="facebank_load_tracked",
-                        use_container_width=True,
-                        type="primary",
-                    ):
-                        st.session_state["episode_selector_unlocked"] = False
-                        helpers.set_ep_id(selection)
-                with col2:
-                    if st.button(
-                        "✗ Cancel",
-                        key="cancel_episode_change",
-                        use_container_width=True,
-                    ):
-                        st.session_state["episode_selector_unlocked"] = False
-                        st.rerun()
-            else:
-                st.info("No tracked episodes yet.")
-
-        with s3_tab:
-            s3_payload = _safe_api_get("/episodes/s3_videos")
-            items = s3_payload.get("items", []) if s3_payload else []
-            if items:
-                labels = [f"{item['ep_id']} · {item.get('last_modified') or 'unknown'}" for item in items]
-                idx = st.selectbox(
-                    "S3 videos",
-                    list(range(len(items))),
-                    format_func=lambda i: labels[i],
-                    key="facebank_s3_select",
-                )
-                selected = items[idx]
-                if st.button("Track & Load", key="facebank_track_s3", use_container_width=True):
-                    st.session_state["episode_selector_unlocked"] = False
-                    _track_episode_from_s3(selected)
-            else:
-                st.info("No S3 videos exposed by the API.")
-
-        ep_id = helpers.get_ep_id()
-        if not ep_id:
-            st.warning("Choose an episode to continue.")
-            st.stop()
-
-        return ep_id
+    """Get episode from session state (managed by global locked selector in sidebar)."""
+    ep_id = helpers.get_ep_id()
+    if not ep_id:
+        st.warning("Choose an episode from the sidebar to continue.")
+        st.stop()
+    return ep_id
 
 
 def _track_episode_from_s3(item: Dict[str, Any]) -> None:
@@ -511,6 +599,12 @@ def _initialize_state(ep_id: str) -> None:
         st.session_state["selected_person"] = None
         st.session_state["selected_identity"] = None
         st.session_state["selected_track"] = None
+        st.session_state.pop("show_roster_names", None)
+        st.session_state.pop("show_people_cache", None)
+        st.session_state.pop("person_clusters_summary", None)
+        st.session_state.pop("unassigned_cluster_suggestions", None)
+        st.session_state.pop("track_media_errors", None)
+        st.session_state.pop("frame_operation_summary", None)
 
 
 def _set_view(
@@ -533,15 +627,22 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
         return None
     cols = st.columns([2, 1, 1])
     with cols[0]:
+        show_slug = detail.get("show_slug", "?")
+        season_number = detail.get("season_number")
+        episode_number = detail.get("episode_number")
+        season_text = f"S{int(season_number):02d}" if isinstance(season_number, int) else "S??"
+        episode_text = f"E{int(episode_number):02d}" if isinstance(episode_number, int) else "E??"
         st.markdown(
-            f"**Episode:** `{ep_id}` · Show `{detail['show_slug']}` · S{detail['season_number']:02d}E{detail['episode_number']:02d}"
+            f"**Episode:** `{ep_id}` · Show `{show_slug}` · {season_text}{episode_text}"
         )
         st.caption(f"Detector: {helpers.tracks_detector_label(ep_id)}")
     with cols[1]:
-        st.caption(f"S3 v2: `{detail['s3']['v2_key']}`")
+        s3_v2 = (detail.get("s3") or {}).get("v2_key")
+        st.caption(f"S3 v2: `{s3_v2 or 'n/a'}`")
+    local_exists = (detail.get("local") or {}).get("exists") is True
     with cols[2]:
-        st.caption(f"Local video: {'✅' if detail['local']['exists'] else '❌'}")
-    if not detail["local"]["exists"]:
+        st.caption(f"Local video: {'✅' if local_exists else '❌'}")
+    if not local_exists:
         if st.button("Mirror from S3", key="facebank_mirror"):
             if _api_post(f"/episodes/{ep_id}/mirror"):
                 st.success("Mirror complete.")
@@ -608,8 +709,7 @@ def _episode_people(ep_id: str) -> tuple[str | None, List[Dict[str, Any]]]:
     show_slug = str(meta.get("show") or "").lower()
     if not show_slug:
         return None, []
-    people_resp = _safe_api_get(f"/shows/{show_slug}/people")
-    people = people_resp.get("people", []) if people_resp else []
+    people = _fetch_show_people(show_slug)
     return show_slug, people
 
 
@@ -647,7 +747,12 @@ def _fetch_track_media(
     if cursor:
         # The backend returns pagination with a 'next_start_after' cursor
         params["start_after"] = cursor
-    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/crops", params=params) or {}
+    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/crops", params=params)
+    if payload is None or not payload:
+        _flag_track_media_error(ep_id, track_id, "Media unavailable—check S3 or presign")
+        return [], None
+    # Clear any previous error if this request succeeded
+    _track_media_errors().pop((ep_id, track_id), None)
     items = payload.get("items", []) if isinstance(payload, dict) else []
     next_cursor = payload.get("next_start_after") if isinstance(payload, dict) else None
     normalized: List[Dict[str, Any]] = []
@@ -691,20 +796,19 @@ def _fetch_track_frames(
 def _render_cast_carousel(
     ep_id: str,
     show_id: str,
-) -> None:
-    """Render featured cast members carousel at the top - ONLY shows cast with clusters in this episode."""
+) -> bool:
+    """Render featured cast members carousel. Returns True if any content was shown."""
     # Fetch cast members from Cast API
     cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast")
     if not cast_api_resp:
-        return
+        return False
 
     cast_members = cast_api_resp.get("cast", [])
     if not cast_members:
-        return
+        return False
 
     # Get people data to check who has clusters
-    people_resp = _safe_api_get(f"/shows/{show_id}/people")
-    people = people_resp.get("people", []) if people_resp else []
+    people = _fetch_show_people(show_id)
     people_by_cast_id = {p.get("cast_id"): p for p in people if p.get("cast_id")}
 
     # Filter to only cast members with clusters in this episode
@@ -719,7 +823,7 @@ def _render_cast_carousel(
 
     # Don't show carousel if no cast members have clusters in this episode
     if not cast_with_clusters:
-        return
+        return False
 
     st.markdown("### 🎬 Cast Lineup")
     st.caption("Cast members with clusters in this episode")
@@ -764,6 +868,7 @@ def _render_cast_carousel(
                     st.rerun()
 
     st.markdown("---")
+    return True
 
 
 def _render_cast_gallery(
@@ -812,7 +917,8 @@ def _render_cast_gallery(
                 avg_cohesion: float | None = None
 
                 if person_id and episode_clusters:
-                    clusters_summary = _safe_api_get(f"/episodes/{ep_id}/people/{person_id}/clusters_summary")
+                    person_key = str(person_id)
+                    clusters_summary = _get_person_clusters_summary(ep_id, person_key)
                     if clusters_summary and clusters_summary.get("clusters"):
                         cohesion_scores: List[float] = []
                         for cluster in clusters_summary.get("clusters", []):
@@ -856,19 +962,14 @@ def _render_unassigned_cluster_card(
     """Render an unassigned cluster card with suggestion and assignment UI."""
     cluster_meta = cluster_lookup.get(cluster_id, {})
     counts = cluster_meta.get("counts", {})
-    tracks_count = counts.get("tracks", 0)
-    faces_count = counts.get("faces", 0)
-    track_list = cluster_meta.get("tracks", [])
+    track_list = cluster_meta.get("tracks", []) or []
 
-    # Filter out tracks with only 1 frame (likely noise/false positives)
-    track_list = [t for t in track_list if t.get("faces", 0) > 1]
-
-    # Recalculate counts after filtering
+    # Always recompute counts from track payload so pagination matches rendered tracks
     tracks_count = len(track_list)
     faces_count = sum(t.get("faces", 0) for t in track_list)
 
-    # Skip clusters with no valid tracks after filtering
-    if not track_list or tracks_count == 0:
+    # If the backend sent zero tracks, there's nothing to render
+    if tracks_count == 0:
         return
 
     # Get suggested person if available
@@ -879,20 +980,18 @@ def _render_unassigned_cluster_card(
     suggested_person = None
 
     if suggested_person_id:
-        # Find the person for the suggested person_id
-        people_resp = _safe_api_get(f"/shows/{show_id}/people")
-        if people_resp:
-            people = people_resp.get("people", [])
-            suggested_person = next((p for p in people if p.get("person_id") == suggested_person_id), None)
-            if suggested_person:
-                suggested_cast_id = suggested_person.get("cast_id")
-                # Use person name first, fallback to cast name if no person name
-                suggested_cast_name = suggested_person.get("name")
-                if not suggested_cast_name and suggested_cast_id:
-                    suggested_cast_name = cast_options.get(suggested_cast_id)
-                # If still no name, use person_id
-                if not suggested_cast_name:
-                    suggested_cast_name = f"Person {suggested_person_id}"
+        # Find the person for the suggested person_id from cached show people
+        people = _fetch_show_people(show_id)
+        suggested_person = next((p for p in people if p.get("person_id") == suggested_person_id), None)
+        if suggested_person:
+            suggested_cast_id = suggested_person.get("cast_id")
+            # Use person name first, fallback to cast name if no person name
+            suggested_cast_name = suggested_person.get("name")
+            if not suggested_cast_name and suggested_cast_id:
+                suggested_cast_name = cast_options.get(suggested_cast_id)
+            # If still no name, use person_id
+            if not suggested_cast_name:
+                suggested_cast_name = f"Person {suggested_person_id}"
 
     with st.container(border=True):
         # Header with cluster info
@@ -911,6 +1010,8 @@ def _render_unassigned_cluster_card(
                 resp = _api_delete(f"/episodes/{ep_id}/identities/{cluster_id}")
                 if resp:
                     st.success(f"Deleted cluster {cluster_id}")
+                    _invalidate_unassigned_suggestions(ep_id)
+                    _invalidate_person_clusters_summary(ep_id)
                     st.rerun()
                 else:
                     st.error("Failed to delete cluster")
@@ -983,7 +1084,10 @@ def _render_unassigned_cluster_card(
                                     hide_if_missing=False,
                                 )
                             st.markdown(thumb_markup, unsafe_allow_html=True)
-                            st.caption(f"Track {track_id} · {track_faces} faces")
+                            faces_label = "face" if track_faces == 1 else "faces"
+                            st.caption(f"Track {track_id} · {track_faces} {faces_label}")
+                            if track_faces <= 1:
+                                st.caption("⚠️ Single frame (low confidence)")
 
         # Show suggestion if available
         if suggested_cast_id and suggested_cast_name:
@@ -1025,6 +1129,9 @@ def _render_unassigned_cluster_card(
                     resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                     if resp and resp.get("status") == "success":
                         st.success(f"Assigned cluster to {suggested_cast_name}!")
+                        _refresh_show_people(show_id)
+                        _invalidate_unassigned_suggestions(ep_id)
+                        _invalidate_person_clusters_summary(ep_id)
                         st.rerun()
                     else:
                         st.error("Failed to assign cluster. Check logs.")
@@ -1084,6 +1191,9 @@ def _render_unassigned_cluster_card(
                             resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                             if resp and resp.get("status") == "success":
                                 st.success(f"Assigned cluster to {cast_options[selected_cast_id]}!")
+                                _refresh_show_people(show_id)
+                                _invalidate_unassigned_suggestions(ep_id)
+                                _invalidate_person_clusters_summary(ep_id)
                                 st.rerun()
                             else:
                                 st.error("Failed to assign cluster. Check logs.")
@@ -1110,6 +1220,9 @@ def _render_unassigned_cluster_card(
                     resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                     if resp and resp.get("status") == "success":
                         st.success(f"Created person '{new_name}' with this cluster!")
+                        _refresh_show_people(show_id)
+                        _invalidate_unassigned_suggestions(ep_id)
+                        _invalidate_person_clusters_summary(ep_id)
                         st.rerun()
                     else:
                         st.error("Failed to create person. Check logs.")
@@ -1121,6 +1234,7 @@ def _render_auto_person_card(
     person: Dict[str, Any],
     episode_clusters: List[str],
     cast_options: Dict[str, str],
+    suggestions_by_cluster: Dict[str, Dict[str, Any]] | None = None,
 ) -> None:
     """Render an auto-detected person card with detailed clusters and bulk assignment."""
     person_id = str(person.get("person_id") or "")
@@ -1128,21 +1242,21 @@ def _render_auto_person_card(
     aliases = person.get("aliases") or []
     total_clusters = len(person.get("cluster_ids", []) or [])
 
-    # Get suggested cast member if available
+    # Get suggested cast member if available - choose best match across clusters
     suggested_person_id = None
     suggested_distance = None
-    if episode_clusters:
-        # Fetch suggestions from API
-        suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions")
-        if suggestions_resp:
-            suggestions = suggestions_resp.get("suggestions", [])
-            # Find suggestion for this person's first cluster
-            first_cluster = episode_clusters[0].split(":")[-1] if episode_clusters else None
-            for suggestion in suggestions:
-                if suggestion.get("cluster_id") == first_cluster:
-                    suggested_person_id = suggestion.get("suggested_person_id")
-                    suggested_distance = suggestion.get("distance")
-                    break
+    if episode_clusters and suggestions_by_cluster:
+        for raw_cluster_id in episode_clusters:
+            cluster_id = raw_cluster_id.split(":")[-1] if ":" in raw_cluster_id else raw_cluster_id
+            suggestion = suggestions_by_cluster.get(cluster_id)
+            if not suggestion:
+                continue
+            distance = suggestion.get("distance")
+            if distance is None:
+                continue
+            if suggested_distance is None or distance < suggested_distance:
+                suggested_distance = distance
+                suggested_person_id = suggestion.get("suggested_person_id")
 
     with st.container(border=True):
         # Name
@@ -1225,6 +1339,9 @@ def _render_auto_person_card(
                                 st.success(
                                     f"Assigned {len(episode_clusters)} clusters to {cast_options[selected_cast_id]}"
                                 )
+                                _refresh_show_people(show_id)
+                                _invalidate_person_clusters_summary(ep_id)
+                                _invalidate_unassigned_suggestions(ep_id)
                                 st.rerun()
                 else:
                     st.info("No cast members available. Create one first in the Cast page.")
@@ -1239,10 +1356,13 @@ def _render_auto_person_card(
                     result = _bulk_assign_to_new_person(ep_id, show_id, person_id, new_name, episode_clusters)
                     if result:
                         st.success(f"Created '{new_name}' and assigned {len(episode_clusters)} clusters")
+                        _refresh_show_people(show_id)
+                        _invalidate_person_clusters_summary(ep_id)
+                        _invalidate_unassigned_suggestions(ep_id)
                         st.rerun()
 
         # Fetch clusters summary to show thumbnails
-        clusters_summary = _safe_api_get(f"/episodes/{ep_id}/people/{person_id}/clusters_summary")
+        clusters_summary = _get_person_clusters_summary(ep_id, person_id)
         if clusters_summary and clusters_summary.get("clusters"):
             st.markdown("**Clusters in this episode:**")
 
@@ -1317,6 +1437,9 @@ def _render_auto_person_card(
                     try:
                         resp = helpers.api_delete(f"/shows/{show_id}/people/{person_id}")
                         st.success(f"Deleted {name} ({person_id})")
+                        _refresh_show_people(show_id)
+                        _invalidate_person_clusters_summary(ep_id)
+                        _invalidate_unassigned_suggestions(ep_id)
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Failed to delete person: {exc}")
@@ -1332,8 +1455,7 @@ def _bulk_assign_clusters(
     """Assign all clusters from source person to a cast member."""
     try:
         # Find or create a person record for this cast_id via API
-        people_resp = _safe_api_get(f"/shows/{show_id}/people")
-        people = people_resp.get("people", []) if people_resp else []
+        people = _fetch_show_people(show_id)
         target_person = next((p for p in people if p.get("cast_id") == target_cast_id), None)
 
         if not target_person:
@@ -1379,8 +1501,7 @@ def _bulk_assign_to_new_person(
     """Create a new person and assign all clusters to them."""
     try:
         # Check if person with this name exists via API
-        people_resp = _safe_api_get(f"/shows/{show_id}/people")
-        people = people_resp.get("people", []) if people_resp else []
+        people = _fetch_show_people(show_id)
 
         # Simple name matching (case-insensitive)
         existing = next((p for p in people if p.get("name", "").lower() == new_name.lower()), None)
@@ -1445,6 +1566,9 @@ def _render_people_view(
                     st.session_state.pop("filter_cast_id", None)
                     st.session_state.pop("filter_cast_name", None)
                     st.rerun()
+
+    if show_id and not filter_cast_id:
+        _render_cast_carousel(ep_id, show_id)
 
     cast_params: Dict[str, Any] = {"include_featured": "1"}
     if season_label:
@@ -1575,8 +1699,23 @@ def _render_people_view(
             cm.get("cast_id"): cm.get("name") for cm in deduped_cast_entries if cm.get("cast_id") and cm.get("name")
         }
 
+        auto_suggestions_by_cluster: Dict[str, Dict[str, Any]] = {}
+        suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions")
+        if suggestions_resp:
+            for suggestion in suggestions_resp.get("suggestions", []):
+                cluster_id = suggestion.get("cluster_id")
+                if cluster_id:
+                    auto_suggestions_by_cluster[cluster_id] = suggestion
+
         for person, episode_clusters in episode_auto_people:
-            _render_auto_person_card(ep_id, show_id, person, episode_clusters, cast_options)
+            _render_auto_person_card(
+                ep_id,
+                show_id,
+                person,
+                episode_clusters,
+                cast_options,
+                auto_suggestions_by_cluster,
+            )
 
     # --- UNASSIGNED CLUSTERS (SUGGESTIONS) SECTION ---
     if unassigned_clusters:
@@ -1602,19 +1741,19 @@ def _render_people_view(
         with header_col3:
             if st.button("🔄 Refresh Suggestions", key=f"refresh_suggestions_{ep_id}"):
                 with st.spinner("Refreshing suggestions..."):
-                    # Use the new endpoint that compares against assigned clusters
-                    suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
+                    suggestions_resp = _load_unassigned_suggestions(ep_id, refresh=True)
                     if suggestions_resp:
                         st.success("Suggestions refreshed!")
-                    st.rerun()
+                    else:
+                        st.warning("Suggestion refresh failed. Check API logs.")
 
         # Build options: map cast_id to name
         cast_options = {
             cm.get("cast_id"): cm.get("name") for cm in deduped_cast_entries if cm.get("cast_id") and cm.get("name")
         }
 
-        # Fetch suggestions from API - now comparing against assigned clusters in this episode
-        suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
+        # Fetch suggestions from cache (refresh if needed)
+        suggestions_resp = _load_unassigned_suggestions(ep_id)
         suggestions_by_cluster = {}
         if suggestions_resp:
             # Build set of person_ids for ALL cast members (including those without clusters in this episode)
@@ -1692,7 +1831,7 @@ def _render_person_clusters(
         return
 
     # Fetch clusters summary to get all tracks across all clusters
-    clusters_summary = _safe_api_get(f"/episodes/{ep_id}/people/{person_id}/clusters_summary")
+    clusters_summary = _get_person_clusters_summary(ep_id, person_id)
     if not clusters_summary:
         st.error("Failed to load cluster data.")
         return
@@ -1731,6 +1870,57 @@ def _render_person_clusters(
             pass
 
     st.caption(f"{len(episode_clusters)} clusters · {total_tracks} tracks · {total_faces} faces")
+
+    # Export all person's tracks to Facebank
+    st.markdown("---")
+    with st.container(border=True):
+        st.markdown("### 💾 Export All Tracks to Facebank")
+        st.caption(
+            f"Automatically select and export up to 8 best frames from ALL tracks for **{name}**. "
+            "The algorithm picks up to 20 high-quality frames based on detection score, sharpness, and similarity."
+        )
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info("✅ Auto-selects best frames: Detection ≥0.75 · Sharpness ≥15 · Similarity ≥0.70")
+        with col2:
+            # We need to export from ALL clusters for this person
+            # The API expects an identity_id, but we have multiple clusters
+            # We'll export from the first cluster that has a person_id mapping
+            can_export = False
+            export_identity_id = None
+            
+            # Find any identity with this person_id
+            identities = identities_payload.get("identities", [])
+            for identity in identities:
+                if identity.get("person_id") == person_id:
+                    export_identity_id = identity.get("identity_id")
+                    can_export = True
+                    break
+            
+            if can_export and export_identity_id:
+                if st.button(
+                    "💾 Export Seeds",
+                    key=f"export_person_seeds_{person_id}",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    with st.spinner(f"Selecting and exporting best frames for {name}..."):
+                        # Export from the first identity - the backend will select best frames
+                        export_resp = _api_post(f"/episodes/{ep_id}/identities/{export_identity_id}/export_seeds", {})
+                        if export_resp and export_resp.get("status") == "success":
+                            seeds_count = export_resp.get("seeds_exported", 0)
+                            seeds_path = export_resp.get("seeds_path", "")
+                            st.success(
+                                f"✅ Exported {seeds_count} high-quality seeds to facebank!\n\n"
+                                f"Path: `{seeds_path}`"
+                            )
+                            st.info("💡 Tip: Run similarity refresh to update cross-episode matching.")
+                        else:
+                            st.error("Failed to export seeds. Check logs for details.")
+            else:
+                st.warning("⚠️ No identities found with person_id mapping. Assign clusters to this person first.")
+    st.markdown("---")
 
     if not all_tracks:
         st.info("No tracks found for this person.")
@@ -1988,7 +2178,7 @@ def _render_cluster_tracks(
             st.markdown("### 💾 Export to Facebank")
             st.caption(
                 "Export high-quality seed frames to permanent facebank for cross-episode similarity matching. "
-                f"This will save the best frames (up to 20) for person **{display_name or person_id_for_export}**."
+                f"This will save up to 8 best frames for person **{display_name or person_id_for_export}**."
             )
 
             col1, col2 = st.columns([3, 1])
@@ -2308,6 +2498,10 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         else:
             st.info("No frames recorded for this track yet.")
 
+    warning_message = _consume_track_media_error(ep_id, track_id)
+    if warning_message:
+        st.warning(warning_message)
+
     if selected_frames:
         identity_values = [None] + [ident["identity_id"] for ident in identities]
         identity_labels = ["Create new identity"] + [
@@ -2408,6 +2602,7 @@ _initialize_state(ep_id)
 episode_detail = _episode_header(ep_id)
 if not episode_detail:
     st.stop()
+_render_frame_operation_summary(ep_id)
 if not helpers.detector_is_face_only(ep_id):
     st.warning(
         "Tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face for best results."
@@ -2557,6 +2752,73 @@ if not identities_payload:
     st.stop()
 
 cluster_payload = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks") or {"clusters": []}
+
+# Episode-wide export to facebank (before showing people/clusters)
+if view_state == "people":
+    st.markdown("---")
+    with st.container(border=True):
+        st.markdown("### 💾 Export Episode to Facebank")
+        st.caption(
+            "Export high-quality seed frames for ALL cast members in this episode. "
+            "Automatically selects up to 8 best frames per person with at least 100 frames between selections."
+        )
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info("✅ Auto-selects: Detection ≥0.75 · Sharpness ≥15 · Similarity ≥0.70 · 100+ frame gap")
+        with col2:
+            if st.button(
+                "💾 Export All",
+                key="export_episode_all_seeds",
+                use_container_width=True,
+                type="primary",
+            ):
+                # Find all identities that have person_id mappings
+                identities = identities_payload.get("identities", [])
+                identities_with_person = [i for i in identities if i.get("person_id")]
+                
+                if not identities_with_person:
+                    st.warning("No identities assigned to cast members yet. Assign people first in the UI.")
+                else:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    exported_count = 0
+                    failed_count = 0
+                    total = len(identities_with_person)
+                    
+                    for idx, identity in enumerate(identities_with_person):
+                        identity_id = identity.get("identity_id")
+                        person_id = identity.get("person_id")
+                        person_name = identity.get("name") or person_id
+                        
+                        status_text.text(f"Exporting {person_name} ({idx+1}/{total})...")
+                        
+                        try:
+                            export_resp = _api_post(f"/episodes/{ep_id}/identities/{identity_id}/export_seeds", {})
+                            if export_resp and export_resp.get("status") == "success":
+                                seeds_count = export_resp.get("seeds_exported", 0)
+                                if seeds_count > 0:
+                                    exported_count += 1
+                            else:
+                                failed_count += 1
+                        except Exception:
+                            failed_count += 1
+                        
+                        progress_bar.progress((idx + 1) / total)
+                    
+                    status_text.empty()
+                    progress_bar.empty()
+                    
+                    if exported_count > 0:
+                        st.success(
+                            f"✅ Exported seeds for {exported_count} cast member(s)!"
+                            + (f" ({failed_count} skipped - no quality frames)" if failed_count > 0 else "")
+                        )
+                        st.info("💡 Tip: Run similarity refresh to update cross-episode matching.")
+                    else:
+                        st.error(f"No seeds exported. Check that identities have high-quality frames.")
+    st.markdown("---")
 cluster_lookup = _clusters_by_identity(cluster_payload)
 identities = identities_payload.get("identities", [])
 identity_index = {ident["identity_id"]: ident for ident in identities}
