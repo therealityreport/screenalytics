@@ -88,7 +88,8 @@ def _detect_track_manifests_ready(detections_path: Path, tracks_path: Path) -> d
     return {
         "detections_ready": detections_ready,
         "tracks_ready": tracks_ready,
-        "manifest_ready": detections_ready and tracks_ready,
+        "manifest_ready": tracks_ready,
+        "tracks_only_fallback": tracks_ready and not detections_ready,
     }
 
 
@@ -105,11 +106,14 @@ def _compute_detect_track_effective_status(
     normalized_status = str(detect_status.get("status") or "missing").strip().lower()
     if not normalized_status:
         normalized_status = "missing"
+    manifest_tracks_ready = bool(manifest_ready)
     if normalized_status == "success":
-        return "success", True, False
-    if manifest_ready:
+        if manifest_tracks_ready:
+            return "success", True, False
+        return "stale", False, False
+    if manifest_tracks_ready:
         return "success", True, True
-    return normalized_status, bool(tracks_ready_flag), False
+    return normalized_status, False, False
 
 
 def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int | None:
@@ -479,6 +483,9 @@ if status_payload:
             if detect_job_record and detect_job_record.get("started_at"):
                 st.caption(f"Started at {detect_job_record['started_at']}")
             st.caption("Live progress appears in the log panel below.")
+        elif detect_status_value == "stale":
+            st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
+            st.caption("Rerun Detect/Track Faces to rebuild detections/tracks for this episode.")
         elif detect_status_value == "partial":
             st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
             st.caption("Rerun detect/track to rebuild tracks.")
@@ -913,6 +920,7 @@ with col_detect:
         _process_detect_result(summary, error_message)
 
 faces_ready = faces_ready_state
+detector_manifest_value = helpers.tracks_detector_value(ep_id)
 detector_face_only = helpers.detector_is_face_only(ep_id)
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
@@ -980,10 +988,17 @@ with col_faces:
                 "not full face detection + tracking. Please run **Detect/Track Faces** again to generate tracks."
             )
     elif not detector_face_only:
-        st.warning(
-            "Current tracks were generated with a legacy or unknown detector. Rerun Detect/Track Faces "
-            "with RetinaFace + ByteTrack before harvesting."
-        )
+        if detector_manifest_value is None:
+            st.warning(
+                "Unable to determine which detector produced the current tracks. Rerun Detect/Track Faces "
+                "with RetinaFace + ByteTrack before harvesting."
+            )
+        else:
+            st.warning(
+                f"Current tracks were generated with unsupported detector "
+                f"{helpers.detector_label_from_value(detector_manifest_value)}. Rerun Detect/Track Faces "
+                "with RetinaFace + ByteTrack before harvesting."
+            )
         if st.button(
             "Rerun Detect/Track (RetinaFace + ByteTrack)",
             key="faces_rerun_detect",

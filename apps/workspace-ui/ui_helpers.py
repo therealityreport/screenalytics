@@ -752,10 +752,7 @@ def tracks_tracker_value(ep_id: str) -> str | None:
 def detector_is_face_only(ep_id: str) -> bool:
     detector = tracks_detector_value(ep_id)
     if detector is None:
-        path = _manifest_path(ep_id, "tracks.jsonl")
-        if not path.exists():
-            return False
-        return True
+        return False
     return detector.lower() in FACE_ONLY_DETECTORS
 
 

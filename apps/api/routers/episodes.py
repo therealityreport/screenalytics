@@ -186,6 +186,39 @@ def _count_nonempty_lines(path: Path) -> int:
         return 0
 
 
+def _manifest_has_rows(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _first_manifest_row(path: Path) -> Dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    return payload
+    except OSError:
+        return None
+    return None
+
+
 def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
     marker_path = _runs_dir(ep_id) / f"{phase}.json"
     if not marker_path.exists():
@@ -278,34 +311,27 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     tracks_count = _count_nonempty_lines(tracks_path)
 
     # Infer detector/tracker from tracks.jsonl if available
-    # Only accept FACE detectors (retinaface, yolov8-face, etc.), NOT scene detectors
+    # Only accept FACE detectors (retinaface, yolov8face, etc.), NOT scene detectors
     detector = None
     tracker = None
-    if tracks_path.exists():
-        try:
-            with tracks_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                        if not detector and "detector" in row:
-                            det_value = row["detector"]
-                            # Filter out scene detectors - only accept face detectors
-                            if det_value and det_value.lower() not in ("pyscenedetect", "internal", "off"):
-                                detector = det_value
-                        if not tracker and "tracker" in row:
-                            tracker = row["tracker"]
-                        if detector and tracker:
-                            break
-                    except json.JSONDecodeError:
-                        continue
-        except (OSError, IOError):
-            pass
+    tracks_manifest_valid = False
+    track_row = _first_manifest_row(tracks_path)
+    if isinstance(track_row, dict):
+        det_value = track_row.get("detector")
+        if isinstance(det_value, str):
+            det_value = det_value.strip()
+            if det_value and det_value.lower() not in ("pyscenedetect", "internal", "off"):
+                detector = det_value
+        tracker_value = track_row.get("tracker")
+        if isinstance(tracker_value, str):
+            tracker = tracker_value.strip() or None
+        track_id_value = track_row.get("track_id")
+        tracks_manifest_valid = detector is not None and tracker is not None and track_id_value is not None
 
     # Determine status
-    if tracks_count > 0:
+    if tracks_count > 0 and not tracks_manifest_valid:
+        status_value = "invalid"
+    elif tracks_count > 0:
         status_value = "success"
     elif detections_count > 0:
         status_value = "partial"  # Has detections but no tracks
@@ -1462,22 +1488,29 @@ def episode_progress(ep_id: str) -> dict:
 
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
-    detect_track_status = PhaseStatus(**_detect_track_phase_status(ep_id))
+    detect_track_payload = _detect_track_phase_status(ep_id)
+
+    tracks_path = get_path(ep_id, "tracks")
+    detections_path = get_path(ep_id, "detections")
+    manifests_dir = detections_path.parent
+    tracks_manifest_ready = _manifest_has_rows(tracks_path)
+    if detect_track_payload.get("status") == "success" and not tracks_manifest_ready:
+        detect_track_payload["status"] = "stale"
+        detect_track_payload["source"] = "missing_artifact"
+    detect_track_status = PhaseStatus(**detect_track_payload)
     faces_status = PhaseStatus(**_faces_phase_status(ep_id))
     cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
 
     # Compute pipeline state indicators
-    from py_screenalytics.artifacts import get_path
-
-    tracks_path = get_path(ep_id, "tracks")
-    manifests_dir = get_path(ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
 
-    # scenes_ready: True if scene detection has run (we consider this always true if tracks exist)
-    scenes_ready = tracks_path.exists() or detect_track_status.detections is not None and detect_track_status.detections > 0
+    # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
+    scenes_ready = tracks_manifest_ready or (
+        detect_track_status.detections is not None and detect_track_status.detections > 0
+    )
 
-    # tracks_ready: True if tracks.jsonl exists and has content
-    tracks_ready = detect_track_status.tracks is not None and detect_track_status.tracks > 0
+    # tracks_ready: True only when tracks manifest exists and API reports success
+    tracks_ready = tracks_manifest_ready and detect_track_status.status == "success"
 
     # faces_harvested: True if faces.jsonl exists and has content
     faces_harvested = faces_status.faces is not None and faces_status.faces > 0

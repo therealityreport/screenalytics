@@ -653,6 +653,16 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     except FileNotFoundError:
         # Missing progress files are normal when a prior run never started.
         pass
+    # Remove stale manifests before launching a new detect/track run
+    stale_paths = [get_path(req.ep_id, "detections"), get_path(req.ep_id, "tracks")]
+    for stale_path in stale_paths:
+        try:
+            stale_path.unlink()
+            LOGGER.info("Removed stale artifact before rerun: %s", stale_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            LOGGER.warning("Failed to remove stale artifact %s: %s", stale_path, exc)
     command = _build_detect_track_command(
         req,
         video_path,
