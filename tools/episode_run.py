@@ -201,11 +201,11 @@ TRACK_BUFFER_BASE_DEFAULT = max(
 BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.85)
 TRACK_HIGH_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_TRACK_HIGH_THRESH",
-    _env_float("BYTE_TRACK_HIGH_THRESH", 0.65),
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.45),
 )
 TRACK_NEW_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_NEW_TRACK_THRESH",
-    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.65),
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
 )
 TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
@@ -2672,7 +2672,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-gap",
         type=int,
-        default=30,
+        default=60,
         help="Maximum frame gap before splitting a track",
     )
     parser.add_argument(
