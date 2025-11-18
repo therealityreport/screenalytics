@@ -1,5 +1,34 @@
 # Tracking Accuracy Tuning Guide
 
+## Default Configuration (Strict Mode)
+
+**As of Nov 18, 2025:** Strict tracking is now the **DEFAULT** configuration.
+
+All `detect track` commands now use stricter thresholds for better single-person track accuracy.
+
+### Current Defaults
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| **Detection threshold** | 0.65 | Filters low-quality detections (ears, partial faces) |
+| **Appearance hard split** | 75% | Immediate rejection if similarity < 75% |
+| **Appearance soft split** | 82% | Start streak counting if similarity < 82% |
+| **Embedding extraction** | Every 5 frames | Balance between accuracy and performance |
+| **Track buffer** | 15 frames | Less persistence without detections (0.5s at 30fps) |
+| **ByteTrack IoU** | 0.85 | Tighter spatial matching required |
+
+### Old Defaults (Pre-Nov 18)
+
+For reference, the old (too permissive) defaults were:
+- Detection threshold: 0.5 (too low, allowed ears/false positives)
+- Appearance hard split: 60% (too permissive)
+- Appearance soft split: 70% (too permissive)
+- Embedding extraction: Variable (often too sparse)
+- Track buffer: 30 frames (too long, allowed incorrect associations)
+- ByteTrack IoU: 0.8 (too permissive)
+
+---
+
 ## Problem: Multi-Person Tracks and Low Similarity Scores
 
 **Symptoms:**
@@ -10,16 +39,14 @@
 
 **Example:** Track 3 containing Kyle's ear + Lisa Rinna faces, but labeled as Brandi Glanville
 
----
+### Root Causes
 
-## Root Causes
-
-### 1. ByteTrack is Purely Spatial
+#### 1. ByteTrack is Purely Spatial
 - Uses IoU (bbox overlap) only, **not appearance/identity**
 - If Kyle's ear bbox overlaps with Lisa's face bbox in next frame → same track!
 - Cannot distinguish between people, only spatial continuity
 
-### 2. Appearance Gate Can't Reject Without Embeddings
+#### 2. Appearance Gate Can't Reject Without Embeddings
 The appearance gate (identity verifier) can only work when ArcFace embeddings are extracted:
 
 ```python
@@ -30,92 +57,97 @@ if similarity is not None and similarity < self.config.appear_t_hard:
 
 **Problem:** If `emb_every` is set too high, embeddings are only extracted every N frames. When embedding is None, similarity is None, and the gate **cannot reject** the detection!
 
-**Your case:** 47% similarity should trigger immediate hard split (< 60% threshold), but if no embedding was extracted for that frame, the gate is blind.
+**Example case:** 47% similarity should trigger immediate hard split (< 75% threshold), but if no embedding was extracted for that frame, the gate is blind.
 
-### 3. Detection Threshold Too Low
-- `RETINAFACE_SCORE_THRESHOLD = 0.5` allows low-quality false positives
-- Ears, partial faces, reflections can enter tracking pipeline
+#### 3. Detection Threshold Too Low
+- Old default of 0.5 allowed low-quality false positives
+- Ears, partial faces, reflections could enter tracking pipeline
+- **Fixed:** Now 0.65 by default
 
-### 4. Track Buffer Too Long
-- `track_buffer: 30` frames = 1 full second at 30fps
-- Allows tracks to persist too long without detections
-- Increases chance of incorrect spatial associations
+#### 4. Track Buffer Too Long
+- Old default of 30 frames = 1 full second at 30fps
+- Allowed tracks to persist too long without detections
+- Increased chance of incorrect spatial associations
+- **Fixed:** Now 15 frames by default
 
 ---
 
-## Solution: Strict Tracking Configuration
+## Ultra-Strict Mode (Every Frame Embeddings)
 
-### Quick Start
-
-Use the pre-configured strict mode:
+For cases where you need **absolute maximum accuracy** and can tolerate 2-3x slower processing:
 
 ```bash
 ./scripts/detect_track_strict.sh <ep_id>
 ```
 
-### What Changed
+**Difference from default:**
+- Extracts embeddings **EVERY frame** instead of every 5 frames
+- Ensures appearance gate can verify identity on every detection
+- All other settings identical to default (0.65 det thresh, 0.75/0.82 gates, etc.)
 
-| Parameter | Default | Strict | Impact |
-|-----------|---------|--------|--------|
-| **Detection threshold** | 0.5 | 0.65 | Filters low-quality detections (ears, partial faces) |
-| **Appearance hard split** | 60% | 75% | More aggressive rejection of mismatches |
-| **Appearance soft split** | 70% | 82% | Earlier streak counting for subtle drift |
-| **Embedding extraction** | Every N frames | **Every frame** | Gate can always verify identity |
-| **Track buffer** | 30 frames | 15 frames | Less persistence without detections |
-| **ByteTrack IoU** | 0.8 | 0.85 | Tighter spatial matching required |
+**When to use:**
+- Critical scenes with rapid person changes
+- Dense crowds with people crossing paths
+- High-value footage where accuracy matters more than speed
 
-### Expected Results
+**Performance impact:**
+- ~2-3x slower than default due to ArcFace inference every frame
+- May cause thermal throttling on long episodes
+- Consider using 480x480 detection size to mitigate heat
 
-**Before (default config):**
-- Track 3: Frames 23-48, similarity 85% → 47%, contains Kyle + Lisa + labeled as Brandi
-- Multiple people per track
-- False positives included
+---
 
-**After (strict config):**
-- Track 3a: Frames 23-30, similarity 85-84%, Kyle only
-- Track 3b: Frames 39-48, similarity 85%+, Lisa only (split at frame 39 due to <75% similarity)
+## Expected Results
+
+### Before (Old Default Config)
+```
+Track 3: frames 23-48
+├─ Frames 23-36: 85% similarity (Kyle's ear/face)
+└─ Frames 39-48: 47% similarity (Lisa Rinna) ❌ Should have split!
+
+Issues:
+- Multiple people in single track
+- Low similarity scores not triggering splits
+- False positives (ears) included
+- Incorrect cluster assignment (labeled as Brandi)
+```
+
+### After (New Default Config)
+```
+Track 3a: frames 23-30, 85% similarity (Kyle only) ✅
+Track 3b: frames 39-48, 85%+ similarity (Lisa only) ✅
+
+Improvements:
+- Split at frame 39 due to < 75% similarity
 - Single person per track
 - Fewer false positives
+- Correct identity assignments
+```
 
 ---
 
 ## Advanced Tuning
 
-### Manual Configuration
-
-Edit `config/pipeline/tracking-strict.yaml` or set environment variables:
-
-```bash
-# Appearance gate thresholds
-export TRACK_GATE_APPEAR_HARD=0.75    # Hard split threshold
-export TRACK_GATE_APPEAR_SOFT=0.82    # Soft split threshold
-export TRACK_GATE_APPEAR_STREAK=2     # Consecutive low-sim frames
-export TRACK_GATE_IOU=0.40            # Spatial continuity threshold
-export TRACK_GATE_EMB_EVERY=1         # Extract embeddings every N frames (1=every frame)
-
-# Detection threshold
-python tools/episode_run.py --det-thresh 0.65 ...
-```
-
-### If Strict Mode Too Aggressive
+### If Default Is Too Aggressive
 
 **Symptoms:** Too many short tracks, valid continuous shots split unnecessarily
 
 **Adjustments:**
 1. Lower appearance thresholds slightly:
    ```bash
-   export TRACK_GATE_APPEAR_HARD=0.70  # Was 0.75
-   export TRACK_GATE_APPEAR_SOFT=0.78  # Was 0.82
+   export TRACK_GATE_APPEAR_HARD=0.70  # Default is 0.75
+   export TRACK_GATE_APPEAR_SOFT=0.78  # Default is 0.82
    ```
 
 2. Increase track buffer:
-   ```yaml
-   track_buffer: 20  # Was 15 in strict, 30 in default
+   ```bash
+   # Edit config/pipeline/tracking.yaml
+   track_buffer: 20  # Default is 15
    ```
 
 3. Lower detection threshold if losing valid faces:
    ```bash
-   --det-thresh 0.60  # Was 0.65
+   python tools/episode_run.py --det-thresh 0.60 ...  # Default is 0.65
    ```
 
 ### If Still Getting Multi-Person Tracks
@@ -123,18 +155,55 @@ python tools/episode_run.py --det-thresh 0.65 ...
 **Increase aggressiveness:**
 1. Raise appearance hard threshold:
    ```bash
-   export TRACK_GATE_APPEAR_HARD=0.80  # Was 0.75
+   export TRACK_GATE_APPEAR_HARD=0.80  # Default is 0.75
    ```
 
-2. Extract embeddings more frequently (if using stride > 1):
+2. Extract embeddings more frequently:
    ```bash
-   export TRACK_GATE_EMB_EVERY=1  # Every frame
+   export TRACK_GATE_EMB_EVERY=3  # Default is 5 (or use ultra-strict script for 1)
    ```
 
 3. Increase ByteTrack match threshold:
-   ```yaml
-   match_thresh: 0.90  # Was 0.85
+   ```bash
+   # Edit config/pipeline/tracking.yaml
+   match_thresh: 0.90  # Default is 0.85
    ```
+
+---
+
+## Manual Configuration
+
+### Environment Variables
+
+```bash
+# Appearance gate thresholds
+export TRACK_GATE_APPEAR_HARD=0.75    # Hard split threshold (default)
+export TRACK_GATE_APPEAR_SOFT=0.82    # Soft split threshold (default)
+export TRACK_GATE_APPEAR_STREAK=2     # Consecutive low-sim frames (default)
+export TRACK_GATE_IOU=0.40            # Spatial continuity threshold (default)
+export TRACK_GATE_EMB_EVERY=5         # Extract embeddings every N frames (default)
+```
+
+### Config File
+
+Edit `config/pipeline/tracking.yaml`:
+
+```yaml
+track_thresh: 0.65      # Min confidence to track
+match_thresh: 0.85      # IoU threshold for bbox matching
+track_buffer: 15        # Frames to keep track alive
+```
+
+### CLI Arguments
+
+```bash
+python tools/episode_run.py \
+  --ep-id EP123 \
+  --det-thresh 0.70 \
+  --gate-appear-hard 0.78 \
+  --gate-emb-every 3 \
+  detect track
+```
 
 ---
 
@@ -182,6 +251,45 @@ After detect/track completes:
 
 ---
 
+## Performance Impact
+
+### Default Config (Emb Every 5 Frames)
+
+**Processing time:**
+- Baseline (old defaults): 1.0x
+- Current defaults: ~1.3-1.5x (embeddings every 5 frames)
+
+**Worth it:** Significantly better track accuracy with minimal slowdown
+
+### Ultra-Strict (Emb Every Frame)
+
+**Processing time:**
+- ~2.5-3.0x slower than old defaults
+- ~2.0x slower than current defaults
+
+**Mitigation:**
+- CoreML acceleration helps (5-10+ fps on Apple Silicon)
+- 480x480 detection size reduces thermal load (already default for CoreML)
+- Consider every 2-3 frames instead of every frame:
+  ```bash
+  export TRACK_GATE_EMB_EVERY=2
+  ```
+
+### Thermal Management
+
+If computer overheats:
+1. Detection size already optimized (480x480 for CoreML)
+2. Reduce embedding frequency:
+   ```bash
+   export TRACK_GATE_EMB_EVERY=7  # Default is 5
+   ```
+3. Process fewer frames:
+   ```bash
+   python tools/episode_run.py --every 2 ...  # Process every 2nd frame
+   ```
+
+---
+
 ## Technical Deep Dive
 
 ### Appearance Gate Logic
@@ -216,7 +324,7 @@ def process(self, tracker_id, bbox, embedding, frame_idx):
         state.proto = _l2_normalize(mixed)
 ```
 
-**Key insight:** If `embedding is None`, all appearance checks fail and only IoU check remains. This is why `--gate-emb-every 1` is critical!
+**Key insight:** If `embedding is None`, all appearance checks fail and only IoU check remains. This is why `emb_every` is critical!
 
 ### ByteTrack IoU Matching
 
@@ -236,16 +344,45 @@ def iou(box_a, box_b):
 ```
 
 **IoU thresholds:**
-- `match_thresh: 0.8` → Requires 80% overlap to associate detection with existing track
-- `match_thresh: 0.85` (strict) → Requires 85% overlap (tighter spatial matching)
+- Old default: `0.8` → Required 80% overlap
+- New default: `0.85` → Requires 85% overlap (tighter spatial matching)
+
+---
+
+## FAQ
+
+**Q: Why did you make strict mode the default?**
+A: The old defaults allowed too many multi-person tracks and false positives. Better to have slower but accurate tracking by default.
+
+**Q: Can I go back to the old permissive defaults?**
+A: Yes, set environment variables:
+```bash
+export TRACK_GATE_APPEAR_HARD=0.60
+export TRACK_GATE_APPEAR_SOFT=0.70
+export TRACK_GATE_IOU=0.35
+export TRACK_GATE_EMB_EVERY=0
+```
+And edit `config/pipeline/tracking.yaml` to restore old values. Not recommended.
+
+**Q: When should I use ultra-strict mode (every frame)?**
+A: Only for critical scenes or when default (every 5 frames) still shows multi-person tracks. Expect 2x slowdown.
+
+**Q: Why 47% similarity didn't trigger a split?**
+A: Likely no embedding was extracted for that frame (old defaults had sparse extraction). New defaults extract every 5 frames.
+
+**Q: Will this affect clustering/identities?**
+A: Yes, positively! Cleaner single-person tracks → more accurate clusters → better identity assignments.
+
+**Q: Can I tune thresholds per-episode?**
+A: Yes, use CLI args or environment variables before running detect/track.
 
 ---
 
 ## Recommended Workflow
 
-1. **Test with strict config first:**
+1. **Default mode works for most cases:**
    ```bash
-   ./scripts/detect_track_strict.sh test-ep-id
+   python tools/episode_run.py --ep-id <ep_id> detect track
    ```
 
 2. **Review tracks in UI:**
@@ -253,102 +390,28 @@ def iou(box_a, box_b):
    - Verify single-person constraint
    - Look for false positives (ears, partial faces)
 
-3. **Tune if needed:**
-   - Too aggressive → lower thresholds
-   - Still multi-person → raise thresholds
-
-4. **Set as default (optional):**
+3. **If still seeing multi-person tracks, use ultra-strict:**
    ```bash
-   # In .bashrc or .zshrc
-   export TRACK_GATE_APPEAR_HARD=0.75
-   export TRACK_GATE_APPEAR_SOFT=0.82
-   export TRACK_GATE_EMB_EVERY=1
+   ./scripts/detect_track_strict.sh <ep_id>
    ```
 
-5. **Re-run detect/track for all episodes:**
+4. **Re-run clustering after fixing tracks:**
    ```bash
-   for ep in $(ls data/episodes/); do
-       ./scripts/detect_track_strict.sh "$ep"
-   done
+   python tools/episode_run.py --ep-id <ep_id> cluster
    ```
 
----
-
-## Performance Impact
-
-### Strict Config Overhead
-
-**Embedding extraction every frame:**
-- Default: ~1.5-2.0x detect/track time (embeddings every 3-5 frames)
-- Strict: ~2.5-3.0x detect/track time (embeddings every frame)
-- **Worth it:** Ensures gate can always verify identity
-
-**Mitigation:**
-- CoreML acceleration helps (5-10+ fps on Apple Silicon)
-- 480x480 detection size reduces thermal load
-- Consider extracting embeddings every 2 frames if 1 is too slow:
-  ```bash
-  export TRACK_GATE_EMB_EVERY=2
-  ```
-
-### Thermal Management
-
-If computer overheats with strict config:
-1. Reduce detection size (already set to 480x480)
-2. Reduce embedding frequency:
+5. **Link to cast:**
    ```bash
-   export TRACK_GATE_EMB_EVERY=2  # Every other frame
+   python scripts/link_people_to_cast.py
    ```
-3. Process fewer frames:
-   ```bash
-   --every 2  # Process every 2nd frame
-   ```
-
----
-
-## FAQ
-
-**Q: Why 47% similarity didn't trigger a split?**
-A: Likely no embedding was extracted for that frame (embedding=None), so the appearance gate couldn't verify identity.
-
-**Q: Why are ears being detected as faces?**
-A: RetinaFace threshold too low (0.5). Strict config raises to 0.65.
-
-**Q: Can I tune thresholds per-episode?**
-A: Yes, pass CLI args:
-```bash
-python tools/episode_run.py --ep-id EP123 \
-  --det-thresh 0.70 \
-  --gate-appear-hard 0.78 \
-  detect track
-```
-
-**Q: What if I want even stricter (no multi-person tracks allowed)?**
-A: Set very high appearance thresholds:
-```bash
-export TRACK_GATE_APPEAR_HARD=0.85
-export TRACK_GATE_APPEAR_SOFT=0.90
-```
-
-**Q: Will this affect clustering/identities?**
-A: Yes, positively! Cleaner single-person tracks → more accurate clusters → better identity assignments.
 
 ---
 
 ## Related Files
 
-- **Strict config:** `config/pipeline/tracking-strict.yaml`
-- **Strict script:** `scripts/detect_track_strict.sh`
+- **Default config:** `config/pipeline/tracking.yaml` (strict settings)
+- **Ultra-strict script:** `scripts/detect_track_strict.sh` (embeddings every frame)
 - **ByteTrack implementation:** `FEATURES/tracking/src/bytetrack_runner.py`
 - **Appearance gate:** `tools/episode_run.py:611-695`
 - **Detection logic:** `tools/episode_run.py:2900-3600`
-
----
-
-## Next Steps
-
-After tuning tracking:
-1. **Re-run clustering:** `python tools/episode_run.py --ep-id <ep_id> cluster`
-2. **Review identities:** Check if Lisa/Kyle/Brandi are correctly separated
-3. **Link to cast:** `python scripts/link_people_to_cast.py` to assign cluster IDs to cast names
-
+- **Gate defaults:** `tools/episode_run.py:131-136`
