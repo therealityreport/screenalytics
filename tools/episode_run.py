@@ -744,10 +744,22 @@ class _TrackerDetections:
 
 def _tracker_inputs_from_samples(detections: list[DetectionSample]) -> _TrackerDetections:
     if detections:
-        boxes = np.vstack([sample.bbox for sample in detections]).astype(np.float32)
-        scores = np.asarray([sample.conf for sample in detections], dtype=np.float32)
-        classes = np.asarray([sample.class_idx for sample in detections], dtype=np.float32)
-        return _TrackerDetections(boxes, scores, classes)
+        # Validate and filter out detections with invalid bboxes before vstack
+        valid_samples: list[DetectionSample] = []
+        for sample in detections:
+            bbox, bbox_err = _safe_bbox_or_none(sample.bbox)
+            if bbox is None:
+                LOGGER.debug("Dropping detection before tracker due to invalid bbox: %s", bbox_err)
+                continue
+            sample.bbox = np.array(bbox, dtype=np.float32)
+            valid_samples.append(sample)
+
+        if valid_samples:
+            boxes = np.vstack([sample.bbox for sample in valid_samples]).astype(np.float32)
+            scores = np.asarray([sample.conf for sample in valid_samples], dtype=np.float32)
+            classes = np.asarray([sample.class_idx for sample in valid_samples], dtype=np.float32)
+            return _TrackerDetections(boxes, scores, classes)
+
     return _TrackerDetections(
         np.zeros((0, 4), dtype=np.float32),
         np.zeros(0, dtype=np.float32),
