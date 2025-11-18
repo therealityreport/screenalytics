@@ -3096,7 +3096,29 @@ def _run_full_pipeline(
                             invalid_bbox_count,
                         )
 
-                    raw_tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+                    # Wrap tracker update in specific try/except to catch NoneType multiply errors
+                    try:
+                        raw_tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+                    except TypeError as e:
+                        msg = str(e)
+                        if "NoneType" in msg and "*" in msg:
+                            LOGGER.error(
+                                "[TRACKER ERROR] Frame %d: NoneType multiply in tracker_adapter.update() with %d validated detections: %s",
+                                frame_idx,
+                                len(validated_detections),
+                                msg,
+                            )
+                            # Log first few detection bboxes for diagnosis
+                            for i, det in enumerate(validated_detections[:3]):
+                                LOGGER.error(
+                                    "[TRACKER ERROR] Detection %d/%d: bbox=%s conf=%.3f",
+                                    i + 1,
+                                    len(validated_detections),
+                                    det.bbox,
+                                    det.conf,
+                                )
+                            raise  # Re-raise to be caught by outer per-frame guard
+                        raise
 
                     # DEBUG: Show tracker output
                     if frames_sampled < 5:
