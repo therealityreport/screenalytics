@@ -172,6 +172,23 @@ POST /jobs/episode_cleanup_async
 
 This spawns `episode_cleanup.py`, streams per-stage summaries to `progress.json`, and publishes `cleanup_report.json` + `track_metrics.json` under `data/manifests/<ep_id>/`.
 
+### Prune orphaned S3 uploads (⚠ episodes)
+
+If the UI still lists deleted episodes with a ⚠ badge (S3 has a video, but the EpisodeStore no longer tracks it), run `tools/prune_orphan_episodes.py` to locate and delete those leftovers:
+
+```bash
+# Preview everything the script would delete (default)
+python tools/prune_orphan_episodes.py
+
+# Target a specific ep_id and actually delete local + S3 assets
+python tools/prune_orphan_episodes.py --ep-id rhobh-s01e01 --apply
+
+# Skip local cleanup or raw video removal when needed
+python tools/prune_orphan_episodes.py --apply --no-local --no-raw
+```
+
+The script enumerates `raw/videos/**/episode.mp4` objects, filters out episodes that still exist in `data/meta/episodes.json`, and removes their local mirrors plus the corresponding S3 prefixes (raw video, frames, crops, manifests, thumbs, analytics). This keeps the Episode Detail browser focused on healthy ✓ entries only.
+
 ### Dependency profiles
 
 - **Core (API/UI/tests):**

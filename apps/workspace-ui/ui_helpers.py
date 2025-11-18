@@ -401,6 +401,33 @@ def render_sidebar_episode_selector() -> str | None:
     if selected_ep_id != current_ep_id:
         set_ep_id(selected_ep_id, rerun=False)
 
+    # Cache clear button
+    st.sidebar.divider()
+    if st.sidebar.button("🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"):
+        import subprocess
+        import shutil
+        from pathlib import Path
+
+        try:
+            # Get the project root (3 levels up from ui_helpers.py)
+            project_root = Path(__file__).resolve().parents[2]
+
+            # Clear __pycache__ directories
+            pycache_count = 0
+            for pycache_dir in project_root.rglob("__pycache__"):
+                shutil.rmtree(pycache_dir, ignore_errors=True)
+                pycache_count += 1
+
+            # Clear .pyc files
+            pyc_count = 0
+            for pyc_file in project_root.rglob("*.pyc"):
+                pyc_file.unlink(missing_ok=True)
+                pyc_count += 1
+
+            st.sidebar.success(f"✅ Cleared {pycache_count} cache dirs, {pyc_count} .pyc files")
+        except Exception as exc:
+            st.sidebar.error(f"Cache clear failed: {exc}")
+
     return selected_ep_id
 
 

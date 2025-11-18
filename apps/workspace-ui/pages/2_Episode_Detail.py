@@ -214,8 +214,29 @@ def _prompt_for_episode() -> None:
         st.warning(f"No episodes found for show '{selected_show}'")
         st.stop()
 
+    tracked_eps = [ep for ep in episodes if ep.get("exists_in_store")]
+    orphan_eps = [ep for ep in episodes if not ep.get("exists_in_store")]
+    show_orphans = True
+    if orphan_eps:
+        default_show = not bool(tracked_eps)
+        show_orphans = st.checkbox(
+            f"Show {len(orphan_eps)} orphan uploads (⚠)",
+            value=default_show,
+            key="episode_detail_show_orphans",
+            help="Orphan uploads are raw S3 videos that were removed from the EpisodeStore. "
+            "Delete them permanently with `python tools/prune_orphan_episodes.py --apply`.",
+        )
+        if not show_orphans and tracked_eps:
+            st.info(
+                f"Hiding {len(orphan_eps)} orphan uploads. Run `python tools/prune_orphan_episodes.py --apply` to remove them."
+            )
+    filtered_episodes = [ep for ep in episodes if show_orphans or ep.get("exists_in_store")]
+    if not filtered_episodes:
+        st.warning("No tracked episodes available. Upload a video or enable orphan view above.")
+        st.stop()
+
     # Episode dropdown
-    episode_options = {ep["ep_id"]: ep for ep in episodes}
+    episode_options = {ep["ep_id"]: ep for ep in filtered_episodes}
     selected_ep_id = st.selectbox(
         "Episode",
         list(episode_options.keys()),
