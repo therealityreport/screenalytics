@@ -3011,13 +3011,13 @@ def _run_full_pipeline(
                 try:
                     # DEBUG: Trace execution at frame start
                     if frames_sampled < 5:
-                        LOGGER.info("[DEBUG] Frame %d START: entering detect/track/crop block", frame_idx)
+                        LOGGER.error("[DEBUG] Frame %d START: entering detect/track/crop block", frame_idx)
 
                     try:
                         detections = detector_backend.detect(frame)
                         # DEBUG: Show detection count
                         if frames_sampled < 5:
-                            LOGGER.info("[DEBUG] Frame %d: detector returned %d detections", frame_idx, len(detections))
+                            LOGGER.error("[DEBUG] Frame %d: detector returned %d detections", frame_idx, len(detections))
                     except Exception as exc:
                         LOGGER.error(
                             "Face detection failed at frame %d for %s: %s",
@@ -3031,7 +3031,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Show face detection count
                     if frames_sampled < 5:
-                        LOGGER.info("[DEBUG] Frame %d: filtered to %d face detections", frame_idx, len(face_detections))
+                        LOGGER.error("[DEBUG] Frame %d: filtered to %d face detections", frame_idx, len(face_detections))
 
                     # Validate detection bboxes before tracking to prevent NoneType multiply errors
                     validated_detections = []
@@ -3067,7 +3067,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Show validation results
                     if frames_sampled < 5:
-                        LOGGER.info(
+                        LOGGER.error(
                             "[DEBUG] Frame %d: after detection bbox validation: %d valid, %d invalid",
                             frame_idx,
                             len(validated_detections),
@@ -3078,7 +3078,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Show tracker output
                     if frames_sampled < 5:
-                        LOGGER.info("[DEBUG] Frame %d: tracker returned %d raw tracked objects", frame_idx, len(raw_tracked_objects))
+                        LOGGER.error("[DEBUG] Frame %d: tracker returned %d raw tracked objects", frame_idx, len(raw_tracked_objects))
 
                     # Validate tracked object bboxes (ByteTrack may return invalid bboxes)
                     tracked_objects = []
@@ -3111,7 +3111,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Log tracked object validation results
                     if frames_sampled < 5:
-                        LOGGER.info(
+                        LOGGER.error(
                             "[DEBUG] Frame %d: after tracked object bbox validation: %d valid, %d invalid",
                             frame_idx,
                             len(tracked_objects),
@@ -3182,7 +3182,7 @@ def _run_full_pipeline(
                         if should_embed_gate and gate_embedder and tracked_objects:
                             # DEBUG: Show gate embedding processing
                             if frames_sampled < 5:
-                                LOGGER.info("[DEBUG] Frame %d: processing gate embeddings for %d tracks", frame_idx, len(tracked_objects))
+                                LOGGER.error("[DEBUG] Frame %d: processing gate embeddings for %d tracks", frame_idx, len(tracked_objects))
 
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
@@ -3293,7 +3293,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Frame processing completed successfully
                     if frames_sampled < 5:
-                        LOGGER.info("[DEBUG] Frame %d END: completed all detect/track/crop processing successfully", frame_idx)
+                        LOGGER.error("[DEBUG] Frame %d END: completed all detect/track/crop processing successfully", frame_idx)
 
                     # === END per-frame detect/track/crop guard ===
                 except TypeError as e:
