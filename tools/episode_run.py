@@ -1054,6 +1054,49 @@ def _letterbox_square(image, size: int = 112, pad_value: int = 127):
     return canvas
 
 
+def _safe_bbox_or_none(bbox: list[float] | np.ndarray) -> tuple[list[float] | None, str | None]:
+    """
+    Validate bbox coordinates are finite numbers before cropping operations.
+
+    Returns:
+        (validated_bbox, error_message) - bbox is None if validation fails
+
+    This prevents NoneType multiplication errors by catching invalid bboxes
+    at call sites before they reach _prepare_face_crop's margin calculations.
+    """
+    if bbox is None:
+        return None, "bbox_is_none"
+
+    try:
+        # Convert to list if numpy array
+        if isinstance(bbox, np.ndarray):
+            bbox_list = bbox.tolist()
+        else:
+            bbox_list = list(bbox)
+
+        # Ensure exactly 4 coordinates
+        if len(bbox_list) != 4:
+            return None, f"bbox_wrong_length_{len(bbox_list)}"
+
+        # Validate each coordinate is a finite number
+        for i, coord in enumerate(bbox_list):
+            if coord is None:
+                return None, f"bbox_coord_{i}_is_none"
+
+            try:
+                val = float(coord)
+                if not np.isfinite(val):
+                    return None, f"bbox_coord_{i}_not_finite_{val}"
+            except (TypeError, ValueError) as e:
+                return None, f"bbox_coord_{i}_invalid_{e}"
+
+        # Return validated bbox as list of floats
+        return [float(c) for c in bbox_list], None
+
+    except Exception as e:
+        return None, f"bbox_validation_error_{e}"
+
+
 def _prepare_face_crop(
     image,
     bbox: list[float],
@@ -3003,6 +3046,17 @@ def _run_full_pipeline(
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
                             for obj in tracked_objects:
+                                # Validate bbox before cropping to prevent NoneType multiply errors
+                                validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
+                                if validated_bbox is None:
+                                    LOGGER.debug(
+                                        "Gate embedding skipped for track %s frame %d: invalid bbox (%s)",
+                                        obj.track_id,
+                                        frame_idx,
+                                        bbox_err,
+                                    )
+                                    continue
+
                                 landmarks_list = None
                                 if obj.landmarks is not None:
                                     landmarks_list = (
@@ -3010,7 +3064,7 @@ def _run_full_pipeline(
                                     )
                                 crop, crop_err = _prepare_face_crop(
                                     frame,
-                                    obj.bbox.tolist(),
+                                    validated_bbox,
                                     landmarks_list,
                                     margin=0.2,
                                 )
@@ -3619,11 +3673,41 @@ def _run_faces_embed_stage(
                     if s3_prefixes and s3_prefixes.get("crops"):
                         crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
 
-            crop, crop_err = _prepare_face_crop(image, bbox, landmarks)
+            # Validate bbox before cropping to prevent NoneType multiply errors
+            validated_bbox, bbox_err = _safe_bbox_or_none(bbox)
+            if validated_bbox is None:
+                rows.append(
+                    _make_skip_face_row(
+                        args.ep_id,
+                        track_id,
+                        frame_idx,
+                        ts_val,
+                        bbox if bbox is not None else [],
+                        detector_choice,
+                        f"invalid_bbox_{bbox_err}",
+                        crop_rel_path=crop_rel_path,
+                        crop_s3_key=crop_s3_key,
+                        thumb_rel_path=thumb_rel_path,
+                        thumb_s3_key=thumb_s3_key,
+                    )
+                )
+                faces_done = min(faces_total, faces_done + 1)
+                progress.emit(
+                    faces_done,
+                    phase="faces_embed",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=embed_device,
+                    extra=_phase_meta(),
+                )
+                continue
+
+            crop, crop_err = _prepare_face_crop(image, validated_bbox, landmarks)
             if image is not None:
                 thumb_rel_path, _ = thumb_writer.write(
                     image,
-                    bbox,
+                    validated_bbox,
                     track_id,
                     frame_idx,
                     prepared_crop=crop,

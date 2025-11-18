@@ -189,3 +189,120 @@ def test_prepare_face_crop_with_invalid_string_coordinates():
     crop, error = _prepare_face_crop(image, bbox, None)
     # Should either succeed (if strings convert to float) or fail gracefully
     assert crop is not None or error is not None, "Should handle string coordinates without crashing"
+
+
+# === Tests for _safe_bbox_or_none validator (regression tests for NoneType multiply prevention) ===
+
+
+def test_safe_bbox_or_none_with_valid_list():
+    """_safe_bbox_or_none should accept valid bbox as list."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    bbox = [100.0, 200.0, 300.0, 400.0]
+    validated, error = _safe_bbox_or_none(bbox)
+
+    assert validated is not None, "Should validate valid bbox"
+    assert error is None, "Should not return error for valid bbox"
+    assert validated == [100.0, 200.0, 300.0, 400.0], "Should return same coordinates"
+
+
+def test_safe_bbox_or_none_with_valid_numpy_array():
+    """_safe_bbox_or_none should accept valid bbox as numpy array."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    bbox = np.array([100.0, 200.0, 300.0, 400.0])
+    validated, error = _safe_bbox_or_none(bbox)
+
+    assert validated is not None, "Should validate valid numpy bbox"
+    assert error is None, "Should not return error for valid numpy bbox"
+    assert validated == [100.0, 200.0, 300.0, 400.0], "Should convert to list"
+
+
+def test_safe_bbox_or_none_with_none_bbox():
+    """_safe_bbox_or_none should reject None bbox."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    validated, error = _safe_bbox_or_none(None)
+
+    assert validated is None, "Should reject None bbox"
+    assert error == "bbox_is_none", f"Expected 'bbox_is_none' error, got: {error}"
+
+
+def test_safe_bbox_or_none_with_none_coordinates():
+    """_safe_bbox_or_none should reject bbox with None coordinates."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    # Test different positions of None
+    test_cases = [
+        ([None, 200.0, 300.0, 400.0], "bbox_coord_0_is_none"),
+        ([100.0, None, 300.0, 400.0], "bbox_coord_1_is_none"),
+        ([100.0, 200.0, None, 400.0], "bbox_coord_2_is_none"),
+        ([100.0, 200.0, 300.0, None], "bbox_coord_3_is_none"),
+    ]
+
+    for bbox, expected_error in test_cases:
+        validated, error = _safe_bbox_or_none(bbox)
+        assert validated is None, f"Should reject bbox {bbox}"
+        assert error == expected_error, f"Expected '{expected_error}' error for {bbox}, got: {error}"
+
+
+def test_safe_bbox_or_none_with_nan_coordinates():
+    """_safe_bbox_or_none should reject bbox with NaN coordinates."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    bbox = [100.0, 200.0, np.nan, 400.0]
+    validated, error = _safe_bbox_or_none(bbox)
+
+    assert validated is None, "Should reject bbox with NaN"
+    assert "bbox_coord_2_not_finite" in error, f"Expected 'not_finite' error, got: {error}"
+
+
+def test_safe_bbox_or_none_with_inf_coordinates():
+    """_safe_bbox_or_none should reject bbox with infinity coordinates."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    bbox = [100.0, 200.0, np.inf, 400.0]
+    validated, error = _safe_bbox_or_none(bbox)
+
+    assert validated is None, "Should reject bbox with infinity"
+    assert "bbox_coord_2_not_finite" in error, f"Expected 'not_finite' error, got: {error}"
+
+
+def test_safe_bbox_or_none_with_wrong_length():
+    """_safe_bbox_or_none should reject bbox with wrong number of coordinates."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    # Too few coordinates
+    bbox_short = [100.0, 200.0, 300.0]
+    validated, error = _safe_bbox_or_none(bbox_short)
+    assert validated is None, "Should reject bbox with 3 coordinates"
+    assert error == "bbox_wrong_length_3", f"Expected 'wrong_length_3' error, got: {error}"
+
+    # Too many coordinates
+    bbox_long = [100.0, 200.0, 300.0, 400.0, 500.0]
+    validated, error = _safe_bbox_or_none(bbox_long)
+    assert validated is None, "Should reject bbox with 5 coordinates"
+    assert error == "bbox_wrong_length_5", f"Expected 'wrong_length_5' error, got: {error}"
+
+
+def test_safe_bbox_or_none_with_string_coordinates():
+    """_safe_bbox_or_none should convert valid string coordinates to floats."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    bbox = ["100", "200", "300", "400"]
+    validated, error = _safe_bbox_or_none(bbox)
+
+    assert validated is not None, "Should validate string bbox that converts to floats"
+    assert error is None, "Should not return error for valid string bbox"
+    assert validated == [100.0, 200.0, 300.0, 400.0], "Should convert strings to floats"
+
+
+def test_safe_bbox_or_none_with_invalid_string_coordinates():
+    """_safe_bbox_or_none should reject bbox with non-numeric strings."""
+    from tools.episode_run import _safe_bbox_or_none
+
+    bbox = [100.0, 200.0, "invalid", 400.0]
+    validated, error = _safe_bbox_or_none(bbox)
+
+    assert validated is None, "Should reject bbox with invalid string"
+    assert "bbox_coord_2_invalid" in error, f"Expected 'invalid' error, got: {error}"

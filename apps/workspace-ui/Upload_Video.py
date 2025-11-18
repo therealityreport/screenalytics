@@ -376,7 +376,7 @@ with st.form("episode-upload"):
             placeholder="rhoslc",
             help="This becomes the show slug used for new episodes",
         )
-        add_show_clicked = st.form_submit_button("Add show", key="upload_add_show_btn")
+        add_show_clicked = st.form_submit_button("Add show")
     else:
         st.session_state.pop("upload_new_show_input", None)
     season_number = st.number_input("Season", min_value=0, max_value=999, value=1, step=1)
