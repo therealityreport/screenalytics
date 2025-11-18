@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import time
+import platform
 from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +83,26 @@ RETINAFACE_SCORE_THRESHOLD = 0.65
 RETINAFACE_NMS = 0.45
 
 RUN_MARKERS_SUBDIR = "runs"
+
+_APPLE_SILICON = sys.platform == "darwin" and platform.machine().lower().startswith(("arm", "aarch64"))
+APPLE_SILICON_HOST = _APPLE_SILICON
+
+
+def _coreml_provider_available() -> bool:
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        providers = ort.get_available_providers()
+    except Exception:
+        return False
+    return any(provider.lower().startswith("coreml") for provider in providers)
+
+
+COREML_PROVIDER_AVAILABLE = _coreml_provider_available()
+if _APPLE_SILICON and not COREML_PROVIDER_AVAILABLE:
+    LOGGER.warning(
+        "CoreMLExecutionProvider unavailable on Apple Silicon. Install onnxruntime-coreml to enable CoreML acceleration."
+    )
 
 
 def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
@@ -299,6 +320,7 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
         is a string label for logging ("cuda", "coreml", or "cpu").
     """
     normalized = (device or "auto").lower()
+    auto_requested = normalized == "auto"
     providers: list[str] = ["CPUExecutionProvider"]
     resolved = "cpu"
 
@@ -323,7 +345,7 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
         return providers, resolved
 
     # Explicit MPS/CoreML request (Apple Silicon)
-    if normalized in {"mps", "metal", "apple"}:
+    if normalized in {"mps", "metal", "apple", "coreml"}:
         requested = ["CoreMLExecutionProvider"]
         providers = _filter_providers(requested, available)
         if "CoreMLExecutionProvider" in providers:
@@ -349,11 +371,21 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
             resolved = "coreml"
             return providers, resolved
 
+    if auto_requested and resolved == "cpu":
+        LOGGER.warning(
+            "device=auto falling back to CPU; accelerator providers unavailable (providers=%s)",
+            available or ["CPUExecutionProvider"],
+        )
     # Fallback to CPU for unknown device values or when no accelerators available
     return providers, resolved
 
 
-def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> tuple[Any, str]:
+def _init_retinaface(
+    model_name: str,
+    device: str,
+    score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
+    coreml_input_size: tuple[int, int] | None = None,
+) -> tuple[Any, str]:
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover - runtime guard
@@ -375,8 +407,10 @@ def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAF
         "det_thresh": float(score_thresh),
     }
     # Use CoreML-specific detection size if available and running on CoreML
-    if resolved == "coreml" and RETINAFACE_COREML_DET_SIZE:
-        prepare_kwargs["input_size"] = RETINAFACE_COREML_DET_SIZE
+    if resolved == "coreml":
+        input_size = coreml_input_size or RETINAFACE_COREML_DET_SIZE
+        if input_size:
+            prepare_kwargs["input_size"] = input_size
     elif RETINAFACE_DET_SIZE:
         prepare_kwargs["input_size"] = RETINAFACE_DET_SIZE
     try:
@@ -1042,18 +1076,30 @@ class StrongSortAdapter:
 
 
 class RetinaFaceDetectorBackend:
-    def __init__(self, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> None:
+    def __init__(
+        self,
+        device: str,
+        score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
+        *,
+        coreml_input_size: tuple[int, int] | None = None,
+    ) -> None:
         self.device = device
         self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
         self.min_area = MIN_FACE_AREA
         self._model = None
         self._resolved_device: Optional[str] = None
+        self._coreml_input_size = coreml_input_size
 
     def _lazy_model(self):
         if self._model is not None:
             return self._model
         try:
-            model, resolved = _init_retinaface(self.model_name, self.device, self.score_thresh)
+            model, resolved = _init_retinaface(
+                self.model_name,
+                self.device,
+                self.score_thresh,
+                coreml_input_size=self._coreml_input_size,
+            )
         except Exception as exc:
             raise RuntimeError(f"{RETINAFACE_HELP} ({exc})") from exc
         self._resolved_device = resolved
@@ -1111,8 +1157,13 @@ class RetinaFaceDetectorBackend:
         return samples
 
 
-def _build_face_detector(detector: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD):
-    return RetinaFaceDetectorBackend(device, score_thresh=score_thresh)
+def _build_face_detector(
+    detector: str,
+    device: str,
+    score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
+    coreml_input_size: tuple[int, int] | None = None,
+):
+    return RetinaFaceDetectorBackend(device, score_thresh=score_thresh, coreml_input_size=coreml_input_size)
 
 
 def _build_tracker_adapter(
@@ -2533,9 +2584,24 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["auto", "cpu", "mps", "cuda"],
+        choices=["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"],
         default="auto",
-        help="Execution device override (auto→CUDA/MPS/CPU)",
+        help="Execution device override (auto→CUDA/CoreML/CPU). Accepts auto/cpu/cuda/mps/coreml/metal/apple.",
+    )
+    parser.add_argument(
+        "--embed-device",
+        choices=["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"],
+        default=None,
+        help="Optional ArcFace/embedding device override. Defaults to --device when omitted.",
+    )
+    parser.add_argument(
+        "--coreml-det-size",
+        type=str,
+        default=None,
+        help=(
+            "Override RetinaFace CoreML input resolution (e.g., 384x384 for an M1/M2 Air, 512x512+ for Pro/Max) "
+            "to trade recall vs thermals on smaller Macs. Only applies when CoreML is the resolved provider."
+        ),
     )
     parser.add_argument(
         "--detector",
@@ -2717,6 +2783,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    coreml_size_arg = getattr(args, "coreml_det_size", None)
+    if coreml_size_arg:
+        args.coreml_det_size = _parse_retinaface_det_size(coreml_size_arg)
+    else:
+        args.coreml_det_size = None
     if hasattr(args, "det_thresh"):
         args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
     args.scene_detector = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
@@ -2923,7 +2994,8 @@ def detect_scene_cuts_pyscenedetect(
             release_handle = getattr(video, "release", None)
             if callable(release_handle):
                 release_handle()
-    return [start.get_frames() for (start, _end) in scenes]
+    # Filter out frame 0 - it's the video start, not a cut
+    return [start.get_frames() for (start, _end) in scenes if start.get_frames() > 0]
 
 
 def detect_scene_cuts(
@@ -3060,7 +3132,12 @@ def _run_full_pipeline(
     args.tracker = tracker_choice
     det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
     args.det_thresh = det_thresh
-    detector_backend = _build_face_detector(detector_choice, device, det_thresh)
+    detector_backend = _build_face_detector(
+        detector_choice,
+        device,
+        det_thresh,
+        coreml_input_size=getattr(args, "coreml_det_size", None),
+    )
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
     tracker_label = tracker_choice
@@ -3952,6 +4029,7 @@ def _run_detect_track_stage(
         else None
     )
 
+    started_at = _utcnow_iso()
     try:
         (
             det_count,
@@ -4018,6 +4096,7 @@ def _run_detect_track_stage(
             "frames_exported": frame_exporter.frames_written if frame_exporter else 0,
             "crops_exported": frame_exporter.crops_written if frame_exporter else 0,
             "device": pipeline_device,
+            "requested_device": args.device,
             "resolved_device": detector_device,
             "analyzed_fps": analyzed_fps,
             "detector": detector_choice,
@@ -4089,6 +4168,38 @@ def _run_detect_track_stage(
         )
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
+        finished_at = _utcnow_iso()
+        _write_run_marker(
+            args.ep_id,
+            "detect_track",
+            {
+                "phase": "detect_track",
+                "status": "success",
+                "version": APP_VERSION,
+                "detections": det_count,
+                "tracks": track_count,
+                "detector": detector_choice,
+                "tracker": tracker_choice,
+                "stride": args.stride,
+                "det_thresh": det_thresh,
+                "max_gap": getattr(args, "max_gap", None),
+                "scene_detector": args.scene_detector,
+                "scene_threshold": args.scene_threshold,
+                "scene_min_len": args.scene_min_len,
+                "scene_warmup_dets": args.scene_warmup_dets,
+                "track_high_thresh": getattr(args, "track_high_thresh", None),
+                "new_track_thresh": getattr(args, "new_track_thresh", None),
+                "fps": analyzed_fps,
+                "save_frames": save_frames,
+                "save_crops": save_crops,
+                "jpeg_quality": jpeg_quality,
+                "device": pipeline_device,
+                "requested_device": args.device,
+                "resolved_device": detector_device,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            },
+        )
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -4128,7 +4239,8 @@ def _run_faces_embed_stage(
         fps_detected=None,
         fps_requested=None,
     )
-    device = pick_device(args.device)
+    requested_embed_device = getattr(args, "embed_device", None) or args.device
+    device = pick_device(requested_embed_device)
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
@@ -4560,6 +4672,7 @@ def _run_faces_embed_stage(
             "ep_id": args.ep_id,
             "faces": len(rows),
             "device": device,
+            "requested_device": requested_embed_device,
             "resolved_device": embed_device,
             "detector": detector_choice,
             "tracker": tracker_choice,
@@ -4616,6 +4729,13 @@ def _run_faces_embed_stage(
                 "status": "success",
                 "version": APP_VERSION,
                 "faces": len(rows),
+                "save_frames": save_frames,
+                "save_crops": save_crops,
+                "jpeg_quality": jpeg_quality,
+                "thumb_size": thumb_writer.size,
+                "device": device,
+                "requested_device": requested_embed_device,
+                "resolved_device": embed_device,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
@@ -5015,6 +5135,7 @@ def _run_cluster_stage(
             "identities_count": len(identity_payload),
             "faces_count": faces_total,
             "device": device,
+            "requested_device": args.device,
             "resolved_device": device,
             "detector": detector_choice,
             "tracker": tracker_choice,
@@ -5065,6 +5186,12 @@ def _run_cluster_stage(
                 "version": APP_VERSION,
                 "faces": faces_total,
                 "identities": len(identity_payload),
+                "cluster_thresh": args.cluster_thresh,
+                "min_cluster_size": args.min_cluster_size,
+                "min_identity_sim": args.min_identity_sim,
+                "device": device,
+                "requested_device": args.device,
+                "resolved_device": device,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,20 @@ _SCENE_DETECTOR_ENV = os.getenv("SCENE_DETECTOR", "pyscenedetect").strip().lower
 if _SCENE_DETECTOR_ENV not in SCENE_DETECTOR_CHOICES:
     _SCENE_DETECTOR_ENV = "pyscenedetect"
 SCENE_DETECTOR_DEFAULT = getattr(episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV)
+try:
+    _CPULIMIT_PERCENT = int(os.environ.get("SCREENALYTICS_CPULIMIT_PERCENT", "250"))
+except ValueError:
+    _CPULIMIT_PERCENT = 0
+
+
+def _maybe_wrap_with_cpulimit(command: list[str]) -> list[str]:
+    """Prefix detect jobs with cpulimit when configured."""
+    if _CPULIMIT_PERCENT <= 0:
+        return command
+    binary = shutil.which("cpulimit")
+    if not binary:
+        return command
+    return [binary, "-l", str(_CPULIMIT_PERCENT), "-i", "--", *command]
 
 
 def _env_float(name: str, default: float) -> float:
@@ -228,8 +243,9 @@ class JobService:
         env = os.environ.copy()
         # Open stderr log for subprocess (will be closed automatically when process exits)
         stderr_file = open(stderr_log_path, "w", encoding="utf-8")  # noqa: SIM115
+        effective_command = _maybe_wrap_with_cpulimit(command)
         proc = subprocess.Popen(
-            command,
+            effective_command,
             cwd=str(PROJECT_ROOT),
             env=env,
             stderr=stderr_file,
@@ -246,7 +262,7 @@ class JobService:
             "ended_at": None,
             "progress_file": str(progress_path),
             "stderr_log": str(stderr_log_path),
-            "command": command,
+            "command": effective_command,
             "requested": requested,
             "summary": None,
             "error": None,
@@ -295,7 +311,7 @@ class JobService:
             raise FileNotFoundError(f"Episode video not found: {video_path}")
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
-        self.ensure_retinaface_ready(detector_value, device, det_thresh)
+        resolved_detect_device = self.ensure_retinaface_ready(detector_value, device, det_thresh)
         progress_path = self._progress_path(ep_id)
         scene_detector_value = self._normalize_scene_detector(scene_detector)
         scene_min_len = max(int(scene_min_len), 1)
@@ -346,6 +362,7 @@ class JobService:
             "stride": stride,
             "fps": fps,
             "device": device,
+            "resolved_detect_device": resolved_detect_device or device,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -384,7 +401,7 @@ class JobService:
         if not track_path.exists():
             raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
         device_value = device or "auto"
-        self.ensure_arcface_ready(device_value)
+        resolved_embed_device = self.ensure_arcface_ready(device_value)
         progress_path = self._progress_path(ep_id)
         command = [
             sys.executable,
@@ -407,6 +424,7 @@ class JobService:
         command += ["--thumb-size", str(thumb_size)]
         requested = {
             "device": device_value,
+            "resolved_embed_device": resolved_embed_device or device_value,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -494,6 +512,9 @@ class JobService:
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
         scene_detector_value = self._normalize_scene_detector(scene_detector)
+        resolved_detect_device = self.ensure_retinaface_ready(detector_value, device, det_thresh)
+        embed_device_value = embed_device or device
+        resolved_embed_device = self.ensure_arcface_ready(embed_device_value)
         progress_path = self._progress_path(ep_id)
         command: List[str] = [
             sys.executable,
@@ -509,7 +530,7 @@ class JobService:
             "--device",
             device,
             "--embed-device",
-            embed_device or device,
+            embed_device_value,
             "--detector",
             detector_value,
             "--tracker",
@@ -555,7 +576,9 @@ class JobService:
             "stride": stride,
             "fps": fps,
             "device": device,
-            "embed_device": embed_device,
+            "resolved_detect_device": resolved_detect_device or device,
+            "embed_device": embed_device_value,
+            "resolved_embed_device": resolved_embed_device or embed_device_value,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -805,34 +828,34 @@ class JobService:
         detector: str,
         device: str,
         det_thresh: float | None,
-    ) -> None:
+    ) -> str | None:
         if detector != "retinaface":
-            return
+            return None
         if episode_run is None:
             raise ValueError(
                 "RetinaFace validation unavailable: install the ML stack (pip install -r requirements-ml.txt) "
                 "before running RetinaFace."
             )
-        ok, error_detail, _ = episode_run.ensure_retinaface_ready(
+        ok, error_detail, resolved = episode_run.ensure_retinaface_ready(
             device,
             det_thresh if det_thresh is not None else None,
         )
         if ok:
-            return
+            return resolved
         message = episode_run.RETINAFACE_HELP
         if error_detail:
             message = f"{message} ({error_detail})"
         raise ValueError(message)
 
-    def ensure_arcface_ready(self, device: str) -> None:
+    def ensure_arcface_ready(self, device: str) -> str | None:
         if episode_run is None:
             raise ValueError(
                 "ArcFace validation unavailable: install the ML stack (pip install -r requirements-ml.txt) "
                 "before running face embedding."
             )
-        ok, error_detail, _ = episode_run.ensure_arcface_ready(device)
+        ok, error_detail, resolved = episode_run.ensure_arcface_ready(device)
         if ok:
-            return
+            return resolved
         message = getattr(
             episode_run,
             "ARC_FACE_HELP",

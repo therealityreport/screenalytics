@@ -10,6 +10,7 @@ import numbers
 import os
 import re
 import time
+import platform
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -88,9 +89,14 @@ LABEL = {
     DEFAULT_TRACKER: "ByteTrack (default)",
     "strongsort": "StrongSORT (ReID)",
 }
-DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
-DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
+DEVICE_LABELS = ["Auto", "CPU", "MPS", "CoreML", "CUDA"]
+DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CoreML": "coreml", "CUDA": "cuda"}
 DEVICE_VALUE_TO_LABEL = {value.lower(): label for label, value in DEVICE_VALUE_MAP.items()}
+DEVICE_VALUE_TO_LABEL["metal"] = "CoreML"
+DEVICE_VALUE_TO_LABEL["apple"] = "CoreML"
+DEVICE_VALUE_TO_LABEL.setdefault("coreml", "CoreML")
+DEVICE_VALUE_TO_LABEL.setdefault("metal", "CoreML")
+DEVICE_VALUE_TO_LABEL.setdefault("apple", "CoreML")
 DETECTOR_OPTIONS = [
     ("RetinaFace (recommended)", DEFAULT_DETECTOR),
 ]
@@ -463,6 +469,46 @@ def api_delete(path: str, **kwargs) -> Dict[str, Any]:
     return resp.json()
 
 
+def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
+    """Fetch TRR canonical metadata for a show from the Postgres backend.
+
+    Args:
+        show_slug: Show identifier (e.g., 'RHOBH', 'RHOSLC')
+
+    Returns:
+        Dict containing:
+        - show: Show metadata object
+        - seasons: List of season objects
+        - episodes: List of episode objects
+        - cast: List of cast member objects
+
+    Raises:
+        RuntimeError: If API base not initialized
+        requests.HTTPError: If API calls fail
+    """
+    # Fetch show metadata first to validate the show exists
+    show = api_get(f"/metadata/shows/{show_slug}")
+
+    # Fetch related data
+    seasons_resp = api_get(f"/metadata/shows/{show_slug}/seasons")
+    episodes_resp = api_get(f"/metadata/shows/{show_slug}/episodes")
+
+    # Cast may not exist yet for all shows; handle 404 gracefully
+    cast_rows = []
+    try:
+        cast_rows = api_get(f"/metadata/shows/{show_slug}/cast")
+    except requests.HTTPError as exc:
+        if exc.response.status_code != 404:
+            raise
+
+    return {
+        "show": show,
+        "seasons": seasons_resp.get("seasons", []),
+        "episodes": episodes_resp.get("episodes", []),
+        "cast": cast_rows,
+    }
+
+
 def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
     url = f"{_api_base()}/episodes/{ep_id}/status"
     try:
@@ -576,9 +622,18 @@ def device_label_index(label: str) -> int:
 def device_label_from_value(value: str | None) -> str:
     if not value:
         return device_default_label()
-    label = DEVICE_VALUE_TO_LABEL.get(value.lower())
+    normalized = str(value).strip().lower()
+    label = DEVICE_VALUE_TO_LABEL.get(normalized)
     if label:
         return label
+    if normalized in {"0", "cuda", "cudaexecutionprovider", "gpu"}:
+        return "CUDA"
+    if normalized in {"coreml", "coremlexecutionprovider", "metal", "apple"}:
+        return "CoreML"
+    if normalized == "mps":
+        return "MPS"
+    if normalized == "auto":
+        return "Auto"
     return device_default_label()
 
 
@@ -703,7 +758,34 @@ def default_cleanup_payload(ep_id: str) -> Dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=1)
+def _onnx_provider_names() -> set[str]:
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        return {provider.lower() for provider in ort.get_available_providers()}
+    except Exception:  # pragma: no cover - onnxruntime optional
+        return set()
+
+
+def _coreml_provider_present() -> bool:
+    return any(name.startswith("coreml") for name in _onnx_provider_names())
+
+
+def _cuda_provider_present() -> bool:
+    return any(name.startswith("cuda") for name in _onnx_provider_names())
+
+
+@lru_cache(maxsize=1)
+def is_apple_silicon() -> bool:
+    return platform.system().lower() == "darwin" and platform.machine().lower().startswith(("arm", "aarch64"))
+
+
 def _guess_device_label() -> str:
+    if _cuda_provider_present():
+        return "CUDA"
+    if _coreml_provider_present():
+        return "CoreML"
     try:
         import torch  # type: ignore
 

@@ -297,7 +297,16 @@ Need the full RetinaFace + ByteTrack pass outside the UI?
 
    - Lower `--stride` (for example `1` or `2`) and higher `--fps` increase recall but also GPU/CPU time.
    - Higher `--stride` or smaller `--fps` are useful for exploratory passes on long episodes.
-   - Device selection order: `auto` → CUDA GPU → Apple `mps` → CPU. Override with `--device cpu` if you need to stay on CPU.
+   - Device selection order: `auto` → CUDA GPU → Apple CoreML (`mps`/`coreml`/`metal`/`apple`) → CPU. Override with `--device cpu` (or `--device coreml`) when you want to pin a specific backend, and watch for warnings if `auto` falls back to CPU because no accelerator providers are available.
+   - Apple Silicon tip: `--coreml-det-size` lets you shrink RetinaFace’s CoreML input tensor (e.g., `384x384` on thermally constrained M1/M2 Airs, `512x512`+ on Pro/Max) to trade accuracy for lower fan noise.
+   - On macOS, make sure ONNX Runtime’s CoreML provider is installed before long runs. You can confirm acceleration with:
+
+     ```bash
+     python - <<'PY'
+     from tools.episode_run import _onnx_providers_for
+     print(_onnx_providers_for("coreml"))
+     PY
+     ```
    - `--scene-detector` (`pyscenedetect` | `internal` | `off`) picks the hard-cut pass. PySceneDetect (default) yields the cleanest resets; the internal HSV histogram fallback matches the legacy behavior. `--scene-threshold` now defaults to `27.0` for PySceneDetect but still accepts `0–2` when you switch to the histogram detector, and `--scene-min-len` / `--scene-warmup-dets` behave as before.
    - Faces harvesting reuses the same RetinaFace detector as detect/track; you can still tune `--min-face-size`, `--min-face-conf`, `--face-validate`, and `--thumb-size` to control filtering and thumbnail outputs.
 

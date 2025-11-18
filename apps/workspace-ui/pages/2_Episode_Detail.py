@@ -491,6 +491,11 @@ if status_payload:
         if st.button("Refresh status", key="episode_status_refresh", use_container_width=True):
             st.rerun()
     st.caption(f"Status refreshed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    coreml_available = status_payload.get("coreml_available")
+    if coreml_available is False and helpers.is_apple_silicon():
+        st.warning(
+            "⚠️ CoreML acceleration isn't available on this host. Install `onnxruntime-coreml` to avoid CPU-only runs."
+        )
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -513,7 +518,11 @@ if status_payload:
         new_track_state = helpers.coerce_float(detect_phase_status.get("new_track_thresh"))
         if new_track_state is not None:
             detect_params.append(f"new_track={new_track_state:.2f}")
-        device_state = detect_phase_status.get("device") or detect_phase_status.get("requested_device")
+        device_state = detect_phase_status.get("device")
+        requested_device_state = detect_phase_status.get("requested_device")
+        resolved_device_state = detect_phase_status.get("resolved_device")
+        if requested_device_state and requested_device_state != device_state:
+            detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
         if device_state:
             detect_params.append(f"device={helpers.device_label_from_value(device_state)}")
         if detect_status_value == "success":
@@ -556,13 +565,20 @@ if status_payload:
                 st.caption(detect_phase_status["error"])
         if detect_params:
             st.caption("Params: " + ", ".join(detect_params))
+        provider_label = helpers.device_label_from_value(resolved_device_state or device_state)
+        if provider_label:
+            st.caption(f"Provider: {provider_label}")
         finished = _format_timestamp(detect_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
 
     with col2:
         faces_params: list[str] = []
-        faces_device_state = faces_phase_status.get("device") or faces_phase_status.get("requested_device")
+        faces_device_state = faces_phase_status.get("device")
+        faces_device_request = faces_phase_status.get("requested_device")
+        faces_resolved_state = faces_phase_status.get("resolved_device")
+        if faces_device_request and faces_device_request != faces_device_state:
+            faces_params.append(f"requested={helpers.device_label_from_value(faces_device_request)}")
         if faces_device_state:
             faces_params.append(f"device={helpers.device_label_from_value(faces_device_state)}")
         save_frames_state = faces_phase_status.get("save_frames")
@@ -596,13 +612,20 @@ if status_payload:
             st.caption("Complete detect/track first.")
         if faces_params:
             st.caption("Params: " + ", ".join(faces_params))
+        faces_provider_label = helpers.device_label_from_value(faces_resolved_state or faces_device_state)
+        if faces_provider_label:
+            st.caption(f"Provider: {faces_provider_label}")
         finished = _format_timestamp(faces_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
 
     with col3:
         cluster_params: list[str] = []
-        cluster_device_state = cluster_phase_status.get("device") or cluster_phase_status.get("requested_device")
+        cluster_device_state = cluster_phase_status.get("device")
+        cluster_device_request = cluster_phase_status.get("requested_device")
+        cluster_resolved_state = cluster_phase_status.get("resolved_device")
+        if cluster_device_request and cluster_device_request != cluster_device_state:
+            cluster_params.append(f"requested={helpers.device_label_from_value(cluster_device_request)}")
         if cluster_device_state:
             cluster_params.append(f"device={helpers.device_label_from_value(cluster_device_state)}")
         cluster_thresh_state = helpers.coerce_float(cluster_phase_status.get("cluster_thresh"))
@@ -631,6 +654,9 @@ if status_payload:
             st.caption("Complete faces harvest first.")
         if cluster_params:
             st.caption("Params: " + ", ".join(cluster_params))
+        cluster_provider_label = helpers.device_label_from_value(cluster_resolved_state or cluster_device_state)
+        if cluster_provider_label:
+            st.caption(f"Provider: {cluster_provider_label}")
         finished = _format_timestamp(cluster_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
@@ -749,6 +775,7 @@ with col_detect:
         "lower values tighten QA, higher values accelerate longer cuts."
     )
     fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=fps_default, step=1.0)
+    st.caption("Frames per second extracted from source video. Lower FPS reduces processing time and storage.")
     # Automatically save to S3
     save_frames = st.checkbox(
         "Save sampled frames",
@@ -763,11 +790,13 @@ with col_detect:
         key="detect_save_crops",
     )
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=jpeg_quality_default, step=5)
+    st.caption("Compression quality for saved face thumbnails and frame images. Higher = better quality, larger files.")
 
     session_prefix = f"episode_detail_detect::{ep_id}"
     max_gap_key = f"{session_prefix}::max_gap"
     max_gap_seed = int(st.session_state.get(max_gap_key, max_gap_default))
     max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=max_gap_seed, step=1)
+    st.caption("Maximum frames a face can be missing before track terminates. Higher values connect tracks across longer occlusions.")
     st.session_state[max_gap_key] = int(max_gap_value)
 
     det_thresh_key = f"{session_prefix}::det_thresh"
@@ -778,8 +807,8 @@ with col_detect:
         max_value=0.9,
         value=float(det_thresh_seed),
         step=0.01,
-        help="Lower thresholds increase recall but may introduce more false positives.",
     )
+    st.caption("Confidence range for valid face detections. Lower values increase recall but may add false positives.")
     st.session_state[det_thresh_key] = float(det_thresh_value)
 
     track_high_default = helpers.coerce_float(detect_job_defaults.get("track_high_thresh"))
@@ -804,9 +833,9 @@ with col_detect:
             "Scene detector",
             helpers.SCENE_DETECTOR_LABELS,
             index=helpers.scene_detector_label_index(scene_detector_seed),
-            help="PySceneDetect uses content detection for accurate hard cuts; switch to HSV fallback or disable if unavailable.",
             key=f"{scene_detector_session_key}::select",
         )
+        st.caption("Automatically detects scene changes/cuts. PySceneDetect uses content detection; HSV is a fallback.")
         scene_detector_value = helpers.scene_detector_value_from_label(scene_detector_label)
         st.session_state[scene_detector_session_key] = scene_detector_value
 
@@ -817,8 +846,8 @@ with col_detect:
             min_value=0.0,
             value=scene_thresh_seed,
             step=0.05,
-            help="PySceneDetect defaults to 27.0 (ContentDetector threshold). HSV fallback expects 0-2 deltas.",
         )
+        st.caption("Sensitivity for detecting scene changes. Lower = more sensitive (detects subtle changes), higher = only hard cuts.")
         st.session_state[scene_thresh_key] = float(scene_threshold_value)
 
         scene_min_key = f"{session_prefix}::scene_min_len"
@@ -830,6 +859,7 @@ with col_detect:
             value=scene_min_seed,
             step=1,
         )
+        st.caption("Prevents rapid consecutive scene cut detections. Enforces minimum gap between detected cuts.")
         st.session_state[scene_min_key] = int(scene_min_len_value)
 
         scene_warmup_key = f"{session_prefix}::scene_warmup"
@@ -840,8 +870,8 @@ with col_detect:
             max_value=25,
             value=scene_warmup_seed,
             step=1,
-            help="Force full detection on the first N frames after each cut",
         )
+        st.caption("Number of 'fresh' detection passes after scene cut. Helps re-establish tracking after scene changes.")
         st.session_state[scene_warmup_key] = int(scene_warmup_value)
 
         if detect_tracker_value == "bytetrack":
@@ -854,8 +884,8 @@ with col_detect:
                 max_value=0.95,
                 value=float(track_high_seed),
                 step=0.01,
-                help="High-confidence gate for extending existing ByteTrack tracks.",
             )
+            st.caption("Confidence threshold for continuing existing tracks. Match must score within this range to extend a track.")
             st.session_state[track_high_session_key] = float(track_high_value)
             track_new_session_key = f"{session_prefix}::new_track_thresh"
             track_new_seed = float(st.session_state.get(track_new_session_key, track_new_default))
@@ -865,8 +895,8 @@ with col_detect:
                 max_value=0.95,
                 value=float(track_new_seed),
                 step=0.01,
-                help="Minimum score required to spawn a new ByteTrack track.",
             )
+            st.caption("Confidence threshold for creating new tracks. Detection must score within this range to start a new track.")
             st.session_state[track_new_session_key] = float(track_new_value)
             st.caption(
                 "Lower thresholds increase recall but may introduce more false tracks; higher thresholds are stricter."
@@ -1058,18 +1088,10 @@ with col_faces:
         key="faces_device_choice",
     )
     faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
-    faces_save_frames = st.checkbox(
-        "Save sampled frames",
-        value=bool(faces_save_frames_default),
-        help="Mirror RGB frames that contain detections for audit/export. Disable to skip writing new frames.",
-        key="faces_save_frames_detail",
-    )
-    faces_save_crops = st.checkbox(
-        "Save face crops to S3",
-        value=bool(faces_save_crops_default),
-        help="Export aligned face crops (recommended when updating facebanks).",
-        key="faces_save_crops_detail",
-    )
+    # Automatically save frames and crops to S3 (no local storage)
+    faces_save_frames = True
+    faces_save_crops = True
+    st.caption("Frames and crops are automatically saved to S3 during harvest.")
     faces_thumb_size_default = int(faces_job_defaults.get("thumb_size") or 256)
     faces_jpeg_quality = st.number_input(
         "JPEG quality",
@@ -1087,10 +1109,18 @@ with col_faces:
         step=32,
         key="faces_thumb_size_detail",
     )
-    if faces_device_value == "mps":
+    if faces_device_value in {"mps", "coreml"}:
         st.caption(
-            "ArcFace embeddings run on CPU when MPS is selected. Tracker/crop export still uses the requested device."
+            "ArcFace embeddings use Apple's CoreML backend on supported hardware and only fall back to CPU "
+            "if the CoreML provider is unavailable."
         )
+    resolved_embed_device = faces_phase_status.get("resolved_device")
+    if isinstance(resolved_embed_device, str) and resolved_embed_device.strip():
+        resolved_embed_device = resolved_embed_device.strip().lower()
+        resolved_label = helpers.device_label_from_value(resolved_embed_device)
+        if resolved_label == helpers.device_default_label() and resolved_embed_device:
+            resolved_label = resolved_embed_device.upper()
+        st.caption(f"Last harvest resolved to **{resolved_label}**.")
     harvest_frame_est = (
         helpers.coerce_int(detect_phase_status.get("frames_exported"))
         or helpers.coerce_int(detect_phase_status.get("sampled_frames"))

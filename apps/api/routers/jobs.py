@@ -81,6 +81,9 @@ async def _reject_legacy_payload(request: Request) -> None:
         raise HTTPException(status_code=400, detail="Stub mode is not supported.")
 
 
+DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
+
+
 class DetectRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     video: str = Field(..., description="Source video path or URL")
@@ -89,7 +92,10 @@ class DetectRequest(BaseModel):
         description="Frame stride for detection sampling (default 4 aligns with detect+track 42-minute runs)",
     )
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    device: DEVICE_LITERAL = Field(
+        "auto",
+        description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
+    )
 
 
 class TrackRequest(BaseModel):
@@ -100,7 +106,10 @@ class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stride: int = Field(4, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    device: DEVICE_LITERAL = Field(
+        "auto",
+        description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
+    )
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
     save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
@@ -164,9 +173,9 @@ class DetectTrackRequest(BaseModel):
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
+    device: DEVICE_LITERAL | None = Field(
         None,
-        description="Execution device (defaults to server auto-detect)",
+        description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
     )
     save_frames: bool = Field(False, description="Export sampled frames alongside crops")
     save_crops: bool = Field(False, description="Export crops to data/frames + S3")
@@ -176,9 +185,9 @@ class FacesEmbedRequest(BaseModel):
 
 class ClusterRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
+    device: DEVICE_LITERAL | None = Field(
         None,
-        description="Execution device (defaults to server auto-detect)",
+        description="Execution device (defaults to server auto-detect with CUDA/CoreML fallbacks)",
     )
     cluster_thresh: float = Field(
         DEFAULT_CLUSTER_SIMILARITY,
@@ -199,8 +208,8 @@ class CleanupJobRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stride: int = Field(4, ge=1, le=50)
     fps: float | None = Field(None, ge=0.0)
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Detect/track device")
-    embed_device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Faces embed device")
+    device: DEVICE_LITERAL = Field("auto", description="Detect/track device (auto→CUDA→CoreML→CPU)")
+    embed_device: DEVICE_LITERAL = Field("auto", description="Faces embed device (supports coreml/metal/apple alias)")
     detector: str = Field(DEFAULT_DETECTOR_ENV, description="Detector backend (retinaface)")
     tracker: str = Field(DEFAULT_TRACKER_ENV, description="Tracker backend")
     max_gap: int = Field(30, ge=1, le=240)
@@ -431,6 +440,16 @@ def _count_lines(path: Path) -> int:
         return 0
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def _load_progress_payload(progress_path: Path | None) -> dict | None:
+    if not progress_path or not progress_path.exists():
+        return None
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _wants_sse(request: Request) -> bool:
@@ -716,12 +735,15 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
 
     detections_count = _count_lines(Path(artifacts["detections"]))
     tracks_count = _count_lines(Path(artifacts["tracks"]))
+    progress_payload = _load_progress_payload(progress_path)
+    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
 
     return {
         "job": "detect_track",
         "ep_id": req.ep_id,
         "command": command,
         "device": req.device,
+        "resolved_device": resolved_device,
         "detector": detector_value,
         "tracker": tracker_value,
         "scene_detector": scene_detector_value,
@@ -768,10 +790,14 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     faces_path = manifests_dir / "faces.jsonl"
     faces_count = _count_lines(faces_path)
     frames_dir = get_path(req.ep_id, "frames_root") / "frames"
+    progress_payload = _load_progress_payload(progress_path)
+    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
     return {
         "job": "faces_embed",
         "ep_id": req.ep_id,
         "faces_count": faces_count,
+        "device": device_value,
+        "resolved_device": resolved_device,
         "artifacts": {
             "faces": str(faces_path),
             "tracks": str(track_path),
@@ -806,11 +832,15 @@ async def run_cluster(req: ClusterRequest, request: Request):
         except json.JSONDecodeError:
             # A partially written identities.json should not break the API response.
             pass
+    progress_payload = _load_progress_payload(progress_path)
+    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
     return {
         "job": "cluster",
         "ep_id": req.ep_id,
         "identities_count": identities_count,
         "faces_count": faces_count,
+        "device": req.device or "auto",
+        "resolved_device": resolved_device,
         "artifacts": {
             "identities": str(identities_path),
             "faces": str(faces_path),

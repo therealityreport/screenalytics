@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
 from py_screenalytics.facebank_seed import select_facebank_seeds, write_facebank_seeds
+from tools import episode_run
 
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
@@ -183,6 +184,13 @@ def _safe_int(value) -> int | None:
         return None
 
 
+def _safe_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _count_nonempty_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -244,6 +252,28 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
         "status": status_value,
         "faces": _safe_int(marker.get("faces")),
         "identities": _safe_int(marker.get("identities")),
+        "detections": _safe_int(marker.get("detections")),
+        "tracks": _safe_int(marker.get("tracks")),
+        "detector": marker.get("detector"),
+        "tracker": marker.get("tracker"),
+        "device": marker.get("device"),
+        "requested_device": marker.get("requested_device"),
+        "resolved_device": marker.get("resolved_device"),
+        "stride": _safe_int(marker.get("stride")),
+        "det_thresh": _safe_float(marker.get("det_thresh")),
+        "max_gap": _safe_int(marker.get("max_gap")),
+        "scene_threshold": _safe_float(marker.get("scene_threshold")),
+        "scene_min_len": _safe_int(marker.get("scene_min_len")),
+        "scene_warmup_dets": _safe_int(marker.get("scene_warmup_dets")),
+        "track_high_thresh": _safe_float(marker.get("track_high_thresh")),
+        "new_track_thresh": _safe_float(marker.get("new_track_thresh")),
+        "save_frames": marker.get("save_frames"),
+        "save_crops": marker.get("save_crops"),
+        "jpeg_quality": _safe_int(marker.get("jpeg_quality")),
+        "thumb_size": _safe_int(marker.get("thumb_size")),
+        "cluster_thresh": _safe_float(marker.get("cluster_thresh")),
+        "min_cluster_size": _safe_int(marker.get("min_cluster_size")),
+        "min_identity_sim": _safe_float(marker.get("min_identity_sim")),
         "started_at": marker.get("started_at"),
         "finished_at": marker.get("finished_at"),
         "version": marker.get("version"),
@@ -264,6 +294,13 @@ def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
         "status": status_value,
         "faces": faces_count,
         "identities": None,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "save_frames": None,
+        "save_crops": None,
+        "jpeg_quality": None,
+        "thumb_size": None,
         "started_at": None,
         "finished_at": None,
         "version": None,
@@ -296,6 +333,12 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         "status": status_value,
         "faces": faces_total,
         "identities": identities_count,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "cluster_thresh": None,
+        "min_cluster_size": None,
+        "min_identity_sim": None,
         "started_at": None,
         "finished_at": None,
         "version": None,
@@ -309,6 +352,9 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     IMPORTANT: Returns the FACE detector (e.g., retinaface), NOT the scene detector.
     Scene detection (pyscenedetect) is a preliminary step, not the main detect/track operation.
     """
+    marker = _load_run_marker(ep_id, "detect_track")
+    if marker:
+        return _phase_status_from_marker("detect_track", marker)
     from py_screenalytics.artifacts import get_path
 
     tracks_path = get_path(ep_id, "tracks")
@@ -358,6 +404,17 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         "tracks": tracks_count,
         "detector": detector,
         "tracker": tracker,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "stride": None,
+        "det_thresh": None,
+        "max_gap": None,
+        "scene_threshold": None,
+        "scene_min_len": None,
+        "scene_warmup_dets": None,
+        "track_high_thresh": None,
+        "new_track_thresh": None,
         "faces": None,
         "identities": None,
         "started_at": None,
@@ -1332,6 +1389,24 @@ class PhaseStatus(BaseModel):
     tracks: int | None = None
     detector: str | None = None
     tracker: str | None = None
+    device: str | None = None
+    requested_device: str | None = None
+    resolved_device: str | None = None
+    stride: int | None = None
+    det_thresh: float | None = None
+    max_gap: int | None = None
+    scene_threshold: float | None = None
+    scene_min_len: int | None = None
+    scene_warmup_dets: int | None = None
+    track_high_thresh: float | None = None
+    new_track_thresh: float | None = None
+    save_frames: bool | None = None
+    save_crops: bool | None = None
+    jpeg_quality: int | None = None
+    thumb_size: int | None = None
+    cluster_thresh: float | None = None
+    min_cluster_size: int | None = None
+    min_identity_sim: float | None = None
     started_at: str | None = None
     finished_at: str | None = None
     version: str | None = None
@@ -1347,6 +1422,7 @@ class EpisodeStatusResponse(BaseModel):
     scenes_ready: bool
     tracks_ready: bool
     faces_harvested: bool
+    coreml_available: bool | None = None
 
 
 class AssetUploadResponse(BaseModel):
@@ -1590,6 +1666,8 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     # faces_harvested: True if faces.jsonl exists and has content
     faces_harvested = faces_status.faces is not None and faces_status.faces > 0
 
+    coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
+
     return EpisodeStatusResponse(
         ep_id=ep_id,
         detect_track=detect_track_status,
@@ -1598,6 +1676,7 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         scenes_ready=scenes_ready,
         tracks_ready=tracks_ready,
         faces_harvested=faces_harvested,
+        coreml_available=coreml_available if isinstance(coreml_available, bool) else None,
     )
 
 

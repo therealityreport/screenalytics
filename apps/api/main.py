@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -14,6 +15,7 @@ from apps.api.routers import (
     grouping,
     identities,
     jobs,
+    metadata,
     people,
     roster,
 )
@@ -40,13 +42,28 @@ app.include_router(files.router, tags=["files"])
 app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
+app.include_router(metadata.router)
 
 
 @app.on_event("startup")
 async def _warmup_retinaface() -> None:
-    ready, detail, _ = episode_run.ensure_retinaface_ready("auto")
-    if not ready:
-        LOGGER.warning("RetinaFace detector not ready: %s", detail)
+    """Launch RetinaFace warmup in background to avoid blocking health checks."""
+
+    async def warmup():
+        """Run the blocking warmup in a thread pool to avoid blocking event loop."""
+        loop = asyncio.get_running_loop()
+        ready, detail, _ = await loop.run_in_executor(
+            None, episode_run.ensure_retinaface_ready, "auto"
+        )
+        if not ready:
+            LOGGER.warning("RetinaFace detector not ready: %s", detail)
+        else:
+            LOGGER.info("RetinaFace detector warmed up successfully")
+
+    # Launch warmup in background without awaiting it
+    # This allows the server to immediately respond to health checks
+    asyncio.create_task(warmup())
+    LOGGER.info("RetinaFace warmup launched in background")
 
 
 @app.get("/health")
@@ -56,4 +73,6 @@ def health() -> dict:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"ok": True}
+    coreml_available = bool(getattr(episode_run, "COREML_PROVIDER_AVAILABLE", False))
+    apple_silicon = bool(getattr(episode_run, "APPLE_SILICON_HOST", False))
+    return {"ok": True, "coreml_available": coreml_available, "apple_silicon": apple_silicon}
