@@ -559,7 +559,17 @@ def _l2_normalize(vec: np.ndarray | None) -> np.ndarray | None:
 def _cosine_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float | None:
     if a is None or b is None:
         return None
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    # Check if arrays contain valid numeric values (no None, NaN, or Inf)
+    try:
+        if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+            return None
+    except (TypeError, ValueError):
+        # Array contains None or other non-numeric values
+        return None
+
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    denom = float(norm_a * norm_b)
     if denom <= 0.0:
         return None
     return float(np.dot(a, b) / denom)
@@ -3219,7 +3229,27 @@ def _run_full_pipeline(
                             if embed_inputs:
                                 encoded = gate_embedder.encode(embed_inputs)
                                 for idx, tid in enumerate(embed_track_ids):
-                                    gate_embeddings[tid] = encoded[idx]
+                                    embedding_vec = encoded[idx]
+                                    # Validate embedding contains finite values before storing
+                                    try:
+                                        if embedding_vec is not None and np.all(np.isfinite(embedding_vec)):
+                                            gate_embeddings[tid] = embedding_vec
+                                        else:
+                                            gate_embeddings[tid] = None
+                                            if embedding_vec is not None:
+                                                LOGGER.warning(
+                                                    "Gate embedding for track %s at frame %d contains invalid values (NaN/Inf/None), discarding",
+                                                    tid,
+                                                    frame_idx,
+                                                )
+                                    except (TypeError, ValueError):
+                                        # Embedding contains None or non-numeric values
+                                        gate_embeddings[tid] = None
+                                        LOGGER.warning(
+                                            "Gate embedding for track %s at frame %d is not a valid numeric array, discarding",
+                                            tid,
+                                            frame_idx,
+                                        )
                         for obj in tracked_objects:
                             gate_embeddings.setdefault(obj.track_id, None)
                         # TODO(perf): Persist gate_embeddings to reuse in faces embed stage.
