@@ -9,6 +9,18 @@ from typing import Any, Dict
 
 import boto3
 import requests
+import os
+
+# Ensure AWS credentials path is set for boto3
+if "AWS_SHARED_CREDENTIALS_FILE" not in os.environ:
+    home = os.path.expanduser("~")
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = f"{home}/.aws/credentials"
+if "AWS_CONFIG_FILE" not in os.environ:
+    home = os.path.expanduser("~")
+    os.environ["AWS_CONFIG_FILE"] = f"{home}/.aws/config"
+
+os.environ.setdefault("STREAMLIT_SERVER_MAX_UPLOAD_SIZE", "5120")
+
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -280,26 +292,105 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
     status_text = st.empty()
     status_text.text(f"Uploading to S3: 0 MB / {file_size / (1024**2):.1f} MB (0%)")
 
-    # Track upload progress
-    uploaded_bytes = [0]  # Use list to allow mutation in callback
-
-    def upload_callback(bytes_amount):
-        uploaded_bytes[0] += bytes_amount
-        progress = uploaded_bytes[0] / file_size
-        progress_bar.progress(min(progress, 1.0))
-        mb_uploaded = uploaded_bytes[0] / (1024**2)
-        mb_total = file_size / (1024**2)
-        status_text.text(f"Uploading to S3: {mb_uploaded:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)")
-
     # Use boto3 for reliable uploads with progress tracking
-    s3_client = boto3.client("s3", region_name="us-east-1")
-    s3_client.upload_fileobj(
-        file_obj,
-        bucket,
-        key,
-        ExtraArgs={"ContentType": content_type},
-        Callback=upload_callback,
-    )
+    # Explicitly load AWS credentials from standard locations
+    try:
+        import boto3.session
+        from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+
+        # Create session that will load credentials from ~/.aws/credentials
+        session = boto3.session.Session()
+
+        # Verify credentials are available before attempting upload
+        credentials = session.get_credentials()
+        if credentials is None:
+            raise NoCredentialsError()
+
+        s3_client = session.client(
+            "s3",
+            region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        )
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise Exception(
+            "AWS credentials not found. Please run 'aws configure' or set "
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
+        ) from e
+
+    # Upload in chunks to maintain Streamlit context and show progress
+    # Using 10MB chunks for good balance between progress updates and performance
+    chunk_size = 10 * 1024 * 1024  # 10 MB
+    uploaded_bytes = 0
+
+    # Use multipart upload for large files
+    if file_size > chunk_size:
+        multipart = s3_client.create_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            ContentType=content_type,
+        )
+        upload_id = multipart["UploadId"]
+
+        parts = []
+        part_number = 1
+
+        try:
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+
+                # Upload this part
+                part = s3_client.upload_part(
+                    Bucket=bucket,
+                    Key=key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=chunk,
+                )
+
+                parts.append({
+                    "PartNumber": part_number,
+                    "ETag": part["ETag"],
+                })
+
+                # Update progress in main thread (where Streamlit context is available)
+                uploaded_bytes += len(chunk)
+                progress = uploaded_bytes / file_size
+                progress_bar.progress(min(progress, 1.0))
+                mb_uploaded = uploaded_bytes / (1024**2)
+                mb_total = file_size / (1024**2)
+                status_text.text(f"Uploading to S3: {mb_uploaded:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)")
+
+                part_number += 1
+
+            # Complete the multipart upload
+            s3_client.complete_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        except Exception as e:
+            # Abort the multipart upload on error
+            s3_client.abort_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+            )
+            raise
+    else:
+        # For small files, use simple put_object
+        data = file_obj.read()
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        uploaded_bytes = len(data)
+        progress_bar.progress(1.0)
+        mb_uploaded = uploaded_bytes / (1024**2)
+        status_text.text(f"Uploading to S3: {mb_uploaded:.1f} MB / {mb_uploaded:.1f} MB (100%)")
 
     # Complete the progress bar
     progress_bar.progress(1.0)

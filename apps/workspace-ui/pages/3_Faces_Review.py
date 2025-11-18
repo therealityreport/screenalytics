@@ -146,11 +146,16 @@ TRACK_PAGE_MEDIUM_SIZE = 75
 TRACK_PAGE_MAX_SIZE = 100
 TRACK_MEDIA_BATCH_LIMIT = 12
 _CAST_CAROUSEL_CACHE_KEY = "cast_carousel_cache"
+_CAST_PEOPLE_CACHE_KEY = "cast_carousel_people_cache"
 _TRACK_MEDIA_CACHE_KEY = "track_media_cache"
 
 
 def _cast_carousel_cache() -> Dict[str, Any]:
     return st.session_state.setdefault(_CAST_CAROUSEL_CACHE_KEY, {})
+
+
+def _cast_people_cache() -> Dict[str, Any]:
+    return st.session_state.setdefault(_CAST_PEOPLE_CACHE_KEY, {})
 
 
 def _track_media_cache() -> Dict[str, Dict[str, Any]]:
@@ -161,7 +166,13 @@ def _track_media_state(ep_id: str, track_id: int) -> Dict[str, Any]:
     cache = _track_media_cache()
     key = f"{ep_id}::{track_id}"
     if key not in cache:
-        cache[key] = {"items": [], "cursor": None, "initialized": False, "sample": None}
+        cache[key] = {
+            "items": [],
+            "cursor": None,
+            "initialized": False,
+            "sample": None,
+            "batch_limit": TRACK_MEDIA_BATCH_LIMIT,
+        }
     return cache[key]
 
 
@@ -642,22 +653,30 @@ def _render_track_media_section(ep_id: str, track_id: int, *, sample: int) -> No
         _reset_track_media_state(ep_id, track_id)
         state = _track_media_state(ep_id, track_id)
     if not state.get("initialized"):
+        batch_limit = TRACK_MEDIA_BATCH_LIMIT
         items, cursor = _fetch_track_media(
             ep_id,
             track_id,
             sample=sample,
-            limit=TRACK_MEDIA_BATCH_LIMIT,
+            limit=batch_limit,
         )
-        state.update({"items": items, "cursor": cursor, "initialized": True, "sample": sample})
+        state.update(
+            {
+                "items": items,
+                "cursor": cursor,
+                "initialized": True,
+                "sample": sample,
+                "batch_limit": batch_limit,
+            }
+        )
 
     items = state.get("items", [])
     cursor = state.get("cursor")
+    batch_limit = int(state.get("batch_limit", TRACK_MEDIA_BATCH_LIMIT))
 
     st.markdown("#### Track crops preview")
     header_cols = st.columns([3, 1])
-    loaded_label = (
-        f"{len(items)} crop{'s' if len(items) != 1 else ''} loaded · first batch size {TRACK_MEDIA_BATCH_LIMIT}"
-    )
+    loaded_label = f"{len(items)} crop{'s' if len(items) != 1 else ''} loaded · batch size {batch_limit}"
     header_cols[0].caption(loaded_label)
     with header_cols[1]:
         if st.button("Refresh track crops", key=f"track_media_refresh_{track_id}"):
@@ -689,13 +708,14 @@ def _render_track_media_section(ep_id: str, track_id: int, *, sample: int) -> No
                 ep_id,
                 track_id,
                 sample=sample,
-                limit=TRACK_MEDIA_BATCH_LIMIT,
+                limit=batch_limit,
                 cursor=cursor,
             )
             if more_items:
                 state["items"].extend(more_items)
             state["cursor"] = next_cursor
             state["sample"] = sample
+            state["batch_limit"] = batch_limit
             st.rerun()
 
 
@@ -709,8 +729,10 @@ def _render_cast_carousel(
     show_key = str(show_id).lower()
     refresh_flag = f"cast_carousel_refresh::{show_key}"
     cache = _cast_carousel_cache()
+    people_cache = _cast_people_cache()
     if st.session_state.pop(refresh_flag, False):
         cache.pop(show_key, None)
+        people_cache.pop(show_key, None)
 
     cast_api_resp = cache.get(show_key)
     if cast_api_resp is None:
@@ -725,7 +747,11 @@ def _render_cast_carousel(
         return
 
     # Get people data to check who has clusters
-    people_resp = _safe_api_get(f"/shows/{show_id}/people")
+    people_resp = people_cache.get(show_key)
+    if people_resp is None:
+        people_resp = _safe_api_get(f"/shows/{show_id}/people")
+        if people_resp:
+            people_cache[show_key] = people_resp
     people = people_resp.get("people", []) if people_resp else []
     people_by_cast_id = {p.get("cast_id"): p for p in people if p.get("cast_id")}
 
@@ -2150,40 +2176,44 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     sample_seeded = sample_key in st.session_state
     if not sample_seeded:
         st.session_state[sample_key] = 1
-    frame_controls = st.columns([1, 1, 2])
-    with frame_controls[0]:
-        prev_sample = st.session_state[sample_key]
+    sample_prev_key = f"{sample_key}::prev"
+    prev_sample = st.session_state.get(sample_prev_key, st.session_state[sample_key])
+    sample_col, page_col, info_col = st.columns([1, 1, 2])
+    with sample_col:
         sample = int(
             st.slider(
                 "Sample every N crops",
                 min_value=1,
                 max_value=20,
-                value=prev_sample,
+                value=st.session_state[sample_key],
                 key=sample_key,
             )
         )
+    sample_changed = sample != prev_sample
+    st.session_state[sample_prev_key] = sample
     page_key = f"track_page_{ep_id}_{track_id}"
     if page_key not in st.session_state:
         st.session_state[page_key] = 1
     page_size_key = f"track_page_size_{ep_id}_{track_id}"
     if page_size_key not in st.session_state:
-        st.session_state[page_size_key] = TRACK_PAGE_BASE_SIZE
-    if sample != prev_sample:
-        st.session_state[page_key] = 1
-        _reset_track_media_state(ep_id, track_id)
-    current_page = int(st.session_state[page_key])
-    with frame_controls[1]:
-        page = int(
-            st.number_input(
-                "Page",
-                min_value=1,
-                value=current_page,
-                step=1,
-                key=page_key,
-            )
-        )
-    page = int(st.session_state[page_key])
+        st.session_state[page_size_key] = _recommended_page_size(st.session_state[sample_key], None)
     page_size = int(st.session_state[page_size_key])
+    if sample_changed:
+        st.session_state[page_key] = 1
+        current_page = 1
+        _reset_track_media_state(ep_id, track_id)
+    else:
+        current_page = int(st.session_state[page_key])
+    with page_col:
+        st.number_input(
+            "Page",
+            min_value=1,
+            value=current_page,
+            step=1,
+            key=page_key,
+        )
+    current_page = int(st.session_state[page_key])
+    page = current_page
     frames_payload = _fetch_track_frames(ep_id, track_id, sample=sample, page=page, page_size=page_size)
     frames = frames_payload.get("items", [])
     best_frame_idx = frames_payload.get("best_frame_idx")
@@ -2197,6 +2227,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     recommended_sample = _suggest_track_sample(candidate_frames)
     if not sample_seeded and sample == 1 and recommended_sample > 1:
         st.session_state[sample_key] = recommended_sample
+        st.session_state[sample_prev_key] = recommended_sample
         st.session_state[page_key] = 1
         _reset_track_media_state(ep_id, track_id)
         st.rerun()
@@ -2206,6 +2237,9 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         st.session_state[page_size_key] = recommended_page_size
         st.session_state[page_key] = 1
         st.rerun()
+    page_size = int(st.session_state[page_size_key])
+    with info_col:
+        st.caption(f"Auto page size: up to {page_size} sampled frames per page (adaptive)")
 
     if page > max_page:
         st.session_state[page_key] = max_page

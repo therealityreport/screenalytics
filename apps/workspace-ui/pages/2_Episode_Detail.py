@@ -66,7 +66,11 @@ def _resolved_device_label(label: str | None) -> str:
     return normalized
 
 
-def _count_manifest_rows(path: Path) -> int | None:
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_count_manifest_rows(path_str: str, mtime: float) -> int | None:
+    """Cache manifest row counts using path+mtime as cache key."""
+    path = Path(path_str)
     if not path.exists():
         return None
     try:
@@ -76,7 +80,10 @@ def _count_manifest_rows(path: Path) -> int | None:
         return None
 
 
-def _manifest_has_rows(path: Path) -> bool:
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_manifest_has_rows(path_str: str, mtime: float) -> bool:
+    """Cache manifest existence check using path+mtime as cache key."""
+    path = Path(path_str)
     if not path.exists() or not path.is_file():
         return False
     try:
@@ -87,6 +94,40 @@ def _manifest_has_rows(path: Path) -> bool:
     except OSError:
         return False
     return False
+
+
+def _count_manifest_rows(path: Path) -> int | None:
+    """Count rows in manifest (cached by path+mtime)."""
+    if not path.exists():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+        return _cached_count_manifest_rows(str(path), mtime)
+    except OSError:
+        return None
+
+
+def _manifest_has_rows(path: Path) -> bool:
+    """Check if manifest has rows (cached by path+mtime)."""
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        mtime = path.stat().st_mtime
+        return _cached_manifest_has_rows(str(path), mtime)
+    except OSError:
+        return False
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_episode_details(ep_id: str, cache_key: float) -> Dict[str, Any]:
+    """Cache episode details API response with 10s TTL."""
+    return helpers.api_get(f"/episodes/{ep_id}")
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_episode_status(ep_id: str, cache_key: float) -> Dict[str, Any] | None:
+    """Cache episode status API response with 10s TTL."""
+    return helpers.get_episode_status(ep_id)
 
 
 def _detect_track_manifests_ready(detections_path: Path, tracks_path: Path) -> dict:
@@ -387,8 +428,11 @@ if running_job_key not in st.session_state:
     st.session_state[running_job_key] = False
 job_running = bool(st.session_state.get(running_job_key))
 
+# Cache API responses with 10s TTL to reduce repeated requests
+cache_key = time.time() // 10
+
 try:
-    details = helpers.api_get(f"/episodes/{ep_id}")
+    details = _cached_episode_details(ep_id, cache_key)
 except requests.HTTPError as exc:
     if exc.response is not None and exc.response.status_code == 404:
         _handle_missing_episode(ep_id)
@@ -398,7 +442,7 @@ except requests.RequestException as exc:
     st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
     st.stop()
 
-status_payload = helpers.get_episode_status(ep_id)
+status_payload = _cached_episode_status(ep_id, cache_key)
 if status_payload is None:
     detect_phase_status: Dict[str, Any] = {}
     faces_phase_status: Dict[str, Any] = {"status": "unknown"}
@@ -473,7 +517,8 @@ faces_ready_state = False
 if faces_status_value == "success":
     if faces_count_value is None and faces_manifest_count is not None:
         faces_count_value = faces_manifest_count
-    faces_ready_state = bool(faces_manifest_count and faces_manifest_count > 0)
+    # Accept success status even with zero faces (successful run with no detections)
+    faces_ready_state = True
 elif faces_status_value in {"missing", "unknown"}:
     if faces_manifest_count and faces_manifest_count > 0:
         faces_ready_state = True
@@ -755,7 +800,10 @@ with col_detect:
     st.markdown("### Detect/Track Faces")
 
     stride_default = int(detect_job_defaults.get("stride") or helpers.DEFAULT_STRIDE)
+    # Prefill FPS from video metadata if available
     fps_default = float(detect_job_defaults.get("fps") or 0.0)
+    if fps_default == 0.0 and video_meta and video_meta.get("fps_detected"):
+        fps_default = float(video_meta["fps_detected"])
     det_thresh_default = float(detect_job_defaults.get("det_thresh") or helpers.DEFAULT_DET_THRESH)
     save_frames_default = detect_job_defaults.get("save_frames")
     if save_frames_default is None:
@@ -903,11 +951,12 @@ with col_detect:
             )
 
     detect_device_choice = st.selectbox(
-        "Device",
+        "Device (for face detection/tracking)",
         helpers.DEVICE_LABELS,
         index=helpers.device_label_index(detect_device_label_default),
         key="detect_device_choice",
     )
+    st.caption("CPU recommended for detection; GPU/CoreML may bottleneck on M-series chips for YOLOv8.")
     detect_device_value = helpers.DEVICE_VALUE_MAP[detect_device_choice]
     detect_device_label = helpers.device_label_from_value(detect_device_value)
 
@@ -923,7 +972,10 @@ with col_detect:
             f"Frames: ≈{helpers.human_size(est_frame_bytes)} for {sampled_frames_est:,} sampled frames (estimate)."
         )
     if save_crops:
-        estimated_faces = helpers.coerce_int(detect_phase_status.get("detections"))
+        # Derive face count from detections manifest for real-time feedback
+        estimated_faces = _count_manifest_rows(detections_path)
+        if estimated_faces is None:
+            estimated_faces = helpers.coerce_int(detect_phase_status.get("detections"))
         if estimated_faces is None and sampled_frames_est:
             estimated_faces = int(sampled_frames_est * AVG_FACES_PER_FRAME)
         if estimated_faces:
@@ -959,6 +1011,7 @@ with col_detect:
             "scene_threshold": float(scene_threshold_value),
             "scene_min_len": int(scene_min_len_value),
             "scene_warmup_dets": int(scene_warmup_value),
+            "cpu_threads": 2,  # Limit CPU threads to reduce contention
         }
     )
     job_payload["detector"] = detect_detector_value
@@ -1082,11 +1135,12 @@ with col_faces:
             )
 
     faces_device_choice = st.selectbox(
-        "Device",
+        "Device (for face embeddings)",
         helpers.DEVICE_LABELS,
         index=helpers.device_label_index(faces_device_label_default),
         key="faces_device_choice",
     )
+    st.caption("CoreML/GPU strongly recommended for ArcFace embeddings; significantly faster than CPU.")
     faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
     # Automatically save frames and crops to S3 (no local storage)
     faces_save_frames = True
@@ -1126,7 +1180,10 @@ with col_faces:
         or helpers.coerce_int(detect_phase_status.get("sampled_frames"))
         or sampled_frames_est
     )
-    harvest_faces_est = helpers.coerce_int(detect_phase_status.get("detections"))
+    # Derive face count from detections manifest for real-time feedback
+    harvest_faces_est = _count_manifest_rows(detections_path)
+    if harvest_faces_est is None:
+        harvest_faces_est = helpers.coerce_int(detect_phase_status.get("detections"))
     if harvest_faces_est is None and harvest_frame_est:
         harvest_faces_est = int(harvest_frame_est * AVG_FACES_PER_FRAME)
     harvest_estimates: list[str] = []
@@ -1251,11 +1308,12 @@ with col_cluster:
     st.markdown("### Cluster Identities")
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
     cluster_device_choice = st.selectbox(
-        "Device",
+        "Device (for clustering)",
         helpers.DEVICE_LABELS,
         index=helpers.device_label_index(cluster_device_label_default),
         key="cluster_device_choice",
     )
+    st.caption("Device for similarity comparisons during clustering; GPU/CoreML provides faster batch processing.")
     cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
     cluster_thresh_value = st.slider(
         "Cluster similarity threshold",
@@ -1296,30 +1354,43 @@ with col_cluster:
                 running_state_key=running_job_key,
             )
             _process_detect_result(summary, error_message)
+
+    # Check if faces harvest succeeded with zero faces
+    zero_faces_success = faces_status_value == "success" and (
+        (faces_count_value is not None and faces_count_value == 0)
+        or (faces_manifest_count == 0)
+    )
+
+    if zero_faces_success:
+        st.info("Faces harvest completed with 0 faces. Clustering is disabled until faces are available.")
     elif not faces_ready:
-        zero_faces_success = faces_status_value == "success" and (
-            (faces_count_value is not None and faces_count_value == 0)
-            or (faces_manifest_count == 0)
-        )
         if faces_status_value == "running":
             st.caption("Faces harvest is running — wait for it to finish before clustering.")
         elif faces_status_value == "error":
             st.error("Faces harvest failed. Rerun harvest to generate embeddings before clustering.")
-        elif zero_faces_success:
-            st.info("Faces harvest completed with 0 faces. Clustering is disabled until faces are available.")
         elif faces_status_value == "success":
             st.warning("Faces manifest not mirrored locally. Mirror artifacts before clustering.")
         else:
             st.caption("Run faces harvest first.")
     elif not detector_face_only:
         st.warning("Current tracks were generated with a legacy detector. Rerun detect/track first.")
-    cluster_disabled = (not faces_ready) or (not detector_face_only) or (not tracks_ready) or job_running
+
+    cluster_disabled = (not faces_ready) or (not detector_face_only) or (not tracks_ready) or job_running or zero_faces_success
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True
         if not local_video_exists:
             can_run_cluster = _ensure_local_artifacts(ep_id, details)
             if can_run_cluster:
                 local_video_exists = True
+        # Ensure faces manifest is mirrored locally before clustering
+        if can_run_cluster and not faces_path.exists():
+            with st.spinner("Mirroring faces manifest from S3…"):
+                try:
+                    helpers.api_post(f"/episodes/{ep_id}/mirror")
+                    st.success("Faces manifest mirrored successfully.")
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/mirror", exc))
+                    can_run_cluster = False
         if can_run_cluster:
             payload = {
                 "ep_id": ep_id,
@@ -1399,8 +1470,8 @@ with col_screen:
                 frames_total = max(int(progress_data.get("frames_total") or 1), 1)
                 st.progress(min(frames_done / frames_total, 1.0))
                 st.caption(f"Frames {frames_done:,} / {frames_total:,}")
-                time.sleep(2)
-                st.rerun()
+                if st.button("Refresh progress", key="refresh_screentime_progress", use_container_width=True):
+                    st.rerun()
             elif job_state == "succeeded":
                 st.success("Screentime analysis complete.")
                 st.caption(f"JSON → {helpers.link_local(helpers.DATA_ROOT / 'analytics' / ep_id / 'screentime.json')}")

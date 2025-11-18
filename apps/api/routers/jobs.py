@@ -169,6 +169,12 @@ class DetectTrackRequest(BaseModel):
         ge=0.0,
         description="Optional ByteTrack min_box_area override",
     )
+    cpu_threads: int | None = Field(
+        None,
+        ge=1,
+        le=16,
+        description="CPU thread limit for ML libraries (OMP, MKL, etc.)",
+    )
 
 
 class FacesEmbedRequest(BaseModel):
@@ -457,8 +463,20 @@ def _wants_sse(request: Request) -> bool:
     return "text/event-stream" in accept
 
 
-def _run_job_with_optional_sse(command: List[str], request: Request, progress_file: Path | None = None):
+def _run_job_with_optional_sse(
+    command: List[str], request: Request, progress_file: Path | None = None, cpu_threads: int | None = None
+):
     env = os.environ.copy()
+    # Apply CPU thread limits if specified
+    if cpu_threads is not None:
+        env["OMP_NUM_THREADS"] = str(cpu_threads)
+        env["MKL_NUM_THREADS"] = str(cpu_threads)
+        env["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+        env["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+        env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+        env["OPENCV_NUM_THREADS"] = str(cpu_threads)
+        env["ORT_INTRA_OP_NUM_THREADS"] = str(cpu_threads)
+        env["ORT_INTER_OP_NUM_THREADS"] = "1"  # Keep inter-op at 1 for stability
     if _wants_sse(request):
         generator = _stream_progress_command(command, env, request, progress_file=progress_file)
         return StreamingResponse(
@@ -729,7 +747,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         req.track_buffer,
         req.min_box_area,
     )
-    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
+    result = _run_job_with_optional_sse(command, request, progress_file=progress_path, cpu_threads=req.cpu_threads)
     if isinstance(result, StreamingResponse):
         return result
 

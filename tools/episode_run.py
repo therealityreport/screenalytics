@@ -19,6 +19,17 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import logging
 
+# Force thread limits before importing ML libraries
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2") 
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+os.environ.setdefault("OPENCV_NUM_THREADS", "2")
+os.environ.setdefault("ORT_INTRA_OP_NUM_THREADS", "2")
+os.environ.setdefault("ORT_INTER_OP_NUM_THREADS", "1")
+
+
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
