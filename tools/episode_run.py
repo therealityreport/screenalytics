@@ -3061,10 +3061,18 @@ def _run_full_pipeline(
                 # Wrap core detect/track/crop logic in targeted TypeError guard to handle
                 # NoneType multiplication errors from malformed bboxes or margins.
                 # If a frame fails with NoneType multiply error, skip it and continue processing.
+
+                # Quarantine: Capture state for diagnostics if TypeError occurs
+                quarantine_detections: list[tuple[np.ndarray, float]] = []
+                quarantine_tracks: list[tuple[int, np.ndarray, float]] = []
+                quarantine_stage = "init"
+
                 try:
                     # DEBUG: Trace execution at frame start
                     if frames_sampled < 5:
                         LOGGER.error("[DEBUG] Frame %d START: entering detect/track/crop block", frame_idx)
+
+                    quarantine_stage = "detection"
 
                     try:
                         detections = detector_backend.detect(frame)
@@ -3126,6 +3134,10 @@ def _run_full_pipeline(
                             len(validated_detections),
                             invalid_bbox_count,
                         )
+
+                    # Quarantine: Capture validated detections for diagnostics
+                    quarantine_detections = [(det.bbox, float(det.conf)) for det in validated_detections[:10]]
+                    quarantine_stage = "tracking"
 
                     # Wrap tracker update in specific try/except to catch NoneType multiply errors
                     try:
@@ -3192,6 +3204,13 @@ def _run_full_pipeline(
                             len(tracked_objects),
                             invalid_track_count,
                         )
+
+                    # Quarantine: Capture validated tracks for diagnostics
+                    quarantine_tracks = [
+                        (obj.track_id, obj.bbox, float(obj.conf) if obj.conf is not None else 0.0)
+                        for obj in tracked_objects[:10]
+                    ]
+                    quarantine_stage = "gate_and_crop"
 
                     diag_stats = _diagnostic_stats(len(validated_detections), len(tracked_objects))
                     last_diag_stats = diag_stats
@@ -3399,19 +3418,92 @@ def _run_full_pipeline(
                         import traceback
                         tb_str = traceback.format_exc()
 
+                        # Build quarantine report with specific detection/track data
+                        quarantine_report = {
+                            "frame": frame_idx,
+                            "stage": quarantine_stage,
+                            "error": msg,
+                            "detections_count": len(quarantine_detections),
+                            "tracks_count": len(quarantine_tracks),
+                        }
+
+                        # Log detailed quarantine information
                         LOGGER.error(
-                            "[DEBUG] ❌ CAUGHT NoneType multiply error at frame %d for %s: %s\n"
-                            "[DEBUG] Full traceback:\n%s",
+                            "[QUARANTINE] ❌ NoneType multiply at frame %d (stage=%s) for %s: %s",
                             frame_idx,
+                            quarantine_stage,
                             args.ep_id,
                             msg,
-                            tb_str,
                         )
+
+                        # Log detection bboxes that were in play
+                        if quarantine_detections:
+                            LOGGER.error(
+                                "[QUARANTINE] Detections (%d) at frame %d:",
+                                len(quarantine_detections),
+                                frame_idx,
+                            )
+                            for idx, (bbox, conf) in enumerate(quarantine_detections[:5]):
+                                bbox_safe = bbox.tolist() if hasattr(bbox, 'tolist') else bbox
+                                LOGGER.error(
+                                    "[QUARANTINE]   Det %d: bbox=%s conf=%.3f",
+                                    idx,
+                                    bbox_safe,
+                                    conf,
+                                )
+                            quarantine_report["sample_detections"] = [
+                                {"bbox": bbox.tolist() if hasattr(bbox, 'tolist') else bbox, "conf": conf}
+                                for bbox, conf in quarantine_detections[:5]
+                            ]
+
+                        # Log track bboxes that were in play
+                        if quarantine_tracks:
+                            LOGGER.error(
+                                "[QUARANTINE] Tracks (%d) at frame %d:",
+                                len(quarantine_tracks),
+                                frame_idx,
+                            )
+                            for idx, (track_id, bbox, conf) in enumerate(quarantine_tracks[:5]):
+                                bbox_safe = bbox.tolist() if hasattr(bbox, 'tolist') else bbox
+                                LOGGER.error(
+                                    "[QUARANTINE]   Track %d (tid=%d): bbox=%s conf=%.3f",
+                                    idx,
+                                    track_id,
+                                    bbox_safe,
+                                    conf,
+                                )
+                            quarantine_report["sample_tracks"] = [
+                                {"track_id": tid, "bbox": bbox.tolist() if hasattr(bbox, 'tolist') else bbox, "conf": conf}
+                                for tid, bbox, conf in quarantine_tracks[:5]
+                            ]
+
+                        # Log full traceback
+                        LOGGER.error("[QUARANTINE] Full traceback:\n%s", tb_str)
+
                         # Track crop errors for diagnostics
                         if last_diag_stats is None:
                             last_diag_stats = _diagnostic_stats(0, 0)
                         skipped = last_diag_stats.get("skipped_none_multiply", 0)
                         last_diag_stats["skipped_none_multiply"] = skipped + 1
+
+                        # Emit quarantine event via progress so it's visible in UI/Health page
+                        if progress:
+                            quarantine_frames, quarantine_meta = _progress_value(frame_idx, include_current=False)
+                            quarantine_extra = dict(quarantine_meta)
+                            quarantine_extra["quarantine"] = quarantine_report
+                            quarantine_extra["skipped_none_multiply"] = last_diag_stats["skipped_none_multiply"]
+                            progress.emit(
+                                quarantine_frames,
+                                phase="track",
+                                device=device,
+                                detector=detector_choice,
+                                tracker=tracker_label,
+                                resolved_device=detector_device,
+                                summary={"event": "none_multiply_skip", "frame": frame_idx, "stage": quarantine_stage},
+                                force=True,
+                                extra=quarantine_extra,
+                            )
+
                         frame_idx += 1
                         frames_since_cut += 1
                         continue
