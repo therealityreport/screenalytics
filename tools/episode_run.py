@@ -3054,7 +3054,37 @@ def _run_full_pipeline(
                             len(face_detections),
                         )
 
-                    tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+                    raw_tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+
+                    # Validate tracked object bboxes (ByteTrack may return invalid bboxes)
+                    tracked_objects = []
+                    invalid_track_count = 0
+                    for track_obj in raw_tracked_objects:
+                        validated_track_bbox, track_bbox_err = _safe_bbox_or_none(track_obj.bbox)
+                        if validated_track_bbox is None:
+                            invalid_track_count += 1
+                            LOGGER.warning(
+                                "Dropping tracked object %s at frame %d for %s: invalid bbox (%s) - bbox=%s",
+                                track_obj.track_id,
+                                frame_idx,
+                                args.ep_id,
+                                track_bbox_err,
+                                track_obj.bbox,
+                            )
+                            continue
+                        # Update track object with validated bbox
+                        track_obj.bbox = np.array(validated_track_bbox)
+                        tracked_objects.append(track_obj)
+
+                    if invalid_track_count > 0:
+                        LOGGER.info(
+                            "Frame %d for %s: dropped %d/%d tracked objects due to invalid bboxes",
+                            frame_idx,
+                            args.ep_id,
+                            invalid_track_count,
+                            len(raw_tracked_objects),
+                        )
+
                     diag_stats = _diagnostic_stats(len(validated_detections), len(tracked_objects))
                     last_diag_stats = diag_stats
                     if progress:
