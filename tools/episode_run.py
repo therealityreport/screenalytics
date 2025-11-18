@@ -588,6 +588,7 @@ def _l2_normalize(vec: np.ndarray | None) -> np.ndarray | None:
 
 
 def _cosine_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float | None:
+    """Compute cosine similarity between two L2-normalized vectors."""
     if a is None or b is None:
         return None
     # Check if arrays contain valid numeric values (no None, NaN, or Inf)
@@ -5043,11 +5044,8 @@ def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
     return model.fit_predict(matrix)
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two L2-normalized vectors."""
-    norm_a = np.linalg.norm(a) + 1e-12
-    norm_b = np.linalg.norm(b) + 1e-12
-    return float(np.dot(a / norm_a, b / norm_b))
+# NOTE: Duplicate _cosine_similarity removed - using single definition at line ~590
+# to prevent function redefinition and ensure validation is always applied.
 
 
 def _remove_low_similarity_outliers(
