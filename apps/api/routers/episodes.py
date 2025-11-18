@@ -842,15 +842,21 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     ctx, prefixes = _require_episode_context(ep_id)
     crops_prefix = (prefixes or {}).get("crops") if prefixes else None
 
-    # Load track centroid for similarity computation
+    # Load track centroid for similarity computation and quality scoring functions
     try:
-        from apps.api.services.track_reps import load_track_reps
+        from apps.api.services.track_reps import (
+            load_track_reps,
+            _extract_quality_metrics,
+            _compute_quality_score,
+        )
         import numpy as np
         track_reps = load_track_reps(ep_id)
         track_rep = track_reps.get(f"track_{track_id:04d}", {})
         track_centroid = np.array(track_rep.get("embed", []), dtype=np.float32) if track_rep else None
     except Exception:
         track_centroid = None
+        _extract_quality_metrics = None
+        _compute_quality_score = None
 
     if not crops and not face_rows:
         return {
@@ -868,6 +874,22 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         start = (page - 1) * page_size
         end = start + page_size
         page_indices = sampled_indices[start:end] if start < total_items else []
+
+        # First pass: compute quality scores for ALL frames to identify best frame
+        best_frame_idx = None
+        best_quality_score = -1.0
+        if _extract_quality_metrics and _compute_quality_score:
+            for idx in frame_indices:
+                meta = face_rows.get(idx, {})
+                if meta.get("skip"):
+                    continue
+                det_score, crop_std, box_area = _extract_quality_metrics(meta)
+                quality_score = _compute_quality_score(det_score, crop_std, box_area)
+                if quality_score > best_quality_score:
+                    best_quality_score = quality_score
+                    best_frame_idx = idx
+
+        # Second pass: build paginated items with quality metadata
         items: List[Dict[str, Any]] = []
         for idx in page_indices:
             meta = face_rows.get(idx, {})
@@ -885,6 +907,18 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     if frame_embed.size == track_centroid.size:
                         similarity = float(np.dot(frame_embed, track_centroid))
 
+            # Extract quality metrics
+            quality = None
+            if _extract_quality_metrics and _compute_quality_score:
+                det_score, crop_std, box_area = _extract_quality_metrics(meta)
+                quality_score = _compute_quality_score(det_score, crop_std, box_area)
+                quality = {
+                    "det_score": round(float(det_score), 3),
+                    "crop_std": round(float(crop_std), 1),
+                    "box_area": round(float(box_area), 1),
+                    "score": round(float(quality_score), 4),
+                }
+
             items.append(
                 {
                     "track_id": track_id,
@@ -899,6 +933,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     "skip": meta.get("skip"),
                     "face_id": meta.get("face_id"),
                     "similarity": similarity,
+                    "quality": quality,
                 }
             )
         return {
@@ -909,8 +944,25 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
             "page": page,
             "page_size": page_size,
             "sample": sample,
+            "best_frame_idx": best_frame_idx,
         }
 
+    # First pass: compute quality scores for ALL frames to identify best frame
+    best_frame_idx = None
+    best_quality_score = -1.0
+    if _extract_quality_metrics and _compute_quality_score:
+        for entry in crops:
+            frame_idx = entry["frame_idx"]
+            meta = face_rows.get(frame_idx, {})
+            if meta.get("skip"):
+                continue
+            det_score, crop_std, box_area = _extract_quality_metrics(meta)
+            quality_score = _compute_quality_score(det_score, crop_std, box_area)
+            if quality_score > best_quality_score:
+                best_quality_score = quality_score
+                best_frame_idx = frame_idx
+
+    # Second pass: build paginated items with quality metadata
     sampled_entries = crops[::sample]
     total_items = len(sampled_entries)
     start = (page - 1) * page_size
@@ -941,6 +993,18 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 if frame_embed.size == track_centroid.size:
                     similarity = float(np.dot(frame_embed, track_centroid))
 
+        # Extract quality metrics
+        quality = None
+        if _extract_quality_metrics and _compute_quality_score and meta:
+            det_score, crop_std, box_area = _extract_quality_metrics(meta)
+            quality_score = _compute_quality_score(det_score, crop_std, box_area)
+            quality = {
+                "det_score": round(float(det_score), 3),
+                "crop_std": round(float(crop_std), 1),
+                "box_area": round(float(box_area), 1),
+                "score": round(float(quality_score), 4),
+            }
+
         items.append(
             {
                 "track_id": track_id,
@@ -955,6 +1019,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 "skip": meta.get("skip"),
                 "face_id": meta.get("face_id"),
                 "similarity": similarity,
+                "quality": quality,
             }
         )
     return {
@@ -965,6 +1030,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         "page": page,
         "page_size": page_size,
         "sample": sample,
+        "best_frame_idx": best_frame_idx,
     }
 
 

@@ -164,6 +164,33 @@ class PeopleService:
 
         return None
 
+    def remove_cluster_from_all_people(
+        self,
+        show_id: str,
+        cluster_id: str,
+    ) -> List[str]:
+        """Remove a cluster from all people in a show.
+
+        Returns list of person_ids that had the cluster removed.
+
+        This ensures single ownership when moving clusters between people.
+        """
+        data = self._load_people(show_id)
+        people = data.get("people", [])
+        modified_person_ids: List[str] = []
+
+        for person in people:
+            cluster_ids = person.get("cluster_ids", [])
+            if cluster_id in cluster_ids:
+                person["cluster_ids"] = [cid for cid in cluster_ids if cid != cluster_id]
+                modified_person_ids.append(person["person_id"])
+
+        if modified_person_ids:
+            data["people"] = people
+            self._save_people(show_id, data)
+
+        return modified_person_ids
+
     def add_cluster_to_person(
         self,
         show_id: str,
@@ -173,7 +200,19 @@ class PeopleService:
         cluster_centroid: Optional[np.ndarray] = None,
         momentum: float = 0.9,
     ) -> Optional[Dict[str, Any]]:
-        """Add a cluster to a person and optionally update prototype."""
+        """Add a cluster to a person and optionally update prototype.
+
+        IMPORTANT: This operation ensures single ownership by first removing
+        the cluster from all other people before adding it to the target person.
+        The operation is idempotent - running it multiple times yields the same result.
+        """
+        # First, remove cluster from all people to ensure single ownership
+        removed_from = self.remove_cluster_from_all_people(show_id, cluster_id)
+        if removed_from:
+            import logging
+            LOGGER = logging.getLogger(__name__)
+            LOGGER.info(f"Removed cluster {cluster_id} from people {removed_from} before reassigning to {person_id}")
+
         person = self.get_person(show_id, person_id)
         if not person:
             return None

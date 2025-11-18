@@ -1287,9 +1287,24 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     page_size = 50
     frames_payload = _fetch_track_frames(ep_id, track_id, sample=sample, page=page, page_size=page_size)
     frames = frames_payload.get("items", [])
+    best_frame_idx = frames_payload.get("best_frame_idx")
     total_sampled = int(frames_payload.get("total") or 0)
     total_frames = int(frames_payload.get("total_frames") or total_sampled)
     max_page = max(1, math.ceil(total_sampled / page_size)) if total_sampled else 1
+
+    # Reorder frames to show best-quality frame first (if present in current page)
+    if best_frame_idx is not None and frames:
+        best_frame = None
+        best_frame_position = None
+        for i, frame in enumerate(frames):
+            if frame.get("frame_idx") == best_frame_idx:
+                best_frame = frame
+                best_frame_position = i
+                break
+
+        if best_frame is not None and best_frame_position is not None and best_frame_position > 0:
+            # Move best frame to the front
+            frames = [best_frame] + frames[:best_frame_position] + frames[best_frame_position + 1:]
     nav_cols = st.columns([1, 1, 3])
     with nav_cols[0]:
         if st.button("Prev page", key=f"track_prev_{track_id}", disabled=page <= 1):
@@ -1378,11 +1393,30 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                     else:
                         st.caption("Crop unavailable.")
                     st.caption(caption)
+                    # Show best-quality frame badge
+                    if frame_idx == best_frame_idx:
+                        st.markdown(
+                            '<span style="background-color: #4CAF50; color: white; padding: 2px 6px; '
+                            'border-radius: 3px; font-size: 0.8em; font-weight: bold;">★ BEST QUALITY</span>',
+                            unsafe_allow_html=True,
+                        )
                     # Show similarity badge if available
                     similarity = frame_meta.get("similarity")
                     if similarity is not None:
                         similarity_badge = _render_similarity_badge(similarity)
                         st.markdown(similarity_badge, unsafe_allow_html=True)
+                    # Show quality score if available
+                    quality = frame_meta.get("quality")
+                    if quality and isinstance(quality, dict):
+                        quality_score = quality.get("score")
+                        if quality_score is not None:
+                            quality_pct = int(quality_score * 100)
+                            quality_color = "#4CAF50" if quality_score >= 0.7 else "#FFA726" if quality_score >= 0.4 else "#EF5350"
+                            st.markdown(
+                                f'<span style="background-color: {quality_color}; color: white; padding: 2px 6px; '
+                                f'border-radius: 3px; font-size: 0.75em;">Q: {quality_pct}%</span>',
+                                unsafe_allow_html=True,
+                            )
                     if skip_reason:
                         st.markdown(f":red[⚠ invalid crop] {skip_reason}")
                     if frame_idx_int is None:

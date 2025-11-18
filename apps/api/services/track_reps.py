@@ -124,16 +124,18 @@ def _load_faces_for_track(ep_id: str, track_id: int) -> List[Dict[str, Any]]:
     return track_faces
 
 
-def _passes_quality_gates(face: Dict[str, Any], crop_path: Optional[str]) -> bool:
-    """Check if a face passes quality gates for representative selection."""
+def _extract_quality_metrics(face: Dict[str, Any]) -> Tuple[float, float, float]:
+    """Extract quality metrics from a face record.
+
+    Returns:
+        (det_score, crop_std, box_area)
+    """
     # Detection confidence
     det_score = face.get("det_score") or face.get("conf") or 0.0
     if not det_score:
         quality = face.get("quality")
         if isinstance(quality, dict):
             det_score = quality.get("det") or 0.0
-    if det_score < REP_DET_MIN:
-        return False
 
     # Crop standard deviation (sharpness)
     std = face.get("crop_std") or 0.0
@@ -141,7 +143,60 @@ def _passes_quality_gates(face: Dict[str, Any], crop_path: Optional[str]) -> boo
         quality = face.get("quality")
         if isinstance(quality, dict):
             std = quality.get("std") or 0.0
-    if std < REP_STD_MIN:
+
+    # Face box area (if available)
+    box = face.get("box") or face.get("bbox")
+    box_area = 0.0
+    if isinstance(box, (list, tuple)) and len(box) == 4:
+        # box format: [x1, y1, x2, y2] or [x, y, w, h]
+        # Assume [x1, y1, x2, y2] format
+        try:
+            width = abs(float(box[2]) - float(box[0]))
+            height = abs(float(box[3]) - float(box[1]))
+            box_area = width * height
+        except (TypeError, ValueError, IndexError):
+            box_area = 0.0
+
+    return float(det_score), float(std), float(box_area)
+
+
+def _compute_quality_score(
+    det_score: float,
+    crop_std: float,
+    box_area: float,
+) -> float:
+    """Compute a weighted quality score for representative frame selection.
+
+    Higher scores = better quality.
+
+    Weights:
+    - Detection confidence: 40%
+    - Sharpness (crop_std): 35%
+    - Face box area: 25%
+    """
+    # Normalize scores to 0-1 range
+    det_norm = min(max(det_score, 0.0), 1.0)
+
+    # Normalize std (higher is sharper, cap at 100 for normalization)
+    std_norm = min(crop_std / 100.0, 1.0)
+
+    # Normalize box area (cap at 100,000 pixels squared)
+    area_norm = min(box_area / 100000.0, 1.0)
+
+    # Weighted combination
+    score = (0.40 * det_norm) + (0.35 * std_norm) + (0.25 * area_norm)
+
+    return float(score)
+
+
+def _passes_quality_gates(face: Dict[str, Any], crop_path: Optional[str]) -> bool:
+    """Check if a face passes minimum quality gates for representative selection."""
+    det_score, crop_std, _ = _extract_quality_metrics(face)
+
+    if det_score < REP_DET_MIN:
+        return False
+
+    if crop_std < REP_STD_MIN:
         return False
 
     # Crop file must exist
@@ -158,15 +213,19 @@ def _passes_quality_gates(face: Dict[str, Any], crop_path: Optional[str]) -> boo
 def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str, Any]]:
     """Compute representative frame and centroid for a track.
 
+    Selects the HIGHEST-QUALITY frame that passes similarity and quality thresholds,
+    not just the first frame that passes gates.
+
     Returns:
         {
             "track_id": "track_0001",
             "rep_frame": 123,
             "crop_key": "crops/track_0001/frame_000123.jpg",
             "embed": [...512-d L2-norm...],
-            "quality": {"det": 0.82, "std": 15.3},
+            "quality": {"det": 0.82, "std": 15.3, "box_area": 12345, "score": 0.87},
             "sim_to_centroid": 0.95,  # optional
-            "low_confidence": true     # optional, when sim < threshold
+            "low_confidence": false,
+            "rep_low_quality": false  # true when had to fall back to low-quality frames
         }
     """
     faces = _load_faces_for_track(ep_id, track_id)
@@ -206,93 +265,94 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     mean_embed = np.mean(embeddings, axis=0)
     track_centroid = l2_normalize(mean_embed)
 
-    # STEP 2: Select representative frame from high-similarity candidates
-    rep_face = None
-    rep_crop_key = None
-    rep_similarity = 0.0
-    low_confidence = False
+    # STEP 2: Score all candidate frames and select the BEST one
+    candidates: List[Tuple[Dict[str, Any], str, float, float]] = []  # (face, crop_path, quality_score, similarity)
 
-    # First pass: try to find a frame that passes quality gates AND similarity threshold
     for face in faces:
         frame_idx = face.get("frame_idx")
         if frame_idx is None:
             continue
 
         crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
-        if not _passes_quality_gates(face, crop_path):
+        if not crop_path:
             continue
 
-        # Check similarity to track centroid
+        # Skip flagged frames
+        if face.get("skip"):
+            continue
+
+        # Extract quality metrics
+        det_score, crop_std, box_area = _extract_quality_metrics(face)
+        quality_score = _compute_quality_score(det_score, crop_std, box_area)
+
+        # Compute similarity to track centroid
         embedding = face.get("embedding")
-        if not embedding:
-            continue
+        similarity = 0.0
+        if embedding:
+            face_embed = np.array(embedding, dtype=np.float32)
+            similarity = cosine_similarity(face_embed, track_centroid)
 
-        face_embed = np.array(embedding, dtype=np.float32)
-        similarity = cosine_similarity(face_embed, track_centroid)
+        candidates.append((face, crop_path, quality_score, similarity))
 
-        if similarity >= REP_MIN_SIM_TO_CENTROID:
-            rep_face = face
-            rep_crop_key = crop_path
-            rep_similarity = similarity
-            break
+    if not candidates:
+        LOGGER.warning(f"No valid candidates for track {track_id} in {ep_id}")
+        return None
 
-    # Second pass: if no high-similarity frame, fall back to any quality-passing frame
-    if not rep_face:
-        for face in faces:
-            frame_idx = face.get("frame_idx")
-            if frame_idx is None:
-                continue
+    # First pass: find best frame that passes BOTH quality gates AND similarity threshold
+    high_quality_candidates = [
+        (face, crop_path, quality_score, similarity)
+        for face, crop_path, quality_score, similarity in candidates
+        if _passes_quality_gates(face, crop_path) and similarity >= REP_MIN_SIM_TO_CENTROID
+    ]
 
-            crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
-            if _passes_quality_gates(face, crop_path):
-                embedding = face.get("embedding")
-                if embedding:
-                    face_embed = np.array(embedding, dtype=np.float32)
-                    rep_similarity = cosine_similarity(face_embed, track_centroid)
-                rep_face = face
-                rep_crop_key = crop_path
-                low_confidence = True  # Mark as low confidence since sim < threshold
-                LOGGER.info(
-                    "Track %d: using fallback rep with sim %.3f < %.3f",
-                    track_id,
-                    rep_similarity,
-                    REP_MIN_SIM_TO_CENTROID,
-                )
-                break
+    rep_face = None
+    rep_crop_key = None
+    rep_similarity = 0.0
+    rep_quality_score = 0.0
+    low_confidence = False
+    rep_low_quality = False
 
-    # Final fallback: any available crop
-    if not rep_face:
-        for face in faces:
-            frame_idx = face.get("frame_idx")
-            if frame_idx is None:
-                continue
-            crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
-            if crop_path:
-                embedding = face.get("embedding")
-                if embedding:
-                    face_embed = np.array(embedding, dtype=np.float32)
-                    rep_similarity = cosine_similarity(face_embed, track_centroid)
-                rep_face = face
-                rep_crop_key = crop_path
-                low_confidence = True
-                break
+    if high_quality_candidates:
+        # Sort by quality score (descending) and pick the best
+        high_quality_candidates.sort(key=lambda x: x[2], reverse=True)
+        rep_face, rep_crop_key, rep_quality_score, rep_similarity = high_quality_candidates[0]
+    else:
+        # Second pass: find best frame that passes quality gates (ignore similarity)
+        quality_only_candidates = [
+            (face, crop_path, quality_score, similarity)
+            for face, crop_path, quality_score, similarity in candidates
+            if _passes_quality_gates(face, crop_path)
+        ]
+
+        if quality_only_candidates:
+            quality_only_candidates.sort(key=lambda x: x[2], reverse=True)
+            rep_face, rep_crop_key, rep_quality_score, rep_similarity = quality_only_candidates[0]
+            low_confidence = True
+            LOGGER.info(
+                "Track %d: using quality-only rep with sim %.3f < %.3f",
+                track_id,
+                rep_similarity,
+                REP_MIN_SIM_TO_CENTROID,
+            )
+        else:
+            # Final fallback: pick best available frame by quality score (no gates)
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            rep_face, rep_crop_key, rep_quality_score, rep_similarity = candidates[0]
+            low_confidence = True
+            rep_low_quality = True
+            LOGGER.warning(
+                "Track %d: using low-quality fallback rep (score=%.3f, sim=%.3f)",
+                track_id,
+                rep_quality_score,
+                rep_similarity,
+            )
 
     if not rep_face:
         LOGGER.warning(f"No representative found for track {track_id} in {ep_id}")
         return None
 
-    # Extract quality metrics
-    det_score = rep_face.get("det_score") or rep_face.get("conf") or 0.0
-    if not det_score:
-        quality = rep_face.get("quality")
-        if isinstance(quality, dict):
-            det_score = quality.get("det") or 0.0
-
-    std = rep_face.get("crop_std") or 0.0
-    if not std:
-        quality = rep_face.get("quality")
-        if isinstance(quality, dict):
-            std = quality.get("std") or 0.0
+    # Extract final quality metrics
+    det_score, crop_std, box_area = _extract_quality_metrics(rep_face)
 
     result = {
         "track_id": f"track_{track_id:04d}",
@@ -301,7 +361,9 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         "embed": track_centroid.tolist(),
         "quality": {
             "det": round(float(det_score), 3),
-            "std": round(float(std), 1),
+            "std": round(float(crop_std), 1),
+            "box_area": round(float(box_area), 1),
+            "score": round(float(rep_quality_score), 4),
         },
     }
 
@@ -310,6 +372,9 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
 
     if low_confidence:
         result["low_confidence"] = True
+
+    if rep_low_quality:
+        result["rep_low_quality"] = True
 
     return result
 
