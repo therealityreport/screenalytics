@@ -16,11 +16,7 @@ from run_retinaface import run_detection  # noqa: E402
 
 def test_detection_config_keys_present():
     cfg_path = REPO_ROOT / "config" / "pipeline" / "detection.yaml"
-    data = (
-        yaml.safe_load(cfg_path.read_text())
-        if yaml
-        else _fallback_parse(cfg_path.read_text())
-    )
+    data = yaml.safe_load(cfg_path.read_text()) if yaml else _fallback_parse(cfg_path.read_text())
     assert {"model_id", "min_size", "confidence_th", "iou_th"}.issubset(data.keys())
 
 
@@ -63,9 +59,7 @@ def test_run_detection_with_plan(tmp_path):
     out_path = tmp_path / "detections.jsonl"
     cfg = {"model_id": "retinaface_r50", "force_simulated": True}
     dummy_video = tmp_path / "dummy.mp4"
-    dummy_video.write_bytes(
-        b"not-a-video"
-    )  # never consumed because plan has image_path
+    dummy_video.write_bytes(b"not-a-video")  # never consumed because plan has image_path
     count = run_detection(
         ep_id="ep1",
         video_path=dummy_video,

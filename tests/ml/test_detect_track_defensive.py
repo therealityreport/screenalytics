@@ -71,9 +71,7 @@ def test_prepare_face_crop_with_none_bbox():
     crop, error = _prepare_face_crop(image, bbox, None)
     assert crop is None, "Should return None crop for invalid bbox"
     assert error is not None, "Should return error message"
-    assert (
-        "invalid_bbox_none_values" in error
-    ), f"Expected 'invalid_bbox_none_values' in error, got: {error}"
+    assert "invalid_bbox_none_values" in error, f"Expected 'invalid_bbox_none_values' in error, got: {error}"
 
 
 def test_prepare_face_crop_with_partial_none_bbox():
@@ -108,9 +106,7 @@ def test_prepare_face_crop_with_invalid_margin():
     # Should not crash with None margin - uses default (0.15)
     crop, error = _prepare_face_crop(image, bbox, None, margin=None)
     # Either succeeds with default margin or fails gracefully
-    assert (
-        crop is not None or error is not None
-    ), "Should handle None margin without crashing"
+    assert crop is not None or error is not None, "Should handle None margin without crashing"
 
 
 def test_prepare_face_crop_with_string_margin():
@@ -123,9 +119,7 @@ def test_prepare_face_crop_with_string_margin():
     # Should not crash with string margin - uses default (0.15)
     crop, error = _prepare_face_crop(image, bbox, None, margin="invalid")
     # Either succeeds with default margin or fails gracefully
-    assert (
-        crop is not None or error is not None
-    ), "Should handle string margin without crashing"
+    assert crop is not None or error is not None, "Should handle string margin without crashing"
 
 
 def test_prepare_face_crop_with_negative_margin():
@@ -138,9 +132,7 @@ def test_prepare_face_crop_with_negative_margin():
     # Negative margin should be clamped to 0.0
     crop, error = _prepare_face_crop(image, bbox, None, margin=-0.5)
     # Should either succeed or fail gracefully (not crash)
-    assert (
-        crop is not None or error is not None
-    ), "Should handle negative margin without crashing"
+    assert crop is not None or error is not None, "Should handle negative margin without crashing"
 
 
 def test_prepare_face_crop_with_valid_inputs():
@@ -153,12 +145,8 @@ def test_prepare_face_crop_with_valid_inputs():
 
     crop, error = _prepare_face_crop(image, bbox, None, margin=0.15)
     # Should succeed (crop might be None if safe_crop fails for other reasons, but no TypeError)
-    assert (
-        error != "invalid_bbox_none_values"
-    ), "Should not report None bbox error for valid bbox"
-    assert "invalid_bbox_coordinates" not in str(
-        error
-    ), "Should not report coordinate error for valid bbox"
+    assert error != "invalid_bbox_none_values", "Should not report None bbox error for valid bbox"
+    assert "invalid_bbox_coordinates" not in str(error), "Should not report coordinate error for valid bbox"
 
 
 def test_prepare_face_crop_adaptive_margin_with_small_face():
@@ -169,17 +157,11 @@ def test_prepare_face_crop_adaptive_margin_with_small_face():
     # Small bbox (50x50 = 2500 px² < 5000 threshold)
     bbox = [100.0, 100.0, 150.0, 150.0]
 
-    crop, error = _prepare_face_crop(
-        image, bbox, None, margin=0.15, adaptive_margin=True
-    )
+    crop, error = _prepare_face_crop(image, bbox, None, margin=0.15, adaptive_margin=True)
     # Should not crash with adaptive margin calculations
-    assert (
-        crop is not None or error is not None
-    ), "Should handle adaptive margin without crashing"
+    assert crop is not None or error is not None, "Should handle adaptive margin without crashing"
     if error:
-        assert (
-            "invalid_bbox" not in error
-        ), f"Should not report bbox error for valid small face, got: {error}"
+        assert "invalid_bbox" not in error, f"Should not report bbox error for valid small face, got: {error}"
 
 
 def test_prepare_face_crop_adaptive_margin_with_large_face():
@@ -190,17 +172,11 @@ def test_prepare_face_crop_adaptive_margin_with_large_face():
     # Large bbox (200x200 = 40000 px² > 15000 threshold)
     bbox = [100.0, 100.0, 300.0, 300.0]
 
-    crop, error = _prepare_face_crop(
-        image, bbox, None, margin=0.15, adaptive_margin=True
-    )
+    crop, error = _prepare_face_crop(image, bbox, None, margin=0.15, adaptive_margin=True)
     # Should not crash with adaptive margin calculations
-    assert (
-        crop is not None or error is not None
-    ), "Should handle adaptive margin without crashing"
+    assert crop is not None or error is not None, "Should handle adaptive margin without crashing"
     if error:
-        assert (
-            "invalid_bbox" not in error
-        ), f"Should not report bbox error for valid large face, got: {error}"
+        assert "invalid_bbox" not in error, f"Should not report bbox error for valid large face, got: {error}"
 
 
 def test_prepare_face_crop_with_invalid_string_coordinates():
@@ -212,9 +188,7 @@ def test_prepare_face_crop_with_invalid_string_coordinates():
 
     crop, error = _prepare_face_crop(image, bbox, None)
     # Should either succeed (if strings convert to float) or fail gracefully
-    assert (
-        crop is not None or error is not None
-    ), "Should handle string coordinates without crashing"
+    assert crop is not None or error is not None, "Should handle string coordinates without crashing"
 
 
 # === Tests for _safe_bbox_or_none validator (regression tests for NoneType multiply prevention) ===
@@ -269,9 +243,7 @@ def test_safe_bbox_or_none_with_none_coordinates():
     for bbox, expected_error in test_cases:
         validated, error = _safe_bbox_or_none(bbox)
         assert validated is None, f"Should reject bbox {bbox}"
-        assert (
-            error == expected_error
-        ), f"Expected '{expected_error}' error for {bbox}, got: {error}"
+        assert error == expected_error, f"Expected '{expected_error}' error for {bbox}, got: {error}"
 
 
 def test_safe_bbox_or_none_with_nan_coordinates():
@@ -282,9 +254,7 @@ def test_safe_bbox_or_none_with_nan_coordinates():
     validated, error = _safe_bbox_or_none(bbox)
 
     assert validated is None, "Should reject bbox with NaN"
-    assert (
-        "bbox_coord_2_not_finite" in error
-    ), f"Expected 'not_finite' error, got: {error}"
+    assert "bbox_coord_2_not_finite" in error, f"Expected 'not_finite' error, got: {error}"
 
 
 def test_safe_bbox_or_none_with_inf_coordinates():
@@ -295,9 +265,7 @@ def test_safe_bbox_or_none_with_inf_coordinates():
     validated, error = _safe_bbox_or_none(bbox)
 
     assert validated is None, "Should reject bbox with infinity"
-    assert (
-        "bbox_coord_2_not_finite" in error
-    ), f"Expected 'not_finite' error, got: {error}"
+    assert "bbox_coord_2_not_finite" in error, f"Expected 'not_finite' error, got: {error}"
 
 
 def test_safe_bbox_or_none_with_wrong_length():
@@ -308,17 +276,13 @@ def test_safe_bbox_or_none_with_wrong_length():
     bbox_short = [100.0, 200.0, 300.0]
     validated, error = _safe_bbox_or_none(bbox_short)
     assert validated is None, "Should reject bbox with 3 coordinates"
-    assert (
-        error == "bbox_wrong_length_3"
-    ), f"Expected 'wrong_length_3' error, got: {error}"
+    assert error == "bbox_wrong_length_3", f"Expected 'wrong_length_3' error, got: {error}"
 
     # Too many coordinates
     bbox_long = [100.0, 200.0, 300.0, 400.0, 500.0]
     validated, error = _safe_bbox_or_none(bbox_long)
     assert validated is None, "Should reject bbox with 5 coordinates"
-    assert (
-        error == "bbox_wrong_length_5"
-    ), f"Expected 'wrong_length_5' error, got: {error}"
+    assert error == "bbox_wrong_length_5", f"Expected 'wrong_length_5' error, got: {error}"
 
 
 def test_safe_bbox_or_none_with_string_coordinates():
@@ -392,9 +356,7 @@ def test_detection_bbox_validation_filters_invalid_before_tracking():
 
     # Assertions
     assert len(raw_detections) == 5, "Should start with 5 raw detections"
-    assert (
-        len(validated_detections) == 2
-    ), "Should have 2 valid detections after filtering"
+    assert len(validated_detections) == 2, "Should have 2 valid detections after filtering"
     assert invalid_count == 3, "Should have dropped 3 invalid detections"
 
     # Validate that remaining detections have valid bboxes
@@ -447,19 +409,13 @@ def test_tracker_inputs_drop_invalid_detections_before_vstack():
     tracker_inputs = _tracker_inputs_from_samples(samples)
 
     # Verify that only 2 valid detections made it through
-    assert (
-        tracker_inputs.xyxy.shape[0] == 2
-    ), f"Expected 2 valid detections, got {tracker_inputs.xyxy.shape[0]}"
+    assert tracker_inputs.xyxy.shape[0] == 2, f"Expected 2 valid detections, got {tracker_inputs.xyxy.shape[0]}"
     assert tracker_inputs.conf.shape[0] == 2
     assert tracker_inputs.cls.shape[0] == 2
 
     # Verify that the valid detections have correct values
-    assert np.isclose(
-        tracker_inputs.conf[0], 0.95
-    ), f"Expected conf[0]=0.95, got {tracker_inputs.conf[0]}"
-    assert np.isclose(
-        tracker_inputs.conf[1], 0.91
-    ), f"Expected conf[1]=0.91, got {tracker_inputs.conf[1]}"
+    assert np.isclose(tracker_inputs.conf[0], 0.95), f"Expected conf[0]=0.95, got {tracker_inputs.conf[0]}"
+    assert np.isclose(tracker_inputs.conf[1], 0.91), f"Expected conf[1]=0.91, got {tracker_inputs.conf[1]}"
 
     # Verify that we can safely perform vstack operation (no TypeError)
     assert tracker_inputs.xyxy.dtype == np.float32
@@ -467,6 +423,4 @@ def test_tracker_inputs_drop_invalid_detections_before_vstack():
     assert tracker_inputs.cls.dtype == np.float32
 
     # Verify that all bbox coordinates are finite
-    assert np.all(
-        np.isfinite(tracker_inputs.xyxy)
-    ), "All bbox coordinates should be finite"
+    assert np.all(np.isfinite(tracker_inputs.xyxy)), "All bbox coordinates should be finite"

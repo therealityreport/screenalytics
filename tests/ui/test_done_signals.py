@@ -21,9 +21,7 @@ class _FakeResponse:
 
 
 def _install_fake_post(helpers_module, fake_response):  # noqa: ANN001
-    def _fake_post(
-        url, json=None, headers=None, stream=False, timeout=None
-    ):  # noqa: ANN001
+    def _fake_post(url, json=None, headers=None, stream=False, timeout=None):  # noqa: ANN001
         return fake_response
 
     helpers_module.requests.post = _fake_post  # type: ignore[attr-defined]
@@ -147,12 +145,8 @@ def test_progress_ends_on_done_or_status_success():
 
 def test_scene_detect_step_done_is_non_terminal():
     helpers = load_ui_helpers_module()
-    assert (
-        helpers._is_phase_done({"phase": "scene_detect:cut", "step": "done"}) is False
-    )
-    assert (
-        helpers._is_phase_done({"phase": "scene_detect:done", "step": "done"}) is False
-    )
+    assert helpers._is_phase_done({"phase": "scene_detect:cut", "step": "done"}) is False
+    assert helpers._is_phase_done({"phase": "scene_detect:done", "step": "done"}) is False
 
 
 def test_fallback_poller_waits_past_scene_detect_and_reports_error():

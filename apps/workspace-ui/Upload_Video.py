@@ -59,11 +59,7 @@ def _get_video_meta(ep_id: str) -> Dict[str, Any] | None:
     try:
         return helpers.api_get(f"/episodes/{ep_id}/video_meta")
     except requests.RequestException as exc:
-        st.warning(
-            helpers.describe_error(
-                f"{cfg['api_base']}/episodes/{ep_id}/video_meta", exc
-            )
-        )
+        st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/video_meta", exc))
         return None
 
 
@@ -115,17 +111,13 @@ def _render_job_sections() -> bool:
     return any_running
 
 
-def _render_single_job(
-    job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[str, Any]]
-) -> bool:
+def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[str, Any]]) -> bool:
     st.markdown(f"**{meta.get('label', f'Job {job_id}')}**")
     st.caption(f"Job ID: `{job_id}` · Episode `{meta.get('ep_id')}`")
     try:
         progress_resp = helpers.api_get(f"/jobs/{job_id}/progress", timeout=10)
     except requests.RequestException as exc:
-        st.error(
-            helpers.describe_error(f"{cfg['api_base']}/jobs/{job_id}/progress", exc)
-        )
+        st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/{job_id}/progress", exc))
         if st.button("Dismiss", key=f"dismiss-{job_id}"):
             jobs.pop(job_id, None)
             st.rerun()
@@ -139,11 +131,7 @@ def _render_single_job(
     total_seconds = helpers.total_seconds_hint(progress)
     eta = helpers.eta_seconds(progress)
     device_label = progress.get("device") or meta.get("requested_device", "auto")
-    fps_value = (
-        progress.get("fps_infer")
-        or progress.get("analyzed_fps")
-        or progress.get("fps_detected")
-    )
+    fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
     elapsed_seconds = progress.get("secs_done") or progress.get("elapsed_sec")
     info_text = (
@@ -162,11 +150,7 @@ def _render_single_job(
                 try:
                     helpers.api_post(f"/jobs/{job_id}/cancel")
                 except requests.RequestException as exc:
-                    st.error(
-                        helpers.describe_error(
-                            f"{cfg['api_base']}/jobs/{job_id}/cancel", exc
-                        )
-                    )
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/{job_id}/cancel", exc))
                 else:
                     st.info("Cancel requested…")
                     st.rerun()
@@ -233,11 +217,7 @@ def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | 
             try:
                 resp = helpers.api_post("/jobs/detect_track", payload)
             except requests.RequestException as sync_exc:
-                st.error(
-                    helpers.describe_error(
-                        f"{cfg['api_base']}/jobs/detect_track", sync_exc
-                    )
-                )
+                st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/detect_track", sync_exc))
                 return None
             else:
                 st.info("Async detect/track not available; ran synchronously.")
@@ -281,9 +261,7 @@ if flash_message:
 jobs_running = _render_job_sections()
 
 
-def _upload_file(
-    bucket: str, key: str, file_obj, content_type: str = "video/mp4"
-) -> None:
+def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4") -> None:
     """Upload file to S3 using boto3 with progress tracking.
 
     Args:
@@ -311,9 +289,7 @@ def _upload_file(
         progress_bar.progress(min(progress, 1.0))
         mb_uploaded = uploaded_bytes[0] / (1024**2)
         mb_total = file_size / (1024**2)
-        status_text.text(
-            f"Uploading to S3: {mb_uploaded:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)"
-        )
+        status_text.text(f"Uploading to S3: {mb_uploaded:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)")
 
     # Use boto3 for reliable uploads with progress tracking
     s3_client = boto3.client("s3", region_name="us-east-1")
@@ -333,9 +309,7 @@ def _upload_file(
     status_text.empty()
 
 
-def _mirror_local(
-    ep_id: str, file_obj, local_path: str, chunk_size: int = 8 * 1024 * 1024
-) -> Path | None:
+def _mirror_local(ep_id: str, file_obj, local_path: str, chunk_size: int = 8 * 1024 * 1024) -> Path | None:
     """Mirror file to local disk using streaming to avoid memory buffering.
 
     Args:
@@ -376,9 +350,7 @@ def _rollback_episode_creation(ep_id: str) -> None:
         helpers.api_delete(f"/episodes/{ep_id}")
         st.info(f"Rolled back episode `{ep_id}` from store.")
     except requests.RequestException as rollback_exc:
-        st.warning(
-            f"Failed to roll back episode: {rollback_exc}. You may need to manually delete `{ep_id}`."
-        )
+        st.warning(f"Failed to roll back episode: {rollback_exc}. You may need to manually delete `{ep_id}`.")
 
 
 def _navigate_to_detail_with_ep(ep_id: str) -> None:
@@ -400,9 +372,7 @@ def _s3_item_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
     parsed_ep = helpers.parse_ep_id(item.get("ep_id", ""))
     show = parsed_key.get("show_slug") if parsed_key else (parsed_ep or {}).get("show")
     season = parsed_key.get("season") if parsed_key else (parsed_ep or {}).get("season")
-    episode = (
-        parsed_key.get("episode") if parsed_key else (parsed_ep or {}).get("episode")
-    )
+    episode = parsed_key.get("episode") if parsed_key else (parsed_ep or {}).get("episode")
     ep_id = parsed_key.get("ep_id") if parsed_key else item.get("ep_id")
     return {
         "ep_id": ep_id,
@@ -440,15 +410,9 @@ with st.form("episode-upload"):
         add_show_clicked = st.form_submit_button("Add show")
     else:
         st.session_state.pop("upload_new_show_input", None)
-    season_number = st.number_input(
-        "Season", min_value=0, max_value=999, value=1, step=1
-    )
-    episode_number = st.number_input(
-        "Episode #", min_value=0, max_value=999, value=1, step=1
-    )
-    title = st.text_input(
-        "Title", placeholder="Don't Ice Me Bro", help="Optional episode title"
-    )
+    season_number = st.number_input("Season", min_value=0, max_value=999, value=1, step=1)
+    episode_number = st.number_input("Episode #", min_value=0, max_value=999, value=1, step=1)
+    title = st.text_input("Title", placeholder="Don't Ice Me Bro", help="Optional episode title")
     include_air_date = st.checkbox("Set air date", value=False)
     air_date_value = st.date_input(
         "Air date",
@@ -456,18 +420,12 @@ with st.form("episode-upload"):
         disabled=not include_air_date,
         help="Optional premiere date",
     )
-    uploaded_file = st.file_uploader(
-        "Episode video", type=["mp4"], accept_multiple_files=False
-    )
-    st.caption(
-        "Video will be uploaded to S3. After upload, open Episode Detail to run detect/track."
-    )
+    uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
+    st.caption("Video will be uploaded to S3. After upload, open Episode Detail to run detect/track.")
     submit = st.form_submit_button("Upload episode", type="primary")
 
 if add_show_clicked:
-    pending_show = (
-        st.session_state.get("upload_new_show_input") or new_show_name or ""
-    ).strip()
+    pending_show = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
     if not pending_show:
         st.error("Enter a new show slug/ID before adding.")
     else:
@@ -480,9 +438,7 @@ if add_show_clicked:
 if submit:
     show_ref = show_choice or ""
     if show_ref == ADD_SHOW_OPTION:
-        show_ref = (
-            st.session_state.get("upload_new_show_input") or new_show_name or ""
-        ).strip()
+        show_ref = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
         if show_ref:
             helpers.remember_custom_show(show_ref)
             st.session_state["upload_show_choice"] = show_ref
@@ -536,11 +492,7 @@ if submit:
 
     bucket = presign_resp.get("bucket")
     key = presign_resp.get("key") or presign_resp.get("object_key")
-    st.info(
-        f"Uploading to s3://{bucket}/{key}"
-        if bucket
-        else f"Writing to {presign_resp['local_video_path']}"
-    )
+    st.info(f"Uploading to s3://{bucket}/{key}" if bucket else f"Writing to {presign_resp['local_video_path']}")
     if bucket and key:
         try:
             _upload_file(bucket, key, uploaded_file)
@@ -555,9 +507,7 @@ if submit:
         _mirror_local(ep_id, uploaded_file, presign_resp["local_video_path"])
     except OSError as exc:
         st.error(f"Failed to write local copy: {exc}")
-        st.warning(
-            "Video uploaded to S3 successfully, but local mirror failed. Check disk space and permissions."
-        )
+        st.warning("Video uploaded to S3 successfully, but local mirror failed. Check disk space and permissions.")
         _rollback_episode_creation(ep_id)
         st.stop()
 
@@ -657,17 +607,13 @@ if s3_items:
         episode_label = selected_meta.get("episode")
         st.write(f"S3 key: `{selected_item['key']}`")
         if show_label and season_label is not None and episode_label is not None:
-            st.caption(
-                f"{show_label} · s{int(season_label):02d}e{int(episode_label):02d}"
-            )
+            st.caption(f"{show_label} · s{int(season_label):02d}e{int(episode_label):02d}")
         tracked = bool(selected_item.get("exists_in_store"))
         st.write(f"Tracked in store: {tracked}")
         if ep_id_from_s3:
             helpers.set_ep_id(ep_id_from_s3, rerun=False)
 
-        prefixes = (
-            helpers.episode_artifact_prefixes(ep_id_from_s3) if ep_id_from_s3 else None
-        )
+        prefixes = helpers.episode_artifact_prefixes(ep_id_from_s3) if ep_id_from_s3 else None
         if prefixes:
             st.caption(
                 "S3 artifacts → "
@@ -681,38 +627,19 @@ if s3_items:
             try:
                 detail_data = helpers.api_get(f"/episodes/{ep_id_from_s3}")
             except requests.RequestException as exc:
-                st.warning(
-                    helpers.describe_error(
-                        f"{cfg['api_base']}/episodes/{ep_id_from_s3}", exc
-                    )
-                )
+                st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id_from_s3}", exc))
         if detail_data:
             s3_info = detail_data.get("s3", {})
-            st.write(
-                f"V2 key: `{s3_info.get('v2_key')}` (exists={s3_info.get('v2_exists')})"
-            )
-            st.write(
-                f"V1 key: `{s3_info.get('v1_key')}` (exists={s3_info.get('v1_exists')})"
-            )
+            st.write(f"V2 key: `{s3_info.get('v2_key')}` (exists={s3_info.get('v2_exists')})")
+            st.write(f"V1 key: `{s3_info.get('v1_key')}` (exists={s3_info.get('v1_exists')})")
             if not s3_info.get("v2_exists") and s3_info.get("v1_exists"):
-                st.warning(
-                    "Found legacy v1 object; mirror will fall back to v1 but new uploads use the v2 path."
-                )
+                st.warning("Found legacy v1 object; mirror will fall back to v1 but new uploads use the v2 path.")
 
         if not tracked:
             st.warning("Episode not in local store yet.")
-            if st.button(
-                "Create episode in store", key=f"create_episode_{ep_id_from_s3}"
-            ):
-                if not (
-                    ep_id_from_s3
-                    and show_label
-                    and season_label is not None
-                    and episode_label is not None
-                ):
-                    st.error(
-                        "Unable to parse S3 key into show/season/episode (v2 keys required)."
-                    )
+            if st.button("Create episode in store", key=f"create_episode_{ep_id_from_s3}"):
+                if not (ep_id_from_s3 and show_label and season_label is not None and episode_label is not None):
+                    st.error("Unable to parse S3 key into show/season/episode (v2 keys required).")
                 else:
                     payload = {
                         "ep_id": ep_id_from_s3,
@@ -721,19 +648,11 @@ if s3_items:
                         "episode": int(episode_label),
                     }
                     try:
-                        upsert_resp = helpers.api_post(
-                            "/episodes/upsert_by_id", payload
-                        )
+                        upsert_resp = helpers.api_post("/episodes/upsert_by_id", payload)
                     except requests.RequestException as exc:
-                        st.error(
-                            helpers.describe_error(
-                                f"{cfg['api_base']}/episodes/upsert_by_id", exc
-                            )
-                        )
+                        st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/upsert_by_id", exc))
                     else:
-                        st.success(
-                            f"Episode `{upsert_resp['ep_id']}` tracked (created={upsert_resp['created']})."
-                        )
+                        st.success(f"Episode `{upsert_resp['ep_id']}` tracked (created={upsert_resp['created']}).")
                         helpers.set_ep_id(upsert_resp["ep_id"])
                         st.rerun()
         elif ep_id_from_s3:
@@ -753,9 +672,7 @@ if s3_items:
                 ):
                     with st.spinner(f"Mirroring video from S3 for {ep_id_from_s3}..."):
                         try:
-                            mirror_resp = helpers.api_post(
-                                f"/episodes/{ep_id_from_s3}/mirror"
-                            )
+                            mirror_resp = helpers.api_post(f"/episodes/{ep_id_from_s3}/mirror")
                         except requests.RequestException as exc:
                             st.error(
                                 helpers.describe_error(

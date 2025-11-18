@@ -31,9 +31,7 @@ def test_track_recorder_splits_on_gap() -> None:
         ts += 0.1
 
     # Large gap for tracker 1 should spawn a new export id and count as a lost track + id switch
-    recorder.record(
-        tracker_track_id=1, frame_idx=50, ts=ts, bbox=[0, 0, 10, 10], class_label="face"
-    )
+    recorder.record(tracker_track_id=1, frame_idx=50, ts=ts, bbox=[0, 0, 10, 10], class_label="face")
     recorder.finalize()
     metrics = recorder.metrics
     assert metrics["tracks_born"] == 3

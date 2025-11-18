@@ -12,7 +12,6 @@ Related: nov-17-detect-track-none-bbox-fix.md (CoreML detection fix)
 from unittest.mock import MagicMock, patch
 
 
-
 def test_onnx_providers_auto_selects_cuda_when_available():
     """device=auto should select CUDA when CUDAExecutionProvider is available."""
     from tools.episode_run import _onnx_providers_for
@@ -224,9 +223,7 @@ def test_onnx_providers_get_providers_error_fallback():
     from tools.episode_run import _onnx_providers_for
 
     mock_ort = MagicMock()
-    mock_ort.get_available_providers.side_effect = RuntimeError(
-        "Provider enumeration failed"
-    )
+    mock_ort.get_available_providers.side_effect = RuntimeError("Provider enumeration failed")
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
         providers, resolved = _onnx_providers_for("auto")

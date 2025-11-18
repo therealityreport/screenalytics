@@ -1,4 +1,3 @@
-
 from apps.api.services.storage import EpisodeContext, StorageService
 
 
@@ -29,9 +28,7 @@ def _make_storage(fake_client) -> StorageService:
 def test_put_artifact_sets_headers(tmp_path):
     client = _FakeClient()
     storage = _make_storage(client)
-    ctx = EpisodeContext(
-        ep_id="demo-s01e01", show_slug="demo", season_number=1, episode_number=1
-    )
+    ctx = EpisodeContext(ep_id="demo-s01e01", show_slug="demo", season_number=1, episode_number=1)
     local_path = tmp_path / "identities.json"
     local_path.write_text("{}", encoding="utf-8")
 

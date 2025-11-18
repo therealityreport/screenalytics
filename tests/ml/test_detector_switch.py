@@ -15,14 +15,10 @@ except ImportError:  # pragma: no cover - optional ML dependency
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUN_ML_TESTS = os.environ.get("RUN_ML_TESTS") == "1"
-pytestmark = pytest.mark.skipif(
-    not RUN_ML_TESTS, reason="set RUN_ML_TESTS=1 to run ML integration tests"
-)
+pytestmark = pytest.mark.skipif(not RUN_ML_TESTS, reason="set RUN_ML_TESTS=1 to run ML integration tests")
 
 
-def _make_sample_video(
-    target: Path, frame_count: int = 8, size: tuple[int, int] = (64, 64)
-) -> Path:
+def _make_sample_video(target: Path, frame_count: int = 8, size: tuple[int, int] = (64, 64)) -> Path:
     import cv2  # type: ignore
 
     width, height = size
@@ -33,9 +29,7 @@ def _make_sample_video(
     for idx in range(frame_count):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         offset = 5 + idx * 2
-        cv2.rectangle(
-            frame, (offset, offset), (offset + 12, offset + 16), (0, 255, 0), -1
-        )
+        cv2.rectangle(frame, (offset, offset), (offset + 12, offset + 16), (0, 255, 0), -1)
         writer.write(frame)
     writer.release()
     return target
@@ -56,9 +50,7 @@ def _read_progress(path: Path) -> dict:
 
 
 @pytest.mark.timeout(120)
-def test_retinaface_detector_progress(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_retinaface_detector_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
     video_path = _make_sample_video(tmp_path / "sample.mp4")

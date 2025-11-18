@@ -145,9 +145,7 @@ class FacebankService:
                 if isinstance(seed, dict) and "display_low_res" not in seed:
                     seed["display_low_res"] = False
                 if isinstance(seed, dict) and "display_key" not in seed:
-                    seed["display_key"] = seed.get("display_s3_key") or seed.get(
-                        "image_s3_key"
-                    )
+                    seed["display_key"] = seed.get("display_s3_key") or seed.get("image_s3_key")
         return data
 
     def _save_facebank(self, show_id: str, cast_id: str, data: Dict[str, Any]) -> None:
@@ -165,9 +163,7 @@ class FacebankService:
             except TypeError:  # Python < 3.8 compatibility
                 if tmp_path.exists():
                     tmp_path.unlink()
-            raise RuntimeError(
-                f"Failed to persist facebank data for {show_id}/{cast_id}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to persist facebank data for {show_id}/{cast_id}: {exc}") from exc
 
     def get_facebank(self, show_id: str, cast_id: str) -> Dict[str, Any]:
         """Get facebank data for a cast member."""
@@ -234,9 +230,7 @@ class FacebankService:
             "fb_id": seed_id,
             "cast_id": cast_id,
             "type": "seed",
-            "embedding": (
-                embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
-            ),
+            "embedding": (embedding.tolist() if isinstance(embedding, np.ndarray) else embedding),
             "embedding_dim": len(embedding),
             "quality": quality or {},
             "source": "upload",
@@ -282,9 +276,7 @@ class FacebankService:
 
         return deleted_count
 
-    def set_featured_seed(
-        self, show_id: str, cast_id: str, seed_id: str
-    ) -> Dict[str, Any]:
+    def set_featured_seed(self, show_id: str, cast_id: str, seed_id: str) -> Dict[str, Any]:
         """Mark a specific seed as featured."""
         data = self._load_facebank(show_id, cast_id)
         seeds = data.get("seeds", [])

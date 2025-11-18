@@ -43,9 +43,7 @@ def presign_image(
 
 
 @router.get("/files/health")
-def check_image_health(
-    path_or_key: str = Query(..., description="Local path or S3 key")
-) -> dict:
+def check_image_health(path_or_key: str = Query(..., description="Local path or S3 key")) -> dict:
     """Check if an image exists and is accessible, with optional image diagnostics."""
     import hashlib
 

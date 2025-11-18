@@ -23,12 +23,8 @@ def test_delete_seeds_endpoint_signature():
     assert delete_route is not None, "DELETE /cast/{cast_id}/seeds endpoint not found"
 
     # Verify DeleteSeedsRequest model
-    assert hasattr(
-        DeleteSeedsRequest, "__fields__"
-    ), "DeleteSeedsRequest should be a Pydantic model"
-    assert (
-        "seed_ids" in DeleteSeedsRequest.__fields__
-    ), "DeleteSeedsRequest should have seed_ids field"
+    assert hasattr(DeleteSeedsRequest, "__fields__"), "DeleteSeedsRequest should be a Pydantic model"
+    assert "seed_ids" in DeleteSeedsRequest.__fields__, "DeleteSeedsRequest should have seed_ids field"
 
     print("✓ Delete seeds endpoint exists with correct signature")
 
@@ -60,13 +56,9 @@ def test_delete_seed_ui_function_exists():
         # Read the file content to check for the function
         content = cast_page_path.read_text()
 
-        assert (
-            "def _delete_seed(" in content
-        ), "_delete_seed function should exist in Cast.py"
+        assert "def _delete_seed(" in content, "_delete_seed function should exist in Cast.py"
         assert "_api_delete(" in content, "Should call _api_delete for deletion"
-        assert (
-            '"🗑️ Delete"' in content or "'🗑️ Delete'" in content
-        ), "Should have delete button in UI"
+        assert '"🗑️ Delete"' in content or "'🗑️ Delete'" in content, "Should have delete button in UI"
         assert "confirm_delete_seed_" in content, "Should have confirmation logic"
 
         print("✓ UI has delete seed function and confirmation flow")
@@ -79,9 +71,7 @@ def test_facebank_service_delete_seeds():
     service = FacebankService()
 
     # Verify method exists
-    assert hasattr(
-        service, "delete_seeds"
-    ), "FacebankService should have delete_seeds method"
+    assert hasattr(service, "delete_seeds"), "FacebankService should have delete_seeds method"
     assert callable(service.delete_seeds), "delete_seeds should be callable"
 
     print("✓ FacebankService has delete_seeds method")

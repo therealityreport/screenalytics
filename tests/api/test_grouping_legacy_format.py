@@ -16,23 +16,17 @@ def test_grouping_service_writes_new_dict_format():
     # Find the compute_cluster_centroids function
     import re
 
-    func_match = re.search(
-        r"def compute_cluster_centroids\(.*?\):.*?return output", content, re.DOTALL
-    )
+    func_match = re.search(r"def compute_cluster_centroids\(.*?\):.*?return output", content, re.DOTALL)
 
     assert func_match, "compute_cluster_centroids function not found"
     func_code = func_match.group(0)
 
     # Check that it uses dict format
     assert "centroids = {}" in func_code, "Should initialize centroids as dict"
-    assert (
-        "centroids[cluster_id] = centroid_entry" in func_code
-    ), "Should assign centroids by cluster_id key"
+    assert "centroids[cluster_id] = centroid_entry" in func_code, "Should assign centroids by cluster_id key"
 
     # Check that it includes tracks
-    assert (
-        '"tracks": tracks_formatted' in func_code
-    ), "Should include tracks in centroid entry"
+    assert '"tracks": tracks_formatted' in func_code, "Should include tracks in centroid entry"
 
     print("✓ GroupingService writes new dict format with tracks")
 
@@ -56,9 +50,7 @@ def test_track_reps_converts_legacy_format():
     content = track_reps_path.read_text()
 
     # Check load_cluster_centroids has conversion logic
-    assert (
-        "if isinstance(centroids, list):" in content
-    ), "Should detect legacy list format"
+    assert "if isinstance(centroids, list):" in content, "Should detect legacy list format"
     assert "identity_tracks_map" in content, "Should load identities to get track_ids"
     assert (
         '"tracks": tracks' in content or '"tracks": identity_tracks_map' in content
@@ -73,9 +65,7 @@ def test_build_cluster_track_reps_guards_incomplete_data():
     content = track_reps_path.read_text()
 
     # Check for guard against missing cluster_data
-    assert (
-        "def build_cluster_track_reps(" in content
-    ), "build_cluster_track_reps function should exist"
+    assert "def build_cluster_track_reps(" in content, "build_cluster_track_reps function should exist"
     assert "if not cluster_data:" in content, "Should check if cluster_data exists"
     assert '"tracks": []' in content, "Should return empty tracks for missing clusters"
 

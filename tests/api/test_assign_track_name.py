@@ -42,15 +42,9 @@ def test_assign_track_name_splits_cluster(tmp_path, monkeypatch):
 
     updated = _read_identities(identities_path)
     assert updated["stats"]["clusters"] == 2
-    original = next(
-        item for item in updated["identities"] if item["identity_id"] == "id_0001"
-    )
+    original = next(item for item in updated["identities"] if item["identity_id"] == "id_0001")
     assert original["track_ids"] == [2]
-    new_identity = next(
-        item
-        for item in updated["identities"]
-        if item["identity_id"] == result["identity_id"]
-    )
+    new_identity = next(item for item in updated["identities"] if item["identity_id"] == result["identity_id"])
     assert new_identity["track_ids"] == [1]
     assert new_identity["name"] == "Kyle"
 

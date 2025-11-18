@@ -72,11 +72,7 @@ try:
                     "Job ID": job["job_id"][:8] + "...",
                     "Status": job["state"],
                     "Started": job.get("started_at", "N/A")[:19].replace("T", " "),
-                    "Ended": (
-                        job.get("ended_at", "N/A")[:19].replace("T", " ")
-                        if job.get("ended_at")
-                        else "Running"
-                    ),
+                    "Ended": (job.get("ended_at", "N/A")[:19].replace("T", " ") if job.get("ended_at") else "Running"),
                 }
             )
         st.dataframe(job_table, use_container_width=True, hide_index=True)
@@ -128,11 +124,7 @@ with col1:
             st.success(f"Screen time analysis job started: {job_id[:12]}...")
             st.rerun()
         except requests.RequestException as exc:
-            st.error(
-                helpers.describe_error(
-                    f"{cfg['api_base']}/jobs/screen_time/analyze", exc
-                )
-            )
+            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screen_time/analyze", exc))
 with col2:
     if st.button("Refresh", use_container_width=True):
         st.rerun()
@@ -203,9 +195,7 @@ if json_path.exists():
         total_faces = sum(m.get("faces_count", 0) for m in metrics)
 
         col1, col2, col3 = st.columns(3)
-        col1.metric(
-            "Total Screen Time", f"{total_time:.1f}s ({total_time / 60:.1f} min)"
-        )
+        col1.metric("Total Screen Time", f"{total_time:.1f}s ({total_time / 60:.1f} min)")
         col2.metric("Cast Members", len(metrics))
         col3.metric("Total Faces", total_faces)
 
@@ -337,9 +327,7 @@ if json_path.exists():
                 with col1:
                     st.metric("Faces Loaded", diagnostics.get("faces_loaded", "N/A"))
                     st.metric("Tracks Loaded", diagnostics.get("tracks_loaded", "N/A"))
-                    st.metric(
-                        "Identities Loaded", diagnostics.get("identities_loaded", "N/A")
-                    )
+                    st.metric("Identities Loaded", diagnostics.get("identities_loaded", "N/A"))
                 with col2:
                     st.metric(
                         "People with Cast ID",
@@ -356,17 +344,11 @@ if json_path.exists():
 
                 # Show specific issues
                 if diagnostics.get("tracks_missing_identity", 0) > 0:
-                    st.info(
-                        f"⚠️ {diagnostics['tracks_missing_identity']} tracks have no identity assignment"
-                    )
+                    st.info(f"⚠️ {diagnostics['tracks_missing_identity']} tracks have no identity assignment")
                 if diagnostics.get("tracks_missing_person", 0) > 0:
-                    st.info(
-                        f"⚠️ {diagnostics['tracks_missing_person']} identities have no person mapping"
-                    )
+                    st.info(f"⚠️ {diagnostics['tracks_missing_person']} identities have no person mapping")
                 if diagnostics.get("tracks_missing_cast", 0) > 0:
-                    st.info(
-                        f"⚠️ {diagnostics['tracks_missing_cast']} people have no cast_id assignment"
-                    )
+                    st.info(f"⚠️ {diagnostics['tracks_missing_cast']} people have no cast_id assignment")
 
         # Specific guidance based on what's missing
         people_with_cast = diagnostics.get("people_with_cast_id", 0)
@@ -374,9 +356,7 @@ if json_path.exists():
 
         if people_with_cast == 0:
             st.error("**No cast members are linked to this show.**")
-            st.info(
-                "➡️ Please assign cast members in the **Cast page** before running screen time analysis."
-            )
+            st.info("➡️ Please assign cast members in the **Cast page** before running screen time analysis.")
         elif tracks_with_cast == 0:
             st.error("**No identities in this episode are linked to cast members.**")
             st.info(
@@ -384,13 +364,9 @@ if json_path.exists():
                 "**Faces & Tracks Review** page for this episode."
             )
         else:
-            st.info(
-                "Make sure cast members are assigned in the Cast page before running screen time analysis."
-            )
+            st.info("Make sure cast members are assigned in the Cast page before running screen time analysis.")
 else:
-    st.info(
-        "No screentime analytics yet. Click 'Analyze Screen Time' to generate results."
-    )
+    st.info("No screentime analytics yet. Click 'Analyze Screen Time' to generate results.")
 
 st.subheader("Output Files")
 if json_path.exists():

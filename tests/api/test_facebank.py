@@ -77,9 +77,7 @@ def _create_webp_image(size=(112, 112)):
     return stream
 
 
-def _mock_face_pipeline(
-    monkeypatch, *, simulated: bool = False, bbox: list[float] | None = None
-):
+def _mock_face_pipeline(monkeypatch, *, simulated: bool = False, bbox: list[float] | None = None):
     """Replace detector/embedder with deterministic fakes."""
 
     simulated_flag = simulated
@@ -114,13 +112,9 @@ def _mock_face_pipeline(
             return np.zeros((len(faces), 512), dtype=np.float32)
 
     fake_det_mod = types.SimpleNamespace(RetinaFaceDetector=_FakeDetector)
-    monkeypatch.setitem(
-        sys.modules, "FEATURES.detection.src.run_retinaface", fake_det_mod
-    )
+    monkeypatch.setitem(sys.modules, "FEATURES.detection.src.run_retinaface", fake_det_mod)
 
-    def _fake_prepare_face_crop(
-        image, bbox, landmarks, margin=0.15, *, detector_mode="retinaface", align=True
-    ):
+    def _fake_prepare_face_crop(image, bbox, landmarks, margin=0.15, *, detector_mode="retinaface", align=True):
         return image, None
 
     fake_tools_mod = types.SimpleNamespace(
@@ -136,9 +130,7 @@ def _mock_face_pipeline(
 
     from apps.api.routers import facebank as facebank_router
 
-    monkeypatch.setattr(
-        facebank_router.episode_run, "ensure_retinaface_ready", _fake_ensure_ready
-    )
+    monkeypatch.setattr(facebank_router.episode_run, "ensure_retinaface_ready", _fake_ensure_ready)
 
 
 class _DummyJobService:
@@ -183,9 +175,7 @@ class _DummyStorageService:
         )
         return key
 
-    def presign_get(
-        self, key: str, expires_in: int = 3600, *, content_type: str | None = None
-    ) -> str:
+    def presign_get(self, key: str, expires_in: int = 3600, *, content_type: str | None = None) -> str:
         self.presign_calls.append((key, expires_in, content_type))
         return f"{self.base_url}/{key}"
 
@@ -193,9 +183,7 @@ class _DummyStorageService:
         return True
 
 
-def _create_cast_member(
-    facebank_router, show_id: str, name: str, data_root: Path
-) -> str:
+def _create_cast_member(facebank_router, show_id: str, name: str, data_root: Path) -> str:
     cast_service = CastService(data_root)
     facebank_router.cast_service = cast_service
     facebank_router.people_service = PeopleService(data_root)
@@ -463,21 +451,9 @@ def test_upload_seeds_presigns_remote_urls(tmp_path, monkeypatch):
     assert resp.status_code == 200
     payload = resp.json()
     assert len(dummy_storage.upload_calls) == 3
-    display_call = next(
-        call
-        for call in dummy_storage.upload_calls
-        if call["object_name"].endswith("_d.png")
-    )
-    embed_call = next(
-        call
-        for call in dummy_storage.upload_calls
-        if call["object_name"].endswith("_e.png")
-    )
-    orig_call = next(
-        call
-        for call in dummy_storage.upload_calls
-        if call["object_name"].endswith("_o.png")
-    )
+    display_call = next(call for call in dummy_storage.upload_calls if call["object_name"].endswith("_d.png"))
+    embed_call = next(call for call in dummy_storage.upload_calls if call["object_name"].endswith("_e.png"))
+    orig_call = next(call for call in dummy_storage.upload_calls if call["object_name"].endswith("_o.png"))
     assert display_call["content_type"] == "image/png"
     assert embed_call["content_type"] == "image/png"
     assert orig_call["content_type"] == "image/png"
@@ -580,9 +556,7 @@ def test_upload_seed_applies_exif_transpose(tmp_path, monkeypatch):
         calls["count"] += 1
         return image.transpose(method=Image.Transpose.FLIP_LEFT_RIGHT)
 
-    monkeypatch.setattr(
-        facebank_router.ImageOps, "exif_transpose", _fake_exif_transpose
-    )
+    monkeypatch.setattr(facebank_router.ImageOps, "exif_transpose", _fake_exif_transpose)
 
     files = [("files", ("seed.jpg", _create_test_image(), "image/jpeg"))]
     resp = client.post(f"/cast/{cast_id}/seeds/upload?show_id={show_id}", files=files)

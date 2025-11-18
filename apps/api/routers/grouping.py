@@ -21,21 +21,11 @@ grouping_service = GroupingService()
 
 
 class GroupClustersRequest(BaseModel):
-    strategy: Literal["auto", "manual", "facebank"] = Field(
-        "auto", description="Grouping strategy"
-    )
-    cluster_ids: Optional[List[str]] = Field(
-        None, description="Cluster IDs for manual grouping"
-    )
-    target_person_id: Optional[str] = Field(
-        None, description="Target person ID for manual grouping"
-    )
-    cast_id: Optional[str] = Field(
-        None, description="Cast ID to link to the person (for new or existing)"
-    )
-    name: Optional[str] = Field(
-        None, description="Name for new person (when target_person_id is None)"
-    )
+    strategy: Literal["auto", "manual", "facebank"] = Field("auto", description="Grouping strategy")
+    cluster_ids: Optional[List[str]] = Field(None, description="Cluster IDs for manual grouping")
+    target_person_id: Optional[str] = Field(None, description="Target person ID for manual grouping")
+    cast_id: Optional[str] = Field(None, description="Cast ID to link to the person (for new or existing)")
+    name: Optional[str] = Field(None, description="Name for new person (when target_person_id is None)")
 
 
 def _trigger_similarity_refresh(ep_id: str, cluster_ids: Iterable[str] | None) -> None:
@@ -68,9 +58,7 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                     }
                 )
 
-            result = grouping_service.group_clusters_auto(
-                ep_id, progress_callback=progress_callback
-            )
+            result = grouping_service.group_clusters_auto(ep_id, progress_callback=progress_callback)
             affected_clusters = set()
             within = (
                 (result.get("within_episode") or {}).get("groups")
@@ -100,9 +88,7 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
             }
         elif body.strategy == "manual":
             if not body.cluster_ids:
-                raise HTTPException(
-                    status_code=400, detail="cluster_ids required for manual grouping"
-                )
+                raise HTTPException(status_code=400, detail="cluster_ids required for manual grouping")
 
             result = grouping_service.manual_assign_clusters(
                 ep_id,
@@ -132,9 +118,7 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                 "result": result,
             }
         else:
-            raise HTTPException(
-                status_code=400, detail=f"Invalid strategy: {body.strategy}"
-            )
+            raise HTTPException(status_code=400, detail=f"Invalid strategy: {body.strategy}")
 
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -151,9 +135,7 @@ def get_cluster_centroids(ep_id: str) -> dict:
         centroids = grouping_service.load_cluster_centroids(ep_id)
         return centroids
     except FileNotFoundError:
-        raise HTTPException(
-            status_code=404, detail=f"Cluster centroids not found for {ep_id}"
-        )
+        raise HTTPException(status_code=404, detail=f"Cluster centroids not found for {ep_id}")
 
 
 @router.post("/episodes/{ep_id}/cluster_centroids/compute")
@@ -165,9 +147,7 @@ def compute_cluster_centroids(ep_id: str) -> dict:
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Centroid computation failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Centroid computation failed: {str(e)}")
 
 
 @router.get("/episodes/{ep_id}/cluster_suggestions")
@@ -212,9 +192,7 @@ def get_cluster_suggestions(ep_id: str) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to compute suggestions: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to compute suggestions: {str(e)}")
 
 
 @router.get("/episodes/{ep_id}/cluster_suggestions_from_assigned")
@@ -265,9 +243,7 @@ def save_assignments(ep_id: str) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to save assignments: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to save assignments: {str(e)}")
 
 
 __all__ = ["router"]

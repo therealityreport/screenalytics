@@ -30,9 +30,7 @@ def _setup_track(tmp_path: Path, count: int = 3) -> str:
                 "ts": idx * 0.5,
             }
         )
-    (track_dir / "index.json").write_text(
-        json.dumps(entries, indent=2), encoding="utf-8"
-    )
+    (track_dir / "index.json").write_text(json.dumps(entries, indent=2), encoding="utf-8")
     return ep_id
 
 
@@ -57,9 +55,7 @@ def _setup_legacy_track(tmp_path: Path, count: int = 2) -> str:
                 "ts": idx * 0.25,
             }
         )
-    (track_dir / "index.json").write_text(
-        json.dumps(entries, indent=2), encoding="utf-8"
-    )
+    (track_dir / "index.json").write_text(json.dumps(entries, indent=2), encoding="utf-8")
     return ep_id
 
 
@@ -176,9 +172,7 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
     monkeypatch.setattr(episodes_router, "STORAGE", storage)
 
     client = TestClient(app)
-    resp = client.get(
-        f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 2}
-    )
+    resp = client.get(f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 2})
     assert resp.status_code == 200
     payload = resp.json()
     assert len(payload["items"]) == 2
@@ -188,9 +182,7 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
 def test_list_track_crops_uses_fallback_root(tmp_path):
     ep_id = _setup_legacy_track(tmp_path, count=2)
     client = TestClient(app)
-    resp = client.get(
-        f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 5}
-    )
+    resp = client.get(f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 5})
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["items"], "expected crops from fallback root"

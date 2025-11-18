@@ -79,9 +79,7 @@ def backfill_facebank_seeds(
                 continue
             if dry_run:
                 stats["updated"] += 1
-                print(
-                    f"[DRY-RUN] would upload {image_path} for {show_id}/{cid}/{seed['fb_id']}"
-                )
+                print(f"[DRY-RUN] would upload {image_path} for {show_id}/{cid}/{seed['fb_id']}")
                 continue
             key = storage.upload_facebank_seed(
                 show_id,
@@ -110,17 +108,11 @@ def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Backfill facebank seeds to S3")
     parser.add_argument("show_id", help="Show identifier (e.g. RHOBH)")
     parser.add_argument("--cast-id", help="Optional cast id to limit backfill")
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Only report actions without uploading"
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Only report actions without uploading")
     args = parser.parse_args(argv)
 
-    stats = backfill_facebank_seeds(
-        args.show_id, cast_id=args.cast_id, dry_run=args.dry_run
-    )
-    print(
-        "Summary: updated={updated} skipped={skipped} failed={failed}".format(**stats)
-    )
+    stats = backfill_facebank_seeds(args.show_id, cast_id=args.cast_id, dry_run=args.dry_run)
+    print("Summary: updated={updated} skipped={skipped} failed={failed}".format(**stats))
     return 0
 
 

@@ -308,9 +308,7 @@ def cluster_track_summary(
             track_row = track_lookup.get(tid)
             if not track_row:
                 continue
-            thumb_url = _thumbnail_url(
-                ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key")
-            )
+            thumb_url = _thumbnail_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
             tracks_payload.append(
                 {
                     "track_id": tid,
@@ -329,8 +327,7 @@ def cluster_track_summary(
                 "label": identity.get("label"),
                 "counts": {
                     "tracks": len(track_ids),
-                    "faces": identity.get("faces")
-                    or sum(face_counts.get(int(tid), 0) for tid in track_ids),
+                    "faces": identity.get("faces") or sum(face_counts.get(int(tid), 0) for tid in track_ids),
                 },
                 "tracks": tracks_payload,
             }
@@ -338,17 +335,13 @@ def cluster_track_summary(
     return {"ep_id": ep_id, "clusters": clusters}
 
 
-def _rebuild_track_entry(
-    track_entry: Dict[str, Any], face_rows: Sequence[Dict[str, Any]]
-) -> Dict[str, Any]:
+def _rebuild_track_entry(track_entry: Dict[str, Any], face_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if not face_rows:
         return track_entry
     sorted_rows = sorted(face_rows, key=lambda row: int(row.get("frame_idx", 0)))
     track_entry["frame_count"] = len(sorted_rows)
     track_entry["faces_count"] = len(sorted_rows)
-    ts_values = [
-        row.get("ts") for row in sorted_rows if isinstance(row.get("ts"), (int, float))
-    ]
+    ts_values = [row.get("ts") for row in sorted_rows if isinstance(row.get("ts"), (int, float))]
     if ts_values:
         track_entry["first_ts"] = float(min(ts_values))
         track_entry["last_ts"] = float(max(ts_values))
@@ -373,9 +366,7 @@ def _rebuild_track_entry(
     return track_entry
 
 
-def _write_track_index(
-    ep_id: str, track_id: int, face_rows: Sequence[Dict[str, Any]], ctx
-) -> None:
+def _write_track_index(ep_id: str, track_id: int, face_rows: Sequence[Dict[str, Any]], ctx) -> None:
     frames_root = get_path(ep_id, "frames_root")
     crops_dir = frames_root / "crops" / _track_dir_name(track_id)
     index_path = crops_dir / "index.json"
@@ -397,9 +388,7 @@ def _write_track_index(
     ]
     index_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
     try:
-        STORAGE.put_artifact(
-            ctx, "crops", index_path, f"{_track_dir_name(track_id)}/index.json"
-        )
+        STORAGE.put_artifact(ctx, "crops", index_path, f"{_track_dir_name(track_id)}/index.json")
     except Exception:
         # Remote sync failures are non-fatal; artifacts stay locally.
         pass
@@ -408,11 +397,7 @@ def _write_track_index(
 def rename_identity(ep_id: str, identity_id: str, label: str | None) -> Dict[str, Any]:
     payload = load_identities(ep_id)
     identity = next(
-        (
-            item
-            for item in payload.get("identities", [])
-            if item.get("identity_id") == identity_id
-        ),
+        (item for item in payload.get("identities", []) if item.get("identity_id") == identity_id),
         None,
     )
     if not identity:
@@ -428,30 +413,22 @@ def rename_identity(ep_id: str, identity_id: str, label: str | None) -> Dict[str
 def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, Any]:
     payload = load_identities(ep_id)
     identities = payload.get("identities", [])
-    source = next(
-        (item for item in identities if item.get("identity_id") == source_id), None
-    )
-    target = next(
-        (item for item in identities if item.get("identity_id") == target_id), None
-    )
+    source = next((item for item in identities if item.get("identity_id") == source_id), None)
+    target = next((item for item in identities if item.get("identity_id") == target_id), None)
     if not source or not target:
         raise ValueError("identity_not_found")
     merged = set(target.get("track_ids", []) or [])
     for tid in source.get("track_ids", []) or []:
         merged.add(int(tid))
     target["track_ids"] = sorted({int(val) for val in merged})
-    payload["identities"] = [
-        item for item in identities if item.get("identity_id") != source_id
-    ]
+    payload["identities"] = [item for item in identities if item.get("identity_id") != source_id]
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
     sync_manifests(ep_id, identities_path)
     return target
 
 
-def move_track(
-    ep_id: str, track_id: int, target_identity_id: str | None
-) -> Dict[str, Any]:
+def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dict[str, Any]:
     payload = load_identities(ep_id)
     identities = payload.get("identities", [])
     source_identity = None
@@ -465,9 +442,7 @@ def move_track(
     if target_identity_id and target_identity is None:
         raise ValueError("target_not_found")
     if source_identity and track_id in source_identity.get("track_ids", []):
-        source_identity["track_ids"] = [
-            tid for tid in source_identity["track_ids"] if tid != track_id
-        ]
+        source_identity["track_ids"] = [tid for tid in source_identity["track_ids"] if tid != track_id]
     if target_identity is not None:
         target_identity.setdefault("track_ids", [])
         if track_id not in target_identity["track_ids"]:
@@ -490,24 +465,17 @@ def drop_track(ep_id: str, track_id: int) -> Dict[str, Any]:
     tracks_path = write_tracks(ep_id, kept_tracks)
     identities = load_identities(ep_id)
     for identity in identities.get("identities", []):
-        identity["track_ids"] = [
-            tid for tid in identity.get("track_ids", []) if tid != track_id
-        ]
+        identity["track_ids"] = [tid for tid in identity.get("track_ids", []) if tid != track_id]
     update_identity_stats(ep_id, identities)
     identities_path = write_identities(ep_id, identities)
     sync_manifests(ep_id, tracks_path, identities_path)
     return {"track_id": track_id, "remaining_tracks": len(kept_tracks)}
 
 
-def drop_frame(
-    ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = False
-) -> Dict[str, Any]:
+def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = False) -> Dict[str, Any]:
     faces = load_faces(ep_id)
     removed = [
-        row
-        for row in faces
-        if int(row.get("track_id", -1)) == track_id
-        and int(row.get("frame_idx", -1)) == frame_idx
+        row for row in faces if int(row.get("track_id", -1)) == track_id and int(row.get("frame_idx", -1)) == frame_idx
     ]
     if not removed:
         raise ValueError("frame_not_found")
@@ -578,9 +546,7 @@ def _persist_identity_name(
             cluster_id_with_prefix = f"{ep_id}:{identity_id}"
 
             # Use alias-aware lookup to find existing person
-            existing_person = people_service.find_person_by_name_or_alias(
-                show_slug, trimmed_name
-            )
+            existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
 
             if existing_person:
                 # Add cluster to existing person (if not already present)
@@ -599,12 +565,8 @@ def _persist_identity_name(
 
                 # Add the input name as an alias if it's different from the primary name
                 primary_name = existing_person.get("name") or ""
-                if people_service.normalize_name(
-                    trimmed_name
-                ) != people_service.normalize_name(primary_name):
-                    people_service.add_alias_to_person(
-                        show_slug, person_id, trimmed_name
-                    )
+                if people_service.normalize_name(trimmed_name) != people_service.normalize_name(primary_name):
+                    people_service.add_alias_to_person(show_slug, person_id, trimmed_name)
                     LOGGER.info(f"Added alias '{trimmed_name}' to person {person_id}")
             else:
                 # Create new person
@@ -614,30 +576,20 @@ def _persist_identity_name(
                     cluster_ids=[cluster_id_with_prefix],
                     aliases=[],
                 )
-                LOGGER.info(
-                    f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id}"
-                )
+                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id}")
 
         except Exception as exc:
             # Don't fail the naming operation if People service fails
-            LOGGER.warning(
-                f"Failed to create/update People record for {trimmed_name}: {exc}"
-            )
+            LOGGER.warning(f"Failed to create/update People record for {trimmed_name}: {exc}")
 
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
 
 
-def assign_identity_name(
-    ep_id: str, identity_id: str, name: str, show: str | None = None
-) -> Dict[str, Any]:
+def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None) -> Dict[str, Any]:
     payload = load_identities(ep_id)
     entries = _identity_rows(payload)
     target = next(
-        (
-            entry
-            for entry in entries
-            if (entry.get("identity_id") or entry.get("id")) == identity_id
-        ),
+        (entry for entry in entries if (entry.get("identity_id") or entry.get("id")) == identity_id),
         None,
     )
     if target is None:
@@ -649,9 +601,7 @@ def assign_identity_name(
     return _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
 
 
-def assign_track_name(
-    ep_id: str, track_id: int, name: str, show: str | None = None
-) -> Dict[str, Any]:
+def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None) -> Dict[str, Any]:
     trimmed = (name or "").strip()
     if not trimmed:
         raise ValueError("name_required")
@@ -747,22 +697,14 @@ def move_frames(
     identities_payload = load_identities(ep_id)
     identities = _identity_rows(identities_payload)
     source_identity = next(
-        (
-            entry
-            for entry in identities
-            if from_track_id in (entry.get("track_ids") or [])
-        ),
+        (entry for entry in identities if from_track_id in (entry.get("track_ids") or [])),
         None,
     )
 
     target_identity = None
     if target_identity_id:
         target_identity = next(
-            (
-                entry
-                for entry in identities
-                if (entry.get("identity_id") or entry.get("id")) == target_identity_id
-            ),
+            (entry for entry in identities if (entry.get("identity_id") or entry.get("id")) == target_identity_id),
             None,
         )
     trimmed_name = (new_identity_name or "").strip()
@@ -771,8 +713,7 @@ def move_frames(
             (
                 entry
                 for entry in identities
-                if isinstance(entry.get("name"), str)
-                and entry["name"].lower() == trimmed_name.lower()
+                if isinstance(entry.get("name"), str) and entry["name"].lower() == trimmed_name.lower()
             ),
             None,
         )
@@ -796,9 +737,7 @@ def move_frames(
             pass
 
     tracks = load_tracks(ep_id)
-    source_track = next(
-        (row for row in tracks if int(row.get("track_id", -1)) == from_track_id), None
-    )
+    source_track = next((row for row in tracks if int(row.get("track_id", -1)) == from_track_id), None)
     if source_track is None:
         raise ValueError("track_not_found")
     new_track_id = _next_track_id(tracks)
@@ -834,45 +773,31 @@ def move_frames(
         row["track_id"] = new_track_id
         row["crop_rel_path"] = new_crop_rel
         if crops_prefix:
-            row["crop_s3_key"] = (
-                f"{crops_prefix}track_{new_track_id:04d}/frame_{frame_idx:06d}.jpg"
-            )
+            row["crop_s3_key"] = f"{crops_prefix}track_{new_track_id:04d}/frame_{frame_idx:06d}.jpg"
         row["thumb_rel_path"] = new_thumb_rel
         if thumbs_prefix:
-            row["thumb_s3_key"] = (
-                f"{thumbs_prefix}track_{new_track_id:04d}/thumb_{frame_idx:06d}.jpg"
-            )
+            row["thumb_s3_key"] = f"{thumbs_prefix}track_{new_track_id:04d}/thumb_{frame_idx:06d}.jpg"
 
     faces_path = write_faces(ep_id, faces)
     faces_by_track = _faces_by_track(faces)
 
     new_track_entry = dict(source_track)
     new_track_entry["track_id"] = new_track_id
-    new_track_entry = _rebuild_track_entry(
-        new_track_entry, faces_by_track.get(new_track_id, [])
-    )
+    new_track_entry = _rebuild_track_entry(new_track_entry, faces_by_track.get(new_track_id, []))
     tracks.append(new_track_entry)
 
     remaining_faces = faces_by_track.get(from_track_id, [])
     if remaining_faces:
         _rebuild_track_entry(source_track, remaining_faces)
     else:
-        tracks = [
-            row for row in tracks if int(row.get("track_id", -1)) != from_track_id
-        ]
+        tracks = [row for row in tracks if int(row.get("track_id", -1)) != from_track_id]
         if source_identity:
-            source_identity["track_ids"] = [
-                tid
-                for tid in source_identity.get("track_ids", [])
-                if tid != from_track_id
-            ]
+            source_identity["track_ids"] = [tid for tid in source_identity.get("track_ids", []) if tid != from_track_id]
 
     _write_track_index(ep_id, from_track_id, remaining_faces, ctx)
     _write_track_index(ep_id, new_track_id, faces_by_track.get(new_track_id, []), ctx)
 
-    target_identity["track_ids"] = sorted(
-        {int(tid) for tid in target_identity.get("track_ids", [])} | {new_track_id}
-    )
+    target_identity["track_ids"] = sorted({int(tid) for tid in target_identity.get("track_ids", [])} | {new_track_id})
     identities_payload["identities"] = identities
     update_identity_stats(ep_id, identities_payload)
 

@@ -157,9 +157,7 @@ class CastService:
             "created": created,
         }
 
-    def list_cast(
-        self, show_id: str, season: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    def list_cast(self, show_id: str, season: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all cast members for a show, optionally filtered by season."""
         data = self._load_cast(show_id)
         cast_members = data.get("cast", [])
@@ -168,9 +166,7 @@ class CastService:
             # Filter by season (case-insensitive)
             season_lower = season.lower()
             cast_members = [
-                member
-                for member in cast_members
-                if any(s.lower() == season_lower for s in member.get("seasons", []))
+                member for member in cast_members if any(s.lower() == season_lower for s in member.get("seasons", []))
             ]
 
         return cast_members

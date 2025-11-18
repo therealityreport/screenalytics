@@ -19,9 +19,7 @@ def _create_episode_dirs(ep_id: str) -> None:
     (frames_dir / "crops").mkdir(parents=True, exist_ok=True)
     manifests_dir = get_path(ep_id, "detections").parent
     manifests_dir.mkdir(parents=True, exist_ok=True)
-    analytics_dir = (
-        Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")) / "analytics" / ep_id
-    )
+    analytics_dir = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")) / "analytics" / ep_id
     analytics_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -34,9 +32,7 @@ def _prepare_store(tmp_path: Path, monkeypatch, count: int = 2) -> list[str]:
     store = episodes_router.EPISODE_STORE
     ep_ids: list[str] = []
     for idx in range(count):
-        record = store.upsert(
-            show_ref=f"demo{idx}", season_number=1, episode_number=idx + 1
-        )
+        record = store.upsert(show_ref=f"demo{idx}", season_number=1, episode_number=idx + 1)
         ep_ids.append(record.ep_id)
         _create_episode_dirs(record.ep_id)
     return ep_ids
@@ -72,9 +68,7 @@ def test_delete_all_invokes_s3_prefix_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr("apps.api.routers.episodes.delete_s3_prefix", fake_delete)
     client = TestClient(app)
 
-    resp = client.post(
-        "/episodes/delete_all", json={"confirm": "DELETE ALL", "include_s3": True}
-    )
+    resp = client.post("/episodes/delete_all", json={"confirm": "DELETE ALL", "include_s3": True})
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["count"] == len(ep_ids)

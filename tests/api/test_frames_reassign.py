@@ -99,38 +99,21 @@ def test_reassign_frames_creates_new_track_and_identity(tmp_path):
     data = resp.json()
     assert data["new_track_id"] == 2
     assert data["moved_faces"] == 1
-    assert any(
-        cluster["identity_id"] == data["target_identity_id"]
-        for cluster in data.get("clusters", [])
-    )
+    assert any(cluster["identity_id"] == data["target_identity_id"] for cluster in data.get("clusters", []))
 
-    faces_after = [
-        json.loads(line)
-        for line in faces_path.read_text(encoding="utf-8").splitlines()
-        if line
-    ]
+    faces_after = [json.loads(line) for line in faces_path.read_text(encoding="utf-8").splitlines() if line]
     moved = next(row for row in faces_after if row["frame_idx"] == 0)
     assert moved["track_id"] == 2
     assert moved["crop_rel_path"].startswith("crops/track_0002/")
     assert (frames_root / moved["crop_rel_path"]).exists()
 
-    tracks_after = [
-        json.loads(line)
-        for line in tracks_path.read_text(encoding="utf-8").splitlines()
-        if line
-    ]
+    tracks_after = [json.loads(line) for line in tracks_path.read_text(encoding="utf-8").splitlines() if line]
     assert any(row["track_id"] == 2 for row in tracks_after)
 
     identities_after = json.loads(identities_path.read_text(encoding="utf-8"))
-    names = [
-        ident.get("name")
-        for ident in identities_after["identities"]
-        if ident.get("name")
-    ]
+    names = [ident.get("name") for ident in identities_after["identities"] if ident.get("name")]
     assert "New Cast Member" in names
-    track_lists = [
-        sorted(ident.get("track_ids", [])) for ident in identities_after["identities"]
-    ]
+    track_lists = [sorted(ident.get("track_ids", [])) for ident in identities_after["identities"]]
     assert [2] in track_lists
 
     roster_path = tmp_path / "data" / "rosters" / "demo.json"
@@ -150,12 +133,8 @@ def test_track_frame_move_endpoint_accepts_frame_ids(tmp_path):
     (frames_root / "crops" / "track_0001").mkdir(parents=True, exist_ok=True)
     (frames_root / "thumbs" / "track_0001").mkdir(parents=True, exist_ok=True)
     for frame_idx in (0, 1):
-        (
-            frames_root / "crops" / "track_0001" / f"frame_{frame_idx:06d}.jpg"
-        ).write_bytes(b"x")
-        (
-            frames_root / "thumbs" / "track_0001" / f"thumb_{frame_idx:06d}.jpg"
-        ).write_bytes(b"x")
+        (frames_root / "crops" / "track_0001" / f"frame_{frame_idx:06d}.jpg").write_bytes(b"x")
+        (frames_root / "thumbs" / "track_0001" / f"thumb_{frame_idx:06d}.jpg").write_bytes(b"x")
     faces_rows = [
         {
             "ep_id": ep_id,
@@ -195,15 +174,8 @@ def test_track_frame_move_endpoint_accepts_frame_ids(tmp_path):
     assert data["moved"] == 1
     ops_path = manifests_dir / "faces_ops.jsonl"
     assert ops_path.exists()
-    ops_entries = [
-        json.loads(line)
-        for line in ops_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert any(
-        entry.get("op") == "move_frame" and entry.get("frame_idx") == 0
-        for entry in ops_entries
-    )
+    ops_entries = [json.loads(line) for line in ops_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(entry.get("op") == "move_frame" and entry.get("frame_idx") == 0 for entry in ops_entries)
 
 
 def test_track_frame_delete_endpoint_removes_multiple_frames(tmp_path):
@@ -254,17 +226,9 @@ def test_track_frame_delete_endpoint_removes_multiple_frames(tmp_path):
     assert data["deleted"] == 2
     assert not (crops_dir / "frame_000000.jpg").exists()
     assert (crops_dir / "frame_000002.jpg").exists()
-    faces_after = [
-        json.loads(line)
-        for line in faces_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    faces_after = [json.loads(line) for line in faces_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     remaining_idxs = {row["frame_idx"] for row in faces_after}
     assert remaining_idxs == {2}
     ops_path = manifests_dir / "faces_ops.jsonl"
-    entries = [
-        json.loads(line)
-        for line in ops_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    entries = [json.loads(line) for line in ops_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert sum(1 for entry in entries if entry.get("op") == "delete_frame") == 2

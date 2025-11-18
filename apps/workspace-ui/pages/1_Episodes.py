@@ -59,9 +59,7 @@ def _show_single_delete(ep_id: str) -> None:
         )
         cols = st.columns(2)
         with cols[0]:
-            if st.button(
-                "Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"
-            ):
+            if st.button("Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"):
                 payload = {"include_s3": True}
                 resp = _api_post_json(f"/episodes/{ep_id}/delete", payload)
                 if resp is not None:
@@ -73,9 +71,7 @@ def _show_single_delete(ep_id: str) -> None:
                         f"S3 objects={deleted.get('s3_objects', 0)}",
                     ]
                     if people_cleanup.get("clusters_removed", 0) > 0:
-                        msg_parts.append(
-                            f"people clusters cleaned={people_cleanup.get('clusters_removed', 0)}"
-                        )
+                        msg_parts.append(f"people clusters cleaned={people_cleanup.get('clusters_removed', 0)}")
                     st.success(" · ".join(msg_parts))
                     _reset_delete_state()
                     st.rerun()
@@ -137,15 +133,11 @@ if not episodes:
     st.info("No episodes yet. Use Upload & Run first.")
     st.stop()
 
-search_query = (
-    st.text_input("Search", "", help="Filter by ep_id or show.").strip().lower()
-)
+search_query = st.text_input("Search", "", help="Filter by ep_id or show.").strip().lower()
 filtered = [
     ep
     for ep in episodes
-    if not search_query
-    or search_query in ep["ep_id"].lower()
-    or search_query in (ep["show_slug"] or "").lower()
+    if not search_query or search_query in ep["ep_id"].lower() or search_query in (ep["show_slug"] or "").lower()
 ]
 if not filtered:
     st.warning("No episodes match that filter.")

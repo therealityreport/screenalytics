@@ -33,9 +33,7 @@ def test_track_to_record_emits_numeric_id():
     record = track.to_record()
 
     # Verify track_id is numeric (int), not a formatted string
-    assert isinstance(
-        record["track_id"], int
-    ), f"track_id should be int, got {type(record['track_id'])}"
+    assert isinstance(record["track_id"], int), f"track_id should be int, got {type(record['track_id'])}"
     assert record["track_id"] == 42
 
     # Verify it can be cast to int (redundant but explicit)
@@ -82,9 +80,7 @@ def test_build_tracks_emits_parseable_track_ids():
         track_id = track["track_id"]
 
         # Verify track_id is numeric type
-        assert isinstance(
-            track_id, int
-        ), f"track_id should be int, got {type(track_id)}: {track_id}"
+        assert isinstance(track_id, int), f"track_id should be int, got {type(track_id)}: {track_id}"
 
         # Verify it can be parsed with int() (critical for downstream)
         parsed = int(track_id)

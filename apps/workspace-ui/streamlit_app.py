@@ -6,9 +6,7 @@ import ui_helpers as helpers
 
 cfg = helpers.init_page("Screenalytics Workspace")
 st.title("Screenalytics Workspace")
-st.caption(
-    "Launch the upload helper or jump into any workspace page. Configure API access via the sidebar."
-)
+st.caption("Launch the upload helper or jump into any workspace page. Configure API access via the sidebar.")
 
 nav_cols = st.columns(2)
 with nav_cols[0]:

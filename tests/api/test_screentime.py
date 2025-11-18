@@ -316,9 +316,7 @@ def test_screentime_track_mode_honors_coverage_gate(
 
     for track in tracks:
         if track["track_id"] == 2:
-            track["frame_count"] = (
-                200  # artificially inflate duration to reduce coverage
-            )
+            track["frame_count"] = 200  # artificially inflate duration to reduce coverage
             track["last_frame_idx"] = track["first_frame_idx"] + 200
 
     with tracks_path.open("w", encoding="utf-8") as f:
@@ -399,9 +397,7 @@ def test_screentime_missing_artifacts(monkeypatch, tmp_path: Path):
         analyzer.analyze_episode(ep_id)
 
 
-def test_screentime_confidence_calculation(
-    temp_episode_data: tuple[str, Path], monkeypatch
-):
+def test_screentime_confidence_calculation(temp_episode_data: tuple[str, Path], monkeypatch):
     """Test that confidence is calculated based on tracks and faces."""
     ep_id, data_root = temp_episode_data
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))

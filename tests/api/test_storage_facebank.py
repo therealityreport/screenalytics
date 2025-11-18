@@ -1,4 +1,3 @@
-
 import pytest
 
 from apps.api.services import storage as storage_module
@@ -31,9 +30,7 @@ class _DummyS3Client:
             "ContentType": entry["content_type"],
         }
 
-    def generate_presigned_url(
-        self, *_args, Params=None, ExpiresIn=None, **_kwargs
-    ):  # noqa: N802
+    def generate_presigned_url(self, *_args, Params=None, ExpiresIn=None, **_kwargs):  # noqa: N802
         self.presigns.append((Params or {}, ExpiresIn or 0))
         bucket = (Params or {}).get("Bucket", "bucket")
         key = (Params or {}).get("Key", "key")

@@ -9,9 +9,7 @@ class _FakeStorage:
         self.calls: list[tuple[str, int, str | None]] = []
         self.url = url
 
-    def presign_get(
-        self, key: str, *, expires_in: int = 3600, content_type: str | None = None
-    ) -> str | None:
+    def presign_get(self, key: str, *, expires_in: int = 3600, content_type: str | None = None) -> str | None:
         self.calls.append((key, expires_in, content_type))
         if not self.url:
             return None

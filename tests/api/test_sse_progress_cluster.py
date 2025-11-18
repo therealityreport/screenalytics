@@ -46,9 +46,7 @@ def test_sse_cluster_done_and_close(tmp_path, monkeypatch) -> None:
 
     client = TestClient(app)
     headers = {"accept": "text/event-stream"}
-    with client.stream(
-        "POST", "/jobs/cluster", headers=headers, json={"ep_id": ep_id}
-    ) as response:
+    with client.stream("POST", "/jobs/cluster", headers=headers, json={"ep_id": ep_id}) as response:
         assert response.status_code == 200
         events = collect_sse_events(response)
         stream_closed = response.is_closed

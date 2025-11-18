@@ -10,9 +10,7 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 
-def clip_bbox(
-    x1: float, y1: float, x2: float, y2: float, *, W: int, H: int
-) -> tuple[int, int, int, int] | None:
+def clip_bbox(x1: float, y1: float, x2: float, y2: float, *, W: int, H: int) -> tuple[int, int, int, int] | None:
     """Clamp an XYXY box to integer pixel coordinates."""
     if W <= 1 or H <= 1:
         return None

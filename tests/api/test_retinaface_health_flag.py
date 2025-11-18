@@ -32,9 +32,7 @@ def test_seed_upload_response_includes_simulated_detector_flag(tmp_path, monkeyp
     def _fake_ensure_ready(device):
         return False, "weights missing", None
 
-    monkeypatch.setattr(
-        facebank_router.episode_run, "ensure_retinaface_ready", _fake_ensure_ready
-    )
+    monkeypatch.setattr(facebank_router.episode_run, "ensure_retinaface_ready", _fake_ensure_ready)
 
     files = [("files", ("seed.jpg", _create_test_image(), "image/jpeg"))]
     resp = client.post(f"/cast/{cast_id}/seeds/upload?show_id={show_id}", files=files)

@@ -95,7 +95,9 @@ def _diag(tag: str, **kw) -> None:
         LOGGER.info("[DIAG:%s] %s", tag, json.dumps(kw, ensure_ascii=False))
 
 
-SIMULATED_DETECTOR_MESSAGE = "Using simulated detector. Crops use full image without alignment. Install RetinaFace to improve results."
+SIMULATED_DETECTOR_MESSAGE = (
+    "Using simulated detector. Crops use full image without alignment. Install RetinaFace to improve results."
+)
 
 
 def _letterbox_square(image: np.ndarray, size: int) -> np.ndarray:
@@ -110,9 +112,7 @@ def _letterbox_square(image: np.ndarray, size: int) -> np.ndarray:
     new_h = max(int(round(h * scale)), 1)
 
     resample_attr = getattr(Image, "Resampling", Image)
-    resample_filter = getattr(
-        resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST)
-    )
+    resample_filter = getattr(resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST))
 
     # Convert BGR to RGB for PIL, resize, then convert back
     pil_img = Image.fromarray(arr[..., ::-1])
@@ -146,9 +146,7 @@ def _resize_display_image(image_bgr: np.ndarray) -> tuple[np.ndarray, list[int],
     result = arr
     if scale != 1.0:
         resample_attr = getattr(Image, "Resampling", Image)
-        resample_filter = getattr(
-            resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST)
-        )
+        resample_filter = getattr(resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST))
         pil_img = Image.fromarray(arr[..., ::-1])
         resized = pil_img.resize((new_w, new_h), resample=resample_filter)
         pil_img.close()
@@ -157,9 +155,7 @@ def _resize_display_image(image_bgr: np.ndarray) -> tuple[np.ndarray, list[int],
     return np.ascontiguousarray(result), [new_w, new_h], long_side < SEED_DISPLAY_MIN
 
 
-def _expand_square_bbox(
-    bbox: list[float], margin: float, width: int, height: int
-) -> list[int]:
+def _expand_square_bbox(bbox: list[float], margin: float, width: int, height: int) -> list[int]:
     x1, y1, x2, y2 = bbox
     box_w = max(x2 - x1, 1.0)
     box_h = max(y2 - y1, 1.0)
@@ -215,9 +211,7 @@ def _save_derivative(image_bgr: np.ndarray, path: Path, fmt: str) -> None:
     target_fmt = "PNG" if fmt == "png" else "JPEG"
     img_rgb = np.ascontiguousarray(image_bgr[..., ::-1])
     image = Image.fromarray(img_rgb)
-    save_kwargs: dict = (
-        {"optimize": True} if target_fmt == "PNG" else {"quality": JPEG_QUALITY}
-    )
+    save_kwargs: dict = {"optimize": True} if target_fmt == "PNG" else {"quality": JPEG_QUALITY}
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path, format=target_fmt, **save_kwargs)
     image.close()
@@ -251,9 +245,7 @@ class DeleteSeedsRequest(BaseModel):
     seed_ids: List[str] = Field(..., description="List of seed IDs to delete")
 
 
-def _emit_facebank_refresh(
-    show_id: str, cast_id: str, action: str, seed_ids: List[str]
-) -> str | None:
+def _emit_facebank_refresh(show_id: str, cast_id: str, action: str, seed_ids: List[str]) -> str | None:
     if not seed_ids:
         return None
     try:
@@ -264,9 +256,7 @@ def _emit_facebank_refresh(
             seed_ids=seed_ids,
         )
     except Exception as exc:  # pragma: no cover - best-effort notification
-        LOGGER.warning(
-            "Facebank refresh emit failed for %s/%s: %s", show_id, cast_id, exc
-        )
+        LOGGER.warning("Facebank refresh emit failed for %s/%s: %s", show_id, cast_id, exc)
         return None
     return record.get("job_id")
 
@@ -328,9 +318,7 @@ async def upload_seeds(
             detail=f"Face detection/embedding modules not available: {exc}",
         ) from exc
 
-    detector_ready, detector_error, detector_provider = (
-        episode_run.ensure_retinaface_ready("auto")
-    )
+    detector_ready, detector_error, detector_provider = episode_run.ensure_retinaface_ready("auto")
     detector = RetinaFaceDetectorBackend(device="auto")
     detector_simulated = not detector_ready
     if detector_simulated:
@@ -365,17 +353,13 @@ async def upload_seeds(
                 pil_image = ImageOps.exif_transpose(pil_image)
                 pil_image = pil_image.convert("RGB")
             except (UnidentifiedImageError, OSError):
-                errors.append(
-                    {"file": file.filename, "error": "Unsupported or corrupt image"}
-                )
+                errors.append({"file": file.filename, "error": "Unsupported or corrupt image"})
                 continue
 
             image_rgb = np.asarray(pil_image)
             pil_image.close()
             if image_rgb.size == 0:
-                errors.append(
-                    {"file": file.filename, "error": "Unsupported or corrupt image"}
-                )
+                errors.append({"file": file.filename, "error": "Unsupported or corrupt image"})
                 continue
             image = np.ascontiguousarray(image_rgb[..., ::-1])
 
@@ -424,10 +408,7 @@ async def upload_seeds(
             if detector_provider:
                 quality["detector_provider"] = detector_provider
 
-            landmarks_abs = [
-                coord * (w if i % 2 == 0 else h)
-                for i, coord in enumerate(landmarks_rel or [])
-            ]
+            landmarks_abs = [coord * (w if i % 2 == 0 else h) for i, coord in enumerate(landmarks_rel or [])]
 
             _diag(
                 "SEED_INPUT",
@@ -440,12 +421,8 @@ async def upload_seeds(
                 detector_mode=detector_mode,
             )
 
-            display_crop, display_bbox = _prepare_display_crop(
-                image, bbox, detector_mode
-            )
-            display_bgr, display_dims, display_low_res = _resize_display_image(
-                display_crop
-            )
+            display_crop, display_bbox = _prepare_display_crop(image, bbox, detector_mode)
+            display_bgr, display_dims, display_low_res = _resize_display_image(display_crop)
 
             crop, crop_err = _prepare_face_crop(
                 image,
@@ -468,9 +445,7 @@ async def upload_seeds(
             )
 
             if crop is None:
-                errors.append(
-                    {"file": file.filename, "error": f"Failed to crop face: {crop_err}"}
-                )
+                errors.append({"file": file.filename, "error": f"Failed to crop face: {crop_err}"})
                 continue
 
             embed_crop = np.ascontiguousarray(crop)
@@ -496,9 +471,7 @@ async def upload_seeds(
             embed_path = seeds_dir / embed_filename
 
             if FACEBANK_KEEP_ORIG:
-                _save_derivative(
-                    image.astype(np.uint8, copy=False), orig_path, SEED_ORIG_FORMAT
-                )
+                _save_derivative(image.astype(np.uint8, copy=False), orig_path, SEED_ORIG_FORMAT)
 
             _save_derivative(
                 display_bgr.astype(np.uint8, copy=False),
@@ -589,9 +562,7 @@ async def upload_seeds(
             )
 
             presigned = (
-                storage_service.presign_get(display_s3_key, content_type=DISPLAY_MIME)
-                if display_s3_key
-                else None
+                storage_service.presign_get(display_s3_key, content_type=DISPLAY_MIME) if display_s3_key else None
             )
 
             uploaded_seeds.append(
@@ -666,9 +637,7 @@ async def upload_seeds(
         refresh_job_id=refresh_job_id,
     )
 
-    status_code = (
-        status.HTTP_202_ACCEPTED if detector_mode == "simulated" else status.HTTP_200_OK
-    )
+    status_code = status.HTTP_202_ACCEPTED if detector_mode == "simulated" else status.HTTP_200_OK
     return JSONResponse(response_payload, status_code=status_code)
 
 
@@ -682,9 +651,7 @@ def delete_seeds(cast_id: str, show_id: str, body: DeleteSeedsRequest) -> dict:
     deleted_count = facebank_service.delete_seeds(show_id, cast_id, body.seed_ids)
     refresh_job_id = None
     if deleted_count:
-        refresh_job_id = _emit_facebank_refresh(
-            show_id, cast_id, "delete", body.seed_ids
-        )
+        refresh_job_id = _emit_facebank_refresh(show_id, cast_id, "delete", body.seed_ids)
 
     return {
         "cast_id": cast_id,
@@ -732,18 +699,14 @@ def feature_seed(cast_id: str, seed_id: str, show_id: str) -> FeatureSeedRespons
             cast_id=cast_id,
         )
 
-    return FeatureSeedResponse(
-        cast_id=cast_id, seed_id=seed_id, image_uri=display_uri or ""
-    )
+    return FeatureSeedResponse(cast_id=cast_id, seed_id=seed_id, image_uri=display_uri or "")
 
 
 @router.get("/cast/{cast_id}/seeds/{seed_id}/image")
 def get_seed_image(cast_id: str, seed_id: str, show_id: str) -> FileResponse:
     """Serve a seed image file (fallback for local storage without S3)."""
     facebank = facebank_service.get_facebank(show_id, cast_id)
-    seed = next(
-        (s for s in facebank.get("seeds", []) if s.get("fb_id") == seed_id), None
-    )
+    seed = next((s for s in facebank.get("seeds", []) if s.get("fb_id") == seed_id), None)
     if not seed:
         raise HTTPException(status_code=404, detail=f"Seed {seed_id} not found")
 

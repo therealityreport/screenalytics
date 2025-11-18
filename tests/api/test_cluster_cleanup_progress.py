@@ -23,9 +23,7 @@ def test_compute_centroids_has_progress_callback():
     func_def = match.group(0)
 
     # Check for progress_callback parameter
-    assert (
-        "progress_callback" in func_def
-    ), "compute_cluster_centroids should have progress_callback parameter"
+    assert "progress_callback" in func_def, "compute_cluster_centroids should have progress_callback parameter"
 
     print("✓ compute_cluster_centroids has progress_callback parameter")
 
@@ -45,9 +43,7 @@ def test_group_within_episode_has_progress_callback():
     func_def = match.group(0)
 
     # Check for progress_callback parameter
-    assert (
-        "progress_callback" in func_def
-    ), "group_within_episode should have progress_callback parameter"
+    assert "progress_callback" in func_def, "group_within_episode should have progress_callback parameter"
 
     print("✓ group_within_episode has progress_callback parameter")
 
@@ -63,9 +59,7 @@ def test_grouping_service_has_progress_logging():
     assert (
         "Computing centroids" in content or "computing centroids" in content.lower()
     ), "Should log centroid computation"
-    assert (
-        "agglomerative clustering" in content.lower()
-    ), "Should log agglomerative clustering step"
+    assert "agglomerative clustering" in content.lower(), "Should log agglomerative clustering step"
 
     print("✓ GroupingService has progress logging")
 
@@ -76,18 +70,12 @@ def test_episode_cleanup_uses_progress_callbacks():
     content = cleanup_path.read_text()
 
     # Check that episode_cleanup calls grouping with progress callbacks
-    assert (
-        "progress_callback=" in content
-    ), "Should pass progress_callback to grouping methods"
-    assert (
-        "log_progress" in content or "log_within_progress" in content
-    ), "Should define progress callback functions"
+    assert "progress_callback=" in content, "Should pass progress_callback to grouping methods"
+    assert "log_progress" in content or "log_within_progress" in content, "Should define progress callback functions"
 
     # Check for progress logging
     assert "[cleanup]" in content, "Should have cleanup log tags"
-    assert (
-        "centroid progress" in content or "grouping" in content
-    ), "Should log centroid/grouping progress"
+    assert "centroid progress" in content or "grouping" in content, "Should log centroid/grouping progress"
 
     print("✓ episode_cleanup uses progress callbacks")
 
@@ -104,9 +92,7 @@ def test_mps_device_support_enabled():
     import re
 
     device_pattern = r"--device.*choices.*\[.*mps"
-    assert re.search(
-        device_pattern, content, re.IGNORECASE | re.DOTALL
-    ), "Should have MPS in device choices"
+    assert re.search(device_pattern, content, re.IGNORECASE | re.DOTALL), "Should have MPS in device choices"
 
     print("✓ MPS device support is enabled")
 

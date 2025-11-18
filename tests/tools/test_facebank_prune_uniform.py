@@ -31,16 +31,12 @@ def test_prune_facebank_seeds_flags_and_removes(tmp_path, monkeypatch):
     fs.add_seed(show_id, cast_id, str(uniform_path), np.zeros(512, dtype=np.float32))
     fs.add_seed(show_id, cast_id, str(varied_path), np.zeros(512, dtype=np.float32))
 
-    stats = prune.prune_facebank_seeds(
-        show_id, cast_id=cast_id, threshold=5.0, delete=False
-    )
+    stats = prune.prune_facebank_seeds(show_id, cast_id=cast_id, threshold=5.0, delete=False)
     assert stats["inspected"] == 2
     assert stats["flagged"] == 1
     assert stats["removed"] == 0
 
-    stats = prune.prune_facebank_seeds(
-        show_id, cast_id=cast_id, threshold=5.0, delete=True
-    )
+    stats = prune.prune_facebank_seeds(show_id, cast_id=cast_id, threshold=5.0, delete=True)
     assert stats["removed"] == 1
 
     refreshed = fs._load_facebank(show_id, cast_id)

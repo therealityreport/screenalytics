@@ -89,9 +89,7 @@ def test_tracker_resets_on_scene_cuts(tmp_path, monkeypatch) -> None:
         return tracker
 
     monkeypatch.setattr(episode_run, "_build_tracker_adapter", _build_tracker_sim)
-    monkeypatch.setattr(
-        episode_run, "_build_face_detector", lambda *a, **k: _FakeDetector()
-    )
+    monkeypatch.setattr(episode_run, "_build_face_detector", lambda *a, **k: _FakeDetector())
 
     args = argparse.Namespace(
         ep_id=ep_id,

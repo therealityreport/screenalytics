@@ -103,9 +103,7 @@ def _delete_s3_assets(
     deleted_objects = 0
     for prefix in keys:
         if not apply_changes:
-            LOGGER.info(
-                "[dry-run] would delete S3 prefix s3://%s/%s", storage.bucket, prefix
-            )
+            LOGGER.info("[dry-run] would delete S3 prefix s3://%s/%s", storage.bucket, prefix)
             continue
         deleted_objects += delete_s3_prefix(storage.bucket, prefix, storage=storage)
         LOGGER.info("Deleted S3 prefix s3://%s/%s", storage.bucket, prefix)
@@ -154,9 +152,7 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Perform deletions instead of printing a dry-run plan",
     )
-    parser.add_argument(
-        "--no-local", action="store_true", help="Skip local filesystem cleanup"
-    )
+    parser.add_argument("--no-local", action="store_true", help="Skip local filesystem cleanup")
     parser.add_argument(
         "--no-artifacts",
         action="store_true",
@@ -180,9 +176,7 @@ def main(argv: list[str]) -> int:
     store = EpisodeStore()
     storage = StorageService()
 
-    candidates = _collect_candidates(
-        store, storage, explicit=args.ep_id, limit=args.limit
-    )
+    candidates = _collect_candidates(store, storage, explicit=args.ep_id, limit=args.limit)
     if not candidates:
         LOGGER.info("No orphan episodes found.")
         return 0

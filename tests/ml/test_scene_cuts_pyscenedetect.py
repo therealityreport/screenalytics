@@ -11,9 +11,7 @@ pytest.importorskip("scenedetect")
 from tools import episode_run
 
 
-def _write_color_bars(
-    path: Path, colors: list[tuple[int, int, int]], frames_per_color: int
-) -> None:
+def _write_color_bars(path: Path, colors: list[tuple[int, int, int]], frames_per_color: int) -> None:
     width, height = 64, 64
     writer = cv2.VideoWriter(
         str(path),

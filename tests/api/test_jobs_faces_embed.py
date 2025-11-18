@@ -21,9 +21,7 @@ def test_faces_embed_async_fails_fast_when_arcface_missing(tmp_path, monkeypatch
     track_path.write_text("{}", encoding="utf-8")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(
-        ep_id=ep_id, show_slug="demo", season=1, episode=4
-    )
+    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=4)
 
     service = JobService(data_root=data_root)
     monkeypatch.setattr(jobs_router, "JOB_SERVICE", service)

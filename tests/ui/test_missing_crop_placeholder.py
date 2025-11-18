@@ -10,15 +10,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 def test_cluster_view_shows_placeholder_for_missing_crops():
     """Test that track representatives without crops show placeholder image."""
-    faces_review_path = (
-        PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
-    )
+    faces_review_path = PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
     content = faces_review_path.read_text()
 
     # Check that hide_if_missing=False is used for track representatives
-    assert (
-        "hide_if_missing=False" in content
-    ), "Should use hide_if_missing=False to show placeholder"
+    assert "hide_if_missing=False" in content, "Should use hide_if_missing=False to show placeholder"
 
     # Check that "Missing crop" caption is not shown (removed)
     # Count occurrences - should be minimal or none in track rep views
@@ -32,9 +28,7 @@ def test_cluster_view_shows_placeholder_for_missing_crops():
 
 def test_set_view_no_rerun_in_callback():
     """Test that _set_view doesn't call st.rerun() to avoid callback warning."""
-    faces_review_path = (
-        PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
-    )
+    faces_review_path = PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
     content = faces_review_path.read_text()
 
     # Find the _set_view function definition (simple approach)
@@ -68,9 +62,7 @@ def test_set_view_no_rerun_in_callback():
 
 def test_direct_set_view_calls_have_rerun():
     """Test that direct (non-callback) _set_view calls are followed by st.rerun()."""
-    faces_review_path = (
-        PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
-    )
+    faces_review_path = PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
     content = faces_review_path.read_text()
 
     # Find direct _set_view calls that are not in lambda/on_click contexts
@@ -87,9 +79,7 @@ def test_direct_set_view_calls_have_rerun():
                     # This is a direct call followed by return - should have st.rerun() before return
                     prev_line = lines[i].strip() if i > 0 else ""
                     assert (
-                        "st.rerun()" in next_line
-                        or i + 2 < len(lines)
-                        and "st.rerun()" in lines[i + 2]
+                        "st.rerun()" in next_line or i + 2 < len(lines) and "st.rerun()" in lines[i + 2]
                     ), f"Line {i+1}: _set_view followed by return should call st.rerun()"
 
     print("✓ Direct _set_view calls followed by return have st.rerun()")

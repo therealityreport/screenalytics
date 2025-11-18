@@ -18,9 +18,7 @@ def test_episode_cleanup_async_enqueues_job(tmp_path, monkeypatch):
     video_path.write_bytes(b"vid")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(
-        ep_id=ep_id, show_slug="demo", season=1, episode=2
-    )
+    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=2)
 
     service = JobService(data_root=data_root)
     captured: dict = {}

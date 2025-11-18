@@ -43,9 +43,7 @@ def _bootstrap_facebank(ep_id: str, data_root: Path) -> None:
             "thumb_rel_path": "track_0002/thumb_000030.jpg",
         },
     ]
-    faces_path.write_text(
-        "\n".join(json.dumps(row) for row in faces_rows) + "\n", encoding="utf-8"
-    )
+    faces_path.write_text("\n".join(json.dumps(row) for row in faces_rows) + "\n", encoding="utf-8")
 
     tracks_rows = [
         {
@@ -59,9 +57,7 @@ def _bootstrap_facebank(ep_id: str, data_root: Path) -> None:
             "thumb_rel_path": "track_0002/thumb_000030.jpg",
         },
     ]
-    track_path.write_text(
-        "\n".join(json.dumps(row) for row in tracks_rows) + "\n", encoding="utf-8"
-    )
+    track_path.write_text("\n".join(json.dumps(row) for row in tracks_rows) + "\n", encoding="utf-8")
 
     identities_payload = {
         "ep_id": ep_id,
@@ -83,9 +79,7 @@ def _bootstrap_facebank(ep_id: str, data_root: Path) -> None:
         ],
         "stats": {"faces": 3, "clusters": 2},
     }
-    identities_path.write_text(
-        json.dumps(identities_payload, indent=2), encoding="utf-8"
-    )
+    identities_path.write_text(json.dumps(identities_payload, indent=2), encoding="utf-8")
 
 
 def test_identity_rename_and_merge(monkeypatch, tmp_path) -> None:
@@ -135,11 +129,7 @@ def test_move_track_and_delete(monkeypatch, tmp_path) -> None:
     assert delete_resp.status_code == 200
 
     faces_path = get_path(ep_id, "detections").parent / "faces.jsonl"
-    remaining_faces = [
-        line
-        for line in faces_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    remaining_faces = [line for line in faces_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(remaining_faces) == 1  # only track 2 remains
 
 
@@ -157,11 +147,5 @@ def test_delete_single_frame(monkeypatch, tmp_path) -> None:
     )
     assert resp.status_code == 200
     faces_path = get_path(ep_id, "detections").parent / "faces.jsonl"
-    faces_rows = [
-        json.loads(line)
-        for line in faces_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert all(
-        not (row["track_id"] == 1 and row["frame_idx"] == 10) for row in faces_rows
-    )
+    faces_rows = [json.loads(line) for line in faces_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert all(not (row["track_id"] == 1 and row["frame_idx"] == 10) for row in faces_rows)

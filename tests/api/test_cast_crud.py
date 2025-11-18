@@ -208,9 +208,7 @@ def test_cast_bulk_import_force_new(tmp_path, monkeypatch):
 
     # Bulk import with force_new=True
     import_payload = {
-        "members": [
-            {"name": "Kyle Richards", "role": "friend"}  # Should create duplicate
-        ],
+        "members": [{"name": "Kyle Richards", "role": "friend"}],  # Should create duplicate
         "force_new": True,
     }
     resp = client.post(f"/shows/{show_id}/cast/import", json=import_payload)

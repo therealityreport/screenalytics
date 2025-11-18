@@ -13,9 +13,7 @@ from PIL import Image
 from apps.api.services.facebank import FacebankService
 
 
-def _iter_cast_dirs(
-    fs: FacebankService, show_id: str, cast_id: str | None
-) -> Iterable[Path]:
+def _iter_cast_dirs(fs: FacebankService, show_id: str, cast_id: str | None) -> Iterable[Path]:
     show_dir = fs.facebank_dir / show_id
     if cast_id:
         yield show_dir / cast_id
@@ -86,9 +84,7 @@ def prune_facebank_seeds(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Detect or delete blank facebank crops."
-    )
+    parser = argparse.ArgumentParser(description="Detect or delete blank facebank crops.")
     parser.add_argument("show_id", help="Show identifier (e.g. RHOBH)")
     parser.add_argument("--cast-id", help="Limit to a single cast id")
     parser.add_argument(
@@ -109,11 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         threshold=max(float(args.threshold), 0.0),
         delete=args.delete,
     )
-    print(
-        "inspected={inspected} flagged={flagged} removed={removed} errors={errors}".format(
-            **stats
-        )
-    )
+    print("inspected={inspected} flagged={flagged} removed={removed} errors={errors}".format(**stats))
     return 0
 
 

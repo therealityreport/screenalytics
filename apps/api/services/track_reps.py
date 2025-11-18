@@ -16,9 +16,7 @@ from py_screenalytics.artifacts import get_path
 LOGGER = logging.getLogger(__name__)
 
 # Quality gates for representative frames
-REP_DET_MIN = float(
-    os.getenv("REP_DET_MIN", "0.50")
-)  # Lowered from 0.60 to accept more frames
+REP_DET_MIN = float(os.getenv("REP_DET_MIN", "0.50"))  # Lowered from 0.60 to accept more frames
 REP_STD_MIN = float(os.getenv("REP_STD_MIN", "1.0"))
 REP_MAX_FRAMES_PER_TRACK = int(os.getenv("REP_MAX_FRAMES_PER_TRACK", "50"))
 REP_MIN_SIM_TO_CENTROID = float(os.getenv("REP_MIN_SIM_TO_CENTROID", "0.50"))
@@ -88,9 +86,7 @@ def _discover_crop_path(ep_id: str, track_id: int, frame_idx: int) -> Optional[s
         return f"crops/{track_component}/{frame_filename}"
 
     # Fallback locations
-    fallback_root = Path(
-        os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")
-    ).expanduser()
+    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
     legacy1 = fallback_root / ep_id / "tracks" / track_component / frame_filename
     if legacy1.exists():
         return f"crops/{track_component}/{frame_filename}"
@@ -101,9 +97,7 @@ def _discover_crop_path(ep_id: str, track_id: int, frame_idx: int) -> Optional[s
     if primary_png.exists():
         return f"crops/{track_component}/{frame_filename_png}"
 
-    legacy1_png = (
-        fallback_root / ep_id / "tracks" / track_component / frame_filename_png
-    )
+    legacy1_png = fallback_root / ep_id / "tracks" / track_component / frame_filename_png
     if legacy1_png.exists():
         return f"crops/{track_component}/{frame_filename_png}"
 
@@ -275,9 +269,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     track_centroid = l2_normalize(mean_embed)
 
     # STEP 2: Score all candidate frames and select the BEST one
-    candidates: List[Tuple[Dict[str, Any], str, float, float]] = (
-        []
-    )  # (face, crop_path, quality_score, similarity)
+    candidates: List[Tuple[Dict[str, Any], str, float, float]] = []  # (face, crop_path, quality_score, similarity)
 
     for face in faces:
         frame_idx = face.get("frame_idx")
@@ -313,8 +305,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     high_quality_candidates = [
         (face, crop_path, quality_score, similarity)
         for face, crop_path, quality_score, similarity in candidates
-        if _passes_quality_gates(face, crop_path)
-        and similarity >= REP_MIN_SIM_TO_CENTROID
+        if _passes_quality_gates(face, crop_path) and similarity >= REP_MIN_SIM_TO_CENTROID
     ]
 
     rep_face = None
@@ -327,9 +318,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     if high_quality_candidates:
         # Sort by quality score (descending) and pick the best
         high_quality_candidates.sort(key=lambda x: x[2], reverse=True)
-        rep_face, rep_crop_key, rep_quality_score, rep_similarity = (
-            high_quality_candidates[0]
-        )
+        rep_face, rep_crop_key, rep_quality_score, rep_similarity = high_quality_candidates[0]
     else:
         # Second pass: prioritize high-similarity frames even if they fail quality gates
         # If similarity is excellent (≥0.85), accept lower quality frames
@@ -342,9 +331,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         if high_sim_candidates:
             # Sort by similarity first, then quality
             high_sim_candidates.sort(key=lambda x: (x[3], x[2]), reverse=True)
-            rep_face, rep_crop_key, rep_quality_score, rep_similarity = (
-                high_sim_candidates[0]
-            )
+            rep_face, rep_crop_key, rep_quality_score, rep_similarity = high_sim_candidates[0]
             LOGGER.info(
                 "Track %d: using high-similarity rep (sim=%.3f, score=%.3f)",
                 track_id,
@@ -361,9 +348,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
 
             if quality_only_candidates:
                 quality_only_candidates.sort(key=lambda x: x[2], reverse=True)
-                rep_face, rep_crop_key, rep_quality_score, rep_similarity = (
-                    quality_only_candidates[0]
-                )
+                rep_face, rep_crop_key, rep_quality_score, rep_similarity = quality_only_candidates[0]
                 low_confidence = True
                 LOGGER.info(
                     "Track %d: using quality-only rep with sim %.3f < %.3f",
@@ -374,9 +359,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
             else:
                 # Final fallback: pick best available frame by quality score (no gates)
                 candidates.sort(key=lambda x: x[2], reverse=True)
-                rep_face, rep_crop_key, rep_quality_score, rep_similarity = candidates[
-                    0
-                ]
+                rep_face, rep_crop_key, rep_quality_score, rep_similarity = candidates[0]
                 low_confidence = True
                 rep_low_quality = True
                 LOGGER.warning(
@@ -487,9 +470,7 @@ def load_track_reps(ep_id: str) -> Dict[str, Dict[str, Any]]:
     return reps
 
 
-def compute_cluster_centroids(
-    ep_id: str, track_reps: Optional[Dict[str, Dict[str, Any]]] = None
-) -> Dict[str, Any]:
+def compute_cluster_centroids(ep_id: str, track_reps: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Compute cluster centroids from track representatives.
 
     Args:
@@ -573,9 +554,7 @@ def compute_cluster_centroids(
         cluster_centroid = l2_normalize(mean_centroid)
 
         # Compute cohesion as mean similarity of tracks to centroid
-        similarities = [
-            cosine_similarity(tc, cluster_centroid) for tc in track_centroids
-        ]
+        similarities = [cosine_similarity(tc, cluster_centroid) for tc in track_centroids]
         cohesion = float(np.mean(similarities))
 
         centroids[cluster_id] = {
@@ -619,9 +598,7 @@ def load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
 
         # Handle old format (list) vs new format (dict)
         if isinstance(centroids, list):
-            LOGGER.warning(
-                f"cluster_centroids.json has old list format for {ep_id}, converting..."
-            )
+            LOGGER.warning(f"cluster_centroids.json has old list format for {ep_id}, converting...")
 
             # Load identities to get track_ids for each cluster
             from apps.api.services.identities import load_identities
@@ -633,9 +610,7 @@ def load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
                 if identity_id:
                     track_ids = identity.get("track_ids", [])
                     # Convert to track_XXXX format
-                    identity_tracks_map[identity_id] = [
-                        f"track_{int(tid):04d}" for tid in track_ids
-                    ]
+                    identity_tracks_map[identity_id] = [f"track_{int(tid):04d}" for tid in track_ids]
 
             # Convert old format to new format
             centroids_dict = {}
@@ -649,9 +624,7 @@ def load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
                         "cohesion": item.get("cohesion"),  # Preserve if available
                     }
 
-            LOGGER.info(
-                f"Converted {len(centroids_dict)} legacy centroids with tracks from identities.json"
-            )
+            LOGGER.info(f"Converted {len(centroids_dict)} legacy centroids with tracks from identities.json")
             return centroids_dict
         elif isinstance(centroids, dict):
             return centroids

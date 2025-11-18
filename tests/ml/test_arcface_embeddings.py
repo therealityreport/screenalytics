@@ -16,14 +16,10 @@ from py_screenalytics.artifacts import ensure_dirs, get_path
 from tools import episode_run
 
 RUN_ML_TESTS = os.environ.get("RUN_ML_TESTS") == "1"
-pytestmark = pytest.mark.skipif(
-    not RUN_ML_TESTS, reason="set RUN_ML_TESTS=1 to run ML integration tests"
-)
+pytestmark = pytest.mark.skipif(not RUN_ML_TESTS, reason="set RUN_ML_TESTS=1 to run ML integration tests")
 
 
-def _make_sample_video(
-    target: Path, frame_count: int = 5, size: tuple[int, int] = (80, 80)
-) -> Path:
+def _make_sample_video(target: Path, frame_count: int = 5, size: tuple[int, int] = (80, 80)) -> Path:
     import cv2  # type: ignore
 
     width, height = size
@@ -34,9 +30,7 @@ def _make_sample_video(
     for idx in range(frame_count):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         offset = 10 + idx * 2
-        cv2.rectangle(
-            frame, (offset, offset), (offset + 20, offset + 26), (255, 255, 255), -1
-        )
+        cv2.rectangle(frame, (offset, offset), (offset + 20, offset + 26), (255, 255, 255), -1)
         writer.write(frame)
     writer.release()
     return target
@@ -107,9 +101,7 @@ def test_arcface_embeddings_are_unit_norm(tmp_path, monkeypatch):
 
     monkeypatch.setattr(episode_run, "ArcFaceEmbedder", _FakeArcFaceEmbedder)
 
-    summary = episode_run._run_faces_embed_stage(
-        args, storage=None, ep_ctx=None, s3_prefixes=None
-    )
+    summary = episode_run._run_faces_embed_stage(args, storage=None, ep_ctx=None, s3_prefixes=None)
     faces_path = manifests_dir / "faces.jsonl"
     assert faces_path.exists()
 

@@ -82,25 +82,17 @@ def test_people_clusters_endpoint_integration():
     }
 
     track_reps_map = {rep["track_id"]: rep for rep in track_reps_list}
-    result = build_cluster_track_reps(
-        ep_id, "id_0001", track_reps_map, cluster_centroids
-    )
+    result = build_cluster_track_reps(ep_id, "id_0001", track_reps_map, cluster_centroids)
 
     # Verify all 20 tracks are returned (no limit to 5)
-    assert (
-        result["total_tracks"] == 20
-    ), f"Should return all 20 tracks, got {result['total_tracks']}"
-    assert (
-        len(result["tracks"]) == 20
-    ), f"Should have 20 track items, got {len(result['tracks'])}"
+    assert result["total_tracks"] == 20, f"Should return all 20 tracks, got {result['total_tracks']}"
+    assert len(result["tracks"]) == 20, f"Should have 20 track items, got {len(result['tracks'])}"
 
     # Verify each track has similarity badge data
     for track in result["tracks"]:
         assert "similarity" in track, f"Track {track['track_id']} missing similarity"
         assert "crop_key" in track, f"Track {track['track_id']} missing crop_key"
-        assert (
-            track["similarity"] is not None
-        ), f"Track {track['track_id']} has None similarity"
+        assert track["similarity"] is not None, f"Track {track['track_id']} has None similarity"
 
     # Verify no track was silently dropped
     returned_track_ids = {t["track_id"] for t in result["tracks"]}

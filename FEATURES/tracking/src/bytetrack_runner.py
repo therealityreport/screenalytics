@@ -168,9 +168,7 @@ class ByteTrackLite:
         return expired
 
 
-def build_tracks(
-    detections: Iterable[Dict[str, object]], cfg: Dict[str, float]
-) -> Iterator[Dict[str, object]]:
+def build_tracks(detections: Iterable[Dict[str, object]], cfg: Dict[str, float]) -> Iterator[Dict[str, object]]:
     track_thresh = float(cfg.get("track_thresh", 0.5))
     tracker = ByteTrackLite(
         match_thresh=float(cfg.get("match_thresh", 0.8)),
@@ -214,12 +212,8 @@ def run_tracking(
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ByteTrack-lite runner")
     parser.add_argument("--ep-id", help="Episode id (used for default paths)")
-    parser.add_argument(
-        "--detections", help="Path to det_v1 JSONL (defaults via resolver)"
-    )
-    parser.add_argument(
-        "--output", help="Path for track_v1 JSONL (defaults via resolver)"
-    )
+    parser.add_argument("--detections", help="Path to det_v1 JSONL (defaults via resolver)")
+    parser.add_argument("--output", help="Path for track_v1 JSONL (defaults via resolver)")
     parser.add_argument(
         "--config",
         default="config/pipeline/tracking.yaml",

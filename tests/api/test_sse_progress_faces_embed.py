@@ -43,9 +43,7 @@ def test_sse_faces_embed_done_and_close(tmp_path, monkeypatch) -> None:
     headers = {"accept": "text/event-stream"}
     payload = {"ep_id": ep_id, "save_crops": False}
 
-    with client.stream(
-        "POST", "/jobs/faces_embed", headers=headers, json=payload
-    ) as response:
+    with client.stream("POST", "/jobs/faces_embed", headers=headers, json=payload) as response:
         assert response.status_code == 200
         events = collect_sse_events(response)
         stream_closed = response.is_closed

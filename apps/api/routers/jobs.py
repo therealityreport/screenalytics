@@ -38,16 +38,10 @@ EPISODE_STORE = EpisodeStore()
 DETECTOR_CHOICES = {"retinaface"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
 _DEFAULT_DETECTOR_RAW = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
-DEFAULT_DETECTOR_ENV = (
-    _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
-)
+DEFAULT_DETECTOR_ENV = _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
-SCENE_DETECTOR_CHOICES = getattr(
-    jobs_service, "SCENE_DETECTOR_CHOICES", ("pyscenedetect", "internal", "off")
-)
-SCENE_DETECTOR_DEFAULT = getattr(
-    jobs_service, "SCENE_DETECTOR_DEFAULT", "pyscenedetect"
-)
+SCENE_DETECTOR_CHOICES = getattr(jobs_service, "SCENE_DETECTOR_CHOICES", ("pyscenedetect", "internal", "off"))
+SCENE_DETECTOR_DEFAULT = getattr(jobs_service, "SCENE_DETECTOR_DEFAULT", "pyscenedetect")
 SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 27.0)
 SCENE_MIN_LEN_DEFAULT = getattr(jobs_service, "SCENE_MIN_LEN_DEFAULT", 12)
 SCENE_WARMUP_DETS_DEFAULT = getattr(jobs_service, "SCENE_WARMUP_DETS_DEFAULT", 3)
@@ -92,9 +86,7 @@ class DetectRequest(BaseModel):
     video: str = Field(..., description="Source video path or URL")
     stride: int = Field(5, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field(
-        "auto", description="Execution device"
-    )
+    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
 
 
 class TrackRequest(BaseModel):
@@ -105,18 +97,10 @@ class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stride: int = Field(3, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field(
-        "auto", description="Execution device"
-    )
-    save_frames: bool = Field(
-        False, description="Sample full-frame JPGs to S3/local frames root"
-    )
-    save_crops: bool = Field(
-        False, description="Save per-track crops (requires tracks)"
-    )
-    jpeg_quality: int = Field(
-        85, ge=1, le=100, description="JPEG quality for frame/crop exports"
-    )
+    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
+    save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
+    jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
     detector: str = Field(
         DEFAULT_DETECTOR_ENV,
         description="Face detector backend (retinaface)",
@@ -125,9 +109,7 @@ class DetectTrackRequest(BaseModel):
         DEFAULT_TRACKER_ENV,
         description="Tracker backend (bytetrack or strongsort)",
     )
-    max_gap: int | None = Field(
-        30, ge=1, description="Frame gap before forcing a new track"
-    )
+    max_gap: int | None = Field(30, ge=1, description="Frame gap before forcing a new track")
     det_thresh: float | None = Field(
         0.5,
         ge=0.0,
@@ -183,13 +165,9 @@ class FacesEmbedRequest(BaseModel):
         None,
         description="Execution device (defaults to server auto-detect)",
     )
-    save_frames: bool = Field(
-        False, description="Export sampled frames alongside crops"
-    )
+    save_frames: bool = Field(False, description="Export sampled frames alongside crops")
     save_crops: bool = Field(False, description="Export crops to data/frames + S3")
-    jpeg_quality: int = Field(
-        85, ge=1, le=100, description="JPEG quality for face crops"
-    )
+    jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for face crops")
     thumb_size: int = Field(256, ge=64, le=512, description="Square thumbnail size")
 
 
@@ -218,15 +196,9 @@ class CleanupJobRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     stride: int = Field(3, ge=1, le=50)
     fps: float | None = Field(None, ge=0.0)
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field(
-        "auto", description="Detect/track device"
-    )
-    embed_device: Literal["auto", "cpu", "mps", "cuda"] = Field(
-        "auto", description="Faces embed device"
-    )
-    detector: str = Field(
-        DEFAULT_DETECTOR_ENV, description="Detector backend (retinaface)"
-    )
+    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Detect/track device")
+    embed_device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Faces embed device")
+    detector: str = Field(DEFAULT_DETECTOR_ENV, description="Detector backend (retinaface)")
     tracker: str = Field(DEFAULT_TRACKER_ENV, description="Tracker backend")
     max_gap: int = Field(30, ge=1, le=240)
     det_thresh: float | None = Field(None, ge=0.0, le=1.0)
@@ -242,16 +214,12 @@ class CleanupJobRequest(BaseModel):
     min_identity_sim: float = Field(MIN_IDENTITY_SIMILARITY, ge=0.0, le=0.99)
     thumb_size: int = Field(256, ge=64, le=512)
     actions: List[CleanupAction] = Field(default_factory=lambda: list(CLEANUP_ACTIONS))
-    write_back: bool = Field(
-        True, description="Update people.json with grouping assignments"
-    )
+    write_back: bool = Field(True, description="Update people.json with grouping assignments")
 
 
 class FacebankBackfillRequest(BaseModel):
     show_id: str = Field(..., description="Show identifier (e.g., RHOBH)")
-    cast_id: str | None = Field(
-        None, description="Optional cast id to limit reprocessing"
-    )
+    cast_id: str | None = Field(None, description="Optional cast id to limit reprocessing")
     dry_run: bool = Field(
         False,
         description="When True, report actions without writing files or uploading to S3",
@@ -261,9 +229,7 @@ class FacebankBackfillRequest(BaseModel):
 @router.post("/jobs/facebank/backfill_display")
 def backfill_facebank_display(req: FacebankBackfillRequest) -> dict:
     """Regenerate missing or low-resolution facebank display derivatives."""
-    stats = _run_facebank_backfill(
-        req.show_id, cast_id=req.cast_id, dry_run=req.dry_run
-    )
+    stats = _run_facebank_backfill(req.show_id, cast_id=req.cast_id, dry_run=req.dry_run)
     return stats
 
 
@@ -297,9 +263,7 @@ def _validate_episode_ready(ep_id: str) -> Path:
             # Just touching the file verifies readable bytes on disk.
             pass
     except OSError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Episode video unreadable: {exc}"
-        ) from exc
+        raise HTTPException(status_code=400, detail=f"Episode video unreadable: {exc}") from exc
     return video_path
 
 
@@ -321,9 +285,7 @@ def _normalize_detector(detector: str | None) -> str:
     fallback = DEFAULT_DETECTOR_ENV or "retinaface"
     value = (detector or fallback).strip().lower()
     if value not in DETECTOR_CHOICES:
-        raise HTTPException(
-            status_code=400, detail=f"Unsupported detector '{detector}'"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported detector '{detector}'")
     return value
 
 
@@ -339,9 +301,7 @@ def _normalize_scene_detector(scene_detector: str | None) -> str:
     fallback = SCENE_DETECTOR_DEFAULT or "pyscenedetect"
     value = (scene_detector or fallback).strip().lower()
     if value not in SCENE_DETECTOR_CHOICES:
-        raise HTTPException(
-            status_code=400, detail=f"Unsupported scene detector '{scene_detector}'"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported scene detector '{scene_detector}'")
     return value
 
 
@@ -475,14 +435,10 @@ def _wants_sse(request: Request) -> bool:
     return "text/event-stream" in accept
 
 
-def _run_job_with_optional_sse(
-    command: List[str], request: Request, progress_file: Path | None = None
-):
+def _run_job_with_optional_sse(command: List[str], request: Request, progress_file: Path | None = None):
     env = os.environ.copy()
     if _wants_sse(request):
-        generator = _stream_progress_command(
-            command, env, request, progress_file=progress_file
-        )
+        generator = _stream_progress_command(command, env, request, progress_file=progress_file)
         return StreamingResponse(
             generator,
             media_type="text/event-stream",
@@ -509,11 +465,7 @@ def _run_job_with_optional_sse(
         }
         if progress_payload:
             detail["progress"] = progress_payload
-            ep_value = (
-                progress_payload.get("ep_id")
-                if isinstance(progress_payload, dict)
-                else None
-            )
+            ep_value = progress_payload.get("ep_id") if isinstance(progress_payload, dict) else None
             if isinstance(ep_value, str):
                 detail.setdefault("ep_id", ep_value)
         raise HTTPException(
@@ -617,8 +569,7 @@ async def _stream_progress_command(
                 stderr_text = stderr_bytes.decode().strip()
             payload = {
                 "phase": "error",
-                "error": stderr_text
-                or f"episode_run exited with code {proc.returncode}",
+                "error": stderr_text or f"episode_run exited with code {proc.returncode}",
                 "return_code": proc.returncode,
             }
             yield _format_sse("error", payload)
@@ -783,9 +734,7 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     await _reject_legacy_payload(request)
     track_path = get_path(req.ep_id, "tracks")
     if not track_path.exists():
-        raise HTTPException(
-            status_code=400, detail="tracks.jsonl not found; run detect/track first"
-        )
+        raise HTTPException(status_code=400, detail="tracks.jsonl not found; run detect/track first")
     device_value = req.device or "auto"
     try:
         JOB_SERVICE.ensure_arcface_ready(device_value)
@@ -836,9 +785,7 @@ async def run_cluster(req: ClusterRequest, request: Request):
     manifests_dir = get_path(req.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     if not faces_path.exists():
-        raise HTTPException(
-            status_code=400, detail="faces.jsonl not found; run faces_embed first"
-        )
+        raise HTTPException(status_code=400, detail="faces.jsonl not found; run faces_embed first")
     progress_path = _progress_file_path(req.ep_id)
     command = _build_cluster_command(req, progress_path)
     result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
@@ -965,9 +912,7 @@ async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
 
 
 @router.post("/episode_cleanup_async")
-async def enqueue_episode_cleanup_async(
-    req: CleanupJobRequest, request: Request
-) -> dict:
+async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request) -> dict:
     await _reject_legacy_payload(request)
     artifacts = _artifact_summary(req.ep_id)
     video_path = _validate_episode_ready(req.ep_id)
@@ -1017,21 +962,13 @@ async def enqueue_episode_cleanup_async(
 
 class AnalyzeScreenTimeRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    quality_min: float | None = Field(
-        None, ge=0.0, le=1.0, description="Minimum face quality threshold"
-    )
-    gap_tolerance_s: float | None = Field(
-        None, ge=0.0, description="Gap tolerance in seconds"
-    )
-    use_video_decode: bool | None = Field(
-        None, description="Use video decode for precise timestamps"
-    )
+    quality_min: float | None = Field(None, ge=0.0, le=1.0, description="Minimum face quality threshold")
+    gap_tolerance_s: float | None = Field(None, ge=0.0, description="Gap tolerance in seconds")
+    use_video_decode: bool | None = Field(None, description="Use video decode for precise timestamps")
     screen_time_mode: Literal["faces", "tracks"] | None = Field(
         None, description="How to derive intervals for screen time aggregation"
     )
-    edge_padding_s: float | None = Field(
-        None, ge=0.0, description="Edge padding (seconds) applied to each interval"
-    )
+    edge_padding_s: float | None = Field(None, ge=0.0, description="Edge padding (seconds) applied to each interval")
     track_coverage_min: float | None = Field(
         None,
         ge=0.0,
@@ -1073,9 +1010,7 @@ async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -
 
 
 @router.get("")
-def list_jobs(
-    ep_id: str | None = None, job_type: str | None = None, limit: int = 50
-) -> dict:
+def list_jobs(ep_id: str | None = None, job_type: str | None = None, limit: int = 50) -> dict:
     """List all jobs, optionally filtered by episode and/or job type."""
     jobs = JOB_SERVICE.list_jobs(ep_id=ep_id, job_type=job_type, limit=limit)
     # Return simplified job records
@@ -1149,16 +1084,12 @@ def _run_facebank_backfill(show_id: str, *, cast_id: str | None, dry_run: bool) 
     service = facebank_router.facebank_service
     show_dir = service.facebank_dir / show_id
     if not show_dir.exists():
-        raise HTTPException(
-            status_code=404, detail=f"Show '{show_id}' has no facebank data"
-        )
+        raise HTTPException(status_code=404, detail=f"Show '{show_id}' has no facebank data")
 
     if cast_id:
         cast_dirs = [show_dir / cast_id]
         if not cast_dirs[0].exists():
-            raise HTTPException(
-                status_code=404, detail=f"Cast '{cast_id}' has no facebank data"
-            )
+            raise HTTPException(status_code=404, detail=f"Cast '{cast_id}' has no facebank data")
     else:
         cast_dirs = sorted(path for path in show_dir.iterdir() if path.is_dir())
 
@@ -1211,9 +1142,7 @@ def _rebuild_seed_display(
     if not storage_id:
         storage_id = seed.get("fb_id")
     if not storage_id:
-        LOGGER.warning(
-            "Seed %s/%s missing identifier; skipping", show_id, seed.get("fb_id")
-        )
+        LOGGER.warning("Seed %s/%s missing identifier; skipping", show_id, seed.get("fb_id"))
         return "failed", False
 
     display_path = _resolve_seed_path(seed, "image_uri", seeds_dir, storage_id, "_d")
@@ -1255,9 +1184,7 @@ def _rebuild_seed_display(
 
     target_path = display_path
     if target_path is None:
-        target_path = (
-            seeds_dir / f"{storage_id}_d.{facebank_router.SEED_DISPLAY_FORMAT}"
-        )
+        target_path = seeds_dir / f"{storage_id}_d.{facebank_router.SEED_DISPLAY_FORMAT}"
     target_path.parent.mkdir(parents=True, exist_ok=True)
     facebank_router._save_derivative(
         display_bgr.astype(np.uint8, copy=False),
@@ -1301,9 +1228,7 @@ def _guess_storage_id(seed: dict) -> str | None:
     return seed.get("fb_id")
 
 
-def _resolve_seed_path(
-    seed: dict, field: str, seeds_dir: Path, storage_id: str | None, suffix: str
-) -> Path | None:
+def _resolve_seed_path(seed: dict, field: str, seeds_dir: Path, storage_id: str | None, suffix: str) -> Path | None:
     candidates: list[Path] = []
     raw = seed.get(field)
     if raw:
@@ -1327,11 +1252,7 @@ def _resolve_seed_path(
 
 def _display_long_side(seed: dict, display_path: Path | None) -> int | None:
     dims = seed.get("display_dims")
-    if (
-        isinstance(dims, (list, tuple))
-        and len(dims) == 2
-        and all(isinstance(v, (int, float)) for v in dims)
-    ):
+    if isinstance(dims, (list, tuple)) and len(dims) == 2 and all(isinstance(v, (int, float)) for v in dims):
         width, height = int(dims[0]), int(dims[1])
         if width > 0 and height > 0:
             return max(width, height)
@@ -1378,9 +1299,7 @@ def _upscale_embed_display(embed_path: Path) -> tuple[np.ndarray, list[int]]:
     new_w = max(int(round(w * scale)), 1)
     new_h = max(int(round(h * scale)), 1)
     resample_attr = getattr(Image, "Resampling", Image)
-    resample_filter = getattr(
-        resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST)
-    )
+    resample_filter = getattr(resample_attr, "LANCZOS", getattr(Image, "BICUBIC", Image.NEAREST))
     pil_img = Image.fromarray(bgr[..., ::-1])
     resized = pil_img.resize((new_w, new_h), resample=resample_filter)
     pil_img.close()

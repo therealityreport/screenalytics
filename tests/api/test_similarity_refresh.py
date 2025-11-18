@@ -79,9 +79,7 @@ def test_clusters_summary_updates_after_track_delete(data_root):
     )
 
     people_service = PeopleService(data_root)
-    person = people_service.create_person(
-        "DEMO", name="Test Person", cluster_ids=[f"{ep_id}:id_0001"]
-    )
+    person = people_service.create_person("DEMO", name="Test Person", cluster_ids=[f"{ep_id}:id_0001"])
     person_id = person["person_id"]
 
     _write_json(
@@ -109,9 +107,7 @@ def test_clusters_summary_updates_after_track_delete(data_root):
         clusters = payload["clusters"]
         assert clusters, "expected at least one cluster"
         track_entries = clusters[0].get("track_reps", [])
-        return {
-            entry["track_id"]: entry["similarity"] for entry in track_entries
-        }, track_entries
+        return {entry["track_id"]: entry["similarity"] for entry in track_entries}, track_entries
 
     initial_map, initial_tracks = _similarities()
     assert "track_0001" in initial_map and "track_0002" in initial_map
@@ -119,9 +115,7 @@ def test_clusters_summary_updates_after_track_delete(data_root):
     assert initial_map["track_0002"] == pytest.approx(0.707, rel=0.01)
     assert len(initial_tracks) == 2
 
-    resp = client.request(
-        "DELETE", f"/episodes/{ep_id}/tracks/2", json={"delete_faces": True}
-    )
+    resp = client.request("DELETE", f"/episodes/{ep_id}/tracks/2", json={"delete_faces": True})
     assert resp.status_code == 200
 
     updated_map, updated_tracks = _similarities()

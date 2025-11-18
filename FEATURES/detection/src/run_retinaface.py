@@ -72,9 +72,7 @@ def _capture_fps(video_path: Path) -> float:
     return fps or 30.0
 
 
-def _iter_video_samples(
-    video_path: Path, ep_id: str, stride: int
-) -> Iterator[FrameSample]:
+def _iter_video_samples(video_path: Path, ep_id: str, stride: int) -> Iterator[FrameSample]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video: {video_path}")
@@ -138,9 +136,7 @@ def _iter_plan_samples(
                     fps = reader.fps
                 image = reader.read(frame_idx)
             if image is None:
-                raise RuntimeError(
-                    "Frame plan entry missing image data and video_path is unavailable"
-                )
+                raise RuntimeError("Frame plan entry missing image data and video_path is unavailable")
             ts_s = float(entry.get("ts_s") or frame_idx / fps)
             yield FrameSample(ep_id=ep_id, frame_idx=frame_idx, ts_s=ts_s, image=image)
     finally:
@@ -154,9 +150,7 @@ class RetinaFaceDetector:
     def __init__(self, cfg: Dict[str, object]):
         self.cfg = cfg
         self.model_id = str(cfg.get("model_id", "retinaface_r50"))
-        self.simulated = bool(
-            cfg.get("force_simulated") or os.getenv("SCREENALYTICS_VISION_SIM") == "1"
-        )
+        self.simulated = bool(cfg.get("force_simulated") or os.getenv("SCREENALYTICS_VISION_SIM") == "1")
         self._model = None
         if not self.simulated:
             self._init_model()

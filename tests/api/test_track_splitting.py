@@ -136,9 +136,7 @@ def test_split_high_spread_tracks_dry_run(mock_episode_data):
     """Test dry run mode identifies tracks to split without modifying files."""
     ep_id, manifests_dir = mock_episode_data
 
-    result = split_high_spread_tracks(
-        ep_id, spread_threshold=0.35, dry_run=True, manifests_dir=manifests_dir
-    )
+    result = split_high_spread_tracks(ep_id, spread_threshold=0.35, dry_run=True, manifests_dir=manifests_dir)
 
     assert result["dry_run"] is True
     assert result["split_count"] == 1  # Only track 2 should be flagged
@@ -155,15 +153,11 @@ def test_split_high_spread_tracks_real_split(mock_episode_data):
     """Test actual splitting of high-spread track."""
     ep_id, manifests_dir = mock_episode_data
 
-    result = split_high_spread_tracks(
-        ep_id, spread_threshold=0.35, dry_run=False, manifests_dir=manifests_dir
-    )
+    result = split_high_spread_tracks(ep_id, spread_threshold=0.35, dry_run=False, manifests_dir=manifests_dir)
 
     assert result["split_count"] == 1
     assert 2 in result["track_mapping"]
-    assert (
-        len(result["track_mapping"][2]) >= 2
-    )  # Track 2 split into at least 2 sub-tracks
+    assert len(result["track_mapping"][2]) >= 2  # Track 2 split into at least 2 sub-tracks
 
     # Verify tracks file was updated
     tracks_path = manifests_dir / "tracks.jsonl"
@@ -193,9 +187,7 @@ def test_split_updates_face_assignments(mock_episode_data):
     track2_faces_before = [f for f in faces_before if f["track_id"] == 2]
     assert len(track2_faces_before) == 20
 
-    result = split_high_spread_tracks(
-        ep_id, spread_threshold=0.35, dry_run=False, manifests_dir=manifests_dir
-    )
+    result = split_high_spread_tracks(ep_id, spread_threshold=0.35, dry_run=False, manifests_dir=manifests_dir)
 
     # After split, track 2 faces should be reassigned
     with faces_path.open("r") as f:
@@ -214,9 +206,7 @@ def test_no_split_needed(mock_episode_data):
     """Test behavior when no tracks exceed threshold."""
     ep_id, manifests_dir = mock_episode_data
 
-    result = split_high_spread_tracks(
-        ep_id, spread_threshold=1.0, dry_run=False, manifests_dir=manifests_dir
-    )
+    result = split_high_spread_tracks(ep_id, spread_threshold=1.0, dry_run=False, manifests_dir=manifests_dir)
 
     assert result["split_count"] == 0
     assert len(result.get("flagged_tracks", [])) == 0
@@ -226,9 +216,7 @@ def test_split_preserves_non_flagged_tracks(mock_episode_data):
     """Test that non-flagged tracks are preserved unchanged."""
     ep_id, manifests_dir = mock_episode_data
 
-    split_high_spread_tracks(
-        ep_id, spread_threshold=0.35, dry_run=False, manifests_dir=manifests_dir
-    )
+    split_high_spread_tracks(ep_id, spread_threshold=0.35, dry_run=False, manifests_dir=manifests_dir)
 
     tracks_path = manifests_dir / "tracks.jsonl"
     with tracks_path.open("r") as f:

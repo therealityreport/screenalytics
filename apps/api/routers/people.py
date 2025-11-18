@@ -97,9 +97,7 @@ def create_person(show_id: str, body: PersonCreateRequest) -> PersonResponse:
 
 
 @router.patch("/shows/{show_id}/people/{person_id}")
-def update_person(
-    show_id: str, person_id: str, body: PersonUpdateRequest
-) -> PersonResponse:
+def update_person(show_id: str, person_id: str, body: PersonUpdateRequest) -> PersonResponse:
     """Update a person."""
     person = people_service.update_person(
         show_id,
@@ -126,13 +124,9 @@ def delete_person(show_id: str, person_id: str) -> dict:
 def merge_people(show_id: str, body: PersonMergeRequest) -> PersonResponse:
     """Merge source person into target person."""
     if body.source_person_id == body.target_person_id:
-        raise HTTPException(
-            status_code=400, detail="Source and target must be different"
-        )
+        raise HTTPException(status_code=400, detail="Source and target must be different")
 
-    result = people_service.merge_people(
-        show_id, body.source_person_id, body.target_person_id
-    )
+    result = people_service.merge_people(show_id, body.source_person_id, body.target_person_id)
     if not result:
         raise HTTPException(
             status_code=404,
@@ -143,9 +137,7 @@ def merge_people(show_id: str, body: PersonMergeRequest) -> PersonResponse:
 
 
 @router.post("/shows/{show_id}/people/{person_id}/add_alias")
-def add_alias(
-    show_id: str, person_id: str, body: PersonAddAliasRequest
-) -> PersonResponse:
+def add_alias(show_id: str, person_id: str, body: PersonAddAliasRequest) -> PersonResponse:
     """Add an alias to a person."""
     person = people_service.add_alias_to_person(show_id, person_id, body.alias)
     if not person:

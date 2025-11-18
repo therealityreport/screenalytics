@@ -46,9 +46,7 @@ def _ensure_streamlit_shims() -> None:
             code=lambda *a, **k: None,
             info=lambda *a, **k: None,
         )
-        streamlit_mod.progress = lambda *args, **kwargs: types.SimpleNamespace(
-            progress=lambda *a, **k: None
-        )
+        streamlit_mod.progress = lambda *args, **kwargs: types.SimpleNamespace(progress=lambda *a, **k: None)
         streamlit_mod.error = lambda *args, **kwargs: None
         streamlit_mod.success = lambda *args, **kwargs: None
         streamlit_mod.warning = lambda *args, **kwargs: None
@@ -84,18 +82,14 @@ def _ensure_streamlit_shims() -> None:
 
 def _ensure_requests_shim() -> None:
     if "requests" not in sys.modules:
-        sys.modules["requests"] = types.SimpleNamespace(
-            RequestException=Exception, HTTPError=Exception
-        )
+        sys.modules["requests"] = types.SimpleNamespace(RequestException=Exception, HTTPError=Exception)
 
 
 @lru_cache(maxsize=1)
 def load_ui_helpers_module():
     _ensure_requests_shim()
     _ensure_streamlit_shims()
-    spec = importlib.util.spec_from_file_location(
-        "workspace_ui_helpers_test", HELPERS_PATH
-    )
+    spec = importlib.util.spec_from_file_location("workspace_ui_helpers_test", HELPERS_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)  # type: ignore[attr-defined]

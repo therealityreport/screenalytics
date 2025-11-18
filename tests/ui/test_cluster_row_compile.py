@@ -9,11 +9,7 @@ def _load_track_row_func():
     source = helpers_path.read_text(encoding="utf-8")
     module = ast.parse(source, filename=str(helpers_path))
     func_node = next(
-        (
-            node
-            for node in module.body
-            if isinstance(node, ast.FunctionDef) and node.name == "track_row_html"
-        ),
+        (node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "track_row_html"),
         None,
     )
     assert func_node is not None, "track_row_html not found"

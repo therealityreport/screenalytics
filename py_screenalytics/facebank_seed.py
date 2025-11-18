@@ -36,9 +36,7 @@ SEED_DET_MIN = float(os.getenv("SEED_DET_MIN", "0.75"))
 SEED_STD_MIN = float(os.getenv("SEED_STD_MIN", "15.0"))
 SEED_SIM_MIN = float(os.getenv("SEED_SIM_MIN", "0.70"))
 SEED_MAX_COUNT = int(os.getenv("SEED_MAX_COUNT", "20"))
-SEED_DIVERSITY_GAP = int(
-    os.getenv("SEED_DIVERSITY_GAP", "10")
-)  # Min frame gap between seeds
+SEED_DIVERSITY_GAP = int(os.getenv("SEED_DIVERSITY_GAP", "10"))  # Min frame gap between seeds
 
 
 def _now_iso() -> str:
@@ -63,9 +61,7 @@ def _extract_quality_metrics(face: Dict[str, Any]) -> Tuple[float, float, float]
         (det_score, crop_std, box_area)
     """
     # Detection confidence
-    det_score = (
-        face.get("det_score") or face.get("conf") or face.get("confidence") or 0.0
-    )
+    det_score = face.get("det_score") or face.get("conf") or face.get("confidence") or 0.0
     if not det_score:
         quality = face.get("quality")
         if isinstance(quality, dict):
@@ -121,9 +117,7 @@ def _compute_quality_score(
     area_norm = min(box_area / 100000.0, 1.0)
 
     # Weighted combination
-    score = (
-        (0.30 * det_norm) + (0.30 * std_norm) + (0.30 * sim_norm) + (0.10 * area_norm)
-    )
+    score = (0.30 * det_norm) + (0.30 * std_norm) + (0.30 * sim_norm) + (0.10 * area_norm)
 
     return float(score)
 
@@ -164,9 +158,7 @@ def _resolve_crop_path(ep_id: str, face: Dict[str, Any]) -> Optional[Path]:
             return crop_path
 
         # Try fallback root
-        fallback_root = Path(
-            os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")
-        ).expanduser()
+        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
         crop_path = fallback_root / ep_id / crop_rel.replace("crops/", "")
         if crop_path.exists():
             return crop_path
@@ -216,16 +208,12 @@ def select_facebank_seeds(
     # Compute identity centroid for similarity scoring
     centroid = _compute_identity_centroid(identity_faces)
     if centroid is None:
-        LOGGER.warning(
-            f"Cannot compute centroid for identity {identity_id}, using fallback"
-        )
+        LOGGER.warning(f"Cannot compute centroid for identity {identity_id}, using fallback")
         # Fallback: select based on quality only (no similarity scoring)
         centroid = None
 
     # Score all candidates
-    candidates: List[Tuple[Dict[str, Any], Path, float, float]] = (
-        []
-    )  # (face, crop_path, quality_score, similarity)
+    candidates: List[Tuple[Dict[str, Any], Path, float, float]] = []  # (face, crop_path, quality_score, similarity)
 
     for face in identity_faces:
         # Skip flagged faces
@@ -257,9 +245,7 @@ def select_facebank_seeds(
             continue
 
         # Compute overall quality score
-        quality_score = _compute_quality_score(
-            det_score, crop_std, box_area, similarity
-        )
+        quality_score = _compute_quality_score(det_score, crop_std, box_area, similarity)
 
         candidates.append((face, crop_path, quality_score, similarity))
 
@@ -308,9 +294,7 @@ def select_facebank_seeds(
         selected_seeds.append(seed)
         last_frame_idx = frame_idx
 
-    LOGGER.info(
-        f"Selected {len(selected_seeds)} seeds for {identity_id} from {len(candidates)} candidates"
-    )
+    LOGGER.info(f"Selected {len(selected_seeds)} seeds for {identity_id} from {len(candidates)} candidates")
 
     return selected_seeds
 
@@ -350,9 +334,7 @@ def write_facebank_seeds(
     person_dir = facebank_root / safe_person_id
 
     # Atomic write: use temp directory, then move
-    temp_dir = Path(
-        tempfile.mkdtemp(prefix=f"facebank_{safe_person_id}_", dir=facebank_root.parent)
-    )
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"facebank_{safe_person_id}_", dir=facebank_root.parent))
 
     try:
         # Copy seed images
@@ -365,18 +347,14 @@ def write_facebank_seeds(
                 continue
 
             if not crop_path.exists():
-                LOGGER.warning(
-                    f"Skipping seed {idx} with missing crop file: {crop_path}"
-                )
+                LOGGER.warning(f"Skipping seed {idx} with missing crop file: {crop_path}")
                 continue
 
             # Generate facebank filename
             frame_idx = seed.get("frame_idx", idx)
             track_id = seed.get("track_id", 0)
             suffix = crop_path.suffix or ".jpg"
-            seed_filename = (
-                f"seed_{idx:03d}_track{track_id:04d}_frame{frame_idx:06d}{suffix}"
-            )
+            seed_filename = f"seed_{idx:03d}_track{track_id:04d}_frame{frame_idx:06d}{suffix}"
 
             dest_path = temp_dir / seed_filename
 
@@ -430,10 +408,7 @@ def write_facebank_seeds(
 
         if person_dir.exists():
             # Backup existing directory
-            backup_dir = (
-                person_dir.parent
-                / f"{safe_person_id}.bak.{int(datetime.utcnow().timestamp())}"
-            )
+            backup_dir = person_dir.parent / f"{safe_person_id}.bak.{int(datetime.utcnow().timestamp())}"
             try:
                 shutil.move(str(person_dir), str(backup_dir))
                 LOGGER.info(f"Backed up existing facebank to {backup_dir}")

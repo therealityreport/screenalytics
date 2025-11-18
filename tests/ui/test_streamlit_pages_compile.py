@@ -19,6 +19,4 @@ PAGE_FILES = [
 def test_streamlit_page_compiles(path: Path) -> None:
     source = path.read_text(encoding="utf-8")
     compile(source, str(path), "exec")
-    assert (
-        "import ui_helpers" in source
-    ), f"{path.name} should import ui_helpers for shared state"
+    assert "import ui_helpers" in source, f"{path.name} should import ui_helpers for shared state"

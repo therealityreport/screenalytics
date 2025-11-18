@@ -71,9 +71,7 @@ if ep_id:
                 exists_str = "True" if local_exists else "False"
             else:
                 exists_str = str(local_exists)
-            st.write(
-                f"Local path {helpers.link_local(local['path'])} exists → {exists_str}"
-            )
+            st.write(f"Local path {helpers.link_local(local['path'])} exists → {exists_str}")
         else:
             st.caption("Local path status: not available")
 
@@ -101,9 +99,7 @@ if ep_id:
                 f"({error_rate:.1%} of attempts skipped due to invalid bboxes)."
             )
         elif crop_attempts is not None and crop_attempts > 0:
-            st.caption(
-                f"**Detect/Track crops:** {crop_attempts} attempts (no error stats available)."
-            )
+            st.caption(f"**Detect/Track crops:** {crop_attempts} attempts (no error stats available).")
         elif detect_track:
             st.caption("**Detect/Track:** No crop diagnostics available for this run.")
 
@@ -124,6 +120,4 @@ if ep_id:
         if cluster_status:
             st.caption(f"Cluster status: `{cluster_status}`")
 else:
-    st.info(
-        "Set an ep_id from another page (Upload/Episodes) to probe specific objects."
-    )
+    st.info("Set an ep_id from another page (Upload/Episodes) to probe specific objects.")
