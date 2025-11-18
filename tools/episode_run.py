@@ -76,6 +76,7 @@ def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
 
 
 RETINAFACE_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_DET_SIZE"))
+RETINAFACE_COREML_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_COREML_DET_SIZE"))
 
 
 def _normalize_det_thresh(value: float | str | None) -> float:
@@ -205,6 +206,25 @@ def _normalize_device_label(device: str | None) -> str:
     return normalized
 
 
+def _filter_providers(
+    requested: list[str], available: list[str]
+) -> list[str]:
+    """
+    Filter ONNX providers to only those available, always including CPU fallback.
+
+    Args:
+        requested: Desired providers in priority order
+        available: Providers available in this ONNX Runtime build
+
+    Returns:
+        Filtered list with CPU fallback appended
+    """
+    filtered = [p for p in requested if p in available]
+    if "CPUExecutionProvider" not in filtered:
+        filtered.append("CPUExecutionProvider")
+    return filtered
+
+
 def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
     """
     Select ONNX Runtime execution providers based on device preference.
@@ -232,8 +252,9 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
 
     # Explicit CUDA request (NVIDIA GPUs)
     if normalized in {"cuda", "0", "gpu"}:
-        if "CUDAExecutionProvider" in available:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        requested = ["CUDAExecutionProvider"]
+        providers = _filter_providers(requested, available)
+        if "CUDAExecutionProvider" in providers:
             resolved = "cuda"
             return providers, resolved
         LOGGER.warning(
@@ -243,8 +264,9 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
 
     # Explicit MPS/CoreML request (Apple Silicon)
     if normalized in {"mps", "metal", "apple"}:
-        if "CoreMLExecutionProvider" in available:
-            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        requested = ["CoreMLExecutionProvider"]
+        providers = _filter_providers(requested, available)
+        if "CoreMLExecutionProvider" in providers:
             resolved = "coreml"
             return providers, resolved
         LOGGER.warning(
@@ -256,13 +278,14 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
     if normalized == "auto":
         # Prefer CUDA on Linux/Windows
         if "CUDAExecutionProvider" in available:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            providers = _filter_providers(["CUDAExecutionProvider"], available)
             resolved = "cuda"
             return providers, resolved
 
-        # Prefer CoreML on macOS (Apple Silicon)
+        # Prefer CoreML on macOS (Apple Silicon) when CUDA is unavailable
         if "CoreMLExecutionProvider" in available:
-            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+            # On macOS with Apple Silicon, prefer CoreML over CPU
+            providers = _filter_providers(["CoreMLExecutionProvider"], available)
             resolved = "coreml"
             return providers, resolved
 
@@ -291,7 +314,10 @@ def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAF
         "nms": RETINAFACE_NMS,
         "det_thresh": float(score_thresh),
     }
-    if RETINAFACE_DET_SIZE:
+    # Use CoreML-specific detection size if available and running on CoreML
+    if resolved == "coreml" and RETINAFACE_COREML_DET_SIZE:
+        prepare_kwargs["input_size"] = RETINAFACE_COREML_DET_SIZE
+    elif RETINAFACE_DET_SIZE:
         prepare_kwargs["input_size"] = RETINAFACE_DET_SIZE
     try:
         model.prepare(**prepare_kwargs)
@@ -335,9 +361,14 @@ def ensure_retinaface_ready(device: str, det_thresh: float | None = None) -> tup
             detector = FaceAnalysis(name=profile, providers=providers)
         except TypeError:
             detector = FaceAnalysis(name=profile)
+        # Use CoreML-specific detection size if available and running on CoreML
+        if resolved == "coreml" and RETINAFACE_COREML_DET_SIZE:
+            det_size = RETINAFACE_COREML_DET_SIZE
+        else:
+            det_size = RETINAFACE_DET_SIZE or (640, 640)
         detector.prepare(
             ctx_id=ctx_id,
-            det_size=RETINAFACE_DET_SIZE or (640, 640),
+            det_size=det_size,
         )
     except Exception as exc:  # pragma: no cover - surfaced via API tests
         return False, str(exc), resolved

@@ -376,3 +376,51 @@ def test_detection_bbox_validation_filters_invalid_before_tracking():
         expand_y = height * margin  # Should not raise TypeError
         assert expand_x >= 0, "Margin expansion should be non-negative"
         assert expand_y >= 0, "Margin expansion should be non-negative"
+
+
+def test_tracker_inputs_drop_invalid_detections_before_vstack():
+    """
+    _tracker_inputs_from_samples should validate and drop invalid bboxes before np.vstack.
+
+    This regression test ensures the fix for NoneType multiply errors caused by
+    invalid bboxes reaching np.vstack in _tracker_inputs_from_samples().
+
+    Related: Comprehensive patch for ONNX provider improvements (Nov 18, 2025)
+    """
+    from tools.episode_run import _tracker_inputs_from_samples
+
+    # Mock DetectionSample class
+    class DetectionSample:
+        def __init__(self, bbox, conf, class_idx):
+            self.bbox = np.array(bbox) if isinstance(bbox, list) else bbox
+            self.conf = conf
+            self.class_idx = class_idx
+
+    # Mix of valid and invalid detections (simulates real-world scenario)
+    samples = [
+        DetectionSample([100.0, 200.0, 300.0, 400.0], 0.95, 0),  # Valid
+        DetectionSample([None, 200.0, 300.0, 400.0], 0.92, 0),  # Invalid: None x1
+        DetectionSample([100.0, 200.0, 300.0, None], 0.89, 0),  # Invalid: None y2
+        DetectionSample([150.0, 250.0, 350.0, 450.0], 0.91, 0),  # Valid
+        DetectionSample([100.0, 200.0, np.nan, 400.0], 0.88, 0),  # Invalid: NaN
+    ]
+
+    # Should not crash and should only keep valid detections
+    tracker_inputs = _tracker_inputs_from_samples(samples)
+
+    # Verify that only 2 valid detections made it through
+    assert tracker_inputs.xyxy.shape[0] == 2, f"Expected 2 valid detections, got {tracker_inputs.xyxy.shape[0]}"
+    assert tracker_inputs.conf.shape[0] == 2
+    assert tracker_inputs.cls.shape[0] == 2
+
+    # Verify that the valid detections have correct values
+    assert np.isclose(tracker_inputs.conf[0], 0.95), f"Expected conf[0]=0.95, got {tracker_inputs.conf[0]}"
+    assert np.isclose(tracker_inputs.conf[1], 0.91), f"Expected conf[1]=0.91, got {tracker_inputs.conf[1]}"
+
+    # Verify that we can safely perform vstack operation (no TypeError)
+    assert tracker_inputs.xyxy.dtype == np.float32
+    assert tracker_inputs.conf.dtype == np.float32
+    assert tracker_inputs.cls.dtype == np.float32
+
+    # Verify that all bbox coordinates are finite
+    assert np.all(np.isfinite(tracker_inputs.xyxy)), "All bbox coordinates should be finite"
