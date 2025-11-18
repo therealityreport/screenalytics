@@ -1,14 +1,14 @@
-"""Similarity Scores Color Key Component for Episode Detail Page.
+"""Similarity Scores Color Key Component for Faces Review Page.
 
-Insert this code block in apps/workspace-ui/pages/2_Episode_Detail.py
-after line 144 (after flash_message handling).
+Insert this code block in apps/workspace-ui/pages/3_Faces_Review.py
+after line 21 (after st.caption with backend info).
 """
 
 import streamlit as st
 
 
 def render_similarity_scores_key():
-    """Render collapsible similarity scores guide with color-coded legend."""
+    """Render collapsible similarity scores guide with color-coded legend for Faces Review."""
     with st.expander("📊 Similarity Scores Guide", expanded=False):
         st.markdown("""
         <style>
@@ -51,6 +51,24 @@ def render_similarity_scores_key():
 
         <div class="sim-key">
             <div class="sim-item">
+                <div class="sim-color" style="background: #2196F3;"></div>
+                <div>
+                    <div class="sim-label">🔵 Identity Similarity</div>
+                    <div class="sim-desc">Frame → Track centroid</div>
+                    <div class="sim-threshold">ID: XX% badge on frames</div>
+                </div>
+            </div>
+
+            <div class="sim-item">
+                <div class="sim-color" style="background: #4CAF50;"></div>
+                <div>
+                    <div class="sim-label">🟢 Quality Score</div>
+                    <div class="sim-desc">Detection + Sharpness + Area</div>
+                    <div class="sim-threshold">Q: XX% badge on frames</div>
+                </div>
+            </div>
+
+            <div class="sim-item">
                 <div class="sim-color" style="background: #9C27B0;"></div>
                 <div>
                     <div class="sim-label">🟣 Cast Similarity</div>
@@ -60,11 +78,11 @@ def render_similarity_scores_key():
             </div>
 
             <div class="sim-item">
-                <div class="sim-color" style="background: #2196F3;"></div>
+                <div class="sim-color" style="background: #FF9800;"></div>
                 <div>
-                    <div class="sim-label">🔵 Identity Similarity</div>
-                    <div class="sim-desc">Frame → Track centroid</div>
-                    <div class="sim-threshold">≥0.60 for rep selection</div>
+                    <div class="sim-label">🟠 Track Similarity</div>
+                    <div class="sim-desc">Appearance gate (logs)</div>
+                    <div class="sim-threshold">≥0.75 hard, ≥0.82 soft</div>
                 </div>
             </div>
 
@@ -72,76 +90,47 @@ def render_similarity_scores_key():
                 <div class="sim-color" style="background: #4CAF50;"></div>
                 <div>
                     <div class="sim-label">🟢 Cluster Similarity</div>
-                    <div class="sim-desc">Face → Face grouping</div>
+                    <div class="sim-desc">Face grouping (DBSCAN)</div>
                     <div class="sim-threshold">≥0.35 for same cluster</div>
-                </div>
-            </div>
-
-            <div class="sim-item">
-                <div class="sim-color" style="background: #FF9800;"></div>
-                <div>
-                    <div class="sim-label">🟠 Track Similarity</div>
-                    <div class="sim-desc">Frame → Track prototype</div>
-                    <div class="sim-threshold">≥0.75 hard, ≥0.82 soft</div>
-                </div>
-            </div>
-
-            <div class="sim-item">
-                <div class="sim-color" style="background: linear-gradient(90deg, #4CAF50 0%, #FFC107 50%, #F44336 100%);"></div>
-                <div>
-                    <div class="sim-label">🟢🟡🔴 Assignment Confidence</div>
-                    <div class="sim-desc">Auto-assign eligibility</div>
-                    <div class="sim-threshold">Margin ≥0.10 required</div>
                 </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
         st.markdown("""
-        **All scores use cosine similarity (0.0-1.0 scale):**
+        **Quality Indicators:**
 
-        | Range | Meaning |
+        | Badge | Meaning |
         |-------|---------|
-        | 0.9+ | Very high similarity (same person, similar conditions) |
-        | 0.7-0.9 | High similarity (same person, varying conditions) |
-        | 0.5-0.7 | Moderate similarity (possibly same person) |
-        | < 0.5 | Low similarity (likely different people) |
+        | Q: 85%+ | High quality (sharp, complete face, good detection) |
+        | Q: 60-84% | Medium quality (acceptable for most uses) |
+        | Q: < 60% | Low quality (partial face, blurry, or low confidence) |
+        | ID: 75%+ | Strong identity match to track |
+        | ID: 60-74% | Good identity match |
+        | ID: < 60% | Weak identity match (may be wrong person) |
+
+        **Badges on frames:**
+        - ★ BEST QUALITY (green): Complete face, high quality, good ID match
+        - ⚠ BEST AVAILABLE (orange): Partial/low-quality, best available option
+        - Partial (orange pill): Edge-clipped or incomplete face
 
         📚 **Full guide:** See `docs/similarity-scores-guide.md` for complete documentation.
-
-        **Where these scores appear:**
-        - 🟣 **Cast Similarity**: Cluster assignment section, identity linking
-        - 🔵 **Identity Similarity**: Faces Review page ("ID: 87%" badges)
-        - 🟢 **Cluster Similarity**: Clustering phase (DBSCAN grouping)
-        - 🟠 **Track Similarity**: Detect/track logs (appearance gate splits)
-        - 🟢🟡🔴 **Assignment Confidence**: Auto-assign decisions
         """)
 
 
 # INTEGRATION INSTRUCTIONS:
 #
-# In apps/workspace-ui/pages/2_Episode_Detail.py, add this after line 144:
+# In apps/workspace-ui/pages/3_Faces_Review.py, add this after line 21:
 #
-# st.title("Episode Detail")
-# flash_message = st.session_state.pop("episode_detail_flash", None)
-# if flash_message:
-#     st.success(flash_message)
+# st.title("Faces & Tracks Review")
+# st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 #
 # # NEW: Add similarity scores key
 # from similarity_key_component import render_similarity_scores_key
 # render_similarity_scores_key()
 #
-# if "detector" in st.session_state:
-#     del st.session_state["detector"]
+# # Inject thumbnail CSS
+# helpers.inject_thumb_css()
 # ...
 #
-# OR copy the function directly into the file and call it inline:
-#
-# st.title("Episode Detail")
-# flash_message = st.session_state.pop("episode_detail_flash", None)
-# if flash_message:
-#     st.success(flash_message)
-#
-# # Similarity Scores Color Key
-# with st.expander("📊 Similarity Scores Guide", expanded=False):
-#     st.markdown("""...""")  # Copy content from render_similarity_scores_key()
+# OR copy the function content directly (already done in 3_Faces_Review.py)
