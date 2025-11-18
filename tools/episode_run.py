@@ -3377,9 +3377,10 @@ def _run_full_pipeline(
                             tb_str,
                         )
                         # Track crop errors for diagnostics
-                        if last_diag_stats:
-                            # Update diagnostics to track skipped frames
-                            pass
+                        if last_diag_stats is None:
+                            last_diag_stats = _diagnostic_stats(0, 0)
+                        skipped = last_diag_stats.get("skipped_none_multiply", 0)
+                        last_diag_stats["skipped_none_multiply"] = skipped + 1
                         frame_idx += 1
                         frames_since_cut += 1
                         continue
