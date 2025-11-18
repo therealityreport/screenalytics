@@ -76,7 +76,8 @@ def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
 
 
 RETINAFACE_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_DET_SIZE"))
-RETINAFACE_COREML_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_COREML_DET_SIZE"))
+# Default to 480x480 for CoreML to reduce thermal load on Apple Silicon
+RETINAFACE_COREML_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_COREML_DET_SIZE") or "480x480")
 
 
 def _normalize_det_thresh(value: float | str | None) -> float:
