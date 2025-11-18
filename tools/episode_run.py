@@ -206,24 +206,67 @@ def _normalize_device_label(device: str | None) -> str:
 
 
 def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
+    """
+    Select ONNX Runtime execution providers based on device preference.
+
+    Order of preference for device="auto":
+    - CUDA (NVIDIA GPUs on Linux/Windows)
+    - CoreML (Apple Silicon M1/M2/M3 on macOS)
+    - CPU (fallback)
+
+    Returns:
+        (providers, resolved_device) tuple where providers is a list of
+        ONNX execution providers in priority order, and resolved_device
+        is a string label for logging ("cuda", "coreml", or "cpu").
+    """
     normalized = (device or "auto").lower()
     providers: list[str] = ["CPUExecutionProvider"]
     resolved = "cpu"
-    if normalized in {"cuda", "0", "gpu", "auto"}:
-        try:
-            import onnxruntime as ort  # type: ignore
 
-            available = ort.get_available_providers()
-        except Exception:
-            available = []
+    # Get available ONNX providers
+    try:
+        import onnxruntime as ort  # type: ignore
+        available = ort.get_available_providers()
+    except Exception:
+        available = []
+
+    # Explicit CUDA request (NVIDIA GPUs)
+    if normalized in {"cuda", "0", "gpu"}:
         if "CUDAExecutionProvider" in available:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             resolved = "cuda"
             return providers, resolved
-        if normalized in {"cuda", "0", "gpu"}:
-            LOGGER.warning("CUDA requested for RetinaFace/ArcFace but CUDAExecutionProvider unavailable; falling back to CPU")
+        LOGGER.warning(
+            "CUDA requested for RetinaFace/ArcFace but CUDAExecutionProvider unavailable; falling back to CPU"
+        )
+        return providers, resolved
+
+    # Explicit MPS/CoreML request (Apple Silicon)
     if normalized in {"mps", "metal", "apple"}:
-        return ["CPUExecutionProvider"], "cpu"
+        if "CoreMLExecutionProvider" in available:
+            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+            resolved = "coreml"
+            return providers, resolved
+        LOGGER.warning(
+            "CoreML requested for RetinaFace/ArcFace but CoreMLExecutionProvider unavailable; falling back to CPU"
+        )
+        return providers, resolved
+
+    # Auto-detect best available provider
+    if normalized == "auto":
+        # Prefer CUDA on Linux/Windows
+        if "CUDAExecutionProvider" in available:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            resolved = "cuda"
+            return providers, resolved
+
+        # Prefer CoreML on macOS (Apple Silicon)
+        if "CoreMLExecutionProvider" in available:
+            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+            resolved = "coreml"
+            return providers, resolved
+
+    # Fallback to CPU for unknown device values or when no accelerators available
     return providers, resolved
 
 
