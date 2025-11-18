@@ -1749,14 +1749,44 @@ class ProgressEmitter:
         self._closed = True
 
 
-def _non_video_phase_meta(step: str | None = None) -> Dict[str, Any]:
+def _crop_diag_meta(source: Any | None) -> Dict[str, Any]:
+    if source is None:
+        return {}
+    payload: Dict[str, Any] = {}
+    attempts = getattr(source, "_crop_attempts", None)
+    if attempts is not None:
+        payload["crop_attempts"] = int(attempts)
+    counts = getattr(source, "_crop_error_counts", None)
+    if counts is not None:
+        try:
+            mapped = {str(key): int(val) for key, val in dict(counts).items()}
+        except Exception:
+            mapped = None
+        if mapped is not None:
+            payload["crop_errors"] = mapped
+    return payload
+
+
+def _non_video_phase_meta(
+    step: str | None = None,
+    *,
+    crop_diag_source: Any | None = None,
+) -> Dict[str, Any]:
     meta: Dict[str, Any] = {"video_time": None, "video_total": None}
     if step:
         meta["step"] = step
+    meta.update(_crop_diag_meta(crop_diag_source))
     return meta
 
 
-def _video_phase_meta(frames_done: int, frames_total: int | None, fps: float | None, step: str | None = None) -> Dict[str, Any]:
+def _video_phase_meta(
+    frames_done: int,
+    frames_total: int | None,
+    fps: float | None,
+    step: str | None = None,
+    *,
+    crop_diag_source: Any | None = None,
+) -> Dict[str, Any]:
     meta: Dict[str, Any] = {}
     if fps and fps > 0 and frames_total and frames_total > 0:
         video_total = frames_total / fps
@@ -1768,6 +1798,7 @@ def _video_phase_meta(frames_done: int, frames_total: int | None, fps: float | N
         meta["video_total"] = None
     if step:
         meta["step"] = step
+    meta.update(_crop_diag_meta(crop_diag_source))
     return meta
 
 
@@ -1781,6 +1812,10 @@ def _write_run_marker(ep_id: str, phase: str, payload: Dict[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     marker_path = run_dir / f"{phase}.json"
     marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+class CropQualityThresholdExceeded(RuntimeError):
+    """Raised when crop exports fail at an unacceptable rate."""
 
 
 class FrameExporter:
@@ -1845,6 +1880,14 @@ class FrameExporter:
                 crop_path = self.crop_abs_path(track_id, frame_idx)
                 try:
                     saved = self._write_crop(image, bbox, crop_path, track_id, frame_idx)
+                except CropQualityThresholdExceeded as exc:
+                    LOGGER.error(
+                        "Aborting crop exports for track %s frame %s after quality threshold: %s",
+                        track_id,
+                        frame_idx,
+                        exc,
+                    )
+                    raise
                 except Exception as exc:  # pragma: no cover - best effort
                     LOGGER.warning("Failed to save crop %s: %s", crop_path, exc)
                     self._register_crop_attempt("exception")
@@ -1902,7 +1945,7 @@ class FrameExporter:
         bad = sum(self._crop_error_counts.get(reason, 0) for reason in self._fail_fast_reasons)
         ratio = bad / max(self._crop_attempts, 1)
         if ratio >= self._fail_fast_threshold:
-            raise RuntimeError(
+            raise CropQualityThresholdExceeded(
                 f"Too many invalid crops ({bad}/{self._crop_attempts}, {ratio:.1%}); aborting export"
             )
 
@@ -2690,6 +2733,7 @@ def _run_full_pipeline(
     elif progress and progress.target_frames:
         frames_goal = progress.target_frames
     video_clock_fps = video_fps if video_fps and video_fps > 0 else (source_fps if source_fps > 0 else None)
+    frame_exporter: FrameExporter | None = None
 
     def _progress_value(frame_index: int, *, include_current: bool = False, step: str | None = None) -> tuple[int, Dict[str, Any]]:
         base = frame_index + (1 if include_current else 0)
@@ -2699,7 +2743,13 @@ def _run_full_pipeline(
         value = base
         if frames_goal:
             value = min(frames_goal, base)
-        meta = _video_phase_meta(value, total if total > 0 else None, video_clock_fps, step=step)
+        meta = _video_phase_meta(
+            value,
+            total if total > 0 else None,
+            video_clock_fps,
+            step=step,
+            crop_diag_source=frame_exporter,
+        )
         return value, meta
     device = pick_device(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
@@ -3359,6 +3409,9 @@ def _run_detect_track_stage(
             if frames_for_scene_rate
             else 0.0
         )
+        completion_extra = _crop_diag_meta(frame_exporter)
+        if detect_track_stats:
+            completion_extra["detect_track_stats"] = detect_track_stats
         progress.complete(
             summary,
             device=pipeline_device,
@@ -3366,7 +3419,7 @@ def _run_detect_track_stage(
             tracker=tracker_choice,
             resolved_device=detector_device,
             step="detect_track",
-            extra={"detect_track_stats": detect_track_stats} if detect_track_stats else None,
+            extra=completion_extra or None,
         )
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
@@ -3409,7 +3462,6 @@ def _run_faces_embed_stage(
         fps_detected=None,
         fps_requested=None,
     )
-    phase_meta = _non_video_phase_meta()
     device = pick_device(args.device)
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
@@ -3429,6 +3481,8 @@ def _run_faces_embed_stage(
         if (save_frames or save_crops)
         else None
     )
+    def _phase_meta(step: str | None = None) -> Dict[str, Any]:
+        return _non_video_phase_meta(step, crop_diag_source=exporter)
     thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
@@ -3466,7 +3520,7 @@ def _run_faces_embed_stage(
             tracker=tracker_choice,
             resolved_device=embed_device,
             force=True,
-            extra=phase_meta,
+            extra=_phase_meta(),
         )
         rows: List[Dict[str, Any]] = []
         for sample in samples:
@@ -3528,7 +3582,7 @@ def _run_faces_embed_stage(
                     detector=detector_choice,
                     tracker=tracker_choice,
                     resolved_device=embed_device,
-                    extra=phase_meta,
+                    extra=_phase_meta(),
                 )
                 continue
 
@@ -3574,7 +3628,7 @@ def _run_faces_embed_stage(
                     detector=detector_choice,
                     tracker=tracker_choice,
                     resolved_device=embed_device,
-                    extra=phase_meta,
+                    extra=_phase_meta(),
                 )
                 continue
 
@@ -3616,7 +3670,7 @@ def _run_faces_embed_stage(
                     detector=detector_choice,
                     tracker=tracker_choice,
                     resolved_device=embed_device,
-                    extra=phase_meta,
+                    extra=_phase_meta(),
                 )
                 continue
 
@@ -3656,7 +3710,7 @@ def _run_faces_embed_stage(
                         detector=detector_choice,
                         tracker=tracker_choice,
                         resolved_device=embed_device,
-                        extra=phase_meta,
+                        extra=_phase_meta(),
                     )
                     continue
             else:
@@ -3684,7 +3738,7 @@ def _run_faces_embed_stage(
                     detector=detector_choice,
                     tracker=tracker_choice,
                     resolved_device=embed_device,
-                    extra=phase_meta,
+                    extra=_phase_meta(),
                 )
                 continue
 
@@ -3735,15 +3789,15 @@ def _run_faces_embed_stage(
                 face_row["seed_similarity"] = round(float(seed_similarity), 4)
             rows.append(face_row)
             faces_done = min(faces_total, faces_done + 1)
-            progress.emit(
-                faces_done,
-                phase="faces_embed",
-                device=device,
-                detector=detector_choice,
-                tracker=tracker_choice,
-                resolved_device=embed_device,
-                extra=phase_meta,
-            )
+        progress.emit(
+            faces_done,
+            phase="faces_embed",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=embed_device,
+            extra=_phase_meta(),
+        )
 
         # Force emit final progress after loop completes
         progress.emit(
@@ -3753,7 +3807,7 @@ def _run_faces_embed_stage(
             detector=detector_choice,
             tracker=tracker_choice,
             resolved_device=embed_device,
-            extra=phase_meta,
+            extra=_phase_meta(),
             force=True,
         )
 
@@ -3825,7 +3879,7 @@ def _run_faces_embed_stage(
             resolved_device=embed_device,
             summary=summary,
             force=True,
-            extra=_non_video_phase_meta("done"),
+            extra=_phase_meta("done"),
         )
         progress.complete(
             summary,
@@ -3834,7 +3888,7 @@ def _run_faces_embed_stage(
             tracker=tracker_choice,
             resolved_device=embed_device,
             step="faces_embed",
-            extra=phase_meta,
+            extra=_phase_meta(),
         )
 
         # Now do S3 sync after completion is signaled
