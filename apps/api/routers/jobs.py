@@ -126,6 +126,28 @@ class DetectTrackRequest(BaseModel):
         ge=0,
         description="Frames forced to run detection immediately after a cut",
     )
+    track_high_thresh: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Optional ByteTrack track_high_thresh override (default 0.5 or env)",
+    )
+    new_track_thresh: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Optional ByteTrack new_track_thresh override (default 0.5 or env)",
+    )
+    track_buffer: int | None = Field(
+        None,
+        ge=1,
+        description="Optional ByteTrack base track_buffer before stride scaling",
+    )
+    min_box_area: float | None = Field(
+        None,
+        ge=0.0,
+        description="Optional ByteTrack min_box_area override",
+    )
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
@@ -266,6 +288,10 @@ def _build_detect_track_command(
     scene_threshold: float,
     scene_min_len: int,
     scene_warmup_dets: int,
+    track_high_thresh: float | None,
+    new_track_thresh: float | None,
+    track_buffer: int | None,
+    min_box_area: float | None,
 ) -> List[str]:
     command: List[str] = [
         sys.executable,
@@ -291,6 +317,14 @@ def _build_detect_track_command(
         command += ["--jpeg-quality", str(req.jpeg_quality)]
     command += ["--detector", detector_value]
     command += ["--tracker", tracker_value]
+    if track_high_thresh is not None:
+        command += ["--track-high-thresh", str(track_high_thresh)]
+    if new_track_thresh is not None:
+        command += ["--new-track-thresh", str(new_track_thresh)]
+    if track_buffer is not None:
+        command += ["--track-buffer", str(track_buffer)]
+    if min_box_area is not None:
+        command += ["--min-box-area", str(min_box_area)]
     if req.max_gap:
         command += ["--max-gap", str(req.max_gap)]
     if det_thresh is not None:
@@ -594,6 +628,10 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         req.scene_threshold,
         req.scene_min_len,
         req.scene_warmup_dets,
+        req.track_high_thresh,
+        req.new_track_thresh,
+        req.track_buffer,
+        req.min_box_area,
     )
     result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
     if isinstance(result, StreamingResponse):
@@ -717,6 +755,10 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             scene_threshold=req.scene_threshold,
             scene_min_len=req.scene_min_len,
             scene_warmup_dets=req.scene_warmup_dets,
+            track_high_thresh=req.track_high_thresh,
+            new_track_thresh=req.new_track_thresh,
+            track_buffer=req.track_buffer,
+            min_box_area=req.min_box_area,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -182,3 +182,50 @@ def test_fallback_poller_waits_past_scene_detect_and_reports_error():
     assert summary is None
     assert error == "detect failed"
     assert len(updates) == 2
+def test_progress_waits_for_track_done_before_summary():
+    helpers = load_ui_helpers_module()
+    helpers.st.session_state["api_base"] = "http://testserver"
+
+    detect_progress = {
+        "phase": "detect",
+        "frames_done": 10,
+        "frames_total": 10,
+        "step": "done",
+    }
+    track_progress = {
+        "phase": "track",
+        "frames_done": 5,
+        "frames_total": 5,
+        "step": "done",
+        "summary": {"stage": "detect_track", "tracks": 5},
+    }
+
+    payloads = [
+        {"progress": detect_progress},
+        {"progress": track_progress},
+    ]
+
+    _install_fake_post(
+        helpers,
+        _FakeResponse(
+            [
+                "event: progress",
+                'data: {"phase": "detect", "frames_done": 10, "frames_total": 10, "step": "done"}',
+                "",
+            ]
+        ),
+    )
+    _install_fake_get_sequence(helpers, payloads)
+
+    summary, error_message = helpers.fallback_poll_progress(
+        "demo",
+        {"ep_id": "demo"},
+        update_cb=lambda payload: None,
+        status_placeholder=helpers.st,
+        job_started=True,
+        async_endpoint="/jobs/detect_track_async",
+    )
+
+    assert error_message is None
+    assert summary is not None
+    assert summary.get("tracks") == 5

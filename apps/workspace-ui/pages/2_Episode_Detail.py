@@ -66,6 +66,45 @@ def _count_manifest_rows(path: Path) -> int | None:
         return None
 
 
+def _manifest_has_rows(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _detect_track_manifests_ready(detections_path: Path, tracks_path: Path) -> dict:
+    detections_ready = _manifest_has_rows(detections_path)
+    tracks_ready = _manifest_has_rows(tracks_path)
+    return {
+        "detections_ready": detections_ready,
+        "tracks_ready": tracks_ready,
+        "manifest_ready": detections_ready and tracks_ready,
+    }
+
+
+def _compute_detect_track_effective_status(
+    detect_status: Dict[str, Any],
+    *,
+    manifest_ready: bool,
+    tracks_ready_flag: bool,
+) -> tuple[str, bool, bool]:
+    normalized_status = str(detect_status.get("status") or "missing").strip().lower()
+    if not normalized_status:
+        normalized_status = "missing"
+    if normalized_status == "success":
+        return "success", True, False
+    if manifest_ready:
+        return "success", True, True
+    return normalized_status, bool(tracks_ready_flag), False
+
+
 def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int | None:
     if not meta:
         return None
@@ -319,7 +358,8 @@ else:
 prefixes = helpers.episode_artifact_prefixes(ep_id)
 bucket_name = cfg.get("bucket")
 tracks_path = get_path(ep_id, "tracks")
-manifests_dir = get_path(ep_id, "detections").parent
+detections_path = get_path(ep_id, "detections")
+manifests_dir = detections_path.parent
 faces_path = manifests_dir / "faces.jsonl"
 identities_path = manifests_dir / "identities.json"
 detect_job_defaults = _load_job_defaults(ep_id, "detect_track")
@@ -338,17 +378,6 @@ if local_video_exists:
             st.session_state[video_meta_key] = video_meta
 else:
     st.session_state.pop(video_meta_key, None)
-
-
-def _check_detect_track_manifests() -> bool:
-    """
-    Check if detect/track manifests exist locally.
-    Returns True if tracks.jsonl exists and is readable.
-    """
-    try:
-        return tracks_path.exists() and tracks_path.is_file()
-    except Exception:
-        return False
 
 
 st.subheader(f"Episode `{ep_id}`")
@@ -377,24 +406,17 @@ if tracks_path.exists():
     st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
     st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
 
-# Check if detect/track manifests exist locally for fallback
-manifests_present = _check_detect_track_manifests()
+manifest_state = _detect_track_manifests_ready(detections_path, tracks_path)
 
 # Get status values from API
-detect_status_value = str(detect_phase_status.get("status") or "missing").lower()
 faces_status_value = str(faces_phase_status.get("status") or "missing").lower()
 cluster_status_value = str(cluster_phase_status.get("status") or "missing").lower()
-tracks_ready_status = bool((status_payload or {}).get("tracks_ready"))
-
-# Apply manifest-based fallback for detect/track status
-using_manifest_fallback = False
-if detect_status_value != "success" and manifests_present:
-    # Promote status to success when manifests exist but status API is missing/stale
-    detect_status_value = "success"
-    using_manifest_fallback = True
-
-# Derive tracks_ready from both status API and manifest fallback
-tracks_ready = tracks_ready_status or manifests_present
+tracks_ready_flag = bool((status_payload or {}).get("tracks_ready"))
+detect_status_value, tracks_ready, using_manifest_fallback = _compute_detect_track_effective_status(
+    detect_phase_status,
+    manifest_ready=manifest_state["manifest_ready"],
+    tracks_ready_flag=tracks_ready_flag,
+)
 
 # Other status values
 faces_ready_state = faces_status_value == "success"
@@ -428,6 +450,15 @@ if status_payload:
             detections = detect_phase_status.get("detections")
             tracks = detect_phase_status.get("tracks")
             st.caption(f"{(detections or 0):,} detections, {(tracks or 0):,} tracks")
+            ratio_value = helpers.coerce_float(
+                detect_phase_status.get("track_to_detection_ratio") or detect_phase_status.get("track_ratio")
+            )
+            if ratio_value is not None:
+                st.caption(f"Tracks / detections: {ratio_value:.2f}")
+                if ratio_value < 0.1:
+                    st.caption(
+                        "⚠️ Track-to-detection ratio < 0.10. Consider lowering ByteTrack thresholds or rerunning detect/track."
+                    )
             # Show manifest-fallback caption when status was inferred from manifests
             if using_manifest_fallback:
                 st.caption("ℹ️ _Detect/Track completion inferred from manifests (status API missing/stale)._")
@@ -628,6 +659,19 @@ with col_detect:
     )
     st.session_state[det_thresh_key] = float(det_thresh_value)
 
+    track_high_default = helpers.coerce_float(detect_job_defaults.get("track_high_thresh"))
+    if track_high_default is None:
+        track_high_default = helpers.coerce_float(detect_phase_status.get("track_high_thresh"))
+    if track_high_default is None:
+        track_high_default = helpers.TRACK_HIGH_THRESH_DEFAULT
+    track_new_default = helpers.coerce_float(detect_job_defaults.get("new_track_thresh"))
+    if track_new_default is None:
+        track_new_default = helpers.coerce_float(detect_phase_status.get("new_track_thresh"))
+    if track_new_default is None:
+        track_new_default = helpers.TRACK_NEW_THRESH_DEFAULT
+    track_high_value: float | None = track_high_default
+    track_new_value: float | None = track_new_default
+
     with st.expander("Advanced detect/track", expanded=False):
         scene_detector_label = st.selectbox(
             "Scene detector",
@@ -673,6 +717,34 @@ with col_detect:
         )
         st.session_state[scene_warmup_key] = int(scene_warmup_value)
 
+        if detect_tracker_value == "bytetrack":
+            st.markdown("#### Advanced tracking")
+            track_high_session_key = f"{session_prefix}::track_high_thresh"
+            track_high_seed = float(st.session_state.get(track_high_session_key, track_high_default))
+            track_high_value = st.slider(
+                "track_high_thresh",
+                min_value=0.30,
+                max_value=0.95,
+                value=float(track_high_seed),
+                step=0.01,
+                help="High-confidence gate for extending existing ByteTrack tracks.",
+            )
+            st.session_state[track_high_session_key] = float(track_high_value)
+            track_new_session_key = f"{session_prefix}::new_track_thresh"
+            track_new_seed = float(st.session_state.get(track_new_session_key, track_new_default))
+            track_new_value = st.slider(
+                "new_track_thresh",
+                min_value=0.30,
+                max_value=0.95,
+                value=float(track_new_seed),
+                step=0.01,
+                help="Minimum score required to spawn a new ByteTrack track.",
+            )
+            st.session_state[track_new_session_key] = float(track_new_value)
+            st.caption(
+                "Lower thresholds increase recall but may introduce more false tracks; higher thresholds are stricter."
+            )
+
     detect_device_choice = st.selectbox(
         "Device",
         helpers.DEVICE_LABELS,
@@ -681,6 +753,10 @@ with col_detect:
     )
     detect_device_value = helpers.DEVICE_VALUE_MAP[detect_device_choice]
     detect_device_label = helpers.device_label_from_value(detect_device_value)
+
+    if detect_tracker_value != "bytetrack":
+        track_high_value = None
+        track_new_value = None
 
     sampled_frames_est = _estimated_sampled_frames(video_meta, stride_value)
     if save_frames and sampled_frames_est:
@@ -719,6 +795,9 @@ with col_detect:
     )
     job_payload["detector"] = detect_detector_value
     job_payload["tracker"] = detect_tracker_value
+    if detect_tracker_value == "bytetrack" and track_high_value is not None and track_new_value is not None:
+        job_payload["track_high_thresh"] = float(track_high_value)
+        job_payload["new_track_thresh"] = float(track_new_value)
     if fps_value > 0:
         job_payload["fps"] = fps_value
     mode_label = f"{detect_detector_label} + {detect_tracker_label}"
@@ -742,6 +821,9 @@ with col_detect:
         crops_exported = helpers.coerce_int(normalized.get("crops_exported"))
         detector_summary = normalized.get("detector")
         tracker_summary = normalized.get("tracker")
+        track_ratio_value = helpers.coerce_float(
+            normalized.get("track_to_detection_ratio") or normalized.get("track_ratio")
+        )
         detector_is_scene = isinstance(detector_summary, str) and detector_summary in helpers.SCENE_DETECTOR_LABEL_MAP
         has_detections = detections is not None and detections > 0
         has_tracks = tracks is not None and tracks > 0
@@ -760,10 +842,16 @@ with col_detect:
         if issue_messages:
             st.error(" ".join(issue_messages) + " Please rerun **Detect/Track Faces** to generate the manifests.")
             return
+        if track_ratio_value is not None and track_ratio_value < 0.1:
+            st.warning(
+                "⚠️ Track-to-detection ratio is below 0.10. Consider lowering ByteTrack thresholds or inspecting the episode."
+            )
         details_line = [
             f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
             f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
         ]
+        if track_ratio_value is not None:
+            details_line.append(f"tracks/detections: {track_ratio_value:.2f}")
         if frames_exported:
             details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
         if crops_exported:

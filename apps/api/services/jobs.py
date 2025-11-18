@@ -56,6 +56,30 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float_multi(names: tuple[str, ...], default: float) -> float:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _env_int_multi(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
 SCENE_THRESHOLD_DEFAULT = getattr(episode_run, "SCENE_THRESHOLD_DEFAULT", _env_float("SCENE_THRESHOLD", 27.0))
 SCENE_MIN_LEN_DEFAULT = getattr(episode_run, "SCENE_MIN_LEN_DEFAULT", max(_env_int("SCENE_MIN_LEN", 12), 1))
 SCENE_WARMUP_DETS_DEFAULT = getattr(
@@ -64,6 +88,53 @@ SCENE_WARMUP_DETS_DEFAULT = getattr(
     max(_env_int("SCENE_WARMUP_DETS", 3), 0),
 )
 CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
+TRACK_HIGH_THRESH_DEFAULT = getattr(episode_run, "TRACK_HIGH_THRESH_DEFAULT", 0.5)
+TRACK_NEW_THRESH_DEFAULT = getattr(episode_run, "TRACK_NEW_THRESH_DEFAULT", 0.5)
+TRACK_BUFFER_BASE_DEFAULT = getattr(episode_run, "TRACK_BUFFER_BASE_DEFAULT", 30)
+TRACK_MIN_BOX_AREA_DEFAULT = getattr(episode_run, "BYTE_TRACK_MIN_BOX_AREA_DEFAULT", 20.0)
+
+
+def _resolve_track_high_thresh(value: float | None) -> float:
+    if value is not None:
+        return min(max(float(value), 0.0), 1.0)
+    return _env_float_multi(
+        ("SCREENALYTICS_TRACK_HIGH_THRESH", "BYTE_TRACK_HIGH_THRESH"),
+        TRACK_HIGH_THRESH_DEFAULT,
+    )
+
+
+def _resolve_new_track_thresh(value: float | None) -> float:
+    if value is not None:
+        return min(max(float(value), 0.0), 1.0)
+    return _env_float_multi(
+        ("SCREENALYTICS_NEW_TRACK_THRESH", "BYTE_TRACK_NEW_TRACK_THRESH"),
+        TRACK_NEW_THRESH_DEFAULT,
+    )
+
+
+def _resolve_track_buffer(value: int | None) -> int:
+    if value is not None:
+        try:
+            return max(int(value), 1)
+        except (TypeError, ValueError):
+            return TRACK_BUFFER_BASE_DEFAULT
+    return max(
+        _env_int_multi(("SCREENALYTICS_TRACK_BUFFER", "BYTE_TRACK_BUFFER"), TRACK_BUFFER_BASE_DEFAULT),
+        1,
+    )
+
+
+def _resolve_min_box_area(value: float | None) -> float:
+    if value is not None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = TRACK_MIN_BOX_AREA_DEFAULT
+        return max(numeric, 0.0)
+    return max(
+        _env_float_multi(("SCREENALYTICS_MIN_BOX_AREA", "BYTE_TRACK_MIN_BOX_AREA"), TRACK_MIN_BOX_AREA_DEFAULT),
+        0.0,
+    )
 
 JobRecord = Dict[str, Any]
 
@@ -193,6 +264,10 @@ class JobService:
         scene_threshold: float,
         scene_min_len: int,
         scene_warmup_dets: int,
+        track_high_thresh: float | None = None,
+        new_track_thresh: float | None = None,
+        track_buffer: int | None = None,
+        min_box_area: float | None = None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
@@ -204,6 +279,10 @@ class JobService:
         scene_min_len = max(int(scene_min_len), 1)
         scene_warmup_dets = max(int(scene_warmup_dets), 0)
         scene_threshold = max(float(scene_threshold), 0.0)
+        track_high_value = _resolve_track_high_thresh(track_high_thresh)
+        new_track_value = _resolve_new_track_thresh(new_track_thresh)
+        track_buffer_value = _resolve_track_buffer(track_buffer)
+        min_box_area_value = _resolve_min_box_area(min_box_area)
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -229,6 +308,10 @@ class JobService:
             command += ["--jpeg-quality", str(jpeg_quality)]
         command += ["--detector", detector_value]
         command += ["--tracker", tracker_value]
+        command += ["--track-high-thresh", str(track_high_value)]
+        command += ["--new-track-thresh", str(new_track_value)]
+        command += ["--track-buffer", str(track_buffer_value)]
+        command += ["--min-box-area", str(min_box_area_value)]
         if max_gap is not None:
             command += ["--max-gap", str(max_gap)]
         if det_thresh is not None:
@@ -252,6 +335,10 @@ class JobService:
             "scene_threshold": scene_threshold,
             "scene_min_len": scene_min_len,
             "scene_warmup_dets": scene_warmup_dets,
+            "track_high_thresh": track_high_value,
+            "new_track_thresh": new_track_value,
+            "track_buffer": track_buffer_value,
+            "min_box_area": min_box_area_value,
         }
         return self._launch_job(
             job_type="detect_track",

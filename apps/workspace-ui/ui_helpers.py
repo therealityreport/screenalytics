@@ -41,6 +41,44 @@ def _diag(tag: str, **kw) -> None:
         LOGGER.info("[DIAG:%s] %s", tag, json.dumps(kw, ensure_ascii=False))
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+TRACK_HIGH_THRESH_DEFAULT = _env_float(
+    "SCREENALYTICS_TRACK_HIGH_THRESH",
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.5),
+)
+TRACK_NEW_THRESH_DEFAULT = _env_float(
+    "SCREENALYTICS_NEW_TRACK_THRESH",
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.5),
+)
+TRACK_BUFFER_BASE_DEFAULT = max(
+    _env_int("SCREENALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 30)),
+    1,
+)
+MIN_BOX_AREA_DEFAULT = max(
+    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    0.0,
+)
+
+
 # Thumbnail constants
 THUMB_W, THUMB_H = 200, 250
 _PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
@@ -97,26 +135,6 @@ def _env_flag(name: str, default: bool) -> bool:
     if value in {"0", "false", "off", "no"}:
         return False
     return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
 
 
 def known_shows(include_session: bool = True) -> List[str]:
@@ -182,6 +200,26 @@ def coerce_int(value: Any) -> int | None:
             return None
         try:
             return int(float(cleaned))
+        except ValueError:
+            return None
+    return None
+
+
+def coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, numbers.Real):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").strip()
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
         except ValueError:
             return None
     return None
@@ -888,10 +926,13 @@ def _is_phase_done(progress: Dict[str, Any]) -> bool:
     if phase == "done":
         return True
     step = str(progress.get("step", "")).lower()
-    # Treat scene_detect completion as non-terminal so fallback polling keeps waiting
-    if step == "done" and not phase.startswith("scene_detect"):
-        return True
-    return False
+    if not step:
+        return False
+    if phase.startswith("scene_detect"):
+        return False
+    if phase == "detect":
+        return False
+    return step == "done"
 
 
 def _phase_from_endpoint(endpoint_path: str | None) -> str | None:

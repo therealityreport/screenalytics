@@ -40,6 +40,7 @@ APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
 PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
+TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1)
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DETECTOR_CHOICES = ("retinaface",)
@@ -83,7 +84,10 @@ def _normalize_det_thresh(value: float | str | None) -> float:
     except (TypeError, ValueError):
         numeric = RETINAFACE_SCORE_THRESHOLD
     return min(max(numeric, 0.0), 1.0)
-BYTE_TRACK_MIN_BOX_AREA = 20.0
+BYTE_TRACK_MIN_BOX_AREA_DEFAULT = max(
+    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    0.0,
+)
 DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
 DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt")
 DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
@@ -95,10 +99,19 @@ GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", 
 GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.35"))
 GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
 GATE_EMB_EVERY_DEFAULT = max(int(os.environ.get("TRACK_GATE_EMB_EVERY", "0")), 0)
-BYTE_TRACK_BUFFER_DEFAULT = max(int(os.environ.get("BYTE_TRACK_BUFFER", "12")), 1)
-BYTE_TRACK_MATCH_THRESH_DEFAULT = float(os.environ.get("BYTE_TRACK_MATCH_THRESH", "0.75"))
-BYTE_TRACK_HIGH_THRESH_DEFAULT = float(os.environ.get("BYTE_TRACK_HIGH_THRESH", "0.5"))
-BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = float(os.environ.get("BYTE_TRACK_NEW_TRACK_THRESH", "0.5"))
+TRACK_BUFFER_BASE_DEFAULT = max(
+    _env_int("SCREENALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 30)),
+    1,
+)
+BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.75)
+TRACK_HIGH_THRESH_DEFAULT = _env_float(
+    "SCREENALYTICS_TRACK_HIGH_THRESH",
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.5),
+)
+TRACK_NEW_THRESH_DEFAULT = _env_float(
+    "SCREENALYTICS_NEW_TRACK_THRESH",
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.5),
+)
 TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
@@ -107,6 +120,10 @@ DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
+BYTE_TRACK_BUFFER_DEFAULT = TRACK_BUFFER_BASE_DEFAULT
+BYTE_TRACK_HIGH_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
+BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = TRACK_NEW_THRESH_DEFAULT
+BYTE_TRACK_MIN_BOX_AREA = BYTE_TRACK_MIN_BOX_AREA_DEFAULT
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -674,12 +691,56 @@ def _tracker_inputs_from_samples(detections: list[DetectionSample]) -> _TrackerD
     )
 
 
+@dataclass
+class ByteTrackRuntimeConfig:
+    """Runtime configuration for ByteTrack builds."""
+
+    track_high_thresh: float = TRACK_HIGH_THRESH_DEFAULT
+    new_track_thresh: float = TRACK_NEW_THRESH_DEFAULT
+    match_thresh: float = BYTE_TRACK_MATCH_THRESH_DEFAULT
+    track_low_thresh: float = 0.1
+    track_buffer_base: int = TRACK_BUFFER_BASE_DEFAULT
+    min_box_area: float = BYTE_TRACK_MIN_BOX_AREA_DEFAULT
+
+    def __post_init__(self) -> None:
+        self.track_high_thresh = min(max(float(self.track_high_thresh), 0.0), 1.0)
+        self.new_track_thresh = min(max(float(self.new_track_thresh), 0.0), 1.0)
+        self.match_thresh = min(max(float(self.match_thresh), 0.0), 1.0)
+        self.track_buffer_base = max(int(self.track_buffer_base), 1)
+        self.min_box_area = max(float(self.min_box_area), 0.0)
+
+    def scaled_buffer(self, stride: int) -> int:
+        stride_value = max(int(stride), 1)
+        scale = max(1.0, float(stride_value) / 3.0)
+        effective = max(int(round(self.track_buffer_base * scale)), self.track_buffer_base)
+        return max(effective, 1)
+
+    def summary(self, stride: int) -> Dict[str, Any]:
+        return {
+            "track_high_thresh": round(self.track_high_thresh, 3),
+            "new_track_thresh": round(self.new_track_thresh, 3),
+            "match_thresh": round(self.match_thresh, 3),
+            "track_buffer": self.scaled_buffer(stride),
+            "track_buffer_base": self.track_buffer_base,
+            "min_box_area": round(self.min_box_area, 3),
+            "stride": max(int(stride), 1),
+        }
+
+
 class ByteTrackAdapter:
     """Wrapper around ultralytics BYTETracker for direct invocation."""
 
-    def __init__(self, frame_rate: float = 30.0, stride: int = 1) -> None:
+    def __init__(
+        self,
+        frame_rate: float = 30.0,
+        stride: int = 1,
+        config: ByteTrackRuntimeConfig | None = None,
+    ) -> None:
         self.frame_rate = max(frame_rate, 1)
         self.stride = max(stride, 1)
+        self.config = config or ByteTrackRuntimeConfig()
+        self._effective_buffer = self.config.scaled_buffer(self.stride)
+        self._config_snapshot = self.config.summary(self.stride)
         self._tracker = self._build_tracker()
 
     def _build_tracker(self):
@@ -687,22 +748,20 @@ class ByteTrackAdapter:
 
         from ultralytics.trackers.byte_tracker import BYTETracker
 
-        # Scale track_buffer based on stride to maintain same temporal window
-        # With stride > 1, we sample fewer frames per second, so buffer needs to be larger
-        # to cover the same time period
-        base_buffer = BYTE_TRACK_BUFFER_DEFAULT
-        scaled_buffer = max(base_buffer, int(base_buffer * self.stride / 2))
-
         cfg = SimpleNamespace(
             tracker_type="bytetrack",
-            track_high_thresh=BYTE_TRACK_HIGH_THRESH_DEFAULT,
-            track_low_thresh=0.1,
-            new_track_thresh=BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT,
-            track_buffer=scaled_buffer,
-            match_thresh=BYTE_TRACK_MATCH_THRESH_DEFAULT,
-            min_box_area=BYTE_TRACK_MIN_BOX_AREA,
+            track_high_thresh=self.config.track_high_thresh,
+            track_low_thresh=self.config.track_low_thresh,
+            new_track_thresh=self.config.new_track_thresh,
+            track_buffer=self._effective_buffer,
+            match_thresh=self.config.match_thresh,
+            min_box_area=self.config.min_box_area,
         )
         return BYTETracker(cfg, frame_rate=self.frame_rate)
+
+    @property
+    def config_summary(self) -> Dict[str, Any]:
+        return dict(self._config_snapshot)
 
     def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
         det_struct = _tracker_inputs_from_samples(detections)
@@ -884,10 +943,30 @@ def _build_face_detector(detector: str, device: str, score_thresh: float = RETIN
     return RetinaFaceDetectorBackend(device, score_thresh=score_thresh)
 
 
-def _build_tracker_adapter(tracker: str, frame_rate: float, stride: int = 1) -> ByteTrackAdapter | StrongSortAdapter:
+def _build_tracker_adapter(
+    tracker: str,
+    frame_rate: float,
+    stride: int = 1,
+    config: ByteTrackRuntimeConfig | None = None,
+) -> ByteTrackAdapter | StrongSortAdapter:
     if tracker == "strongsort":
         return StrongSortAdapter(frame_rate=frame_rate)
-    return ByteTrackAdapter(frame_rate=frame_rate, stride=stride)
+    return ByteTrackAdapter(frame_rate=frame_rate, stride=stride, config=config)
+
+
+def _bytetrack_config_from_args(args: argparse.Namespace) -> ByteTrackRuntimeConfig:
+    return ByteTrackRuntimeConfig(
+        track_high_thresh=getattr(args, "track_high_thresh", TRACK_HIGH_THRESH_DEFAULT)
+        or TRACK_HIGH_THRESH_DEFAULT,
+        new_track_thresh=getattr(args, "new_track_thresh", TRACK_NEW_THRESH_DEFAULT)
+        or TRACK_NEW_THRESH_DEFAULT,
+        match_thresh=BYTE_TRACK_MATCH_THRESH_DEFAULT,
+        track_low_thresh=0.1,
+        track_buffer_base=getattr(args, "track_buffer", TRACK_BUFFER_BASE_DEFAULT)
+        or TRACK_BUFFER_BASE_DEFAULT,
+        min_box_area=getattr(args, "min_box_area", BYTE_TRACK_MIN_BOX_AREA_DEFAULT)
+        or BYTE_TRACK_MIN_BOX_AREA_DEFAULT,
+    )
 
 
 class ArcFaceEmbedder:
@@ -1202,6 +1281,10 @@ class TrackRecorder:
             payload.append(track.to_row())
         return payload
 
+    @property
+    def active_track_count(self) -> int:
+        return len(self._active_exports)
+
     def top_long_tracks(self, limit: int = 5) -> list[dict]:
         longest = sorted(self._accumulators.values(), key=lambda item: item.frame_count, reverse=True)[:limit]
         return [
@@ -1405,7 +1488,7 @@ def _faces_embed_path(ep_id: str) -> Path:
 class ProgressEmitter:
     """Emit structured progress to stdout + optional file for SSE/polling."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(
         self,
@@ -2115,6 +2198,30 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Tracker backend (ByteTrack default, StrongSORT optional for occlusions)",
     )
     parser.add_argument(
+        "--track-high-thresh",
+        type=float,
+        default=TRACK_HIGH_THRESH_DEFAULT,
+        help="ByteTrack track_high_thresh gate (default: env or 0.5).",
+    )
+    parser.add_argument(
+        "--new-track-thresh",
+        type=float,
+        default=TRACK_NEW_THRESH_DEFAULT,
+        help="ByteTrack new_track_thresh gate (default: env or 0.5).",
+    )
+    parser.add_argument(
+        "--track-buffer",
+        type=int,
+        default=TRACK_BUFFER_BASE_DEFAULT,
+        help="Base ByteTrack track_buffer before stride scaling (default: env or 30).",
+    )
+    parser.add_argument(
+        "--min-box-area",
+        type=float,
+        default=BYTE_TRACK_MIN_BOX_AREA_DEFAULT,
+        help="Minimum box area for ByteTrack gating (default: env or 20).",
+    )
+    parser.add_argument(
         "--scene-detector",
         choices=list(SCENE_DETECTOR_CHOICES),
         default=SCENE_DETECTOR_DEFAULT,
@@ -2245,6 +2352,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     args.scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
     args.scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
     args.scene_warmup_dets = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
+    args.track_high_thresh = min(
+        max(float(getattr(args, "track_high_thresh", TRACK_HIGH_THRESH_DEFAULT) or TRACK_HIGH_THRESH_DEFAULT), 0.0),
+        1.0,
+    )
+    args.new_track_thresh = min(
+        max(float(getattr(args, "new_track_thresh", TRACK_NEW_THRESH_DEFAULT) or TRACK_NEW_THRESH_DEFAULT), 0.0),
+        1.0,
+    )
+    args.track_buffer = max(int(getattr(args, "track_buffer", TRACK_BUFFER_BASE_DEFAULT) or TRACK_BUFFER_BASE_DEFAULT), 1)
+    args.min_box_area = max(
+        float(getattr(args, "min_box_area", BYTE_TRACK_MIN_BOX_AREA_DEFAULT) or BYTE_TRACK_MIN_BOX_AREA_DEFAULT),
+        0.0,
+    )
     cli_track_limit = getattr(args, "track_sample_limit", None)
     if cli_track_limit is not None:
         _set_track_sample_limit(cli_track_limit)
@@ -2498,7 +2618,19 @@ def _run_full_pipeline(
     frame_exporter: FrameExporter | None = None,
     total_frames: int | None = None,
     video_fps: float | None = None,
-) -> Tuple[int, int, int, str, str, float | None, Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[
+    int,
+    int,
+    int,
+    str,
+    str,
+    float | None,
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, int],
+    Dict[str, Any] | None,
+    Dict[str, Any] | None,
+]:
     import cv2  # type: ignore
 
     analyzed_fps = target_fps or source_fps
@@ -2552,7 +2684,16 @@ def _run_full_pipeline(
             extra=video_meta,
         )
 
-    tracker_adapter = _build_tracker_adapter(tracker_choice, frame_rate=source_fps or 30.0, stride=frame_stride)
+    tracker_config = _bytetrack_config_from_args(args) if tracker_choice == "bytetrack" else None
+    tracker_adapter = _build_tracker_adapter(
+        tracker_choice,
+        frame_rate=source_fps or 30.0,
+        stride=frame_stride,
+        config=tracker_config,
+    )
+    tracker_config_summary: Dict[str, Any] | None = None
+    if tracker_choice == "bytetrack":
+        tracker_config_summary = tracker_adapter.config_summary
     appearance_gate: AppearanceGate | None = None
     gate_embedder: ArcFaceEmbedder | None = None
     gate_config: GateConfig | None = None
@@ -2602,9 +2743,24 @@ def _run_full_pipeline(
     det_count = 0
     frames_sampled = 0
     frame_idx = 0
+    last_diag_stats: Dict[str, Any] | None = None
+
+    def _diagnostic_stats(detections_in_frame: int, tracks_in_frame: int) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "frames_seen": frames_sampled,
+            "detections_seen": det_count,
+            "detections_in_frame": detections_in_frame,
+            "tracks_in_frame": tracks_in_frame,
+            "tracks_born": recorder.metrics["tracks_born"],
+            "tracks_alive": recorder.active_track_count,
+            "tracks_lost": recorder.metrics["tracks_lost"],
+        }
+        if tracker_config_summary:
+            stats.setdefault("tracker_config", tracker_config_summary)
+        return stats
 
     # Track detection confidence distribution for diagnostics
-    confidence_histogram = {
+    detection_conf_hist = {
         "0.0-0.5": 0,
         "0.5-0.6": 0,
         "0.6-0.7": 0,
@@ -2613,15 +2769,23 @@ def _run_full_pipeline(
         "0.9-1.0": 0,
     }
 
+    def _record_detection_conf(conf_value: float) -> None:
+        if conf_value < 0.5:
+            detection_conf_hist["0.0-0.5"] += 1
+        elif conf_value < 0.6:
+            detection_conf_hist["0.5-0.6"] += 1
+        elif conf_value < 0.7:
+            detection_conf_hist["0.6-0.7"] += 1
+        elif conf_value < 0.8:
+            detection_conf_hist["0.7-0.8"] += 1
+        elif conf_value < 0.9:
+            detection_conf_hist["0.8-0.9"] += 1
+        else:
+            detection_conf_hist["0.9-1.0"] += 1
+
     cap = cv2.VideoCapture(str(video_dest))
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video {video_dest}")
-
-    # NOV17-DETECT-ENTER: Loud logging to verify detect loop entry
-    LOGGER.error(
-        "NOV17-DETECT-ENTER: ep_id=%s video=%s total_frames=%d stride=%d detector=%s tracker=%s",
-        args.ep_id, video_dest, total_frames, frame_stride, detector_choice, tracker_label
-    )
 
     try:
         with det_path.open("w", encoding="utf-8") as det_handle:
@@ -2661,34 +2825,10 @@ def _run_full_pipeline(
 
                 frames_sampled += 1
                 detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
-                if progress:
-                    progress.emit(
-                        detect_frames,
-                        phase="detect",
-                        device=device,
-                        detector=detector_choice,
-                        tracker=tracker_label,
-                        resolved_device=detector_device,
-                        extra=detect_meta,
-                    )
                 ts = frame_idx / ts_fps if ts_fps else 0.0
-
-                # NOV17-DETECT-CALL: Log before detector call (first frame only to reduce spam)
-                if frames_sampled == 0:
-                    LOGGER.error(
-                        "NOV17-DETECT-CALL: About to call detector.detect() frame_idx=%d ep_id=%s",
-                        frame_idx, args.ep_id
-                    )
 
                 try:
                     detections = detector_backend.detect(frame)
-
-                    # NOV17-DETECT-RESULT: Log result (first frame only)
-                    if frames_sampled == 0:
-                        LOGGER.error(
-                            "NOV17-DETECT-RESULT: detector.detect() returned %d detections for frame_idx=%d",
-                            len(detections) if detections else 0, frame_idx
-                        )
                 except Exception as exc:
                     LOGGER.error(
                         "Face detection failed at frame %d for %s: %s",
@@ -2699,17 +2839,59 @@ def _run_full_pipeline(
                     )
                     raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
                 face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+                for det_sample in face_detections:
+                    _record_detection_conf(float(det_sample.conf))
                 tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
-
-                # Log tracking conversion rate periodically for diagnostics
-                if frames_sampled % 100 == 0 and frames_sampled > 0:
-                    LOGGER.info(
-                        "Tracking progress: frame=%d sampled=%d detections_this_frame=%d tracked_objects=%d",
-                        frame_idx,
-                        frames_sampled,
-                        len(face_detections),
-                        len(tracked_objects),
+                diag_stats = _diagnostic_stats(len(face_detections), len(tracked_objects))
+                last_diag_stats = diag_stats
+                if progress:
+                    detect_extra = dict(detect_meta)
+                    detect_extra["detect_track_stats"] = diag_stats
+                    progress.emit(
+                        detect_frames,
+                        phase="detect",
+                        device=device,
+                        detector=detector_choice,
+                        tracker=tracker_label,
+                        resolved_device=detector_device,
+                        extra=detect_extra,
                     )
+
+                if frames_sampled > 0 and frames_sampled % TRACKING_DIAG_INTERVAL == 0:
+                    if tracker_config_summary:
+                        LOGGER.info(
+                            "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
+                            "tracks_born=%d detections_frame=%d tracks_frame=%d stride=%d "
+                            "track_high=%.2f new_track=%.2f match_thresh=%.2f track_buffer=%d min_box_area=%.2f",
+                            args.ep_id,
+                            frame_idx,
+                            frames_sampled,
+                            det_count,
+                            recorder.active_track_count,
+                            recorder.metrics["tracks_born"],
+                            len(face_detections),
+                            len(tracked_objects),
+                            frame_stride,
+                            tracker_config_summary.get("track_high_thresh", 0.0),
+                            tracker_config_summary.get("new_track_thresh", 0.0),
+                            tracker_config_summary.get("match_thresh", 0.0),
+                            tracker_config_summary.get("track_buffer", 0),
+                            tracker_config_summary.get("min_box_area", 0.0),
+                        )
+                    else:
+                        LOGGER.info(
+                            "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
+                            "tracks_born=%d detections_frame=%d tracks_frame=%d stride=%d",
+                            args.ep_id,
+                            frame_idx,
+                            frames_sampled,
+                            det_count,
+                            recorder.active_track_count,
+                            recorder.metrics["tracks_born"],
+                            len(face_detections),
+                            len(tracked_objects),
+                            frame_stride,
+                        )
 
                 crop_records: list[tuple[int, list[float]]] = []
                 gate_embeddings: dict[int, np.ndarray | None] = {}
@@ -2791,20 +2973,6 @@ def _run_full_pipeline(
                     bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
                     conf_value = float(obj.conf)
 
-                    # Update confidence histogram for diagnostics
-                    if conf_value < 0.5:
-                        confidence_histogram["0.0-0.5"] += 1
-                    elif conf_value < 0.6:
-                        confidence_histogram["0.5-0.6"] += 1
-                    elif conf_value < 0.7:
-                        confidence_histogram["0.6-0.7"] += 1
-                    elif conf_value < 0.8:
-                        confidence_histogram["0.7-0.8"] += 1
-                    elif conf_value < 0.9:
-                        confidence_histogram["0.8-0.9"] += 1
-                    else:
-                        confidence_histogram["0.9-1.0"] += 1
-
                     row = {
                         "ep_id": args.ep_id,
                         "ts": round(float(ts), 4),
@@ -2834,6 +3002,9 @@ def _run_full_pipeline(
 
                 if progress:
                     track_frames, track_meta = _progress_value(frame_idx, include_current=True)
+                    track_extra = dict(track_meta)
+                    if last_diag_stats:
+                        track_extra["detect_track_stats"] = last_diag_stats
                     progress.emit(
                         track_frames,
                         phase="track",
@@ -2847,18 +3018,12 @@ def _run_full_pipeline(
                             "id_switches": recorder.metrics["id_switches"],
                             "forced_splits": recorder.metrics.get("forced_splits", 0),
                         },
-                        extra=track_meta,
+                        extra=track_extra,
                     )
                 frame_idx += 1
                 frames_since_cut += 1
     finally:
         cap.release()
-
-    # NOV17-DETECT-GUARD: Loud logging before guard check
-    LOGGER.error(
-        "NOV17-DETECT-GUARD: ep_id=%s frames_sampled=%d frame_idx=%d total_frames=%d det_count=%d",
-        args.ep_id, frames_sampled, frame_idx, total_frames, det_count
-    )
 
     # Guard: Ensure detect loop actually processed frames
     if frames_sampled == 0:
@@ -2873,6 +3038,9 @@ def _run_full_pipeline(
     if progress and frame_idx > 0:
         detect_done_index = max(frame_idx - 1, 0)
         detect_done_frames, detect_done_meta = _progress_value(detect_done_index, include_current=True, step="done")
+        if last_diag_stats:
+            detect_done_meta = dict(detect_done_meta)
+            detect_done_meta["detect_track_stats"] = last_diag_stats
         progress.emit(
             detect_done_frames,
             phase="detect",
@@ -2888,18 +3056,25 @@ def _run_full_pipeline(
     if frame_exporter:
         frame_exporter.write_indexes()
     track_rows = recorder.rows()
+    final_diag_stats = last_diag_stats or _diagnostic_stats(0, 0)
 
     # CRITICAL: Validate that tracking produced results when detections exist
     if det_count > 0 and len(track_rows) == 0:
+        cfg = tracker_config_summary or {}
         LOGGER.error(
-            "ZERO TRACKS PRODUCED despite %d detections! "
-            "This usually indicates a ByteTrack threshold mismatch. "
-            "ByteTrack track_high_thresh (%.2f) and new_track_thresh (%.2f) must be <= det_thresh (%.2f). "
-            "Check that detections have sufficient confidence to pass tracker thresholds. "
-            "Set BYTE_TRACK_HIGH_THRESH and BYTE_TRACK_NEW_TRACK_THRESH environment variables to adjust.",
+            "ZERO TRACKS produced for ep_id=%s despite %d detections (tracks=%d). "
+            "ByteTrack config → track_high=%.2f new_track=%.2f match_thresh=%.2f track_buffer=%d "
+            "min_box_area=%.2f stride=%d det_thresh=%.2f. "
+            "Lower the ByteTrack thresholds or rerun detect/track to rebuild tracks.",
+            args.ep_id,
             det_count,
-            BYTE_TRACK_HIGH_THRESH_DEFAULT,
-            BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT,
+            len(track_rows),
+            cfg.get("track_high_thresh", TRACK_HIGH_THRESH_DEFAULT),
+            cfg.get("new_track_thresh", TRACK_NEW_THRESH_DEFAULT),
+            cfg.get("match_thresh", BYTE_TRACK_MATCH_THRESH_DEFAULT),
+            cfg.get("track_buffer", TRACK_BUFFER_BASE_DEFAULT),
+            cfg.get("min_box_area", BYTE_TRACK_MIN_BOX_AREA_DEFAULT),
+            frame_stride,
             args.det_thresh,
         )
 
@@ -2916,11 +3091,18 @@ def _run_full_pipeline(
         "longest_tracks": recorder.top_long_tracks(),
         "max_gap_frames": recorder.max_gap,
     }
+    if tracker_config_summary:
+        metrics["tracker_config"] = tracker_config_summary
+    if final_diag_stats:
+        metrics["detect_track_stats"] = final_diag_stats
     if appearance_gate:
         metrics["appearance_gate"] = appearance_gate.summary()
     if progress:
         final_track_index = max(frame_idx - 1, 0)
         track_done_frames, track_done_meta = _progress_value(final_track_index, include_current=True, step="done")
+        if final_diag_stats:
+            track_done_meta = dict(track_done_meta)
+            track_done_meta["detect_track_stats"] = final_diag_stats
         progress.emit(
             track_done_frames,
             phase="track",
@@ -2941,7 +3123,9 @@ def _run_full_pipeline(
         analyzed_fps,
         metrics,
         scene_summary,
-        confidence_histogram,
+        detection_conf_hist,
+        final_diag_stats,
+        tracker_config_summary,
     )
 
 
@@ -3020,7 +3204,9 @@ def _run_detect_track_stage(
             analyzed_fps,
             track_metrics,
             scene_summary,
-            confidence_histogram,
+            detection_conf_hist,
+            detect_track_stats,
+            tracker_config_summary,
         ) = _run_full_pipeline(
             args,
             video_dest,
@@ -3034,15 +3220,19 @@ def _run_detect_track_stage(
 
         manifests_dir = get_path(args.ep_id, "detections").parent
 
-        # Guard: Verify artifacts exist with non-zero content before reporting success
-        if det_count == 0 or track_count == 0:
-            error_msg = (
-                f"Detect/track pipeline completed but artifacts are missing or empty for {args.ep_id}: "
-                f"detections={det_count}, tracks={track_count}, frames_sampled={frames_sampled}. "
-                f"This indicates the detect loop ran but produced no output, which should be impossible."
+        if det_count == 0:
+            LOGGER.warning(
+                "Detect/track completed with 0 detections for %s; resulting tracks=%d.",
+                args.ep_id,
+                track_count,
             )
-            LOGGER.error(error_msg)
-            raise RuntimeError(error_msg)
+        if track_count == 0:
+            LOGGER.error(
+                "Detect/track completed with 0 tracks for %s despite %d detections. "
+                "Review thresholds and rerun detect/track.",
+                args.ep_id,
+                det_count,
+            )
 
         s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
         _report_s3_upload(
@@ -3053,13 +3243,18 @@ def _run_detect_track_stage(
             tracker=tracker_choice,
             resolved_device=detector_device,
         )
+        track_ratio = round(track_count / det_count, 3) if det_count > 0 else 0.0
         summary: Dict[str, Any] = {
             "stage": "detect_track",
             "ep_id": args.ep_id,
             "detections": det_count,
             "tracks": track_count,
-            "track_ratio": round(track_count / det_count, 3) if det_count > 0 else 0.0,
-            "confidence_histogram": confidence_histogram,
+            "detections_total": det_count,
+            "tracks_total": track_count,
+            "track_ratio": track_ratio,
+            "track_to_detection_ratio": track_ratio,
+            "detection_confidence_histogram": detection_conf_hist,
+            "confidence_histogram": detection_conf_hist,
             "frames_sampled": frames_sampled,
             "frames_total": progress.target_frames,
             "frames_exported": frame_exporter.frames_written if frame_exporter else 0,
@@ -3082,6 +3277,10 @@ def _run_detect_track_stage(
                 "s3_uploads": s3_stats,
             },
         }
+        if detect_track_stats:
+            summary["detect_track_stats"] = detect_track_stats
+        if tracker_config_summary:
+            summary["tracker_config"] = tracker_config_summary
         scene_summary = scene_summary or {"count": 0}
         metrics_path = manifests_dir / "track_metrics.json"
         metrics_payload = {
@@ -3104,6 +3303,13 @@ def _run_detect_track_stage(
         if isinstance(detector_label, str):
             scene_cuts_payload["detector"] = detector_label
         summary["scene_cuts"] = scene_cuts_payload
+        summary["scene_cuts_total"] = scene_cuts_payload["count"]
+        frames_for_scene_rate = summary.get("frames_total") or frames_sampled or progress.target_frames or 1
+        summary["scene_cuts_per_1k_frames"] = (
+            round((scene_cuts_payload["count"] / max(frames_for_scene_rate, 1)) * 1000.0, 3)
+            if frames_for_scene_rate
+            else 0.0
+        )
         progress.complete(
             summary,
             device=pipeline_device,
@@ -3111,6 +3317,7 @@ def _run_detect_track_stage(
             tracker=tracker_choice,
             resolved_device=detector_device,
             step="detect_track",
+            extra={"detect_track_stats": detect_track_stats} if detect_track_stats else None,
         )
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
