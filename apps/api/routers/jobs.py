@@ -84,7 +84,10 @@ async def _reject_legacy_payload(request: Request) -> None:
 class DetectRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     video: str = Field(..., description="Source video path or URL")
-    stride: int = Field(5, description="Frame stride for detection sampling")
+    stride: int = Field(
+        4,
+        description="Frame stride for detection sampling (default 4 aligns with detect+track 42-minute runs)",
+    )
     fps: float | None = Field(None, description="Optional target FPS for sampling")
     device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
 
@@ -95,7 +98,7 @@ class TrackRequest(BaseModel):
 
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stride: int = Field(3, description="Frame stride for detection sampling")
+    stride: int = Field(4, description="Frame stride for detection sampling")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
     device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
@@ -194,7 +197,7 @@ class ClusterRequest(BaseModel):
 
 class CleanupJobRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stride: int = Field(3, ge=1, le=50)
+    stride: int = Field(4, ge=1, le=50)
     fps: float | None = Field(None, ge=0.0)
     device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Detect/track device")
     embed_device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Faces embed device")

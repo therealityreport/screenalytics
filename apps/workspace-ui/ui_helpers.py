@@ -21,7 +21,7 @@ import streamlit.components.v1 as components
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DEFAULT_STRIDE = 3
+DEFAULT_STRIDE = 4
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
 DEFAULT_DEVICE = "auto"
@@ -708,7 +708,7 @@ def _guess_device_label() -> str:
         import torch  # type: ignore
 
         if torch.cuda.is_available():  # pragma: no cover
-            return "Auto"
+            return "CUDA"
         mps_backend = getattr(torch.backends, "mps", None)
         if mps_backend is not None and mps_backend.is_available():  # pragma: no cover
             return "MPS"
@@ -778,11 +778,26 @@ def tracks_tracker_value(ep_id: str) -> str | None:
     return None
 
 
-def detector_is_face_only(ep_id: str) -> bool:
+def detector_is_face_only(ep_id: str, detect_status: Dict[str, Any] | None = None) -> bool:
     detector = tracks_detector_value(ep_id)
-    if detector is None:
+    if detector:
+        return detector.lower() in FACE_ONLY_DETECTORS
+    status_detector = None
+    if detect_status and isinstance(detect_status, dict):
+        status_detector = detect_status.get("detector")
+    if status_detector:
+        return str(status_detector).lower() in FACE_ONLY_DETECTORS
+    manifest_path = _manifest_path(ep_id, "tracks.jsonl")
+    if not manifest_path.exists():
         return False
-    return detector.lower() in FACE_ONLY_DETECTORS
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def tracks_detector_label(ep_id: str) -> str:

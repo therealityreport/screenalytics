@@ -16,9 +16,7 @@ if str(WORKSPACE_DIR) not in sys.path:
 
 import ui_helpers as helpers  # noqa: E402
 
-cfg = helpers.init_page("Faces & Tracks")
 st.title("Faces & Tracks Review")
-st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 
 # Similarity Scores Color Key (native Streamlit layout to avoid raw HTML)
 with st.expander("📊 Similarity Scores Guide", expanded=False):
@@ -141,6 +139,52 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
 helpers.inject_thumb_css()
 
 MAX_TRACKS_PER_ROW = 6
+TRACK_SAMPLE_LONG_THRESHOLD = 10_000
+TRACK_SAMPLE_HIGH_THRESHOLD = 20_000
+TRACK_PAGE_BASE_SIZE = 50
+TRACK_PAGE_MEDIUM_SIZE = 75
+TRACK_PAGE_MAX_SIZE = 100
+TRACK_MEDIA_BATCH_LIMIT = 12
+_CAST_CAROUSEL_CACHE_KEY = "cast_carousel_cache"
+_TRACK_MEDIA_CACHE_KEY = "track_media_cache"
+
+
+def _cast_carousel_cache() -> Dict[str, Any]:
+    return st.session_state.setdefault(_CAST_CAROUSEL_CACHE_KEY, {})
+
+
+def _track_media_cache() -> Dict[str, Dict[str, Any]]:
+    return st.session_state.setdefault(_TRACK_MEDIA_CACHE_KEY, {})
+
+
+def _track_media_state(ep_id: str, track_id: int) -> Dict[str, Any]:
+    cache = _track_media_cache()
+    key = f"{ep_id}::{track_id}"
+    if key not in cache:
+        cache[key] = {"items": [], "cursor": None, "initialized": False, "sample": None}
+    return cache[key]
+
+
+def _reset_track_media_state(ep_id: str, track_id: int) -> None:
+    _track_media_cache().pop(f"{ep_id}::{track_id}", None)
+
+
+def _suggest_track_sample(frame_count: int | None) -> int:
+    frames = int(frame_count or 0)
+    if frames >= TRACK_SAMPLE_HIGH_THRESHOLD:
+        return 3
+    if frames >= TRACK_SAMPLE_LONG_THRESHOLD:
+        return 2
+    return 1
+
+
+def _recommended_page_size(sample: int, total_sampled: int | None) -> int:
+    total = int(total_sampled or 0)
+    if sample >= 3 or total >= TRACK_SAMPLE_HIGH_THRESHOLD:
+        return TRACK_PAGE_MAX_SIZE
+    if sample >= 2 or total >= TRACK_SAMPLE_LONG_THRESHOLD:
+        return TRACK_PAGE_MEDIUM_SIZE
+    return TRACK_PAGE_BASE_SIZE
 
 
 def _render_similarity_badge(similarity: float | None, metric: str = "identity") -> str:
@@ -362,103 +406,6 @@ def _delete_frames_api(ep_id: str, track_id: int, frame_ids: List[int], delete_a
     st.rerun()
 
 
-def _select_episode() -> str:
-    """Episode selector in sidebar with lock/unlock mechanism."""
-    with st.sidebar:
-        st.markdown("### Episode")
-
-        current = helpers.get_ep_id()
-
-        # Check if selector is locked (default is locked)
-        is_locked = not st.session_state.get("episode_selector_unlocked", False)
-
-        if current and is_locked:
-            # Show locked state - just display current episode
-            ep_meta = helpers.parse_ep_id(current) or {}
-            show = ep_meta.get("show", "").upper()
-            season = ep_meta.get("season", 0)
-            episode = ep_meta.get("episode", 0)
-            display_text = f"{show} S{season:02d}E{episode:02d}" if show and season and episode else current
-
-            st.info(f"🔒 **{display_text}**")
-
-            if st.button(
-                "🔓 Change Episode",
-                key="unlock_episode_selector",
-                use_container_width=True,
-            ):
-                st.session_state["episode_selector_unlocked"] = True
-                st.rerun()
-
-            return current
-
-        # Show unlocked state - full selector
-        st.session_state["episode_selector_unlocked"] = True
-
-        tracked_tab, s3_tab = st.tabs(["Tracked", "Browse S3"])
-
-        with tracked_tab:
-            payload = _safe_api_get("/episodes")
-            options = payload.get("episodes", []) if payload else []
-            if options:
-                ep_ids = [item["ep_id"] for item in options]
-                default_idx = ep_ids.index(current) if current in ep_ids else 0
-
-                selection = st.selectbox(
-                    "Select episode",
-                    ep_ids,
-                    format_func=lambda eid: f"{eid} ({options[ep_ids.index(eid)]['show_slug']})",
-                    index=default_idx if ep_ids else 0,
-                    key="facebank_tracked_select",
-                )
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button(
-                        "✓ Load",
-                        key="facebank_load_tracked",
-                        use_container_width=True,
-                        type="primary",
-                    ):
-                        st.session_state["episode_selector_unlocked"] = False
-                        helpers.set_ep_id(selection)
-                with col2:
-                    if st.button(
-                        "✗ Cancel",
-                        key="cancel_episode_change",
-                        use_container_width=True,
-                    ):
-                        st.session_state["episode_selector_unlocked"] = False
-                        st.rerun()
-            else:
-                st.info("No tracked episodes yet.")
-
-        with s3_tab:
-            s3_payload = _safe_api_get("/episodes/s3_videos")
-            items = s3_payload.get("items", []) if s3_payload else []
-            if items:
-                labels = [f"{item['ep_id']} · {item.get('last_modified') or 'unknown'}" for item in items]
-                idx = st.selectbox(
-                    "S3 videos",
-                    list(range(len(items))),
-                    format_func=lambda i: labels[i],
-                    key="facebank_s3_select",
-                )
-                selected = items[idx]
-                if st.button("Track & Load", key="facebank_track_s3", use_container_width=True):
-                    st.session_state["episode_selector_unlocked"] = False
-                    _track_episode_from_s3(selected)
-            else:
-                st.info("No S3 videos exposed by the API.")
-
-        ep_id = helpers.get_ep_id()
-        if not ep_id:
-            st.warning("Choose an episode to continue.")
-            st.stop()
-
-        return ep_id
-
-
 def _track_episode_from_s3(item: Dict[str, Any]) -> None:
     ep_id = str(item.get("ep_id", "")).lower()
     ep_meta = helpers.parse_ep_id(ep_id) or {}
@@ -640,7 +587,7 @@ def _fetch_track_media(
     track_id: int,
     *,
     sample: int = 1,
-    limit: int = 2,
+    limit: int = TRACK_MEDIA_BATCH_LIMIT,
     cursor: str | None = None,
 ) -> tuple[List[Dict[str, Any]], str | None]:
     params: Dict[str, Any] = {"sample": int(sample), "limit": int(limit)}
@@ -688,13 +635,88 @@ def _fetch_track_frames(
     return {}
 
 
+def _render_track_media_section(ep_id: str, track_id: int, *, sample: int) -> None:
+    """Show cached crops with lazy pagination for the active track."""
+    state = _track_media_state(ep_id, track_id)
+    if state.get("sample") != sample:
+        _reset_track_media_state(ep_id, track_id)
+        state = _track_media_state(ep_id, track_id)
+    if not state.get("initialized"):
+        items, cursor = _fetch_track_media(
+            ep_id,
+            track_id,
+            sample=sample,
+            limit=TRACK_MEDIA_BATCH_LIMIT,
+        )
+        state.update({"items": items, "cursor": cursor, "initialized": True, "sample": sample})
+
+    items = state.get("items", [])
+    cursor = state.get("cursor")
+
+    st.markdown("#### Track crops preview")
+    header_cols = st.columns([3, 1])
+    loaded_label = (
+        f"{len(items)} crop{'s' if len(items) != 1 else ''} loaded · first batch size {TRACK_MEDIA_BATCH_LIMIT}"
+    )
+    header_cols[0].caption(loaded_label)
+    with header_cols[1]:
+        if st.button("Refresh track crops", key=f"track_media_refresh_{track_id}"):
+            _reset_track_media_state(ep_id, track_id)
+            st.rerun()
+
+    if items:
+        cols_per_row = min(len(items), 6) or 1
+        for row_start in range(0, len(items), cols_per_row):
+            row_items = items[row_start : row_start + cols_per_row]
+            row_cols = st.columns(len(row_items))
+            for idx, item in enumerate(row_items):
+                with row_cols[idx]:
+                    frame_idx = item.get("frame_idx")
+                    caption = f"Frame {frame_idx}" if frame_idx is not None else f"Track {track_id}"
+                    url = item.get("url")
+                    thumb_markup = helpers.thumb_html(url, alt=caption, hide_if_missing=False)
+                    if thumb_markup:
+                        st.markdown(thumb_markup, unsafe_allow_html=True)
+                    else:
+                        st.caption("Crop unavailable.")
+                    st.caption(caption)
+    else:
+        st.info("No crops available for this track.")
+
+    if cursor:
+        if st.button("Load more crops", key=f"track_media_more_{track_id}", use_container_width=True):
+            more_items, next_cursor = _fetch_track_media(
+                ep_id,
+                track_id,
+                sample=sample,
+                limit=TRACK_MEDIA_BATCH_LIMIT,
+                cursor=cursor,
+            )
+            if more_items:
+                state["items"].extend(more_items)
+            state["cursor"] = next_cursor
+            state["sample"] = sample
+            st.rerun()
+
+
 def _render_cast_carousel(
     ep_id: str,
     show_id: str,
 ) -> None:
     """Render featured cast members carousel at the top - ONLY shows cast with clusters in this episode."""
-    # Fetch cast members from Cast API
-    cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast")
+    if not show_id:
+        return
+    show_key = str(show_id).lower()
+    refresh_flag = f"cast_carousel_refresh::{show_key}"
+    cache = _cast_carousel_cache()
+    if st.session_state.pop(refresh_flag, False):
+        cache.pop(show_key, None)
+
+    cast_api_resp = cache.get(show_key)
+    if cast_api_resp is None:
+        cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast")
+        if cast_api_resp:
+            cache[show_key] = cast_api_resp
     if not cast_api_resp:
         return
 
@@ -721,8 +743,18 @@ def _render_cast_carousel(
     if not cast_with_clusters:
         return
 
-    st.markdown("### 🎬 Cast Lineup")
-    st.caption("Cast members with clusters in this episode")
+    header_cols = st.columns([3, 1])
+    with header_cols[0]:
+        st.markdown("### 🎬 Cast Lineup")
+        st.caption("Cast members with clusters in this episode")
+    with header_cols[1]:
+        if st.button(
+            "Refresh cast list",
+            key=f"refresh_cast_{show_key}",
+            use_container_width=True,
+        ):
+            st.session_state[refresh_flag] = True
+            st.rerun()
 
     # Create horizontal carousel (max 5 per row)
     cols_per_row = min(len(cast_with_clusters), 5)
@@ -2115,7 +2147,8 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     show_slug = _episode_show_slug(ep_id)
     roster_names = _fetch_roster_names(show_slug)
     sample_key = f"track_sample_{ep_id}_{track_id}"
-    if sample_key not in st.session_state:
+    sample_seeded = sample_key in st.session_state
+    if not sample_seeded:
         st.session_state[sample_key] = 1
     frame_controls = st.columns([1, 1, 2])
     with frame_controls[0]:
@@ -2132,8 +2165,12 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     page_key = f"track_page_{ep_id}_{track_id}"
     if page_key not in st.session_state:
         st.session_state[page_key] = 1
+    page_size_key = f"track_page_size_{ep_id}_{track_id}"
+    if page_size_key not in st.session_state:
+        st.session_state[page_size_key] = TRACK_PAGE_BASE_SIZE
     if sample != prev_sample:
         st.session_state[page_key] = 1
+        _reset_track_media_state(ep_id, track_id)
     current_page = int(st.session_state[page_key])
     with frame_controls[1]:
         page = int(
@@ -2146,7 +2183,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             )
         )
     page = int(st.session_state[page_key])
-    page_size = 50
+    page_size = int(st.session_state[page_size_key])
     frames_payload = _fetch_track_frames(ep_id, track_id, sample=sample, page=page, page_size=page_size)
     frames = frames_payload.get("items", [])
     best_frame_idx = frames_payload.get("best_frame_idx")
@@ -2155,6 +2192,24 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     total_frames_raw = frames_payload.get("total_frames")
     total_frames = int(total_frames_raw) if total_frames_raw is not None else total_sampled
     max_page = max(1, math.ceil(total_sampled / page_size)) if total_sampled else 1
+
+    candidate_frames = total_frames or total_sampled
+    recommended_sample = _suggest_track_sample(candidate_frames)
+    if not sample_seeded and sample == 1 and recommended_sample > 1:
+        st.session_state[sample_key] = recommended_sample
+        st.session_state[page_key] = 1
+        _reset_track_media_state(ep_id, track_id)
+        st.rerun()
+
+    recommended_page_size = _recommended_page_size(sample, total_sampled)
+    if page_size != recommended_page_size:
+        st.session_state[page_size_key] = recommended_page_size
+        st.session_state[page_key] = 1
+        st.rerun()
+
+    if page > max_page:
+        st.session_state[page_key] = max_page
+        st.rerun()
 
     # Reorder frames to show best-quality frame first (if present in current page)
     if best_frame_idx is not None and frames:
@@ -2179,10 +2234,14 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             st.session_state[page_key] = min(max_page, page + 1)
             st.rerun()
     shown = len(frames)
-    summary = f"Frames shown: {shown} / {total_sampled or 0} (page {page}/{max_page}) · Sample every {sample}"
+    summary = (
+        f"Frames shown: {shown} / {total_sampled or 0} (page {page}/{max_page}) · "
+        f"Sample every {sample} · up to {page_size} per page (auto)"
+    )
     if total_frames:
         summary += f" · Faces tracked: {total_frames}"
     nav_cols[2].caption(summary)
+    _render_track_media_section(ep_id, track_id, sample=sample)
     if current_identity:
         assign_container = st.container(border=True)
         with assign_container:
@@ -2403,7 +2462,11 @@ def _delete_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool
         st.rerun()
 
 
-ep_id = _select_episode()
+helpers.init_page("Faces & Tracks")
+ep_id = helpers.get_ep_id()
+if not ep_id:
+    st.warning("Select an episode from the sidebar to continue.")
+    st.stop()
 _initialize_state(ep_id)
 episode_detail = _episode_header(ep_id)
 if not episode_detail:
