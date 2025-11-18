@@ -3009,8 +3009,15 @@ def _run_full_pipeline(
                 # NoneType multiplication errors from malformed bboxes or margins.
                 # If a frame fails with NoneType multiply error, skip it and continue processing.
                 try:
+                    # DEBUG: Trace execution at frame start
+                    if frames_sampled < 5:
+                        LOGGER.info("[DEBUG] Frame %d START: entering detect/track/crop block", frame_idx)
+
                     try:
                         detections = detector_backend.detect(frame)
+                        # DEBUG: Show detection count
+                        if frames_sampled < 5:
+                            LOGGER.info("[DEBUG] Frame %d: detector returned %d detections", frame_idx, len(detections))
                     except Exception as exc:
                         LOGGER.error(
                             "Face detection failed at frame %d for %s: %s",
@@ -3021,6 +3028,10 @@ def _run_full_pipeline(
                         )
                         raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
                     face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+
+                    # DEBUG: Show face detection count
+                    if frames_sampled < 5:
+                        LOGGER.info("[DEBUG] Frame %d: filtered to %d face detections", frame_idx, len(face_detections))
 
                     # Validate detection bboxes before tracking to prevent NoneType multiply errors
                     validated_detections = []
@@ -3054,7 +3065,20 @@ def _run_full_pipeline(
                             len(face_detections),
                         )
 
+                    # DEBUG: Show validation results
+                    if frames_sampled < 5:
+                        LOGGER.info(
+                            "[DEBUG] Frame %d: after detection bbox validation: %d valid, %d invalid",
+                            frame_idx,
+                            len(validated_detections),
+                            invalid_bbox_count,
+                        )
+
                     raw_tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+
+                    # DEBUG: Show tracker output
+                    if frames_sampled < 5:
+                        LOGGER.info("[DEBUG] Frame %d: tracker returned %d raw tracked objects", frame_idx, len(raw_tracked_objects))
 
                     # Validate tracked object bboxes (ByteTrack may return invalid bboxes)
                     tracked_objects = []
@@ -3077,12 +3101,21 @@ def _run_full_pipeline(
                         tracked_objects.append(track_obj)
 
                     if invalid_track_count > 0:
-                        LOGGER.info(
+                        LOGGER.warning(
                             "Frame %d for %s: dropped %d/%d tracked objects due to invalid bboxes",
                             frame_idx,
                             args.ep_id,
                             invalid_track_count,
                             len(raw_tracked_objects),
+                        )
+
+                    # DEBUG: Log tracked object validation results
+                    if frames_sampled < 5:
+                        LOGGER.info(
+                            "[DEBUG] Frame %d: after tracked object bbox validation: %d valid, %d invalid",
+                            frame_idx,
+                            len(tracked_objects),
+                            invalid_track_count,
                         )
 
                     diag_stats = _diagnostic_stats(len(validated_detections), len(tracked_objects))
@@ -3147,6 +3180,10 @@ def _run_full_pipeline(
                         else:
                             should_embed_gate = True
                         if should_embed_gate and gate_embedder and tracked_objects:
+                            # DEBUG: Show gate embedding processing
+                            if frames_sampled < 5:
+                                LOGGER.info("[DEBUG] Frame %d: processing gate embeddings for %d tracks", frame_idx, len(tracked_objects))
+
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
                             for obj in tracked_objects:
@@ -3254,13 +3291,17 @@ def _run_full_pipeline(
                     if frame_exporter and (frame_exporter.save_frames or crop_records):
                         frame_exporter.export(frame_idx, frame, crop_records, ts=ts)
 
+                    # DEBUG: Frame processing completed successfully
+                    if frames_sampled < 5:
+                        LOGGER.info("[DEBUG] Frame %d END: completed all detect/track/crop processing successfully", frame_idx)
+
                     # === END per-frame detect/track/crop guard ===
                 except TypeError as e:
                     # Only catch NoneType multiplication errors from malformed bboxes/margins
                     msg = str(e)
                     if "NoneType" in msg and "*" in msg:
                         LOGGER.error(
-                            "Skipping frame %d for %s due to NoneType multiply error: %s",
+                            "[DEBUG] ❌ CAUGHT NoneType multiply error at frame %d for %s: %s",
                             frame_idx,
                             args.ep_id,
                             msg,

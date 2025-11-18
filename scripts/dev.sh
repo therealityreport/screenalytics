@@ -24,7 +24,10 @@ echo "[dev.sh] STORAGE_BACKEND=${STORAGE_BACKEND}  BUCKET=${AWS_S3_BUCKET:-local
 # Activate virtual environment
 source .venv/bin/activate
 
-python -m uvicorn apps.api.main:app --port 8000 & API_PID=$!
+# Start API server with output captured to log file
+API_LOG="${ROOT}/api_server.log"
+echo "[dev.sh] Starting API server (logs: ${API_LOG})"
+python -m uvicorn apps.api.main:app --port 8000 > "$API_LOG" 2>&1 & API_PID=$!
 trap 'kill $API_PID 2>/dev/null || true' EXIT
 
 HEALTH_URL="${API_BASE_URL%/}/healthz"
@@ -40,6 +43,8 @@ for _ in {1..50}; do
 done
 if [[ "$health_ok" != "true" ]]; then
   echo "[dev.sh] Warning: API health check did not succeed" >&2
+  echo "[dev.sh] Last 50 lines of API log:" >&2
+  tail -n 50 "$API_LOG" >&2
 fi
 
 streamlit run apps/workspace-ui/Upload_Video.py
