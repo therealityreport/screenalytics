@@ -19,6 +19,9 @@ import ui_helpers as helpers  # noqa: E402
 from py_screenalytics.artifacts import get_path  # noqa: E402
 
 SCREENTIME_JOB_KEY = "episode_detail_screentime_job"
+FRAME_JPEG_SIZE_EST_BYTES = 220_000
+CROP_JPEG_SIZE_EST_BYTES = 40_000
+AVG_FACES_PER_FRAME = 1.5
 
 
 def _load_job_defaults(ep_id: str, job_type: str) -> Dict[str, Any]:
@@ -51,6 +54,38 @@ def _choose_value(*candidates: Any, fallback: str) -> str:
             if cleaned:
                 return cleaned.lower()
     return fallback
+
+
+def _count_manifest_rows(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return None
+
+
+def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int | None:
+    if not meta:
+        return None
+    frames_val = meta.get("frames") if isinstance(meta, dict) else None
+    fps_detected = meta.get("fps_detected") if isinstance(meta, dict) else None
+    duration_sec = meta.get("duration_sec") if isinstance(meta, dict) else None
+    frames = None
+    try:
+        if frames_val is not None:
+            frames = float(frames_val)
+        elif duration_sec and (fps_detected or fps_detected == 0):
+            frames = float(duration_sec) * float(fps_detected or 0)
+        elif duration_sec:
+            frames = float(duration_sec) * 24.0
+    except (TypeError, ValueError):
+        frames = None
+    if not frames or frames <= 0:
+        return None
+    stride_val = max(int(stride or 1), 1)
+    return max(int(frames // stride_val), 0)
 
 cfg = helpers.init_page("Episode Detail")
 st.title("Episode Detail")
@@ -221,6 +256,35 @@ def _ensure_local_artifacts(ep_id: str, details: Dict[str, Any]) -> bool:
         return True
 
 
+def _launch_detect_job(
+    local_exists: bool,
+    ep_id: str,
+    details: Dict[str, Any],
+    job_payload: Dict[str, Any],
+    device_value: str,
+    detector_value: str,
+    tracker_value: str,
+    mode_label: str,
+    device_label: str,
+):
+    current_local = local_exists
+    if not current_local:
+        if not _ensure_local_artifacts(ep_id, details):
+            return current_local, None, "mirror_failed"
+        current_local = True
+    with st.spinner(f"Running detect/track ({mode_label} on {device_label})…"):
+        summary, error_message = helpers.run_job_with_progress(
+            ep_id,
+            "/jobs/detect_track",
+            job_payload,
+            requested_device=device_value,
+            async_endpoint="/jobs/detect_track_async",
+            requested_detector=detector_value,
+            requested_tracker=tracker_value,
+        )
+    return current_local, summary, error_message
+
+
 ep_id = helpers.get_ep_id()
 if not ep_id:
     _prompt_for_episode()
@@ -262,6 +326,18 @@ detect_job_defaults = _load_job_defaults(ep_id, "detect_track")
 faces_job_defaults = _load_job_defaults(ep_id, "faces_embed")
 cluster_job_defaults = _load_job_defaults(ep_id, "cluster")
 local_video_exists = bool(details["local"].get("exists"))
+video_meta_key = f"episode_detail_video_meta::{ep_id}"
+video_meta = st.session_state.get(video_meta_key)
+if local_video_exists:
+    if video_meta is None:
+        try:
+            video_meta = helpers.api_get(f"/episodes/{ep_id}/video_meta")
+        except requests.RequestException:
+            video_meta = None
+        else:
+            st.session_state[video_meta_key] = video_meta
+else:
+    st.session_state.pop(video_meta_key, None)
 
 
 def _check_detect_track_manifests() -> bool:
@@ -324,6 +400,11 @@ tracks_ready = tracks_ready_status or manifests_present
 faces_ready_state = faces_status_value == "success"
 faces_count_value = helpers.coerce_int(faces_phase_status.get("faces"))
 identities_count_value = helpers.coerce_int(cluster_phase_status.get("identities"))
+faces_manifest_count = _count_manifest_rows(faces_path)
+if not faces_ready_state and faces_manifest_count is not None:
+    faces_ready_state = True
+    if faces_count_value is None:
+        faces_count_value = faces_manifest_count
 
 # Add pipeline state indicators
 if status_payload:
@@ -408,19 +489,27 @@ if status_payload:
 
     st.divider()
 
+detector_override = st.session_state.pop("episode_detail_detector_override", None)
+tracker_override = st.session_state.pop("episode_detail_tracker_override", None)
+device_override = st.session_state.pop("episode_detail_device_override", None)
+autorun_detect = st.session_state.pop("episode_detail_detect_autorun_flag", False)
+
 detect_detector_value = _choose_value(
+    detector_override,
     detect_job_defaults.get("detector"),
     detect_phase_status.get("detector"),
     helpers.tracks_detector_value(ep_id),
     fallback=helpers.DEFAULT_DETECTOR,
 )
 detect_tracker_value = _choose_value(
+    tracker_override,
     detect_job_defaults.get("tracker"),
     detect_phase_status.get("tracker"),
     helpers.tracks_tracker_value(ep_id),
     fallback=helpers.DEFAULT_TRACKER,
 )
 detect_device_default_value = _choose_value(
+    device_override,
     detect_job_defaults.get("device"),
     detect_job_defaults.get("requested_device"),
     detect_phase_status.get("device"),
@@ -490,6 +579,7 @@ with col_detect:
 
     stride_default = int(detect_job_defaults.get("stride") or helpers.DEFAULT_STRIDE)
     fps_default = float(detect_job_defaults.get("fps") or 0.0)
+    det_thresh_default = float(detect_job_defaults.get("det_thresh") or helpers.DEFAULT_DET_THRESH)
     save_frames_default = detect_job_defaults.get("save_frames")
     if save_frames_default is None:
         save_frames_default = True
@@ -504,14 +594,14 @@ with col_detect:
     if "scene_detector_choice" not in st.session_state and detect_job_defaults.get("scene_detector"):
         st.session_state["scene_detector_choice"] = detect_job_defaults["scene_detector"]
 
-    # Show current detector/tracker configuration prominently
+    stride_hint = "every frame" if stride_default == 1 else f"every {stride_default}th frame"
     st.info(
-        f"**Configuration**: This will run **full face detection + tracking** on every frame.\n\n"
+        f"**Configuration**: This will run **full face detection + tracking** on sampled frames.\n\n"
         f"- **Face Detector**: {detect_detector_label}\n"
         f"- **Tracker**: {detect_tracker_label}\n"
-        f"- **Stride**: {stride_default} (every frame for 24fps episodes)\n"
+        f"- **Stride**: {stride_default} ({stride_hint})\n"
         f"- **Device**: {detect_device_label_default}\n\n"
-        f"This will generate `detections.jsonl` and `tracks.jsonl` for the episode."
+        f"This job exports `detections.jsonl` and `tracks.jsonl` plus optional frames/crops."
     )
 
     stride_value = st.number_input("Stride", min_value=1, max_value=50, value=stride_default, step=1)
@@ -519,7 +609,70 @@ with col_detect:
     save_frames = st.checkbox("Save frames to S3", value=bool(save_frames_default))
     save_crops = st.checkbox("Save face crops to S3", value=bool(save_crops_default))
     jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=jpeg_quality_default, step=5)
-    max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=max_gap_default, step=1)
+
+    session_prefix = f"episode_detail_detect::{ep_id}"
+    max_gap_key = f"{session_prefix}::max_gap"
+    max_gap_seed = int(st.session_state.get(max_gap_key, max_gap_default))
+    max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=max_gap_seed, step=1)
+    st.session_state[max_gap_key] = int(max_gap_value)
+
+    det_thresh_key = f"{session_prefix}::det_thresh"
+    det_thresh_seed = float(st.session_state.get(det_thresh_key, det_thresh_default))
+    det_thresh_value = st.slider(
+        "Detection threshold",
+        min_value=0.1,
+        max_value=0.9,
+        value=float(det_thresh_seed),
+        step=0.01,
+        help="Lower thresholds increase recall but may introduce more false positives.",
+    )
+    st.session_state[det_thresh_key] = float(det_thresh_value)
+
+    with st.expander("Advanced detect/track", expanded=False):
+        scene_detector_label = st.selectbox(
+            "Scene detector",
+            helpers.SCENE_DETECTOR_LABELS,
+            index=helpers.scene_detector_label_index(st.session_state.get("scene_detector_choice")),
+            help="PySceneDetect uses content detection for accurate hard cuts; switch to HSV fallback or disable if unavailable.",
+            key="scene_detector_select",
+        )
+        scene_detector_value = helpers.scene_detector_value_from_label(scene_detector_label)
+        st.session_state["scene_detector_choice"] = scene_detector_value
+
+        scene_thresh_key = f"{session_prefix}::scene_threshold"
+        scene_thresh_seed = float(st.session_state.get(scene_thresh_key, scene_threshold_default))
+        scene_threshold_value = st.number_input(
+            "Scene cut threshold",
+            min_value=0.0,
+            value=scene_thresh_seed,
+            step=0.05,
+            help="PySceneDetect defaults to 27.0 (ContentDetector threshold). HSV fallback expects 0-2 deltas.",
+        )
+        st.session_state[scene_thresh_key] = float(scene_threshold_value)
+
+        scene_min_key = f"{session_prefix}::scene_min_len"
+        scene_min_seed = int(st.session_state.get(scene_min_key, scene_min_len_default))
+        scene_min_len_value = st.number_input(
+            "Minimum frames between cuts",
+            min_value=1,
+            max_value=600,
+            value=scene_min_seed,
+            step=1,
+        )
+        st.session_state[scene_min_key] = int(scene_min_len_value)
+
+        scene_warmup_key = f"{session_prefix}::scene_warmup"
+        scene_warmup_seed = int(st.session_state.get(scene_warmup_key, scene_warmup_default))
+        scene_warmup_value = st.number_input(
+            "Warmup detections after cut",
+            min_value=0,
+            max_value=25,
+            value=scene_warmup_seed,
+            step=1,
+            help="Force full detection on the first N frames after each cut",
+        )
+        st.session_state[scene_warmup_key] = int(scene_warmup_value)
+
     detect_device_choice = st.selectbox(
         "Device",
         helpers.DEVICE_LABELS,
@@ -527,133 +680,135 @@ with col_detect:
         key="detect_device_choice",
     )
     detect_device_value = helpers.DEVICE_VALUE_MAP[detect_device_choice]
-    with st.expander("Advanced detect/track", expanded=False):
-        scene_detector_label = st.selectbox(
-            "Scene detector",
-            helpers.SCENE_DETECTOR_LABELS,
-            index=helpers.scene_detector_label_index(st.session_state.get("scene_detector_choice")),
-            help="PySceneDetect uses content detection for accurate hard cuts; switch to the internal HSV histogram fallback or disable if PySceneDetect is unavailable.",
-            key="scene_detector_select",
+    detect_device_label = helpers.device_label_from_value(detect_device_value)
+
+    sampled_frames_est = _estimated_sampled_frames(video_meta, stride_value)
+    if save_frames and sampled_frames_est:
+        quality_factor = max(min(jpeg_quality / 85.0, 2.0), 0.5)
+        est_frame_bytes = int(sampled_frames_est * FRAME_JPEG_SIZE_EST_BYTES * quality_factor)
+        st.caption(
+            f"Frames: ≈{helpers.human_size(est_frame_bytes)} for {sampled_frames_est:,} sampled frames (estimate)."
         )
-        scene_detector_value = helpers.scene_detector_value_from_label(scene_detector_label)
-        st.session_state["scene_detector_choice"] = scene_detector_value
-        scene_threshold_value = st.number_input(
-            "Scene cut threshold",
-            min_value=0.0,
-            value=scene_threshold_default,
-            step=0.05,
-            help="PySceneDetect defaults to 27.0 (ContentDetector threshold). The histogram fallback still expects 0-2 deltas.",
-        )
-        scene_min_len_value = st.number_input(
-            "Minimum frames between cuts",
-            min_value=1,
-            max_value=600,
-            value=scene_min_len_default,
-            step=1,
-        )
-        scene_warmup_value = st.number_input(
-            "Warmup detections after cut",
-            min_value=0,
-            max_value=25,
-            value=scene_warmup_default,
-            step=1,
-            help="Force full detection on the first N frames after each cut",
-        )
-    run_disabled = False
-    if not local_video_exists:
-        st.warning("Mirror the episode locally before running detect/track.")
-        run_disabled = True
-    run_label = "Run detect/track"
-    if st.button(run_label, use_container_width=True, disabled=run_disabled):
-        job_payload = helpers.default_detect_track_payload(
-            ep_id,
-            stride=int(stride_value),
-            det_thresh=helpers.DEFAULT_DET_THRESH,
-            device=detect_device_value,
-        )
-        job_payload.update(
-            {
-                "save_frames": bool(save_frames),
-                "save_crops": bool(save_crops),
-                "jpeg_quality": int(jpeg_quality),
-                "max_gap": int(max_gap_value),
-                "scene_detector": scene_detector_value,
-                "scene_threshold": float(scene_threshold_value),
-                "scene_min_len": int(scene_min_len_value),
-                "scene_warmup_dets": int(scene_warmup_value),
-            }
-        )
-        job_payload["detector"] = detect_detector_value
-        job_payload["tracker"] = detect_tracker_value
-        if fps_value > 0:
-            job_payload["fps"] = fps_value
-        mode_label = f"{detect_detector_label} + {detect_tracker_label}"
-        device_label = helpers.device_label_from_value(detect_device_value)
-        with st.spinner(f"Running detect/track ({mode_label} on {device_label})…"):
-            summary, error_message = helpers.run_job_with_progress(
-                ep_id,
-                "/jobs/detect_track",
-                job_payload,
-                requested_device=detect_device_value,
-                async_endpoint="/jobs/detect_track_async",
-                requested_detector=detect_detector_value,
-                requested_tracker=detect_tracker_value,
+    if save_crops:
+        estimated_faces = helpers.coerce_int(detect_phase_status.get("detections"))
+        if estimated_faces is None and sampled_frames_est:
+            estimated_faces = int(sampled_frames_est * AVG_FACES_PER_FRAME)
+        if estimated_faces:
+            est_crop_bytes = int(estimated_faces * CROP_JPEG_SIZE_EST_BYTES)
+            st.caption(
+                f"Crops: ≈{helpers.human_size(est_crop_bytes)} for approximately {estimated_faces:,} faces."
             )
+
+    job_payload = helpers.default_detect_track_payload(
+        ep_id,
+        stride=int(stride_value),
+        det_thresh=float(det_thresh_value),
+        device=detect_device_value,
+    )
+    job_payload.update(
+        {
+            "save_frames": bool(save_frames),
+            "save_crops": bool(save_crops),
+            "jpeg_quality": int(jpeg_quality),
+            "max_gap": int(max_gap_value),
+            "scene_detector": scene_detector_value,
+            "scene_threshold": float(scene_threshold_value),
+            "scene_min_len": int(scene_min_len_value),
+            "scene_warmup_dets": int(scene_warmup_value),
+        }
+    )
+    job_payload["detector"] = detect_detector_value
+    job_payload["tracker"] = detect_tracker_value
+    if fps_value > 0:
+        job_payload["fps"] = fps_value
+    mode_label = f"{detect_detector_label} + {detect_tracker_label}"
+
+    def _process_detect_result(summary: Dict[str, Any] | None, error_message: str | None) -> None:
         if error_message:
+            if error_message == "mirror_failed":
+                return
             if "RetinaFace weights missing or could not initialize" in error_message:
                 st.error(error_message)
                 st.caption("Run `python scripts/fetch_models.py` then retry.")
             else:
                 st.error(error_message)
-        else:
-            normalized = helpers.normalize_summary(ep_id, summary)
-            detections = helpers.coerce_int(normalized.get("detections"))
-            tracks = helpers.coerce_int(normalized.get("tracks"))
-            frames_exported = helpers.coerce_int(normalized.get("frames_exported"))
-            crops_exported = helpers.coerce_int(normalized.get("crops_exported"))
-            detector_summary = normalized.get("detector")
-            tracker_summary = normalized.get("tracker")
-            detector_is_scene = (
-                isinstance(detector_summary, str) and detector_summary in helpers.SCENE_DETECTOR_LABEL_MAP
+            return
+        if not summary:
+            return
+        normalized = helpers.normalize_summary(ep_id, summary)
+        detections = helpers.coerce_int(normalized.get("detections"))
+        tracks = helpers.coerce_int(normalized.get("tracks"))
+        frames_exported = helpers.coerce_int(normalized.get("frames_exported"))
+        crops_exported = helpers.coerce_int(normalized.get("crops_exported"))
+        detector_summary = normalized.get("detector")
+        tracker_summary = normalized.get("tracker")
+        detector_is_scene = isinstance(detector_summary, str) and detector_summary in helpers.SCENE_DETECTOR_LABEL_MAP
+        has_detections = detections is not None and detections > 0
+        has_tracks = tracks is not None and tracks > 0
+        issue_messages: list[str] = []
+        if detector_is_scene:
+            detector_label = helpers.SCENE_DETECTOR_LABEL_MAP.get(detector_summary, detector_summary)
+            issue_messages.append(
+                f"Pipeline stopped after scene detection ({detector_label}); detect/track never ran."
             )
-            has_detections = detections is not None and detections > 0
-            has_tracks = tracks is not None and tracks > 0
-            issue_messages: list[str] = []
-            if detector_is_scene:
-                detector_label = helpers.SCENE_DETECTOR_LABEL_MAP.get(detector_summary, detector_summary)
-                issue_messages.append(
-                    f"Pipeline stopped after scene detection ({detector_label}); detect/track never ran."
-                )
-            if not has_detections or not has_tracks:
-                det_label = helpers.format_count(detections) or "0"
-                track_label = helpers.format_count(tracks) or "0"
-                issue_messages.append(
-                    f"No detections/tracks were created (detections={det_label}, tracks={track_label})."
-                )
-            if issue_messages:
-                st.error(
-                    " ".join(issue_messages) + " Please rerun **Detect/Track Faces** to generate the manifests."
-                )
-            else:
-                details_line = [
-                    f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
-                    f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
-                ]
-                if frames_exported:
-                    details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
-                if crops_exported:
-                    details_line.append(f"crops exported: {helpers.format_count(crops_exported)}")
-                if detector_summary:
-                    details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
-                if tracker_summary:
-                    details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
-                st.session_state["episode_detail_flash"] = "Detect/track complete · " + " · ".join(details_line)
-                st.rerun()
+        if not has_detections or not has_tracks:
+            det_label = helpers.format_count(detections) or "0"
+            track_label = helpers.format_count(tracks) or "0"
+            issue_messages.append(
+                f"No detections/tracks were created (detections={det_label}, tracks={track_label})."
+            )
+        if issue_messages:
+            st.error(" ".join(issue_messages) + " Please rerun **Detect/Track Faces** to generate the manifests.")
+            return
+        details_line = [
+            f"detections: {helpers.format_count(detections)}" if detections is not None else "detections: ?",
+            f"tracks: {helpers.format_count(tracks)}" if tracks is not None else "tracks: ?",
+        ]
+        if frames_exported:
+            details_line.append(f"frames exported: {helpers.format_count(frames_exported)}")
+        if crops_exported:
+            details_line.append(f"crops exported: {helpers.format_count(crops_exported)}")
+        if detector_summary:
+            details_line.append(f"detector: {helpers.detector_label_from_value(detector_summary)}")
+        if tracker_summary:
+            details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
+        st.session_state["episode_detail_flash"] = "Detect/track complete · " + " · ".join(details_line)
+        st.rerun()
 
-# tracks_ready is already computed above with manifest fallback (line ~321)
+    if autorun_detect:
+        local_video_exists, summary, error_message = _launch_detect_job(
+            local_video_exists,
+            ep_id,
+            details,
+            job_payload,
+            detect_device_value,
+            detect_detector_value,
+            detect_tracker_value,
+            mode_label,
+            detect_device_label,
+        )
+        _process_detect_result(summary, error_message)
+
+    if not local_video_exists:
+        st.info("Local mirror missing; Detect/Track will mirror automatically before starting.")
+
+    run_label = "Run detect/track"
+    if st.button(run_label, use_container_width=True):
+        local_video_exists, summary, error_message = _launch_detect_job(
+            local_video_exists,
+            ep_id,
+            details,
+            job_payload,
+            detect_device_value,
+            detect_detector_value,
+            detect_tracker_value,
+            mode_label,
+            detect_device_label,
+        )
+        _process_detect_result(summary, error_message)
+
 faces_ready = faces_ready_state
 detector_face_only = helpers.detector_is_face_only(ep_id)
-
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
     st.markdown("### Faces Harvest")
@@ -665,7 +820,10 @@ with col_faces:
         detector_name = detect_track_info.get("detector")
         tracker_name = detect_track_info.get("tracker")
         if detector_name and tracker_name:
-            st.caption(f"📊 Current pipeline: {detector_name} + {tracker_name}")
+            st.caption(
+                f"📊 Current pipeline: {helpers.detector_label_from_value(detector_name)} + "
+                f"{helpers.tracker_label_from_value(tracker_name)}"
+            )
 
     faces_device_choice = st.selectbox(
         "Device",
@@ -717,7 +875,21 @@ with col_faces:
                 "not full face detection + tracking. Please run **Detect/Track Faces** again to generate tracks."
             )
     elif not detector_face_only:
-        st.warning("Current tracks were generated with a legacy detector. Rerun detect/track with RetinaFace or YOLOv8-face.")
+        st.warning(
+            "Current tracks were generated with a legacy or unknown detector. Rerun Detect/Track Faces "
+            "with RetinaFace + ByteTrack before harvesting."
+        )
+        if st.button(
+            "Rerun Detect/Track (RetinaFace + ByteTrack)",
+            key="faces_rerun_detect",
+            use_container_width=True,
+        ):
+            st.session_state["episode_detail_detector_override"] = helpers.DEFAULT_DETECTOR
+            st.session_state["episode_detail_tracker_override"] = helpers.DEFAULT_TRACKER
+            st.session_state["episode_detail_device_override"] = helpers.DEFAULT_DEVICE
+            st.session_state["episode_detail_detect_autorun_flag"] = True
+            st.session_state["episode_detail_flash"] = "Starting Detect/Track with RetinaFace + ByteTrack…"
+            st.rerun()
 
     faces_disabled = (not tracks_ready) or (not detector_face_only)
     if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):

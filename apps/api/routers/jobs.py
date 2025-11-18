@@ -321,6 +321,8 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         command.append("--save-crops")
     if req.jpeg_quality and req.jpeg_quality != 85:
         command += ["--jpeg-quality", str(req.jpeg_quality)]
+    if req.thumb_size and req.thumb_size != 256:
+        command += ["--thumb-size", str(req.thumb_size)]
     return command
 
 
@@ -732,6 +734,8 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
 @router.post("/faces_embed_async")
 async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) -> dict:
     await _reject_legacy_payload(request)
+    # Ensure the local mirror exists so asynchronous jobs don't fail later
+    _validate_episode_ready(req.ep_id)
     try:
         job = JOB_SERVICE.start_faces_embed_job(
             ep_id=req.ep_id,

@@ -715,7 +715,9 @@ def detector_is_face_only(ep_id: str) -> bool:
     detector = tracks_detector_value(ep_id)
     if detector is None:
         path = _manifest_path(ep_id, "tracks.jsonl")
-        return not path.exists()
+        if not path.exists():
+            return False
+        return True
     return detector.lower() in FACE_ONLY_DETECTORS
 
 
@@ -1037,6 +1039,8 @@ def fallback_poll_progress(
             return None, describe_error(f"{_api_base()}{async_endpoint}", exc)
 
     progress_url = f"{_api_base()}/episodes/{ep_id}/progress"
+    phase_hint = _phase_from_endpoint(async_endpoint) or "detect_track"
+    last_progress: Dict[str, Any] | None = None
     while True:
         try:
             resp = requests.get(progress_url, timeout=5)
@@ -1053,11 +1057,21 @@ def fallback_poll_progress(
             time.sleep(0.5)
             continue
         update_cb(progress)
+        last_progress = progress
         phase = str(progress.get("phase", "")).lower()
         if phase == "error":
             return None, progress.get("error") or "Job failed"
-        if _is_phase_done(progress) and isinstance(progress.get("summary"), dict):
-            return progress["summary"], None
+        if _is_phase_done(progress):
+            summary_block = progress.get("summary")
+            if isinstance(summary_block, dict):
+                return summary_block, None
+            status_placeholder.info("Async job finished without summary; using latest status metrics …")
+            status_summary = _summary_from_status(ep_id, phase_hint)
+            if status_summary:
+                return status_summary, None
+            if last_progress:
+                return last_progress, None
+            return progress, None
         time.sleep(0.5)
 
 
