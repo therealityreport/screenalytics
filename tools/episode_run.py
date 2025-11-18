@@ -3300,11 +3300,17 @@ def _run_full_pipeline(
                     # Only catch NoneType multiplication errors from malformed bboxes/margins
                     msg = str(e)
                     if "NoneType" in msg and "*" in msg:
+                        # Log with full traceback to identify exact location
+                        import traceback
+                        tb_str = traceback.format_exc()
+
                         LOGGER.error(
-                            "[DEBUG] ❌ CAUGHT NoneType multiply error at frame %d for %s: %s",
+                            "[DEBUG] ❌ CAUGHT NoneType multiply error at frame %d for %s: %s\n"
+                            "[DEBUG] Full traceback:\n%s",
                             frame_idx,
                             args.ep_id,
                             msg,
+                            tb_str,
                         )
                         # Track crop errors for diagnostics
                         if last_diag_stats:
