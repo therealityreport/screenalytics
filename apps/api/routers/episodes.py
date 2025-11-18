@@ -1204,10 +1204,6 @@ class FrameDeleteRequest(BaseModel):
 
 
 
-class DeleteEpisodeIn(BaseModel):
-    include_s3: bool = False
-
-
 class DeleteAllIn(BaseModel):
     confirm: str
     include_s3: bool = False
@@ -1549,8 +1545,6 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
 
     # Compute pipeline state indicators
-    faces_path = manifests_dir / "faces.jsonl"
-
     # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
     scenes_ready = tracks_manifest_ready or (
         detect_track_status.detections is not None and detect_track_status.detections > 0
