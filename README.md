@@ -21,15 +21,15 @@ Screenalytics ingests an episode, detects and tracks faces, recognizes cast memb
 ## Architecture
 
 **Core stack**
-- **Detection**: RetinaFace (InsightFace) with MediaPipe fallback  
-- **Tracking**: ByteTrack  
-- **Recognition**: ArcFace ONNX (AuraFace optional)  
-- **Audio**: Pyannote diarization + Faster-Whisper ASR  
-- **Storage**: S3-compatible (R2 / S3 / GCS)  
-- **Database**: Postgres + **pgvector**  
-- **Jobs**: Redis queue, idempotent workers  
-- **UI**: Next.js workspace (SHOWS, PEOPLE, Episode Workspace)  
-- **Agents**: Codex/Agents SDK + MCP servers (`screenalytics`, `storage`, `postgres`)  
+- **Detection**: RetinaFace (InsightFace) with MediaPipe fallback
+- **Tracking**: ByteTrack
+- **Recognition**: ArcFace ONNX (AuraFace optional)
+- **Audio**: Pyannote diarization + Faster-Whisper ASR
+- **Storage**: S3-compatible (R2 / S3 / GCS)
+- **Database**: Postgres + **pgvector**
+- **Jobs**: Redis queue, idempotent workers
+- **UI**: Next.js workspace (SHOWS, PEOPLE, Episode Workspace)
+- **Agents**: Codex/Agents SDK + MCP servers (`screenalytics`, `storage`, `postgres`)
 - **Automation**: Zapier/n8n webhooks for notifications and exports
 
 **Data flow**

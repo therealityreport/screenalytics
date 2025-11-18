@@ -8,7 +8,6 @@ Related: nov-17-detect-track-none-bbox-fix.md
 """
 
 import numpy as np
-import pytest
 
 
 def test_valid_face_box_with_none_coords():

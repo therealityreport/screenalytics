@@ -57,14 +57,13 @@ def test_display_crop_fallback_on_invalid_bbox():
     assert (
         crop.shape == image.shape
     ), f"Should fall back to full frame, got {crop.shape} vs {image.shape}"
-    print(f"✓ Display crop falls back to full frame for invalid bbox")
+    print("✓ Display crop falls back to full frame for invalid bbox")
 
 
 def test_simulated_detector_bbox_preserved():
     """Test that simulated detector bbox is not overwritten with [0,0,1,1]."""
     # This test verifies that the code no longer has the override block
     # that was discarding the simulated detector's bbox
-    from pathlib import Path
 
     facebank_path = PROJECT_ROOT / "apps" / "api" / "routers" / "facebank.py"
     content = facebank_path.read_text()

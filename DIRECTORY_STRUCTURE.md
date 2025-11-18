@@ -1,7 +1,7 @@
 # DIRECTORY_STRUCTURE.md — Screenalytics
 
-Version: 1.1 (Enhanced)  
-Status: Planning  
+Version: 1.1 (Enhanced)
+Status: Planning
 
 ---
 
@@ -60,27 +60,27 @@ FEATURES/<feature>/
 └─ TODO.md
 
 ````
-- Time-to-live: 30 days  
-- Imports from `FEATURES/**` forbidden in production code  
+- Time-to-live: 30 days
+- Imports from `FEATURES/**` forbidden in production code
 - Promotion requires CI approval, docs, and tests
 
 ---
 
 ## 4. Promotion Workflow
-1. Implement under `FEATURES/<feature>/`.  
-2. Add docs and configs in that folder.  
-3. Pass CI and promotion checklist.  
-4. Run `tools/promote-feature.py`.  
-5. Agents update global docs (README, PRD, Solution Architecture, Directory Structure).  
+1. Implement under `FEATURES/<feature>/`.
+2. Add docs and configs in that folder.
+3. Pass CI and promotion checklist.
+4. Run `tools/promote-feature.py`.
+5. Agents update global docs (README, PRD, Solution Architecture, Directory Structure).
 6. Update `ACCEPTANCE_MATRIX.md` to ✅ for the feature, either via the promotion trigger or manually before merge.
 
 ---
 
 ## 5. CI Enforcement
 - `.github/workflows/feature-promote.yml` checks:
-  - `TODO.md` status → PROMOTED  
-  - `docs/**` updated  
-  - tests present  
+  - `TODO.md` status → PROMOTED
+  - `docs/**` updated
+  - tests present
   - imports validated
 - `.github/workflows/doc-policy.yml` also runs `tools/check-acceptance-matrix.py` to block promotion if a production feature lacks a ✅ entry.
 
@@ -98,7 +98,7 @@ FEATURES/<feature>/
 ---
 
 ## 7. Agent Update Hooks
-- Any file creation, deletion, or rename triggers **Codex** and **Claude** agents.  
+- Any file creation, deletion, or rename triggers **Codex** and **Claude** agents.
 - Agents automatically patch:
   - `SOLUTION_ARCHITECTURE.md`
   - `DIRECTORY_STRUCTURE.md`
@@ -111,8 +111,8 @@ Hook defined in `/agents/playbooks/update-docs-on-change.yaml`.
 
 # Message to CODEX (configuration directive)
 
-> **To:** Codex system agent  
-> **Subject:** Repo-wide doc synchronization rule  
+> **To:** Codex system agent
+> **Subject:** Repo-wide doc synchronization rule
 > **Action:** Update configuration to maintain documentation parity.
 
 ---
@@ -162,5 +162,5 @@ Codex, please configure the repository automation as follows:
 
 **Outcome**
 
-Every structural change instantly refreshes the project’s high-level documentation.  
+Every structural change instantly refreshes the project’s high-level documentation.
 Codex and Claude stay aware of evolving architecture, keeping README, PRD, SolutionArchitecture, and DirectoryStructure perpetually in sync.

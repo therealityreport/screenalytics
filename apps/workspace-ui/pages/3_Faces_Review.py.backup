@@ -758,20 +758,20 @@ def _bulk_assign_clusters(
     try:
         from apps.api.services.people import PeopleService
         people_service = PeopleService()
-        
+
         # Find or create a person record for this cast_id
         target_person = people_service.find_person_by_cast_id(show_id, target_cast_id)
-        
+
         if not target_person:
             # Fetch cast member details to get the name
             cast_resp = helpers.api_get(f"/shows/{show_id}/cast")
             cast_members = cast_resp.get("cast", []) if cast_resp else []
             cast_member = next((cm for cm in cast_members if cm.get("cast_id") == target_cast_id), None)
-            
+
             if not cast_member:
                 st.error(f"Cast member {target_cast_id} not found")
                 return False
-            
+
             # Create a new person record linked to this cast member
             target_person = people_service.create_person(
                 show_id,
@@ -779,7 +779,7 @@ def _bulk_assign_clusters(
                 cast_id=target_cast_id,
                 aliases=cast_member.get("aliases", []),
             )
-        
+
         # Merge source person into target person
         payload = {
             "source_person_id": source_person_id,
@@ -842,54 +842,54 @@ def _render_cast_carousel(
     cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast")
     if not cast_api_resp:
         return
-    
+
     cast_members = cast_api_resp.get("cast", [])
     if not cast_members:
         return
-    
+
     # Get people data to check who has clusters
     people_resp = _safe_api_get(f"/shows/{show_id}/people")
     people = people_resp.get("people", []) if people_resp else []
     people_by_cast_id = {p.get("cast_id"): p for p in people if p.get("cast_id")}
-    
+
     st.markdown("### 🎬 Cast Lineup")
     st.caption(f"Featured cast members for {show_id}")
-    
+
     # Create horizontal carousel (max 5 per row)
     cols_per_row = min(len(cast_members), 5)
-    
+
     for row_start in range(0, len(cast_members), cols_per_row):
         row_members = cast_members[row_start : row_start + cols_per_row]
         cols = st.columns(cols_per_row)
-        
+
         for idx, cast in enumerate(row_members):
             with cols[idx]:
                 cast_id = cast.get("cast_id")
                 name = cast.get("name", "(unnamed)")
-                
+
                 # Get facebank featured image
                 facebank_resp = _safe_api_get(f"/cast/{cast_id}/facebank?show_id={show_id}")
                 featured_url = None
                 if facebank_resp and facebank_resp.get("featured_seed"):
                     featured_seed = facebank_resp["featured_seed"]
                     featured_url = featured_seed.get("display_url")
-                
+
                 # Display featured image
                 if featured_url:
                     thumb_markup = helpers.thumb_html(featured_url, alt=name, hide_if_missing=False)
                     st.markdown(thumb_markup, unsafe_allow_html=True)
                 else:
                     st.markdown("_No featured image_")
-                
+
                 # Name
                 st.markdown(f"**{name}**")
-                
+
                 # Check if they have clusters in this episode
                 person = people_by_cast_id.get(cast_id)
                 if person:
                     episode_clusters = _episode_cluster_ids(person, ep_id)
                     cluster_count = len(episode_clusters)
-                    
+
                     if cluster_count > 0:
                         st.caption(f"✓ {cluster_count} cluster{'s' if cluster_count != 1 else ''}")
                         # View detections button
@@ -901,7 +901,7 @@ def _render_cast_carousel(
                         st.caption("No clusters yet")
                 else:
                     st.caption("No clusters yet")
-    
+
     st.markdown("---")
 
 

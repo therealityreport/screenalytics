@@ -11,7 +11,6 @@ Related: nov-17-detect-track-none-bbox-fix.md (CoreML detection fix)
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 def test_onnx_providers_auto_selects_cuda_when_available():

@@ -1,15 +1,10 @@
 """Test that cluster track representatives return all tracks."""
 
-import json
-from pathlib import Path
-import pytest
 
 
 def test_cluster_track_reps_returns_all_tracks(tmp_path):
     """Given a cluster with 13 tracks, track_reps returns 13 items with crop_key and similarity."""
     from apps.api.services.track_reps import (
-        write_track_reps,
-        write_cluster_centroids,
         build_cluster_track_reps,
     )
 

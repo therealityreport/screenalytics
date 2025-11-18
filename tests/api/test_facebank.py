@@ -1,6 +1,5 @@
 """Test facebank seed management endpoints."""
 
-import json
 import os
 import sys
 import types

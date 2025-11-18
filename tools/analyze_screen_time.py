@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
 
         emit_progress(
             "done",
-            f"Screen time analysis complete",
+            "Screen time analysis complete",
             json_path=str(json_path),
             csv_path=str(csv_path),
             cast_count=len(metrics_data.get("metrics", [])),

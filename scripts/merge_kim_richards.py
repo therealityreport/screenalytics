@@ -71,12 +71,12 @@ def main():
                 f"    ✓ Success - {len(result.get('cluster_ids', []))} total clusters"
             )
         else:
-            print(f"    ✗ Failed")
+            print("    ✗ Failed")
 
     # Show final state
     final = people_service.get_person(show_id, canonical["person_id"])
     if final:
-        print(f"\nFinal merged person:")
+        print("\nFinal merged person:")
         print(f"  ID: {final['person_id']}")
         print(f"  Name: {final.get('name')}")
         print(f"  Aliases: {final.get('aliases', [])}")

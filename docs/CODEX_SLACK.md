@@ -1,8 +1,8 @@
 # Codex Slack Integration
 
 ## Enable the integration
-1. Install the Codex Slack app from the OpenAI dashboard.  
-2. In Slack, authorize the workspace where Screenalytics incidents are discussed.  
+1. Install the Codex Slack app from the OpenAI dashboard.
+2. In Slack, authorize the workspace where Screenalytics incidents are discussed.
 3. Map the Codex workspace to this repo by providing the GitHub URL and the default playbook (`agents/playbooks/update-docs-on-change.yaml`) in the integration settings.
 
 ## `/export` command → `export_screen_time`

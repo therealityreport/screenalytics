@@ -5,12 +5,12 @@ Screenalytics delivers automated face, voice, and screen-time intelligence for u
 ---
 
 ## 11. CI / Promotion Flow
-1. Develop in `FEATURES/<name>/` (`src/`, `tests/`, `docs/`, `TODO.md`).  
+1. Develop in `FEATURES/<name>/` (`src/`, `tests/`, `docs/`, `TODO.md`).
 2. CI enforces:
    - 30-day TTL
    - Tests + docs present
    - No imports from `FEATURES/**` in production
-3. Promote via `tools/promote-feature.py`.  
+3. Promote via `tools/promote-feature.py`.
 4. Post-promotion CI re-runs end-to-end sample clip.
 
 ---
@@ -44,12 +44,12 @@ Screenalytics delivers automated face, voice, and screen-time intelligence for u
 ---
 
 ## 14. Acceptance Criteria
-- ✅ All stages produce valid artifacts (validated schema + checksum).  
-- ✅ Unit + integration tests pass (coverage > 85 %).  
-- ✅ Configs documented in `CONFIG_GUIDE.md`.  
-- ✅ One-hour validation episode processed ≤ 10 min GPU.  
-- ✅ Exported `screen_time.csv` verified against manual benchmark (± 5 %).  
-- ✅ Matching row in `ACCEPTANCE_MATRIX.md` marked Accepted for the promoted module.  
+- ✅ All stages produce valid artifacts (validated schema + checksum).
+- ✅ Unit + integration tests pass (coverage > 85 %).
+- ✅ Configs documented in `CONFIG_GUIDE.md`.
+- ✅ One-hour validation episode processed ≤ 10 min GPU.
+- ✅ Exported `screen_time.csv` verified against manual benchmark (± 5 %).
+- ✅ Matching row in `ACCEPTANCE_MATRIX.md` marked Accepted for the promoted module.
 - ✅ Docs + tests + config + promotion checklist complete.
 
 See `ACCEPTANCE_MATRIX.md` for the detailed acceptance checklist.
@@ -57,22 +57,22 @@ See `ACCEPTANCE_MATRIX.md` for the detailed acceptance checklist.
 ---
 
 ## 15. Future Enhancements
-- Scene-type classification via VLM (e.g., LLaVA / Qwen-VL).  
-- Emotion / sentiment tagging.  
-- Multi-camera or split-screen handling.  
-- Real-time episode analytics stream.  
+- Scene-type classification via VLM (e.g., LLaVA / Qwen-VL).
+- Emotion / sentiment tagging.
+- Multi-camera or split-screen handling.
+- Real-time episode analytics stream.
 - Dashboard for cross-season trends.
 
 ---
 
 ## 16. References
-- `SOLUTION_ARCHITECTURE.md` — system diagram  
-- `DIRECTORY_STRUCTURE.md` — repo layout  
-- `CONFIG_GUIDE.md` — configuration reference  
-- `ACCEPTANCE_MATRIX.md` — QA checklist  
-- `FEATURES_GUIDE.md` — promotion policy  
+- `SOLUTION_ARCHITECTURE.md` — system diagram
+- `DIRECTORY_STRUCTURE.md` — repo layout
+- `CONFIG_GUIDE.md` — configuration reference
+- `ACCEPTANCE_MATRIX.md` — QA checklist
+- `FEATURES_GUIDE.md` — promotion policy
 
 ---
 
-**Approved by:** TRR Engineering / Analytics / Design / Automation leads  
+**Approved by:** TRR Engineering / Analytics / Design / Automation leads
 **Next review:** after Phase 1 completion

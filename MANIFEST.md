@@ -1,8 +1,8 @@
 # Screenalytics — Project Manifest
 
 ## 1. Origin
-Successor to **Screenalyzer v2**.  
-Built to eliminate legacy path drift, silent errors, and configuration sprawl.  
+Successor to **Screenalyzer v2**.
+Built to eliminate legacy path drift, silent errors, and configuration sprawl.
 Mission: precise, modular, cloud-native analytics for cast presence, speech, and engagement in reality television.
 
 ---
@@ -16,22 +16,22 @@ It powers insights, merch, and fan engagement across *The Reality Report* ecosys
 ---
 
 ## 3. Core Principles
-1. **Central truth:** one artifact resolver, one schema per stage.  
-2. **Modular compute:** detection → tracking → identity → audio → fusion → export.  
-3. **Human-in-the-loop:** every auto decision overrideable and auditable.  
-4. **Agents over scripts:** automation via Codex + MCP, not ad-hoc jobs.  
-5. **Docs before code:** every module ships with usage notes and acceptance tests.  
+1. **Central truth:** one artifact resolver, one schema per stage.
+2. **Modular compute:** detection → tracking → identity → audio → fusion → export.
+3. **Human-in-the-loop:** every auto decision overrideable and auditable.
+4. **Agents over scripts:** automation via Codex + MCP, not ad-hoc jobs.
+5. **Docs before code:** every module ships with usage notes and acceptance tests.
 
 ---
 
 ## 4. Architecture Snapshot
-- **API:** FastAPI (typed endpoints, OpenAPI)  
-- **UI:** Next.js workspace (Shows / People / Episodes)  
-- **Workers:** Python pipelines (RetinaFace, ByteTrack, ArcFace, Pyannote, Whisper)  
-- **Storage:** S3-compatible object store  
-- **Database:** Postgres + pgvector  
-- **Agents:** Codex + MCP servers (screenalytics / storage / postgres)  
-- **Automation:** Zapier / n8n for exports + alerts  
+- **API:** FastAPI (typed endpoints, OpenAPI)
+- **UI:** Next.js workspace (Shows / People / Episodes)
+- **Workers:** Python pipelines (RetinaFace, ByteTrack, ArcFace, Pyannote, Whisper)
+- **Storage:** S3-compatible object store
+- **Database:** Postgres + pgvector
+- **Agents:** Codex + MCP servers (screenalytics / storage / postgres)
+- **Automation:** Zapier / n8n for exports + alerts
 
 ---
 
@@ -51,19 +51,19 @@ It powers insights, merch, and fan engagement across *The Reality Report* ecosys
 ---
 
 ## 6. Naming Conventions
-- **Repo name:** `screenalytics`  
-- **Package name:** `py-screenalytics`  
-- **CLI command (future):** `screenalytics run <episode>`  
-- **Database schema:** `screenalytics_prod`  
-- **Object storage prefix:** `screenalytics/<show>/<episode>/`  
+- **Repo name:** `screenalytics`
+- **Package name:** `py-screenalytics`
+- **CLI command (future):** `screenalytics run <episode>`
+- **Database schema:** `screenalytics_prod`
+- **Object storage prefix:** `screenalytics/<show>/<episode>/`
 
 ---
 
 ## 7. Governance
-- Branch model: `main` (stable) + `feature/*` (active).  
-- Every PR references a checklist in `MASTER_TODO.md`.  
-- Promotion rules from `FEATURES/README.md`.  
-- CI gates enforce tests + config updates.  
+- Branch model: `main` (stable) + `feature/*` (active).
+- Every PR references a checklist in `MASTER_TODO.md`.
+- Promotion rules from `FEATURES/README.md`.
+- CI gates enforce tests + config updates.
 
 ---
 
@@ -80,12 +80,12 @@ It powers insights, merch, and fan engagement across *The Reality Report* ecosys
 ---
 
 ## 9. Tagline Ideas
-- *“See every second.”*  
-- *“Screenalytics — Reality quantified.”*  
+- *“See every second.”*
+- *“Screenalytics — Reality quantified.”*
 - *“From frame to fame.”*
 
 ---
 
-**Created:** _(today’s date)_  
-**Author:** The Reality Report Core Team  
+**Created:** _(today’s date)_
+**Author:** The Reality Report Core Team
 **Version:** 0.0.1 (Pre-init)

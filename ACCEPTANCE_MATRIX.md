@@ -1,12 +1,12 @@
 # ACCEPTANCE_MATRIX.md — Screenalytics
 
-Version: 1.0  
-Status: Live QA Standard  
+Version: 1.0
+Status: Live QA Standard
 
 ---
 
 ## 1. Purpose
-To define measurable acceptance criteria for every feature or system module in Screenalytics.  
+To define measurable acceptance criteria for every feature or system module in Screenalytics.
 A feature is considered **Accepted** only when all associated checkpoints below are satisfied and verified by CI or QA review.
 
 ---
@@ -66,20 +66,20 @@ A feature is considered **Accepted** only when all associated checkpoints below 
 ---
 
 ## 6. Sign-off Procedure
-1. Feature owner verifies all applicable criteria.  
-2. CI passes automated checks.  
-3. PR labeled `promotion` merges into `main`.  
-4. `ACCEPTANCE_MATRIX.md` row updated to ✅ **Accepted**.  
+1. Feature owner verifies all applicable criteria.
+2. CI passes automated checks.
+3. PR labeled `promotion` merges into `main`.
+4. `ACCEPTANCE_MATRIX.md` row updated to ✅ **Accepted**.
 5. Codex posts summary under release tag.
 
 ---
 
 ## 7. Change Control
-- All edits tracked via PR review.  
-- Codex automatically appends new rows when features are added in `FEATURES/`.  
+- All edits tracked via PR review.
+- Codex automatically appends new rows when features are added in `FEATURES/`.
 - CI compares feature folders against matrix entries; warns if missing.
 
 ---
 
-**Next Review:** Quarterly QA Sync  
+**Next Review:** Quarterly QA Sync
 **Maintainers:** TRR Analytics + Automation Ops

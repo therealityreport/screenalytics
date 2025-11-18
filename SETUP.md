@@ -93,7 +93,7 @@ psql "$DB_URL" -f db/migrations/0001_init_core.sql
 ---
 
 ## 6️⃣ Verify install
-Visit [http://localhost:3000](http://localhost:3000) → Upload tab should appear.  
+Visit [http://localhost:3000](http://localhost:3000) → Upload tab should appear.
 API health check: [http://localhost:8000/health](http://localhost:8000/health) returns `{"status":"ok"}`.
 
 ---

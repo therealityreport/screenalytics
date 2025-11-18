@@ -52,13 +52,8 @@ def test_similarity_badge_rendering():
 
 def test_people_clusters_endpoint_integration():
     """Integration test: verify endpoint returns all tracks without limit."""
-    import json
-    from pathlib import Path
-    import tempfile
 
     from apps.api.services.track_reps import (
-        write_track_reps,
-        write_cluster_centroids,
         build_cluster_track_reps,
     )
 

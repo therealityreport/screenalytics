@@ -1,6 +1,5 @@
 """Test GroupingService handles legacy cluster centroids format."""
 
-import json
 import sys
 from pathlib import Path
 

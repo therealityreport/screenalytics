@@ -1,7 +1,6 @@
 """Test cluster cohesion computation with synthetic embeddings."""
 
 import numpy as np
-import pytest
 
 
 def test_tight_cluster_high_cohesion():

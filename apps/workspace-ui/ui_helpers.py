@@ -425,7 +425,6 @@ def render_sidebar_episode_selector() -> str | None:
     if st.sidebar.button(
         "🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"
     ):
-        import subprocess
         import shutil
         from pathlib import Path
 
@@ -1595,7 +1594,7 @@ def track_row_html(
     thumbs_html = "".join(thumbs)
     return f"""
     <style>
-      .track-grid {{ 
+      .track-grid {{
         display: grid;
         grid-template-columns: repeat(5, {thumb_width}px);
         gap: 12px;
@@ -1605,14 +1604,14 @@ def track_row_html(
         border-radius: 8px;
         background: #fafafa;
       }}
-      .track-grid.empty {{ 
+      .track-grid.empty {{
         display: flex;
         align-items: center;
         justify-content: center;
         min-height: 100px;
         color: #666;
       }}
-      .track-grid .thumb {{ 
+      .track-grid .thumb {{
         width: {thumb_width}px;
         aspect-ratio: 4 / 5;
         object-fit: fill;
@@ -1620,7 +1619,7 @@ def track_row_html(
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         transition: transform 0.2s, box-shadow 0.2s;
       }}
-      .track-grid .thumb:hover {{ 
+      .track-grid .thumb:hover {{
         transform: scale(1.05);
         box-shadow: 0 4px 12px rgba(0,0,0,0.2);
         cursor: pointer;

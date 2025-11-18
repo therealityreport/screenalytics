@@ -1,10 +1,8 @@
 """Regression test for legacy cluster_centroids.json format."""
 
-import json
 import sys
 from pathlib import Path
 
-import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:

@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
+from py_screanalytics.facebank_seed import select_facebank_seeds, write_facebank_seeds
 
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
@@ -1649,7 +1650,6 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
 
     tracks_path = get_path(ep_id, "tracks")
     detections_path = get_path(ep_id, "detections")
-    manifests_dir = detections_path.parent
     tracks_manifest_ready = _manifest_has_rows(tracks_path)
     if detect_track_payload.get("status") == "success" and not tracks_manifest_ready:
         detect_track_payload["status"] = "stale"
@@ -2693,4 +2693,111 @@ def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
         "frame_idx": payload.frame_idx,
         "removed": len(removed_rows),
         "remaining": len(faces),
+    }
+
+
+@router.post("/episodes/{ep_id}/identities/{identity_id}/export_seeds", tags=["episodes"])
+def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
+    """
+    Select and export high-quality seed frames to permanent facebank.
+    Only exports user-confirmed identities with person_id mappings.
+    """
+    # Validate identity_id format (prevent path traversal)
+    if not identity_id or not re.match(r'^[a-zA-Z0-9_-]+$', identity_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid identity_id format. Must match [a-zA-Z0-9_-]+"
+        )
+
+    # Verify episode exists
+    _require_episode_context(ep_id)
+
+    # Load all faces for this identity
+    all_faces = _load_faces(ep_id, include_skipped=False)
+    identity_faces = [f for f in all_faces if f.get("identity_id") == identity_id]
+
+    if not identity_faces:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No faces found for identity {identity_id} in episode {ep_id}"
+        )
+
+    # Check if identity has a person_id mapping (cast member)
+    identities = _load_identities(ep_id)
+    if not isinstance(identities, dict):
+        raise HTTPException(status_code=500, detail="Invalid identities data structure")
+
+    identity_record = next(
+        (i for i in identities.get("identities", []) if i.get("identity_id") == identity_id),
+        None
+    )
+
+    if not identity_record:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Identity {identity_id} not found in manifest for episode {ep_id}"
+        )
+
+    person_id = identity_record.get("person_id")
+    if not person_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Identity {identity_id} has no person_id mapping. Assign to a cast member first in the Faces Review UI."
+        )
+
+    # Select seeds using quality criteria
+    try:
+        seeds = select_facebank_seeds(ep_id, identity_id, identity_faces)
+    except Exception as exc:
+        LOGGER.error(f"Failed to select facebank seeds for {ep_id}/{identity_id}: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Seed selection failed: {exc}"
+        ) from exc
+
+    if not seeds:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No quality seeds available for {identity_id}. "
+                "Check that faces have detection scores ≥0.75, sharpness ≥15.0, and similarity ≥0.70. "
+                "Review frames in the Faces Review UI to confirm quality."
+            )
+        )
+
+    # Write to facebank
+    facebank_root = Path(os.environ.get("SCREENALYTICS_FACEBANK_ROOT", "data/facebank")).expanduser()
+
+    try:
+        seeds_path = write_facebank_seeds(person_id, seeds, facebank_root)
+    except (OSError, ValueError) as exc:
+        LOGGER.error(f"Failed to write facebank seeds for {person_id}: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write seeds to facebank: {exc}"
+        ) from exc
+
+    # Log successful export
+    LOGGER.info(
+        "Exported %d facebank seeds for ep_id=%s identity=%s person=%s to %s",
+        len(seeds),
+        ep_id,
+        identity_id,
+        person_id,
+        seeds_path,
+    )
+
+    # TODO: Emit refresh job for similarity recomputation across episodes
+    # This would trigger re-indexing of embeddings in pgvector/FAISS
+    # For now, similarity refresh must be triggered manually
+
+    return {
+        "status": "success",
+        "person_id": person_id,
+        "identity_id": identity_id,
+        "ep_id": ep_id,
+        "seeds_exported": len(seeds),
+        "seeds_path": str(seeds_path),
+        "refresh_required": True,
+        "message": f"Exported {len(seeds)} high-quality seeds to facebank. Similarity refresh recommended.",
     }

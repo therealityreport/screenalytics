@@ -13,7 +13,6 @@ import time
 from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
-from itertools import groupby
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 

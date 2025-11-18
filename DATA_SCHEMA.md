@@ -1,6 +1,6 @@
 # DATA_SCHEMA.md — Screenalytics
 
-Version: 1.0  
+Version: 1.0
 Status: Draft (ready to implement)
 
 ## Principles
@@ -9,15 +9,15 @@ Status: Draft (ready to implement)
 - pgvector holds face embeddings; HNSW index for k-NN.
 
 ## ER Overview (text)
-show(1) ──< season(1) ──< episode(1) ──< track(1) ──< assignment  
-                    └─< shot  
-person ──< cast_membership (to show)  
-person ──< media_asset (featured)  
-episode ──< detection  
-track ──< embedding (owner_type='track')  
-person ──< embedding (owner_type='facebank')  
-episode ──< speech_segment  
-track ──< av_link >── speech_segment  
+show(1) ──< season(1) ──< episode(1) ──< track(1) ──< assignment
+                    └─< shot
+person ──< cast_membership (to show)
+person ──< media_asset (featured)
+episode ──< detection
+track ──< embedding (owner_type='track')
+person ──< embedding (owner_type='facebank')
+episode ──< speech_segment
+track ──< av_link >── speech_segment
 episode+person ──< screen_time
 
 ## Tables (Postgres)

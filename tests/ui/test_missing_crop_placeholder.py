@@ -74,7 +74,6 @@ def test_direct_set_view_calls_have_rerun():
     content = faces_review_path.read_text()
 
     # Find direct _set_view calls that are not in lambda/on_click contexts
-    import re
 
     # Look for pattern: _set_view(...) followed by return without st.rerun()
     # This pattern should have st.rerun() before return

@@ -14,7 +14,6 @@ def test_fetch_roster_names_merges_sources():
     # 1. /shows/{show}/cast_names (roster.json)
     # 2. /shows/{show}/cast (cast.json / facebank)
 
-    from pathlib import Path
 
     faces_review_path = (
         PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
@@ -40,7 +39,6 @@ def test_fetch_roster_names_merges_sources():
 
 def test_name_choice_widget_includes_merged_names():
     """Test that name choice widget receives the merged names."""
-    from pathlib import Path
 
     faces_review_path = (
         PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"

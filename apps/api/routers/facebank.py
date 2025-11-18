@@ -26,7 +26,6 @@ from apps.api.services.jobs import JobService
 from apps.api.services.people import PeopleService
 from apps.api.services.storage import StorageService
 from tools import episode_run
-from tools._img_utils import safe_crop
 
 router = APIRouter()
 cast_service = CastService()

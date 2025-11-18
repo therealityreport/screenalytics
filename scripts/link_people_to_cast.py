@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Link existing people to cast members by name matching."""
 
-import json
 import sys
 from pathlib import Path
 

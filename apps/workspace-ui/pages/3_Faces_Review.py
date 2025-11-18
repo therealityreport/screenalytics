@@ -130,9 +130,9 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
     st.markdown("### Frame Badges")
     st.markdown(
         """
-        - **★ BEST QUALITY (green)** – Complete face, high quality, good ID match  
-        - **⚠ BEST AVAILABLE (orange)** – Partial/low-quality, best available frame  
-        - **Partial (orange pill)** – Edge-clipped or incomplete face  
+        - **★ BEST QUALITY (green)** – Complete face, high quality, good ID match
+        - **⚠ BEST AVAILABLE (orange)** – Partial/low-quality, best available frame
+        - **Partial (orange pill)** – Edge-clipped or incomplete face
 
         📚 **Full guide:** `docs/similarity-scores-guide.md`
         """,
@@ -626,7 +626,7 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 # Trigger similarity index refresh for all identities
                 refresh_resp = _api_post(f"/episodes/{ep_id}/refresh_similarity", {})
                 if refresh_resp and refresh_resp.get("status") == "success":
-                    st.success(f"✅ Refreshed similarity values!")
+                    st.success("✅ Refreshed similarity values!")
                     st.rerun()
                 else:
                     st.error("Failed to refresh similarity values. Check logs.")
@@ -758,7 +758,7 @@ def _render_cast_carousel(
         return
 
     st.markdown("### 🎬 Cast Lineup")
-    st.caption(f"Cast members with clusters in this episode")
+    st.caption("Cast members with clusters in this episode")
 
     # Create horizontal carousel (max 5 per row)
     cols_per_row = min(len(cast_with_clusters), 5)
@@ -1328,7 +1328,7 @@ def _render_auto_person_card(
                     placeholder="Enter name...",
                 )
                 if new_name and st.button(
-                    f"Create & Assign", key=f"create_assign_btn_{person_id}"
+                    "Create & Assign", key=f"create_assign_btn_{person_id}"
                 ):
                     # Assign all clusters with this name
                     result = _bulk_assign_to_new_person(
@@ -1690,7 +1690,7 @@ def _render_people_view(
     # --- CAST MEMBERS SECTION ---
     if cast_gallery_cards:
         st.markdown(f"### 🎬 Cast Members ({len(cast_gallery_cards)})")
-        st.caption(f"Cast members with clusters in this episode")
+        st.caption("Cast members with clusters in this episode")
         _render_cast_gallery(ep_id, cast_gallery_cards)
 
     # --- EPISODE AUTO-PEOPLE SECTION ---
@@ -1722,7 +1722,7 @@ def _render_people_view(
                 f"### 🔍 Unassigned Clusters - Review Suggestions ({len(unassigned_clusters)})"
             )
             st.caption(
-                f"Clusters detected but not yet assigned to cast members. Review and assign manually."
+                "Clusters detected but not yet assigned to cast members. Review and assign manually."
             )
         with header_col2:
             if st.button(
@@ -1886,7 +1886,6 @@ def _render_person_clusters(
         person_cluster_ids = set(episode_clusters)
 
         # Load faces.jsonl to get embeddings
-        import numpy as np
 
         try:
             # We'll compute average embedding across all frames for this person
@@ -2205,6 +2204,45 @@ def _render_cluster_tracks(
         roster_names=roster_names,
         prefix=f"cluster_tracks_{identity_id}",
     )
+
+    # Export to Facebank button (only if person_id is assigned)
+    person_id_for_export = identity_meta.get("person_id")
+    if person_id_for_export:
+        st.markdown("---")
+        with st.container(border=True):
+            st.markdown("### 💾 Export to Facebank")
+            st.caption(
+                "Export high-quality seed frames to permanent facebank for cross-episode similarity matching. "
+                f"This will save the best frames (up to 20) for person **{display_name or person_id_for_export}**."
+            )
+
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.info(
+                    "✅ Requirements: Detection score ≥0.75 · Sharpness ≥15 · Similarity ≥0.70"
+                )
+            with col2:
+                if st.button("💾 Export Seeds", key=f"export_seeds_{identity_id}", use_container_width=True, type="primary"):
+                    with st.spinner(f"Selecting and exporting seeds for {display_name or person_id_for_export}..."):
+                        export_resp = _api_post(
+                            f"/episodes/{ep_id}/identities/{identity_id}/export_seeds",
+                            {}
+                        )
+                        if export_resp and export_resp.get("status") == "success":
+                            seeds_count = export_resp.get("seeds_exported", 0)
+                            seeds_path = export_resp.get("seeds_path", "")
+                            st.success(
+                                f"✅ Exported {seeds_count} high-quality seeds to facebank!\n\n"
+                                f"Path: `{seeds_path}`"
+                            )
+                            st.info("💡 Tip: Run similarity refresh to update cross-episode matching.")
+                        else:
+                            st.error("Failed to export seeds. Check logs for details.")
+        st.markdown("---")
+    else:
+        st.info(
+            "💡 To export this identity to facebank, first assign it to a cast member using the name controls above."
+        )
 
     # Display all track representatives with similarity scores
     if not track_reps:

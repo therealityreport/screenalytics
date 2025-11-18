@@ -1,7 +1,7 @@
 # SOLUTION_ARCHITECTURE.md — Screenalytics
 
-Version: 1.1 (Enhanced)  
-Status: Planning  
+Version: 1.1 (Enhanced)
+Status: Planning
 
 ---
 
@@ -89,10 +89,10 @@ Lifecycle rules:
 ---
 
 ## 7. Configuration Layers
-- **Pipeline configs** (`config/pipeline/*.yaml`): thresholds, model IDs, stage toggles  
-- **Service configs** (`config/services.yaml`): timeouts, endpoints  
-- **Storage** (`config/storage.yaml`): bucket names, lifecycle  
-- **Agents** (`config/codex.config.toml`, `config/claude.policies.yaml`): write rules and MCP servers  
+- **Pipeline configs** (`config/pipeline/*.yaml`): thresholds, model IDs, stage toggles
+- **Service configs** (`config/services.yaml`): timeouts, endpoints
+- **Storage** (`config/storage.yaml`): bucket names, lifecycle
+- **Agents** (`config/codex.config.toml`, `config/claude.policies.yaml`): write rules and MCP servers
 
 ---
 
@@ -113,24 +113,24 @@ Lifecycle rules:
 ---
 
 ## 10. Performance Targets
-- 1-hour episode ≤ 10 min on single GPU  
-- ID accuracy ≥ 90%  
-- Speaking match ≥ 85%  
+- 1-hour episode ≤ 10 min on single GPU
+- ID accuracy ≥ 90%
+- Speaking match ≥ 85%
 - CI integration test: ≤ 15 min full pipeline run
 
 ---
 
 ## 11. Promotion & CI Flow
-1. Build feature in `FEATURES/<name>/`  
-2. Test, document, and config-drive it  
-3. Promote via PR → CI verifies  
+1. Build feature in `FEATURES/<name>/`
+2. Test, document, and config-drive it
+3. Promote via PR → CI verifies
 4. Agents update docs automatically (see configuration below)
 
 ---
 
 ## 12. Agents & Automation Hooks
-- **Trigger:** when files are added or removed  
-- **Action:** Codex & Claude agents update  
+- **Trigger:** when files are added or removed
+- **Action:** Codex & Claude agents update
   - `SOLUTION_ARCHITECTURE.md`
   - `DIRECTORY_STRUCTURE.md`
   - `PRD.md`
