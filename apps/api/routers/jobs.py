@@ -429,12 +429,24 @@ def _run_job_with_optional_sse(command: List[str], request: Request, progress_fi
         env=env,
     )
     if completed.returncode != 0:
+        progress_payload = None
+        if progress_file and progress_file.exists():
+            try:
+                progress_payload = json.loads(progress_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                progress_payload = None
+        detail: dict[str, Any] = {
+            "error": "episode_run_failed",
+            "stderr": completed.stderr.strip(),
+        }
+        if progress_payload:
+            detail["progress"] = progress_payload
+            ep_value = progress_payload.get("ep_id") if isinstance(progress_payload, dict) else None
+            if isinstance(ep_value, str):
+                detail.setdefault("ep_id", ep_value)
         raise HTTPException(
             status_code=500,
-            detail={
-                "error": "episode_run_failed",
-                "stderr": completed.stderr.strip(),
-            },
+            detail=detail,
         )
     return completed
 
