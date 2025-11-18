@@ -298,8 +298,7 @@ async def upload_seeds(
         raise HTTPException(status_code=404, detail=f"Cast member {cast_id} not found")
 
     try:
-        from FEATURES.detection.src.run_retinaface import RetinaFaceDetector
-        from tools.episode_run import ArcFaceEmbedder, _prepare_face_crop
+        from tools.episode_run import RetinaFaceDetectorBackend, ArcFaceEmbedder, _prepare_face_crop
     except ImportError as exc:
         raise HTTPException(
             status_code=500,
@@ -307,9 +306,8 @@ async def upload_seeds(
         ) from exc
 
     detector_ready, detector_error, detector_provider = episode_run.ensure_retinaface_ready("auto")
-    detector_cfg = {"ctx_id": -1, "force_simulated": not detector_ready}
-    detector = RetinaFaceDetector(detector_cfg)
-    detector_simulated = bool(getattr(detector, "simulated", False))
+    detector = RetinaFaceDetectorBackend(device="auto")
+    detector_simulated = not detector_ready
     if detector_simulated:
         detector_ready = False
     detector_mode = "simulated" if detector_simulated else "retinaface"
@@ -352,7 +350,7 @@ async def upload_seeds(
                 continue
             image = np.ascontiguousarray(image_rgb[..., ::-1])
 
-            detections = detector(image)
+            detections = detector.detect(image)
 
             if len(detections) == 0:
                 errors.append({"file": file.filename, "error": "No face detected"})
@@ -362,17 +360,12 @@ async def upload_seeds(
                 continue
 
             detection = detections[0]
-            bbox_rel = detection["bbox"]
-            landmarks_rel = detection["landmarks"]
-            conf = detection["conf"]
+            # DetectionSample has bbox as absolute coordinates already
+            bbox = detection.bbox  # [x1, y1, x2, y2] in pixels
+            landmarks_rel = detection.landmarks
+            conf = detection.conf
 
             h, w = image.shape[:2]
-            bbox = [
-                bbox_rel[0] * w,
-                bbox_rel[1] * h,
-                bbox_rel[2] * w,
-                bbox_rel[3] * h,
-            ]
 
             bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             bbox_ratio = bbox_area / (w * h)

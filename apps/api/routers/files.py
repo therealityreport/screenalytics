@@ -124,23 +124,21 @@ def check_detector_health() -> dict:
 
     # Try to initialize detector to check availability
     try:
-        from FEATURES.detection.src.run_retinaface import RetinaFaceDetector
+        from tools.episode_run import RetinaFaceDetectorBackend
 
-        detector_cfg = {"ctx_id": -1, "force_simulated": False}
-        detector = RetinaFaceDetector(detector_cfg)
+        detector = RetinaFaceDetectorBackend(device="auto")
+        # Try to load model to verify it's available
+        detector._get_or_create_model()
 
-        if detector.simulated:
-            result["reason_if_false"] = "Detector initialized in simulated mode (models unavailable)"
-        else:
-            result["retinaface_ready"] = True
+        result["retinaface_ready"] = True
 
-            # Try to get ONNX runtime provider info
-            try:
-                import onnxruntime as ort
-                providers = ort.get_available_providers()
-                result["resolved_provider"] = providers[0] if providers else "Unknown"
-            except Exception:
-                result["resolved_provider"] = "ONNX Runtime not available"
+        # Try to get ONNX runtime provider info
+        try:
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            result["resolved_provider"] = providers[0] if providers else "Unknown"
+        except Exception:
+            result["resolved_provider"] = "ONNX Runtime not available"
 
     except ImportError as e:
         result["reason_if_false"] = f"Import error: {str(e)}"
