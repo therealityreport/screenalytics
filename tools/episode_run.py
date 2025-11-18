@@ -2918,178 +2918,204 @@ def _run_full_pipeline(
                 detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
                 ts = frame_idx / ts_fps if ts_fps else 0.0
 
+                # === BEGIN per-frame detect/track/crop guard ===
+                # Wrap core detect/track/crop logic in targeted TypeError guard to handle
+                # NoneType multiplication errors from malformed bboxes or margins.
+                # If a frame fails with NoneType multiply error, skip it and continue processing.
                 try:
-                    detections = detector_backend.detect(frame)
-                except Exception as exc:
-                    LOGGER.error(
-                        "Face detection failed at frame %d for %s: %s",
-                        frame_idx,
-                        args.ep_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
-                face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
-                for det_sample in face_detections:
-                    _record_detection_conf(float(det_sample.conf))
-                tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
-                diag_stats = _diagnostic_stats(len(face_detections), len(tracked_objects))
-                last_diag_stats = diag_stats
-                if progress:
-                    detect_extra = dict(detect_meta)
-                    detect_extra["detect_track_stats"] = diag_stats
-                    progress.emit(
-                        detect_frames,
-                        phase="detect",
-                        device=device,
-                        detector=detector_choice,
-                        tracker=tracker_label,
-                        resolved_device=detector_device,
-                        extra=detect_extra,
-                    )
-
-                if frames_sampled > 0 and frames_sampled % TRACKING_DIAG_INTERVAL == 0:
-                    if tracker_config_summary:
-                        LOGGER.info(
-                            "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
-                            "tracks_born=%d detections_frame=%d tracks_frame=%d stride=%d "
-                            "track_high=%.2f new_track=%.2f match_thresh=%.2f track_buffer=%d min_box_area=%.2f",
-                            args.ep_id,
+                    try:
+                        detections = detector_backend.detect(frame)
+                    except Exception as exc:
+                        LOGGER.error(
+                            "Face detection failed at frame %d for %s: %s",
                             frame_idx,
-                            frames_sampled,
-                            det_count,
-                            recorder.active_track_count,
-                            recorder.metrics["tracks_born"],
-                            len(face_detections),
-                            len(tracked_objects),
-                            frame_stride,
-                            tracker_config_summary.get("track_high_thresh", 0.0),
-                            tracker_config_summary.get("new_track_thresh", 0.0),
-                            tracker_config_summary.get("match_thresh", 0.0),
-                            tracker_config_summary.get("track_buffer", 0),
-                            tracker_config_summary.get("min_box_area", 0.0),
+                            args.ep_id,
+                            exc,
+                            exc_info=True,
                         )
-                    else:
-                        LOGGER.info(
-                            "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
-                            "tracks_born=%d detections_frame=%d tracks_frame=%d stride=%d",
-                            args.ep_id,
-                            frame_idx,
-                            frames_sampled,
-                            det_count,
-                            recorder.active_track_count,
-                            recorder.metrics["tracks_born"],
-                            len(face_detections),
-                            len(tracked_objects),
-                            frame_stride,
+                        raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
+                    face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+                    for det_sample in face_detections:
+                        _record_detection_conf(float(det_sample.conf))
+                    tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
+                    diag_stats = _diagnostic_stats(len(face_detections), len(tracked_objects))
+                    last_diag_stats = diag_stats
+                    if progress:
+                        detect_extra = dict(detect_meta)
+                        detect_extra["detect_track_stats"] = diag_stats
+                        progress.emit(
+                            detect_frames,
+                            phase="detect",
+                            device=device,
+                            detector=detector_choice,
+                            tracker=tracker_label,
+                            resolved_device=detector_device,
+                            extra=detect_extra,
                         )
 
-                crop_records: list[tuple[int, list[float]]] = []
-                gate_embeddings: dict[int, np.ndarray | None] = {}
-                should_embed_gate = False
-                if appearance_gate:
-                    should_embed_gate = True if frames_since_cut < scene_warmup else False
-                    stride_for_gate = gate_embed_stride or frame_stride
-                    if stride_for_gate > 1 and not should_embed_gate:
-                        should_embed_gate = frame_idx % stride_for_gate == 0
-                    else:
-                        should_embed_gate = True
-                    if should_embed_gate and gate_embedder and tracked_objects:
-                        embed_inputs: list[np.ndarray] = []
-                        embed_track_ids: list[int] = []
-                        for obj in tracked_objects:
-                            landmarks_list = None
-                            if obj.landmarks is not None:
-                                landmarks_list = (
-                                    obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
-                                )
-                            crop, crop_err = _prepare_face_crop(
-                                frame,
-                                obj.bbox.tolist(),
-                                landmarks_list,
-                                margin=0.2,
+                    if frames_sampled > 0 and frames_sampled % TRACKING_DIAG_INTERVAL == 0:
+                        if tracker_config_summary:
+                            LOGGER.info(
+                                "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
+                                "tracks_born=%d detections_frame=%d tracks_frame=%d stride=%d "
+                                "track_high=%.2f new_track=%.2f match_thresh=%.2f track_buffer=%d min_box_area=%.2f",
+                                args.ep_id,
+                                frame_idx,
+                                frames_sampled,
+                                det_count,
+                                recorder.active_track_count,
+                                recorder.metrics["tracks_born"],
+                                len(face_detections),
+                                len(tracked_objects),
+                                frame_stride,
+                                tracker_config_summary.get("track_high_thresh", 0.0),
+                                tracker_config_summary.get("new_track_thresh", 0.0),
+                                tracker_config_summary.get("match_thresh", 0.0),
+                                tracker_config_summary.get("track_buffer", 0),
+                                tracker_config_summary.get("min_box_area", 0.0),
                             )
-                            if crop is None:
-                                if crop_err:
-                                    LOGGER.debug("Gate crop failed for track %s: %s", obj.track_id, crop_err)
-                                continue
-                            aligned = _resize_for_arcface(crop)
-                            embed_inputs.append(aligned)
-                            embed_track_ids.append(obj.track_id)
-                        if embed_inputs:
-                            encoded = gate_embedder.encode(embed_inputs)
-                            for idx, tid in enumerate(embed_track_ids):
-                                gate_embeddings[tid] = encoded[idx]
-                    for obj in tracked_objects:
-                        gate_embeddings.setdefault(obj.track_id, None)
-                    # TODO(perf): Persist gate_embeddings to reuse in faces embed stage.
-                    # Would require: (1) extending tracks.jsonl schema to include gate_embedding,
-                    # (2) saving embeddings in TrackRecorder, (3) loading in faces embed, (4)
-                    # matching gate embedding to appropriate face sample per track. Requires
-                    # invasive schema changes and careful handling of missing/mismatched cases.
+                        else:
+                            LOGGER.info(
+                                "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
+                                "tracks_born=%d detections_frame=%d tracks_frame=%d stride=%d",
+                                args.ep_id,
+                                frame_idx,
+                                frames_sampled,
+                                det_count,
+                                recorder.active_track_count,
+                                recorder.metrics["tracks_born"],
+                                len(face_detections),
+                                len(tracked_objects),
+                                frame_stride,
+                            )
 
-                if not face_detections:
-                    if frame_exporter and frame_exporter.save_frames:
-                        frame_exporter.export(frame_idx, frame, [], ts=ts)
-                    frame_idx += 1
-                    frames_since_cut += 1
-                    continue
-
-                active_ids: set[int] = set()
-                for obj in tracked_objects:
-                    active_ids.add(obj.track_id)
-                    class_value = FACE_CLASS_LABEL
-                    landmarks = None
-                    if obj.landmarks is not None:
-                        landmarks = obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
-                    force_split = False
+                    crop_records: list[tuple[int, list[float]]] = []
+                    gate_embeddings: dict[int, np.ndarray | None] = {}
+                    should_embed_gate = False
                     if appearance_gate:
-                        embedding_vec = gate_embeddings.get(obj.track_id)
-                        force_split, _, _, _ = appearance_gate.process(
-                            obj.track_id,
-                            obj.bbox,
-                            embedding_vec,
-                            frame_idx,
+                        should_embed_gate = True if frames_since_cut < scene_warmup else False
+                        stride_for_gate = gate_embed_stride or frame_stride
+                        if stride_for_gate > 1 and not should_embed_gate:
+                            should_embed_gate = frame_idx % stride_for_gate == 0
+                        else:
+                            should_embed_gate = True
+                        if should_embed_gate and gate_embedder and tracked_objects:
+                            embed_inputs: list[np.ndarray] = []
+                            embed_track_ids: list[int] = []
+                            for obj in tracked_objects:
+                                landmarks_list = None
+                                if obj.landmarks is not None:
+                                    landmarks_list = (
+                                        obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                                    )
+                                crop, crop_err = _prepare_face_crop(
+                                    frame,
+                                    obj.bbox.tolist(),
+                                    landmarks_list,
+                                    margin=0.2,
+                                )
+                                if crop is None:
+                                    if crop_err:
+                                        LOGGER.debug("Gate crop failed for track %s: %s", obj.track_id, crop_err)
+                                    continue
+                                aligned = _resize_for_arcface(crop)
+                                embed_inputs.append(aligned)
+                                embed_track_ids.append(obj.track_id)
+                            if embed_inputs:
+                                encoded = gate_embedder.encode(embed_inputs)
+                                for idx, tid in enumerate(embed_track_ids):
+                                    gate_embeddings[tid] = encoded[idx]
+                        for obj in tracked_objects:
+                            gate_embeddings.setdefault(obj.track_id, None)
+                        # TODO(perf): Persist gate_embeddings to reuse in faces embed stage.
+                        # Would require: (1) extending tracks.jsonl schema to include gate_embedding,
+                        # (2) saving embeddings in TrackRecorder, (3) loading in faces embed, (4)
+                        # matching gate embedding to appropriate face sample per track. Requires
+                        # invasive schema changes and careful handling of missing/mismatched cases.
+
+                    if not face_detections:
+                        if frame_exporter and frame_exporter.save_frames:
+                            frame_exporter.export(frame_idx, frame, [], ts=ts)
+                        frame_idx += 1
+                        frames_since_cut += 1
+                        continue
+
+                    active_ids: set[int] = set()
+                    for obj in tracked_objects:
+                        active_ids.add(obj.track_id)
+                        class_value = FACE_CLASS_LABEL
+                        landmarks = None
+                        if obj.landmarks is not None:
+                            landmarks = obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                        force_split = False
+                        if appearance_gate:
+                            embedding_vec = gate_embeddings.get(obj.track_id)
+                            force_split, _, _, _ = appearance_gate.process(
+                                obj.track_id,
+                                obj.bbox,
+                                embedding_vec,
+                                frame_idx,
+                            )
+                        export_id = recorder.record(
+                            tracker_track_id=obj.track_id,
+                            frame_idx=frame_idx,
+                            ts=ts,
+                            bbox=obj.bbox,
+                            class_label=class_value,
+                            landmarks=landmarks,
+                            confidence=float(obj.conf) if obj.conf is not None else None,
+                            force_new_track=force_split,
                         )
-                    export_id = recorder.record(
-                        tracker_track_id=obj.track_id,
-                        frame_idx=frame_idx,
-                        ts=ts,
-                        bbox=obj.bbox,
-                        class_label=class_value,
-                        landmarks=landmarks,
-                        confidence=float(obj.conf) if obj.conf is not None else None,
-                        force_new_track=force_split,
-                    )
-                    bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
-                    conf_value = float(obj.conf)
+                        bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
+                        conf_value = float(obj.conf)
 
-                    row = {
-                        "ep_id": args.ep_id,
-                        "ts": round(float(ts), 4),
-                        "frame_idx": frame_idx,
-                        "class": class_value,
-                        "conf": round(conf_value, 4),
-                        "bbox_xyxy": bbox_list,
-                        "track_id": export_id,
-                        "model": detector_backend.model_name,
-                        "detector": detector_choice,
-                        "tracker": tracker_label,
-                        "pipeline_ver": PIPELINE_VERSION,
-                        "fps": round(float(analyzed_fps), 4) if analyzed_fps else None,
-                    }
-                    if landmarks:
-                        row["landmarks"] = [round(float(val), 4) for val in landmarks]
-                    det_handle.write(json.dumps(row) + "\n")
-                    det_count += 1
-                    if frame_exporter and frame_exporter.save_crops:
-                        crop_records.append((export_id, bbox_list))
+                        row = {
+                            "ep_id": args.ep_id,
+                            "ts": round(float(ts), 4),
+                            "frame_idx": frame_idx,
+                            "class": class_value,
+                            "conf": round(conf_value, 4),
+                            "bbox_xyxy": bbox_list,
+                            "track_id": export_id,
+                            "model": detector_backend.model_name,
+                            "detector": detector_choice,
+                            "tracker": tracker_label,
+                            "pipeline_ver": PIPELINE_VERSION,
+                            "fps": round(float(analyzed_fps), 4) if analyzed_fps else None,
+                        }
+                        if landmarks:
+                            row["landmarks"] = [round(float(val), 4) for val in landmarks]
+                        det_handle.write(json.dumps(row) + "\n")
+                        det_count += 1
+                        if frame_exporter and frame_exporter.save_crops:
+                            crop_records.append((export_id, bbox_list))
 
-                if appearance_gate:
-                    appearance_gate.prune(active_ids)
+                    if appearance_gate:
+                        appearance_gate.prune(active_ids)
 
-                if frame_exporter and (frame_exporter.save_frames or crop_records):
-                    frame_exporter.export(frame_idx, frame, crop_records, ts=ts)
+                    if frame_exporter and (frame_exporter.save_frames or crop_records):
+                        frame_exporter.export(frame_idx, frame, crop_records, ts=ts)
+
+                    # === END per-frame detect/track/crop guard ===
+                except TypeError as e:
+                    # Only catch NoneType multiplication errors from malformed bboxes/margins
+                    msg = str(e)
+                    if "NoneType" in msg and "*" in msg:
+                        LOGGER.error(
+                            "Skipping frame %d for %s due to NoneType multiply error: %s",
+                            frame_idx,
+                            args.ep_id,
+                            msg,
+                        )
+                        # Track crop errors for diagnostics
+                        if last_diag_stats:
+                            # Update diagnostics to track skipped frames
+                            pass
+                        frame_idx += 1
+                        frames_since_cut += 1
+                        continue
+                    # Re-raise if it's a different TypeError
+                    raise
 
                 if progress:
                     track_frames, track_meta = _progress_value(frame_idx, include_current=True)
