@@ -4,7 +4,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import requests
 import streamlit as st
@@ -24,16 +24,19 @@ CROP_JPEG_SIZE_EST_BYTES = 40_000
 AVG_FACES_PER_FRAME = 1.5
 
 
-def _load_job_defaults(ep_id: str, job_type: str) -> Dict[str, Any]:
+def _load_job_defaults(ep_id: str, job_type: str) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
     try:
         resp = helpers.api_get(f"/jobs?ep_id={ep_id}&job_type={job_type}&limit=1")
     except requests.RequestException:
-        return {}
+        return {}, None
     jobs = resp.get("jobs") or []
     if not jobs:
-        return {}
-    requested = jobs[0].get("requested")
-    return requested if isinstance(requested, dict) else {}
+        return {}, None
+    job = jobs[0]
+    requested = job.get("requested")
+    if isinstance(requested, dict):
+        return dict(requested), job
+    return {}, job
 
 
 def _format_timestamp(value: str | None) -> str | None:
@@ -94,7 +97,11 @@ def _compute_detect_track_effective_status(
     *,
     manifest_ready: bool,
     tracks_ready_flag: bool,
+    job_state: str | None = None,
 ) -> tuple[str, bool, bool]:
+    normalized_job_state = str(job_state or "").strip().lower()
+    if normalized_job_state == "running":
+        return "running", False, False
     normalized_status = str(detect_status.get("status") or "missing").strip().lower()
     if not normalized_status:
         normalized_status = "missing"
@@ -273,7 +280,10 @@ def _format_phase_status(label: str, status: Dict[str, Any], count_key: str) -> 
 
 def _ensure_local_artifacts(ep_id: str, details: Dict[str, Any]) -> bool:
     local_block = details.setdefault("local", {})
-    if local_block.get("exists"):
+    video_path = get_path(ep_id, "video")
+    if video_path.exists():
+        local_block["path"] = str(video_path)
+        local_block["exists"] = True
         return True
     s3_meta = details.get("s3") or {}
     if not (s3_meta.get("v2_exists") or s3_meta.get("v1_exists")):
@@ -290,7 +300,7 @@ def _ensure_local_artifacts(ep_id: str, details: Dict[str, Any]) -> bool:
             f"Mirrored to {helpers.link_local(resp['local_video_path'])} "
             f"({helpers.human_size(resp.get('bytes'))})"
         )
-        local_block["path"] = resp.get("local_video_path") or local_block.get("path")
+        local_block["path"] = resp.get("local_video_path") or str(video_path)
         local_block["exists"] = True
         return True
 
@@ -362,9 +372,9 @@ detections_path = get_path(ep_id, "detections")
 manifests_dir = detections_path.parent
 faces_path = manifests_dir / "faces.jsonl"
 identities_path = manifests_dir / "identities.json"
-detect_job_defaults = _load_job_defaults(ep_id, "detect_track")
-faces_job_defaults = _load_job_defaults(ep_id, "faces_embed")
-cluster_job_defaults = _load_job_defaults(ep_id, "cluster")
+detect_job_defaults, detect_job_record = _load_job_defaults(ep_id, "detect_track")
+faces_job_defaults, _ = _load_job_defaults(ep_id, "faces_embed")
+cluster_job_defaults, _ = _load_job_defaults(ep_id, "cluster")
 local_video_exists = bool(details["local"].get("exists"))
 video_meta_key = f"episode_detail_video_meta::{ep_id}"
 video_meta = st.session_state.get(video_meta_key)
@@ -412,10 +422,12 @@ manifest_state = _detect_track_manifests_ready(detections_path, tracks_path)
 faces_status_value = str(faces_phase_status.get("status") or "missing").lower()
 cluster_status_value = str(cluster_phase_status.get("status") or "missing").lower()
 tracks_ready_flag = bool((status_payload or {}).get("tracks_ready"))
+detect_job_state = (detect_job_record or {}).get("state")
 detect_status_value, tracks_ready, using_manifest_fallback = _compute_detect_track_effective_status(
     detect_phase_status,
     manifest_ready=manifest_state["manifest_ready"],
     tracks_ready_flag=tracks_ready_flag,
+    job_state=detect_job_state,
 )
 
 # Other status values
@@ -462,6 +474,11 @@ if status_payload:
             # Show manifest-fallback caption when status was inferred from manifests
             if using_manifest_fallback:
                 st.caption("ℹ️ _Detect/Track completion inferred from manifests (status API missing/stale)._")
+        elif detect_status_value == "running":
+            st.info("⏳ **Detect/Track**: Running")
+            if detect_job_record and detect_job_record.get("started_at"):
+                st.caption(f"Started at {detect_job_record['started_at']}")
+            st.caption("Live progress appears in the log panel below.")
         elif detect_status_value == "partial":
             st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
             st.caption("Rerun detect/track to rebuild tracks.")
