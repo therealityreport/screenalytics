@@ -44,4 +44,3 @@ jobs:
             Prioritize P0 and P1 items with concrete, minimal fixes.
             Use the repository’s guidelines:
             ${{ steps.guidelines.outputs.guidelines }}
-

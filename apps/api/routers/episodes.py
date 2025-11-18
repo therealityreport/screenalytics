@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
-from py_screanalytics.facebank_seed import select_facebank_seeds, write_facebank_seeds
+from py_screenalytics.facebank_seed import select_facebank_seeds, write_facebank_seeds
 
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service

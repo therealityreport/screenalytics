@@ -76,4 +76,3 @@ jobs:
             } else {
               core.info('Not an issue/PR context; skipping comment.');
             }
-

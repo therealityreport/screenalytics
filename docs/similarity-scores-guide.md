@@ -54,4 +54,3 @@ The system uses **cosine similarity** (0.0-1.0 scale) to compare face embeddings
 - 🟢 **Strong** (#4CAF50): sim ≥ 0.68 AND margin ≥ 0.10 → Auto-assign
 - 🟡 **Ambiguous** (#FFC107): sim ≥ 0.68 BUT margin < 0.10 → Manual review
 - 🔴 **Weak** (#F44336): sim < 0.68 → Do not assign
-

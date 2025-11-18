@@ -34,4 +34,3 @@ Review only the PR diff. Favor minimal, targeted fixes over broad refactors.
 - Leave inline comments where code is affected.
 - Summarize P0/P1 with a short list of required changes.
 - Provide minimal code suggestions when safe.
-
