@@ -1093,9 +1093,17 @@ def _prepare_face_crop(
                 pass
 
     x1, y1, x2, y2 = bbox
-    width = max(x2 - x1, 1.0)
-    height = max(y2 - y1, 1.0)
-    
+
+    # Validate bbox coordinates before computing dimensions
+    if x1 is None or y1 is None or x2 is None or y2 is None:
+        return None, f"invalid_bbox_none_values_{x1}_{y1}_{x2}_{y2}"
+
+    try:
+        width = max(float(x2) - float(x1), 1.0)
+        height = max(float(y2) - float(y1), 1.0)
+    except (TypeError, ValueError) as e:
+        return None, f"invalid_bbox_coordinates_{e}"
+
     # Adaptive margin: smaller faces get more margin to capture context
     # Larger faces get less margin to avoid over-cropping
     if adaptive_margin:
