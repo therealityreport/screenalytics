@@ -946,6 +946,39 @@ def _phase_from_endpoint(endpoint_path: str | None) -> str | None:
     return None
 
 
+def _fetch_async_job_error(ep_id: str, phase: str) -> str | None:
+    """
+    Fetch the most recent async job record for the given episode and phase
+    to extract error details when progress file is missing.
+    """
+    try:
+        resp = requests.get(
+            f"{_api_base()}/jobs",
+            params={"ep_id": ep_id, "job_type": phase},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        jobs = resp.json()
+        if not isinstance(jobs, list) or not jobs:
+            return None
+        # Get most recent job (jobs are typically sorted by creation time)
+        job = jobs[0]
+        if isinstance(job, dict):
+            error = job.get("error")
+            if error:
+                return f"Job failed: {error}"
+            state = job.get("state")
+            if state == "failed":
+                stderr_log = job.get("stderr_log")
+                if stderr_log:
+                    return f"Job failed (check stderr log: {stderr_log})"
+                return "Job failed during initialization (no error details available)"
+    except Exception:
+        # Don't fail if we can't fetch job details, just return None
+        pass
+    return None
+
+
 def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
     payload = _episode_status_payload(ep_id)
     if not payload:
@@ -1082,10 +1115,18 @@ def fallback_poll_progress(
     progress_url = f"{_api_base()}/episodes/{ep_id}/progress"
     phase_hint = _phase_from_endpoint(async_endpoint) or "detect_track"
     last_progress: Dict[str, Any] | None = None
+    poll_attempts = 0
+    max_poll_attempts = 60  # 30 seconds (60 attempts * 0.5s sleep)
     while True:
         try:
             resp = requests.get(progress_url, timeout=5)
             if resp.status_code == 404:
+                poll_attempts += 1
+                if poll_attempts > max_poll_attempts:
+                    # Timeout: progress file never appeared, job likely failed during init
+                    # Fetch job record to surface actual error
+                    job_error = _fetch_async_job_error(ep_id, phase_hint)
+                    return None, job_error or f"Job initialization timed out after {max_poll_attempts * 0.5:.0f}s (progress file never created)"
                 status_placeholder.info("initializing...")
                 time.sleep(0.5)
                 continue

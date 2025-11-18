@@ -610,7 +610,22 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     try:
         JOB_SERVICE.ensure_retinaface_ready(detector_value, req.device, req.det_thresh)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Model validation failed - provide actionable error message
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model initialization failed: {exc}",
+        ) from exc
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing dependencies for detector '{detector_value}': {exc}. "
+            "Install ML stack with: pip install -r requirements-ml.txt",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error initializing detector '{detector_value}' on device '{req.device}': {exc}",
+        ) from exc
     progress_path = _progress_file_path(req.ep_id)
     try:
         progress_path.unlink()
@@ -665,7 +680,22 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     try:
         JOB_SERVICE.ensure_arcface_ready(device_value)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Model validation failed - provide actionable error message
+        raise HTTPException(
+            status_code=400,
+            detail=f"Face embedding model initialization failed: {exc}",
+        ) from exc
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing dependencies for face embedding: {exc}. "
+            "Install ML stack with: pip install -r requirements-ml.txt",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error initializing ArcFace on device '{device_value}': {exc}",
+        ) from exc
     progress_path = _progress_file_path(req.ep_id)
     command = _build_faces_command(req, progress_path)
     result = _run_job_with_optional_sse(command, request, progress_file=progress_path)

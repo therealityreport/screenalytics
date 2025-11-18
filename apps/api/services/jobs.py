@@ -212,8 +212,22 @@ class JobService:
             pass
 
         job_id = uuid.uuid4().hex
+
+        # Create stderr log file to capture early failures (model init, video access, etc.)
+        stderr_log_dir = progress_path.parent / "logs"
+        stderr_log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_log_path = stderr_log_dir / f"job-{job_id}.stderr.log"
+
         env = os.environ.copy()
-        proc = subprocess.Popen(command, cwd=str(PROJECT_ROOT), env=env)  # noqa: S603
+        # Open stderr log for subprocess (will be closed automatically when process exits)
+        stderr_file = open(stderr_log_path, "w", encoding="utf-8")  # noqa: SIM115
+        proc = subprocess.Popen(
+            command,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            stderr=stderr_file,
+            stdout=subprocess.DEVNULL,  # Stdout goes to progress.json via ProgressEmitter
+        )  # noqa: S603
 
         record: JobRecord = {
             "job_id": job_id,
@@ -224,6 +238,7 @@ class JobService:
             "started_at": self._now(),
             "ended_at": None,
             "progress_file": str(progress_path),
+            "stderr_log": str(stderr_log_path),
             "command": command,
             "requested": requested,
             "summary": None,

@@ -84,6 +84,39 @@ def _normalize_det_thresh(value: float | str | None) -> float:
     except (TypeError, ValueError):
         numeric = RETINAFACE_SCORE_THRESHOLD
     return min(max(numeric, 0.0), 1.0)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "off", "no"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
 BYTE_TRACK_MIN_BOX_AREA_DEFAULT = max(
     _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
     0.0,
@@ -124,38 +157,6 @@ BYTE_TRACK_BUFFER_DEFAULT = TRACK_BUFFER_BASE_DEFAULT
 BYTE_TRACK_HIGH_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
 BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = TRACK_NEW_THRESH_DEFAULT
 BYTE_TRACK_MIN_BOX_AREA = BYTE_TRACK_MIN_BOX_AREA_DEFAULT
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "off", "no"}:
-        return False
-    return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
 
 
 def _resolve_track_sample_limit(value: str | int | None) -> int | None:
@@ -3175,6 +3176,14 @@ def _run_detect_track_stage(
         stride=args.stride,
         fps_detected=source_fps,
         fps_requested=target_fps,
+    )
+
+    # Emit initial progress before model initialization to ensure progress.json
+    # exists even if the job fails early (e.g., model load error, video access issue)
+    progress.emit(
+        frames_done=0,
+        phase="init",
+        force=True,
     )
 
     save_frames = bool(args.save_frames)
