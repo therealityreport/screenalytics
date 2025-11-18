@@ -2978,10 +2978,41 @@ def _run_full_pipeline(
                         )
                         raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
                     face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+
+                    # Validate detection bboxes before tracking to prevent NoneType multiply errors
+                    validated_detections = []
+                    invalid_bbox_count = 0
                     for det_sample in face_detections:
                         _record_detection_conf(float(det_sample.conf))
-                    tracked_objects = tracker_adapter.update(face_detections, frame_idx, frame)
-                    diag_stats = _diagnostic_stats(len(face_detections), len(tracked_objects))
+
+                        # Validate bbox coordinates
+                        validated_bbox, bbox_err = _safe_bbox_or_none(det_sample.bbox)
+                        if validated_bbox is None:
+                            invalid_bbox_count += 1
+                            LOGGER.warning(
+                                "Dropping detection at frame %d for %s: invalid bbox (%s) - bbox=%s",
+                                frame_idx,
+                                args.ep_id,
+                                bbox_err,
+                                det_sample.bbox,
+                            )
+                            continue
+
+                        # Update detection with validated bbox
+                        det_sample.bbox = np.array(validated_bbox)
+                        validated_detections.append(det_sample)
+
+                    if invalid_bbox_count > 0:
+                        LOGGER.info(
+                            "Frame %d for %s: dropped %d/%d detections due to invalid bboxes",
+                            frame_idx,
+                            args.ep_id,
+                            invalid_bbox_count,
+                            len(face_detections),
+                        )
+
+                    tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+                    diag_stats = _diagnostic_stats(len(validated_detections), len(tracked_objects))
                     last_diag_stats = diag_stats
                     if progress:
                         detect_extra = dict(detect_meta)
@@ -3008,7 +3039,7 @@ def _run_full_pipeline(
                                 det_count,
                                 recorder.active_track_count,
                                 recorder.metrics["tracks_born"],
-                                len(face_detections),
+                                len(validated_detections),
                                 len(tracked_objects),
                                 frame_stride,
                                 tracker_config_summary.get("track_high_thresh", 0.0),
@@ -3027,7 +3058,7 @@ def _run_full_pipeline(
                                 det_count,
                                 recorder.active_track_count,
                                 recorder.metrics["tracks_born"],
-                                len(face_detections),
+                                len(validated_detections),
                                 len(tracked_objects),
                                 frame_stride,
                             )
@@ -3087,7 +3118,7 @@ def _run_full_pipeline(
                         # matching gate embedding to appropriate face sample per track. Requires
                         # invasive schema changes and careful handling of missing/mismatched cases.
 
-                    if not face_detections:
+                    if not validated_detections:
                         if frame_exporter and frame_exporter.save_frames:
                             frame_exporter.export(frame_idx, frame, [], ts=ts)
                         frame_idx += 1

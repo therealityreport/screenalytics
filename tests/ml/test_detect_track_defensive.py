@@ -306,3 +306,73 @@ def test_safe_bbox_or_none_with_invalid_string_coordinates():
 
     assert validated is None, "Should reject bbox with invalid string"
     assert "bbox_coord_2_invalid" in error, f"Expected 'invalid' error, got: {error}"
+
+
+# === Integration test for detection bbox validation in detect loop ===
+
+
+def test_detection_bbox_validation_filters_invalid_before_tracking():
+    """
+    Detect loop should validate detection bboxes before passing to ByteTrack.
+
+    This regression test ensures invalid bboxes from RetinaFace are dropped
+    early, preventing NoneType multiply errors in downstream crop/export logic.
+    """
+    from tools.episode_run import _safe_bbox_or_none
+
+    # Simulate detection results with mix of valid and invalid bboxes
+    class MockDetection:
+        def __init__(self, bbox, conf, class_label):
+            self.bbox = np.array(bbox) if bbox is not None else None
+            self.conf = conf
+            self.class_label = class_label
+
+    # Mix of valid and invalid detections (like RetinaFace might emit)
+    raw_detections = [
+        MockDetection([100.0, 200.0, 300.0, 400.0], 0.95, "face"),  # Valid
+        MockDetection([None, 200.0, 300.0, 400.0], 0.92, "face"),  # Invalid: None x1
+        MockDetection([100.0, 200.0, 300.0, None], 0.89, "face"),  # Invalid: None y2
+        MockDetection([150.0, 250.0, 350.0, 450.0], 0.91, "face"),  # Valid
+        MockDetection([100.0, 200.0, np.nan, 400.0], 0.88, "face"),  # Invalid: NaN
+    ]
+
+    # Filter logic (simulates what detect loop should do)
+    validated_detections = []
+    invalid_count = 0
+
+    for det in raw_detections:
+        if det.class_label != "face":
+            continue
+
+        validated_bbox, bbox_err = _safe_bbox_or_none(det.bbox)
+        if validated_bbox is None:
+            invalid_count += 1
+            # In real code, would log warning here
+            continue
+
+        # Update with validated bbox
+        det.bbox = np.array(validated_bbox)
+        validated_detections.append(det)
+
+    # Assertions
+    assert len(raw_detections) == 5, "Should start with 5 raw detections"
+    assert len(validated_detections) == 2, "Should have 2 valid detections after filtering"
+    assert invalid_count == 3, "Should have dropped 3 invalid detections"
+
+    # Validate that remaining detections have valid bboxes
+    for det in validated_detections:
+        assert len(det.bbox) == 4, "Valid detection should have 4 bbox coords"
+        for coord in det.bbox:
+            assert coord is not None, "Valid bbox should have no None coords"
+            assert np.isfinite(coord), "Valid bbox should have finite coords"
+
+    # Verify we can safely perform multiplication on validated bboxes (no TypeError)
+    for det in validated_detections:
+        x1, y1, x2, y2 = det.bbox
+        width = x2 - x1
+        height = y2 - y1
+        margin = 0.15
+        expand_x = width * margin  # Should not raise TypeError
+        expand_y = height * margin  # Should not raise TypeError
+        assert expand_x >= 0, "Margin expansion should be non-negative"
+        assert expand_y >= 0, "Margin expansion should be non-negative"
