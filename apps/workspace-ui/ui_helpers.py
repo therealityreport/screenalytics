@@ -1208,22 +1208,42 @@ def run_job_with_progress(
     log_expander = st.expander("Detailed log", expanded=False)
     with log_expander:
         log_placeholder = st.empty()
-        log_placeholder.code("Waiting for progress updates…", language="text")
     log_lines: List[str] = []
     max_log_lines = 25
     last_logged_frame: int | None = None
     last_logged_phase: str | None = None
     frame_log_interval = 100
+    events_seen = False
+
+    def _mode_context() -> str:
+        parts: List[str] = []
+        if requested_detector:
+            parts.append(f"detector={requested_detector}")
+        if requested_tracker:
+            parts.append(f"tracker={requested_tracker}")
+        if requested_device:
+            parts.append(f"device={requested_device}")
+        context = ", ".join(parts) if parts else f"device={requested_device}"
+        return context
+
+    def _append_log(entry: str) -> None:
+        log_lines.append(entry)
+        if len(log_lines) > max_log_lines:
+            del log_lines[0 : len(log_lines) - max_log_lines]
+        log_placeholder.code("\n\n".join(log_lines), language="text")
 
     dedupe_key = f"last_progress_event::{endpoint_path}"
     run_id_key = f"current_run_id::{endpoint_path}"
     st.session_state.pop(dedupe_key, None)
     phase_hint = _phase_from_endpoint(endpoint_path) or "detect_track"
 
+    _append_log(f"Starting request to {endpoint_path} ({_mode_context()})…")
+
     def _cb(progress: Dict[str, Any]) -> None:
-        nonlocal last_logged_frame, last_logged_phase
+        nonlocal last_logged_frame, last_logged_phase, events_seen
         if not isinstance(progress, dict):
             return
+        events_seen = True
 
         # Honor run_id: ignore events from stale runs
         event_run_id = progress.get("run_id")
@@ -1254,6 +1274,13 @@ def run_job_with_progress(
             progress["video_time"] = video_total
         if progress.get("detector"):
             remember_detector(progress.get("detector"))
+        current_phase = str(progress.get("phase") or "")
+        if current_phase.lower() == "log":
+            stream_label = progress.get("stream") or "stdout"
+            message = progress.get("message")
+            if message:
+                _append_log(f"[{stream_label}] {message}")
+            return
         status_line, frames_line = update_progress_display(
             progress,
             progress_bar=progress_bar,
@@ -1264,7 +1291,6 @@ def run_job_with_progress(
             requested_tracker=requested_tracker,
         )
         frames_done_val = coerce_int(progress.get("frames_done"))
-        current_phase = str(progress.get("phase") or "")
         log_event = False
         if last_logged_phase is None or current_phase != last_logged_phase:
             log_event = True
@@ -1275,10 +1301,7 @@ def run_job_with_progress(
         elif last_logged_frame is None:
             log_event = True
         if log_event:
-            log_lines.append(f"{status_line}\n{frames_line}")
-            if len(log_lines) > max_log_lines:
-                del log_lines[0 : len(log_lines) - max_log_lines]
-            log_placeholder.code("\n\n".join(log_lines), language="text")
+            _append_log(f"{status_line}\n{frames_line}")
             last_logged_phase = current_phase
             if frames_done_val is not None:
                 last_logged_frame = frames_done_val
@@ -1288,6 +1311,9 @@ def run_job_with_progress(
     try:
         if use_async_only:
             target_endpoint = async_endpoint or endpoint_path
+            _append_log(
+                f"Using async endpoint {target_endpoint} immediately ({_mode_context()}); polling for progress…"
+            )
             summary, error_message = fallback_poll_progress(
                 ep_id,
                 payload,
@@ -1298,7 +1324,28 @@ def run_job_with_progress(
             )
         else:
             summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
+            if not events_seen:
+                if error_message:
+                    _append_log(
+                        f"Request failed before any realtime updates ({_mode_context()}): {error_message}"
+                    )
+                elif summary:
+                    _append_log(
+                        f"Server returned a synchronous summary before streaming updates ({_mode_context()})."
+                    )
+                else:
+                    fallback_hint = (
+                        f"; checking async fallback via {async_endpoint}"
+                        if async_endpoint
+                        else ""
+                    )
+                    _append_log(
+                        f"No realtime events received yet from {endpoint_path} ({_mode_context()}){fallback_hint}."
+                    )
             if async_endpoint and (summary is None or error_message):
+                _append_log(
+                    f"Falling back to async endpoint {async_endpoint} for {endpoint_path} ({_mode_context()})…"
+                )
                 fallback_summary, fallback_error = fallback_poll_progress(
                     ep_id,
                     payload,
@@ -1310,6 +1357,14 @@ def run_job_with_progress(
                 if fallback_summary is not None or fallback_error is None:
                     summary = fallback_summary
                     error_message = fallback_error
+                if fallback_error:
+                    _append_log(
+                        f"Async endpoint {async_endpoint} reported an error ({_mode_context()}): {fallback_error}"
+                    )
+                elif fallback_summary:
+                    _append_log(
+                        f"Async endpoint {async_endpoint} returned a summary ({_mode_context()})."
+                    )
         if summary and isinstance(summary, dict):
             remember_detector(summary.get("detector"))
             remember_tracker(summary.get("tracker"))

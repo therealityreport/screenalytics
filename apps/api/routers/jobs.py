@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Literal
+from typing import Any, List, Literal
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request
@@ -403,28 +403,75 @@ async def _stream_progress_command(command: List[str], env: dict, request: Reque
         env=env,
     )
     saw_terminal = False
+    last_run_id: str | None = None
+    stdout_task: asyncio.Task | None = None
+    stderr_task: asyncio.Task | None = None
     try:
         assert proc.stdout is not None
-        async for raw_line in proc.stdout:
-            line = raw_line.decode().strip()
-            if not line:
-                continue
-            payload = _parse_progress_line(line)
-            if payload is None:
-                continue
-            phase = str(payload.get("phase", "")).lower()
-            if phase == "done":
-                event_name = "done"
-                saw_terminal = True
-            elif phase == "error":
-                event_name = "error"
-                saw_terminal = True
-            else:
-                event_name = "progress"
-            yield _format_sse(event_name, payload)
-            if await request.is_disconnected():
-                proc.terminate()
+        stdout_task = asyncio.create_task(proc.stdout.readline())
+        if proc.stderr is not None:
+            stderr_task = asyncio.create_task(proc.stderr.readline())
+        while stdout_task or stderr_task:
+            pending = [task for task in (stdout_task, stderr_task) if task]
+            if not pending:
                 break
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if stdout_task in done:
+                raw_line = stdout_task.result()
+                stdout_task = None
+                if raw_line:
+                    line = raw_line.decode().strip()
+                    if line:
+                        payload = _parse_progress_line(line)
+                        if payload is None:
+                            log_payload: dict[str, Any] = {
+                                "phase": "log",
+                                "stream": "stdout",
+                                "message": line,
+                            }
+                            if last_run_id:
+                                log_payload["run_id"] = last_run_id
+                            yield _format_sse("log", log_payload)
+                        else:
+                            run_id_value = payload.get("run_id")
+                            if isinstance(run_id_value, str):
+                                last_run_id = run_id_value
+                            phase = str(payload.get("phase", "")).lower()
+                            if phase == "done":
+                                event_name = "done"
+                                saw_terminal = True
+                            elif phase == "error":
+                                event_name = "error"
+                                saw_terminal = True
+                            else:
+                                event_name = "progress"
+                            yield _format_sse(event_name, payload)
+                            if await request.is_disconnected():
+                                proc.terminate()
+                                break
+                    stdout_task = asyncio.create_task(proc.stdout.readline())
+                else:
+                    stdout_task = None
+            if stderr_task in done:
+                raw_err = stderr_task.result()
+                stderr_task = None
+                if raw_err:
+                    err_line = raw_err.decode().strip()
+                    if err_line:
+                        err_payload: dict[str, Any] = {
+                            "phase": "log",
+                            "stream": "stderr",
+                            "message": err_line,
+                        }
+                        if last_run_id:
+                            err_payload["run_id"] = last_run_id
+                        yield _format_sse("log", err_payload)
+                        if await request.is_disconnected():
+                            proc.terminate()
+                            break
+                    stderr_task = asyncio.create_task(proc.stderr.readline())
+                else:
+                    stderr_task = None
         await proc.wait()
         if proc.returncode not in (0, None) and not saw_terminal:
             stderr_text = ""
@@ -438,6 +485,9 @@ async def _stream_progress_command(command: List[str], env: dict, request: Reque
             }
             yield _format_sse("error", payload)
     finally:
+        for task in (stdout_task, stderr_task):
+            if task:
+                task.cancel()
         if proc.returncode is None:
             proc.kill()
 
