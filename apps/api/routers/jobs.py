@@ -42,6 +42,7 @@ SCENE_THRESHOLD_DEFAULT = getattr(jobs_service, "SCENE_THRESHOLD_DEFAULT", 27.0)
 SCENE_MIN_LEN_DEFAULT = getattr(jobs_service, "SCENE_MIN_LEN_DEFAULT", 12)
 SCENE_WARMUP_DETS_DEFAULT = getattr(jobs_service, "SCENE_WARMUP_DETS_DEFAULT", 3)
 DEFAULT_CLUSTER_SIMILARITY = float(os.getenv("SCREENALYTICS_CLUSTER_SIM", "0.7"))
+MIN_IDENTITY_SIMILARITY = float(os.getenv("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
 CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
 CleanupAction = Literal["split_tracks", "reembed", "recluster", "group_clusters"]
 
@@ -173,6 +174,12 @@ class ClusterRequest(BaseModel):
         description="Minimum cosine similarity for clustering (converted to 1-sim distance)",
     )
     min_cluster_size: int = Field(2, ge=1, description="Minimum tracks per identity")
+    min_identity_sim: float = Field(
+        MIN_IDENTITY_SIMILARITY,
+        ge=0.0,
+        le=0.99,
+        description="Minimum cosine similarity for a track to remain in an identity cluster",
+    )
 
 
 class CleanupJobRequest(BaseModel):
@@ -194,6 +201,7 @@ class CleanupJobRequest(BaseModel):
     scene_warmup_dets: int = Field(SCENE_WARMUP_DETS_DEFAULT, ge=0)
     cluster_thresh: float = Field(DEFAULT_CLUSTER_SIMILARITY, ge=0.2, le=0.99)
     min_cluster_size: int = Field(2, ge=1, le=50)
+    min_identity_sim: float = Field(MIN_IDENTITY_SIMILARITY, ge=0.0, le=0.99)
     thumb_size: int = Field(256, ge=64, le=512)
     actions: List[CleanupAction] = Field(default_factory=lambda: list(CLEANUP_ACTIONS))
     write_back: bool = Field(True, description="Update people.json with grouping assignments")
@@ -375,6 +383,7 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
     ]
     command += ["--cluster-thresh", str(req.cluster_thresh)]
     command += ["--min-cluster-size", str(req.min_cluster_size)]
+    command += ["--min-identity-sim", str(req.min_identity_sim)]
     return command
 
 
@@ -838,6 +847,7 @@ async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
             device=req.device or "auto",
             cluster_thresh=req.cluster_thresh,
             min_cluster_size=req.min_cluster_size,
+            min_identity_sim=req.min_identity_sim,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -882,6 +892,7 @@ async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request
             scene_warmup_dets=req.scene_warmup_dets,
             cluster_thresh=req.cluster_thresh,
             min_cluster_size=req.min_cluster_size,
+            min_identity_sim=req.min_identity_sim,
             thumb_size=req.thumb_size,
             actions=actions,
             write_back=req.write_back,

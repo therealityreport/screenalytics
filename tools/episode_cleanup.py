@@ -135,6 +135,8 @@ def _build_cluster_command(args, progress_path: Path) -> List[str]:
         str(args.cluster_thresh),
         "--min-cluster-size",
         str(args.min_cluster_size),
+        "--min-identity-sim",
+        str(args.min_identity_sim),
         "--progress-file",
         str(progress_path),
     ]
@@ -183,6 +185,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-gap", type=int, default=30)
     parser.add_argument("--cluster-thresh", type=float, default=0.6)
     parser.add_argument("--min-cluster-size", type=int, default=2)
+    parser.add_argument("--min-identity-sim", type=float, default=0.5)
     parser.add_argument("--thumb-size", type=int, default=256)
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--progress-file", help="Path to write aggregated progress JSON")

@@ -150,6 +150,7 @@ TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
 DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
+MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
@@ -2305,6 +2306,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=2,
         help="Minimum tracks per identity before splitting into singletons",
     )
+    parser.add_argument(
+        "--min-identity-sim",
+        type=float,
+        default=MIN_IDENTITY_SIMILARITY,
+        help="Minimum cosine similarity for a track to remain in an identity cluster (outliers are split out)",
+    )
     gate_group = parser.add_argument_group("Appearance gate")
     gate_group.add_argument(
         "--gate-appear-hard",
@@ -4037,6 +4044,27 @@ def _run_cluster_stage(
             for tid, label in zip(track_ids, labels):
                 track_groups[label].append(tid)
 
+        # Build track embeddings index for outlier removal
+        track_embeddings: Dict[int, np.ndarray] = {}
+        for tid, embed in zip(track_ids, embedding_rows):
+            track_embeddings[tid] = embed
+
+        # Remove low-similarity outliers from clusters
+        min_identity_sim = max(0.0, min(float(args.min_identity_sim), 0.99))
+        outlier_tracks: List[Tuple[int, str]] = []
+        if min_identity_sim > 0.0 and track_groups:
+            track_groups, outlier_tracks = _remove_low_similarity_outliers(
+                track_groups,
+                track_embeddings,
+                min_identity_sim,
+            )
+            if outlier_tracks:
+                LOGGER.info(
+                    "Removed %d outlier tracks with similarity < %.2f from their identity clusters",
+                    len(outlier_tracks),
+                    min_identity_sim,
+                )
+
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
         thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
@@ -4044,6 +4072,13 @@ def _run_cluster_stage(
         identity_counter = 1
         candidate_groups: List[List[int]] = list(track_groups.values())
         candidate_groups.extend(forced_singletons)
+
+        # Add outlier tracks as separate single-track identities
+        outlier_singletons: List[List[int]] = [[tid] for tid, _ in outlier_tracks]
+        candidate_groups.extend(outlier_singletons)
+
+        # Build outlier lookup for manifest metadata
+        outlier_map: Dict[int, str] = {tid: reason for tid, reason in outlier_tracks}
         for tids in candidate_groups:
             buckets = [tids]
             if len(tids) < min_cluster:
@@ -4061,16 +4096,52 @@ def _run_cluster_stage(
                     identity_id,
                     s3_prefixes,
                 )
-                identity_payload.append(
-                    {
-                        "identity_id": identity_id,
-                        "label": None,
-                        "track_ids": bucket,
-                        "size": identity_faces,
-                        "rep_thumb_rel_path": rep_rel,
-                        "rep_thumb_s3_key": rep_s3,
-                    }
-                )
+
+                # Check if any tracks in this identity are outliers
+                outlier_reasons = [outlier_map[tid] for tid in bucket if tid in outlier_map]
+                is_outlier_identity = len(outlier_reasons) > 0
+                is_singleton_outlier = len(bucket) == 1 and is_outlier_identity
+
+                # Compute identity cohesion (average similarity to centroid)
+                cohesion_score: float | None = None
+                min_sim_to_centroid: float | None = None
+                if len(bucket) > 1:
+                    bucket_embeds = [track_embeddings[tid] for tid in bucket if tid in track_embeddings]
+                    if len(bucket_embeds) >= 2:
+                        centroid = np.mean(bucket_embeds, axis=0)
+                        norm_centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+                        sims = [_cosine_similarity(emb, norm_centroid) for emb in bucket_embeds]
+                        cohesion_score = float(np.mean(sims))
+                        min_sim_to_centroid = float(np.min(sims))
+
+                identity_record = {
+                    "identity_id": identity_id,
+                    "label": None,
+                    "track_ids": bucket,
+                    "size": identity_faces,
+                    "rep_thumb_rel_path": rep_rel,
+                    "rep_thumb_s3_key": rep_s3,
+                }
+
+                # Add outlier metadata
+                if is_singleton_outlier:
+                    identity_record["outlier_reason"] = outlier_reasons[0]
+                    identity_record["low_cohesion"] = True
+
+                # Add cohesion stats
+                if cohesion_score is not None:
+                    identity_record["cohesion"] = round(cohesion_score, 4)
+                if min_sim_to_centroid is not None:
+                    identity_record["min_identity_sim"] = round(min_sim_to_centroid, 4)
+
+                # Flag low cohesion if cohesion or min_sim is below threshold
+                if not is_outlier_identity:
+                    if cohesion_score is not None and cohesion_score < 0.80:
+                        identity_record["low_cohesion"] = True
+                    elif min_sim_to_centroid is not None and min_sim_to_centroid < min_identity_sim:
+                        identity_record["low_cohesion"] = True
+
+                identity_payload.append(identity_record)
                 faces_done = min(faces_total, faces_done + identity_faces)
                 progress.emit(
                     faces_done,
@@ -4095,13 +4166,21 @@ def _run_cluster_stage(
         )
 
         identities_path = manifests_dir / "identities.json"
+        low_cohesion_count = sum(1 for identity in identity_payload if identity.get("low_cohesion"))
         payload = {
             "ep_id": args.ep_id,
             "pipeline_ver": PIPELINE_VERSION,
+            "config": {
+                "cluster_thresh": args.cluster_thresh,
+                "min_cluster_size": min_cluster,
+                "min_identity_sim": min_identity_sim,
+            },
             "stats": {
                 "faces": faces_total,
                 "clusters": len(identity_payload),
                 "mixed_tracks": len(flagged_tracks),
+                "outlier_tracks": len(outlier_tracks),
+                "low_cohesion_identities": low_cohesion_count,
             },
             "identities": identity_payload,
         }
@@ -4399,6 +4478,70 @@ def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
         distance_threshold=distance_threshold,
     )
     return model.fit_predict(matrix)
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two L2-normalized vectors."""
+    norm_a = np.linalg.norm(a) + 1e-12
+    norm_b = np.linalg.norm(b) + 1e-12
+    return float(np.dot(a / norm_a, b / norm_b))
+
+
+def _remove_low_similarity_outliers(
+    track_groups: Dict[int, List[int]],
+    track_embeddings: Dict[int, np.ndarray],
+    min_sim: float,
+) -> Tuple[Dict[int, List[int]], List[Tuple[int, str]]]:
+    """Remove tracks that have low similarity to their identity centroid.
+
+    Returns:
+        - Updated track_groups with outliers removed
+        - List of (track_id, reason) tuples for outlier tracks
+    """
+    outliers: List[Tuple[int, str]] = []
+    updated_groups: Dict[int, List[int]] = {}
+
+    for label, track_ids in track_groups.items():
+        if len(track_ids) < 2:
+            # Single-track identities always pass
+            updated_groups[label] = track_ids
+            continue
+
+        # Compute cluster centroid
+        cluster_embeds = [track_embeddings[tid] for tid in track_ids if tid in track_embeddings]
+        if not cluster_embeds:
+            updated_groups[label] = track_ids
+            continue
+
+        centroid = np.mean(cluster_embeds, axis=0)
+        norm_centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+
+        # Check similarity of each track to centroid
+        kept_tracks = []
+        for tid in track_ids:
+            if tid not in track_embeddings:
+                kept_tracks.append(tid)
+                continue
+
+            track_embed = track_embeddings[tid]
+            similarity = _cosine_similarity(track_embed, norm_centroid)
+
+            if similarity >= min_sim:
+                kept_tracks.append(tid)
+            else:
+                outliers.append((tid, f"low_identity_similarity_{similarity:.3f}"))
+                LOGGER.info(
+                    "Track %d removed from cluster %d (similarity %.3f < %.3f)",
+                    tid,
+                    label,
+                    similarity,
+                    min_sim,
+                )
+
+        if kept_tracks:
+            updated_groups[label] = kept_tracks
+
+    return updated_groups, outliers
 
 
 def _materialize_identity_thumb(

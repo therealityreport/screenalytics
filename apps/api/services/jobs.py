@@ -420,6 +420,7 @@ class JobService:
         device: str,
         cluster_thresh: float,
         min_cluster_size: int,
+        min_identity_sim: float,
     ) -> JobRecord:
         manifests_dir = get_path(ep_id, "detections").parent
         faces_path = manifests_dir / "faces.jsonl"
@@ -439,10 +440,12 @@ class JobService:
         ]
         command += ["--cluster-thresh", str(cluster_thresh)]
         command += ["--min-cluster-size", str(min_cluster_size)]
+        command += ["--min-identity-sim", str(min_identity_sim)]
         requested = {
             "device": device,
             "cluster_thresh": cluster_thresh,
             "min_cluster_size": min_cluster_size,
+            "min_identity_sim": min_identity_sim,
         }
         return self._launch_job(
             job_type="cluster",
@@ -474,6 +477,7 @@ class JobService:
         scene_warmup_dets: int,
         cluster_thresh: float,
         min_cluster_size: int,
+        min_identity_sim: float,
         thumb_size: int,
         actions: List[str],
         write_back: bool,
@@ -515,6 +519,8 @@ class JobService:
             str(cluster_thresh),
             "--min-cluster-size",
             str(min_cluster_size),
+            "--min-identity-sim",
+            str(min_identity_sim),
             "--thumb-size",
             str(thumb_size),
             "--jpeg-quality",
@@ -556,6 +562,7 @@ class JobService:
             "scene_warmup_dets": scene_warmup_dets,
             "cluster_thresh": cluster_thresh,
             "min_cluster_size": min_cluster_size,
+            "min_identity_sim": min_identity_sim,
             "thumb_size": thumb_size,
             "actions": normalized_actions,
             "write_back": write_back,

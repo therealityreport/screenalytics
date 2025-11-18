@@ -19,6 +19,7 @@ LOGGER = logging.getLogger(__name__)
 REP_DET_MIN = float(os.getenv("REP_DET_MIN", "0.60"))
 REP_STD_MIN = float(os.getenv("REP_STD_MIN", "1.0"))
 REP_MAX_FRAMES_PER_TRACK = int(os.getenv("REP_MAX_FRAMES_PER_TRACK", "50"))
+REP_MIN_SIM_TO_CENTROID = float(os.getenv("REP_MIN_SIM_TO_CENTROID", "0.50"))
 
 
 def _now_iso() -> str:
@@ -163,7 +164,9 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
             "rep_frame": 123,
             "crop_key": "crops/track_0001/frame_000123.jpg",
             "embed": [...512-d L2-norm...],
-            "quality": {"det": 0.82, "std": 15.3}
+            "quality": {"det": 0.82, "std": 15.3},
+            "sim_to_centroid": 0.95,  # optional
+            "low_confidence": true     # optional, when sim < threshold
         }
     """
     faces = _load_faces_for_track(ep_id, track_id)
@@ -173,38 +176,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     # Sort by frame index
     faces.sort(key=lambda f: f.get("frame_idx", float('inf')))
 
-    # Find first accepted frame
-    rep_face = None
-    rep_crop_key = None
-
-    for face in faces:
-        frame_idx = face.get("frame_idx")
-        if frame_idx is None:
-            continue
-
-        crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
-        if _passes_quality_gates(face, crop_path):
-            rep_face = face
-            rep_crop_key = crop_path
-            break
-
-    # Fallback to first available crop if no frame passes gates
-    if not rep_face:
-        for face in faces:
-            frame_idx = face.get("frame_idx")
-            if frame_idx is None:
-                continue
-            crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
-            if crop_path:
-                rep_face = face
-                rep_crop_key = crop_path
-                break
-
-    if not rep_face:
-        LOGGER.warning(f"No representative found for track {track_id} in {ep_id}")
-        return None
-
-    # Collect embeddings for track centroid (limited to first N accepted frames)
+    # STEP 1: Collect embeddings for track centroid computation (from quality-passing frames)
     embeddings: List[np.ndarray] = []
     for face in faces[:REP_MAX_FRAMES_PER_TRACK]:
         embedding = face.get("embedding")
@@ -234,6 +206,81 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     mean_embed = np.mean(embeddings, axis=0)
     track_centroid = l2_normalize(mean_embed)
 
+    # STEP 2: Select representative frame from high-similarity candidates
+    rep_face = None
+    rep_crop_key = None
+    rep_similarity = 0.0
+    low_confidence = False
+
+    # First pass: try to find a frame that passes quality gates AND similarity threshold
+    for face in faces:
+        frame_idx = face.get("frame_idx")
+        if frame_idx is None:
+            continue
+
+        crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
+        if not _passes_quality_gates(face, crop_path):
+            continue
+
+        # Check similarity to track centroid
+        embedding = face.get("embedding")
+        if not embedding:
+            continue
+
+        face_embed = np.array(embedding, dtype=np.float32)
+        similarity = cosine_similarity(face_embed, track_centroid)
+
+        if similarity >= REP_MIN_SIM_TO_CENTROID:
+            rep_face = face
+            rep_crop_key = crop_path
+            rep_similarity = similarity
+            break
+
+    # Second pass: if no high-similarity frame, fall back to any quality-passing frame
+    if not rep_face:
+        for face in faces:
+            frame_idx = face.get("frame_idx")
+            if frame_idx is None:
+                continue
+
+            crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
+            if _passes_quality_gates(face, crop_path):
+                embedding = face.get("embedding")
+                if embedding:
+                    face_embed = np.array(embedding, dtype=np.float32)
+                    rep_similarity = cosine_similarity(face_embed, track_centroid)
+                rep_face = face
+                rep_crop_key = crop_path
+                low_confidence = True  # Mark as low confidence since sim < threshold
+                LOGGER.info(
+                    "Track %d: using fallback rep with sim %.3f < %.3f",
+                    track_id,
+                    rep_similarity,
+                    REP_MIN_SIM_TO_CENTROID,
+                )
+                break
+
+    # Final fallback: any available crop
+    if not rep_face:
+        for face in faces:
+            frame_idx = face.get("frame_idx")
+            if frame_idx is None:
+                continue
+            crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
+            if crop_path:
+                embedding = face.get("embedding")
+                if embedding:
+                    face_embed = np.array(embedding, dtype=np.float32)
+                    rep_similarity = cosine_similarity(face_embed, track_centroid)
+                rep_face = face
+                rep_crop_key = crop_path
+                low_confidence = True
+                break
+
+    if not rep_face:
+        LOGGER.warning(f"No representative found for track {track_id} in {ep_id}")
+        return None
+
     # Extract quality metrics
     det_score = rep_face.get("det_score") or rep_face.get("conf") or 0.0
     if not det_score:
@@ -247,7 +294,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         if isinstance(quality, dict):
             std = quality.get("std") or 0.0
 
-    return {
+    result = {
         "track_id": f"track_{track_id:04d}",
         "rep_frame": rep_face.get("frame_idx"),
         "crop_key": rep_crop_key,
@@ -255,8 +302,16 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         "quality": {
             "det": round(float(det_score), 3),
             "std": round(float(std), 1),
-        }
+        },
     }
+
+    if rep_similarity > 0:
+        result["sim_to_centroid"] = round(float(rep_similarity), 4)
+
+    if low_confidence:
+        result["low_confidence"] = True
+
+    return result
 
 
 def compute_all_track_reps(ep_id: str) -> List[Dict[str, Any]]:
