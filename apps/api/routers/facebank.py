@@ -306,7 +306,7 @@ async def upload_seeds(
             detail=f"Face detection/embedding modules not available: {exc}",
         ) from exc
 
-    detector_ready, detector_error, detector_provider = episode_run.ensure_retinaface_ready("cpu")
+    detector_ready, detector_error, detector_provider = episode_run.ensure_retinaface_ready("auto")
     detector_cfg = {"ctx_id": -1, "force_simulated": not detector_ready}
     detector = RetinaFaceDetector(detector_cfg)
     detector_simulated = bool(getattr(detector, "simulated", False))

@@ -34,7 +34,7 @@ app.include_router(grouping.router, tags=["grouping"])
 
 @app.on_event("startup")
 async def _warmup_retinaface() -> None:
-    ready, detail, _ = episode_run.ensure_retinaface_ready("cpu")
+    ready, detail, _ = episode_run.ensure_retinaface_ready("auto")
     if not ready:
         LOGGER.warning("RetinaFace detector not ready: %s", detail)
 
