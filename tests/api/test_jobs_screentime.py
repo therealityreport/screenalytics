@@ -39,7 +39,9 @@ def test_start_screen_time_job_happy_path(tmp_path, monkeypatch):
     people_path.write_text(json.dumps({"people": []}), encoding="utf-8")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="test", season=1, episode=1)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="test", season=1, episode=1
+    )
 
     service = JobService(data_root=data_root)
     captured: dict = {}
@@ -118,7 +120,9 @@ def test_start_screen_time_job_default_params(tmp_path, monkeypatch):
     people_path.write_text(json.dumps({"people": []}), encoding="utf-8")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="test", season=1, episode=2)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="test", season=1, episode=2
+    )
 
     service = JobService(data_root=data_root)
     captured: dict = {}
@@ -259,7 +263,9 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
     people_path.write_text(json.dumps({"people": []}), encoding="utf-8")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="test", season=1, episode=6)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="test", season=1, episode=6
+    )
 
     service = JobService(data_root=data_root)
 
@@ -288,7 +294,7 @@ def test_analyze_screen_time_endpoint(tmp_path, monkeypatch):
             "edge_padding_s": 0.1,
             "track_coverage_min": 0.25,
             "preset": "bravo_default",
-        }
+        },
     )
 
     assert resp.status_code == 200
@@ -314,16 +320,15 @@ def test_analyze_screen_time_endpoint_missing_artifacts(tmp_path, monkeypatch):
     ensure_dirs(ep_id)
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="test", season=1, episode=7)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="test", season=1, episode=7
+    )
 
     service = JobService(data_root=data_root)
     monkeypatch.setattr(jobs_router, "JOB_SERVICE", service)
 
     client = TestClient(app)
-    resp = client.post(
-        "/jobs/screen_time/analyze",
-        json={"ep_id": ep_id}
-    )
+    resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id})
 
     assert resp.status_code == 400
     assert "detail" in resp.json()
@@ -356,7 +361,9 @@ def test_analyze_screen_time_endpoint_minimal_payload(tmp_path, monkeypatch):
     people_path.write_text(json.dumps({"people": []}), encoding="utf-8")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="test", season=1, episode=8)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="test", season=1, episode=8
+    )
 
     service = JobService(data_root=data_root)
 
@@ -373,10 +380,7 @@ def test_analyze_screen_time_endpoint_minimal_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs_router, "JOB_SERVICE", service)
 
     client = TestClient(app)
-    resp = client.post(
-        "/jobs/screen_time/analyze",
-        json={"ep_id": ep_id}
-    )
+    resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id})
 
     assert resp.status_code == 200
     data = resp.json()

@@ -36,7 +36,9 @@ def _setup_env(monkeypatch, auto_create: str):
 def test_s3_auto_creates_bucket(monkeypatch):
     _setup_env(monkeypatch, "1")
     fake_client = FakeS3Client(exists=False)
-    monkeypatch.setattr("apps.api.services.storage._boto3", lambda: FakeBoto3(fake_client))
+    monkeypatch.setattr(
+        "apps.api.services.storage._boto3", lambda: FakeBoto3(fake_client)
+    )
     storage = StorageService()
     assert fake_client.created is True
     assert storage.bucket == "screenalytics"
@@ -45,7 +47,9 @@ def test_s3_auto_creates_bucket(monkeypatch):
 def test_s3_missing_bucket_raises(monkeypatch):
     _setup_env(monkeypatch, "0")
     fake_client = FakeS3Client(exists=False)
-    monkeypatch.setattr("apps.api.services.storage._boto3", lambda: FakeBoto3(fake_client))
+    monkeypatch.setattr(
+        "apps.api.services.storage._boto3", lambda: FakeBoto3(fake_client)
+    )
     try:
         StorageService()
     except RuntimeError as exc:

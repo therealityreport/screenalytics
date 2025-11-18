@@ -15,7 +15,10 @@ def test_fetch_roster_names_merges_sources():
     # 2. /shows/{show}/cast (cast.json / facebank)
 
     from pathlib import Path
-    faces_review_path = PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
+
+    faces_review_path = (
+        PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
+    )
     content = faces_review_path.read_text()
 
     # Check that function fetches from both endpoints
@@ -23,11 +26,14 @@ def test_fetch_roster_names_merges_sources():
     assert 'f"/shows/{show}/cast"' in content, "Should fetch cast members"
 
     # Check that it merges the results
-    assert 'roster_names + cast_names' in content or 'roster_names' in content and 'cast_names' in content, \
-        "Should merge roster and cast names"
+    assert (
+        "roster_names + cast_names" in content
+        or "roster_names" in content
+        and "cast_names" in content
+    ), "Should merge roster and cast names"
 
     # Check that it deduplicates
-    assert 'seen_lower' in content or 'set' in content, "Should deduplicate names"
+    assert "seen_lower" in content or "set" in content, "Should deduplicate names"
 
     print("✓ _fetch_roster_names merges both roster and cast member names")
 
@@ -35,15 +41,20 @@ def test_fetch_roster_names_merges_sources():
 def test_name_choice_widget_includes_merged_names():
     """Test that name choice widget receives the merged names."""
     from pathlib import Path
-    faces_review_path = PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
+
+    faces_review_path = (
+        PROJECT_ROOT / "apps" / "workspace-ui" / "pages" / "3_Faces_Review.py"
+    )
     content = faces_review_path.read_text()
 
     # Verify _name_choice_widget is called with roster_names
-    assert 'def _name_choice_widget(' in content, "Should have name choice widget"
-    assert 'roster_names: List[str]' in content, "Widget should accept roster_names parameter"
+    assert "def _name_choice_widget(" in content, "Should have name choice widget"
+    assert (
+        "roster_names: List[str]" in content
+    ), "Widget should accept roster_names parameter"
 
     # Verify the widget is used in track assignment
-    assert 'roster_names=roster_names' in content, "Should pass roster_names to widget"
+    assert "roster_names=roster_names" in content, "Should pass roster_names to widget"
 
     print("✓ Name choice widget uses merged roster/cast names")
 

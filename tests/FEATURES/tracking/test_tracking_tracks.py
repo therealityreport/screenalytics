@@ -12,10 +12,34 @@ from bytetrack_runner import load_config, run_tracking  # noqa: E402
 def test_tracking_produces_consistent_track_ids(tmp_path):
     detections_path = tmp_path / "detections.jsonl"
     detections = [
-        {"ep_id": "ep_demo", "frame_idx": 0, "ts_s": 0.0, "bbox": [0.1, 0.1, 0.3, 0.3], "conf": 0.95},
-        {"ep_id": "ep_demo", "frame_idx": 1, "ts_s": 0.5, "bbox": [0.11, 0.11, 0.31, 0.31], "conf": 0.96},
-        {"ep_id": "ep_demo", "frame_idx": 0, "ts_s": 0.0, "bbox": [0.6, 0.6, 0.8, 0.8], "conf": 0.9},
-        {"ep_id": "ep_demo", "frame_idx": 1, "ts_s": 0.5, "bbox": [0.62, 0.62, 0.82, 0.82], "conf": 0.88},
+        {
+            "ep_id": "ep_demo",
+            "frame_idx": 0,
+            "ts_s": 0.0,
+            "bbox": [0.1, 0.1, 0.3, 0.3],
+            "conf": 0.95,
+        },
+        {
+            "ep_id": "ep_demo",
+            "frame_idx": 1,
+            "ts_s": 0.5,
+            "bbox": [0.11, 0.11, 0.31, 0.31],
+            "conf": 0.96,
+        },
+        {
+            "ep_id": "ep_demo",
+            "frame_idx": 0,
+            "ts_s": 0.0,
+            "bbox": [0.6, 0.6, 0.8, 0.8],
+            "conf": 0.9,
+        },
+        {
+            "ep_id": "ep_demo",
+            "frame_idx": 1,
+            "ts_s": 0.5,
+            "bbox": [0.62, 0.62, 0.82, 0.82],
+            "conf": 0.88,
+        },
     ]
     detections_path.write_text("\n".join(json.dumps(det) for det in detections))
 

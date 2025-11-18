@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+
 def test_tight_cluster_high_cohesion():
     """A tight cluster with similar embeddings should have high cohesion (>0.7)."""
     from apps.api.services.track_reps import cosine_similarity, l2_normalize
@@ -25,7 +26,9 @@ def test_tight_cluster_high_cohesion():
     similarities = [cosine_similarity(emb, cluster_centroid) for emb in embeddings]
     cohesion = float(np.mean(similarities))
 
-    assert cohesion > 0.7, f"Tight cluster should have cohesion > 0.7, got {cohesion:.3f}"
+    assert (
+        cohesion > 0.7
+    ), f"Tight cluster should have cohesion > 0.7, got {cohesion:.3f}"
     assert cohesion <= 1.0, f"Cohesion should be <= 1.0, got {cohesion:.3f}"
 
 
@@ -49,7 +52,9 @@ def test_loose_cluster_low_cohesion():
     similarities = [cosine_similarity(emb, cluster_centroid) for emb in embeddings]
     cohesion = float(np.mean(similarities))
 
-    assert cohesion < 0.4, f"Loose cluster should have cohesion < 0.4, got {cohesion:.3f}"
+    assert (
+        cohesion < 0.4
+    ), f"Loose cluster should have cohesion < 0.4, got {cohesion:.3f}"
     assert cohesion >= 0.0, f"Cohesion should be >= 0.0, got {cohesion:.3f}"
 
 
@@ -95,7 +100,9 @@ def test_two_separated_clusters():
     cluster2_centroid = l2_normalize(np.mean(cluster2_embeddings, axis=0))
     cross_similarity = cosine_similarity(cluster1_centroid, cluster2_centroid)
 
-    assert cross_similarity < 0.3, f"Separated clusters should have low cross-similarity, got {cross_similarity:.3f}"
+    assert (
+        cross_similarity < 0.3
+    ), f"Separated clusters should have low cross-similarity, got {cross_similarity:.3f}"
 
 
 def test_cohesion_single_embedding():
@@ -109,4 +116,6 @@ def test_cohesion_single_embedding():
     centroid = embedding
 
     similarity = cosine_similarity(embedding, centroid)
-    assert abs(similarity - 1.0) < 0.001, f"Single embedding should have similarity 1.0 to itself, got {similarity:.3f}"
+    assert (
+        abs(similarity - 1.0) < 0.001
+    ), f"Single embedding should have similarity 1.0 to itself, got {similarity:.3f}"

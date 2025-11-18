@@ -8,7 +8,9 @@ from apps.api.services.facebank import FacebankService
 
 try:  # Ensure we honor the numpy skip used by the shared facebank helpers
     from tests.api import test_facebank as _facebank_tests  # noqa: F401
-except pytest.skip.Exception as exc:  # pragma: no cover - mirrors upstream skip handling
+except (
+    pytest.skip.Exception
+) as exc:  # pragma: no cover - mirrors upstream skip handling
     pytest.skip(str(exc), allow_module_level=True)
 
 from tests.api.test_facebank import (  # noqa: E402

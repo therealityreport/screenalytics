@@ -10,7 +10,9 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 
-def clip_bbox(x1: float, y1: float, x2: float, y2: float, *, W: int, H: int) -> tuple[int, int, int, int] | None:
+def clip_bbox(
+    x1: float, y1: float, x2: float, y2: float, *, W: int, H: int
+) -> tuple[int, int, int, int] | None:
     """Clamp an XYXY box to integer pixel coordinates."""
     if W <= 1 or H <= 1:
         return None
@@ -50,7 +52,9 @@ def to_u8_bgr(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def safe_crop(frame_bgr, bbox: Iterable[float]) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str | None]:
+def safe_crop(
+    frame_bgr, bbox: Iterable[float]
+) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str | None]:
     """Crop using clip_bbox + dtype normalization."""
     if frame_bgr is None:
         return None, None, "frame_missing"
@@ -81,11 +85,7 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     jpeg_q = max(1, min(int(jpg_q or 85), 100))
     variance = float(np.std(img)) if img.size else 0.0
-    range_val = (
-        float(np.nanmax(img)) - float(np.nanmin(img))
-        if img.size
-        else 0.0
-    )
+    range_val = float(np.nanmax(img)) - float(np.nanmin(img)) if img.size else 0.0
     ok = cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
     if not ok:
         return False, "imwrite_failed"
@@ -107,7 +107,10 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
             # Ignore if concurrent deletion already removed the file.
             pass
         LOGGER.warning(
-            "Removed near-uniform image %s (std=%.5f range=%.3f)", out_path, variance, range_val
+            "Removed near-uniform image %s (std=%.5f range=%.3f)",
+            out_path,
+            variance,
+            range_val,
         )
         return False, "near_uniform_gray"
     return True, None

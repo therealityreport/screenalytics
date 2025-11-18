@@ -73,7 +73,9 @@ def test_gate_splits_after_soft_streak() -> None:
     bbox = np.array([0, 0, 5, 5], dtype=np.float32)
     base = _unit(np.ones(512, dtype=np.float32))
     gate.process(7, bbox, base, frame_idx=1)
-    varied = np.concatenate([np.ones(200, dtype=np.float32), np.zeros(312, dtype=np.float32)])
+    varied = np.concatenate(
+        [np.ones(200, dtype=np.float32), np.zeros(312, dtype=np.float32)]
+    )
     off = _unit(varied)
     sim = float(np.dot(base, off))
     assert config.appear_t_hard < sim < config.appear_t_soft

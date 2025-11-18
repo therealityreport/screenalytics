@@ -73,33 +73,41 @@ def mock_episode_data(tmp_path):
     faces = []
     # Track 1 faces (not split)
     for i in range(5):
-        faces.append({
-            "track_id": 1,
-            "frame_idx": i,
-            "embedding": (person1_base + np.random.randn(512) * 0.01).tolist(),
-        })
+        faces.append(
+            {
+                "track_id": 1,
+                "frame_idx": i,
+                "embedding": (person1_base + np.random.randn(512) * 0.01).tolist(),
+            }
+        )
 
     # Track 2 faces (will be split) - 10 from person1, 10 from person2
     for i in range(10):
-        faces.append({
-            "track_id": 2,
-            "frame_idx": 30 + i,
-            "embedding": (person1_base + np.random.randn(512) * 0.01).tolist(),
-        })
+        faces.append(
+            {
+                "track_id": 2,
+                "frame_idx": 30 + i,
+                "embedding": (person1_base + np.random.randn(512) * 0.01).tolist(),
+            }
+        )
     for i in range(10, 20):
-        faces.append({
-            "track_id": 2,
-            "frame_idx": 30 + i,
-            "embedding": (person2_base + np.random.randn(512) * 0.01).tolist(),
-        })
+        faces.append(
+            {
+                "track_id": 2,
+                "frame_idx": 30 + i,
+                "embedding": (person2_base + np.random.randn(512) * 0.01).tolist(),
+            }
+        )
 
     # Track 3 faces (not split)
     for i in range(5):
-        faces.append({
-            "track_id": 3,
-            "frame_idx": 90 + i,
-            "embedding": (person1_base + np.random.randn(512) * 0.01).tolist(),
-        })
+        faces.append(
+            {
+                "track_id": 3,
+                "frame_idx": 90 + i,
+                "embedding": (person1_base + np.random.randn(512) * 0.01).tolist(),
+            }
+        )
 
     faces_path = manifests_dir / "faces.jsonl"
     with faces_path.open("w", encoding="utf-8") as f:
@@ -108,6 +116,7 @@ def mock_episode_data(tmp_path):
 
     # Mock get_path to return our test directory
     import py_screenalytics.artifacts as artifacts_module
+
     original_get_path = artifacts_module.get_path
 
     def mock_get_path(ep_id_arg, artifact_type):
@@ -152,7 +161,9 @@ def test_split_high_spread_tracks_real_split(mock_episode_data):
 
     assert result["split_count"] == 1
     assert 2 in result["track_mapping"]
-    assert len(result["track_mapping"][2]) >= 2  # Track 2 split into at least 2 sub-tracks
+    assert (
+        len(result["track_mapping"][2]) >= 2
+    )  # Track 2 split into at least 2 sub-tracks
 
     # Verify tracks file was updated
     tracks_path = manifests_dir / "tracks.jsonl"

@@ -64,7 +64,9 @@ class EpisodeStore:
     def _write(self, data: Dict[str, Dict[str, object]]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self._path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
+        )
         tmp_path.replace(self._path)
 
     # Public API -------------------------------------------------------
@@ -117,7 +119,9 @@ class EpisodeStore:
             raise ValueError("ep_id is required")
         expected = self.make_ep_id(show_slug, season, episode)
         if ep_id.lower() != expected.lower():
-            raise ValueError(f"ep_id '{ep_id}' does not match show/season/episode ({expected})")
+            raise ValueError(
+                f"ep_id '{ep_id}' does not match show/season/episode ({expected})"
+            )
 
         content = self._read()
         existing = content.get(ep_id)
@@ -131,7 +135,9 @@ class EpisodeStore:
             "season_number": season,
             "episode_number": episode,
             "title": title,
-            "air_date": air_date.isoformat() if isinstance(air_date, date) else air_date,
+            "air_date": (
+                air_date.isoformat() if isinstance(air_date, date) else air_date
+            ),
             "created_at": now,
             "updated_at": now,
         }

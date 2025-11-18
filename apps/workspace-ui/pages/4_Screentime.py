@@ -67,12 +67,18 @@ try:
     if jobs_list:
         job_table = []
         for job in jobs_list[:5]:  # Show last 5 jobs
-            job_table.append({
-                "Job ID": job["job_id"][:8] + "...",
-                "Status": job["state"],
-                "Started": job.get("started_at", "N/A")[:19].replace("T", " "),
-                "Ended": (job.get("ended_at", "N/A")[:19].replace("T", " ") if job.get("ended_at") else "Running"),
-            })
+            job_table.append(
+                {
+                    "Job ID": job["job_id"][:8] + "...",
+                    "Status": job["state"],
+                    "Started": job.get("started_at", "N/A")[:19].replace("T", " "),
+                    "Ended": (
+                        job.get("ended_at", "N/A")[:19].replace("T", " ")
+                        if job.get("ended_at")
+                        else "Running"
+                    ),
+                }
+            )
         st.dataframe(job_table, use_container_width=True, hide_index=True)
     else:
         st.info("No screen time jobs have been run yet for this episode.")
@@ -89,7 +95,7 @@ with st.expander("Analysis Configuration", expanded=False):
         max_value=1.0,
         value=0.7,
         step=0.05,
-        help="Only face samples with quality >= this value will be counted"
+        help="Only face samples with quality >= this value will be counted",
     )
     gap_tolerance_s = st.number_input(
         "Gap tolerance (seconds)",
@@ -97,12 +103,12 @@ with st.expander("Analysis Configuration", expanded=False):
         max_value=5.0,
         value=0.5,
         step=0.1,
-        help="Maximum gap between face samples to be considered continuous"
+        help="Maximum gap between face samples to be considered continuous",
     )
     use_video_decode = st.checkbox(
         "Use video decode for timestamps",
         value=True,
-        help="Use video decoding for accurate timestamps (slower but more accurate)"
+        help="Use video decoding for accurate timestamps (slower but more accurate)",
     )
 
 # Job launch section
@@ -122,7 +128,11 @@ with col1:
             st.success(f"Screen time analysis job started: {job_id[:12]}...")
             st.rerun()
         except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screen_time/analyze", exc))
+            st.error(
+                helpers.describe_error(
+                    f"{cfg['api_base']}/jobs/screen_time/analyze", exc
+                )
+            )
 with col2:
     if st.button("Refresh", use_container_width=True):
         st.rerun()
@@ -193,7 +203,9 @@ if json_path.exists():
         total_faces = sum(m.get("faces_count", 0) for m in metrics)
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Screen Time", f"{total_time:.1f}s ({total_time / 60:.1f} min)")
+        col1.metric(
+            "Total Screen Time", f"{total_time:.1f}s ({total_time / 60:.1f} min)"
+        )
         col2.metric("Cast Members", len(metrics))
         col3.metric("Total Faces", total_faces)
 
@@ -211,17 +223,19 @@ if json_path.exists():
         display_rows = []
         for m in metrics:
             visual_s = m.get("visual_s", 0.0)
-            display_rows.append({
-                "Name": m.get("name", "Unknown"),
-                "Time": format_time(visual_s),
-                "Percentage": f"{(visual_s / max(total_time, 1)) * 100:.1f}%",
-                "Tracks": m.get("tracks_count", 0),
-                "Faces": m.get("faces_count", 0),
-                "Confidence": f"{m.get('confidence', 0.0):.3f}",
-                "Person ID": m.get("person_id", "unknown"),
-                "Cast ID": m.get("cast_id", "unknown")[:12] + "...",
-                "_visual_s": visual_s,  # Hidden column for sorting
-            })
+            display_rows.append(
+                {
+                    "Name": m.get("name", "Unknown"),
+                    "Time": format_time(visual_s),
+                    "Percentage": f"{(visual_s / max(total_time, 1)) * 100:.1f}%",
+                    "Tracks": m.get("tracks_count", 0),
+                    "Faces": m.get("faces_count", 0),
+                    "Confidence": f"{m.get('confidence', 0.0):.3f}",
+                    "Person ID": m.get("person_id", "unknown"),
+                    "Cast ID": m.get("cast_id", "unknown")[:12] + "...",
+                    "_visual_s": visual_s,  # Hidden column for sorting
+                }
+            )
 
         # Convert to DataFrame for better display
         df = pd.DataFrame(display_rows)
@@ -231,7 +245,7 @@ if json_path.exists():
         sort_by = st.selectbox(
             "Sort by",
             ["Time", "Percentage", "Tracks", "Faces", "Confidence", "Name"],
-            index=0
+            index=0,
         )
         ascending = st.checkbox("Ascending order", value=False)
 
@@ -255,10 +269,12 @@ if json_path.exists():
 
         with tab1:
             # Bar chart of screen time
-            chart_data = pd.DataFrame({
-                "Person": [m.get("person_id", "unknown") for m in metrics],
-                "Screen Time (s)": [m.get("visual_s", 0.0) for m in metrics],
-            }).sort_values("Screen Time (s)", ascending=False)
+            chart_data = pd.DataFrame(
+                {
+                    "Person": [m.get("person_id", "unknown") for m in metrics],
+                    "Screen Time (s)": [m.get("visual_s", 0.0) for m in metrics],
+                }
+            ).sort_values("Screen Time (s)", ascending=False)
 
             st.bar_chart(chart_data.set_index("Person"), height=400)
 
@@ -266,10 +282,12 @@ if json_path.exists():
             # Pie chart showing percentage distribution
             import plotly.express as px
 
-            pie_data = pd.DataFrame({
-                "Person": [m.get("person_id", "unknown") for m in metrics],
-                "Screen Time": [m.get("visual_s", 0.0) for m in metrics],
-            })
+            pie_data = pd.DataFrame(
+                {
+                    "Person": [m.get("person_id", "unknown") for m in metrics],
+                    "Screen Time": [m.get("visual_s", 0.0) for m in metrics],
+                }
+            )
 
             fig = px.pie(
                 pie_data,
@@ -281,12 +299,14 @@ if json_path.exists():
 
         with tab3:
             # Scatter plot: Tracks vs Faces
-            scatter_data = pd.DataFrame({
-                "Person": [m.get("person_id", "unknown") for m in metrics],
-                "Tracks": [m.get("tracks_count", 0) for m in metrics],
-                "Faces": [m.get("faces_count", 0) for m in metrics],
-                "Screen Time (s)": [m.get("visual_s", 0.0) for m in metrics],
-            })
+            scatter_data = pd.DataFrame(
+                {
+                    "Person": [m.get("person_id", "unknown") for m in metrics],
+                    "Tracks": [m.get("tracks_count", 0) for m in metrics],
+                    "Faces": [m.get("faces_count", 0) for m in metrics],
+                    "Screen Time (s)": [m.get("visual_s", 0.0) for m in metrics],
+                }
+            )
 
             fig2 = px.scatter(
                 scatter_data,
@@ -317,19 +337,36 @@ if json_path.exists():
                 with col1:
                     st.metric("Faces Loaded", diagnostics.get("faces_loaded", "N/A"))
                     st.metric("Tracks Loaded", diagnostics.get("tracks_loaded", "N/A"))
-                    st.metric("Identities Loaded", diagnostics.get("identities_loaded", "N/A"))
+                    st.metric(
+                        "Identities Loaded", diagnostics.get("identities_loaded", "N/A")
+                    )
                 with col2:
-                    st.metric("People with Cast ID", diagnostics.get("people_with_cast_id", "N/A"))
-                    st.metric("Tracks Mapped to Identity", diagnostics.get("tracks_mapped_to_identity", "N/A"))
-                    st.metric("Tracks with Cast ID", diagnostics.get("tracks_with_cast_id", "N/A"))
+                    st.metric(
+                        "People with Cast ID",
+                        diagnostics.get("people_with_cast_id", "N/A"),
+                    )
+                    st.metric(
+                        "Tracks Mapped to Identity",
+                        diagnostics.get("tracks_mapped_to_identity", "N/A"),
+                    )
+                    st.metric(
+                        "Tracks with Cast ID",
+                        diagnostics.get("tracks_with_cast_id", "N/A"),
+                    )
 
                 # Show specific issues
                 if diagnostics.get("tracks_missing_identity", 0) > 0:
-                    st.info(f"⚠️ {diagnostics['tracks_missing_identity']} tracks have no identity assignment")
+                    st.info(
+                        f"⚠️ {diagnostics['tracks_missing_identity']} tracks have no identity assignment"
+                    )
                 if diagnostics.get("tracks_missing_person", 0) > 0:
-                    st.info(f"⚠️ {diagnostics['tracks_missing_person']} identities have no person mapping")
+                    st.info(
+                        f"⚠️ {diagnostics['tracks_missing_person']} identities have no person mapping"
+                    )
                 if diagnostics.get("tracks_missing_cast", 0) > 0:
-                    st.info(f"⚠️ {diagnostics['tracks_missing_cast']} people have no cast_id assignment")
+                    st.info(
+                        f"⚠️ {diagnostics['tracks_missing_cast']} people have no cast_id assignment"
+                    )
 
         # Specific guidance based on what's missing
         people_with_cast = diagnostics.get("people_with_cast_id", 0)
@@ -337,7 +374,9 @@ if json_path.exists():
 
         if people_with_cast == 0:
             st.error("**No cast members are linked to this show.**")
-            st.info("➡️ Please assign cast members in the **Cast page** before running screen time analysis.")
+            st.info(
+                "➡️ Please assign cast members in the **Cast page** before running screen time analysis."
+            )
         elif tracks_with_cast == 0:
             st.error("**No identities in this episode are linked to cast members.**")
             st.info(
@@ -345,9 +384,13 @@ if json_path.exists():
                 "**Faces & Tracks Review** page for this episode."
             )
         else:
-            st.info("Make sure cast members are assigned in the Cast page before running screen time analysis.")
+            st.info(
+                "Make sure cast members are assigned in the Cast page before running screen time analysis."
+            )
 else:
-    st.info("No screentime analytics yet. Click 'Analyze Screen Time' to generate results.")
+    st.info(
+        "No screentime analytics yet. Click 'Analyze Screen Time' to generate results."
+    )
 
 st.subheader("Output Files")
 if json_path.exists():

@@ -23,7 +23,9 @@ def test_group_using_facebank_assigns_clusters(tmp_path, monkeypatch):
     image_path.write_bytes(b"seed")
     embedding = np.zeros(512, dtype=np.float32)
     embedding[0] = 1.0
-    facebank_service.add_seed(show_id, cast_member["cast_id"], str(image_path), embedding)
+    facebank_service.add_seed(
+        show_id, cast_member["cast_id"], str(image_path), embedding
+    )
 
     ep_id = "test-s01e01"
     manifests_dir = data_root / "manifests" / ep_id
@@ -39,7 +41,9 @@ def test_group_using_facebank_assigns_clusters(tmp_path, monkeypatch):
             }
         ],
     }
-    (manifests_dir / "cluster_centroids.json").write_text(json.dumps(centroids_payload), encoding="utf-8")
+    (manifests_dir / "cluster_centroids.json").write_text(
+        json.dumps(centroids_payload), encoding="utf-8"
+    )
 
     identities_payload = {
         "ep_id": ep_id,
@@ -53,7 +57,9 @@ def test_group_using_facebank_assigns_clusters(tmp_path, monkeypatch):
         ],
         "stats": {},
     }
-    (manifests_dir / "identities.json").write_text(json.dumps(identities_payload), encoding="utf-8")
+    (manifests_dir / "identities.json").write_text(
+        json.dumps(identities_payload), encoding="utf-8"
+    )
 
     service = GroupingService(data_root)
     result = service.group_using_facebank(ep_id)
@@ -62,5 +68,7 @@ def test_group_using_facebank_assigns_clusters(tmp_path, monkeypatch):
     assert not result["unmatched_clusters"]
     assert result["assigned"][0]["cast_id"] == cast_member["cast_id"]
 
-    updated_identities = json.loads((manifests_dir / "identities.json").read_text(encoding="utf-8"))
+    updated_identities = json.loads(
+        (manifests_dir / "identities.json").read_text(encoding="utf-8")
+    )
     assert updated_identities["identities"][0]["person_id"]

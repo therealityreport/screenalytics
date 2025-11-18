@@ -23,7 +23,12 @@ def test_resolve_thumb_handles_png_presign(monkeypatch):
     def _fake_get(url, params=None, timeout=None):
         calls.append((url, params))
         if url == "http://api.test/files/presign":
-            return _Response(json_data={"url": "https://cdn.test/seed.png", "content_type": "image/png"})
+            return _Response(
+                json_data={
+                    "url": "https://cdn.test/seed.png",
+                    "content_type": "image/png",
+                }
+            )
         raise AssertionError(f"Unexpected request: {url}")
 
     monkeypatch.setattr(helpers.requests, "get", _fake_get, raising=False)

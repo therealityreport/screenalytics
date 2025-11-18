@@ -43,7 +43,9 @@ def presign_image(
 
 
 @router.get("/files/health")
-def check_image_health(path_or_key: str = Query(..., description="Local path or S3 key")) -> dict:
+def check_image_health(
+    path_or_key: str = Query(..., description="Local path or S3 key")
+) -> dict:
     """Check if an image exists and is accessible, with optional image diagnostics."""
     import hashlib
 
@@ -73,8 +75,13 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
                     try:
                         from PIL import Image
                         import numpy as np
+
                         with Image.open(p) as img:
-                            result["dimensions"] = {"width": img.width, "height": img.height, "mode": img.mode}
+                            result["dimensions"] = {
+                                "width": img.width,
+                                "height": img.height,
+                                "mode": img.mode,
+                            }
                             # Calculate std dev for diagnostic
                             arr = np.asarray(img)
                             result["std_dev"] = float(arr.std())
@@ -87,7 +94,12 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
 
                 return result
         except Exception as e:
-            return {"exists": False, "error": str(e), "source": "local", "mime_guess": mime_guess}
+            return {
+                "exists": False,
+                "error": str(e),
+                "source": "local",
+                "mime_guess": mime_guess,
+            }
 
     # Assume it's an S3 key
     if storage_service.s3_enabled():
@@ -101,7 +113,11 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
             "mime": mime_guess,
         }
 
-    return {"exists": False, "error": "Not a local file and S3 not enabled", "mime_guess": mime_guess}
+    return {
+        "exists": False,
+        "error": "Not a local file and S3 not enabled",
+        "mime_guess": mime_guess,
+    }
 
 
 @router.get("/health/detector")
@@ -135,6 +151,7 @@ def check_detector_health() -> dict:
         # Try to get ONNX runtime provider info
         try:
             import onnxruntime as ort
+
             providers = ort.get_available_providers()
             result["resolved_provider"] = providers[0] if providers else "Unknown"
         except Exception:

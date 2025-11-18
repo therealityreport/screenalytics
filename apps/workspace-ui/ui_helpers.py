@@ -74,7 +74,9 @@ TRACK_BUFFER_BASE_DEFAULT = max(
     1,
 )
 MIN_BOX_AREA_DEFAULT = max(
-    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    _env_float(
+        "SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)
+    ),
     0.0,
 )
 
@@ -90,7 +92,9 @@ LABEL = {
 }
 DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
 DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
-DEVICE_VALUE_TO_LABEL = {value.lower(): label for label, value in DEVICE_VALUE_MAP.items()}
+DEVICE_VALUE_TO_LABEL = {
+    value.lower(): label for label, value in DEVICE_VALUE_MAP.items()
+}
 DETECTOR_OPTIONS = [
     ("RetinaFace (recommended)", DEFAULT_DETECTOR),
 ]
@@ -115,9 +119,13 @@ SCENE_DETECTOR_VALUE_MAP = {label: value for label, value in SCENE_DETECTOR_OPTI
 SCENE_DETECTOR_LABEL_MAP = {value: label for label, value in SCENE_DETECTOR_OPTIONS}
 _SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
 SCENE_DETECTOR_DEFAULT = (
-    _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
+    _SCENE_DETECTOR_ENV
+    if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP
+    else "pyscenedetect"
 )
-_EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
+_EP_ID_REGEX = re.compile(
+    r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE
+)
 _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
 
 
@@ -263,9 +271,13 @@ def _api_base() -> str:
 
 def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     st.set_page_config(page_title=title, layout="wide")
-    api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
+    api_base = st.session_state.get("api_base") or _env(
+        "SCREENALYTICS_API_URL", "http://localhost:8000"
+    )
     st.session_state.setdefault("api_base", api_base)
-    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "local").lower()
+    backend = (
+        st.session_state.get("backend") or _env("STORAGE_BACKEND", "local").lower()
+    )
     st.session_state.setdefault("backend", backend)
     bucket = st.session_state.get("bucket") or (
         _env("AWS_S3_BUCKET")
@@ -410,7 +422,9 @@ def render_sidebar_episode_selector() -> str | None:
 
     # Cache clear button
     st.sidebar.divider()
-    if st.sidebar.button("🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"):
+    if st.sidebar.button(
+        "🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"
+    ):
         import subprocess
         import shutil
         from pathlib import Path
@@ -431,7 +445,9 @@ def render_sidebar_episode_selector() -> str | None:
                 pyc_file.unlink(missing_ok=True)
                 pyc_count += 1
 
-            st.sidebar.success(f"✅ Cleared {pycache_count} cache dirs, {pyc_count} .pyc files")
+            st.sidebar.success(
+                f"✅ Cleared {pycache_count} cache dirs, {pyc_count} .pyc files"
+            )
         except Exception as exc:
             st.sidebar.error(f"Cache clear failed: {exc}")
 
@@ -669,7 +685,9 @@ def default_detect_track_payload(
         "device": (device or DEFAULT_DEVICE).lower(),
         "detector": DEFAULT_DETECTOR,
         "tracker": DEFAULT_TRACKER,
-        "det_thresh": float(det_thresh if det_thresh is not None else DEFAULT_DET_THRESH),
+        "det_thresh": float(
+            det_thresh if det_thresh is not None else DEFAULT_DET_THRESH
+        ),
         "save_frames": True,
         "save_crops": True,
         "jpeg_quality": 85,
@@ -841,13 +859,19 @@ def total_seconds_hint(progress: Dict[str, Any]) -> float | None:
     if secs_total is not None:
         return secs_total
     frames_total = progress.get("frames_total")
-    fps = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
+    fps = (
+        progress.get("fps_infer")
+        or progress.get("analyzed_fps")
+        or progress.get("fps_detected")
+    )
     if frames_total and fps and fps > 0:
         return frames_total / fps
     return None
 
 
-def iter_sse_events(response: requests.Response) -> Generator[Tuple[str, Dict[str, Any]], None, None]:
+def iter_sse_events(
+    response: requests.Response,
+) -> Generator[Tuple[str, Dict[str, Any]], None, None]:
     event_name = "message"
     data_lines: List[str] = []
     try:
@@ -932,7 +956,11 @@ def compose_progress_text(
     detector_label = detector_label_from_value(raw_detector) if raw_detector else "--"
     raw_tracker = progress.get("tracker") or requested_tracker
     tracker_label = tracker_label_from_value(raw_tracker) if raw_tracker else "--"
-    fps_value = progress.get("fps_infer") or progress.get("analyzed_fps") or progress.get("fps_detected")
+    fps_value = (
+        progress.get("fps_infer")
+        or progress.get("analyzed_fps")
+        or progress.get("fps_detected")
+    )
     fps_text = f"{fps_value:.2f} fps" if fps_value else "--"
     time_prefix = ""
     if video_time is not None and video_total is not None:
@@ -1018,11 +1046,16 @@ def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
     # For detect_track, count files directly since status API doesn't include it
     if phase == "detect_track":
         from py_screenalytics.artifacts import get_path
+
         det_path = get_path(ep_id, "detections")
         track_path = get_path(ep_id, "tracks")
         if det_path.exists() and track_path.exists():
-            det_count = sum(1 for line in det_path.open("r", encoding="utf-8") if line.strip())
-            track_count = sum(1 for line in track_path.open("r", encoding="utf-8") if line.strip())
+            det_count = sum(
+                1 for line in det_path.open("r", encoding="utf-8") if line.strip()
+            )
+            track_count = sum(
+                1 for line in track_path.open("r", encoding="utf-8") if line.strip()
+            )
             return {
                 "stage": "detect_track",
                 "detections": det_count,
@@ -1083,7 +1116,9 @@ def attempt_sse_run(
     url = f"{_api_base()}{endpoint_path}"
     headers = {"Accept": "text/event-stream"}
     try:
-        response = requests.post(url, json=payload, headers=headers, stream=True, timeout=(5, 300))
+        response = requests.post(
+            url, json=payload, headers=headers, stream=True, timeout=(5, 300)
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         return None, describe_error(url, exc), False
@@ -1104,7 +1139,9 @@ def attempt_sse_run(
                 continue
             update_cb(event_payload)
             summary_candidate = event_payload.get("summary")
-            if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
+            if isinstance(summary_candidate, dict) and _is_complete_summary(
+                summary_candidate
+            ):
                 final_summary = summary_candidate
             phase = str(event_payload.get("phase", "")).lower()
             if event_name == "error" or phase == "error":
@@ -1112,7 +1149,9 @@ def attempt_sse_run(
             if event_name == "done" or _is_phase_done(event_payload):
                 if final_summary:
                     return final_summary, None, True
-                if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
+                if isinstance(summary_candidate, dict) and _is_complete_summary(
+                    summary_candidate
+                ):
                     return summary_candidate, None, True
                 return None, None, True
     finally:
@@ -1139,7 +1178,9 @@ def fallback_poll_progress(
 ) -> tuple[Dict[str, Any] | None, str | None]:
     if not job_started:
         try:
-            requests.post(f"{_api_base()}{async_endpoint}", json=payload, timeout=30).raise_for_status()
+            requests.post(
+                f"{_api_base()}{async_endpoint}", json=payload, timeout=30
+            ).raise_for_status()
         except requests.RequestException as exc:
             return None, describe_error(f"{_api_base()}{async_endpoint}", exc)
 
@@ -1157,7 +1198,11 @@ def fallback_poll_progress(
                     # Timeout: progress file never appeared, job likely failed during init
                     # Fetch job record to surface actual error
                     job_error = _fetch_async_job_error(ep_id, phase_hint)
-                    return None, job_error or f"Job initialization timed out after {max_poll_attempts * 0.5:.0f}s (progress file never created)"
+                    return (
+                        None,
+                        job_error
+                        or f"Job initialization timed out after {max_poll_attempts * 0.5:.0f}s (progress file never created)",
+                    )
                 status_placeholder.info("initializing...")
                 time.sleep(0.5)
                 continue
@@ -1178,7 +1223,9 @@ def fallback_poll_progress(
             summary_block = progress.get("summary")
             if isinstance(summary_block, dict):
                 return summary_block, None
-            status_placeholder.info("Async job finished without summary; using latest status metrics …")
+            status_placeholder.info(
+                "Async job finished without summary; using latest status metrics …"
+            )
             status_summary = _summary_from_status(ep_id, phase_hint)
             if status_summary:
                 return status_summary, None
@@ -1192,7 +1239,9 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
     summary = raw or {}
     if "summary" in summary and isinstance(summary["summary"], dict):
         summary = summary["summary"]
-    result_block = summary.get("result") if isinstance(summary.get("result"), dict) else None
+    result_block = (
+        summary.get("result") if isinstance(summary.get("result"), dict) else None
+    )
     artifacts = summary.setdefault("artifacts", {})
     local = artifacts.setdefault("local", {})
     manifests_dir = DATA_ROOT / "manifests" / ep_id
@@ -1203,7 +1252,11 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
     counts_candidates = [summary]
     if result_block:
         counts_candidates.append(result_block)
-        counts = result_block.get("counts") if isinstance(result_block.get("counts"), dict) else None
+        counts = (
+            result_block.get("counts")
+            if isinstance(result_block.get("counts"), dict)
+            else None
+        )
         if counts:
             counts_candidates.append(counts)
     for key in ("detections", "tracks", "faces", "identities"):
@@ -1245,7 +1298,9 @@ def scene_cuts_badge_text(summary: Dict[str, Any] | None) -> str | None:
         if isinstance(scene_field, dict):
             scene_block = scene_field
         else:
-            scene_block = summary if "count" in summary and "scene_cuts" not in summary else None
+            scene_block = (
+                summary if "count" in summary and "scene_cuts" not in summary else None
+            )
     if not scene_block:
         return None
     count = scene_block.get("count")
@@ -1396,7 +1451,11 @@ def run_job_with_progress(
         # Clamp video_time to video_total on UI side as extra safety
         video_time = progress.get("video_time")
         video_total = progress.get("video_total")
-        if video_time is not None and video_total is not None and video_time > video_total:
+        if (
+            video_time is not None
+            and video_total is not None
+            and video_time > video_total
+        ):
             progress = progress.copy()
             progress["video_time"] = video_total
         if progress.get("detector"):
@@ -1450,7 +1509,9 @@ def run_job_with_progress(
                 async_endpoint=target_endpoint,
             )
         else:
-            summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
+            summary, error_message, job_started = attempt_sse_run(
+                endpoint_path, payload, update_cb=_cb
+            )
             if not events_seen:
                 if error_message:
                     _append_log(
@@ -1505,10 +1566,12 @@ def run_job_with_progress(
         st.session_state.pop(run_id_key, None)
 
 
-def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
+def track_row_html(
+    track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200
+) -> str:
     if not items:
         return (
-            "<div class=\"track-grid empty\">"
+            '<div class="track-grid empty">'
             "<span>No frames available for this track yet.</span>"
             "</div>"
         )
@@ -1525,7 +1588,7 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
         )
     if not thumbs:
         return (
-            "<div class=\"track-grid empty\">"
+            '<div class="track-grid empty">'
             "<span>No frames available for this track yet.</span>"
             "</div>"
         )
@@ -1567,18 +1630,25 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
     """
 
 
-def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> None:
+def render_track_row(
+    track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200
+) -> None:
     html_block = track_row_html(track_id, items, thumb_width=thumb_width)
     # Calculate height: rows of thumbs (200px * 5/4 for 4:5 aspect) + gaps + padding
-    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio means height = width * 5/4
+    thumb_height = int(
+        thumb_width * 5 / 4
+    )  # 4:5 aspect ratio means height = width * 5/4
     num_rows = (len(items) + 4) // 5  # Round up to get number of rows
-    row_height = max(num_rows * thumb_height + (num_rows - 1) * 12 + 50, 150)  # thumbs + gaps + padding
+    row_height = max(
+        num_rows * thumb_height + (num_rows - 1) * 12 + 50, 150
+    )  # thumbs + gaps + padding
     components.html(html_block, height=row_height, scrolling=False)
 
 
 def inject_thumb_css() -> None:
     """Inject CSS for fixed 200×250 thumbnail frames."""
-    st.markdown(f"""
+    st.markdown(
+        f"""
     <style>
       .thumb {{
         width:{THUMB_W}px;
@@ -1617,7 +1687,9 @@ def inject_thumb_css() -> None:
         100%{{background-position:-100% 0}}
       }}
     </style>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
 
 
 def resolve_thumb(src: str | None) -> str | None:
@@ -1633,15 +1705,15 @@ def resolve_thumb(src: str | None) -> str | None:
     """
     if not src:
         return None
-    
+
     # Already a data URL? Return as-is
     if isinstance(src, str) and src.startswith("data:"):
         return src
-    
+
     # HTTPS URLs (S3 presigned) can be loaded directly - return as-is
     if isinstance(src, str) and src.startswith("https://"):
         return src
-    
+
     # HTTP localhost API URLs need to be fetched and converted to data URLs
     # (Streamlit at :8501 can't load images from :8000 without CORS)
     if isinstance(src, str) and src.startswith("http://localhost:"):
@@ -1649,11 +1721,20 @@ def resolve_thumb(src: str | None) -> str | None:
             response = requests.get(src, timeout=2)
             if response.ok and response.content:
                 encoded = base64.b64encode(response.content).decode("ascii")
-                content_type = response.headers.get("content-type") or _infer_mime(src) or "image/jpeg"
+                content_type = (
+                    response.headers.get("content-type")
+                    or _infer_mime(src)
+                    or "image/jpeg"
+                )
                 return f"data:{content_type};base64,{encoded}"
         except Exception as exc:
-            _diag("UI_RESOLVE_FAIL", src=src, reason="localhost_fetch_error", error=str(exc))
-    
+            _diag(
+                "UI_RESOLVE_FAIL",
+                src=src,
+                reason="localhost_fetch_error",
+                error=str(exc),
+            )
+
     # Try as local file path
     try:
         path = Path(src)
@@ -1663,18 +1744,20 @@ def resolve_thumb(src: str | None) -> str | None:
                 return converted
     except (OSError, ValueError) as exc:
         _diag("UI_RESOLVE_FAIL", src=src, reason="local_file_error", error=str(exc))
-    
+
     # Try as S3 key - call presign endpoint and then fetch
     if isinstance(src, str) and (
-        src.startswith("artifacts/") or 
-        src.startswith("raw/") or
-        ("/" in src and not src.startswith("/") and not src.startswith("http"))
+        src.startswith("artifacts/")
+        or src.startswith("raw/")
+        or ("/" in src and not src.startswith("/") and not src.startswith("http"))
     ):
         try:
             api_base = st.session_state.get("api_base") or "http://localhost:8000"
             params = {"key": src, "ttl": 3600}
             inferred_mime = _infer_mime(src)
-            response = requests.get(f"{api_base}/files/presign", params=params, timeout=2)
+            response = requests.get(
+                f"{api_base}/files/presign", params=params, timeout=2
+            )
             if response.ok:
                 data = response.json()
                 presigned_url = data.get("url")
@@ -1687,7 +1770,11 @@ def resolve_thumb(src: str | None) -> str | None:
                     img_response = requests.get(presigned_url, timeout=5)
                     if img_response.ok and img_response.content:
                         encoded = base64.b64encode(img_response.content).decode("ascii")
-                        content_type = img_response.headers.get("content-type") or resolved_mime or "image/jpeg"
+                        content_type = (
+                            img_response.headers.get("content-type")
+                            or resolved_mime
+                            or "image/jpeg"
+                        )
                         return f"data:{content_type};base64,{encoded}"
         except Exception as exc:
             _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=str(exc))
@@ -1720,7 +1807,9 @@ def _infer_mime(name: str | None) -> str | None:
     return "image/jpeg"
 
 
-def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = False) -> str:
+def thumb_html(
+    src: str | None, alt: str = "thumb", *, hide_if_missing: bool = False
+) -> str:
     """Generate HTML for a fixed 200×250 thumbnail frame.
 
     Args:

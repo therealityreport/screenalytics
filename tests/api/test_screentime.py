@@ -47,11 +47,9 @@ def temp_episode_data(tmp_path: Path, monkeypatch) -> tuple[str, Path]:
         {"track_id": 1, "frame_idx": 30, "ts": 1.0, "quality": 0.9},
         {"track_id": 1, "frame_idx": 45, "ts": 1.5, "quality": 0.85},
         {"track_id": 1, "frame_idx": 60, "ts": 2.0, "quality": 0.95},
-
         # Alice - Track 2 (two separate intervals due to gap)
         {"track_id": 2, "frame_idx": 150, "ts": 5.0, "quality": 0.8},
         {"track_id": 2, "frame_idx": 180, "ts": 6.0, "quality": 0.9},
-
         # Bob - Track 3 (should be ignored, no cast_id)
         {"track_id": 3, "frame_idx": 300, "ts": 10.0, "quality": 0.95},
         {"track_id": 3, "frame_idx": 330, "ts": 11.0, "quality": 0.9},
@@ -189,7 +187,7 @@ def test_screentime_basic_analysis(temp_episode_data: tuple[str, Path]):
 
     # Verify track and face counts
     assert alice_metrics["tracks_count"] == 2  # tracks 1 and 2
-    assert alice_metrics["faces_count"] == 5   # 3 from track 1, 2 from track 2
+    assert alice_metrics["faces_count"] == 5  # 3 from track 1, 2 from track 2
 
     # Verify speaking_s and both_s are 0 (not implemented yet)
     assert alice_metrics["speaking_s"] == 0.0
@@ -302,7 +300,9 @@ def test_screentime_track_mode_uses_track_spans(temp_episode_data: tuple[str, Pa
     assert alice_metrics["visual_s"] == pytest.approx(2.8, rel=0.01)
 
 
-def test_screentime_track_mode_honors_coverage_gate(temp_episode_data: tuple[str, Path]):
+def test_screentime_track_mode_honors_coverage_gate(
+    temp_episode_data: tuple[str, Path],
+):
     """Track-based mode should drop tracks with low coverage."""
     ep_id, data_root = temp_episode_data
     manifests_dir = data_root / "manifests" / ep_id
@@ -318,7 +318,9 @@ def test_screentime_track_mode_honors_coverage_gate(temp_episode_data: tuple[str
 
     for track in tracks:
         if track["track_id"] == 2:
-            track["frame_count"] = 200  # artificially inflate duration to reduce coverage
+            track["frame_count"] = (
+                200  # artificially inflate duration to reduce coverage
+            )
             track["last_frame_idx"] = track["first_frame_idx"] + 200
 
     with tracks_path.open("w", encoding="utf-8") as f:
@@ -399,7 +401,9 @@ def test_screentime_missing_artifacts(monkeypatch, tmp_path: Path):
         analyzer.analyze_episode(ep_id)
 
 
-def test_screentime_confidence_calculation(temp_episode_data: tuple[str, Path], monkeypatch):
+def test_screentime_confidence_calculation(
+    temp_episode_data: tuple[str, Path], monkeypatch
+):
     """Test that confidence is calculated based on tracks and faces."""
     ep_id, data_root = temp_episode_data
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
@@ -439,7 +443,6 @@ def test_screentime_multiple_cast_members(tmp_path: Path, monkeypatch):
         {"track_id": 1, "frame_idx": 30, "ts": 1.0, "quality": 0.9},
         {"track_id": 1, "frame_idx": 45, "ts": 1.5, "quality": 0.9},
         {"track_id": 1, "frame_idx": 60, "ts": 2.0, "quality": 0.9},
-
         # Bob - Track 2 (gap = 0.5s, within tolerance) - has more screen time
         {"track_id": 2, "frame_idx": 90, "ts": 3.0, "quality": 0.9},
         {"track_id": 2, "frame_idx": 105, "ts": 3.5, "quality": 0.9},

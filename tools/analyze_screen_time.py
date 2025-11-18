@@ -61,7 +61,11 @@ def resolve_config(raw_config: dict, preset_override: str | None = None) -> dict
         raw_config = {}
 
     presets = raw_config.get("screen_time_presets") or {}
-    preset_name = preset_override or raw_config.get("preset") or raw_config.get("screen_time_preset")
+    preset_name = (
+        preset_override
+        or raw_config.get("preset")
+        or raw_config.get("screen_time_preset")
+    )
 
     resolved: dict = {}
     if preset_name:
@@ -85,25 +89,45 @@ def resolve_config(raw_config: dict, preset_override: str | None = None) -> dict
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Analyze per-cast screen time from faces and tracks")
-    parser.add_argument("--ep-id", required=True, help="Episode identifier (e.g., rhobh-s05e17)")
-    parser.add_argument("--quality-min", type=float, help="Minimum face quality threshold (0.0-1.0)")
-    parser.add_argument("--gap-tolerance-s", type=float, help="Gap tolerance in seconds")
+    parser = argparse.ArgumentParser(
+        description="Analyze per-cast screen time from faces and tracks"
+    )
+    parser.add_argument(
+        "--ep-id", required=True, help="Episode identifier (e.g., rhobh-s05e17)"
+    )
+    parser.add_argument(
+        "--quality-min", type=float, help="Minimum face quality threshold (0.0-1.0)"
+    )
+    parser.add_argument(
+        "--gap-tolerance-s", type=float, help="Gap tolerance in seconds"
+    )
     parser.add_argument(
         "--use-video-decode",
         type=lambda x: x.lower() in ("true", "1", "yes"),
         help="Use video decode for timestamps (true/false)",
     )
-    parser.add_argument("--screen-time-mode", choices=["faces", "tracks"], help="Interval calculation mode")
-    parser.add_argument("--edge-padding-s", type=float, help="Edge padding applied to each interval (seconds)")
+    parser.add_argument(
+        "--screen-time-mode",
+        choices=["faces", "tracks"],
+        help="Interval calculation mode",
+    )
+    parser.add_argument(
+        "--edge-padding-s",
+        type=float,
+        help="Edge padding applied to each interval (seconds)",
+    )
     parser.add_argument(
         "--track-coverage-min",
         type=float,
         help="Minimum detection coverage required when screen_time_mode=tracks",
     )
-    parser.add_argument("--preset", help="Name of the screen time preset defined in the YAML config")
+    parser.add_argument(
+        "--preset", help="Name of the screen time preset defined in the YAML config"
+    )
     parser.add_argument("--config", type=Path, help="Path to custom config YAML")
-    parser.add_argument("--progress-file", type=Path, help="Path to write progress JSON")
+    parser.add_argument(
+        "--progress-file", type=Path, help="Path to write progress JSON"
+    )
     return parser.parse_args(argv)
 
 

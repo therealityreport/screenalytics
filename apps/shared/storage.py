@@ -150,4 +150,13 @@ def s3_write_json(key: str, payload: Dict[str, Any]) -> None:
         LOGGER.warning("Failed to write S3 object %s: %s", key, exc)
 
 
-__all__ = ["data_root", "exists", "now_iso", "project_root", "read_json", "s3_write_json", "use_s3", "write_json"]
+__all__ = [
+    "data_root",
+    "exists",
+    "now_iso",
+    "project_root",
+    "read_json",
+    "s3_write_json",
+    "use_s3",
+    "write_json",
+]

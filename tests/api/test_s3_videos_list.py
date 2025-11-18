@@ -74,5 +74,7 @@ def test_s3_videos_endpoint(monkeypatch) -> None:
     assert rhoa_entry["season"] == 1
     assert rhoa_entry["episode"] == 1
     assert rhoa_entry["key_version"] == "v2"
-    rhobh_entry = next(item for item in data["items"] if item["ep_id"] == "rhobh-s05e17")
+    rhobh_entry = next(
+        item for item in data["items"] if item["ep_id"] == "rhobh-s05e17"
+    )
     assert rhobh_entry["exists_in_store"] is False

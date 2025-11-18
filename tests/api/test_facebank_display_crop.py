@@ -27,13 +27,15 @@ def test_display_crop_uses_bbox():
 
     # Verify that we got a crop (not the full image)
     assert crop is not None, "Crop should not be None"
-    assert crop.shape[0] < 100 or crop.shape[1] < 100, (
-        f"Crop should be smaller than original image, got {crop.shape} vs (100, 100, 3)"
-    )
+    assert (
+        crop.shape[0] < 100 or crop.shape[1] < 100
+    ), f"Crop should be smaller than original image, got {crop.shape} vs (100, 100, 3)"
 
     # Verify that the crop contains the face region
     # The crop should be expanded with margin, but still centered on the face
-    assert crop.shape[0] > 0 and crop.shape[1] > 0, "Crop should have positive dimensions"
+    assert (
+        crop.shape[0] > 0 and crop.shape[1] > 0
+    ), "Crop should have positive dimensions"
     print(f"✓ Display crop uses bbox: original (100, 100, 3) → crop {crop.shape}")
 
 
@@ -52,9 +54,9 @@ def test_display_crop_fallback_on_invalid_bbox():
 
     # Verify we got the full frame as fallback
     assert crop is not None, "Crop should not be None"
-    assert crop.shape == image.shape, (
-        f"Should fall back to full frame, got {crop.shape} vs {image.shape}"
-    )
+    assert (
+        crop.shape == image.shape
+    ), f"Should fall back to full frame, got {crop.shape} vs {image.shape}"
     print(f"✓ Display crop falls back to full frame for invalid bbox")
 
 
@@ -68,9 +70,10 @@ def test_simulated_detector_bbox_preserved():
     content = facebank_path.read_text()
 
     # Check that the problematic override is not present
-    assert 'detections = [\n                    {\n                        "bbox": [0.0, 0.0, 1.0, 1.0],' not in content, (
-        "Code should not override simulated detector bbox with [0,0,1,1]"
-    )
+    assert (
+        'detections = [\n                    {\n                        "bbox": [0.0, 0.0, 1.0, 1.0],'
+        not in content
+    ), "Code should not override simulated detector bbox with [0,0,1,1]"
     print("✓ Simulated detector bbox is preserved (override code removed)")
 
 
@@ -89,12 +92,7 @@ def test_prepare_face_crop_uses_simulated_bbox():
 
     # Call with simulated detector mode
     crop, err = _prepare_face_crop(
-        image,
-        bbox,
-        landmarks,
-        margin=0.15,
-        align=True,
-        detector_mode="simulated"
+        image, bbox, landmarks, margin=0.15, align=True, detector_mode="simulated"
     )
 
     # Verify we got a crop, not a letterboxed full image
@@ -104,9 +102,9 @@ def test_prepare_face_crop_uses_simulated_bbox():
     # The crop should be smaller than the full image (bbox-based crop, not letterbox)
     # Letterbox would preserve full dimensions, while bbox crop reduces them
     h, w = crop.shape[:2]
-    assert h < 200 or w < 200, (
-        f"Crop should be smaller than original for bbox-based crop, got {crop.shape} vs (200, 200, 3)"
-    )
+    assert (
+        h < 200 or w < 200
+    ), f"Crop should be smaller than original for bbox-based crop, got {crop.shape} vs (200, 200, 3)"
 
     print(f"✓ Simulated detector uses bbox for cropping: (200, 200, 3) → {crop.shape}")
 

@@ -39,7 +39,9 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
             {"identity_id": "id_0002", "track_ids": [2], "size": 3},
         ],
     }
-    (manifests_dir / "identities.json").write_text(json.dumps(identities_payload), encoding="utf-8")
+    (manifests_dir / "identities.json").write_text(
+        json.dumps(identities_payload), encoding="utf-8"
+    )
 
     status_resp = client.get(f"/episodes/{ep_id}/status")
     assert status_resp.status_code == 200
@@ -53,7 +55,10 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
 
     cluster_status = payload.get("cluster", {})
     assert cluster_status.get("status") == "success"
-    assert isinstance(cluster_status.get("identities"), int) and cluster_status["identities"] > 0
+    assert (
+        isinstance(cluster_status.get("identities"), int)
+        and cluster_status["identities"] > 0
+    )
     assert cluster_status.get("source") == "marker"
 
     if run_dir.exists():

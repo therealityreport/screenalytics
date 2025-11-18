@@ -45,10 +45,18 @@ def add_roster_name(show: str, payload: CastNameRequest) -> dict:
 @router.get("/{show}/cast_names")
 def list_cast_names(show: str) -> dict:
     roster = get_roster(show)
-    return {"show": roster["show"], "names": roster.get("names", []), "updated_at": roster.get("updated_at")}
+    return {
+        "show": roster["show"],
+        "names": roster.get("names", []),
+        "updated_at": roster.get("updated_at"),
+    }
 
 
 @router.post("/{show}/cast_names")
 def add_cast_name(show: str, payload: CastNameRequest) -> dict:
     roster = _add_name(show, payload.name)
-    return {"show": roster["show"], "names": roster.get("names", []), "updated_at": roster.get("updated_at")}
+    return {
+        "show": roster["show"],
+        "names": roster.get("names", []),
+        "updated_at": roster.get("updated_at"),
+    }

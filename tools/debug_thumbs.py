@@ -79,7 +79,9 @@ def summarize_log(path: str | Path) -> Dict[str, Any]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Summarize crops_debug.jsonl diagnostics")
+    parser = argparse.ArgumentParser(
+        description="Summarize crops_debug.jsonl diagnostics"
+    )
     parser.add_argument("logfile", type=str, help="Path to crops_debug.jsonl")
     return parser
 

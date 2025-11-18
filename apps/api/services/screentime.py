@@ -20,6 +20,7 @@ LOGGER = logging.getLogger(__name__)
 @dataclass
 class ScreenTimeConfig:
     """Configuration for screen time analysis."""
+
     quality_min: float = 0.7
     gap_tolerance_s: float = 0.5
     use_video_decode: bool = True
@@ -31,6 +32,7 @@ class ScreenTimeConfig:
 @dataclass
 class CastMetrics:
     """Screen time metrics for a single cast member."""
+
     cast_id: str
     person_id: str
     visual_s: float
@@ -116,10 +118,14 @@ class ScreenTimeAnalyzer:
         # Log sample mappings for debugging
         if track_to_identity:
             sample_tracks = list(track_to_identity.items())[:3]
-            LOGGER.info(f"[screentime] Sample track->identity mappings: {sample_tracks}")
+            LOGGER.info(
+                f"[screentime] Sample track->identity mappings: {sample_tracks}"
+            )
         if identity_to_person:
             sample_identities = list(identity_to_person.items())[:3]
-            LOGGER.info(f"[screentime] Sample identity->person mappings: {sample_identities}")
+            LOGGER.info(
+                f"[screentime] Sample identity->person mappings: {sample_identities}"
+            )
         if person_to_cast:
             sample_people = list(person_to_cast.items())[:3]
             LOGGER.info(f"[screentime] Sample person->cast mappings: {sample_people}")
@@ -142,13 +148,17 @@ class ScreenTimeAnalyzer:
             person_id = identity_to_person.get(identity_id)
             if not person_id:
                 diagnostics["tracks_missing_person"] += 1
-                LOGGER.debug(f"[screentime] Track {track_id} -> identity {identity_id} has no person_id mapping")
+                LOGGER.debug(
+                    f"[screentime] Track {track_id} -> identity {identity_id} has no person_id mapping"
+                )
                 continue
 
             cast_id = person_to_cast.get(person_id)
             if not cast_id:
                 diagnostics["tracks_missing_cast"] += 1
-                LOGGER.debug(f"[screentime] Track {track_id} -> person {person_id} has no cast_id, skipping")
+                LOGGER.debug(
+                    f"[screentime] Track {track_id} -> person {person_id} has no cast_id, skipping"
+                )
                 continue
 
             # This track has a full chain to cast_id
@@ -178,7 +188,8 @@ class ScreenTimeAnalyzer:
                 continue
 
             valid_faces = [
-                face for face in track_faces
+                face
+                for face in track_faces
                 if face.get("quality", 1.0) >= self.config.quality_min
             ]
 
@@ -219,7 +230,9 @@ class ScreenTimeAnalyzer:
             padded = self._apply_edge_padding(intervals)
             merged = self._merge_intervals(padded)
             raw_duration = sum(self._interval_duration(interval) for interval in padded)
-            merged_duration = sum(self._interval_duration(interval) for interval in merged)
+            merged_duration = sum(
+                self._interval_duration(interval) for interval in merged
+            )
             metrics.visual_s = merged_duration
 
             if LOGGER.isEnabledFor(logging.DEBUG):
@@ -261,7 +274,9 @@ class ScreenTimeAnalyzer:
                     "tracks_count": m.tracks_count,
                     "faces_count": m.faces_count,
                 }
-                for m in sorted(cast_metrics_map.values(), key=lambda x: x.visual_s, reverse=True)
+                for m in sorted(
+                    cast_metrics_map.values(), key=lambda x: x.visual_s, reverse=True
+                )
             ],
         }
 
@@ -333,7 +348,9 @@ class ScreenTimeAnalyzer:
 
         return data.get("people", []), show_id
 
-    def _build_track_to_identity_map(self, identities: List[Dict[str, Any]]) -> Dict[int, str]:
+    def _build_track_to_identity_map(
+        self, identities: List[Dict[str, Any]]
+    ) -> Dict[int, str]:
         """Build mapping from track_id to identity_id.
 
         Note: identities.json uses 'track_ids' field, not 'tracks'.
@@ -396,7 +413,9 @@ class ScreenTimeAnalyzer:
 
         return mapping
 
-    def _group_faces_by_track(self, faces: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    def _group_faces_by_track(
+        self, faces: List[Dict[str, Any]]
+    ) -> Dict[int, List[Dict[str, Any]]]:
         """Group face samples by track_id."""
         groups: Dict[int, List[Dict[str, Any]]] = {}
         for face in faces:
@@ -435,7 +454,9 @@ class ScreenTimeAnalyzer:
         if track_meta:
             frame_count = track_meta.get("frame_count")
             faces_count = track_meta.get("faces_count")
-            start_frame = track_meta.get("first_frame_idx") or track_meta.get("start_frame")
+            start_frame = track_meta.get("first_frame_idx") or track_meta.get(
+                "start_frame"
+            )
             end_frame = track_meta.get("last_frame_idx") or track_meta.get("end_frame")
             if isinstance(frame_count, (int, float)) and frame_count > 0:
                 total_frames = float(frame_count)
@@ -570,10 +591,17 @@ class ScreenTimeAnalyzer:
             ):
                 duration = last_ts - first_ts
 
-            first_frame = track_meta.get("first_frame_idx") or track_meta.get("start_frame")
+            first_frame = track_meta.get("first_frame_idx") or track_meta.get(
+                "start_frame"
+            )
             last_frame = track_meta.get("last_frame_idx") or track_meta.get("end_frame")
 
-            if duration and isinstance(first_frame, (int, float)) and isinstance(last_frame, (int, float)) and last_frame > first_frame:
+            if (
+                duration
+                and isinstance(first_frame, (int, float))
+                and isinstance(last_frame, (int, float))
+                and last_frame > first_frame
+            ):
                 return float(last_frame - first_frame) / duration
 
             frame_count = track_meta.get("frame_count")
@@ -593,7 +621,9 @@ class ScreenTimeAnalyzer:
 
         return None
 
-    def _resolve_face_time(self, face: Dict[str, Any], fps: Optional[float]) -> Optional[float]:
+    def _resolve_face_time(
+        self, face: Dict[str, Any], fps: Optional[float]
+    ) -> Optional[float]:
         """Resolve the timestamp for a face sample respecting config preferences."""
         ts = face.get("ts")
         if self.config.use_video_decode and isinstance(ts, (int, float)):
@@ -647,7 +677,9 @@ class ScreenTimeAnalyzer:
         start, end = interval
         return max(0.0, end - start)
 
-    def write_outputs(self, ep_id: str, metrics_data: Dict[str, Any]) -> Tuple[Path, Path]:
+    def write_outputs(
+        self, ep_id: str, metrics_data: Dict[str, Any]
+    ) -> Tuple[Path, Path]:
         """Write screen time outputs to JSON and CSV.
 
         Returns:

@@ -214,8 +214,12 @@ def run_tracking(
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ByteTrack-lite runner")
     parser.add_argument("--ep-id", help="Episode id (used for default paths)")
-    parser.add_argument("--detections", help="Path to det_v1 JSONL (defaults via resolver)")
-    parser.add_argument("--output", help="Path for track_v1 JSONL (defaults via resolver)")
+    parser.add_argument(
+        "--detections", help="Path to det_v1 JSONL (defaults via resolver)"
+    )
+    parser.add_argument(
+        "--output", help="Path for track_v1 JSONL (defaults via resolver)"
+    )
     parser.add_argument(
         "--config",
         default="config/pipeline/tracking.yaml",

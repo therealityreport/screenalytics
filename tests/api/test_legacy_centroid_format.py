@@ -45,7 +45,9 @@ def test_build_cluster_track_reps_with_legacy_data():
     }
 
     # Build cluster track reps
-    result = build_cluster_track_reps(ep_id, "id_0001", track_reps_map, cluster_centroids)
+    result = build_cluster_track_reps(
+        ep_id, "id_0001", track_reps_map, cluster_centroids
+    )
 
     # Verify result structure
     assert result["cluster_id"] == "id_0001"
@@ -62,7 +64,9 @@ def test_build_cluster_track_reps_with_legacy_data():
         assert "similarity" in track
         assert track["similarity"] is not None, "Track should have similarity score"
 
-    print(f"✓ build_cluster_track_reps works with legacy data: {result['total_tracks']} tracks")
+    print(
+        f"✓ build_cluster_track_reps works with legacy data: {result['total_tracks']} tracks"
+    )
 
 
 if __name__ == "__main__":

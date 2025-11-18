@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from apps.api.services.people import PeopleService
 import requests
 
+
 def main():
     show_id = "RHOBH"
     people_service = PeopleService()
@@ -40,7 +41,9 @@ def main():
 
         # Skip if already linked
         if current_cast_id:
-            print(f"✓ {person_id} ({person_name}) already linked to cast_id {current_cast_id}")
+            print(
+                f"✓ {person_id} ({person_name}) already linked to cast_id {current_cast_id}"
+            )
             continue
 
         # Skip unnamed people
@@ -76,11 +79,14 @@ def main():
 
             # Update person with cast_id
             people_service.update_person(show_id, person_id, cast_id=cast_id)
-            print(f"✓ Linked {person_id} ({person_name}) to cast member {cast_name} ({cast_id})")
+            print(
+                f"✓ Linked {person_id} ({person_name}) to cast member {cast_name} ({cast_id})"
+            )
         else:
             print(f"  No cast member found for {person_id} ({person_name})")
 
     print("\nDone!")
+
 
 if __name__ == "__main__":
     main()

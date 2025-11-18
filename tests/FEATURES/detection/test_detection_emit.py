@@ -12,7 +12,9 @@ sys.path.append(str(SRC_DIR))
 from run_retinaface import load_config, run_detection  # noqa: E402
 
 
-def _make_dummy_video(path: Path, frames: int = 4, size: tuple[int, int] = (48, 48)) -> None:
+def _make_dummy_video(
+    path: Path, frames: int = 4, size: tuple[int, int] = (48, 48)
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
         str(path),

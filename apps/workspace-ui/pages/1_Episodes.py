@@ -46,7 +46,9 @@ def _show_single_delete(ep_id: str) -> None:
         st.session_state["episodes_delete_target"] = ep_id
     target = st.session_state.get("episodes_delete_target")
     if target != ep_id:
-        st.caption("Removes the EpisodeStore entry, local video/manifests/frames/embeddings, and cleans up people cluster references.")
+        st.caption(
+            "Removes the EpisodeStore entry, local video/manifests/frames/embeddings, and cleans up people cluster references."
+        )
         return
     with st.container(border=True):
         st.warning(
@@ -57,7 +59,9 @@ def _show_single_delete(ep_id: str) -> None:
         )
         cols = st.columns(2)
         with cols[0]:
-            if st.button("Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"):
+            if st.button(
+                "Confirm delete", type="primary", key=f"confirm_delete_{ep_id}"
+            ):
                 payload = {"include_s3": True}
                 resp = _api_post_json(f"/episodes/{ep_id}/delete", payload)
                 if resp is not None:
@@ -121,6 +125,7 @@ def _show_purge_section() -> None:
                 _reset_purge_state()
                 st.rerun()
 
+
 try:
     episodes_payload = helpers.api_get("/episodes")
 except requests.RequestException as exc:
@@ -132,7 +137,9 @@ if not episodes:
     st.info("No episodes yet. Use Upload & Run first.")
     st.stop()
 
-search_query = st.text_input("Search", "", help="Filter by ep_id or show.").strip().lower()
+search_query = (
+    st.text_input("Search", "", help="Filter by ep_id or show.").strip().lower()
+)
 filtered = [
     ep
     for ep in episodes

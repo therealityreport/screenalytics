@@ -6,7 +6,17 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from apps.api.routers import cast, episodes, facebank, files, grouping, identities, jobs, people, roster
+from apps.api.routers import (
+    cast,
+    episodes,
+    facebank,
+    files,
+    grouping,
+    identities,
+    jobs,
+    people,
+    roster,
+)
 from tools import episode_run
 
 app = FastAPI(title="Screenalytics API", version="0.1.0")

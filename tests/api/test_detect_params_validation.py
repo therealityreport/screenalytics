@@ -20,10 +20,14 @@ def test_detect_track_invalid_detector(tmp_path, monkeypatch):
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(b"fake-bytes")
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=1)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="demo", season=1, episode=1
+    )
 
     client = TestClient(app)
-    response = client.post("/jobs/detect_track", json={"ep_id": ep_id, "detector": "yolov8face"})
+    response = client.post(
+        "/jobs/detect_track", json={"ep_id": ep_id, "detector": "yolov8face"}
+    )
     assert response.status_code == 400
     assert "Unsupported detector" in response.json().get("detail", "")
 
@@ -38,7 +42,9 @@ def test_detect_track_invalid_tracker(tmp_path, monkeypatch):
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(b"fake-bytes-2")
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=2)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="demo", season=1, episode=2
+    )
 
     client = TestClient(app)
     response = client.post(
@@ -60,10 +66,16 @@ def test_detect_track_retinaface_missing_models_returns_400(tmp_path, monkeypatc
     video_path.write_bytes(b"fake-video")
 
     jobs_router.EPISODE_STORE = EpisodeStore()
-    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=3)
+    jobs_router.EPISODE_STORE.upsert_ep_id(
+        ep_id=ep_id, show_slug="demo", season=1, episode=3
+    )
     monkeypatch.setattr(jobs_router, "JOB_SERVICE", JobService(data_root=data_root))
     fake_episode_run = types.SimpleNamespace(
-        ensure_retinaface_ready=lambda device, det_thresh=None: (False, "weights missing", None),
+        ensure_retinaface_ready=lambda device, det_thresh=None: (
+            False,
+            "weights missing",
+            None,
+        ),
         RETINAFACE_HELP="RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py.",
     )
     monkeypatch.setattr(jobs_service, "episode_run", fake_episode_run)

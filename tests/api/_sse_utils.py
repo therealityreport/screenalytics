@@ -14,11 +14,13 @@ def write_sample_tracks(ep_id: str, sample_count: int = 5) -> None:
     tracks_path.parent.mkdir(parents=True, exist_ok=True)
     samples = []
     for idx in range(max(sample_count, 1)):
-        samples.append({
-            "frame_idx": idx * 5,
-            "ts": round(idx * 0.5, 4),
-            "bbox_xyxy": [10 + idx, 20 + idx, 110 + idx, 160 + idx],
-        })
+        samples.append(
+            {
+                "frame_idx": idx * 5,
+                "ts": round(idx * 0.5, 4),
+                "bbox_xyxy": [10 + idx, 20 + idx, 110 + idx, 160 + idx],
+            }
+        )
     row = {
         "ep_id": ep_id,
         "track_id": 1,
@@ -44,7 +46,9 @@ def write_sample_faces(ep_id: str, face_count: int = 5) -> None:
                 "bbox_xyxy": [10, 20, 110, 160],
             }
         )
-    faces_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    faces_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
 
 
 def collect_sse_events(response) -> List[Tuple[str, Dict[str, Any]]]:
@@ -54,7 +58,9 @@ def collect_sse_events(response) -> List[Tuple[str, Dict[str, Any]]]:
     for raw_line in response.iter_lines():
         if raw_line is None:
             continue
-        line = raw_line.decode() if isinstance(raw_line, (bytes, bytearray)) else raw_line
+        line = (
+            raw_line.decode() if isinstance(raw_line, (bytes, bytearray)) else raw_line
+        )
         line = line.strip()
         if not line:
             if data_lines:

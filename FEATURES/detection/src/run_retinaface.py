@@ -72,7 +72,9 @@ def _capture_fps(video_path: Path) -> float:
     return fps or 30.0
 
 
-def _iter_video_samples(video_path: Path, ep_id: str, stride: int) -> Iterator[FrameSample]:
+def _iter_video_samples(
+    video_path: Path, ep_id: str, stride: int
+) -> Iterator[FrameSample]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video: {video_path}")

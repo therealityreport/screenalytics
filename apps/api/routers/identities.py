@@ -28,7 +28,9 @@ class MergeRequest(BaseModel):
 
 class MoveTrackRequest(BaseModel):
     track_id: int
-    target_identity_id: str | None = Field(None, description="Destination identity or null")
+    target_identity_id: str | None = Field(
+        None, description="Destination identity or null"
+    )
 
 
 class DropTrackRequest(BaseModel):
@@ -44,7 +46,9 @@ class DropFrameRequest(BaseModel):
 @router.post("/{ep_id}/rename")
 def rename_identity(ep_id: str, body: RenameRequest) -> dict:
     try:
-        identity = identity_service.rename_identity(ep_id, body.identity_id, body.new_label)
+        identity = identity_service.rename_identity(
+            ep_id, body.identity_id, body.new_label
+        )
     except ValueError as exc:  # pragma: no cover - defensive guard
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"identity_id": body.identity_id, "label": identity.get("label")}
@@ -53,9 +57,13 @@ def rename_identity(ep_id: str, body: RenameRequest) -> dict:
 @router.post("/{ep_id}/merge")
 def merge_identities(ep_id: str, body: MergeRequest) -> dict:
     if body.source_id == body.target_id:
-        raise HTTPException(status_code=400, detail="Source and target must be different")
+        raise HTTPException(
+            status_code=400, detail="Source and target must be different"
+        )
     try:
-        merged = identity_service.merge_identities(ep_id, body.source_id, body.target_id)
+        merged = identity_service.merge_identities(
+            ep_id, body.source_id, body.target_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"identity_id": body.target_id, "track_ids": merged.get("track_ids", [])}
@@ -64,7 +72,9 @@ def merge_identities(ep_id: str, body: MergeRequest) -> dict:
 @router.post("/{ep_id}/move_track")
 def move_track(ep_id: str, body: MoveTrackRequest) -> dict:
     try:
-        result = identity_service.move_track(ep_id, body.track_id, body.target_identity_id)
+        result = identity_service.move_track(
+            ep_id, body.track_id, body.target_identity_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return result
@@ -81,7 +91,8 @@ def drop_track(ep_id: str, body: DropTrackRequest) -> dict:
 @router.post("/{ep_id}/drop_frame")
 def drop_frame(ep_id: str, body: DropFrameRequest) -> dict:
     try:
-        return identity_service.drop_frame(ep_id, body.track_id, body.frame_idx, body.delete_assets)
+        return identity_service.drop_frame(
+            ep_id, body.track_id, body.frame_idx, body.delete_assets
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-

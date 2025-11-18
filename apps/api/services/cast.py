@@ -97,13 +97,15 @@ class CastService:
                 payload = json.loads(cast_file.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 payload = {"cast": []}
-            shows.append({
-                "show_id": payload.get("show_id") or entry.name,
-                "title": payload.get("show_title"),
-                "full_name": payload.get("full_name"),
-                "imdb_series_id": payload.get("imdb_series_id"),
-                "cast_count": len(payload.get("cast", []) or []),
-            })
+            shows.append(
+                {
+                    "show_id": payload.get("show_id") or entry.name,
+                    "title": payload.get("show_title"),
+                    "full_name": payload.get("full_name"),
+                    "imdb_series_id": payload.get("imdb_series_id"),
+                    "cast_count": len(payload.get("cast", []) or []),
+                }
+            )
         return shows
 
     def register_show(
@@ -155,7 +157,9 @@ class CastService:
             "created": created,
         }
 
-    def list_cast(self, show_id: str, season: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_cast(
+        self, show_id: str, season: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """Get all cast members for a show, optionally filtered by season."""
         data = self._load_cast(show_id)
         cast_members = data.get("cast", [])
@@ -164,7 +168,8 @@ class CastService:
             # Filter by season (case-insensitive)
             season_lower = season.lower()
             cast_members = [
-                member for member in cast_members
+                member
+                for member in cast_members
                 if any(s.lower() == season_lower for s in member.get("seasons", []))
             ]
 

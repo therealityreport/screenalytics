@@ -14,7 +14,13 @@ def _ensure_streamlit_shims() -> None:
     if "streamlit" not in sys.modules:
         streamlit_mod = types.ModuleType("streamlit")
         streamlit_mod.session_state = {}
-        streamlit_mod.sidebar = types.SimpleNamespace(header=lambda *args, **kwargs: None, code=lambda *args, **kwargs: None, success=lambda *args, **kwargs: None, error=lambda *args, **kwargs: None, caption=lambda *args, **kwargs: None)
+        streamlit_mod.sidebar = types.SimpleNamespace(
+            header=lambda *args, **kwargs: None,
+            code=lambda *args, **kwargs: None,
+            success=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+            caption=lambda *args, **kwargs: None,
+        )
         streamlit_mod.set_page_config = lambda *args, **kwargs: None
         streamlit_mod.title = lambda *args, **kwargs: None
         streamlit_mod.caption = lambda *args, **kwargs: None
@@ -28,10 +34,21 @@ def _ensure_streamlit_shims() -> None:
             caption=lambda *args, **kwargs: None,
         )
         streamlit_mod.session_state = {}
-        streamlit_mod.columns = lambda *args, **kwargs: [types.SimpleNamespace()] * (args[0] if args else kwargs.get("spec", 1))
-        streamlit_mod.container = lambda *args, **kwargs: types.SimpleNamespace(__enter__=lambda self: None, __exit__=lambda self, exc_type, exc, tb: False)
-        streamlit_mod.empty = lambda: types.SimpleNamespace(write=lambda *a, **k: None, caption=lambda *a, **k: None, code=lambda *a, **k: None, info=lambda *a, **k: None)
-        streamlit_mod.progress = lambda *args, **kwargs: types.SimpleNamespace(progress=lambda *a, **k: None)
+        streamlit_mod.columns = lambda *args, **kwargs: [types.SimpleNamespace()] * (
+            args[0] if args else kwargs.get("spec", 1)
+        )
+        streamlit_mod.container = lambda *args, **kwargs: types.SimpleNamespace(
+            __enter__=lambda self: None, __exit__=lambda self, exc_type, exc, tb: False
+        )
+        streamlit_mod.empty = lambda: types.SimpleNamespace(
+            write=lambda *a, **k: None,
+            caption=lambda *a, **k: None,
+            code=lambda *a, **k: None,
+            info=lambda *a, **k: None,
+        )
+        streamlit_mod.progress = lambda *args, **kwargs: types.SimpleNamespace(
+            progress=lambda *a, **k: None
+        )
         streamlit_mod.error = lambda *args, **kwargs: None
         streamlit_mod.success = lambda *args, **kwargs: None
         streamlit_mod.warning = lambda *args, **kwargs: None
@@ -43,7 +60,13 @@ def _ensure_streamlit_shims() -> None:
         streamlit_mod.selectbox = lambda *args, **kwargs: kwargs.get("index", 0)
         streamlit_mod.number_input = lambda *args, **kwargs: kwargs.get("value", 0)
         streamlit_mod.text_input = lambda *args, **kwargs: kwargs.get("value", "")
-        streamlit_mod.tabs = lambda labels: [types.SimpleNamespace(__enter__=lambda self: None, __exit__=lambda self, exc_type, exc, tb: False) for _ in labels]
+        streamlit_mod.tabs = lambda labels: [
+            types.SimpleNamespace(
+                __enter__=lambda self: None,
+                __exit__=lambda self, exc_type, exc, tb: False,
+            )
+            for _ in labels
+        ]
         streamlit_mod.stop = lambda: None
         streamlit_mod.rerun = lambda: None
         streamlit_mod.session_state = {}
@@ -61,14 +84,18 @@ def _ensure_streamlit_shims() -> None:
 
 def _ensure_requests_shim() -> None:
     if "requests" not in sys.modules:
-        sys.modules["requests"] = types.SimpleNamespace(RequestException=Exception, HTTPError=Exception)
+        sys.modules["requests"] = types.SimpleNamespace(
+            RequestException=Exception, HTTPError=Exception
+        )
 
 
 @lru_cache(maxsize=1)
 def load_ui_helpers_module():
     _ensure_requests_shim()
     _ensure_streamlit_shims()
-    spec = importlib.util.spec_from_file_location("workspace_ui_helpers_test", HELPERS_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "workspace_ui_helpers_test", HELPERS_PATH
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)  # type: ignore[attr-defined]

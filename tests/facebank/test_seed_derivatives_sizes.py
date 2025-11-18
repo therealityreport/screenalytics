@@ -34,7 +34,14 @@ def _prepare_facebank_env(monkeypatch, tmp_path):
     return facebank_router, dummy_storage
 
 
-def _upload_seed(monkeypatch, facebank_router, show_id: str, cast_id: str, image, filename: str = "seed.jpg"):
+def _upload_seed(
+    monkeypatch,
+    facebank_router,
+    show_id: str,
+    cast_id: str,
+    image,
+    filename: str = "seed.jpg",
+):
     _mock_face_pipeline(monkeypatch)
     client = TestClient(app)
     files = [("files", (filename, image, "image/jpeg"))]

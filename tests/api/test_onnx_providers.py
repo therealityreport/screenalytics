@@ -225,7 +225,9 @@ def test_onnx_providers_get_providers_error_fallback():
     from tools.episode_run import _onnx_providers_for
 
     mock_ort = MagicMock()
-    mock_ort.get_available_providers.side_effect = RuntimeError("Provider enumeration failed")
+    mock_ort.get_available_providers.side_effect = RuntimeError(
+        "Provider enumeration failed"
+    )
 
     with patch.dict("sys.modules", {"onnxruntime": mock_ort}):
         providers, resolved = _onnx_providers_for("auto")

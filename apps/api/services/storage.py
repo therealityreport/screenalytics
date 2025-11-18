@@ -24,7 +24,9 @@ _V2_KEY_RE = re.compile(
     r"raw/videos/(?P<show>[^/]+)/s(?P<season>\d{2})/e(?P<episode>\d{2})/episode\.mp4"
 )
 _V1_KEY_RE = re.compile(r"raw/videos/(?P<ep_id>[^/]+)/episode\.mp4")
-_EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
+_EP_ID_REGEX = re.compile(
+    r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE
+)
 _FRAME_NAME_RE = re.compile(r"frame_(\d{6})\.jpg$", re.IGNORECASE)
 _CURSOR_SEP = "|"
 LOGGER = logging.getLogger(__name__)
@@ -100,6 +102,7 @@ def _normalize_cursor_key(track_prefix: str, raw_key: str | None) -> str | None:
 def _boto3():
     try:
         import boto3  # type: ignore
+
         return boto3
     except ImportError as exc:  # pragma: no cover - only triggered in misconfig
         raise RuntimeError(
@@ -131,11 +134,15 @@ class PresignedUpload:
 def episode_context_from_id(ep_id: str) -> EpisodeContext:
     match = _EP_ID_REGEX.match(ep_id)
     if not match:
-        raise ValueError(f"Unable to parse episode id '{ep_id}' into show/season/episode")
+        raise ValueError(
+            f"Unable to parse episode id '{ep_id}' into show/season/episode"
+        )
     show = match.group("show")
     season = int(match.group("season"))
     episode = int(match.group("episode"))
-    return EpisodeContext(ep_id=ep_id, show_slug=show, season_number=season, episode_number=episode)
+    return EpisodeContext(
+        ep_id=ep_id, show_slug=show, season_number=season, episode_number=episode
+    )
 
 
 def artifact_prefixes(ep_ctx: EpisodeContext) -> Dict[str, str]:
@@ -201,7 +208,9 @@ class StorageService:
             if custom_endpoint:
                 client_kwargs["endpoint_url"] = custom_endpoint
             self._client = boto3_mod.client("s3", **client_kwargs)
-            configured_bucket = os.environ.get("SCREENALYTICS_S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
+            configured_bucket = os.environ.get(
+                "SCREENALYTICS_S3_BUCKET"
+            ) or os.environ.get("AWS_S3_BUCKET")
             self.bucket = configured_bucket or DEFAULT_BUCKET
             self._client_error_cls = ClientError
             self._ensure_s3_bucket(ClientError)
@@ -210,12 +219,24 @@ class StorageService:
             from botocore.client import Config  # type: ignore
             from botocore.exceptions import ClientError  # type: ignore
 
-            endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT", "http://localhost:9000")
-            access_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY", "minio")
-            secret_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY", "miniosecret")
-            signature_version = os.environ.get("SCREENALYTICS_OBJECT_STORE_SIGNATURE", "s3v4")
-            minio_region = os.environ.get("SCREENALYTICS_OBJECT_STORE_REGION", DEFAULT_REGION)
-            self.bucket = os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET", DEFAULT_BUCKET)
+            endpoint = os.environ.get(
+                "SCREENALYTICS_OBJECT_STORE_ENDPOINT", "http://localhost:9000"
+            )
+            access_key = os.environ.get(
+                "SCREENALYTICS_OBJECT_STORE_ACCESS_KEY", "minio"
+            )
+            secret_key = os.environ.get(
+                "SCREENALYTICS_OBJECT_STORE_SECRET_KEY", "miniosecret"
+            )
+            signature_version = os.environ.get(
+                "SCREENALYTICS_OBJECT_STORE_SIGNATURE", "s3v4"
+            )
+            minio_region = os.environ.get(
+                "SCREENALYTICS_OBJECT_STORE_REGION", DEFAULT_REGION
+            )
+            self.bucket = os.environ.get(
+                "SCREENALYTICS_OBJECT_STORE_BUCKET", DEFAULT_BUCKET
+            )
             self._client = boto3_mod.client(
                 "s3",
                 endpoint_url=endpoint,
@@ -234,7 +255,11 @@ class StorageService:
         default_enabled = self.backend in {"s3", "minio"} and self._client is not None
         if flag is not None:
             default_enabled = flag.lower() in {"1", "true", "yes"}
-        self.write_enabled = default_enabled and self.backend in {"s3", "minio"} and self._client is not None
+        self.write_enabled = (
+            default_enabled
+            and self.backend in {"s3", "minio"}
+            and self._client is not None
+        )
         self._init_facebank_storage()
 
     def _init_facebank_storage(self) -> None:
@@ -260,10 +285,16 @@ class StorageService:
         if not bucket:
             return
 
-        endpoint = os.environ.get("FACEBANK_S3_ENDPOINT") or os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT")
+        endpoint = os.environ.get("FACEBANK_S3_ENDPOINT") or os.environ.get(
+            "SCREENALYTICS_OBJECT_STORE_ENDPOINT"
+        )
         region = os.environ.get("FACEBANK_S3_REGION") or self.region or DEFAULT_REGION
-        access_key = os.environ.get("FACEBANK_S3_ACCESS_KEY") or os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY")
-        secret_key = os.environ.get("FACEBANK_S3_SECRET_KEY") or os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY")
+        access_key = os.environ.get("FACEBANK_S3_ACCESS_KEY") or os.environ.get(
+            "SCREENALYTICS_OBJECT_STORE_ACCESS_KEY"
+        )
+        secret_key = os.environ.get("FACEBANK_S3_SECRET_KEY") or os.environ.get(
+            "SCREENALYTICS_OBJECT_STORE_SECRET_KEY"
+        )
         signature_version = os.environ.get("FACEBANK_S3_SIGNATURE", "s3v4")
 
         try:
@@ -286,7 +317,9 @@ class StorageService:
             self._facebank_client = boto3_mod.client("s3", **client_kwargs)
             self._facebank_bucket = bucket
             flag = os.environ.get("FACEBANK_S3_WRITE")
-            self._facebank_write_enabled = True if flag is None else flag.lower() in {"1", "true", "yes"}
+            self._facebank_write_enabled = (
+                True if flag is None else flag.lower() in {"1", "true", "yes"}
+            )
         except Exception as exc:  # pragma: no cover - optional feature
             LOGGER.warning("Failed to initialise facebank S3 client: %s", exc)
             self._facebank_client = None
@@ -296,7 +329,9 @@ class StorageService:
     def s3_enabled(self) -> bool:
         return self.backend in {"s3", "minio"} and self._client is not None
 
-    def _object_extra_args(self, local_path: Path, *, content_type_hint: str | None = None) -> Dict[str, str]:
+    def _object_extra_args(
+        self, local_path: Path, *, content_type_hint: str | None = None
+    ) -> Dict[str, str]:
         mime = content_type_hint or guess_type(str(local_path))[0]
         if not mime:
             mime = _infer_mime_from_key(local_path.name)
@@ -324,7 +359,11 @@ class StorageService:
             path = object_key
         else:
             assert self._client is not None  # for mypy
-            params = {"Bucket": self.bucket, "Key": object_key, "ContentType": content_type}
+            params = {
+                "Bucket": self.bucket,
+                "Key": object_key,
+                "ContentType": content_type,
+            }
             upload_url = self._client.generate_presigned_url(
                 "put_object",
                 Params=params,
@@ -346,7 +385,9 @@ class StorageService:
             backend=self.backend,
         )
 
-    def presign_get(self, key: str, expires_in: int = 3600, *, content_type: str | None = None) -> str | None:
+    def presign_get(
+        self, key: str, expires_in: int = 3600, *, content_type: str | None = None
+    ) -> str | None:
         client = None
         bucket = None
         if self.backend in {"s3", "minio"} and self._client is not None:
@@ -389,11 +430,24 @@ class StorageService:
         }
         if self.backend == "local":
             return info
-        if self.backend not in {"s3", "minio"} or self._client is None or self._client_error_cls is None:
+        if (
+            self.backend not in {"s3", "minio"}
+            or self._client is None
+            or self._client_error_cls is None
+        ):
             return info
         keys_to_try: List[tuple[str, str]] = []
-        if show_ref is not None and season_number is not None and episode_number is not None:
-            keys_to_try.append(("v2", self.video_object_key_v2(show_ref, season_number, episode_number)))
+        if (
+            show_ref is not None
+            and season_number is not None
+            and episode_number is not None
+        ):
+            keys_to_try.append(
+                (
+                    "v2",
+                    self.video_object_key_v2(show_ref, season_number, episode_number),
+                )
+            )
         keys_to_try.append(("v1", self.video_object_key_v1(ep_id)))
 
         for version, key in keys_to_try:
@@ -408,20 +462,32 @@ class StorageService:
                 info["used_key_version"] = version
                 return info
             except self._client_error_cls as exc:  # type: ignore[misc]
-                error_code = exc.response.get("Error", {}).get("Code") if hasattr(exc, "response") else None
+                error_code = (
+                    exc.response.get("Error", {}).get("Code")
+                    if hasattr(exc, "response")
+                    else None
+                )
                 if error_code in {"404", "NoSuchKey", "NotFound"}:
                     continue
                 raise
         raise RuntimeError("Episode video not found in S3 (checked v2 then v1)")
 
     def object_exists(self, key: str) -> bool:
-        if self.backend not in {"s3", "minio"} or self._client is None or self._client_error_cls is None:
+        if (
+            self.backend not in {"s3", "minio"}
+            or self._client is None
+            or self._client_error_cls is None
+        ):
             return False
         try:
             self._client.head_object(Bucket=self.bucket, Key=key)
             return True
         except self._client_error_cls as exc:  # type: ignore[misc]
-            error_code = exc.response.get("Error", {}).get("Code") if hasattr(exc, "response") else None
+            error_code = (
+                exc.response.get("Error", {}).get("Code")
+                if hasattr(exc, "response")
+                else None
+            )
             if error_code in {"404", "NoSuchKey", "NotFound"}:
                 return False
             raise
@@ -435,7 +501,9 @@ class StorageService:
         return f"{prefix}videos/{show_slug}/s{season:02d}/e{episode:02d}/episode.mp4"
 
     # ------------------------------------------------------------------
-    def put_artifact(self, ep_ctx: EpisodeContext, kind: str, local_path: Path, key_rel: str) -> bool:
+    def put_artifact(
+        self, ep_ctx: EpisodeContext, kind: str, local_path: Path, key_rel: str
+    ) -> bool:
         """Upload a single artifact file under the v2 hierarchy."""
 
         if self.backend not in {"s3", "minio"} or self._client is None:
@@ -459,10 +527,18 @@ class StorageService:
             )
             return True
         except Exception as exc:  # pragma: no cover - best-effort upload
-            LOGGER.warning("Failed to upload artifact %s to s3://%s/%s: %s", local_path, self.bucket, key, exc)
+            LOGGER.warning(
+                "Failed to upload artifact %s to s3://%s/%s: %s",
+                local_path,
+                self.bucket,
+                key,
+                exc,
+            )
             return False
 
-    def sync_tree_to_s3(self, ep_ctx: EpisodeContext, local_dir: Path, s3_prefix: str) -> int:
+    def sync_tree_to_s3(
+        self, ep_ctx: EpisodeContext, local_dir: Path, s3_prefix: str
+    ) -> int:
         """Sync an entire directory tree to the configured bucket (best effort)."""
 
         return self.upload_dir(local_dir, s3_prefix)
@@ -481,11 +557,19 @@ class StorageService:
         client = None
         bucket = None
         write_ok = False
-        if self.backend in {"s3", "minio"} and self._client is not None and self.write_enabled:
+        if (
+            self.backend in {"s3", "minio"}
+            and self._client is not None
+            and self.write_enabled
+        ):
             client = self._client
             bucket = self.bucket
             write_ok = True
-        elif self._facebank_client is not None and self._facebank_bucket and self._facebank_write_enabled:
+        elif (
+            self._facebank_client is not None
+            and self._facebank_bucket
+            and self._facebank_write_enabled
+        ):
             client = self._facebank_client
             bucket = self._facebank_bucket
             write_ok = True
@@ -527,7 +611,9 @@ class StorageService:
             )
             return None
 
-    def _log_display_object_size(self, client, bucket: str, key: str, fallback_size: int) -> None:
+    def _log_display_object_size(
+        self, client, bucket: str, key: str, fallback_size: int
+    ) -> None:
         try:
             head = client.head_object(Bucket=bucket, Key=key)
             size = head.get("ContentLength", fallback_size)
@@ -539,9 +625,13 @@ class StorageService:
         except (TypeError, ValueError):
             size_int = fallback_size
         if size_int < 10_000:
-            LOGGER.warning("Facebank display object small: key=%s bytes=%s", key, size_int)
+            LOGGER.warning(
+                "Facebank display object small: key=%s bytes=%s", key, size_int
+            )
         else:
-            LOGGER.info("Facebank display object uploaded: key=%s bytes=%s", key, size_int)
+            LOGGER.info(
+                "Facebank display object uploaded: key=%s bytes=%s", key, size_int
+            )
 
     def upload_dir(
         self,
@@ -583,7 +673,10 @@ class StorageService:
             if not path.is_file():
                 continue
             rel = path.relative_to(root).as_posix()
-            if skip_exact and (rel in skip_exact or any(rel.startswith(prefix) for prefix in skip_prefixes)):
+            if skip_exact and (
+                rel in skip_exact
+                or any(rel.startswith(prefix) for prefix in skip_prefixes)
+            ):
                 continue
             key = f"{prefix}{rel}" if rel else prefix.rstrip("/")
             extra = self._object_extra_args(path) if guess_mime else None
@@ -594,13 +687,21 @@ class StorageService:
                     self._client.upload_file(str(path), self.bucket, key)  # type: ignore[union-attr]
                 uploaded += 1
             except Exception as exc:  # pragma: no cover
-                LOGGER.warning("Failed to upload %s to s3://%s/%s: %s", path, self.bucket, key, exc)
+                LOGGER.warning(
+                    "Failed to upload %s to s3://%s/%s: %s", path, self.bucket, key, exc
+                )
         return uploaded
 
-    def list_objects(self, prefix: str, suffix: str | None = None, max_items: int = 1000) -> List[str]:
+    def list_objects(
+        self, prefix: str, suffix: str | None = None, max_items: int = 1000
+    ) -> List[str]:
         """Return up to `max_items` object keys under the provided prefix."""
 
-        if self.backend not in {"s3", "minio"} or self._client is None or max_items <= 0:
+        if (
+            self.backend not in {"s3", "minio"}
+            or self._client is None
+            or max_items <= 0
+        ):
             return []
         results: List[str] = []
         continuation_token: str | None = None
@@ -656,10 +757,16 @@ class StorageService:
             contents: Iterable[Dict[str, Any]] = response.get("Contents", [])
             if not contents:
                 break
-            batch = [{"Key": obj.get("Key")} for obj in contents if isinstance(obj.get("Key"), str)]
+            batch = [
+                {"Key": obj.get("Key")}
+                for obj in contents
+                if isinstance(obj.get("Key"), str)
+            ]
             if not batch:
                 break
-            self._client.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
+            self._client.delete_objects(
+                Bucket=bucket, Delete={"Objects": batch, "Quiet": True}
+            )
             total_deleted += len(batch)
             if not response.get("IsTruncated"):
                 break
@@ -704,7 +811,7 @@ class StorageService:
                         **meta,
                         "size": obj.get("Size"),
                         "last_modified": obj.get("LastModified"),
-                        "etag": (obj.get("ETag") or '').strip('"'),
+                        "etag": (obj.get("ETag") or "").strip('"'),
                     }
                 )
                 fetched += 1
@@ -764,7 +871,9 @@ class StorageService:
     ) -> Dict[str, Any]:
         crops_root = get_path(ep_id, "frames_root") / "crops"
         candidate_roots: List[Path] = [crops_root]
-        fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+        fallback_root = Path(
+            os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")
+        ).expanduser()
         legacy_root = fallback_root / ep_id / "tracks"
         if legacy_root not in candidate_roots:
             candidate_roots.append(legacy_root)
@@ -789,7 +898,9 @@ class StorageService:
             if not abs_path.exists():
                 continue
             filtered.append({**entry, "_abs_path": abs_path})
-        selected, cursor = self._slice_entries(filtered, sample, max_keys, cursor_key, cursor_cycle)
+        selected, cursor = self._slice_entries(
+            filtered, sample, max_keys, cursor_key, cursor_cycle
+        )
         items: List[Dict[str, Any]] = []
         for entry in selected:
             abs_path: Path = entry.get("_abs_path")  # type: ignore[assignment]
@@ -821,7 +932,9 @@ class StorageService:
         index_key = f"{track_prefix_full}index.json"
         entries = self._load_remote_track_index(index_key, track_prefix)
         if entries:
-            selected, cursor = self._slice_entries(entries, sample, max_keys, cursor_key, cursor_cycle)
+            selected, cursor = self._slice_entries(
+                entries, sample, max_keys, cursor_key, cursor_cycle
+            )
             items: List[Dict[str, Any]] = []
             for entry in selected:
                 s3_key = f"{base_prefix}{entry['key']}"
@@ -846,7 +959,9 @@ class StorageService:
             cursor_cycle,
         )
 
-    def _load_track_index_from_path(self, track_dir: Path, track_prefix: str) -> List[Dict[str, Any]]:
+    def _load_track_index_from_path(
+        self, track_dir: Path, track_prefix: str
+    ) -> List[Dict[str, Any]]:
         index_path = track_dir / "index.json"
         if not index_path.exists():
             return []
@@ -859,7 +974,9 @@ class StorageService:
             return []
         return self._normalize_track_index_entries(raw, track_prefix)
 
-    def _entries_from_files(self, track_dir: Path, track_prefix: str) -> List[Dict[str, Any]]:
+    def _entries_from_files(
+        self, track_dir: Path, track_prefix: str
+    ) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
         if not track_dir.exists():
             return entries
@@ -871,7 +988,9 @@ class StorageService:
             entries.append({"key": key, "frame_idx": frame_idx, "ts": None})
         return entries
 
-    def _normalize_track_index_entries(self, raw_entries: Iterable[Any], track_prefix: str) -> List[Dict[str, Any]]:
+    def _normalize_track_index_entries(
+        self, raw_entries: Iterable[Any], track_prefix: str
+    ) -> List[Dict[str, Any]]:
         normalized: Dict[str, Dict[str, Any]] = {}
         marker = track_prefix
         for entry in raw_entries:
@@ -898,7 +1017,11 @@ class StorageService:
                     ts_val = float(ts_val)
                 except (TypeError, ValueError):
                     ts_val = None
-            normalized[candidate] = {"key": candidate, "frame_idx": frame_idx, "ts": ts_val}
+            normalized[candidate] = {
+                "key": candidate,
+                "frame_idx": frame_idx,
+                "ts": ts_val,
+            }
         ordered = sorted(normalized.values(), key=lambda item: item["frame_idx"])
         return ordered
 
@@ -933,13 +1056,23 @@ class StorageService:
                 break
         return selected, next_cursor
 
-    def _load_remote_track_index(self, index_key: str, track_prefix: str) -> List[Dict[str, Any]]:
-        if self.backend not in {"s3", "minio"} or self._client is None or self._client_error_cls is None:
+    def _load_remote_track_index(
+        self, index_key: str, track_prefix: str
+    ) -> List[Dict[str, Any]]:
+        if (
+            self.backend not in {"s3", "minio"}
+            or self._client is None
+            or self._client_error_cls is None
+        ):
             return []
         try:
             response = self._client.get_object(Bucket=self.bucket, Key=index_key)
         except self._client_error_cls as exc:  # type: ignore[misc]
-            error_code = exc.response.get("Error", {}).get("Code") if hasattr(exc, "response") else None
+            error_code = (
+                exc.response.get("Error", {}).get("Code")
+                if hasattr(exc, "response")
+                else None
+            )
             if error_code in {"404", "NoSuchKey", "NotFound"}:
                 return []
             raise
@@ -986,7 +1119,11 @@ class StorageService:
         while len(items) < max_keys:
             remaining = max(max_keys - len(items), 1)
             fetch_budget = min(1000, max(remaining * sample, sample))
-            kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": track_root, "MaxKeys": fetch_budget}
+            kwargs: Dict[str, Any] = {
+                "Bucket": self.bucket,
+                "Prefix": track_root,
+                "MaxKeys": fetch_budget,
+            }
             if continuation_token:
                 kwargs["ContinuationToken"] = continuation_token
             elif start_after_key:
@@ -1012,7 +1149,9 @@ class StorageService:
                 url = self.presign_get(key)
                 if not url:
                     continue
-                items.append({"key": rel, "frame_idx": frame_idx, "ts": None, "url": url})
+                items.append(
+                    {"key": rel, "frame_idx": frame_idx, "ts": None, "url": url}
+                )
                 if len(items) >= max_keys:
                     next_cursor = _encode_cursor(rel, cycle)
                     more_available = True
@@ -1021,7 +1160,10 @@ class StorageService:
                 break
             continuation_token = response.get("NextContinuationToken")
             start_after_key = None
-        return {"items": items, "next_start_after": next_cursor if more_available else None}
+        return {
+            "items": items,
+            "next_start_after": next_cursor if more_available else None,
+        }
 
     def _parse_s3_key_metadata(self, key: str) -> Dict[str, object]:
         parsed_v2 = parse_v2_episode_key(key)
@@ -1037,7 +1179,13 @@ class StorageService:
                 "episode": None,
                 "key_version": "v1",
             }
-        return {"ep_id": "unknown", "key_version": "unknown", "show": None, "season": None, "episode": None}
+        return {
+            "ep_id": "unknown",
+            "key_version": "unknown",
+            "show": None,
+            "season": None,
+            "episode": None,
+        }
 
     def _ensure_s3_bucket(self, client_error_cls) -> None:
         assert self._client is not None
@@ -1047,7 +1195,9 @@ class StorageService:
             if self.auto_create:
                 create_kwargs = {"Bucket": self.bucket}
                 if self.region != "us-east-1":
-                    create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": self.region}
+                    create_kwargs["CreateBucketConfiguration"] = {
+                        "LocationConstraint": self.region
+                    }
                 self._client.create_bucket(**create_kwargs)
             else:
                 raise RuntimeError(
@@ -1055,7 +1205,9 @@ class StorageService:
                 ) from exc
 
 
-def delete_s3_prefix(bucket: str, prefix: str, storage: StorageService | None = None) -> int:
+def delete_s3_prefix(
+    bucket: str, prefix: str, storage: StorageService | None = None
+) -> int:
     service = storage or StorageService()
     target_bucket = bucket or service.bucket
     return service.delete_prefix(prefix, bucket_override=target_bucket)
@@ -1075,7 +1227,9 @@ def v2_artifact_prefixes(ep_ctx: EpisodeContext) -> Dict[str, str]:
     show = ep_ctx.show_slug
     season = ep_ctx.season_number
     episode = ep_ctx.episode_number
-    base.setdefault("analytics", f"{ARTIFACT_ROOT}/analytics/{show}/s{season:02d}/e{episode:02d}/")
+    base.setdefault(
+        "analytics", f"{ARTIFACT_ROOT}/analytics/{show}/s{season:02d}/e{episode:02d}/"
+    )
     base.setdefault("raw_v2", f"raw/videos/{show}/s{season:02d}/e{episode:02d}/")
     base.setdefault("raw_v1", f"raw/videos/{ep_ctx.ep_id}/")
     return base

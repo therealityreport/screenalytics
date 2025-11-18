@@ -40,28 +40,75 @@ def severity_of(text: str) -> str:
 
 def category_of(text: str) -> str:
     lowered = text.lower()
-    if any(k in lowered for k in ["secret", "token", "api key", "credential", "pii", "sanitize"]):
+    if any(
+        k in lowered
+        for k in ["secret", "token", "api key", "credential", "pii", "sanitize"]
+    ):
         return "security"
-    if any(k in lowered for k in ["none", "null", "exception", "try:", "validate", "bounds", "off-by-one", "race", "deadlock"]):
+    if any(
+        k in lowered
+        for k in [
+            "none",
+            "null",
+            "exception",
+            "try:",
+            "validate",
+            "bounds",
+            "off-by-one",
+            "race",
+            "deadlock",
+        ]
+    ):
         return "correctness"
-    if any(k in lowered for k in ["perf", "performance", "cache", "batch", "vectoriz", "o(", "complexity"]):
+    if any(
+        k in lowered
+        for k in [
+            "perf",
+            "performance",
+            "cache",
+            "batch",
+            "vectoriz",
+            "o(",
+            "complexity",
+        ]
+    ):
         return "performance"
-    if any(k in lowered for k in ["typo", "style", "lint", "format", "black", "flake8", "eslint", "prettier"]):
+    if any(
+        k in lowered
+        for k in [
+            "typo",
+            "style",
+            "lint",
+            "format",
+            "black",
+            "flake8",
+            "eslint",
+            "prettier",
+        ]
+    ):
         return "style"
     return "other"
 
 
 def violates_invariants(text: str, suggestion: str):
     lowered = (text + "\n" + suggestion).lower()
-    if "retinaface" in lowered and any(bad in lowered for bad in ["yolo", "coco", "ssd"]):
+    if "retinaface" in lowered and any(
+        bad in lowered for bad in ["yolo", "coco", "ssd"]
+    ):
         return "Keep RetinaFace for face detection per project guideline"
-    if "arcface" in lowered and any(k in lowered for k in ["facenet", "dlib", "openface"]):
+    if "arcface" in lowered and any(
+        k in lowered for k in ["facenet", "dlib", "openface"]
+    ):
         return "Keep ArcFace embeddings (512-d) for compatibility"
     if "bytetrack" in lowered and "strongsort" in lowered and "replace" in lowered:
         return "ByteTrack is required baseline; avoid wholesale replacement"
-    if "s3" in lowered and any(k in lowered for k in ["change layout", "rename bucket", "flatten structure"]):
+    if "s3" in lowered and any(
+        k in lowered for k in ["change layout", "rename bucket", "flatten structure"]
+    ):
         return "Respect S3 v2 layout contract"
-    if "facebank" in lowered and any(k in lowered for k in ["non-atomic", "partial write"]):
+    if "facebank" in lowered and any(
+        k in lowered for k in ["non-atomic", "partial write"]
+    ):
         return "Facebank updates must stay atomic"
     return None
 
@@ -136,6 +183,7 @@ for path, arr in sorted(by_file.items()):
         output_lines.append(f"{entry['snippet']}\n")
         output_lines.append("  ```\n")
 
-pathlib.Path("codex_pr4_checklist.md").write_text("\n".join(output_lines), encoding="utf-8")
+pathlib.Path("codex_pr4_checklist.md").write_text(
+    "\n".join(output_lines), encoding="utf-8"
+)
 print("Wrote codex_pr4_checklist.md with triage results.")
-

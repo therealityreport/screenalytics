@@ -13,6 +13,7 @@ import numpy as np
 
 try:
     from sklearn.cluster import AgglomerativeClustering
+
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -42,6 +43,7 @@ def _now_iso() -> str:
 def _parse_ep_id(ep_id: str) -> Optional[Dict[str, Any]]:
     """Parse episode ID like rhobh-s05e14 into components."""
     import re
+
     pattern = r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$"
     match = re.match(pattern, ep_id, re.IGNORECASE)
     if not match:
@@ -82,7 +84,9 @@ class GroupingService:
         manifests_dir = get_path(ep_id, "detections").parent
         return manifests_dir / "group_log.json"
 
-    def compute_cluster_centroids(self, ep_id: str, *, progress_callback=None) -> Dict[str, Any]:
+    def compute_cluster_centroids(
+        self, ep_id: str, *, progress_callback=None
+    ) -> Dict[str, Any]:
         """Compute centroids for all clusters in an episode.
 
         Args:
@@ -92,6 +96,7 @@ class GroupingService:
         Returns: {"centroids": [{cluster_id, centroid, num_faces}, ...]}
         """
         import logging
+
         LOGGER = logging.getLogger(__name__)
 
         faces_path = self._faces_path(ep_id)
@@ -118,9 +123,13 @@ class GroupingService:
             cluster_to_tracks[cluster_id] = track_ids
 
         # Load faces and group by cluster
-        cluster_embeddings: Dict[str, List[np.ndarray]] = {cid: [] for cid in cluster_to_tracks}
+        cluster_embeddings: Dict[str, List[np.ndarray]] = {
+            cid: [] for cid in cluster_to_tracks
+        }
         cluster_counts: Dict[str, int] = {cid: 0 for cid in cluster_to_tracks}
-        cluster_seed_matches: Dict[str, List[str]] = {cid: [] for cid in cluster_to_tracks}
+        cluster_seed_matches: Dict[str, List[str]] = {
+            cid: [] for cid in cluster_to_tracks
+        }
 
         LOGGER.info(f"[cluster_cleanup] Processing faces from {faces_path}")
         if progress_callback:
@@ -154,7 +163,9 @@ class GroupingService:
                         break
 
         # Compute centroids
-        LOGGER.info(f"[cluster_cleanup] Computing centroids for {len(cluster_to_tracks)} clusters")
+        LOGGER.info(
+            f"[cluster_cleanup] Computing centroids for {len(cluster_to_tracks)} clusters"
+        )
         if progress_callback:
             progress_callback(2, 3, f"Computing {len(cluster_to_tracks)} centroids")
 
@@ -183,6 +194,7 @@ class GroupingService:
             seed_confidence = 0.0
             if seed_matches:
                 from collections import Counter
+
                 seed_counts = Counter(seed_matches)
                 most_common_seed, count = seed_counts.most_common(1)[0]
                 seed_confidence = count / len(seed_matches)
@@ -207,7 +219,9 @@ class GroupingService:
         centroids_path = self._cluster_centroids_path(ep_id)
         centroids_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
-        LOGGER.info(f"[cluster_cleanup] Saved {len(centroids)} centroids to {centroids_path}")
+        LOGGER.info(
+            f"[cluster_cleanup] Saved {len(centroids)} centroids to {centroids_path}"
+        )
         if progress_callback:
             progress_callback(3, 3, f"Saved {len(centroids)} centroids")
 
@@ -237,10 +251,13 @@ class GroupingService:
         Returns: {"groups": [{person_id, cluster_ids}, ...], "merged_count": int}
         """
         import logging
+
         LOGGER = logging.getLogger(__name__)
 
         if not HAS_SKLEARN:
-            raise RuntimeError("sklearn not available; install with: pip install scikit-learn")
+            raise RuntimeError(
+                "sklearn not available; install with: pip install scikit-learn"
+            )
 
         LOGGER.info(f"[cluster_cleanup] Grouping clusters within {ep_id}")
         if progress_callback:
@@ -257,8 +274,7 @@ class GroupingService:
         elif isinstance(centroids, dict):
             # New format: dict keyed by cluster_id
             centroids_list = [
-                {"cluster_id": cid, **data}
-                for cid, data in centroids.items()
+                {"cluster_id": cid, **data} for cid, data in centroids.items()
             ]
         else:
             return {"groups": [], "merged_count": 0}
@@ -281,7 +297,11 @@ class GroupingService:
                 dist = cosine_distance(vectors[i], vectors[j])
 
                 # Apply seed-based distance reduction if both clusters match same seed
-                if seed_cast_ids[i] and seed_cast_ids[j] and seed_cast_ids[i] == seed_cast_ids[j]:
+                if (
+                    seed_cast_ids[i]
+                    and seed_cast_ids[j]
+                    and seed_cast_ids[i] == seed_cast_ids[j]
+                ):
                     dist = max(0.0, dist - SEED_CLUSTER_DELTA)
                     seed_adjustments += 1
 
@@ -289,15 +309,17 @@ class GroupingService:
                 distance_matrix[j, i] = dist
 
         # Agglomerative clustering
-        LOGGER.info(f"[cluster_cleanup] Running agglomerative clustering on {n} centroids (threshold={distance_threshold})")
+        LOGGER.info(
+            f"[cluster_cleanup] Running agglomerative clustering on {n} centroids (threshold={distance_threshold})"
+        )
         if progress_callback:
             progress_callback(1, 2, f"Clustering {n} centroids")
 
         model = AgglomerativeClustering(
             n_clusters=None,
             distance_threshold=distance_threshold,
-            metric='precomputed',
-            linkage='complete',
+            metric="precomputed",
+            linkage="complete",
         )
         labels = model.fit_predict(distance_matrix)
 
@@ -309,7 +331,9 @@ class GroupingService:
         # Filter groups with more than one cluster (actual merges)
         merged_groups = [cids for cids in groups_map.values() if len(cids) > 1]
 
-        LOGGER.info(f"[cluster_cleanup] Found {len(merged_groups)} merged groups (seed adjustments: {seed_adjustments})")
+        LOGGER.info(
+            f"[cluster_cleanup] Found {len(merged_groups)} merged groups (seed adjustments: {seed_adjustments})"
+        )
         if progress_callback:
             progress_callback(2, 2, f"Found {len(merged_groups)} merged groups")
 
@@ -352,8 +376,7 @@ class GroupingService:
             centroids_list = centroids
         elif isinstance(centroids, dict):
             centroids_list = [
-                {"cluster_id": cid, **data}
-                for cid, data in centroids.items()
+                {"cluster_id": cid, **data} for cid, data in centroids.items()
             ]
         else:
             centroids_list = []
@@ -367,11 +390,13 @@ class GroupingService:
             centroid = np.array(centroid_info["centroid"], dtype=np.float32)
 
             # Try to find matching person
-            match = self.people_service.find_matching_person(show_id, centroid, max_distance)
+            match = self.people_service.find_matching_person(
+                show_id, centroid, max_distance
+            )
 
             if match:
                 person_id, distance = match
-                
+
                 if auto_assign:
                     # Assign to existing person
                     full_cluster_id = f"{ep_id}:{cluster_id}"
@@ -383,19 +408,23 @@ class GroupingService:
                         cluster_centroid=centroid,
                         momentum=momentum,
                     )
-                    assigned.append({
-                        "cluster_id": cluster_id,
-                        "person_id": person_id,
-                        "distance": distance,
-                        "suggested": False,
-                    })
+                    assigned.append(
+                        {
+                            "cluster_id": cluster_id,
+                            "person_id": person_id,
+                            "distance": distance,
+                            "suggested": False,
+                        }
+                    )
                 else:
                     # Just store suggestion without assigning
-                    suggestions.append({
-                        "cluster_id": cluster_id,
-                        "suggested_person_id": person_id,
-                        "distance": distance,
-                    })
+                    suggestions.append(
+                        {
+                            "cluster_id": cluster_id,
+                            "suggested_person_id": person_id,
+                            "distance": distance,
+                        }
+                    )
             else:
                 if auto_assign:
                     # Create new person
@@ -406,12 +435,14 @@ class GroupingService:
                         cluster_ids=[full_cluster_id],
                     )
                     new_people.append(person)
-                    assigned.append({
-                        "cluster_id": cluster_id,
-                        "person_id": person["person_id"],
-                        "distance": None,
-                        "suggested": False,
-                    })
+                    assigned.append(
+                        {
+                            "cluster_id": cluster_id,
+                            "person_id": person["person_id"],
+                            "distance": None,
+                            "suggested": False,
+                        }
+                    )
 
         # Update identities.json with person_id assignments (only if auto_assign=True)
         if auto_assign:
@@ -426,9 +457,9 @@ class GroupingService:
 
     def _clear_person_assignments(self, ep_id: str) -> int:
         """Clear all person_id assignments from identities.json AND remove episode clusters from people.json.
-        
+
         This ensures a clean state before clustering - no stale assignments remain.
-        
+
         Returns: Number of assignments cleared from identities.json.
         """
         # Step 1: Remove episode clusters from people.json FIRST
@@ -441,10 +472,14 @@ class GroupingService:
                 result = self.people_service.remove_episode_clusters(show_id, ep_id)
                 removed_clusters = result.get("removed_clusters_count", 0)
                 removed_people = result.get("removed_people_count", 0)
-                LOGGER.info(f"[{ep_id}] Removed {removed_clusters} cluster(s) from people.json ({removed_people} empty people deleted)")
+                LOGGER.info(
+                    f"[{ep_id}] Removed {removed_clusters} cluster(s) from people.json ({removed_people} empty people deleted)"
+                )
             except Exception as e:
-                LOGGER.warning(f"[{ep_id}] Failed to remove clusters from people.json: {e}")
-        
+                LOGGER.warning(
+                    f"[{ep_id}] Failed to remove clusters from people.json: {e}"
+                )
+
         # Step 2: Clear person_id from identities.json
         identities_path = self._identities_path(ep_id)
         cleared_identities = 0
@@ -460,8 +495,10 @@ class GroupingService:
 
             data["identities"] = identities
             identities_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            LOGGER.info(f"[{ep_id}] Cleared {cleared_identities} stale person_id assignment(s) from identities.json")
-        
+            LOGGER.info(
+                f"[{ep_id}] Cleared {cleared_identities} stale person_id assignment(s) from identities.json"
+            )
+
         # Return total cleaned: identities.json assignments + people.json clusters
         return cleared_identities + removed_clusters
 
@@ -490,7 +527,9 @@ class GroupingService:
         data["identities"] = identities
         identities_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def group_clusters_auto(self, ep_id: str, *, progress_callback=None) -> Dict[str, Any]:
+    def group_clusters_auto(
+        self, ep_id: str, *, progress_callback=None
+    ) -> Dict[str, Any]:
         """Run full auto grouping: compute centroids, within-episode, across-episode.
 
         Args:
@@ -499,6 +538,7 @@ class GroupingService:
 
         Returns combined result with audit log.
         """
+
         def _progress(step: str, pct: float, msg: str):
             if progress_callback:
                 progress_callback(step, pct, msg)
@@ -514,14 +554,20 @@ class GroupingService:
         _progress("clear_assignments", 0.0, "Clearing stale person assignments...")
         try:
             cleared = self._clear_person_assignments(ep_id)
-            log["steps"].append({
-                "step": "clear_assignments",
-                "status": "success",
-                "cleared_count": cleared,
-            })
-            _progress("clear_assignments", 0.1, f"Cleared {cleared} stale assignment(s)")
+            log["steps"].append(
+                {
+                    "step": "clear_assignments",
+                    "status": "success",
+                    "cleared_count": cleared,
+                }
+            )
+            _progress(
+                "clear_assignments", 0.1, f"Cleared {cleared} stale assignment(s)"
+            )
         except Exception as e:
-            log["steps"].append({"step": "clear_assignments", "status": "error", "error": str(e)})
+            log["steps"].append(
+                {"step": "clear_assignments", "status": "error", "error": str(e)}
+            )
             LOGGER.warning(f"[{ep_id}] Failed to clear assignments: {e}")
 
         # Step 1: Compute centroids
@@ -529,49 +575,73 @@ class GroupingService:
         try:
             centroids_result = self.compute_cluster_centroids(ep_id)
             centroids_count = len(centroids_result.get("centroids", []))
-            log["steps"].append({
-                "step": "compute_centroids",
-                "status": "success",
-                "centroids_count": centroids_count,
-            })
-            _progress("compute_centroids", 0.4, f"Computed {centroids_count} centroid(s)")
+            log["steps"].append(
+                {
+                    "step": "compute_centroids",
+                    "status": "success",
+                    "centroids_count": centroids_count,
+                }
+            )
+            _progress(
+                "compute_centroids", 0.4, f"Computed {centroids_count} centroid(s)"
+            )
         except Exception as e:
-            log["steps"].append({"step": "compute_centroids", "status": "error", "error": str(e)})
+            log["steps"].append(
+                {"step": "compute_centroids", "status": "error", "error": str(e)}
+            )
             log["finished_at"] = _now_iso()
             self._save_group_log(ep_id, log)
             _progress("compute_centroids", 0.4, f"ERROR: {str(e)}")
             raise
 
         # Step 2: Within-episode grouping
-        _progress("group_within_episode", 0.4, "Grouping similar clusters within episode...")
+        _progress(
+            "group_within_episode", 0.4, "Grouping similar clusters within episode..."
+        )
         try:
             within_result = self.group_within_episode(ep_id)
             merged = within_result.get("merged_count", 0)
-            log["steps"].append({
-                "step": "group_within_episode",
-                "status": "success",
-                "merged_count": merged,
-            })
+            log["steps"].append(
+                {
+                    "step": "group_within_episode",
+                    "status": "success",
+                    "merged_count": merged,
+                }
+            )
             _progress("group_within_episode", 0.7, f"Merged {merged} cluster group(s)")
         except Exception as e:
-            log["steps"].append({"step": "group_within_episode", "status": "error", "error": str(e)})
+            log["steps"].append(
+                {"step": "group_within_episode", "status": "error", "error": str(e)}
+            )
             _progress("group_within_episode", 0.7, f"WARNING: {str(e)}")
             # Continue even if within-episode grouping fails
 
         # Step 3: Across-episode matching to people (compute suggestions only, don't auto-assign)
-        _progress("group_across_episodes", 0.7, "Computing similarity suggestions to cast members...")
+        _progress(
+            "group_across_episodes",
+            0.7,
+            "Computing similarity suggestions to cast members...",
+        )
         try:
             across_result = self.group_across_episodes(ep_id, auto_assign=False)
             suggestions_count = len(across_result.get("suggestions", []))
-            log["steps"].append({
-                "step": "group_across_episodes",
-                "status": "success",
-                "suggestions_count": suggestions_count,
-                "assigned_count": len(across_result.get("assigned", [])),
-            })
-            _progress("group_across_episodes", 1.0, f"Computed {suggestions_count} suggestion(s)")
+            log["steps"].append(
+                {
+                    "step": "group_across_episodes",
+                    "status": "success",
+                    "suggestions_count": suggestions_count,
+                    "assigned_count": len(across_result.get("assigned", [])),
+                }
+            )
+            _progress(
+                "group_across_episodes",
+                1.0,
+                f"Computed {suggestions_count} suggestion(s)",
+            )
         except Exception as e:
-            log["steps"].append({"step": "group_across_episodes", "status": "error", "error": str(e)})
+            log["steps"].append(
+                {"step": "group_across_episodes", "status": "error", "error": str(e)}
+            )
             log["finished_at"] = _now_iso()
             self._save_group_log(ep_id, log)
             _progress("group_across_episodes", 1.0, f"ERROR: {str(e)}")
@@ -613,18 +683,24 @@ class GroupingService:
 
         # Handle both dict (new) and list (legacy) formats
         if isinstance(centroids, list):
-            centroids_map = {c["cluster_id"]: np.array(c["centroid"], dtype=np.float32)
-                           for c in centroids}
+            centroids_map = {
+                c["cluster_id"]: np.array(c["centroid"], dtype=np.float32)
+                for c in centroids
+            }
         elif isinstance(centroids, dict):
-            centroids_map = {cid: np.array(data["centroid"], dtype=np.float32)
-                           for cid, data in centroids.items()}
+            centroids_map = {
+                cid: np.array(data["centroid"], dtype=np.float32)
+                for cid, data in centroids.items()
+            }
         else:
             centroids_map = {}
 
         # If no target person, create new
         if not target_person_id:
             # Use mean of selected clusters as prototype
-            centroids_to_merge = [centroids_map[cid] for cid in cluster_ids if cid in centroids_map]
+            centroids_to_merge = [
+                centroids_map[cid] for cid in cluster_ids if cid in centroids_map
+            ]
             if not centroids_to_merge:
                 raise ValueError("No valid clusters found")
 
@@ -651,7 +727,9 @@ class GroupingService:
                 )
 
         # Update identities.json
-        assignments = [{"cluster_id": cid, "person_id": target_person_id} for cid in cluster_ids]
+        assignments = [
+            {"cluster_id": cid, "person_id": target_person_id} for cid in cluster_ids
+        ]
         self._update_identities_with_people(ep_id, assignments)
 
         return {
@@ -683,8 +761,7 @@ class GroupingService:
             centroids_list = centroids
         elif isinstance(centroids, dict):
             centroids_list = [
-                {"cluster_id": cid, **data}
-                for cid, data in centroids.items()
+                {"cluster_id": cid, **data} for cid, data in centroids.items()
             ]
         else:
             centroids_list = []
@@ -693,9 +770,15 @@ class GroupingService:
             raise ValueError(f"No cluster centroids found for {ep_id}")
 
         cast_members = self.cast_service.list_cast(show_id)
-        cast_lookup = {member["cast_id"]: member for member in cast_members if member.get("cast_id")}
+        cast_lookup = {
+            member["cast_id"]: member
+            for member in cast_members
+            if member.get("cast_id")
+        }
         people = self.people_service.list_people(show_id)
-        cast_person_map = {person.get("cast_id"): person for person in people if person.get("cast_id")}
+        cast_person_map = {
+            person.get("cast_id"): person for person in people if person.get("cast_id")
+        }
 
         assignments = []
         matched_clusters: List[Dict[str, Any]] = []
@@ -704,7 +787,9 @@ class GroupingService:
         for centroid_entry in centroids_list:
             cluster_id = centroid_entry["cluster_id"]
             centroid_vec = np.array(centroid_entry["centroid"], dtype=np.float32)
-            match = self.facebank_service.find_matching_seed(show_id, centroid_vec, min_similarity)
+            match = self.facebank_service.find_matching_seed(
+                show_id, centroid_vec, min_similarity
+            )
             if not match:
                 unmatched_clusters.append(cluster_id)
                 continue
@@ -737,13 +822,17 @@ class GroupingService:
                 cast_person_map[cast_id] = updated
 
             assignments.append({"cluster_id": cluster_id, "person_id": person_id})
-            matched_clusters.append({
-                "cluster_id": cluster_id,
-                "person_id": person_id,
-                "cast_id": cast_id,
-                "seed_id": seed_id,
-                "similarity": round(float(similarity), 4) if similarity is not None else None,
-            })
+            matched_clusters.append(
+                {
+                    "cluster_id": cluster_id,
+                    "person_id": person_id,
+                    "cast_id": cast_id,
+                    "seed_id": seed_id,
+                    "similarity": (
+                        round(float(similarity), 4) if similarity is not None else None
+                    ),
+                }
+            )
 
         if assignments:
             self._update_identities_with_people(ep_id, assignments)
@@ -779,143 +868,157 @@ class GroupingService:
         max_distance: float = PEOPLE_MATCH_DISTANCE,
     ) -> Dict[str, Any]:
         """Suggest matches for unassigned clusters by comparing with assigned clusters.
-        
+
         For each unassigned cluster, find the most similar assigned cluster and suggest
         that person. This uses actual episode data rather than facebank prototypes.
-        
+
         Args:
             ep_id: Episode ID
             max_distance: Maximum distance threshold for suggestions
-            
+
         Returns: {"suggestions": [{cluster_id, suggested_person_id, distance}, ...]}
         """
         # Load identities to see which clusters are assigned vs unassigned
         identities_path = self._identities_path(ep_id)
         if not identities_path.exists():
             raise FileNotFoundError(f"identities.json not found for {ep_id}")
-        
+
         identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
         identities = identities_data.get("identities", [])
-        
+
         # Load centroids
         centroids_data = self.load_cluster_centroids(ep_id)
         centroids = centroids_data.get("centroids", {})
-        
+
         # Handle both dict (new) and list (legacy) formats
         if isinstance(centroids, list):
-            centroids_map = {c["cluster_id"]: np.array(c["centroid"], dtype=np.float32)
-                           for c in centroids}
+            centroids_map = {
+                c["cluster_id"]: np.array(c["centroid"], dtype=np.float32)
+                for c in centroids
+            }
         elif isinstance(centroids, dict):
-            centroids_map = {cid: np.array(data["centroid"], dtype=np.float32)
-                           for cid, data in centroids.items()}
+            centroids_map = {
+                cid: np.array(data["centroid"], dtype=np.float32)
+                for cid, data in centroids.items()
+            }
         else:
             centroids_map = {}
-        
+
         # Separate assigned and unassigned clusters
         assigned_clusters = {}  # cluster_id -> person_id
         unassigned_clusters = []
-        
+
         for identity in identities:
             cluster_id = identity.get("identity_id")
             person_id = identity.get("person_id")
-            
+
             if person_id:
                 assigned_clusters[cluster_id] = person_id
             else:
                 unassigned_clusters.append(cluster_id)
-        
+
         if not assigned_clusters:
             LOGGER.warning(f"[{ep_id}] No assigned clusters found for comparison")
             return {"suggestions": []}
-        
+
         if not unassigned_clusters:
             LOGGER.info(f"[{ep_id}] No unassigned clusters to suggest")
             return {"suggestions": []}
-        
-        LOGGER.info(f"[{ep_id}] Comparing {len(unassigned_clusters)} unassigned vs {len(assigned_clusters)} assigned clusters")
-        
+
+        LOGGER.info(
+            f"[{ep_id}] Comparing {len(unassigned_clusters)} unassigned vs {len(assigned_clusters)} assigned clusters"
+        )
+
         suggestions = []
-        
+
         # For each unassigned cluster, find best match among assigned clusters
         for unassigned_id in unassigned_clusters:
             unassigned_centroid = centroids_map.get(unassigned_id)
             if unassigned_centroid is None:
                 continue
-            
+
             best_match_person = None
-            best_distance = float('inf')
-            
+            best_distance = float("inf")
+
             # Compare against all assigned clusters
             for assigned_id, person_id in assigned_clusters.items():
                 assigned_centroid = centroids_map.get(assigned_id)
                 if assigned_centroid is None:
                     continue
-                
+
                 distance = cosine_distance(unassigned_centroid, assigned_centroid)
-                
+
                 if distance < best_distance:
                     best_distance = distance
                     best_match_person = person_id
-            
+
             # Only suggest if distance is below threshold
             if best_match_person and best_distance <= max_distance:
-                suggestions.append({
-                    "cluster_id": unassigned_id,
-                    "suggested_person_id": best_match_person,
-                    "distance": float(best_distance),
-                })
-        
-        LOGGER.info(f"[{ep_id}] Generated {len(suggestions)} suggestions from assigned clusters")
+                suggestions.append(
+                    {
+                        "cluster_id": unassigned_id,
+                        "suggested_person_id": best_match_person,
+                        "distance": float(best_distance),
+                    }
+                )
+
+        LOGGER.info(
+            f"[{ep_id}] Generated {len(suggestions)} suggestions from assigned clusters"
+        )
         return {"suggestions": suggestions}
 
     def save_current_assignments(self, ep_id: str) -> Dict[str, Any]:
         """Save all current cluster->person assignments to people.json.
-        
+
         Reads identities.json to get all cluster->person_id mappings, then ensures
         they're all properly saved in people.json with updated prototypes.
-        
+
         Returns: {"saved_count": int}
         """
         parsed = _parse_ep_id(ep_id)
         if not parsed:
             raise ValueError(f"Invalid episode ID: {ep_id}")
         show_id = parsed["show"]
-        
+
         # Load identities
         identities_path = self._identities_path(ep_id)
         if not identities_path.exists():
             raise FileNotFoundError(f"identities.json not found for {ep_id}")
-        
+
         identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
         identities = identities_data.get("identities", [])
-        
+
         # Load centroids
         centroids_data = self.load_cluster_centroids(ep_id)
         centroids = centroids_data.get("centroids", {})
-        
+
         # Handle both dict (new) and list (legacy) formats
         if isinstance(centroids, list):
-            centroids_map = {c["cluster_id"]: np.array(c["centroid"], dtype=np.float32)
-                           for c in centroids}
+            centroids_map = {
+                c["cluster_id"]: np.array(c["centroid"], dtype=np.float32)
+                for c in centroids
+            }
         elif isinstance(centroids, dict):
-            centroids_map = {cid: np.array(data["centroid"], dtype=np.float32)
-                           for cid, data in centroids.items()}
+            centroids_map = {
+                cid: np.array(data["centroid"], dtype=np.float32)
+                for cid, data in centroids.items()
+            }
         else:
             centroids_map = {}
-        
+
         # Collect all assignments
         saved_count = 0
         for identity in identities:
             cluster_id = identity.get("identity_id")
             person_id = identity.get("person_id")
-            
+
             if not person_id or not cluster_id:
                 continue
-            
+
             # Ensure this cluster is in the person's cluster list
             full_cluster_id = f"{ep_id}:{cluster_id}"
             centroid = centroids_map.get(cluster_id)
-            
+
             # Add to person (this is idempotent - won't duplicate if already there)
             self.people_service.add_cluster_to_person(
                 show_id,
@@ -925,10 +1028,9 @@ class GroupingService:
                 cluster_centroid=centroid,
             )
             saved_count += 1
-        
+
         LOGGER.info(f"[{ep_id}] Saved {saved_count} cluster assignments to people.json")
         return {"saved_count": saved_count}
 
 
 __all__ = ["GroupingService", "GROUP_WITHIN_EP_DISTANCE", "PEOPLE_MATCH_DISTANCE"]
-

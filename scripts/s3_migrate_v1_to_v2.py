@@ -31,7 +31,10 @@ def migrate(dry_run: bool = True) -> None:
     items = storage.list_episode_videos_s3()
     client = storage._client
     if client is None:
-        print("Storage client unavailable; ensure STORAGE_BACKEND is s3/minio", file=sys.stderr)
+        print(
+            "Storage client unavailable; ensure STORAGE_BACKEND is s3/minio",
+            file=sys.stderr,
+        )
         return
 
     for item in items:
@@ -57,12 +60,20 @@ def migrate(dry_run: bool = True) -> None:
         print(f"Copy {src_key} → {dest_key}")
         if dry_run:
             continue
-        client.copy_object(Bucket=storage.bucket, CopySource={"Bucket": storage.bucket, "Key": src_key}, Key=dest_key)
+        client.copy_object(
+            Bucket=storage.bucket,
+            CopySource={"Bucket": storage.bucket, "Key": src_key},
+            Key=dest_key,
+        )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Migrate S3 episode videos from v1 to v2 layout")
-    parser.add_argument("--apply", action="store_true", help="Perform copy instead of dry-run")
+    parser = argparse.ArgumentParser(
+        description="Migrate S3 episode videos from v1 to v2 layout"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Perform copy instead of dry-run"
+    )
     args = parser.parse_args()
     migrate(dry_run=not args.apply)
     return 0

@@ -67,7 +67,14 @@ def _delete_local_assets(ep_id: str, apply_changes: bool) -> int:
     return deleted
 
 
-def _delete_s3_assets(ep_id: str, storage: StorageService, *, delete_artifacts: bool, delete_raw: bool, apply_changes: bool) -> int:
+def _delete_s3_assets(
+    ep_id: str,
+    storage: StorageService,
+    *,
+    delete_artifacts: bool,
+    delete_raw: bool,
+    apply_changes: bool,
+) -> int:
     try:
         ep_ctx = episode_context_from_id(ep_id)
     except ValueError as exc:
@@ -96,14 +103,22 @@ def _delete_s3_assets(ep_id: str, storage: StorageService, *, delete_artifacts: 
     deleted_objects = 0
     for prefix in keys:
         if not apply_changes:
-            LOGGER.info("[dry-run] would delete S3 prefix s3://%s/%s", storage.bucket, prefix)
+            LOGGER.info(
+                "[dry-run] would delete S3 prefix s3://%s/%s", storage.bucket, prefix
+            )
             continue
         deleted_objects += delete_s3_prefix(storage.bucket, prefix, storage=storage)
         LOGGER.info("Deleted S3 prefix s3://%s/%s", storage.bucket, prefix)
     return deleted_objects
 
 
-def _collect_candidates(store: EpisodeStore, storage: StorageService, *, explicit: Iterable[str] | None, limit: int) -> List[str]:
+def _collect_candidates(
+    store: EpisodeStore,
+    storage: StorageService,
+    *,
+    explicit: Iterable[str] | None,
+    limit: int,
+) -> List[str]:
     if explicit:
         candidates = sorted({ep.strip() for ep in explicit if ep and ep.strip()})
         return [ep for ep in candidates]
@@ -128,11 +143,30 @@ def main(argv: list[str]) -> int:
         action="append",
         help="Specific ep_id to prune (can be repeated). When omitted all orphaned uploads are targeted.",
     )
-    parser.add_argument("--limit", type=int, default=5000, help="Maximum S3 objects to scan when auto-discovering (default: 5000)")
-    parser.add_argument("--apply", action="store_true", help="Perform deletions instead of printing a dry-run plan")
-    parser.add_argument("--no-local", action="store_true", help="Skip local filesystem cleanup")
-    parser.add_argument("--no-artifacts", action="store_true", help="Skip deleting S3 artifact prefixes (frames/crops/manifests)")
-    parser.add_argument("--no-raw", action="store_true", help="Skip deleting the raw video prefixes from S3")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=5000,
+        help="Maximum S3 objects to scan when auto-discovering (default: 5000)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform deletions instead of printing a dry-run plan",
+    )
+    parser.add_argument(
+        "--no-local", action="store_true", help="Skip local filesystem cleanup"
+    )
+    parser.add_argument(
+        "--no-artifacts",
+        action="store_true",
+        help="Skip deleting S3 artifact prefixes (frames/crops/manifests)",
+    )
+    parser.add_argument(
+        "--no-raw",
+        action="store_true",
+        help="Skip deleting the raw video prefixes from S3",
+    )
     parser.add_argument(
         "--include-tracked",
         action="store_true",
@@ -146,7 +180,9 @@ def main(argv: list[str]) -> int:
     store = EpisodeStore()
     storage = StorageService()
 
-    candidates = _collect_candidates(store, storage, explicit=args.ep_id, limit=args.limit)
+    candidates = _collect_candidates(
+        store, storage, explicit=args.ep_id, limit=args.limit
+    )
     if not candidates:
         LOGGER.info("No orphan episodes found.")
         return 0

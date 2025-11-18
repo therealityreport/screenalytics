@@ -33,26 +33,34 @@ from apps.api.services.storage import (
 )
 from py_screenalytics.artifacts import ensure_dirs, get_path
 from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
-from tools.debug_thumbs import init_debug_logger, debug_thumbs_enabled, NullLogger, JsonlLogger
+from tools.debug_thumbs import (
+    init_debug_logger,
+    debug_thumbs_enabled,
+    NullLogger,
+    JsonlLogger,
+)
 
 
 def _load_tracking_config_yaml() -> dict[str, Any]:
     """Load tracking configuration from YAML file if available."""
     config_path = REPO_ROOT / "config" / "pipeline" / "tracking.yaml"
     if not config_path.exists():
-        LOGGER.debug("Tracking config YAML not found at %s, using defaults", config_path)
+        LOGGER.debug(
+            "Tracking config YAML not found at %s, using defaults", config_path
+        )
         return {}
-    
+
     try:
         import yaml
-        with open(config_path, 'r') as f:
+
+        with open(config_path, "r") as f:
             config = yaml.safe_load(f)
         if config:
             LOGGER.info("Loaded tracking config from %s", config_path)
             return config
     except Exception as exc:
         LOGGER.warning("Failed to load tracking config YAML: %s", exc)
-    
+
     return {}
 
 
@@ -61,7 +69,9 @@ APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
 PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
-TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1)
+TRACKING_DIAG_INTERVAL = max(
+    int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1
+)
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DETECTOR_CHOICES = ("retinaface",)
@@ -77,6 +87,8 @@ RETINAFACE_SCORE_THRESHOLD = 0.65
 RETINAFACE_NMS = 0.45
 
 RUN_MARKERS_SUBDIR = "runs"
+
+
 def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
     if not value:
         return 640, 640
@@ -98,7 +110,9 @@ def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
 
 RETINAFACE_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_DET_SIZE"))
 # Default to 480x480 for CoreML to reduce thermal load on Apple Silicon
-RETINAFACE_COREML_DET_SIZE = _parse_retinaface_det_size(os.environ.get("RETINAFACE_COREML_DET_SIZE") or "480x480")
+RETINAFACE_COREML_DET_SIZE = _parse_retinaface_det_size(
+    os.environ.get("RETINAFACE_COREML_DET_SIZE") or "480x480"
+)
 
 
 def _normalize_det_thresh(value: float | str | None) -> float:
@@ -140,22 +154,37 @@ def _env_int(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
+
 BYTE_TRACK_MIN_BOX_AREA_DEFAULT = max(
-    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    _env_float(
+        "SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)
+    ),
     0.0,
 )
 DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
 DEFAULT_REID_MODEL = os.environ.get("SCREENALYTICS_REID_MODEL", "yolov8n-cls.pt")
-DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {"1", "true", "yes"}
+DEFAULT_REID_ENABLED = os.environ.get("SCREENALYTICS_REID_ENABLED", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 RETINAFACE_HELP = "RetinaFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 # Strict tracking defaults (matching config/pipeline/tracking.yaml)
 GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.75"))
 GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.82"))
-GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1)
-GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.50"))  # Increased to prevent spatial jumps
-GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
-GATE_EMB_EVERY_DEFAULT = max(int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0)  # Reduced from 5 to 10 for better thermal performance
+GATE_APPEAR_STREAK_DEFAULT = max(
+    int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1
+)
+GATE_IOU_THRESHOLD_DEFAULT = float(
+    os.environ.get("TRACK_GATE_IOU", "0.50")
+)  # Increased to prevent spatial jumps
+GATE_PROTO_MOMENTUM_DEFAULT = min(
+    max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0
+)
+GATE_EMB_EVERY_DEFAULT = max(
+    int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0
+)  # Reduced from 5 to 10 for better thermal performance
 # ByteTrack spatial matching - strict defaults
 TRACK_BUFFER_BASE_DEFAULT = max(
     _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
@@ -174,24 +203,43 @@ TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
-DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75"))  # Increased to prevent multiple people in same cluster
+DEFAULT_CLUSTER_SIMILARITY = float(
+    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75")
+)  # Increased to prevent multiple people in same cluster
 
 # Load and apply YAML config overrides if available (only if env vars not set)
 _YAML_CONFIG = _load_tracking_config_yaml()
-if _YAML_CONFIG and "BYTE_TRACK_BUFFER" not in os.environ and "SCREANALYTICS_TRACK_BUFFER" not in os.environ:
+if (
+    _YAML_CONFIG
+    and "BYTE_TRACK_BUFFER" not in os.environ
+    and "SCREANALYTICS_TRACK_BUFFER" not in os.environ
+):
     if "track_buffer" in _YAML_CONFIG:
         TRACK_BUFFER_BASE_DEFAULT = max(int(_YAML_CONFIG["track_buffer"]), 1)
-        LOGGER.info("Applied track_buffer=%s from YAML config", TRACK_BUFFER_BASE_DEFAULT)
+        LOGGER.info(
+            "Applied track_buffer=%s from YAML config", TRACK_BUFFER_BASE_DEFAULT
+        )
 if _YAML_CONFIG and "BYTE_TRACK_MATCH_THRESH" not in os.environ:
     if "match_thresh" in _YAML_CONFIG:
         BYTE_TRACK_MATCH_THRESH_DEFAULT = float(_YAML_CONFIG["match_thresh"])
-        LOGGER.info("Applied match_thresh=%.2f from YAML config", BYTE_TRACK_MATCH_THRESH_DEFAULT)
-if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTICS_TRACK_HIGH_THRESH" not in os.environ:
+        LOGGER.info(
+            "Applied match_thresh=%.2f from YAML config",
+            BYTE_TRACK_MATCH_THRESH_DEFAULT,
+        )
+if (
+    _YAML_CONFIG
+    and "BYTE_TRACK_HIGH_THRESH" not in os.environ
+    and "SCREENALYTICS_TRACK_HIGH_THRESH" not in os.environ
+):
     if "track_thresh" in _YAML_CONFIG:
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
-        LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
-MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
+        LOGGER.info(
+            "Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT
+        )
+MIN_IDENTITY_SIMILARITY = float(
+    os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50")
+)
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
@@ -222,7 +270,9 @@ def _set_track_sample_limit(value: int | None) -> None:
     TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(value)
 
 
-TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT"))
+TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(
+    os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT")
+)
 
 
 # Seed-based detection boosting configuration
@@ -232,7 +282,11 @@ SEED_BOOST_MIN_SIM = float(os.environ.get("SEED_BOOST_MIN_SIM", "0.42"))
 
 SCENE_DETECTOR_CHOICES = ("pyscenedetect", "internal", "off")
 _RAW_SCENE_DETECTOR = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
-SCENE_DETECTOR_DEFAULT = _RAW_SCENE_DETECTOR if _RAW_SCENE_DETECTOR in SCENE_DETECTOR_CHOICES else "pyscenedetect"
+SCENE_DETECTOR_DEFAULT = (
+    _RAW_SCENE_DETECTOR
+    if _RAW_SCENE_DETECTOR in SCENE_DETECTOR_CHOICES
+    else "pyscenedetect"
+)
 SCENE_DETECT_DEFAULT = SCENE_DETECTOR_DEFAULT != "off"
 SCENE_THRESHOLD_DEFAULT = _env_float("SCENE_THRESHOLD", 27.0)
 SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
@@ -246,9 +300,7 @@ def _normalize_device_label(device: str | None) -> str:
     return normalized
 
 
-def _filter_providers(
-    requested: list[str], available: list[str]
-) -> list[str]:
+def _filter_providers(requested: list[str], available: list[str]) -> list[str]:
     """
     Filter ONNX providers to only those available, always including CPU fallback.
 
@@ -286,6 +338,7 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
     # Get available ONNX providers
     try:
         import onnxruntime as ort  # type: ignore
+
         available = ort.get_available_providers()
     except Exception:
         available = []
@@ -333,7 +386,9 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
     return providers, resolved
 
 
-def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> tuple[Any, str]:
+def _init_retinaface(
+    model_name: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD
+) -> tuple[Any, str]:
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover - runtime guard
@@ -384,7 +439,9 @@ def _init_arcface(model_name: str, device: str):
     return model, resolved
 
 
-def ensure_retinaface_ready(device: str, det_thresh: float | None = None) -> tuple[bool, Optional[str], Optional[str]]:
+def ensure_retinaface_ready(
+    device: str, det_thresh: float | None = None
+) -> tuple[bool, Optional[str], Optional[str]]:
     """Lightweight readiness probe for API/CLI preflight checks."""
 
     try:
@@ -447,7 +504,9 @@ def pick_device(explicit: str | None = None) -> str:
         if torch.cuda.is_available():  # pragma: no cover - depends on env
             return "0"
         mps_available = getattr(torch.backends, "mps", None)
-        if mps_available is not None and mps_available.is_available():  # pragma: no cover - mac only
+        if (
+            mps_available is not None and mps_available.is_available()
+        ):  # pragma: no cover - mac only
             return "mps"
     except Exception:  # pragma: no cover - torch import/runtime guard
         # Torch import issues should fall back to CPU without crashing CLI.
@@ -480,7 +539,9 @@ def _normalize_scene_detector_choice(scene_detector: str | None) -> str:
     return SCENE_DETECTOR_DEFAULT
 
 
-def _valid_face_box(bbox: np.ndarray, score: float, *, min_score: float, min_area: float) -> bool:
+def _valid_face_box(
+    bbox: np.ndarray, score: float, *, min_score: float, min_area: float
+) -> bool:
     # Validate bbox has valid numeric coordinates
     try:
         if len(bbox) < 4:
@@ -505,7 +566,9 @@ def _nms_detections(
     detections: list[tuple[np.ndarray, float, np.ndarray | None]],
     thresh: float,
 ) -> list[tuple[np.ndarray, float, np.ndarray | None]]:
-    ordered = sorted(range(len(detections)), key=lambda idx: detections[idx][1], reverse=True)
+    ordered = sorted(
+        range(len(detections)), key=lambda idx: detections[idx][1], reverse=True
+    )
     keep: list[tuple[np.ndarray, float, np.ndarray | None]] = []
     while ordered:
         current_idx = ordered.pop(0)
@@ -597,7 +660,6 @@ class TrackedObject:
     landmarks: np.ndarray | None = None
 
 
-
 @dataclass
 class GateConfig:
     appear_t_hard: float = GATE_APPEAR_T_HARD_DEFAULT
@@ -676,7 +738,9 @@ class AppearanceGate:
             iou = float(_bbox_iou(state.last_box.tolist(), bbox_arr.tolist()))
         split = False
         reason: str | None = None
-        low_similarity = similarity is not None and similarity < self.config.appear_t_soft
+        low_similarity = (
+            similarity is not None and similarity < self.config.appear_t_soft
+        )
         if similarity is not None and similarity < self.config.appear_t_hard:
             split = True
             reason = "hard"
@@ -703,7 +767,9 @@ class AppearanceGate:
                 reason or "unknown",
             )
             state.low_sim_streak = 0
-            state.proto = _l2_normalize(embedding.copy()) if embedding is not None else None
+            state.proto = (
+                _l2_normalize(embedding.copy()) if embedding is not None else None
+            )
         else:
             if similarity is not None:
                 self.stats["sim_sum"] += similarity
@@ -712,7 +778,10 @@ class AppearanceGate:
                 if state.proto is None:
                     state.proto = _l2_normalize(embedding.copy())
                 else:
-                    mixed = self.config.proto_momentum * state.proto + (1.0 - self.config.proto_momentum) * embedding
+                    mixed = (
+                        self.config.proto_momentum * state.proto
+                        + (1.0 - self.config.proto_momentum) * embedding
+                    )
                     state.proto = _l2_normalize(mixed)
         state.last_box = bbox_arr
         return split, reason, similarity, iou
@@ -733,13 +802,13 @@ class AppearanceGate:
         }
 
 
-
 def _parse_ep_id_for_show(ep_id: str) -> Optional[str]:
     """Extract show_id from ep_id (e.g., 'rhobh-s05e01' -> 'rhobh')."""
     import re
-    match = re.match(r'^(?P<show>.+)-s\d{2}e\d{2}$', ep_id, re.IGNORECASE)
+
+    match = re.match(r"^(?P<show>.+)-s\d{2}e\d{2}$", ep_id, re.IGNORECASE)
     if match:
-        return match.group('show').lower()
+        return match.group("show").lower()
     return None
 
 
@@ -747,9 +816,10 @@ def _load_show_seeds(show_id: str) -> List[Dict[str, Any]]:
     """Load all seed embeddings for a show from facebank."""
     if not show_id:
         return []
-    
+
     try:
         from apps.api.services.facebank import FacebankService
+
         facebank_svc = FacebankService(data_root=DATA_ROOT)
         seeds = facebank_svc.get_all_seeds_for_show(show_id)
         return seeds
@@ -761,39 +831,45 @@ def _load_show_seeds(show_id: str) -> List[Dict[str, Any]]:
 def _find_best_seed_match(
     embedding: np.ndarray,
     seeds: List[Dict[str, Any]],
-    min_sim: float = SEED_BOOST_MIN_SIM
+    min_sim: float = SEED_BOOST_MIN_SIM,
 ) -> Optional[Tuple[str, float]]:
     """Find the best matching seed for an embedding.
-    
+
     Returns (cast_id, similarity) if match found above threshold, else None.
     """
     if not seeds or embedding is None:
         return None
-    
+
     best_sim = -1.0
     best_cast_id = None
-    
+
     for seed in seeds:
-        seed_emb = np.array(seed.get('embedding', []), dtype=np.float32)
+        seed_emb = np.array(seed.get("embedding", []), dtype=np.float32)
         if seed_emb.size == 0:
             continue
-        
+
         # Cosine similarity
-        sim = float(np.dot(embedding, seed_emb) / (np.linalg.norm(embedding) * np.linalg.norm(seed_emb) + 1e-12))
-        
+        sim = float(
+            np.dot(embedding, seed_emb)
+            / (np.linalg.norm(embedding) * np.linalg.norm(seed_emb) + 1e-12)
+        )
+
         if sim > best_sim:
             best_sim = sim
-            best_cast_id = seed.get('cast_id')
-    
+            best_cast_id = seed.get("cast_id")
+
     if best_sim >= min_sim and best_cast_id:
         return (best_cast_id, best_sim)
-    
+
     return None
+
 
 class _TrackerDetections:
     """Lightweight structure that mimics ultralytics' Boxes for BYTETracker inputs."""
 
-    def __init__(self, boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray) -> None:
+    def __init__(
+        self, boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray
+    ) -> None:
         self.xyxy = boxes.astype(np.float32)
         self.conf = scores.astype(np.float32)
         self.cls = classes.astype(np.float32)
@@ -814,22 +890,33 @@ class _TrackerDetections:
         return self.xywh
 
 
-def _tracker_inputs_from_samples(detections: list[DetectionSample]) -> _TrackerDetections:
+def _tracker_inputs_from_samples(
+    detections: list[DetectionSample],
+) -> _TrackerDetections:
     if detections:
         # Validate and filter out detections with invalid bboxes before vstack
         valid_samples: list[DetectionSample] = []
         for sample in detections:
             bbox, bbox_err = _safe_bbox_or_none(sample.bbox)
             if bbox is None:
-                LOGGER.debug("Dropping detection before tracker due to invalid bbox: %s", bbox_err)
+                LOGGER.debug(
+                    "Dropping detection before tracker due to invalid bbox: %s",
+                    bbox_err,
+                )
                 continue
             sample.bbox = np.array(bbox, dtype=np.float32)
             valid_samples.append(sample)
 
         if valid_samples:
-            boxes = np.vstack([sample.bbox for sample in valid_samples]).astype(np.float32)
-            scores = np.asarray([sample.conf for sample in valid_samples], dtype=np.float32)
-            classes = np.asarray([sample.class_idx for sample in valid_samples], dtype=np.float32)
+            boxes = np.vstack([sample.bbox for sample in valid_samples]).astype(
+                np.float32
+            )
+            scores = np.asarray(
+                [sample.conf for sample in valid_samples], dtype=np.float32
+            )
+            classes = np.asarray(
+                [sample.class_idx for sample in valid_samples], dtype=np.float32
+            )
             return _TrackerDetections(boxes, scores, classes)
 
     return _TrackerDetections(
@@ -860,7 +947,9 @@ class ByteTrackRuntimeConfig:
     def scaled_buffer(self, stride: int) -> int:
         stride_value = max(int(stride), 1)
         scale = max(1.0, float(stride_value) / 3.0)
-        effective = max(int(round(self.track_buffer_base * scale)), self.track_buffer_base)
+        effective = max(
+            int(round(self.track_buffer_base * scale)), self.track_buffer_base
+        )
         return max(effective, 1)
 
     def summary(self, stride: int) -> Dict[str, Any]:
@@ -911,7 +1000,9 @@ class ByteTrackAdapter:
     def config_summary(self) -> Dict[str, Any]:
         return dict(self._config_snapshot)
 
-    def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
+    def update(
+        self, detections: list[DetectionSample], frame_idx: int, image
+    ) -> list[TrackedObject]:
         det_struct = _tracker_inputs_from_samples(detections)
         tracks = self._tracker.update(det_struct, image)
         tracked: list[TrackedObject] = []
@@ -973,15 +1064,22 @@ class StrongSortAdapter:
             match_thresh=0.8,
             min_box_area=BYTE_TRACK_MIN_BOX_AREA,
             gmc_method=os.environ.get("SCREENALYTICS_GMC_METHOD", DEFAULT_GMC_METHOD),
-            proximity_thresh=float(os.environ.get("SCREENALYTICS_REID_PROXIMITY", "0.6")),
-            appearance_thresh=float(os.environ.get("SCREENALYTICS_REID_APPEARANCE", "0.7")),
+            proximity_thresh=float(
+                os.environ.get("SCREENALYTICS_REID_PROXIMITY", "0.6")
+            ),
+            appearance_thresh=float(
+                os.environ.get("SCREENALYTICS_REID_APPEARANCE", "0.7")
+            ),
             with_reid=_env_flag("SCREENALYTICS_REID_ENABLED", DEFAULT_REID_ENABLED),
-            model=os.environ.get("SCREENALYTICS_REID_MODEL", DEFAULT_REID_MODEL) or "auto",
+            model=os.environ.get("SCREENALYTICS_REID_MODEL", DEFAULT_REID_MODEL)
+            or "auto",
             fuse_score=_env_flag("SCREENALYTICS_REID_FUSE_SCORE", False),
         )
         return BOTSORT(cfg, frame_rate=self.frame_rate)
 
-    def update(self, detections: list[DetectionSample], frame_idx: int, image) -> list[TrackedObject]:
+    def update(
+        self, detections: list[DetectionSample], frame_idx: int, image
+    ) -> list[TrackedObject]:
         det_struct = _tracker_inputs_from_samples(detections)
         tracks = self._tracker.update(det_struct, image)
         tracked: list[TrackedObject] = []
@@ -1018,9 +1116,13 @@ class StrongSortAdapter:
 
 
 class RetinaFaceDetectorBackend:
-    def __init__(self, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> None:
+    def __init__(
+        self, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD
+    ) -> None:
         self.device = device
-        self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
+        self.score_thresh = max(
+            min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0
+        )
         self.min_area = MIN_FACE_AREA
         self._model = None
         self._resolved_device: Optional[str] = None
@@ -1029,7 +1131,9 @@ class RetinaFaceDetectorBackend:
         if self._model is not None:
             return self._model
         try:
-            model, resolved = _init_retinaface(self.model_name, self.device, self.score_thresh)
+            model, resolved = _init_retinaface(
+                self.model_name, self.device, self.score_thresh
+            )
         except Exception as exc:
             raise RuntimeError(f"{RETINAFACE_HELP} ({exc})") from exc
         self._resolved_device = resolved
@@ -1066,7 +1170,9 @@ class RetinaFaceDetectorBackend:
             raw = bboxes[idx]
             score = float(raw[4]) if raw.shape[0] >= 5 else float(self.score_thresh)
             bbox = raw[:4].astype(np.float32)
-            if not _valid_face_box(bbox, score, min_score=self.score_thresh, min_area=self.min_area):
+            if not _valid_face_box(
+                bbox, score, min_score=self.score_thresh, min_area=self.min_area
+            ):
                 continue
             kps = None
             if landmarks is not None and idx < len(landmarks):
@@ -1087,7 +1193,9 @@ class RetinaFaceDetectorBackend:
         return samples
 
 
-def _build_face_detector(detector: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD):
+def _build_face_detector(
+    detector: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD
+):
     return RetinaFaceDetectorBackend(device, score_thresh=score_thresh)
 
 
@@ -1129,7 +1237,9 @@ class ArcFaceEmbedder:
         try:
             model, resolved = _init_arcface(ARC_FACE_MODEL_NAME, self.device)
         except Exception as exc:
-            raise RuntimeError(f"ArcFace init failed: {exc}. Install insightface + models or run scripts/fetch_models.py.") from exc
+            raise RuntimeError(
+                f"ArcFace init failed: {exc}. Install insightface + models or run scripts/fetch_models.py."
+            ) from exc
         self._resolved_device = resolved
         self._model = model
         return self._model
@@ -1191,7 +1301,9 @@ def _letterbox_square(image, size: int = 112, pad_value: int = 127):
     return canvas
 
 
-def _safe_bbox_or_none(bbox: list[float] | np.ndarray) -> tuple[list[float] | None, str | None]:
+def _safe_bbox_or_none(
+    bbox: list[float] | np.ndarray,
+) -> tuple[list[float] | None, str | None]:
     """
     Validate bbox coordinates are finite numbers before cropping operations.
 
@@ -1245,7 +1357,7 @@ def _prepare_face_crop(
     adaptive_margin: bool = True,
 ) -> tuple[np.ndarray | None, str | None]:
     """Prepare face crop with optional adaptive margins.
-    
+
     Args:
         image: Source image
         bbox: Face bounding box [x1, y1, x2, y2]
@@ -1254,7 +1366,7 @@ def _prepare_face_crop(
         align: Whether to use landmark-based alignment
         detector_mode: Detector name for mode-specific handling
         adaptive_margin: Scale margin based on bbox size (default True)
-        
+
     Returns:
         (cropped_image, error_message) tuple
     """
@@ -1325,7 +1437,7 @@ def _prepare_face_crop(
         effective_margin = margin * margin_scale
     else:
         effective_margin = margin
-    
+
     expand_x = width * effective_margin
     expand_y = height * effective_margin
     expanded_box = [
@@ -1455,21 +1567,31 @@ class TrackRecorder:
                 export_id = self._spawn_export_id()
             else:
                 export_id = mapping["export_id"]
-            self._mapping[tracker_track_id] = {"export_id": export_id, "last_frame": frame_idx}
+            self._mapping[tracker_track_id] = {
+                "export_id": export_id,
+                "last_frame": frame_idx,
+            }
         else:
             if mapping is None:
                 export_id = tracker_track_id
                 self._active_exports.add(export_id)
-                self._mapping[tracker_track_id] = {"export_id": export_id, "last_frame": frame_idx}
+                self._mapping[tracker_track_id] = {
+                    "export_id": export_id,
+                    "last_frame": frame_idx,
+                }
                 self.metrics["tracks_born"] += 1
             else:
                 export_id = mapping["export_id"]
                 mapping["last_frame"] = frame_idx
         track = self._accumulators.get(export_id)
         if track is None:
-            track = TrackAccumulator(track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts)
+            track = TrackAccumulator(
+                track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts
+            )
             self._accumulators[export_id] = track
-        track.add(ts, frame_idx, bbox_values, confidence=confidence, landmarks=landmarks)
+        track.add(
+            ts, frame_idx, bbox_values, confidence=confidence, landmarks=landmarks
+        )
         return export_id
 
     def finalize(self) -> None:
@@ -1492,7 +1614,9 @@ class TrackRecorder:
 
     def rows(self) -> list[dict]:
         payload: list[dict] = []
-        for track in sorted(self._accumulators.values(), key=lambda item: item.track_id):
+        for track in sorted(
+            self._accumulators.values(), key=lambda item: item.track_id
+        ):
             payload.append(track.to_row())
         return payload
 
@@ -1501,7 +1625,9 @@ class TrackRecorder:
         return len(self._active_exports)
 
     def top_long_tracks(self, limit: int = 5) -> list[dict]:
-        longest = sorted(self._accumulators.values(), key=lambda item: item.frame_count, reverse=True)[:limit]
+        longest = sorted(
+            self._accumulators.values(), key=lambda item: item.frame_count, reverse=True
+        )[:limit]
         return [
             {"track_id": track.track_id, "frame_count": track.frame_count}
             for track in longest
@@ -1536,7 +1662,9 @@ def _try_import(module: str):
         return None
 
 
-def sanitize_xyxy(x1: float, y1: float, x2: float, y2: float, width: int, height: int) -> tuple[int, int, int, int] | None:
+def sanitize_xyxy(
+    x1: float, y1: float, x2: float, y2: float, width: int, height: int
+) -> tuple[int, int, int, int] | None:
     """Round + clamp XYXY boxes to integer pixel coordinates, skipping empty windows."""
     if width <= 0 or height <= 0:
         return None
@@ -1577,7 +1705,9 @@ def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8, copy=False)
 
 
-def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr") -> None:
+def save_jpeg(
+    path: str | Path, image, *, quality: int = 85, color: str = "bgr"
+) -> None:
     """Normalize + persist an image to JPEG, ensuring non-blank uint8 BGR data."""
     import cv2  # type: ignore
 
@@ -1643,7 +1773,12 @@ class ThumbWriter:
         if source is None:
             crop, clipped_bbox, err = safe_crop(image, bbox)
             if crop is None:
-                LOGGER.debug("Skipping thumb track=%s frame=%s reason=%s", track_id, frame_idx, err)
+                LOGGER.debug(
+                    "Skipping thumb track=%s frame=%s reason=%s",
+                    track_id,
+                    frame_idx,
+                    err,
+                )
                 return None, None
             source = crop
             source_kind = "fallback"
@@ -1663,9 +1798,18 @@ class ThumbWriter:
         thumb = self._letterbox(source)
         if self._stat_samples < self._stat_limit:
             mn, mx, mean = _image_stats(thumb)
-            LOGGER.info("thumb stats track=%s frame=%s min=%.3f max=%.3f mean=%.3f", track_id, frame_idx, mn, mx, mean)
+            LOGGER.info(
+                "thumb stats track=%s frame=%s min=%.3f max=%.3f mean=%.3f",
+                track_id,
+                frame_idx,
+                mn,
+                mx,
+                mean,
+            )
             if mx - mn < 1e-6:
-                LOGGER.warning("Nearly constant thumb track=%s frame=%s", track_id, frame_idx)
+                LOGGER.warning(
+                    "Nearly constant thumb track=%s frame=%s", track_id, frame_idx
+                )
             self._stat_samples += 1
         rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
         abs_path = self.root_dir / rel_path
@@ -1700,6 +1844,8 @@ def _faces_embed_path(ep_id: str) -> Path:
     embed_dir = DATA_ROOT / "embeds" / ep_id
     embed_dir.mkdir(parents=True, exist_ok=True)
     return embed_dir / "faces.npy"
+
+
 class ProgressEmitter:
     """Emit structured progress to stdout + optional file for SSE/polling."""
 
@@ -1719,6 +1865,7 @@ class ProgressEmitter:
         run_id: str | None = None,
     ) -> None:
         import uuid
+
         self.ep_id = ep_id
         self.run_id = run_id or str(uuid.uuid4())
         self.path = Path(file_path).expanduser() if file_path else None
@@ -1730,7 +1877,9 @@ class ProgressEmitter:
         self.fps_detected = float(fps_detected) if fps_detected else None
         self.fps_requested = float(fps_requested) if fps_requested else None
         default_interval = PROGRESS_FRAME_STEP
-        chosen_interval = frame_interval if frame_interval is not None else default_interval
+        chosen_interval = (
+            frame_interval if frame_interval is not None else default_interval
+        )
         self._frame_interval = max(int(chosen_interval), 1)
         self._start_ts = time.time()
         self._last_frames = 0
@@ -1745,7 +1894,9 @@ class ProgressEmitter:
     def _now(self) -> str:
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-    def _should_emit(self, frames_done: int, phase: str, step: str | None, force: bool) -> bool:
+    def _should_emit(
+        self, frames_done: int, phase: str, step: str | None, force: bool
+    ) -> bool:
         if force:
             return True
         if phase != self._last_phase:
@@ -1776,7 +1927,9 @@ class ProgressEmitter:
         is_scene_phase = phase.startswith("scene_detect")
         detector_value = None if is_scene_phase else (detector or self._detector)
         tracker_value = None if is_scene_phase else (tracker or self._tracker)
-        resolved_device_value = None if is_scene_phase else (resolved_device or self._resolved_device)
+        resolved_device_value = (
+            None if is_scene_phase else (resolved_device or self._resolved_device)
+        )
 
         payload: Dict[str, object] = {
             "progress_version": self.VERSION,
@@ -1789,8 +1942,12 @@ class ProgressEmitter:
             "secs_total": round(float(self.secs_total), 3) if self.secs_total else None,
             "device": device or self._device,
             "fps_infer": round(float(fps_infer), 3) if fps_infer else None,
-            "fps_detected": round(float(self.fps_detected), 3) if self.fps_detected else None,
-            "fps_requested": round(float(self.fps_requested), 3) if self.fps_requested else None,
+            "fps_detected": (
+                round(float(self.fps_detected), 3) if self.fps_detected else None
+            ),
+            "fps_requested": (
+                round(float(self.fps_requested), 3) if self.fps_requested else None
+            ),
             "stride": self.stride,
             "updated_at": self._now(),
             "detector": detector_value,
@@ -1822,12 +1979,26 @@ class ProgressEmitter:
         if vt is not None and vtotal is not None:
             LOGGER.info(
                 "[job=%s run=%s phase=%s step=%s frames=%s/%s vt=%.1f/%.1f fps=%.2f]",
-                self.ep_id, run_id_short, phase, step, frames, total, vt, vtotal, fps or 0.0
+                self.ep_id,
+                run_id_short,
+                phase,
+                step,
+                frames,
+                total,
+                vt,
+                vtotal,
+                fps or 0.0,
             )
         else:
             LOGGER.info(
                 "[job=%s run=%s phase=%s step=%s frames=%s/%s fps=%.2f]",
-                self.ep_id, run_id_short, phase, step, frames, total, fps or 0.0
+                self.ep_id,
+                run_id_short,
+                phase,
+                step,
+                frames,
+                total,
+                fps or 0.0,
             )
 
         if self.path:
@@ -1901,7 +2072,9 @@ class ProgressEmitter:
         step: str | None = None,
         extra: Dict[str, Any] | None = None,
     ) -> None:
-        final_frames = self.frames_total or summary.get("frames_sampled") or self._last_frames
+        final_frames = (
+            self.frames_total or summary.get("frames_sampled") or self._last_frames
+        )
         final_frames = int(final_frames or 0)
         completion_extra: Dict[str, Any] = {} if extra is None else dict(extra)
         if step:
@@ -1919,7 +2092,13 @@ class ProgressEmitter:
         )
 
     def fail(self, error: str) -> None:
-        self.emit(self._last_frames, phase="error", error=error, force=True, tracker=self._tracker)
+        self.emit(
+            self._last_frames,
+            phase="error",
+            error=error,
+            force=True,
+            tracker=self._tracker,
+        )
 
     @property
     def target_frames(self) -> int:
@@ -2029,7 +2208,9 @@ class FrameExporter:
         self._crop_attempts = 0
         self._crop_error_counts: Counter[str] = Counter()
         self._fail_fast_threshold = 0.40  # Require 40% failure rate before aborting
-        self._fail_fast_min_attempts = 50  # Require at least 50 attempts before checking
+        self._fail_fast_min_attempts = (
+            50  # Require at least 50 attempts before checking
+        )
         self._fail_fast_reasons = {"near_uniform_gray", "tiny_file"}
         self.debug_logger = debug_logger
 
@@ -2039,10 +2220,23 @@ class FrameExporter:
         mn, mx, mean = _image_stats(image)
         LOGGER.info("%s stats %s min=%.3f max=%.3f mean=%.3f", kind, path, mn, mx, mean)
         if mx - mn < 1e-6:
-            LOGGER.warning("Nearly constant %s %s mn=%.6f mx=%.6f mean=%.6f", kind, path, mn, mx, mean)
+            LOGGER.warning(
+                "Nearly constant %s %s mn=%.6f mx=%.6f mean=%.6f",
+                kind,
+                path,
+                mn,
+                mx,
+                mean,
+            )
         self._stat_samples += 1
 
-    def export(self, frame_idx: int, image, crops: List[Tuple[int, List[float]]], ts: float | None = None) -> None:
+    def export(
+        self,
+        frame_idx: int,
+        image,
+        crops: List[Tuple[int, List[float]]],
+        ts: float | None = None,
+    ) -> None:
         if not (self.save_frames or self.save_crops):
             return
         if self.save_frames:
@@ -2059,7 +2253,9 @@ class FrameExporter:
                     continue
                 crop_path = self.crop_abs_path(track_id, frame_idx)
                 try:
-                    saved = self._write_crop(image, bbox, crop_path, track_id, frame_idx)
+                    saved = self._write_crop(
+                        image, bbox, crop_path, track_id, frame_idx
+                    )
                 except CropQualityThresholdExceeded as exc:
                     LOGGER.error(
                         "Aborting crop exports for track %s frame %s after quality threshold: %s",
@@ -2085,7 +2281,9 @@ class FrameExporter:
     def crop_abs_path(self, track_id: int, frame_idx: int) -> Path:
         return self.crops_dir / self.crop_component(track_id, frame_idx)
 
-    def _record_crop_index(self, track_id: int, frame_idx: int, ts: float | None) -> None:
+    def _record_crop_index(
+        self, track_id: int, frame_idx: int, ts: float | None
+    ) -> None:
         if not self.save_crops:
             return
         key = self.crop_component(track_id, frame_idx)
@@ -2122,7 +2320,9 @@ class FrameExporter:
     def _maybe_fail_fast(self) -> None:
         if self._crop_attempts < self._fail_fast_min_attempts:
             return
-        bad = sum(self._crop_error_counts.get(reason, 0) for reason in self._fail_fast_reasons)
+        bad = sum(
+            self._crop_error_counts.get(reason, 0) for reason in self._fail_fast_reasons
+        )
         ratio = bad / max(self._crop_attempts, 1)
         if ratio >= self._fail_fast_threshold:
             raise CropQualityThresholdExceeded(
@@ -2178,7 +2378,9 @@ class FrameExporter:
                     "mean": mean,
                     "save_ok": bool(ok),
                     "save_err": save_err,
-                    "file_size": crop_path.stat().st_size if ok and crop_path.exists() else None,
+                    "file_size": (
+                        crop_path.stat().st_size if ok and crop_path.exists() else None
+                    ),
                     "ms": int((time.time() - start) * 1000),
                 }
             )
@@ -2266,7 +2468,8 @@ class FrameDecoder:
             "hits": self._cache_hits,
             "misses": self._cache_misses,
             "size": len(self._cache),
-            "hit_rate": self._cache_hits / max(1, self._cache_hits + self._cache_misses),
+            "hit_rate": self._cache_hits
+            / max(1, self._cache_hits + self._cache_misses),
         }
 
     def close(self) -> None:
@@ -2284,10 +2487,10 @@ class FrameDecoder:
 
 def _copy_video(src: Path, dest: Path) -> None:
     """Copy video from source to destination, skipping if unchanged.
-    
+
     Compares file size and modification time to avoid unnecessary copies
     of large video files when running detect multiple times.
-    
+
     Args:
         src: Source video path
         dest: Destination video path
@@ -2295,15 +2498,21 @@ def _copy_video(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.resolve() == dest.resolve():
         return
-    
+
     # Skip copy if dest exists and matches source (size + mtime)
     if dest.exists():
         src_stat = src.stat()
         dest_stat = dest.stat()
-        if src_stat.st_size == dest_stat.st_size and abs(src_stat.st_mtime - dest_stat.st_mtime) < 1.0:
-            LOGGER.info("Skipping video copy; destination matches source (size=%d)", src_stat.st_size)
+        if (
+            src_stat.st_size == dest_stat.st_size
+            and abs(src_stat.st_mtime - dest_stat.st_mtime) < 1.0
+        ):
+            LOGGER.info(
+                "Skipping video copy; destination matches source (size=%d)",
+                src_stat.st_size,
+            )
             return
-    
+
     shutil.copy2(src, dest)
 
 
@@ -2336,11 +2545,15 @@ def _episode_ctx(ep_id: str) -> EpisodeContext | None:
     try:
         return episode_context_from_id(ep_id)
     except ValueError:
-        LOGGER.warning("Unable to parse episode id '%s'; artifact prefixes unavailable", ep_id)
+        LOGGER.warning(
+            "Unable to parse episode id '%s'; artifact prefixes unavailable", ep_id
+        )
         return None
- 
 
-def _storage_context(ep_id: str) -> tuple[StorageService | None, EpisodeContext | None, Dict[str, str] | None]:
+
+def _storage_context(
+    ep_id: str,
+) -> tuple[StorageService | None, EpisodeContext | None, Dict[str, str] | None]:
     storage_backend = os.environ.get("STORAGE_BACKEND", "local").lower()
     storage: StorageService | None = None
     if storage_backend in {"s3", "minio"}:
@@ -2370,8 +2583,19 @@ def _sync_artifacts_to_s3(
     handling from background threads, (3) ensuring all uploads complete before exit, (4)
     progress reporting across threads. Benefit is marginal since user must wait anyway.
     """
-    stats = {"manifests": 0, "frames": 0, "crops": 0, "thumbs_tracks": 0, "thumbs_identities": 0}
-    if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
+    stats = {
+        "manifests": 0,
+        "frames": 0,
+        "crops": 0,
+        "thumbs_tracks": 0,
+        "thumbs_identities": 0,
+    }
+    if (
+        storage is None
+        or ep_ctx is None
+        or not storage.s3_enabled()
+        or not storage.write_enabled
+    ):
         return stats
     prefixes = artifact_prefixes(ep_ctx)
     manifests_dir = get_path(ep_id, "detections").parent
@@ -2430,8 +2654,15 @@ def _report_s3_upload(
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run detection + tracking locally.")
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
-    parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
-    parser.add_argument("--stride", type=int, default=1, help="Frame stride for detection (default: 1 = every frame)")
+    parser.add_argument(
+        "--video", help="Path to source video (required for detect/track runs)"
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Frame stride for detection (default: 1 = every frame)",
+    )
     parser.add_argument(
         "--fps",
         type=float,
@@ -2539,17 +2770,38 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=4,
         help="Sample interval for per-track sampling (default: 4)",
     )
-    parser.add_argument("--thumb-size", type=int, default=256, help="Square thumbnail size for faces")
+    parser.add_argument(
+        "--thumb-size", type=int, default=256, help="Square thumbnail size for faces"
+    )
     parser.add_argument(
         "--out-root",
         help="Data root override (defaults to SCREENALYTICS_DATA_ROOT or ./data)",
     )
-    parser.add_argument("--progress-file", help="Progress JSON file to update during processing")
-    parser.add_argument("--save-frames", action="store_true", help="Save sampled frame JPGs under data/frames/{ep_id}")
-    parser.add_argument("--save-crops", action="store_true", help="Save per-track crops (requires --save-frames or track IDs)")
-    parser.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality for frame exports (1-100)")
-    parser.add_argument("--faces-embed", action="store_true", help="Run faces embedding stage only")
-    parser.add_argument("--cluster", action="store_true", help="Run clustering stage only")
+    parser.add_argument(
+        "--progress-file", help="Progress JSON file to update during processing"
+    )
+    parser.add_argument(
+        "--save-frames",
+        action="store_true",
+        help="Save sampled frame JPGs under data/frames/{ep_id}",
+    )
+    parser.add_argument(
+        "--save-crops",
+        action="store_true",
+        help="Save per-track crops (requires --save-frames or track IDs)",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=85,
+        help="JPEG quality for frame exports (1-100)",
+    )
+    parser.add_argument(
+        "--faces-embed", action="store_true", help="Run faces embedding stage only"
+    )
+    parser.add_argument(
+        "--cluster", action="store_true", help="Run clustering stage only"
+    )
     parser.add_argument(
         "--cluster-thresh",
         type=float,
@@ -2611,22 +2863,53 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if hasattr(args, "det_thresh"):
-        args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
-    args.scene_detector = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
-    args.scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
-    args.scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
-    args.scene_warmup_dets = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
+        args.det_thresh = _normalize_det_thresh(
+            getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD)
+        )
+    args.scene_detector = _normalize_scene_detector_choice(
+        getattr(args, "scene_detector", None)
+    )
+    args.scene_threshold = max(
+        float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0
+    )
+    args.scene_min_len = max(
+        int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1
+    )
+    args.scene_warmup_dets = max(
+        int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0
+    )
     args.track_high_thresh = min(
-        max(float(getattr(args, "track_high_thresh", TRACK_HIGH_THRESH_DEFAULT) or TRACK_HIGH_THRESH_DEFAULT), 0.0),
+        max(
+            float(
+                getattr(args, "track_high_thresh", TRACK_HIGH_THRESH_DEFAULT)
+                or TRACK_HIGH_THRESH_DEFAULT
+            ),
+            0.0,
+        ),
         1.0,
     )
     args.new_track_thresh = min(
-        max(float(getattr(args, "new_track_thresh", TRACK_NEW_THRESH_DEFAULT) or TRACK_NEW_THRESH_DEFAULT), 0.0),
+        max(
+            float(
+                getattr(args, "new_track_thresh", TRACK_NEW_THRESH_DEFAULT)
+                or TRACK_NEW_THRESH_DEFAULT
+            ),
+            0.0,
+        ),
         1.0,
     )
-    args.track_buffer = max(int(getattr(args, "track_buffer", TRACK_BUFFER_BASE_DEFAULT) or TRACK_BUFFER_BASE_DEFAULT), 1)
+    args.track_buffer = max(
+        int(
+            getattr(args, "track_buffer", TRACK_BUFFER_BASE_DEFAULT)
+            or TRACK_BUFFER_BASE_DEFAULT
+        ),
+        1,
+    )
     args.min_box_area = max(
-        float(getattr(args, "min_box_area", BYTE_TRACK_MIN_BOX_AREA_DEFAULT) or BYTE_TRACK_MIN_BOX_AREA_DEFAULT),
+        float(
+            getattr(args, "min_box_area", BYTE_TRACK_MIN_BOX_AREA_DEFAULT)
+            or BYTE_TRACK_MIN_BOX_AREA_DEFAULT
+        ),
         0.0,
     )
     cli_track_limit = getattr(args, "track_sample_limit", None)
@@ -2635,7 +2918,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         if TRACK_SAMPLE_LIMIT is None:
             LOGGER.info("Track sampling disabled; persisting all detections per track.")
         else:
-            LOGGER.info("Track sampling limited to the first %s detections per track.", TRACK_SAMPLE_LIMIT)
+            LOGGER.info(
+                "Track sampling limited to the first %s detections per track.",
+                TRACK_SAMPLE_LIMIT,
+            )
     data_root = (
         Path(args.out_root).expanduser()
         if args.out_root
@@ -2675,9 +2961,15 @@ def _gate_config_from_args(args: argparse.Namespace, frame_stride: int) -> GateC
 
     appear_hard = _clamp(getattr(args, "gate_appear_hard", GATE_APPEAR_T_HARD_DEFAULT))
     appear_soft = _clamp(getattr(args, "gate_appear_soft", GATE_APPEAR_T_SOFT_DEFAULT))
-    streak = max(int(getattr(args, "gate_appear_streak", GATE_APPEAR_STREAK_DEFAULT)), 1)
-    gate_iou = _clamp(getattr(args, "gate_iou", GATE_IOU_THRESHOLD_DEFAULT), lo=0.0, hi=1.0)
-    proto_mom = _clamp(getattr(args, "gate_proto_momentum", GATE_PROTO_MOMENTUM_DEFAULT))
+    streak = max(
+        int(getattr(args, "gate_appear_streak", GATE_APPEAR_STREAK_DEFAULT)), 1
+    )
+    gate_iou = _clamp(
+        getattr(args, "gate_iou", GATE_IOU_THRESHOLD_DEFAULT), lo=0.0, hi=1.0
+    )
+    proto_mom = _clamp(
+        getattr(args, "gate_proto_momentum", GATE_PROTO_MOMENTUM_DEFAULT)
+    )
     emb_every = getattr(args, "gate_emb_every", None)
     if emb_every is None or int(emb_every) <= 0:
         emb_stride = max(frame_stride, 1)
@@ -2740,7 +3032,7 @@ def _detect_scene_cuts_histogram(
         return []
     cuts: list[int] = []
     prev_hist = None
-    last_cut = -10**9
+    last_cut = -(10**9)
     idx = 0
     target_frames = progress.target_frames if progress else 0
     emit_interval = 50  # Emit every 50 frames to reduce spam
@@ -2791,7 +3083,9 @@ def detect_scene_cuts_pyscenedetect(
 
     video = open_video(str(video_path))
     manager = SceneManager()
-    detector = ContentDetector(threshold=float(threshold), min_scene_len=max(int(min_len), 1))
+    detector = ContentDetector(
+        threshold=float(threshold), min_scene_len=max(int(min_len), 1)
+    )
     manager.add_detector(detector)
     try:
         manager.detect_scenes(video, show_progress=False)
@@ -2905,17 +3199,29 @@ def _run_full_pipeline(
     # This controls how often detection runs, NOT how many samples get embedded/exported.
     # Per-track sampling for embedding/export is controlled separately via
     # --max-samples-per-track, --min-samples-per-track, --sample-every-n-frames
-    frame_stride = _effective_stride(args.stride, target_fps or analyzed_fps, source_fps)
-    ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
+    frame_stride = _effective_stride(
+        args.stride, target_fps or analyzed_fps, source_fps
+    )
+    ts_fps = (
+        analyzed_fps
+        if analyzed_fps and analyzed_fps > 0
+        else max(args.fps or 30.0, 1.0)
+    )
     frames_goal = None
     if total_frames and total_frames > 0:
         frames_goal = int(total_frames)
     elif progress and progress.target_frames:
         frames_goal = progress.target_frames
-    video_clock_fps = video_fps if video_fps and video_fps > 0 else (source_fps if source_fps > 0 else None)
+    video_clock_fps = (
+        video_fps
+        if video_fps and video_fps > 0
+        else (source_fps if source_fps > 0 else None)
+    )
     frame_exporter: FrameExporter | None = None
 
-    def _progress_value(frame_index: int, *, include_current: bool = False, step: str | None = None) -> tuple[int, Dict[str, Any]]:
+    def _progress_value(
+        frame_index: int, *, include_current: bool = False, step: str | None = None
+    ) -> tuple[int, Dict[str, Any]]:
         base = frame_index + (1 if include_current else 0)
         if base < 0:
             base = 0
@@ -2931,12 +3237,15 @@ def _run_full_pipeline(
             crop_diag_source=frame_exporter,
         )
         return value, meta
+
     device = pick_device(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
     args.detector = detector_choice
     args.tracker = tracker_choice
-    det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
+    det_thresh = _normalize_det_thresh(
+        getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD)
+    )
     args.det_thresh = det_thresh
     detector_backend = _build_face_detector(detector_choice, device, det_thresh)
     detector_backend.ensure_ready()
@@ -2955,7 +3264,9 @@ def _run_full_pipeline(
             extra=video_meta,
         )
 
-    tracker_config = _bytetrack_config_from_args(args) if tracker_choice == "bytetrack" else None
+    tracker_config = (
+        _bytetrack_config_from_args(args) if tracker_choice == "bytetrack" else None
+    )
     tracker_adapter = _build_tracker_adapter(
         tracker_choice,
         frame_rate=source_fps or 30.0,
@@ -2981,11 +3292,17 @@ def _run_full_pipeline(
                 "ArcFace gate embedder is required for ByteTrack gating. "
                 "Install the ArcFace weights via scripts/fetch_models.py or rerun with --tracker strongsort."
             ) from exc
-    scene_detector_choice = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
+    scene_detector_choice = _normalize_scene_detector_choice(
+        getattr(args, "scene_detector", None)
+    )
     args.scene_detector = scene_detector_choice
-    scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
+    scene_threshold = max(
+        float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0
+    )
     scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
-    scene_warmup = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
+    scene_warmup = max(
+        int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0
+    )
     scene_cuts: list[int] = []
     if scene_detector_choice != "off":
         scene_cuts = detect_scene_cuts(
@@ -2995,7 +3312,11 @@ def _run_full_pipeline(
             min_len=scene_min_len,
             progress=progress,
         )
-    scene_summary = {"count": len(scene_cuts), "indices": scene_cuts, "detector": scene_detector_choice}
+    scene_summary = {
+        "count": len(scene_cuts),
+        "indices": scene_cuts,
+        "detector": scene_detector_choice,
+    }
     cut_ix = 0
     next_cut = scene_cuts[cut_ix] if scene_cuts else None
     frames_since_cut = 10**9
@@ -3016,7 +3337,9 @@ def _run_full_pipeline(
     frame_idx = 0
     last_diag_stats: Dict[str, Any] | None = None
 
-    def _diagnostic_stats(detections_in_frame: int, tracks_in_frame: int) -> Dict[str, Any]:
+    def _diagnostic_stats(
+        detections_in_frame: int, tracks_in_frame: int
+    ) -> Dict[str, Any]:
         stats: Dict[str, Any] = {
             "frames_seen": frames_sampled,
             "detections_seen": det_count,
@@ -3087,7 +3410,9 @@ def _run_full_pipeline(
                     cut_ix += 1
                     next_cut = scene_cuts[cut_ix] if cut_ix < len(scene_cuts) else None
                     if progress:
-                        emit_frames, video_meta = _progress_value(frame_idx, include_current=False)
+                        emit_frames, video_meta = _progress_value(
+                            frame_idx, include_current=False
+                        )
                         progress.emit(
                             emit_frames,
                             phase="track",
@@ -3107,7 +3432,9 @@ def _run_full_pipeline(
                     continue
 
                 frames_sampled += 1
-                detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
+                detect_frames, detect_meta = _progress_value(
+                    frame_idx, include_current=True
+                )
                 ts = frame_idx / ts_fps if ts_fps else 0.0
 
                 # === BEGIN per-frame detect/track/crop guard ===
@@ -3123,7 +3450,10 @@ def _run_full_pipeline(
                 try:
                     # DEBUG: Trace execution at frame start
                     if frames_sampled < 5:
-                        LOGGER.error("[DEBUG] Frame %d START: entering detect/track/crop block", frame_idx)
+                        LOGGER.error(
+                            "[DEBUG] Frame %d START: entering detect/track/crop block",
+                            frame_idx,
+                        )
 
                     quarantine_stage = "detection"
 
@@ -3131,7 +3461,11 @@ def _run_full_pipeline(
                         detections = detector_backend.detect(frame)
                         # DEBUG: Show detection count
                         if frames_sampled < 5:
-                            LOGGER.error("[DEBUG] Frame %d: detector returned %d detections", frame_idx, len(detections))
+                            LOGGER.error(
+                                "[DEBUG] Frame %d: detector returned %d detections",
+                                frame_idx,
+                                len(detections),
+                            )
                     except Exception as exc:
                         LOGGER.error(
                             "Face detection failed at frame %d for %s: %s",
@@ -3140,12 +3474,22 @@ def _run_full_pipeline(
                             exc,
                             exc_info=True,
                         )
-                        raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
-                    face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+                        raise RuntimeError(
+                            f"Face detection failed at frame {frame_idx}"
+                        ) from exc
+                    face_detections = [
+                        sample
+                        for sample in detections
+                        if sample.class_label == FACE_CLASS_LABEL
+                    ]
 
                     # DEBUG: Show face detection count
                     if frames_sampled < 5:
-                        LOGGER.error("[DEBUG] Frame %d: filtered to %d face detections", frame_idx, len(face_detections))
+                        LOGGER.error(
+                            "[DEBUG] Frame %d: filtered to %d face detections",
+                            frame_idx,
+                            len(face_detections),
+                        )
 
                     # Validate detection bboxes before tracking to prevent NoneType multiply errors
                     validated_detections = []
@@ -3189,12 +3533,16 @@ def _run_full_pipeline(
                         )
 
                     # Quarantine: Capture validated detections for diagnostics
-                    quarantine_detections = [(det.bbox, float(det.conf)) for det in validated_detections[:10]]
+                    quarantine_detections = [
+                        (det.bbox, float(det.conf)) for det in validated_detections[:10]
+                    ]
                     quarantine_stage = "tracking"
 
                     # Wrap tracker update in specific try/except to catch NoneType multiply errors
                     try:
-                        raw_tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+                        raw_tracked_objects = tracker_adapter.update(
+                            validated_detections, frame_idx, frame
+                        )
                     except TypeError as e:
                         msg = str(e)
                         if "NoneType" in msg and "*" in msg:
@@ -3218,13 +3566,19 @@ def _run_full_pipeline(
 
                     # DEBUG: Show tracker output
                     if frames_sampled < 5:
-                        LOGGER.error("[DEBUG] Frame %d: tracker returned %d raw tracked objects", frame_idx, len(raw_tracked_objects))
+                        LOGGER.error(
+                            "[DEBUG] Frame %d: tracker returned %d raw tracked objects",
+                            frame_idx,
+                            len(raw_tracked_objects),
+                        )
 
                     # Validate tracked object bboxes (ByteTrack may return invalid bboxes)
                     tracked_objects = []
                     invalid_track_count = 0
                     for track_obj in raw_tracked_objects:
-                        validated_track_bbox, track_bbox_err = _safe_bbox_or_none(track_obj.bbox)
+                        validated_track_bbox, track_bbox_err = _safe_bbox_or_none(
+                            track_obj.bbox
+                        )
                         if validated_track_bbox is None:
                             invalid_track_count += 1
                             LOGGER.warning(
@@ -3260,15 +3614,23 @@ def _run_full_pipeline(
 
                     # Quarantine: Capture validated tracks for diagnostics
                     quarantine_tracks = [
-                        (obj.track_id, obj.bbox, float(obj.conf) if obj.conf is not None else 0.0)
+                        (
+                            obj.track_id,
+                            obj.bbox,
+                            float(obj.conf) if obj.conf is not None else 0.0,
+                        )
                         for obj in tracked_objects[:10]
                     ]
                     quarantine_stage = "gate_and_crop"
 
-                    diag_stats = _diagnostic_stats(len(validated_detections), len(tracked_objects))
+                    diag_stats = _diagnostic_stats(
+                        len(validated_detections), len(tracked_objects)
+                    )
                     # Preserve skipped_none_multiply counter from previous iterations
                     if last_diag_stats and "skipped_none_multiply" in last_diag_stats:
-                        diag_stats["skipped_none_multiply"] = last_diag_stats["skipped_none_multiply"]
+                        diag_stats["skipped_none_multiply"] = last_diag_stats[
+                            "skipped_none_multiply"
+                        ]
                     last_diag_stats = diag_stats
                     if progress:
                         detect_extra = dict(detect_meta)
@@ -3283,7 +3645,10 @@ def _run_full_pipeline(
                             extra=detect_extra,
                         )
 
-                    if frames_sampled > 0 and frames_sampled % TRACKING_DIAG_INTERVAL == 0:
+                    if (
+                        frames_sampled > 0
+                        and frames_sampled % TRACKING_DIAG_INTERVAL == 0
+                    ):
                         if tracker_config_summary:
                             LOGGER.info(
                                 "Tracking diag ep=%s frame=%d sampled=%d detections_total=%d tracks_alive=%d "
@@ -3323,7 +3688,9 @@ def _run_full_pipeline(
                     gate_embeddings: dict[int, np.ndarray | None] = {}
                     should_embed_gate = False
                     if appearance_gate:
-                        should_embed_gate = True if frames_since_cut < scene_warmup else False
+                        should_embed_gate = (
+                            True if frames_since_cut < scene_warmup else False
+                        )
                         stride_for_gate = gate_embed_stride or frame_stride
                         if stride_for_gate > 1 and not should_embed_gate:
                             should_embed_gate = frame_idx % stride_for_gate == 0
@@ -3332,7 +3699,11 @@ def _run_full_pipeline(
                         if should_embed_gate and gate_embedder and tracked_objects:
                             # DEBUG: Show gate embedding processing
                             if frames_sampled < 5:
-                                LOGGER.error("[DEBUG] Frame %d: processing gate embeddings for %d tracks", frame_idx, len(tracked_objects))
+                                LOGGER.error(
+                                    "[DEBUG] Frame %d: processing gate embeddings for %d tracks",
+                                    frame_idx,
+                                    len(tracked_objects),
+                                )
 
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
@@ -3351,7 +3722,9 @@ def _run_full_pipeline(
                                 landmarks_list = None
                                 if obj.landmarks is not None:
                                     landmarks_list = (
-                                        obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                                        obj.landmarks.tolist()
+                                        if isinstance(obj.landmarks, np.ndarray)
+                                        else obj.landmarks
                                     )
                                 crop, crop_err = _prepare_face_crop(
                                     frame,
@@ -3361,7 +3734,11 @@ def _run_full_pipeline(
                                 )
                                 if crop is None:
                                     if crop_err:
-                                        LOGGER.debug("Gate crop failed for track %s: %s", obj.track_id, crop_err)
+                                        LOGGER.debug(
+                                            "Gate crop failed for track %s: %s",
+                                            obj.track_id,
+                                            crop_err,
+                                        )
                                     continue
                                 aligned = _resize_for_arcface(crop)
                                 embed_inputs.append(aligned)
@@ -3372,7 +3749,9 @@ def _run_full_pipeline(
                                     embedding_vec = encoded[idx]
                                     # Validate embedding contains finite values before storing
                                     try:
-                                        if embedding_vec is not None and np.all(np.isfinite(embedding_vec)):
+                                        if embedding_vec is not None and np.all(
+                                            np.isfinite(embedding_vec)
+                                        ):
                                             gate_embeddings[tid] = embedding_vec
                                         else:
                                             gate_embeddings[tid] = None
@@ -3411,7 +3790,11 @@ def _run_full_pipeline(
                         class_value = FACE_CLASS_LABEL
                         landmarks = None
                         if obj.landmarks is not None:
-                            landmarks = obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                            landmarks = (
+                                obj.landmarks.tolist()
+                                if isinstance(obj.landmarks, np.ndarray)
+                                else obj.landmarks
+                            )
                         force_split = False
                         if appearance_gate:
                             embedding_vec = gate_embeddings.get(obj.track_id)
@@ -3428,10 +3811,14 @@ def _run_full_pipeline(
                             bbox=obj.bbox,
                             class_label=class_value,
                             landmarks=landmarks,
-                            confidence=float(obj.conf) if obj.conf is not None else None,
+                            confidence=(
+                                float(obj.conf) if obj.conf is not None else None
+                            ),
                             force_new_track=force_split,
                         )
-                        bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
+                        bbox_list = [
+                            round(float(coord), 4) for coord in obj.bbox.tolist()
+                        ]
                         conf_value = float(obj.conf)
 
                         row = {
@@ -3446,10 +3833,14 @@ def _run_full_pipeline(
                             "detector": detector_choice,
                             "tracker": tracker_label,
                             "pipeline_ver": PIPELINE_VERSION,
-                            "fps": round(float(analyzed_fps), 4) if analyzed_fps else None,
+                            "fps": (
+                                round(float(analyzed_fps), 4) if analyzed_fps else None
+                            ),
                         }
                         if landmarks:
-                            row["landmarks"] = [round(float(val), 4) for val in landmarks]
+                            row["landmarks"] = [
+                                round(float(val), 4) for val in landmarks
+                            ]
                         det_handle.write(json.dumps(row) + "\n")
                         det_count += 1
                         if frame_exporter and frame_exporter.save_crops:
@@ -3463,7 +3854,10 @@ def _run_full_pipeline(
 
                     # DEBUG: Frame processing completed successfully
                     if frames_sampled < 5:
-                        LOGGER.error("[DEBUG] Frame %d END: completed all detect/track/crop processing successfully", frame_idx)
+                        LOGGER.error(
+                            "[DEBUG] Frame %d END: completed all detect/track/crop processing successfully",
+                            frame_idx,
+                        )
 
                     # === END per-frame detect/track/crop guard ===
                 except TypeError as e:
@@ -3472,6 +3866,7 @@ def _run_full_pipeline(
                     if "NoneType" in msg and "*" in msg:
                         # Log with full traceback to identify exact location
                         import traceback
+
                         tb_str = traceback.format_exc()
 
                         # Build quarantine report with specific detection/track data
@@ -3500,8 +3895,12 @@ def _run_full_pipeline(
                                 len(quarantine_detections),
                                 frame_idx,
                             )
-                            for idx, (bbox, conf) in enumerate(quarantine_detections[:5]):
-                                bbox_safe = bbox.tolist() if hasattr(bbox, 'tolist') else bbox
+                            for idx, (bbox, conf) in enumerate(
+                                quarantine_detections[:5]
+                            ):
+                                bbox_safe = (
+                                    bbox.tolist() if hasattr(bbox, "tolist") else bbox
+                                )
                                 LOGGER.error(
                                     "[QUARANTINE]   Det %d: bbox=%s conf=%.3f",
                                     idx,
@@ -3509,7 +3908,14 @@ def _run_full_pipeline(
                                     conf,
                                 )
                             quarantine_report["sample_detections"] = [
-                                {"bbox": bbox.tolist() if hasattr(bbox, 'tolist') else bbox, "conf": conf}
+                                {
+                                    "bbox": (
+                                        bbox.tolist()
+                                        if hasattr(bbox, "tolist")
+                                        else bbox
+                                    ),
+                                    "conf": conf,
+                                }
                                 for bbox, conf in quarantine_detections[:5]
                             ]
 
@@ -3520,8 +3926,12 @@ def _run_full_pipeline(
                                 len(quarantine_tracks),
                                 frame_idx,
                             )
-                            for idx, (track_id, bbox, conf) in enumerate(quarantine_tracks[:5]):
-                                bbox_safe = bbox.tolist() if hasattr(bbox, 'tolist') else bbox
+                            for idx, (track_id, bbox, conf) in enumerate(
+                                quarantine_tracks[:5]
+                            ):
+                                bbox_safe = (
+                                    bbox.tolist() if hasattr(bbox, "tolist") else bbox
+                                )
                                 LOGGER.error(
                                     "[QUARANTINE]   Track %d (tid=%d): bbox=%s conf=%.3f",
                                     idx,
@@ -3530,7 +3940,15 @@ def _run_full_pipeline(
                                     conf,
                                 )
                             quarantine_report["sample_tracks"] = [
-                                {"track_id": tid, "bbox": bbox.tolist() if hasattr(bbox, 'tolist') else bbox, "conf": conf}
+                                {
+                                    "track_id": tid,
+                                    "bbox": (
+                                        bbox.tolist()
+                                        if hasattr(bbox, "tolist")
+                                        else bbox
+                                    ),
+                                    "conf": conf,
+                                }
                                 for tid, bbox, conf in quarantine_tracks[:5]
                             ]
 
@@ -3545,10 +3963,14 @@ def _run_full_pipeline(
 
                         # Emit quarantine event via progress so it's visible in UI/Health page
                         if progress:
-                            quarantine_frames, quarantine_meta = _progress_value(frame_idx, include_current=False)
+                            quarantine_frames, quarantine_meta = _progress_value(
+                                frame_idx, include_current=False
+                            )
                             quarantine_extra = dict(quarantine_meta)
                             quarantine_extra["quarantine"] = quarantine_report
-                            quarantine_extra["skipped_none_multiply"] = last_diag_stats["skipped_none_multiply"]
+                            quarantine_extra["skipped_none_multiply"] = last_diag_stats[
+                                "skipped_none_multiply"
+                            ]
                             progress.emit(
                                 quarantine_frames,
                                 phase="track",
@@ -3556,7 +3978,11 @@ def _run_full_pipeline(
                                 detector=detector_choice,
                                 tracker=tracker_label,
                                 resolved_device=detector_device,
-                                summary={"event": "none_multiply_skip", "frame": frame_idx, "stage": quarantine_stage},
+                                summary={
+                                    "event": "none_multiply_skip",
+                                    "frame": frame_idx,
+                                    "stage": quarantine_stage,
+                                },
                                 force=True,
                                 extra=quarantine_extra,
                             )
@@ -3579,7 +4005,9 @@ def _run_full_pipeline(
                     raise
 
                 if progress:
-                    track_frames, track_meta = _progress_value(frame_idx, include_current=True)
+                    track_frames, track_meta = _progress_value(
+                        frame_idx, include_current=True
+                    )
                     track_extra = dict(track_meta)
                     if last_diag_stats:
                         track_extra["detect_track_stats"] = last_diag_stats
@@ -3615,7 +4043,9 @@ def _run_full_pipeline(
 
     if progress and frame_idx > 0:
         detect_done_index = max(frame_idx - 1, 0)
-        detect_done_frames, detect_done_meta = _progress_value(detect_done_index, include_current=True, step="done")
+        detect_done_frames, detect_done_meta = _progress_value(
+            detect_done_index, include_current=True, step="done"
+        )
         if last_diag_stats:
             detect_done_meta = dict(detect_done_meta)
             detect_done_meta["detect_track_stats"] = last_diag_stats
@@ -3677,7 +4107,9 @@ def _run_full_pipeline(
         metrics["appearance_gate"] = appearance_gate.summary()
     if progress:
         final_track_index = max(frame_idx - 1, 0)
-        track_done_frames, track_done_meta = _progress_value(final_track_index, include_current=True, step="done")
+        track_done_frames, track_done_meta = _progress_value(
+            final_track_index, include_current=True, step="done"
+        )
         if final_diag_stats:
             track_done_meta = dict(track_done_meta)
             track_done_meta["detect_track_stats"] = final_diag_stats
@@ -3856,8 +4288,16 @@ def _run_detect_track_stage(
                     "detections": str(get_path(args.ep_id, "detections")),
                     "tracks": str(get_path(args.ep_id, "tracks")),
                     "manifests_dir": str(manifests_dir),
-                    "frames_dir": str(frame_exporter.frames_dir) if frame_exporter and frame_exporter.save_frames else None,
-                    "crops_dir": str(frame_exporter.crops_dir) if frame_exporter and frame_exporter.save_crops else None,
+                    "frames_dir": (
+                        str(frame_exporter.frames_dir)
+                        if frame_exporter and frame_exporter.save_frames
+                        else None
+                    ),
+                    "crops_dir": (
+                        str(frame_exporter.crops_dir)
+                        if frame_exporter and frame_exporter.save_crops
+                        else None
+                    ),
                 },
                 "s3_prefixes": s3_prefixes,
                 "s3_uploads": s3_stats,
@@ -3876,12 +4316,16 @@ def _run_detect_track_stage(
             "scene_cuts": scene_summary,
         }
         try:
-            metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+            metrics_path.write_text(
+                json.dumps(metrics_payload, indent=2), encoding="utf-8"
+            )
             summary["artifacts"]["local"]["track_metrics"] = str(metrics_path)
         except OSError as exc:  # pragma: no cover - best effort diagnostics
             LOGGER.warning("Failed to write track metrics for %s: %s", args.ep_id, exc)
         scene_count = scene_summary.get("count")
-        scene_cuts_payload: Dict[str, Any] = {"count": int(scene_count) if isinstance(scene_count, int) else 0}
+        scene_cuts_payload: Dict[str, Any] = {
+            "count": int(scene_count) if isinstance(scene_count, int) else 0
+        }
         indices = scene_summary.get("indices")
         if isinstance(indices, list):
             scene_cuts_payload["indices"] = indices
@@ -3890,9 +4334,14 @@ def _run_detect_track_stage(
             scene_cuts_payload["detector"] = detector_label
         summary["scene_cuts"] = scene_cuts_payload
         summary["scene_cuts_total"] = scene_cuts_payload["count"]
-        frames_for_scene_rate = summary.get("frames_total") or frames_sampled or progress.target_frames or 1
+        frames_for_scene_rate = (
+            summary.get("frames_total") or frames_sampled or progress.target_frames or 1
+        )
         summary["scene_cuts_per_1k_frames"] = (
-            round((scene_cuts_payload["count"] / max(frames_for_scene_rate, 1)) * 1000.0, 3)
+            round(
+                (scene_cuts_payload["count"] / max(frames_for_scene_rate, 1)) * 1000.0,
+                3,
+            )
             if frames_for_scene_rate
             else 0.0
         )
@@ -3968,8 +4417,10 @@ def _run_faces_embed_stage(
         if (save_frames or save_crops)
         else None
     )
+
     def _phase_meta(step: str | None = None) -> Dict[str, Any]:
         return _non_video_phase_meta(step, crop_diag_source=exporter)
+
     thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
@@ -3994,7 +4445,9 @@ def _run_faces_embed_stage(
         if show_id:
             show_seeds = _load_show_seeds(show_id)
             if show_seeds:
-                LOGGER.info("Loaded %d seed embeddings for show %s", len(show_seeds), show_id)
+                LOGGER.info(
+                    "Loaded %d seed embeddings for show %s", len(show_seeds), show_id
+                )
 
     faces_done = 0
     started_at = _utcnow_iso()
@@ -4039,17 +4492,29 @@ def _run_faces_embed_stage(
                 frame_std = float(np.std(image)) if image is not None else 0.0
                 if image is None or frame_std < 1.0:
                     LOGGER.warning(
-                        "Low-variance frame %s std=%.4f; retrying decode for track %s", frame_idx, frame_std, track_id
+                        "Low-variance frame %s std=%.4f; retrying decode for track %s",
+                        frame_idx,
+                        frame_std,
+                        track_id,
                     )
                     image = frame_decoder.read(frame_idx)
                     frame_std = float(np.std(image)) if image is not None else 0.0
             except (RuntimeError, Exception) as decode_exc:
-                LOGGER.error("Decode failure on frame %s for track %s: %s", frame_idx, track_id, decode_exc)
+                LOGGER.error(
+                    "Decode failure on frame %s for track %s: %s",
+                    frame_idx,
+                    track_id,
+                    decode_exc,
+                )
                 image = None
                 frame_std = 0.0
 
             if image is None or frame_std < 1.0:
-                LOGGER.error("Skipping frame %s for track %s due to bad_source_frame", frame_idx, track_id)
+                LOGGER.error(
+                    "Skipping frame %s for track %s due to bad_source_frame",
+                    frame_idx,
+                    track_id,
+                )
                 rows.append(
                     _make_skip_face_row(
                         args.ep_id,
@@ -4269,7 +4734,9 @@ def _run_faces_embed_stage(
             seed_similarity = None
             if show_seeds and SEED_BOOST_ENABLED:
                 seed_match_stats["total"] += 1
-                match_result = _find_best_seed_match(embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM)
+                match_result = _find_best_seed_match(
+                    embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM
+                )
                 if match_result:
                     seed_cast_id, seed_similarity = match_result
                     seed_match_stats["matches"] += 1
@@ -4356,7 +4823,9 @@ def _run_faces_embed_stage(
         else:
             np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
 
-        _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
+        _update_track_embeddings(
+            track_path, track_embeddings, track_best_thumb, embedding_model_name
+        )
         if exporter:
             exporter.write_indexes()
 
@@ -4371,15 +4840,27 @@ def _run_faces_embed_stage(
             "detector": detector_choice,
             "tracker": tracker_choice,
             "embedding_model": embedding_model_name,
-            "frames_exported": exporter.frames_written if exporter and exporter.save_frames else 0,
-            "crops_exported": exporter.crops_written if exporter and exporter.save_crops else 0,
+            "frames_exported": (
+                exporter.frames_written if exporter and exporter.save_frames else 0
+            ),
+            "crops_exported": (
+                exporter.crops_written if exporter and exporter.save_crops else 0
+            ),
             "artifacts": {
                 "local": {
                     "faces": str(faces_path),
                     "tracks": str(track_path),
                     "manifests_dir": str(manifests_dir),
-                    "frames_dir": str(exporter.frames_dir) if exporter and exporter.save_frames else None,
-                    "crops_dir": str(exporter.crops_dir) if exporter and exporter.save_crops else None,
+                    "frames_dir": (
+                        str(exporter.frames_dir)
+                        if exporter and exporter.save_frames
+                        else None
+                    ),
+                    "crops_dir": (
+                        str(exporter.crops_dir)
+                        if exporter and exporter.save_crops
+                        else None
+                    ),
                     "thumbs_dir": str(thumb_writer.root_dir),
                     "faces_embeddings": str(embed_path),
                 },
@@ -4411,7 +4892,9 @@ def _run_faces_embed_stage(
         )
 
         # Now do S3 sync after completion is signaled
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
+        s3_stats = _sync_artifacts_to_s3(
+            args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir
+        )
         summary["artifacts"]["s3_uploads"] = s3_stats
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
@@ -4456,7 +4939,9 @@ def _max_pairwise_cosine_distance(vectors: np.ndarray) -> float:
     return max_dist
 
 
-def _select_track_prototype(samples: List[TrackEmbeddingSample]) -> tuple[np.ndarray | None, int, float | None]:
+def _select_track_prototype(
+    samples: List[TrackEmbeddingSample],
+) -> tuple[np.ndarray | None, int, float | None]:
     if not samples:
         return None, 0, None
     ranked = sorted(samples, key=lambda item: item[0], reverse=True)
@@ -4494,7 +4979,9 @@ def _select_track_prototype(samples: List[TrackEmbeddingSample]) -> tuple[np.nda
             weight_arr = weight_arr / max(float(weight_arr.sum()), 1e-6)
             proto = np.sum(stack * weight_arr[:, None], axis=0)
             proto = _l2_normalize(proto)
-            sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
+            sims = np.array(
+                [float(np.dot(vec, proto)) for vec in stack], dtype=np.float32
+            )
             sims = np.clip(sims, -1.0, 1.0)
     spread = _max_pairwise_cosine_distance(stack)
     return proto, stack.shape[0], spread
@@ -4630,10 +5117,15 @@ def _run_cluster_stage(
         # Add tracks with no accepted embeddings as forced singletons
         # This ensures tracks whose faces were all skipped still appear in identities.json
         for track_id, row in track_index.items():
-            if track_id not in tracks_with_embeddings and track_id not in flagged_tracks:
+            if (
+                track_id not in tracks_with_embeddings
+                and track_id not in flagged_tracks
+            ):
                 # Track has no embedding and wasn't already flagged
                 faces_count = faces_per_track.get(track_id, 0)
-                if faces_count > 0:  # Only if we saw faces for this track (even if skipped)
+                if (
+                    faces_count > 0
+                ):  # Only if we saw faces for this track (even if skipped)
                     forced_singletons.append([track_id])
                     LOGGER.info(
                         "Track %d has no accepted embeddings (%d faces seen but all skipped); adding as forced singleton",
@@ -4642,7 +5134,9 @@ def _run_cluster_stage(
                     )
 
         if not embedding_rows and not forced_singletons:
-            raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
+            raise RuntimeError(
+                "No track embeddings available; rerun faces_embed with detector enabled"
+            )
 
         track_groups: Dict[int, List[int]] = defaultdict(list)
         if embedding_rows:
@@ -4695,7 +5189,10 @@ def _run_cluster_stage(
                 identity_faces = sum(faces_per_track.get(tid, 0) for tid in bucket)
                 if identity_faces <= 0:
                     identity_faces = len(bucket)
-                rep_track_id = max(bucket, key=lambda tid: track_index.get(tid, {}).get("faces_count", 0))
+                rep_track_id = max(
+                    bucket,
+                    key=lambda tid: track_index.get(tid, {}).get("faces_count", 0),
+                )
                 rep_rel, rep_s3 = _materialize_identity_thumb(
                     thumb_root,
                     track_index.get(rep_track_id),
@@ -4704,7 +5201,9 @@ def _run_cluster_stage(
                 )
 
                 # Check if any tracks in this identity are outliers
-                outlier_reasons = [outlier_map[tid] for tid in bucket if tid in outlier_map]
+                outlier_reasons = [
+                    outlier_map[tid] for tid in bucket if tid in outlier_map
+                ]
                 is_outlier_identity = len(outlier_reasons) > 0
                 is_singleton_outlier = len(bucket) == 1 and is_outlier_identity
 
@@ -4712,11 +5211,18 @@ def _run_cluster_stage(
                 cohesion_score: float | None = None
                 min_sim_to_centroid: float | None = None
                 if len(bucket) > 1:
-                    bucket_embeds = [track_embeddings[tid] for tid in bucket if tid in track_embeddings]
+                    bucket_embeds = [
+                        track_embeddings[tid]
+                        for tid in bucket
+                        if tid in track_embeddings
+                    ]
                     if len(bucket_embeds) >= 2:
                         centroid = np.mean(bucket_embeds, axis=0)
                         norm_centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
-                        sims = [_cosine_similarity(emb, norm_centroid) for emb in bucket_embeds]
+                        sims = [
+                            _cosine_similarity(emb, norm_centroid)
+                            for emb in bucket_embeds
+                        ]
                         cohesion_score = float(np.mean(sims))
                         min_sim_to_centroid = float(np.min(sims))
 
@@ -4744,7 +5250,10 @@ def _run_cluster_stage(
                 if not is_outlier_identity:
                     if cohesion_score is not None and cohesion_score < 0.80:
                         identity_record["low_cohesion"] = True
-                    elif min_sim_to_centroid is not None and min_sim_to_centroid < min_identity_sim:
+                    elif (
+                        min_sim_to_centroid is not None
+                        and min_sim_to_centroid < min_identity_sim
+                    ):
                         identity_record["low_cohesion"] = True
 
                 identity_payload.append(identity_record)
@@ -4772,7 +5281,9 @@ def _run_cluster_stage(
         )
 
         identities_path = manifests_dir / "identities.json"
-        low_cohesion_count = sum(1 for identity in identity_payload if identity.get("low_cohesion"))
+        low_cohesion_count = sum(
+            1 for identity in identity_payload if identity.get("low_cohesion")
+        )
         payload = {
             "ep_id": args.ep_id,
             "pipeline_ver": PIPELINE_VERSION,
@@ -4795,7 +5306,11 @@ def _run_cluster_stage(
         # Generate track representatives and cluster centroids
         try:
             from apps.api.services.track_reps import generate_track_reps_and_centroids
-            LOGGER.info("Generating track representatives and cluster centroids for %s", args.ep_id)
+
+            LOGGER.info(
+                "Generating track representatives and cluster centroids for %s",
+                args.ep_id,
+            )
             track_reps_summary = generate_track_reps_and_centroids(args.ep_id)
             LOGGER.info(
                 "Generated %d track reps and %d cluster centroids",
@@ -4850,7 +5365,9 @@ def _run_cluster_stage(
         )
 
         # Now do S3 sync after completion is signaled
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
+        s3_stats = _sync_artifacts_to_s3(
+            args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root
+        )
         summary["artifacts"]["s3_uploads"] = s3_stats
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
@@ -4932,7 +5449,9 @@ def _sample_track_uniformly(
         # Add more samples uniformly
         additional_needed = min_samples - len(sampled)
         step = n / (min_samples + 1)
-        additional_indices = [int(round((i + 1) * step)) for i in range(additional_needed)]
+        additional_indices = [
+            int(round((i + 1) * step)) for i in range(additional_needed)
+        ]
         for idx in additional_indices:
             if 0 <= idx < n and track_samples[idx] not in sampled:
                 sampled.append(track_samples[idx])
@@ -5066,7 +5585,13 @@ def _infer_tracker_from_tracks(track_path: Path) -> str | None:
 
 
 def _cluster_distance_threshold(similarity: float) -> float:
-    sim = min(max(float(similarity if similarity is not None else DEFAULT_CLUSTER_SIMILARITY), 0.0), 0.999)
+    sim = min(
+        max(
+            float(similarity if similarity is not None else DEFAULT_CLUSTER_SIMILARITY),
+            0.0,
+        ),
+        0.999,
+    )
     distance = 1.0 - sim
     return max(distance, 0.01)
 
@@ -5111,7 +5636,9 @@ def _remove_low_similarity_outliers(
             continue
 
         # Compute cluster centroid
-        cluster_embeds = [track_embeddings[tid] for tid in track_ids if tid in track_embeddings]
+        cluster_embeds = [
+            track_embeddings[tid] for tid in track_ids if tid in track_embeddings
+        ]
         if not cluster_embeds:
             updated_groups[label] = track_ids
             continue
@@ -5175,7 +5702,9 @@ def _build_identity_clusters(
     faces_by_track: Dict[int, List[Dict[str, Any]]],
     s3_prefixes: Dict[str, str] | None,
 ) -> List[Dict[str, Any]]:
-    track_ids = sorted(track_id for track_id in faces_by_track.keys() if track_id is not None)
+    track_ids = sorted(
+        track_id for track_id in faces_by_track.keys() if track_id is not None
+    )
     clusters: List[List[int]] = []
     current: List[int] = []
     for track_id in track_ids:
@@ -5205,7 +5734,9 @@ def _build_identity_clusters(
             "label": f"Identity {idx:02d}",
             "track_ids": track_group,
             "count": count,
-            "samples": [face.get("face_id") for face in track_faces[:3] if face.get("face_id")],
+            "samples": [
+                face.get("face_id") for face in track_faces[:3] if face.get("face_id")
+            ],
         }
         rep_payload = _rep_payload(rep_face, s3_prefixes)
         if rep_payload:
@@ -5214,7 +5745,9 @@ def _build_identity_clusters(
     return identities
 
 
-def _rep_payload(face: Dict[str, Any] | None, s3_prefixes: Dict[str, str] | None) -> Dict[str, Any] | None:
+def _rep_payload(
+    face: Dict[str, Any] | None, s3_prefixes: Dict[str, str] | None
+) -> Dict[str, Any] | None:
     if not face:
         return None
     rep: Dict[str, Any] = {

@@ -17,7 +17,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_sample_video(target: Path, frame_count: int = 12, size: tuple[int, int] = (96, 96)) -> Path:
+def _make_sample_video(
+    target: Path, frame_count: int = 12, size: tuple[int, int] = (96, 96)
+) -> Path:
     import cv2  # type: ignore
 
     width, height = size
@@ -28,7 +30,9 @@ def _make_sample_video(target: Path, frame_count: int = 12, size: tuple[int, int
     for idx in range(frame_count):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         offset = 5 + idx * 2
-        cv2.rectangle(frame, (offset, offset), (offset + 20, offset + 30), (0, 255, 0), -1)
+        cv2.rectangle(
+            frame, (offset, offset), (offset + 20, offset + 30), (0, 255, 0), -1
+        )
         writer.write(frame)
     writer.release()
     return target
@@ -44,7 +48,9 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 @pytest.mark.timeout(120)
-def test_detect_track_real_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detect_track_real_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
 
     data_root = tmp_path / "data"
     video_path = _make_sample_video(tmp_path / "sample.mp4")
@@ -84,12 +90,18 @@ def test_detect_track_real_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     )
 
     summary_line = next(
-        (line for line in completed.stdout.splitlines() if line.startswith("[episode_run]")),
+        (
+            line
+            for line in completed.stdout.splitlines()
+            if line.startswith("[episode_run]")
+        ),
         "",
     )
     if summary_line.startswith("[episode_run]"):
         try:
-            summary_json = ast.literal_eval(summary_line.split("[episode_run]")[-1].strip())
+            summary_json = ast.literal_eval(
+                summary_line.split("[episode_run]")[-1].strip()
+            )
         except Exception:
             summary_json = {}
         assert summary_json.get("analyzed_fps", 0) > 0
@@ -109,6 +121,8 @@ def test_detect_track_real_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     assert det_rows[0]["model"].startswith("yolov8")
     assert det_rows[0]["tracker"] == "bytetrack"
-    assert any(row.get("track_id") is not None for row in det_rows), "Detections lack track IDs"
+    assert any(
+        row.get("track_id") is not None for row in det_rows
+    ), "Detections lack track IDs"
     assert track_rows[0]["frame_count"] >= 1
     assert track_rows[0]["pipeline_ver"]

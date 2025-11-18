@@ -25,9 +25,7 @@ helpers.inject_thumb_css()
 
 SUPPORTED_IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "avif", "heic", "heif"]
 SUPPORTED_IMAGE_DESC = "Supported: JPG, PNG, WebP, AVIF, HEIC/HEIF"
-SIMULATED_DETECTOR_WARNING = (
-    "Seed uploads are using the simulated detector. Install RetinaFace (insightface + buffalo_l) for aligned crops."
-)
+SIMULATED_DETECTOR_WARNING = "Seed uploads are using the simulated detector. Install RetinaFace (insightface + buffalo_l) for aligned crops."
 _CAST_EDIT_FIELDS = ["name", "role", "status", "aliases", "seasons"]
 
 
@@ -61,11 +59,21 @@ def _render_cast_edit_form(member: Dict[str, Any], show_id: str) -> None:
         name = st.text_input("Name*", key="cast_edit_name")
         form_cols = st.columns(2)
         with form_cols[0]:
-            role = st.selectbox("Role", options=["main", "friend", "guest", "other"], key="cast_edit_role")
+            role = st.selectbox(
+                "Role",
+                options=["main", "friend", "guest", "other"],
+                key="cast_edit_role",
+            )
         with form_cols[1]:
-            status = st.selectbox("Status", options=["active", "past", "inactive"], key="cast_edit_status")
-        aliases_raw = st.text_input("Aliases (comma-separated)", key="cast_edit_aliases")
-        seasons_raw = st.text_input("Seasons (comma-separated)", key="cast_edit_seasons")
+            status = st.selectbox(
+                "Status", options=["active", "past", "inactive"], key="cast_edit_status"
+            )
+        aliases_raw = st.text_input(
+            "Aliases (comma-separated)", key="cast_edit_aliases"
+        )
+        seasons_raw = st.text_input(
+            "Seasons (comma-separated)", key="cast_edit_seasons"
+        )
 
         button_cols = st.columns([1, 1])
         submit = button_cols[0].form_submit_button("Save changes", type="primary")
@@ -125,7 +133,11 @@ def _resolve_api_url(url: str | None) -> str | None:
         return url
     # If it's a relative API path, prepend the API base
     if url.startswith("/"):
-        api_base = cfg.get("api_base") or st.session_state.get("api_base") or "http://localhost:8000"
+        api_base = (
+            cfg.get("api_base")
+            or st.session_state.get("api_base")
+            or "http://localhost:8000"
+        )
         return f"{api_base}{url}"
     return url
 
@@ -138,7 +150,9 @@ def _api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] 
         return None
 
 
-def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+def _api_post(
+    path: str, payload: Dict[str, Any] | None = None
+) -> Dict[str, Any] | None:
     try:
         return helpers.api_post(path, payload or {})
     except requests.RequestException as exc:
@@ -146,7 +160,9 @@ def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any
         return None
 
 
-def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+def _api_patch(
+    path: str, payload: Dict[str, Any] | None = None
+) -> Dict[str, Any] | None:
     base = st.session_state.get("api_base")
     if not base:
         st.error("API base URL missing; re-run init_page().")
@@ -160,7 +176,9 @@ def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, An
         return None
 
 
-def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+def _api_delete(
+    path: str, payload: Dict[str, Any] | None = None
+) -> Dict[str, Any] | None:
     base = st.session_state.get("api_base")
     if not base:
         st.error("API base URL missing; re-run init_page().")
@@ -185,12 +203,24 @@ def _warn_if_simulated(payload: Dict[str, Any] | None) -> None:
 
 # Show creation form
 with st.expander("➕ Add New Show", expanded=False):
-    st.caption("Create a show slug before adding cast members. Use lowercase letters/numbers/dashes (e.g., rhobh).")
+    st.caption(
+        "Create a show slug before adding cast members. Use lowercase letters/numbers/dashes (e.g., rhobh)."
+    )
     with st.form("cast_new_show_form"):
-        new_show_id = st.text_input("Show slug*", key="cast_new_show_slug", placeholder="e.g., rhobh")
-        new_show_title = st.text_input("Display name", key="cast_new_show_title", placeholder="e.g., RHOBH")
-        new_show_full_name = st.text_input("Full name", key="cast_new_show_full_name", placeholder="e.g., The Real Housewives of Beverly Hills")
-        new_show_imdb = st.text_input("IMDb Series ID", key="cast_new_show_imdb", placeholder="e.g., tt1720601")
+        new_show_id = st.text_input(
+            "Show slug*", key="cast_new_show_slug", placeholder="e.g., rhobh"
+        )
+        new_show_title = st.text_input(
+            "Display name", key="cast_new_show_title", placeholder="e.g., RHOBH"
+        )
+        new_show_full_name = st.text_input(
+            "Full name",
+            key="cast_new_show_full_name",
+            placeholder="e.g., The Real Housewives of Beverly Hills",
+        )
+        new_show_imdb = st.text_input(
+            "IMDb Series ID", key="cast_new_show_imdb", placeholder="e.g., tt1720601"
+        )
         create_show = st.form_submit_button("Create show", type="primary")
 
         if create_show:
@@ -262,10 +292,15 @@ if not cast_resp:
 cast_members = cast_resp.get("cast", [])
 
 # Check if we're in add form mode
-show_add_form = st.session_state.get("cast_show_add_form") and not st.session_state.get("selected_cast_id")
+show_add_form = st.session_state.get("cast_show_add_form") and not st.session_state.get(
+    "selected_cast_id"
+)
 
 if not cast_members and not show_add_form:
-    st.info(f"No cast members found for {show_id}" + (f" in {season_filter}" if season_filter else ""))
+    st.info(
+        f"No cast members found for {show_id}"
+        + (f" in {season_filter}" if season_filter else "")
+    )
 
     # Add new cast member button
     if st.button("Add Cast Member", key="cast_add_new"):
@@ -294,23 +329,33 @@ if show_add_form:
         if not st.session_state.get("new_cast_created"):
             with st.form("add_cast_details_form"):
                 st.markdown("**Cast Member Information**")
-                name = st.text_input("Name*", key="new_cast_name", placeholder="e.g., Kyle Richards")
+                name = st.text_input(
+                    "Name*", key="new_cast_name", placeholder="e.g., Kyle Richards"
+                )
 
                 col1, col2 = st.columns(2)
                 with col1:
-                    role = st.selectbox("Role", options=["main", "friend", "guest", "other"], key="new_cast_role")
+                    role = st.selectbox(
+                        "Role",
+                        options=["main", "friend", "guest", "other"],
+                        key="new_cast_role",
+                    )
                 with col2:
-                    status = st.selectbox("Status", options=["active", "past", "inactive"], key="new_cast_status")
+                    status = st.selectbox(
+                        "Status",
+                        options=["active", "past", "inactive"],
+                        key="new_cast_status",
+                    )
 
                 aliases_text = st.text_input(
                     "Aliases (comma-separated)",
                     key="new_cast_aliases",
-                    placeholder="e.g., Kyle, Kyle R"
+                    placeholder="e.g., Kyle, Kyle R",
                 )
                 seasons_text = st.text_input(
                     "Seasons (comma-separated)",
                     key="new_cast_seasons",
-                    placeholder="e.g., S01,S02,S03"
+                    placeholder="e.g., S01,S02,S03",
                 )
 
                 cols = st.columns([1, 1])
@@ -318,8 +363,12 @@ if show_add_form:
                     if not name or not name.strip():
                         st.error("Name is required")
                     else:
-                        aliases = [a.strip() for a in aliases_text.split(",") if a.strip()]
-                        seasons = [s.strip() for s in seasons_text.split(",") if s.strip()]
+                        aliases = [
+                            a.strip() for a in aliases_text.split(",") if a.strip()
+                        ]
+                        seasons = [
+                            s.strip() for s in seasons_text.split(",") if s.strip()
+                        ]
 
                         payload = {
                             "name": name.strip(),
@@ -346,7 +395,9 @@ if show_add_form:
 
             st.success(f"✓ Created cast member: **{new_cast_name}**")
             st.markdown("**Optional: Upload Seed Images**")
-            st.caption("Upload photos/portraits of this person to improve face recognition. Images must contain exactly 1 face.")
+            st.caption(
+                "Upload photos/portraits of this person to improve face recognition. Images must contain exactly 1 face."
+            )
 
             with st.form("upload_seeds_after_create_form"):
                 uploaded_files = st.file_uploader(
@@ -354,7 +405,7 @@ if show_add_form:
                     type=SUPPORTED_IMAGE_TYPES,
                     accept_multiple_files=True,
                     key="new_cast_upload_files",
-                    help=f"Select one or more photos ({SUPPORTED_IMAGE_DESC})"
+                    help=f"Select one or more photos ({SUPPORTED_IMAGE_DESC})",
                 )
 
                 cols = st.columns([1, 1, 1, 1])
@@ -362,8 +413,13 @@ if show_add_form:
                     if uploaded_files:
                         # Upload via API
                         base = cfg["api_base"]
-                        url = f"{base}/cast/{new_cast_id}/seeds/upload?show_id={show_id}"
-                        files = [("files", (f.name, f.getvalue(), f.type)) for f in uploaded_files]
+                        url = (
+                            f"{base}/cast/{new_cast_id}/seeds/upload?show_id={show_id}"
+                        )
+                        files = [
+                            ("files", (f.name, f.getvalue(), f.type))
+                            for f in uploaded_files
+                        ]
 
                         try:
                             resp = requests.post(url, files=files, timeout=120)
@@ -423,7 +479,8 @@ search = st.text_input("Search cast", key="cast_search", placeholder="Name or al
 if search:
     search_lower = search.lower()
     cast_members = [
-        m for m in cast_members
+        m
+        for m in cast_members
         if search_lower in m["name"].lower()
         or any(search_lower in alias.lower() for alias in m.get("aliases", []))
     ]
@@ -444,11 +501,16 @@ for row_start in range(0, len(cast_members), cols_per_row):
 
             # Fetch facebank for featured image
             facebank_resp = _api_get(f"/cast/{cast_id}/facebank?show_id={show_id}")
-            featured_seed_id = facebank_resp.get("featured_seed_id") if facebank_resp else None
+            featured_seed_id = (
+                facebank_resp.get("featured_seed_id") if facebank_resp else None
+            )
             featured_seed = None
             if facebank_resp and featured_seed_id:
                 seeds = facebank_resp.get("seeds", [])
-                featured_seed = next((seed for seed in seeds if seed.get("fb_id") == featured_seed_id), None)
+                featured_seed = next(
+                    (seed for seed in seeds if seed.get("fb_id") == featured_seed_id),
+                    None,
+                )
 
             # Get featured image URL
             image_url = None
@@ -459,11 +521,15 @@ for row_start in range(0, len(cast_members), cols_per_row):
                 resolved_thumb = None
 
             # Render 4:5 portrait frame
-            thumb_markup = helpers.thumb_html(resolved_thumb, alt=name, hide_if_missing=False)
+            thumb_markup = helpers.thumb_html(
+                resolved_thumb, alt=name, hide_if_missing=False
+            )
             st.markdown(thumb_markup, unsafe_allow_html=True)
 
             # Name and seasons
-            status_emoji = "✅" if status == "active" else ("⏸️" if status == "past" else "❌")
+            status_emoji = (
+                "✅" if status == "active" else ("⏸️" if status == "past" else "❌")
+            )
             st.markdown(f"**{status_emoji} {name}**")
             if seasons:
                 st.caption(f"Seasons: {', '.join(seasons)}")
@@ -471,7 +537,9 @@ for row_start in range(0, len(cast_members), cols_per_row):
                 st.caption(role.upper())
 
             # Select button
-            if st.button("View Details", key=f"cast_select_{cast_id}", use_container_width=True):
+            if st.button(
+                "View Details", key=f"cast_select_{cast_id}", use_container_width=True
+            ):
                 st.session_state["selected_cast_id"] = cast_id
                 st.rerun()
 
@@ -487,7 +555,10 @@ if selected_cast_id:
 
     member = member_resp
 
-    if st.session_state.get("cast_edit_id") and st.session_state["cast_edit_id"] != selected_cast_id:
+    if (
+        st.session_state.get("cast_edit_id")
+        and st.session_state["cast_edit_id"] != selected_cast_id
+    ):
         _reset_cast_edit_state()
 
     st.subheader(f"Cast Detail: {member['name']}")
@@ -515,29 +586,45 @@ if selected_cast_id:
 
     # Fetch facebank
     facebank_params = {"show_id": show_id}
-    facebank_resp = _api_get(f"/cast/{selected_cast_id}/facebank", params=facebank_params)
+    facebank_resp = _api_get(
+        f"/cast/{selected_cast_id}/facebank", params=facebank_params
+    )
 
     if facebank_resp:
         seeds = facebank_resp.get("seeds", [])
         stats = facebank_resp.get("stats", {})
         featured_seed_id = facebank_resp.get("featured_seed_id")
         similarity_stats = facebank_resp.get("similarity") or {}
-        summary_stats = similarity_stats.get("summary") if isinstance(similarity_stats, dict) else None
-        avg_similarity = summary_stats.get("mean") if isinstance(summary_stats, dict) else None
-        per_seed_similarity = similarity_stats.get("per_seed") if isinstance(similarity_stats, dict) else {}
+        summary_stats = (
+            similarity_stats.get("summary")
+            if isinstance(similarity_stats, dict)
+            else None
+        )
+        avg_similarity = (
+            summary_stats.get("mean") if isinstance(summary_stats, dict) else None
+        )
+        per_seed_similarity = (
+            similarity_stats.get("per_seed")
+            if isinstance(similarity_stats, dict)
+            else {}
+        )
 
         # Stats chips
         stat_cols = st.columns(4)
         stat_cols[0].metric("Seed Images", stats.get("total_seeds", 0))
         stat_cols[1].metric("Exemplars", stats.get("total_exemplars", 0))
         if avg_similarity is not None:
-            stat_cols[2].metric("Avg Similarity", f"{int(round(avg_similarity * 100))}%")
+            stat_cols[2].metric(
+                "Avg Similarity", f"{int(round(avg_similarity * 100))}%"
+            )
         else:
             stat_cols[2].metric("Avg Similarity", "n/a")
         updated_label = stats.get("updated_at", "never") or "never"
         stat_cols[3].caption(f"Updated: {updated_label[:10]}")
 
-        featured_seed = next((seed for seed in seeds if seed.get("fb_id") == featured_seed_id), None)
+        featured_seed = next(
+            (seed for seed in seeds if seed.get("fb_id") == featured_seed_id), None
+        )
         if featured_seed:
             st.markdown("**⭐ Featured Image**")
             image_uri = _resolve_api_url(helpers.seed_display_source(featured_seed))
@@ -559,21 +646,33 @@ if selected_cast_id:
                         image_uri = _resolve_api_url(helpers.seed_display_source(seed))
                         fb_id = seed.get("fb_id")
                         resolved_thumb = helpers.resolve_thumb(image_uri)
-                        st.markdown(helpers.thumb_html(resolved_thumb, alt=f"Seed {fb_id}"), unsafe_allow_html=True)
+                        st.markdown(
+                            helpers.thumb_html(resolved_thumb, alt=f"Seed {fb_id}"),
+                            unsafe_allow_html=True,
+                        )
                         if seed.get("featured"):
                             st.caption("⭐ Featured")
                         else:
                             st.caption(f"Seed {fb_id[:8]}...")
                             if st.button("☆ Feature", key=f"feature_seed_{fb_id}"):
                                 _mark_featured_seed(show_id, selected_cast_id, fb_id)
-                        sim_info = per_seed_similarity.get(fb_id) if isinstance(per_seed_similarity, dict) else None
-                        if isinstance(sim_info, dict) and sim_info.get("mean") is not None:
+                        sim_info = (
+                            per_seed_similarity.get(fb_id)
+                            if isinstance(per_seed_similarity, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(sim_info, dict)
+                            and sim_info.get("mean") is not None
+                        ):
                             sim_pct = int(round(sim_info["mean"] * 100))
                             st.caption(f"{sim_pct}% avg similarity")
 
                         # Delete button for all seeds (including featured)
                         confirm_key = f"confirm_delete_seed_{fb_id}"
-                        if st.button("🗑️ Delete", key=f"delete_seed_{fb_id}", type="secondary"):
+                        if st.button(
+                            "🗑️ Delete", key=f"delete_seed_{fb_id}", type="secondary"
+                        ):
                             if st.session_state.get(confirm_key):
                                 _delete_seed(show_id, selected_cast_id, fb_id)
                                 st.session_state.pop(confirm_key, None)
@@ -593,7 +692,9 @@ if selected_cast_id:
         if st.session_state.get("cast_show_upload_form"):
             with st.form("upload_seeds_form"):
                 st.markdown("**Upload Seed Images**")
-                st.caption(f"Images must contain exactly 1 face. {SUPPORTED_IMAGE_DESC}")
+                st.caption(
+                    f"Images must contain exactly 1 face. {SUPPORTED_IMAGE_DESC}"
+                )
 
                 uploaded_files = st.file_uploader(
                     "Choose images",
@@ -611,7 +712,10 @@ if selected_cast_id:
                         base = cfg["api_base"]
                         url = f"{base}/cast/{selected_cast_id}/seeds/upload?show_id={show_id}"
 
-                        files = [("files", (f.name, f.getvalue(), f.type)) for f in uploaded_files]
+                        files = [
+                            ("files", (f.name, f.getvalue(), f.type))
+                            for f in uploaded_files
+                        ]
 
                         try:
                             resp = requests.post(url, files=files, timeout=120)
@@ -647,7 +751,9 @@ if selected_cast_id:
 
     with action_cols[0]:
         if edit_mode:
-            st.button("Editing…", key=f"cast_edit_disabled_{selected_cast_id}", disabled=True)
+            st.button(
+                "Editing…", key=f"cast_edit_disabled_{selected_cast_id}", disabled=True
+            )
         else:
             if st.button("Edit Cast Member", key=f"cast_edit_{selected_cast_id}"):
                 _prime_cast_edit_state(member)
@@ -661,7 +767,11 @@ if selected_cast_id:
             st.switch_page("pages/3_Faces_Review.py")
 
     with action_cols[2]:
-        if st.button("Delete Cast Member", key=f"cast_delete_{selected_cast_id}", type="secondary"):
+        if st.button(
+            "Delete Cast Member",
+            key=f"cast_delete_{selected_cast_id}",
+            type="secondary",
+        ):
             if st.session_state.get(f"confirm_delete_{selected_cast_id}"):
                 result = _api_delete(f"/shows/{show_id}/cast/{selected_cast_id}")
                 if result:

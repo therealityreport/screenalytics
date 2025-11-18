@@ -60,7 +60,12 @@ def test_cluster_summary_endpoint(tmp_path):
     )
     _write_json(
         identities_path,
-        {"ep_id": ep_id, "identities": [{"identity_id": "id_0001", "track_ids": [1], "name": "Test"}]},
+        {
+            "ep_id": ep_id,
+            "identities": [
+                {"identity_id": "id_0001", "track_ids": [1], "name": "Test"}
+            ],
+        },
     )
 
     resp = client.get(f"/episodes/{ep_id}/cluster_tracks")
@@ -129,7 +134,9 @@ def test_cluster_tracks_include_skipped_face_previews(tmp_path):
     track = resp.json()["clusters"][0]["tracks"][0]
     assert track["track_id"] == 2
     preview_url = track.get("rep_thumb_url")
-    assert preview_url, "cluster preview URL should be hydrated even when faces are skipped"
+    assert (
+        preview_url
+    ), "cluster preview URL should be hydrated even when faces are skipped"
     assert preview_url.endswith("frame_000007.jpg")
 
 

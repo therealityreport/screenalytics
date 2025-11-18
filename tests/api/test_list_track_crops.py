@@ -23,8 +23,16 @@ def _setup_track(tmp_path: Path, count: int = 3) -> str:
     for idx in range(count):
         frame_path = track_dir / f"frame_{idx:06d}.jpg"
         frame_path.write_bytes(b"test")
-        entries.append({"key": f"track_0001/frame_{idx:06d}.jpg", "frame_idx": idx, "ts": idx * 0.5})
-    (track_dir / "index.json").write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        entries.append(
+            {
+                "key": f"track_0001/frame_{idx:06d}.jpg",
+                "frame_idx": idx,
+                "ts": idx * 0.5,
+            }
+        )
+    (track_dir / "index.json").write_text(
+        json.dumps(entries, indent=2), encoding="utf-8"
+    )
     return ep_id
 
 
@@ -42,8 +50,16 @@ def _setup_legacy_track(tmp_path: Path, count: int = 2) -> str:
     for idx in range(count):
         frame_path = track_dir / f"frame_{idx:06d}.jpg"
         frame_path.write_bytes(b"legacy")
-        entries.append({"key": f"track_0001/frame_{idx:06d}.jpg", "frame_idx": idx, "ts": idx * 0.25})
-    (track_dir / "index.json").write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        entries.append(
+            {
+                "key": f"track_0001/frame_{idx:06d}.jpg",
+                "frame_idx": idx,
+                "ts": idx * 0.25,
+            }
+        )
+    (track_dir / "index.json").write_text(
+        json.dumps(entries, indent=2), encoding="utf-8"
+    )
     return ep_id
 
 
@@ -152,11 +168,17 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
     storage.bucket = "demo-bucket"
     storage._client = _FakeClient(entries)
     storage._client_error_cls = Exception
-    monkeypatch.setattr(storage, "presign_get", lambda key, expires_in=3600: f"https://example.com/{key}")
+    monkeypatch.setattr(
+        storage,
+        "presign_get",
+        lambda key, expires_in=3600: f"https://example.com/{key}",
+    )
     monkeypatch.setattr(episodes_router, "STORAGE", storage)
 
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 2})
+    resp = client.get(
+        f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 2}
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert len(payload["items"]) == 2
@@ -166,7 +188,9 @@ def test_list_track_crops_remote_uses_presigned(monkeypatch, tmp_path):
 def test_list_track_crops_uses_fallback_root(tmp_path):
     ep_id = _setup_legacy_track(tmp_path, count=2)
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 5})
+    resp = client.get(
+        f"/episodes/{ep_id}/tracks/1/crops", params={"sample": 1, "limit": 5}
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["items"], "expected crops from fallback root"
@@ -178,7 +202,10 @@ def test_track_frames_endpoint_returns_media(tmp_path):
     ep_id = _setup_track(tmp_path, count=4)
     _write_faces(ep_id, count=4)
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/frames", params={"sample": 1, "page": 1, "page_size": 2})
+    resp = client.get(
+        f"/episodes/{ep_id}/tracks/1/frames",
+        params={"sample": 1, "page": 1, "page_size": 2},
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["total"] == 4
@@ -195,7 +222,10 @@ def test_track_frames_endpoint_falls_back_when_no_crops(tmp_path):
     ensure_dirs(ep_id)
     _write_faces(ep_id, count=2)
     client = TestClient(app)
-    resp = client.get(f"/episodes/{ep_id}/tracks/1/frames", params={"sample": 1, "page": 1, "page_size": 5})
+    resp = client.get(
+        f"/episodes/{ep_id}/tracks/1/frames",
+        params={"sample": 1, "page": 1, "page_size": 5},
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["total"] == 2

@@ -10,7 +10,8 @@ import streamlit as st
 def render_similarity_scores_key():
     """Render collapsible similarity scores guide with color-coded legend for Faces Review."""
     with st.expander("📊 Similarity Scores Guide", expanded=False):
-        st.markdown("""
+        st.markdown(
+            """
         <style>
         .sim-key {
             display: flex;
@@ -95,9 +96,12 @@ def render_similarity_scores_key():
                 </div>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
 
-        st.markdown("""
+        st.markdown(
+            """
         **Quality Indicators:**
 
         | Badge | Meaning |
@@ -115,7 +119,8 @@ def render_similarity_scores_key():
         - Partial (orange pill): Edge-clipped or incomplete face
 
         📚 **Full guide:** See `docs/similarity-scores-guide.md` for complete documentation.
-        """)
+        """
+        )
 
 
 # INTEGRATION INSTRUCTIONS:

@@ -11,8 +11,20 @@ from bytetrack_runner import build_tracks, main  # noqa: E402
 
 def test_build_tracks_generates_ids():
     detections = [
-        {"ep_id": "ep1", "ts_s": 0.2, "frame_idx": 0, "conf": 0.9, "bbox": [0.1, 0.1, 0.3, 0.3]},
-        {"ep_id": "ep1", "ts_s": 1.0, "frame_idx": 1, "conf": 0.95, "bbox": [0.1, 0.1, 0.3, 0.3]},
+        {
+            "ep_id": "ep1",
+            "ts_s": 0.2,
+            "frame_idx": 0,
+            "conf": 0.9,
+            "bbox": [0.1, 0.1, 0.3, 0.3],
+        },
+        {
+            "ep_id": "ep1",
+            "ts_s": 1.0,
+            "frame_idx": 1,
+            "conf": 0.95,
+            "bbox": [0.1, 0.1, 0.3, 0.3],
+        },
     ]
     cfg = {"track_thresh": 0.0, "match_thresh": 0.1, "track_buffer": 1}
     tracks = list(build_tracks(detections, cfg))

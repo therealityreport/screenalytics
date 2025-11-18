@@ -56,7 +56,9 @@ class ShowCreateRequest(BaseModel):
     show_id: str = Field(..., description="Unique show identifier (slug)")
     title: Optional[str] = Field(None, description="Short display name")
     full_name: Optional[str] = Field(None, description="Full/legal show name")
-    imdb_series_id: Optional[str] = Field(None, description="IMDb series identifier (e.g., tt2861424)")
+    imdb_series_id: Optional[str] = Field(
+        None, description="IMDb series identifier (e.g., tt2861424)"
+    )
 
 
 class CastMemberResponse(BaseModel):
@@ -79,10 +81,18 @@ class CastMemberCreateRequest(BaseModel):
     full_name: Optional[str] = Field(None, description="Legal/full name")
     role: str = Field("other", description="Role: main, friend, guest, other")
     status: str = Field("active", description="Status: active, past, inactive")
-    aliases: Optional[List[str]] = Field(default_factory=list, description="Aliases/nicknames")
-    seasons: Optional[List[str]] = Field(default_factory=list, description="Season IDs (e.g., S05)")
-    social: Optional[dict] = Field(default_factory=dict, description="Social media handles")
-    imdb_id: Optional[str] = Field(None, description="IMDb person identifier (e.g., nm0000001)")
+    aliases: Optional[List[str]] = Field(
+        default_factory=list, description="Aliases/nicknames"
+    )
+    seasons: Optional[List[str]] = Field(
+        default_factory=list, description="Season IDs (e.g., S05)"
+    )
+    social: Optional[dict] = Field(
+        default_factory=dict, description="Social media handles"
+    )
+    imdb_id: Optional[str] = Field(
+        None, description="IMDb person identifier (e.g., nm0000001)"
+    )
 
 
 class CastMemberUpdateRequest(BaseModel):
@@ -185,7 +195,9 @@ def get_cast_member(show_id: str, cast_id: str) -> CastMemberResponse:
 
 
 @router.post("/shows/{show_id}/cast")
-def create_cast_member(show_id: str, body: CastMemberCreateRequest) -> CastMemberResponse:
+def create_cast_member(
+    show_id: str, body: CastMemberCreateRequest
+) -> CastMemberResponse:
     """Create a new cast member."""
     member = _cast_service().create_cast_member(
         show_id,
@@ -202,7 +214,9 @@ def create_cast_member(show_id: str, body: CastMemberCreateRequest) -> CastMembe
 
 
 @router.patch("/shows/{show_id}/cast/{cast_id}")
-def update_cast_member(show_id: str, cast_id: str, body: CastMemberUpdateRequest) -> CastMemberResponse:
+def update_cast_member(
+    show_id: str, cast_id: str, body: CastMemberUpdateRequest
+) -> CastMemberResponse:
     """Update a cast member."""
     member = _cast_service().update_cast_member(
         show_id,
@@ -232,7 +246,9 @@ def delete_cast_member(show_id: str, cast_id: str) -> dict:
 
 class BulkImportRequest(BaseModel):
     members: List[Dict[str, Any]] = Field(..., description="List of cast member data")
-    force_new: bool = Field(False, description="Always create new members (skip merge by name)")
+    force_new: bool = Field(
+        False, description="Always create new members (skip merge by name)"
+    )
 
 
 @router.post("/shows/{show_id}/cast/import")
@@ -255,7 +271,9 @@ def bulk_import_cast(show_id: str, body: BulkImportRequest) -> dict:
       "force_new": false
     }
     """
-    result = _cast_service().bulk_import_cast(show_id, body.members, force_new=body.force_new)
+    result = _cast_service().bulk_import_cast(
+        show_id, body.members, force_new=body.force_new
+    )
     return result
 
 

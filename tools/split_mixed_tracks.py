@@ -16,6 +16,7 @@ import numpy as np
 
 try:
     from sklearn.cluster import AgglomerativeClustering
+
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -101,7 +102,9 @@ def split_high_spread_tracks(
     for old_track_id in sorted(flagged_tracks):
         track_faces = faces_by_track.get(old_track_id, [])
         if len(track_faces) < 2:
-            LOGGER.warning(f"[split_tracks] Track {old_track_id} has <2 faces, skipping")
+            LOGGER.warning(
+                f"[split_tracks] Track {old_track_id} has <2 faces, skipping"
+            )
             continue
 
         # Extract embeddings
@@ -112,13 +115,17 @@ def split_high_spread_tracks(
                 embeddings.append(np.array(emb, dtype=np.float32))
 
         if len(embeddings) < 2:
-            LOGGER.warning(f"[split_tracks] Track {old_track_id} has <2 embeddings, skipping")
+            LOGGER.warning(
+                f"[split_tracks] Track {old_track_id} has <2 embeddings, skipping"
+            )
             continue
 
         # Cluster faces within this track
         X = np.vstack(embeddings)
         n_clusters = min(len(embeddings), 5)  # Max 5 sub-tracks
-        model = AgglomerativeClustering(n_clusters=n_clusters, metric='cosine', linkage='average')
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters, metric="cosine", linkage="average"
+        )
         labels = model.fit_predict(X)
 
         # Group faces by sub-cluster
@@ -129,7 +136,9 @@ def split_high_spread_tracks(
         # Only split if we found multiple clusters
         unique_labels = set(labels)
         if len(unique_labels) == 1:
-            LOGGER.info(f"[split_tracks] Track {old_track_id} clustered into 1 group, not splitting")
+            LOGGER.info(
+                f"[split_tracks] Track {old_track_id} clustered into 1 group, not splitting"
+            )
             continue
 
         LOGGER.info(
@@ -167,7 +176,9 @@ def split_high_spread_tracks(
         track_mapping[old_track_id] = new_track_ids
 
     if dry_run:
-        LOGGER.info("[split_tracks] DRY RUN - would split %d tracks", len(track_mapping))
+        LOGGER.info(
+            "[split_tracks] DRY RUN - would split %d tracks", len(track_mapping)
+        )
         return {
             "dry_run": True,
             "split_count": len(track_mapping),
@@ -216,11 +227,14 @@ def split_high_spread_tracks(
 
 if __name__ == "__main__":
     import argparse
+
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="Split high-spread tracks")
     parser.add_argument("--ep-id", required=True, help="Episode ID")
-    parser.add_argument("--threshold", type=float, default=0.35, help="Spread threshold")
+    parser.add_argument(
+        "--threshold", type=float, default=0.35, help="Spread threshold"
+    )
     parser.add_argument("--dry-run", action="store_true", help="Don't modify files")
     args = parser.parse_args()
 

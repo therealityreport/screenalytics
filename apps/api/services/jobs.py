@@ -27,13 +27,19 @@ DEFAULT_DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expa
 DETECTOR_CHOICES = {"retinaface"}
 TRACKER_CHOICES = {"bytetrack", "strongsort"}
 _DEFAULT_DETECTOR_RAW = os.getenv("DEFAULT_DETECTOR", "retinaface").lower()
-DEFAULT_DETECTOR_ENV = _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
+DEFAULT_DETECTOR_ENV = (
+    _DEFAULT_DETECTOR_RAW if _DEFAULT_DETECTOR_RAW in DETECTOR_CHOICES else "retinaface"
+)
 DEFAULT_TRACKER_ENV = os.getenv("DEFAULT_TRACKER", "bytetrack").lower()
-SCENE_DETECTOR_CHOICES = tuple(getattr(episode_run, "SCENE_DETECTOR_CHOICES", ("pyscenedetect", "internal", "off")))
+SCENE_DETECTOR_CHOICES = tuple(
+    getattr(episode_run, "SCENE_DETECTOR_CHOICES", ("pyscenedetect", "internal", "off"))
+)
 _SCENE_DETECTOR_ENV = os.getenv("SCENE_DETECTOR", "pyscenedetect").strip().lower()
 if _SCENE_DETECTOR_ENV not in SCENE_DETECTOR_CHOICES:
     _SCENE_DETECTOR_ENV = "pyscenedetect"
-SCENE_DETECTOR_DEFAULT = getattr(episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV)
+SCENE_DETECTOR_DEFAULT = getattr(
+    episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -80,8 +86,12 @@ def _env_int_multi(names: tuple[str, ...], default: int) -> int:
     return default
 
 
-SCENE_THRESHOLD_DEFAULT = getattr(episode_run, "SCENE_THRESHOLD_DEFAULT", _env_float("SCENE_THRESHOLD", 27.0))
-SCENE_MIN_LEN_DEFAULT = getattr(episode_run, "SCENE_MIN_LEN_DEFAULT", max(_env_int("SCENE_MIN_LEN", 12), 1))
+SCENE_THRESHOLD_DEFAULT = getattr(
+    episode_run, "SCENE_THRESHOLD_DEFAULT", _env_float("SCENE_THRESHOLD", 27.0)
+)
+SCENE_MIN_LEN_DEFAULT = getattr(
+    episode_run, "SCENE_MIN_LEN_DEFAULT", max(_env_int("SCENE_MIN_LEN", 12), 1)
+)
 SCENE_WARMUP_DETS_DEFAULT = getattr(
     episode_run,
     "SCENE_WARMUP_DETS_DEFAULT",
@@ -91,7 +101,9 @@ CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
 TRACK_HIGH_THRESH_DEFAULT = getattr(episode_run, "TRACK_HIGH_THRESH_DEFAULT", 0.5)
 TRACK_NEW_THRESH_DEFAULT = getattr(episode_run, "TRACK_NEW_THRESH_DEFAULT", 0.5)
 TRACK_BUFFER_BASE_DEFAULT = getattr(episode_run, "TRACK_BUFFER_BASE_DEFAULT", 30)
-TRACK_MIN_BOX_AREA_DEFAULT = getattr(episode_run, "BYTE_TRACK_MIN_BOX_AREA_DEFAULT", 20.0)
+TRACK_MIN_BOX_AREA_DEFAULT = getattr(
+    episode_run, "BYTE_TRACK_MIN_BOX_AREA_DEFAULT", 20.0
+)
 
 
 def _resolve_track_high_thresh(value: float | None) -> float:
@@ -119,7 +131,10 @@ def _resolve_track_buffer(value: int | None) -> int:
         except (TypeError, ValueError):
             return TRACK_BUFFER_BASE_DEFAULT
     return max(
-        _env_int_multi(("SCREENALYTICS_TRACK_BUFFER", "BYTE_TRACK_BUFFER"), TRACK_BUFFER_BASE_DEFAULT),
+        _env_int_multi(
+            ("SCREENALYTICS_TRACK_BUFFER", "BYTE_TRACK_BUFFER"),
+            TRACK_BUFFER_BASE_DEFAULT,
+        ),
         1,
     )
 
@@ -132,9 +147,13 @@ def _resolve_min_box_area(value: float | None) -> float:
             numeric = TRACK_MIN_BOX_AREA_DEFAULT
         return max(numeric, 0.0)
     return max(
-        _env_float_multi(("SCREENALYTICS_MIN_BOX_AREA", "BYTE_TRACK_MIN_BOX_AREA"), TRACK_MIN_BOX_AREA_DEFAULT),
+        _env_float_multi(
+            ("SCREENALYTICS_MIN_BOX_AREA", "BYTE_TRACK_MIN_BOX_AREA"),
+            TRACK_MIN_BOX_AREA_DEFAULT,
+        ),
         0.0,
     )
+
 
 JobRecord = Dict[str, Any]
 
@@ -147,7 +166,9 @@ class JobService:
     """Minimal filesystem-backed job tracker."""
 
     def __init__(self, data_root: Path | str | None = None) -> None:
-        self.data_root = Path(data_root).expanduser() if data_root else DEFAULT_DATA_ROOT
+        self.data_root = (
+            Path(data_root).expanduser() if data_root else DEFAULT_DATA_ROOT
+        )
         self.jobs_dir = self.data_root / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -172,10 +193,14 @@ class JobService:
     def _write_job(self, record: JobRecord) -> None:
         path = self._job_path(record["job_id"])
         tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.write_text(
+            json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
+        )
         tmp_path.replace(path)
 
-    def _mutate_job(self, job_id: str, mutator: Callable[[JobRecord], None]) -> JobRecord:
+    def _mutate_job(
+        self, job_id: str, mutator: Callable[[JobRecord], None]
+    ) -> JobRecord:
         with self._lock:
             record = self._read_job(job_id)
             mutator(record)
@@ -542,7 +567,9 @@ class JobService:
             command.append("--no-save-crops")
         if not write_back:
             command.append("--no-write-back")
-        normalized_actions = [action for action in actions if action in CLEANUP_ACTIONS] or list(CLEANUP_ACTIONS)
+        normalized_actions = [
+            action for action in actions if action in CLEANUP_ACTIONS
+        ] or list(CLEANUP_ACTIONS)
         command += ["--actions", *normalized_actions]
         requested = {
             "stride": stride,
@@ -689,7 +716,9 @@ class JobService:
         state = "succeeded" if return_code == 0 and error_msg is None else "failed"
         self._finalize_job(job_id, state, return_code, error_msg)
 
-    def _finalize_job(self, job_id: str, state: str, return_code: int, error_msg: str | None) -> None:
+    def _finalize_job(
+        self, job_id: str, state: str, return_code: int, error_msg: str | None
+    ) -> None:
         progress_data = None
 
         def _apply(record: JobRecord) -> None:
@@ -772,10 +801,7 @@ class JobService:
                 continue
 
         # Sort by started_at descending (most recent first)
-        all_jobs.sort(
-            key=lambda j: j.get("started_at", ""),
-            reverse=True
-        )
+        all_jobs.sort(key=lambda j: j.get("started_at", ""), reverse=True)
 
         return all_jobs[:limit]
 

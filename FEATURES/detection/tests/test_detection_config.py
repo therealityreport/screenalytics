@@ -48,7 +48,14 @@ def test_run_detection_with_plan(tmp_path):
         img = np.full((32, 32, 3), idx * 60, dtype=np.uint8)
         frame_path = tmp_path / f"frame_{idx}.png"
         cv2.imwrite(str(frame_path), img)
-        frames.append({"ep_id": "ep1", "frame_idx": idx, "ts_s": idx * 0.33, "image_path": str(frame_path)})
+        frames.append(
+            {
+                "ep_id": "ep1",
+                "frame_idx": idx,
+                "ts_s": idx * 0.33,
+                "image_path": str(frame_path),
+            }
+        )
 
     manifest = tmp_path / "frames.jsonl"
     manifest.write_text("\n".join(json.dumps(fr) for fr in frames))
@@ -56,7 +63,9 @@ def test_run_detection_with_plan(tmp_path):
     out_path = tmp_path / "detections.jsonl"
     cfg = {"model_id": "retinaface_r50", "force_simulated": True}
     dummy_video = tmp_path / "dummy.mp4"
-    dummy_video.write_bytes(b"not-a-video")  # never consumed because plan has image_path
+    dummy_video.write_bytes(
+        b"not-a-video"
+    )  # never consumed because plan has image_path
     count = run_detection(
         ep_id="ep1",
         video_path=dummy_video,

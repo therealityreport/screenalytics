@@ -14,7 +14,9 @@ def _reset_services(monkeypatch) -> None:
     monkeypatch.setattr(episodes_router, "STORAGE", StorageService())
 
 
-def _create_episode(client: TestClient, show_ref: str, season: int, episode: int) -> str:
+def _create_episode(
+    client: TestClient, show_ref: str, season: int, episode: int
+) -> str:
     resp = client.post(
         "/episodes",
         json={
@@ -62,7 +64,10 @@ def test_episode_list_detail_and_mirror_local(monkeypatch, tmp_path):
     assert mirror_data["local_video_path"].endswith("episode.mp4")
     assert mirror_data["bytes"] == len(sample_bytes)
     assert Path(mirror_data["local_video_path"]).exists()
-    assert mirror_data["used_key_version"] is None or mirror_data["used_key_version"] == "v2"
+    assert (
+        mirror_data["used_key_version"] is None
+        or mirror_data["used_key_version"] == "v2"
+    )
 
     hydrate_resp = client.post(f"/episodes/{ep_id}/hydrate")
     assert hydrate_resp.status_code == 200

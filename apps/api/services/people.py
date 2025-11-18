@@ -182,7 +182,9 @@ class PeopleService:
         for person in people:
             cluster_ids = person.get("cluster_ids", [])
             if cluster_id in cluster_ids:
-                person["cluster_ids"] = [cid for cid in cluster_ids if cid != cluster_id]
+                person["cluster_ids"] = [
+                    cid for cid in cluster_ids if cid != cluster_id
+                ]
                 modified_person_ids.append(person["person_id"])
 
         if modified_person_ids:
@@ -210,8 +212,11 @@ class PeopleService:
         removed_from = self.remove_cluster_from_all_people(show_id, cluster_id)
         if removed_from:
             import logging
+
             LOGGER = logging.getLogger(__name__)
-            LOGGER.info(f"Removed cluster {cluster_id} from people {removed_from} before reassigning to {person_id}")
+            LOGGER.info(
+                f"Removed cluster {cluster_id} from people {removed_from} before reassigning to {person_id}"
+            )
 
         person = self.get_person(show_id, person_id)
         if not person:
@@ -233,9 +238,13 @@ class PeopleService:
             prototype = updated.tolist()
         elif update_prototype and cluster_centroid is not None:
             # First cluster for this person
-            prototype = l2_normalize(np.array(cluster_centroid, dtype=np.float32)).tolist()
+            prototype = l2_normalize(
+                np.array(cluster_centroid, dtype=np.float32)
+            ).tolist()
 
-        return self.update_person(show_id, person_id, cluster_ids=cluster_ids, prototype=prototype)
+        return self.update_person(
+            show_id, person_id, cluster_ids=cluster_ids, prototype=prototype
+        )
 
     def find_matching_person(
         self,
@@ -250,7 +259,7 @@ class PeopleService:
         people = self.list_people(show_id)
 
         best_person_id = None
-        best_distance = float('inf')
+        best_distance = float("inf")
 
         for person in people:
             prototype = person.get("prototype", [])
@@ -269,7 +278,9 @@ class PeopleService:
 
         return None
 
-    def find_person_by_cast_id(self, show_id: str, cast_id: str) -> Optional[Dict[str, Any]]:
+    def find_person_by_cast_id(
+        self, show_id: str, cast_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Find a person record linked to a given cast member."""
         people = self.list_people(show_id)
         for person in people:
@@ -408,7 +419,9 @@ class PeopleService:
         # Add source's primary name as alias if different from target's name
         source_name = source.get("name")
         target_name = target.get("name")
-        if source_name and self.normalize_name(source_name) != self.normalize_name(target_name or ""):
+        if source_name and self.normalize_name(source_name) != self.normalize_name(
+            target_name or ""
+        ):
             source_aliases.append(source_name)
 
         # Merge unique aliases (normalized comparison)
@@ -454,7 +467,8 @@ class PeopleService:
             original_clusters = person.get("cluster_ids") or []
             # Filter out clusters belonging to the deleted episode
             cleaned_clusters = [
-                cid for cid in original_clusters
+                cid
+                for cid in original_clusters
                 if not str(cid).startswith(cluster_prefix)
             ]
 

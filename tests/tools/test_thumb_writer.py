@@ -14,6 +14,7 @@ def test_thumb_writer_prefers_prepared_crop(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_BACKEND", "local")
     ep_id = "demo-s02e01"
     ensure_dirs(ep_id)
+
     def _fake_imwrite(path, image, jpg_q=85):
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)

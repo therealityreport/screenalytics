@@ -27,7 +27,9 @@ def test_backfill_updates_missing_s3(monkeypatch, tmp_path):
     fs.add_seed(show_id, cast_id, str(image_path), np.zeros(512, dtype=np.float32))
 
     dummy_storage = _DummyStorage()
-    monkeypatch.setattr("tools.facebank_sync_seeds.StorageService", lambda: dummy_storage)
+    monkeypatch.setattr(
+        "tools.facebank_sync_seeds.StorageService", lambda: dummy_storage
+    )
 
     stats = backfill_facebank_seeds(show_id)
     assert stats["updated"] == 1

@@ -5,7 +5,11 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
-from tests.api._sse_utils import collect_sse_events, write_sample_faces, write_sample_tracks
+from tests.api._sse_utils import (
+    collect_sse_events,
+    write_sample_faces,
+    write_sample_tracks,
+)
 
 pytest.importorskip("numpy")
 
@@ -19,7 +23,13 @@ def test_sse_cluster_done_and_close(tmp_path, monkeypatch) -> None:
 
     events_to_emit = [
         {"phase": "cluster", "frames_done": 0, "frames_total": 8},
-        {"phase": "cluster", "frames_done": 8, "frames_total": 8, "step": "done", "summary": {"stage": "cluster"}},
+        {
+            "phase": "cluster",
+            "frames_done": 8,
+            "frames_total": 8,
+            "step": "done",
+            "summary": {"stage": "cluster"},
+        },
         {"phase": "done", "step": "cluster"},
     ]
 
@@ -36,7 +46,9 @@ def test_sse_cluster_done_and_close(tmp_path, monkeypatch) -> None:
 
     client = TestClient(app)
     headers = {"accept": "text/event-stream"}
-    with client.stream("POST", "/jobs/cluster", headers=headers, json={"ep_id": ep_id}) as response:
+    with client.stream(
+        "POST", "/jobs/cluster", headers=headers, json={"ep_id": ep_id}
+    ) as response:
         assert response.status_code == 200
         events = collect_sse_events(response)
         stream_closed = response.is_closed

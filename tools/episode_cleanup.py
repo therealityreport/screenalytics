@@ -168,13 +168,21 @@ def _normalize_actions(actions: Iterable[str] | None) -> List[str]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run full cleanup pipeline for an episode.")
-    parser.add_argument("--ep-id", required=True, help="Episode identifier (slug-sXXeYY)")
+    parser = argparse.ArgumentParser(
+        description="Run full cleanup pipeline for an episode."
+    )
+    parser.add_argument(
+        "--ep-id", required=True, help="Episode identifier (slug-sXXeYY)"
+    )
     parser.add_argument("--video", help="Override path to mirrored episode video")
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--fps", type=float, default=0.0)
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
-    parser.add_argument("--embed-device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    parser.add_argument(
+        "--device", default="auto", choices=["auto", "cpu", "mps", "cuda"]
+    )
+    parser.add_argument(
+        "--embed-device", default="auto", choices=["auto", "cpu", "mps", "cuda"]
+    )
     parser.add_argument("--detector", default="retinaface")
     parser.add_argument("--tracker", default="bytetrack")
     parser.add_argument("--det-thresh", type=float, default=None)
@@ -188,13 +196,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-identity-sim", type=float, default=0.5)
     parser.add_argument("--thumb-size", type=int, default=256)
     parser.add_argument("--jpeg-quality", type=int, default=85)
-    parser.add_argument("--progress-file", help="Path to write aggregated progress JSON")
-    parser.add_argument("--actions", nargs="+", choices=DEFAULT_ACTIONS, help="Subset of cleanup actions to run")
-    parser.add_argument("--save-frames", dest="save_frames", action="store_true", default=False)
+    parser.add_argument(
+        "--progress-file", help="Path to write aggregated progress JSON"
+    )
+    parser.add_argument(
+        "--actions",
+        nargs="+",
+        choices=DEFAULT_ACTIONS,
+        help="Subset of cleanup actions to run",
+    )
+    parser.add_argument(
+        "--save-frames", dest="save_frames", action="store_true", default=False
+    )
     parser.add_argument("--no-save-frames", dest="save_frames", action="store_false")
-    parser.add_argument("--save-crops", dest="save_crops", action="store_true", default=False)
+    parser.add_argument(
+        "--save-crops", dest="save_crops", action="store_true", default=False
+    )
     parser.add_argument("--no-save-crops", dest="save_crops", action="store_false")
-    parser.add_argument("--write-back", dest="write_back", action="store_true", default=True)
+    parser.add_argument(
+        "--write-back", dest="write_back", action="store_true", default=True
+    )
     parser.add_argument("--no-write-back", dest="write_back", action="store_false")
     return parser.parse_args(argv)
 
@@ -205,7 +226,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifests_dir = get_path(args.ep_id, "detections").parent
     data_actions = _normalize_actions(args.actions)
     LOGGER.info("[cleanup] starting run ep_id=%s actions=%s", args.ep_id, data_actions)
-    progress_path = Path(args.progress_file) if args.progress_file else manifests_dir / "cleanup_progress.json"
+    progress_path = (
+        Path(args.progress_file)
+        if args.progress_file
+        else manifests_dir / "cleanup_progress.json"
+    )
     video_path = Path(args.video) if args.video else get_path(args.ep_id, "video")
     if not video_path.exists():
         raise FileNotFoundError(f"Episode video not found at {video_path}")
@@ -251,7 +276,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     metrics_path = manifests_dir / "track_metrics.json"
     metrics_payload = _read_json(metrics_path) or {}
-    splits = metrics_payload.get("metrics", {}).get("appearance_gate", {}).get("splits", {})
+    splits = (
+        metrics_payload.get("metrics", {}).get("appearance_gate", {}).get("splits", {})
+    )
     if splits:
         LOGGER.info(
             "[cleanup] gate splits breakdown: hard=%s streak=%s iou=%s total=%s",
@@ -270,13 +297,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         def log_progress(current, total, status):
             LOGGER.info(f"[cleanup] centroid progress: {current}/{total} - {status}")
 
-        centroids = grouping.compute_cluster_centroids(args.ep_id, progress_callback=log_progress)
+        centroids = grouping.compute_cluster_centroids(
+            args.ep_id, progress_callback=log_progress
+        )
 
         # Group within episode
         def log_within_progress(current, total, status):
-            LOGGER.info(f"[cleanup] within-episode grouping: {current}/{total} - {status}")
+            LOGGER.info(
+                f"[cleanup] within-episode grouping: {current}/{total} - {status}"
+            )
 
-        within = grouping.group_within_episode(args.ep_id, progress_callback=log_within_progress)
+        within = grouping.group_within_episode(
+            args.ep_id, progress_callback=log_within_progress
+        )
 
         # Group across episodes
         across = None
@@ -292,7 +325,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         centroids_count = len(centroids.get("centroids", []))
         merged = within.get("merged_count", 0) if isinstance(within, dict) else 0
         assigned = len(across.get("assigned", [])) if isinstance(across, dict) else 0
-        new_people = across.get("new_people_count", 0) if isinstance(across, dict) else 0
+        new_people = (
+            across.get("new_people_count", 0) if isinstance(across, dict) else 0
+        )
         LOGGER.info(
             "[cleanup] grouping done: centroids=%s merged=%s assigned=%s new_people=%s",
             centroids_count,
@@ -314,7 +349,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     report_path = manifests_dir / "cleanup_report.json"
     _write_json(report_path, report)
-    _write_json(progress_path, {"stage": "episode_cleanup", "summary": report, "ep_id": args.ep_id})
+    _write_json(
+        progress_path,
+        {"stage": "episode_cleanup", "summary": report, "ep_id": args.ep_id},
+    )
 
     LOGGER.info("[cleanup] completed run for %s; report → %s", args.ep_id, report_path)
     return 0

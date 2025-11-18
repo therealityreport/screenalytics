@@ -101,7 +101,9 @@ if ep_id:
                 f"({error_rate:.1%} of attempts skipped due to invalid bboxes)."
             )
         elif crop_attempts is not None and crop_attempts > 0:
-            st.caption(f"**Detect/Track crops:** {crop_attempts} attempts (no error stats available).")
+            st.caption(
+                f"**Detect/Track crops:** {crop_attempts} attempts (no error stats available)."
+            )
         elif detect_track:
             st.caption("**Detect/Track:** No crop diagnostics available for this run.")
 
@@ -122,4 +124,6 @@ if ep_id:
         if cluster_status:
             st.caption(f"Cluster status: `{cluster_status}`")
 else:
-    st.info("Set an ep_id from another page (Upload/Episodes) to probe specific objects.")
+    st.info(
+        "Set an ep_id from another page (Upload/Episodes) to probe specific objects."
+    )

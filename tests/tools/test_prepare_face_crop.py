@@ -30,7 +30,9 @@ def test_prepare_face_crop_skips_degenerate_landmarks(monkeypatch):
     bbox = [50.0, 50.0, 150.0, 150.0]
     degenerate_landmarks = [100.0, 100.0] * 5
 
-    crop, err = episode_run._prepare_face_crop(image, bbox, degenerate_landmarks, margin=0.0)
+    crop, err = episode_run._prepare_face_crop(
+        image, bbox, degenerate_landmarks, margin=0.0
+    )
 
     assert err is None
     assert crop is not None
