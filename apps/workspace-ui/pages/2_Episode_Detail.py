@@ -263,6 +263,18 @@ faces_job_defaults = _load_job_defaults(ep_id, "faces_embed")
 cluster_job_defaults = _load_job_defaults(ep_id, "cluster")
 local_video_exists = bool(details["local"].get("exists"))
 
+
+def _check_detect_track_manifests() -> bool:
+    """
+    Check if detect/track manifests exist locally.
+    Returns True if tracks.jsonl exists and is readable.
+    """
+    try:
+        return tracks_path.exists() and tracks_path.is_file()
+    except Exception:
+        return False
+
+
 st.subheader(f"Episode `{ep_id}`")
 st.write(
     f"Show `{details['show_slug']}` · Season {details['season_number']} Episode {details['episode_number']}"
@@ -289,10 +301,26 @@ if tracks_path.exists():
     st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
     st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
 
+# Check if detect/track manifests exist locally for fallback
+manifests_present = _check_detect_track_manifests()
+
+# Get status values from API
 detect_status_value = str(detect_phase_status.get("status") or "missing").lower()
 faces_status_value = str(faces_phase_status.get("status") or "missing").lower()
 cluster_status_value = str(cluster_phase_status.get("status") or "missing").lower()
 tracks_ready_status = bool((status_payload or {}).get("tracks_ready"))
+
+# Apply manifest-based fallback for detect/track status
+using_manifest_fallback = False
+if detect_status_value != "success" and manifests_present:
+    # Promote status to success when manifests exist but status API is missing/stale
+    detect_status_value = "success"
+    using_manifest_fallback = True
+
+# Derive tracks_ready from both status API and manifest fallback
+tracks_ready = tracks_ready_status or manifests_present
+
+# Other status values
 faces_ready_state = faces_status_value == "success"
 faces_count_value = helpers.coerce_int(faces_phase_status.get("faces"))
 identities_count_value = helpers.coerce_int(cluster_phase_status.get("identities"))
@@ -319,6 +347,9 @@ if status_payload:
             detections = detect_phase_status.get("detections")
             tracks = detect_phase_status.get("tracks")
             st.caption(f"{(detections or 0):,} detections, {(tracks or 0):,} tracks")
+            # Show manifest-fallback caption when status was inferred from manifests
+            if using_manifest_fallback:
+                st.caption("ℹ️ _Detect/Track completion inferred from manifests (status API missing/stale)._")
         elif detect_status_value == "partial":
             st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
             st.caption("Rerun detect/track to rebuild tracks.")
@@ -342,7 +373,7 @@ if status_payload:
             st.warning(f"⚠️ **Faces Harvest**: {faces_status_value.title()}")
             if faces_phase_status.get("error"):
                 st.caption(faces_phase_status["error"])
-        elif tracks_ready_status:
+        elif tracks_ready:
             st.info("⏳ **Faces Harvest**: Ready to run")
             st.caption("Click 'Run Faces Harvest' below.")
         else:
@@ -619,7 +650,7 @@ with col_detect:
                 st.session_state["episode_detail_flash"] = "Detect/track complete · " + " · ".join(details_line)
                 st.rerun()
 
-tracks_ready = tracks_ready_status
+# tracks_ready is already computed above with manifest fallback (line ~321)
 faces_ready = faces_ready_state
 detector_face_only = helpers.detector_is_face_only(ep_id)
 
