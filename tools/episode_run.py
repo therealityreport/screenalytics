@@ -367,15 +367,24 @@ def _normalize_scene_detector_choice(scene_detector: str | None) -> str:
 
 
 def _valid_face_box(bbox: np.ndarray, score: float, *, min_score: float, min_area: float) -> bool:
-    width = bbox[2] - bbox[0]
-    height = bbox[3] - bbox[1]
-    area = max(width, 0.0) * max(height, 0.0)
+    # Validate bbox has valid numeric coordinates
+    try:
+        if len(bbox) < 4:
+            return False
+        width = float(bbox[2]) - float(bbox[0])
+        height = float(bbox[3]) - float(bbox[1])
+        area = max(width, 0.0) * max(height, 0.0)
+    except (TypeError, ValueError, IndexError):
+        return False
     if score < min_score:
         return False
     if area < min_area:
         return False
-    ratio = width / max(height, 1e-6)
-    return FACE_RATIO_BOUNDS[0] <= ratio <= FACE_RATIO_BOUNDS[1]
+    try:
+        ratio = width / max(height, 1e-6)
+        return FACE_RATIO_BOUNDS[0] <= ratio <= FACE_RATIO_BOUNDS[1]
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
 
 
 def _nms_detections(
