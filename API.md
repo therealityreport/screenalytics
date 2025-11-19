@@ -346,6 +346,29 @@ Poll job progress (live updates).
 
 **Note:** `track_metrics` is included once metrics are available (typically after job completion). During execution, partial metrics may be included.
 
+**Cleanup Job Progress:**
+
+For `episode_cleanup` jobs, progress includes phase tracking:
+
+```json
+{
+  "state": "running",
+  "phase": "reembed",
+  "phase_index": 2,
+  "phase_total": 4,
+  "phase_progress": 0.5,
+  "total_elapsed_seconds": 127.8,
+  "track_metrics": {...}
+}
+```
+
+**Cleanup Progress Fields:**
+- `phase` (string): Current cleanup phase (`split_tracks`, `reembed`, `recluster`, `group_clusters`)
+- `phase_index` (int): Current phase number (1-indexed)
+- `phase_total` (int): Total number of phases to execute
+- `phase_progress` (float): Phase completion (0.0 = starting, 1.0 = complete)
+- `total_elapsed_seconds` (float): Elapsed time since cleanup started
+
 **States:** `pending` | `running` | `succeeded` | `failed` | `canceled`
 
 #### `POST /jobs/{job_id}/cancel`
