@@ -82,11 +82,16 @@ async def _reject_legacy_payload(request: Request) -> None:
 
 
 DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
+PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "high_accuracy"]
 
 
 class DetectRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     video: str = Field(..., description="Source video path or URL")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Overrides stride/FPS/min_size defaults.",
+    )
     stride: int = Field(
         4,
         description="Frame stride for detection sampling (default 4 aligns with detect+track 42-minute runs)",
@@ -104,6 +109,10 @@ class TrackRequest(BaseModel):
 
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Overrides stride/FPS/min_size defaults.",
+    )
     stride: int = Field(6, description="Frame stride for detection sampling (default: 6)")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
     device: DEVICE_LITERAL = Field(
@@ -179,6 +188,10 @@ class DetectTrackRequest(BaseModel):
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Controls quality gating and sampling.",
+    )
     device: DEVICE_LITERAL | None = Field(
         None,
         description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
@@ -191,6 +204,10 @@ class FacesEmbedRequest(BaseModel):
 
 class ClusterRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Controls clustering thresholds.",
+    )
     device: DEVICE_LITERAL | None = Field(
         None,
         description="Execution device (defaults to server auto-detect with CUDA/CoreML fallbacks)",
@@ -212,6 +229,10 @@ class ClusterRequest(BaseModel):
 
 class CleanupJobRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Applies to all cleanup stages.",
+    )
     stride: int = Field(4, ge=1, le=50)
     fps: float | None = Field(None, ge=0.0)
     device: DEVICE_LITERAL = Field("auto", description="Detect/track device (auto→CUDA→CoreML→CPU)")
@@ -353,6 +374,8 @@ def _build_detect_track_command(
         "--progress-file",
         str(progress_path),
     ]
+    if req.profile:
+        command += ["--profile", req.profile]
     if req.fps is not None and req.fps > 0:
         command += ["--fps", str(req.fps)]
     if req.save_frames:
@@ -395,6 +418,8 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         "--progress-file",
         str(progress_path),
     ]
+    if req.profile:
+        command += ["--profile", req.profile]
     if req.save_frames:
         command.append("--save-frames")
     if req.save_crops:
@@ -419,6 +444,8 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
         "--progress-file",
         str(progress_path),
     ]
+    if req.profile:
+        command += ["--profile", req.profile]
     command += ["--cluster-thresh", str(req.cluster_thresh)]
     command += ["--min-cluster-size", str(req.min_cluster_size)]
     command += ["--min-identity-sim", str(req.min_identity_sim)]
@@ -899,6 +926,7 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             new_track_thresh=req.new_track_thresh,
             track_buffer=req.track_buffer,
             min_box_area=req.min_box_area,
+            profile=req.profile,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -926,6 +954,7 @@ async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) ->
             save_crops=req.save_crops,
             jpeg_quality=req.jpeg_quality,
             thumb_size=req.thumb_size,
+            profile=req.profile,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -949,6 +978,7 @@ async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
             cluster_thresh=req.cluster_thresh,
             min_cluster_size=req.min_cluster_size,
             min_identity_sim=req.min_identity_sim,
+            profile=req.profile,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -997,6 +1027,7 @@ async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request
             thumb_size=req.thumb_size,
             actions=actions,
             write_back=req.write_back,
+            profile=req.profile,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

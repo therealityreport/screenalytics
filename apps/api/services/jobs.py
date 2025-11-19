@@ -382,6 +382,7 @@ class JobService:
         new_track_thresh: float | None = None,
         track_buffer: int | None = None,
         min_box_area: float | None = None,
+        profile: str | None = None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
@@ -411,6 +412,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         if fps and fps > 0:
             command += ["--fps", str(fps)]
         if save_frames:
@@ -472,6 +475,7 @@ class JobService:
         save_crops: bool,
         jpeg_quality: int,
         thumb_size: int,
+        profile: str | None = None,
     ) -> JobRecord:
         track_path = get_path(ep_id, "tracks")
         if not track_path.exists():
@@ -490,6 +494,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         if save_frames:
             command.append("--save-frames")
         if save_crops:
@@ -522,6 +528,7 @@ class JobService:
         cluster_thresh: float,
         min_cluster_size: int,
         min_identity_sim: float,
+        profile: str | None = None,
     ) -> JobRecord:
         manifests_dir = get_path(ep_id, "detections").parent
         faces_path = manifests_dir / "faces.jsonl"
@@ -539,6 +546,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         command += ["--cluster-thresh", str(cluster_thresh)]
         command += ["--min-cluster-size", str(min_cluster_size)]
         command += ["--min-identity-sim", str(min_identity_sim)]
@@ -582,6 +591,7 @@ class JobService:
         thumb_size: int,
         actions: List[str],
         write_back: bool,
+        profile: str | None = None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
@@ -632,6 +642,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         if fps and fps > 0:
             command += ["--fps", str(fps)]
         if det_thresh is not None:
