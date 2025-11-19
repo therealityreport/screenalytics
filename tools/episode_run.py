@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -574,6 +575,35 @@ def _init_retinaface(
 def _insightface_model_dir(model_name: str) -> Path:
     root = Path(os.environ.get("INSIGHTFACE_HOME", str(Path.home() / ".insightface"))).expanduser()
     return root / "models" / model_name
+
+
+def _embedding_is_valid(embedding: Optional[np.ndarray]) -> bool:
+    """
+    Check if an embedding vector is valid.
+
+    Args:
+        embedding: Numpy array embedding vector or None
+
+    Returns:
+        True if embedding is a non-None numpy array with at least one element
+    """
+    return embedding is not None and isinstance(embedding, np.ndarray) and embedding.size > 0
+
+
+def _analyze_pose_expression(landmarks: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Analyze facial landmarks to extract pose (yaw, pitch) and expression.
+
+    TODO: Implement actual pose/expression analysis from landmarks.
+    For now, returns None values to skip quality checks.
+
+    Args:
+        landmarks: Facial landmark points from face detection
+
+    Returns:
+        Tuple of (yaw, pitch, expression) - all None for now
+    """
+    return (None, None, None)
 
 
 def _compute_file_sha256(path: Path) -> str:
