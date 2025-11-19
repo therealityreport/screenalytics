@@ -396,6 +396,7 @@ TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(os.environ.get("SCREANALYTICS_T
 SEED_BOOST_ENABLED = _env_flag("SEED_BOOST_ENABLED", False)
 SEED_BOOST_SCORE_DELTA = float(os.environ.get("SEED_BOOST_SCORE_DELTA", "0.15"))
 SEED_BOOST_MIN_SIM = float(os.environ.get("SEED_BOOST_MIN_SIM", "0.42"))
+SEED_REJECTION_MIN_SIM = float(os.environ.get("SEED_REJECTION_MIN_SIM", "0.42"))
 
 SCENE_DETECTOR_CHOICES = ("pyscenedetect", "internal", "off")
 _RAW_SCENE_DETECTOR = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
@@ -1335,9 +1336,9 @@ def _load_show_seeds(show_id: str) -> List[Dict[str, Any]]:
         facebank_svc = FacebankService(data_root=DATA_ROOT)
         seeds = facebank_svc.get_all_seeds_for_show(show_id)
         return seeds
-        except Exception as exc:
-            LOGGER.debug("Failed to load seeds for show %s: %s", show_id, exc)
-            return []
+    except Exception as exc:
+        LOGGER.debug("Failed to load seeds for show %s: %s", show_id, exc)
+        return []
 
 
 class SeedMatcher:
@@ -3828,9 +3829,11 @@ def detect_scene_cuts_pyscenedetect(
     manager = SceneManager()
     detector = ContentDetector(threshold=float(threshold), min_scene_len=max(int(min_len), 1))
     manager.add_detector(detector)
+    LOGGER.info("[PySceneDetect] Starting scene detection (threshold=%.1f, min_len=%d)", threshold, min_len)
     try:
-        manager.detect_scenes(video, show_progress=False)
+        manager.detect_scenes(video, show_progress=True)
         scenes = manager.get_scene_list()
+        LOGGER.info("[PySceneDetect] Detected %d scene cuts", len(scenes))
     finally:
         close_handle = getattr(video, "close", None)
         if callable(close_handle):  # pragma: no cover - depends on backend
