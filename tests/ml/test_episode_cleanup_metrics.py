@@ -332,7 +332,18 @@ def test_cleanup_report_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         report = json.load(f)
 
     # Validate required top-level fields
-    required_fields = ["actions_completed", "runtime_sec"]
+    required_fields = [
+        "actions_completed",
+        "runtime_sec",
+        "tracks_before",
+        "tracks_after",
+        "faces_before",
+        "faces_after",
+        "clusters_before",
+        "clusters_after",
+        "metrics_before",
+        "metrics_after",
+    ]
     for field in required_fields:
         assert field in report, f"Missing required field: {field}"
 
@@ -340,9 +351,106 @@ def test_cleanup_report_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert isinstance(report["runtime_sec"], (int, float))
     assert report["runtime_sec"] > 0
 
+    # Validate count fields are integers
+    assert isinstance(report["tracks_before"], int)
+    assert isinstance(report["tracks_after"], int)
+    assert isinstance(report["faces_before"], int)
+    assert isinstance(report["faces_after"], int)
+    assert isinstance(report["clusters_before"], int)
+    assert isinstance(report["clusters_after"], int)
+
+    # Validate metrics_before/after are dicts
+    assert isinstance(report["metrics_before"], dict)
+    assert isinstance(report["metrics_after"], dict)
+
+    # Check that key metrics are present (if data exists)
+    if report["tracks_before"] > 0:
+        # Should have before metrics
+        expected_metrics = ["tracks_per_minute", "short_track_fraction", "id_switch_rate"]
+        for metric in expected_metrics:
+            if metric in report["metrics_before"]:
+                assert isinstance(report["metrics_before"][metric], (int, float, type(None)))
+
     print(f"\n✓ Cleanup report schema validated:")
     print(f"  Actions completed: {report['actions_completed']}")
     print(f"  Runtime: {report['runtime_sec']:.1f}s")
+    print(f"  Tracks: {report['tracks_before']} → {report['tracks_after']}")
+    print(f"  Faces: {report['faces_before']} → {report['faces_after']}")
+    print(f"  Clusters: {report['clusters_before']} → {report['clusters_after']}")
+
+
+@pytest.mark.timeout(600)
+def test_cleanup_progress_reporting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that cleanup writes progress with phase tracking."""
+
+    ep_id = "test-cleanup-progress"
+    data_root = _run_full_pipeline(tmp_path, ep_id, monkeypatch)
+
+    manifest_root = data_root / "manifests" / ep_id
+    progress_path = manifest_root / "cleanup_progress.json"
+
+    # Run cleanup with profile
+    video_path = tmp_path / "fixture.mp4"
+    cmd_cleanup = [
+        sys.executable,
+        str(PROJECT_ROOT / "tools" / "episode_cleanup.py"),
+        "--ep-id", ep_id,
+        "--video", str(video_path),
+        "--profile", "balanced",  # Test profile parameter
+        "--device", "cpu",
+        "--embed-device", "cpu",
+        "--out-root", str(data_root),
+        "--actions", "split_tracks", "reembed",  # Two actions for phase tracking
+        "--write-back",
+    ]
+
+    env = os.environ.copy()
+    env["SCREENALYTICS_DATA_ROOT"] = str(data_root)
+
+    result = subprocess.run(
+        cmd_cleanup,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=400,
+    )
+
+    assert result.returncode == 0, f"Cleanup failed: {result.stderr}"
+
+    # Load final progress
+    assert progress_path.exists(), f"Progress file missing at {progress_path}"
+
+    with progress_path.open("r") as f:
+        progress = json.load(f)
+
+    # Validate progress structure
+    required_progress_fields = [
+        "stage",
+        "ep_id",
+        "phase",
+        "phase_index",
+        "phase_total",
+        "phase_progress",
+        "total_elapsed_seconds",
+    ]
+    for field in required_progress_fields:
+        assert field in progress, f"Missing progress field: {field}"
+
+    # Validate values
+    assert progress["stage"] == "episode_cleanup"
+    assert progress["ep_id"] == ep_id
+    assert progress["phase"] in ["split_tracks", "reembed", "recluster", "group_clusters"]
+    assert isinstance(progress["phase_index"], int)
+    assert isinstance(progress["phase_total"], int)
+    assert 0.0 <= progress["phase_progress"] <= 1.0
+    assert progress["total_elapsed_seconds"] > 0
+
+    print(f"\n✓ Progress reporting validated:")
+    print(f"  Final phase: {progress['phase']}")
+    print(f"  Phase {progress['phase_index']}/{progress['phase_total']}")
+    print(f"  Progress: {progress['phase_progress']:.1%}")
+    print(f"  Elapsed: {progress['total_elapsed_seconds']:.1f}s")
 
 
 @pytest.mark.timeout(600)
