@@ -98,31 +98,128 @@ API health check: [http://localhost:8000/health](http://localhost:8000/health) r
 
 ---
 
-## 🔍 Detection & Tracking Artifacts
+## 7️⃣ Hardware Requirements & Performance
 
-### det_v1 (`detections.jsonl`)
-- `ep_id` – episode id.
-- `frame_idx` – zero-based frame number.
-- `ts_s` – timestamp in seconds.
-- `bbox` – `[x1,y1,x2,y2]` normalized (0–1) coordinates.
-- `landmarks` – flattened `[x,y]*5` facial landmarks.
-- `conf` – detector confidence.
-- `model_id`, `schema_version`.
+### CPU vs GPU
 
-### track_v1 (`tracks.jsonl`)
-- `track_id` – deterministic `track-00001` style id.
-- `ep_id` – episode id.
-- `start_s` / `end_s` – timestamps for the track span.
-- `frame_span` – `[start_frame,end_frame]`.
-- `sample_thumbs` – list of thumbnail paths (empty for now).
-- `stats` – `{detections, avg_conf}` summary.
-- `schema_version` – `"track_v1"`.
+**CPU-only (Apple Silicon M1/M2/M3):**
+- ✅ Suitable for development and testing
+- ⚠️ Use `--profile fast_cpu` to avoid thermal throttling
+- Expected runtime: ~10-15 min for 24-minute episode (stride=10)
+- **Avoid:** `--stride 1` + `--save-frames` on fanless laptops
 
-These files are produced by the RetinaFace detection runner and ByteTrack-lite tracker under `FEATURES/detection` and `FEATURES/tracking`.
+**GPU (CUDA):**
+- ✅ Recommended for production and high-accuracy work
+- Use `--profile high_accuracy --device cuda`
+- Expected runtime: ~3-5 min for 24-minute episode (stride=1)
+
+### Performance Profiles
+
+See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for full details. Quick reference:
+
+```bash
+# Fanless devices (MacBook Air, low-power)
+python tools/episode_run.py --ep-id demo --video test.mp4 --profile fast_cpu
+
+# Standard local dev (balanced recall/speed)
+python tools/episode_run.py --ep-id demo --video test.mp4 --profile balanced
+
+# GPU production (maximum accuracy)
+python tools/episode_run.py --ep-id demo --video test.mp4 --profile high_accuracy --device cuda
+```
+
+**For detailed performance tuning**, see:
+- [docs/ops/performance_tuning_faces_pipeline.md](docs/ops/performance_tuning_faces_pipeline.md)
+- [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md)
 
 ---
 
-## 7️⃣ Agents & automation
+## 8️⃣ Artifact Pipeline
+
+The faces pipeline produces a chain of artifacts that link together via `ep_id`, `track_id`, and `identity_id`:
+
+```
+detect/track → faces_embed → cluster → cleanup
+```
+
+### Pipeline Stages & Outputs
+
+**Stage 1: Detection & Tracking**
+- `data/detections/{ep_id}/detections.jsonl` – Raw face detections per frame
+- `data/tracks/{ep_id}/tracks.jsonl` – Temporal face tracks with metadata
+- `data/tracks/{ep_id}/track_metrics.json` – Derived metrics (tracks_per_minute, short_track_fraction, etc.)
+
+**Stage 2: Face Embedding & Sampling**
+- `data/faces/{ep_id}/faces.jsonl` – Quality-gated face crops with embeddings
+- `data/faces/{ep_id}/faces.npy` – Face embeddings as NumPy array
+- `data/embeds/{ep_id}/tracks.npy` – Track-level pooled embeddings (used for clustering)
+
+**Stage 3: Clustering**
+- `data/identities/{ep_id}/identities.json` – Cluster assignments mapping `track_id` → `identity_id`
+- Includes cluster metrics: `singleton_fraction`, `largest_cluster_fraction`, `cluster_count`
+
+**Stage 4: Cleanup (Optional)**
+- `data/cleanup/{ep_id}/cleanup_report.json` – Before/after metrics from outlier removal
+- Cleaned versions of `tracks.jsonl`, `faces.jsonl`, `identities.json`
+
+### Artifact Relationships
+
+```
+detections.jsonl
+  ↓ (grouped by track_id)
+tracks.jsonl ──────────────┐
+  ↓ (quality gating)        │ track_id links
+faces.jsonl ───────────────┤
+  ↓ (pooling)               │
+tracks.npy ────────────────┤
+  ↓ (clustering)            │
+identities.json ───────────┘
+  (track_id → identity_id mapping)
+```
+
+**Key Fields:**
+- `ep_id` – Links all artifacts for a single episode
+- `track_id` – Unique ID for a face track (e.g., `track-00001`)
+- `identity_id` – Cluster assignment (e.g., `identity-00001`)
+- `frame_idx` – Zero-based frame number in source video
+- `ts_s` – Timestamp in seconds
+
+### Schema Documentation
+
+For complete schema definitions and field descriptions, see:
+- [docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md)
+- [docs/reference/schemas/identities_v1_spec.md](docs/reference/schemas/identities_v1_spec.md)
+
+---
+
+## 9️⃣ Documentation Index
+
+All comprehensive documentation from Phase 1:
+
+**Pipeline Overview:**
+- [docs/pipeline/overview.md](docs/pipeline/overview.md) – End-to-end pipeline architecture
+- [docs/pipeline/detect_track_stage.md](docs/pipeline/detect_track_stage.md) – Detection & tracking details
+- [docs/pipeline/faces_embed_stage.md](docs/pipeline/faces_embed_stage.md) – Face sampling & embedding
+- [docs/pipeline/clustering_stage.md](docs/pipeline/clustering_stage.md) – Identity clustering
+- [docs/pipeline/cleanup_stage.md](docs/pipeline/cleanup_stage.md) – Outlier removal & post-processing
+
+**Configuration & Tuning:**
+- [CONFIG_GUIDE.md](CONFIG_GUIDE.md) – Quick config reference
+- [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md) – All config parameters
+- [docs/ops/performance_tuning_faces_pipeline.md](docs/ops/performance_tuning_faces_pipeline.md) – Speed vs accuracy tuning
+
+**Schemas & Metrics:**
+- [docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md) – All artifact schemas
+- [docs/reference/metrics/derived_metrics.md](docs/reference/metrics/derived_metrics.md) – Calculated metrics & guardrails
+- [docs/reference/metrics/acceptance_matrix.md](docs/reference/metrics/acceptance_matrix.md) – Quality thresholds
+
+**Operations:**
+- [docs/ops/monitoring_logging_faces_pipeline.md](docs/ops/monitoring_logging_faces_pipeline.md) – Logging & debugging
+- [docs/ops/episode_cleanup.md](docs/ops/episode_cleanup.md) – Cleanup workflow
+
+---
+
+## 🔟 Agents & automation
 * Codex config: `config/codex.config.toml`
 * Claude policy: `config/claude.policies.yaml`
 * Agents auto-update docs (README, PRD, SolutionArchitecture, DirectoryStructure) when files change.
@@ -134,7 +231,7 @@ codex exec --config config/codex.config.toml --task agents/tasks/aggregate-scree
 
 ---
 
-## 8️⃣ Promotion workflow
+## 1️⃣1️⃣ Promotion workflow
 1. Create feature via `python tools/new-feature.py <name>`
 2. Work inside `FEATURES/<name>/`
 3. Pass CI (tests + docs)
@@ -143,7 +240,7 @@ codex exec --config config/codex.config.toml --task agents/tasks/aggregate-scree
 
 ---
 
-## 9️⃣ Troubleshooting
+## 1️⃣2️⃣ Troubleshooting
 | Symptom | Fix |
 | --------------------- | ------------------------------------------------ |
 | `ModuleNotFoundError` | Activate `.venv` |

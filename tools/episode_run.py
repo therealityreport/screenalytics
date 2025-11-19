@@ -5209,11 +5209,38 @@ def _run_detect_track_stage(
             summary["tracker_config"] = tracker_config_summary
         scene_summary = scene_summary or {"count": 0}
         metrics_path = manifests_dir / "track_metrics.json"
+
+        # Include crop statistics from frame exporter
+        crop_stats = _crop_diag_meta(frame_exporter)
+        if crop_stats:
+            # Calculate crop quality metrics
+            total_crops = crop_stats.get("crop_attempts", 0)
+            crop_errors = crop_stats.get("crop_errors", {})
+
+            # Count blank/gray crops (near_uniform_gray + tiny_file)
+            blank_crops = crop_errors.get("near_uniform_gray", 0) + crop_errors.get("tiny_file", 0)
+            blank_fraction = round(blank_crops / max(total_crops, 1), 4) if total_crops > 0 else 0.0
+
+            crop_stats["blank_crops"] = blank_crops
+            crop_stats["blank_fraction"] = blank_fraction
+
+            # Warn if blank fraction exceeds 10%
+            if blank_fraction > 0.10 and total_crops > 0:
+                LOGGER.warning(
+                    "High blank crop rate for %s: %d/%d (%.1f%%) crops were blank or near-uniform. "
+                    "Consider reviewing quality gating thresholds or source video quality.",
+                    args.ep_id,
+                    blank_crops,
+                    total_crops,
+                    blank_fraction * 100,
+                )
+
         metrics_payload = {
             "ep_id": args.ep_id,
             "generated_at": _utcnow_iso(),
             "metrics": track_metrics,
             "scene_cuts": scene_summary,
+            "crop_stats": crop_stats if crop_stats else None,
         }
         try:
             metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
@@ -6364,6 +6391,27 @@ def _run_cluster_stage(
             "identities": identity_payload,
         }
         identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        # Update track_metrics.json with cluster metrics
+        metrics_path = manifests_dir / "track_metrics.json"
+        if metrics_path.exists():
+            try:
+                metrics_data = json.loads(metrics_path.read_text(encoding="utf-8"))
+                # Add cluster metrics to existing metrics
+                metrics_data["cluster_metrics"] = {
+                    "singleton_count": singleton_count,
+                    "singleton_fraction": round(singleton_fraction, 3),
+                    "largest_cluster_size": largest_cluster_size,
+                    "largest_cluster_fraction": round(largest_cluster_fraction, 3),
+                    "total_clusters": total_clusters,
+                    "total_tracks": total_tracks,
+                    "outlier_tracks": len(outlier_tracks),
+                    "low_cohesion_identities": low_cohesion_count,
+                }
+                metrics_path.write_text(json.dumps(metrics_data, indent=2), encoding="utf-8")
+                LOGGER.info("Updated track_metrics.json with cluster metrics")
+            except Exception as exc:
+                LOGGER.warning("Failed to update track_metrics.json with cluster metrics: %s", exc)
 
         # Generate track representatives and cluster centroids
         try:

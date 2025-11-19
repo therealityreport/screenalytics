@@ -44,15 +44,37 @@ Screenalytics delivers automated face, voice, and screen-time intelligence for u
 ---
 
 ## 14. Acceptance Criteria
-- ✅ All stages produce valid artifacts (validated schema + checksum).
-- ✅ Unit + integration tests pass (coverage > 85 %).
-- ✅ Configs documented in `CONFIG_GUIDE.md`.
-- ✅ One-hour validation episode processed ≤ 10 min GPU.
-- ✅ Exported `screen_time.csv` verified against manual benchmark (± 5 %).
-- ✅ Matching row in `ACCEPTANCE_MATRIX.md` marked Accepted for the promoted module.
-- ✅ Docs + tests + config + promotion checklist complete.
 
-See `ACCEPTANCE_MATRIX.md` for the detailed acceptance checklist.
+All acceptance criteria are **defined and enforced** in [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md). High-level requirements:
+
+### Pipeline Metrics (see ACCEPTANCE_MATRIX.md for full thresholds)
+
+**Detection & Tracking:**
+- tracks_per_minute: 10–30 (CPU/GPU)
+- short_track_fraction: < 0.20 (CPU), < 0.15 (GPU)
+- id_switch_rate: < 0.05 (CPU), < 0.03 (GPU)
+- Runtime: ≤ 10 min GPU for 1hr episode
+
+**Face Embedding:**
+- faces_per_track_avg: 20–50
+- quality_mean: ≥ 0.75
+- rejection_rate: < 0.30
+- Runtime: ≤ 30 sec GPU for 1hr episode
+
+**Clustering:**
+- singleton_fraction: < 0.30
+- largest_cluster_fraction: < 0.40
+- num_clusters: 5–15 (typical TV episode)
+- Runtime: ≤ 10 sec for 1hr episode
+
+### Quality Gates
+- ✅ All artifacts validate against schemas ([docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md))
+- ✅ Integration tests pass with metric assertions ([ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) section 3)
+- ✅ All configs documented ([CONFIG_GUIDE.md](CONFIG_GUIDE.md))
+- ✅ Performance profiles verified on CPU and GPU
+- ✅ Guardrails trigger warnings when metrics exceed thresholds
+
+**For complete acceptance criteria, thresholds, and verification methods**, see [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md).
 
 ---
 
@@ -66,11 +88,35 @@ See `ACCEPTANCE_MATRIX.md` for the detailed acceptance checklist.
 ---
 
 ## 16. References
-- `SOLUTION_ARCHITECTURE.md` — system diagram
-- `DIRECTORY_STRUCTURE.md` — repo layout
-- `CONFIG_GUIDE.md` — configuration reference
-- `ACCEPTANCE_MATRIX.md` — QA checklist
-- `FEATURES_GUIDE.md` — promotion policy
+
+### Top-Level Documentation
+- [README.md](README.md) — Project overview and quick start
+- [SETUP.md](SETUP.md) — Installation, artifact pipeline, hardware requirements
+- [CONFIG_GUIDE.md](CONFIG_GUIDE.md) — Configuration quick reference
+- [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) — QA checklist with metrics & thresholds
+- [SOLUTION_ARCHITECTURE.md](SOLUTION_ARCHITECTURE.md) — System architecture diagram
+- [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md) — Repository layout
+- [FEATURES_GUIDE.md](FEATURES_GUIDE.md) — Feature promotion policy
+
+### Pipeline Documentation
+- [docs/pipeline/overview.md](docs/pipeline/overview.md) — End-to-end pipeline architecture
+- [docs/pipeline/detect_track_stage.md](docs/pipeline/detect_track_stage.md) — Detection & tracking
+- [docs/pipeline/faces_embed_stage.md](docs/pipeline/faces_embed_stage.md) — Face sampling & embedding
+- [docs/pipeline/clustering_stage.md](docs/pipeline/clustering_stage.md) — Identity clustering
+- [docs/pipeline/cleanup_stage.md](docs/pipeline/cleanup_stage.md) — Outlier removal & post-processing
+
+### Configuration & Tuning
+- [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md) — Complete config parameters
+- [docs/ops/performance_tuning_faces_pipeline.md](docs/ops/performance_tuning_faces_pipeline.md) — Speed vs accuracy tuning
+- [docs/ops/monitoring_logging_faces_pipeline.md](docs/ops/monitoring_logging_faces_pipeline.md) — Logging & debugging
+
+### Schemas & Metrics
+- [docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md) — All artifact schemas
+- [docs/reference/schemas/identities_v1_spec.md](docs/reference/schemas/identities_v1_spec.md) — Identity cluster schema
+- [docs/reference/metrics/derived_metrics.md](docs/reference/metrics/derived_metrics.md) — Calculated metrics & guardrails
+
+### Operations
+- [docs/ops/episode_cleanup.md](docs/ops/episode_cleanup.md) — Cleanup workflow and configuration
 
 ---
 
