@@ -66,6 +66,83 @@ def _resolved_device_label(label: str | None) -> str:
     return normalized
 
 
+def _detect_setting_key(ep_id: str, field: str) -> str:
+    return f"episode_detail_detect::{ep_id}::{field}"
+
+
+def _job_activity_key(ep_id: str) -> str:
+    return f"{ep_id}::job_active"
+
+
+def _detect_job_state_key(ep_id: str) -> str:
+    return f"{ep_id}::detect_job_running"
+
+
+def _set_job_active(ep_id: str, active: bool) -> None:
+    st.session_state[_job_activity_key(ep_id)] = bool(active)
+
+
+def _job_active(ep_id: str) -> bool:
+    return bool(st.session_state.get(_job_activity_key(ep_id), False))
+
+
+def _status_cache_key(ep_id: str) -> str:
+    return f"{ep_id}::status_payload"
+
+
+def _status_timestamp_key(ep_id: str) -> str:
+    return f"{ep_id}::status_fetched_at"
+
+
+def _status_fetch_token_key(ep_id: str) -> str:
+    return f"{ep_id}::status_fetch_token"
+
+
+def _status_force_refresh_key(ep_id: str) -> str:
+    return f"{ep_id}::status_force_refresh"
+
+
+def _refresh_click_key(ep_id: str) -> str:
+    return f"{ep_id}::status_refresh_clicked_at"
+
+
+def _trigger_safe_detect_rerun(ep_id: str, message: str) -> None:
+    st.session_state["episode_detail_detector_override"] = helpers.DEFAULT_DETECTOR
+    st.session_state["episode_detail_tracker_override"] = helpers.DEFAULT_TRACKER
+    st.session_state["episode_detail_device_override"] = helpers.DEFAULT_DEVICE
+    st.session_state["episode_detail_detect_autorun_flag"] = True
+    st.session_state["episode_detail_flash"] = message
+    st.rerun()
+
+
+def _render_device_summary(requested: str | None, resolved: str | None) -> None:
+    req_label = helpers.device_label_from_value(requested) if requested else None
+    resolved_label = helpers.device_label_from_value(resolved or requested)
+    if not (req_label or resolved_label):
+        return
+    if req_label and resolved_label and req_label != resolved_label:
+        caption = f"Device: requested {req_label} → resolved {resolved_label}"
+        if req_label in {"CUDA", "CoreML", "MPS"} and resolved_label == "CPU":
+            st.caption(f"⚠️ {caption}")
+        else:
+            st.caption(caption)
+    else:
+        st.caption(f"Device: {resolved_label or req_label}")
+
+
+def _estimate_runtime_seconds(frames: int, device_value: str) -> float:
+    per_device = {
+        "cpu": 45.0,
+        "cuda": 110.0,
+        "coreml": 90.0,
+        "mps": 70.0,
+    }
+    rate = per_device.get((device_value or "cpu").lower(), 40.0)
+    if frames <= 0 or rate <= 0:
+        return 0.0
+    return frames / rate
+
+
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_count_manifest_rows(path_str: str, mtime: float) -> int | None:
@@ -389,6 +466,9 @@ def _launch_detect_job(
     mode_label: str,
     device_label: str,
     running_state_key: str | None = None,
+    *,
+    active_job_key: str | None = None,
+    detect_flag_key: str | None = None,
 ):
     current_local = local_exists
     if not current_local:
@@ -397,6 +477,10 @@ def _launch_detect_job(
         current_local = True
     if running_state_key:
         st.session_state[running_state_key] = True
+    if active_job_key:
+        st.session_state[active_job_key] = True
+    if detect_flag_key:
+        st.session_state[detect_flag_key] = True
     try:
         with st.spinner(f"Running detect/track ({mode_label} on {device_label})…"):
             summary, error_message = helpers.run_job_with_progress(
@@ -411,6 +495,10 @@ def _launch_detect_job(
     finally:
         if running_state_key:
             st.session_state[running_state_key] = False
+        if active_job_key:
+            st.session_state[active_job_key] = False
+        if detect_flag_key:
+            st.session_state[detect_flag_key] = False
     return current_local, summary, error_message
 
 
@@ -426,6 +514,11 @@ ep_id = canonical_ep_id
 running_job_key = f"{ep_id}::pipeline_job_running"
 if running_job_key not in st.session_state:
     st.session_state[running_job_key] = False
+detect_running_key = _detect_job_state_key(ep_id)
+if detect_running_key not in st.session_state:
+    st.session_state[detect_running_key] = False
+if _job_activity_key(ep_id) not in st.session_state:
+    st.session_state[_job_activity_key(ep_id)] = False
 job_running = bool(st.session_state.get(running_job_key))
 
 # Cache API responses with 10s TTL to reduce repeated requests
@@ -442,7 +535,22 @@ except requests.RequestException as exc:
     st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
     st.stop()
 
-status_payload = _cached_episode_status(ep_id, cache_key)
+status_cache_key = _status_cache_key(ep_id)
+status_ts_key = _status_timestamp_key(ep_id)
+fetch_token_key = _status_fetch_token_key(ep_id)
+force_refresh_key = _status_force_refresh_key(ep_id)
+force_refresh = bool(st.session_state.pop(force_refresh_key, False))
+fetch_token = st.session_state.get(fetch_token_key, 0)
+status_payload = st.session_state.get(status_cache_key)
+should_refresh_status = force_refresh or _job_active(ep_id) or status_payload is None
+if should_refresh_status:
+    fetch_token += 1
+    st.session_state[fetch_token_key] = fetch_token
+    status_payload = _cached_episode_status(ep_id, fetch_token)
+    st.session_state[status_cache_key] = status_payload
+    st.session_state[status_ts_key] = time.time()
+status_refreshed_at = st.session_state.get(status_ts_key)
+
 if status_payload is None:
     detect_phase_status: Dict[str, Any] = {}
     faces_phase_status: Dict[str, Any] = {"status": "unknown"}
@@ -508,6 +616,16 @@ detect_status_value, tracks_ready, using_manifest_fallback = _compute_detect_tra
     tracks_ready_flag=tracks_ready_flag,
     job_state=detect_job_state,
 )
+status_running = (
+    detect_status_value == "running"
+    or faces_status_value == "running"
+    or cluster_status_value == "running"
+    or str(detect_job_state or "").lower() == "running"
+)
+if status_running:
+    _set_job_active(ep_id, True)
+elif not job_running:
+    _set_job_active(ep_id, False)
 
 # Other status values
 faces_count_value = helpers.coerce_int(faces_phase_status.get("faces"))
@@ -534,8 +652,19 @@ if status_payload:
         st.subheader("Pipeline Status")
     with header_cols[1]:
         if st.button("Refresh status", key="episode_status_refresh", use_container_width=True):
-            st.rerun()
-    st.caption(f"Status refreshed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            now = time.time()
+            last_click = float(st.session_state.get(_refresh_click_key(ep_id), 0.0))
+            if now - last_click < 1.0:
+                st.caption("Please wait ≥1s between refreshes.")
+            else:
+                st.session_state[_refresh_click_key(ep_id)] = now
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.rerun()
+    if status_refreshed_at:
+        refreshed_label = datetime.utcfromtimestamp(status_refreshed_at).strftime("%Y-%m-%d %H:%M:%S UTC")
+        st.caption(f"Status refreshed at {refreshed_label}")
+    else:
+        st.caption("Status will refresh when a job starts or you press refresh.")
     coreml_available = status_payload.get("coreml_available")
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
@@ -563,6 +692,15 @@ if status_payload:
         new_track_state = helpers.coerce_float(detect_phase_status.get("new_track_thresh"))
         if new_track_state is not None:
             detect_params.append(f"new_track={new_track_state:.2f}")
+        save_frames_state = detect_phase_status.get("save_frames")
+        if save_frames_state is not None:
+            detect_params.append(f"save_frames={'on' if save_frames_state else 'off'}")
+        save_crops_state = detect_phase_status.get("save_crops")
+        if save_crops_state is not None:
+            detect_params.append(f"save_crops={'on' if save_crops_state else 'off'}")
+        jpeg_state = helpers.coerce_int(detect_phase_status.get("jpeg_quality"))
+        if jpeg_state:
+            detect_params.append(f"jpeg={jpeg_state}")
         device_state = detect_phase_status.get("device")
         requested_device_state = detect_phase_status.get("requested_device")
         resolved_device_state = detect_phase_status.get("resolved_device")
@@ -610,9 +748,9 @@ if status_payload:
                 st.caption(detect_phase_status["error"])
         if detect_params:
             st.caption("Params: " + ", ".join(detect_params))
-        provider_label = helpers.device_label_from_value(resolved_device_state or device_state)
-        if provider_label:
-            st.caption(f"Provider: {provider_label}")
+        if jpeg_state:
+            st.caption(f"JPEG quality: {jpeg_state}")
+        _render_device_summary(requested_device_state, resolved_device_state or device_state)
         finished = _format_timestamp(detect_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
@@ -657,9 +795,7 @@ if status_payload:
             st.caption("Complete detect/track first.")
         if faces_params:
             st.caption("Params: " + ", ".join(faces_params))
-        faces_provider_label = helpers.device_label_from_value(faces_resolved_state or faces_device_state)
-        if faces_provider_label:
-            st.caption(f"Provider: {faces_provider_label}")
+        _render_device_summary(faces_device_request, faces_resolved_state or faces_device_state)
         finished = _format_timestamp(faces_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
@@ -699,9 +835,7 @@ if status_payload:
             st.caption("Complete faces harvest first.")
         if cluster_params:
             st.caption("Params: " + ", ".join(cluster_params))
-        cluster_provider_label = helpers.device_label_from_value(cluster_resolved_state or cluster_device_state)
-        if cluster_provider_label:
-            st.caption(f"Provider: {cluster_provider_label}")
+        _render_device_summary(cluster_device_request, cluster_resolved_state or cluster_device_state)
         finished = _format_timestamp(cluster_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
@@ -785,7 +919,10 @@ if min_cluster_size_default is None:
 
 col_hydrate, col_detect = st.columns(2)
 with col_hydrate:
-    if st.button("Mirror from S3", use_container_width=True):
+    detect_inflight = bool(st.session_state.get(detect_running_key))
+    mirror_disabled = detect_inflight or job_running
+    mirror_help = "Detect/Track automatically mirrors before running." if detect_inflight else None
+    if st.button("Mirror from S3", use_container_width=True, disabled=mirror_disabled, help=mirror_help):
         mirror_path = f"/episodes/{ep_id}/mirror"
         try:
             resp = helpers.api_post(mirror_path)
@@ -796,8 +933,11 @@ with col_hydrate:
                 f"Mirrored → {helpers.link_local(resp['local_video_path'])} | size {helpers.human_size(resp.get('bytes'))}"
             )
             st.rerun()
+    if detect_inflight:
+        st.caption("Detect/Track is mirroring required artifacts automatically…")
 with col_detect:
     st.markdown("### Detect/Track Faces")
+    session_prefix = f"episode_detail_detect::{ep_id}"
 
     stride_default = int(detect_job_defaults.get("stride") or helpers.DEFAULT_STRIDE)
     # Prefill FPS from video metadata if available
@@ -817,30 +957,65 @@ with col_detect:
     scene_min_len_default = int(detect_job_defaults.get("scene_min_len") or helpers.SCENE_MIN_LEN_DEFAULT)
     scene_warmup_default = int(detect_job_defaults.get("scene_warmup_dets") or helpers.SCENE_WARMUP_DETS_DEFAULT)
 
-    stride_value = st.number_input("Stride", min_value=1, max_value=50, value=stride_default, step=1)
+    stride_field = _detect_setting_key(ep_id, "stride")
+    if stride_field not in st.session_state:
+        st.session_state[stride_field] = int(stride_default)
+    stride_value = st.number_input(
+        "Stride",
+        min_value=1,
+        max_value=50,
+        value=int(st.session_state[stride_field]),
+        step=1,
+        key=stride_field,
+    )
     st.caption(
         "Stride 4 (sampling every fourth frame) is the standard baseline for 42-minute episodes; "
         "lower values tighten QA, higher values accelerate longer cuts."
     )
-    fps_value = st.number_input("FPS", min_value=0.0, max_value=120.0, value=fps_default, step=1.0)
+    fps_field = _detect_setting_key(ep_id, "fps")
+    if fps_field not in st.session_state:
+        st.session_state[fps_field] = float(fps_default)
+    fps_value = st.number_input(
+        "FPS",
+        min_value=0.0,
+        max_value=120.0,
+        value=float(st.session_state[fps_field]),
+        step=1.0,
+        key=fps_field,
+    )
     st.caption("Frames per second extracted from source video. Lower FPS reduces processing time and storage.")
     # Automatically save to S3
+    save_frames_key = _detect_setting_key(ep_id, "save_frames")
+    if save_frames_key not in st.session_state:
+        st.session_state[save_frames_key] = bool(save_frames_default)
     save_frames = st.checkbox(
         "Save sampled frames",
-        value=bool(save_frames_default),
+        value=bool(st.session_state[save_frames_key]),
         help="Stores sampled RGB frames alongside detections for QA and future crops.",
-        key="detect_save_frames",
+        key=save_frames_key,
     )
+    save_crops_key = _detect_setting_key(ep_id, "save_crops")
+    if save_crops_key not in st.session_state:
+        st.session_state[save_crops_key] = bool(save_crops_default)
     save_crops = st.checkbox(
         "Save crops",
-        value=bool(save_crops_default),
+        value=bool(st.session_state[save_crops_key]),
         help="Exports aligned face crops during detect/track. Disable when reusing previous crops.",
-        key="detect_save_crops",
+        key=save_crops_key,
     )
-    jpeg_quality = st.number_input("JPEG quality", min_value=50, max_value=100, value=jpeg_quality_default, step=5)
+    jpeg_key = _detect_setting_key(ep_id, "jpeg_quality")
+    if jpeg_key not in st.session_state:
+        st.session_state[jpeg_key] = int(jpeg_quality_default)
+    jpeg_quality = st.number_input(
+        "JPEG quality",
+        min_value=50,
+        max_value=100,
+        value=int(st.session_state[jpeg_key]),
+        step=5,
+        key=jpeg_key,
+    )
     st.caption("Compression quality for saved face thumbnails and frame images. Higher = better quality, larger files.")
 
-    session_prefix = f"episode_detail_detect::{ep_id}"
     max_gap_key = f"{session_prefix}::max_gap"
     max_gap_seed = int(st.session_state.get(max_gap_key, max_gap_default))
     max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=max_gap_seed, step=1)
@@ -964,7 +1139,18 @@ with col_detect:
         track_high_value = None
         track_new_value = None
 
-    sampled_frames_est = _estimated_sampled_frames(video_meta, stride_value)
+    sampled_frames_est = _estimated_sampled_frames(video_meta, int(stride_value))
+    if sampled_frames_est:
+        est_seconds = _estimate_runtime_seconds(sampled_frames_est, detect_device_value)
+        if est_seconds > 0:
+            runtime_minutes = est_seconds / 60.0
+            st.caption(
+                f"≈{sampled_frames_est:,} frames scheduled; rough runtime ~{runtime_minutes:.1f} min on {detect_device_label}."
+            )
+            if sampled_frames_est > 200_000 and detect_device_value == "cpu":
+                st.warning(
+                    "High load: consider increasing stride or lowering FPS when running on CPU to avoid stalls."
+                )
     if save_frames and sampled_frames_est:
         quality_factor = max(min(jpeg_quality / 85.0, 2.0), 0.5)
         est_frame_bytes = int(sampled_frames_est * FRAME_JPEG_SIZE_EST_BYTES * quality_factor)
@@ -1092,13 +1278,32 @@ with col_detect:
             mode_label,
             detect_device_label,
             running_state_key=running_job_key,
+            active_job_key=_job_activity_key(ep_id),
+            detect_flag_key=detect_running_key,
         )
         _process_detect_result(summary, error_message)
 
     if not local_video_exists:
         st.info("Local mirror missing; Detect/Track will mirror automatically before starting.")
 
-    run_label = "Run detect/track"
+    # Display total frames from video metadata
+    total_frames = None
+    if video_meta:
+        frames_val = video_meta.get("frames")
+        fps_detected = video_meta.get("fps_detected")
+        duration_sec = video_meta.get("duration_sec")
+        try:
+            if frames_val is not None:
+                total_frames = int(frames_val)
+            elif duration_sec and fps_detected:
+                total_frames = int(float(duration_sec) * float(fps_detected))
+        except (TypeError, ValueError):
+            pass
+
+    if total_frames:
+        st.markdown(f"**Total Frames:** {total_frames:,}")
+
+    run_label = "Detect/Track (auto-mirrors from S3)"
     detect_button_disabled = job_running or detect_status_value == "running"
     if st.button(run_label, use_container_width=True, disabled=detect_button_disabled):
         local_video_exists, summary, error_message = _launch_detect_job(
@@ -1112,12 +1317,19 @@ with col_detect:
             mode_label,
             detect_device_label,
             running_state_key=running_job_key,
+            active_job_key=_job_activity_key(ep_id),
+            detect_flag_key=detect_running_key,
         )
         _process_detect_result(summary, error_message)
+    st.caption("Mirrors required video artifacts automatically before detect/track starts.")
 
 faces_ready = faces_ready_state
 detector_manifest_value = helpers.tracks_detector_value(ep_id)
+tracker_manifest_value = helpers.tracks_tracker_value(ep_id)
 detector_face_only = helpers.detector_is_face_only(ep_id, detect_phase_status)
+combo_detector, combo_tracker = helpers.detect_tracker_combo(ep_id, detect_phase_status)
+combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_detector, combo_tracker)
+combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
 col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
     st.markdown("### Faces Harvest")
@@ -1227,6 +1439,8 @@ with col_faces:
                 mode_label,
                 detect_device_label,
                 running_state_key=running_job_key,
+                active_job_key=_job_activity_key(ep_id),
+                detect_flag_key=detect_running_key,
             )
             _process_detect_result(summary, error_message)
     elif faces_status_value == "running":
@@ -1249,14 +1463,28 @@ with col_faces:
             use_container_width=True,
             disabled=job_running,
         ):
-            st.session_state["episode_detail_detector_override"] = helpers.DEFAULT_DETECTOR
-            st.session_state["episode_detail_tracker_override"] = helpers.DEFAULT_TRACKER
-            st.session_state["episode_detail_device_override"] = helpers.DEFAULT_DEVICE
-            st.session_state["episode_detail_detect_autorun_flag"] = True
-            st.session_state["episode_detail_flash"] = "Starting Detect/Track with RetinaFace + ByteTrack…"
-            st.rerun()
+            _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
+    elif not combo_supported_harvest:
+        current_combo = f"{helpers.detector_label_from_value(combo_detector)} + {helpers.tracker_label_from_value(combo_tracker)}"
+        st.error(
+            f"Harvest requires RetinaFace + ByteTrack tracks. Last detect run used **{current_combo}**. "
+            "Fix the detector/tracker combo and rerun detect/track."
+        )
+        if st.button(
+            "Fix + rerun detect",
+            key="faces_fix_combo",
+            use_container_width=True,
+            disabled=job_running,
+        ):
+            _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
 
-    faces_disabled = (not tracks_ready) or (not detector_face_only) or job_running or faces_status_value == "running"
+    faces_disabled = (
+        (not tracks_ready)
+        or (not detector_face_only)
+        or job_running
+        or faces_status_value == "running"
+        or (not combo_supported_harvest)
+    )
     if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
         can_run_faces = True
         if not local_video_exists:
@@ -1273,6 +1501,7 @@ with col_faces:
                 "thumb_size": int(faces_thumb_size),
             }
             st.session_state[running_job_key] = True
+            _set_job_active(ep_id, True)
             try:
                 with st.spinner("Running faces harvest…"):
                     summary, error_message = helpers.run_job_with_progress(
@@ -1286,6 +1515,7 @@ with col_faces:
                     )
             finally:
                 st.session_state[running_job_key] = False
+                _set_job_active(ep_id, False)
             if error_message:
                 if "tracks.jsonl" in error_message.lower():
                     st.error("Run detect/track first.")
@@ -1352,6 +1582,8 @@ with col_cluster:
                 mode_label,
                 detect_device_label,
                 running_state_key=running_job_key,
+                active_job_key=_job_activity_key(ep_id),
+                detect_flag_key=detect_running_key,
             )
             _process_detect_result(summary, error_message)
 
@@ -1374,8 +1606,28 @@ with col_cluster:
             st.caption("Run faces harvest first.")
     elif not detector_face_only:
         st.warning("Current tracks were generated with a legacy detector. Rerun detect/track first.")
+    elif not combo_supported_cluster:
+        combo_label = f"{helpers.detector_label_from_value(combo_detector)} + {helpers.tracker_label_from_value(combo_tracker)}"
+        st.error(
+            f"Cluster requires RetinaFace + ByteTrack tracks. Last detect run used **{combo_label}**. "
+            "Rerun detect/track with the supported combo before clustering."
+        )
+        if st.button(
+            "Fix + rerun detect",
+            key="cluster_fix_combo",
+            use_container_width=True,
+            disabled=job_running,
+        ):
+            _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
 
-    cluster_disabled = (not faces_ready) or (not detector_face_only) or (not tracks_ready) or job_running or zero_faces_success
+    cluster_disabled = (
+        (not faces_ready)
+        or (not detector_face_only)
+        or (not tracks_ready)
+        or job_running
+        or zero_faces_success
+        or (not combo_supported_cluster)
+    )
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True
         if not local_video_exists:
@@ -1399,6 +1651,7 @@ with col_cluster:
                 "min_cluster_size": int(min_cluster_size_value),
             }
             st.session_state[running_job_key] = True
+            _set_job_active(ep_id, True)
             try:
                 with st.spinner("Clustering faces…"):
                     summary, error_message = helpers.run_job_with_progress(
@@ -1412,6 +1665,7 @@ with col_cluster:
                     )
             finally:
                 st.session_state[running_job_key] = False
+                _set_job_active(ep_id, False)
             if error_message:
                 if "faces.jsonl" in error_message.lower():
                     st.error("Run faces harvest first.")
