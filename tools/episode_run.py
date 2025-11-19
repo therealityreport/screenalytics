@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import logging
 
+import queue
+import threading
 # Add project root to path for imports BEFORE applying CPU limits
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -942,6 +944,7 @@ class TrackAccumulator:
     last_frame_idx: int = -1
     frame_count: int = 0
     samples: List[dict] = field(default_factory=list)
+    gate_embedding: List[float] | None = None  # G3: Store gate embedding
 
     def add(
         self,
@@ -985,6 +988,9 @@ class TrackAccumulator:
             row["last_frame_idx"] = int(self.last_frame_idx)
         if self.samples:
             row["bboxes_sampled"] = self.samples
+        # G3: Include gate embedding if available
+        if self.gate_embedding:
+            row["gate_embedding"] = self.gate_embedding
         return row
 
 
@@ -1075,17 +1081,48 @@ class AppearanceGate:
             if tracker_id not in active_ids:
                 self._states.pop(tracker_id, None)
 
-    def should_extract_embedding(self, tracker_id: int) -> bool:
-        """Check if we should extract embeddings for this track on this frame."""
-        state = self._states.get(tracker_id)
-        if state is None:
-            # New track, always extract first embedding
-            return True
-        if state.proto is None:
-            # No prototype yet, need embedding
-            return True
-        # Throttle: only extract every N frames per track
-        return state.frames_since_embed >= self.embed_throttle_interval
+    def should_extract_embedding(
+        self,
+        tracker_id: int,
+        crop: np.ndarray | None,
+        frame_idx: int,
+    ) -> tuple[bool, np.ndarray | None]:
+        """Decide whether to extract an embedding based on crop deltas + frame gap."""
+        if crop is None or crop.size == 0:
+            return False, None
+        state = self._states.setdefault(tracker_id, GateTrackState())
+        signature = _compute_crop_signature(crop)
+        if signature is None:
+            return False, None
+        if state.last_embed_frame_idx >= 0:
+            frame_gap = frame_idx - state.last_embed_frame_idx
+            if frame_gap < self.embed_throttle_interval and not _signature_changed(
+                state.last_crop_signature,
+                signature,
+                self.embed_change_threshold,
+            ):
+                return False, None
+        if state.last_crop_signature is not None and not _signature_changed(
+            state.last_crop_signature,
+            signature,
+            self.embed_change_threshold,
+        ):
+            # Crop hasn't changed materially; skip redundant embedding
+            return False, None
+        return True, signature
+
+    def note_embedding_extracted(
+        self,
+        tracker_id: int,
+        frame_idx: int,
+        signature: np.ndarray | None,
+        success: bool,
+    ) -> None:
+        """Record the crop fingerprint for the last successful embedding."""
+        state = self._states.setdefault(tracker_id, GateTrackState())
+        if success and signature is not None:
+            state.last_embed_frame_idx = frame_idx
+            state.last_crop_signature = signature
 
     def process(
         self,
@@ -1098,7 +1135,8 @@ class AppearanceGate:
         # Increment frame counter for throttling
         state.frames_since_embed += 1
         bbox_arr = bbox.astype(np.float32, copy=True)
-        similarity = _cosine_similarity(embedding, state.proto)
+        embedding_vec = embedding if _embedding_is_valid(embedding) else None
+        similarity = _cosine_similarity(embedding_vec, state.proto)
         iou = 1.0
         if state.last_box is not None:
             iou = float(_bbox_iou(state.last_box.tolist(), bbox_arr.tolist()))
@@ -1131,20 +1169,27 @@ class AppearanceGate:
                 reason or "unknown",
             )
             state.low_sim_streak = 0
-            state.proto = _l2_normalize(embedding.copy()) if embedding is not None else None
-            if embedding is not None:
+            state.proto = _l2_normalize(embedding_vec.copy()) if embedding_vec is not None else None
+            if embedding_vec is not None:
                 state.frames_since_embed = 0  # Reset counter when embedding used
         else:
             if similarity is not None:
                 self.stats["sim_sum"] += similarity
                 self.stats["sim_count"] += 1
-            if embedding is not None and not low_similarity:
+            if embedding_vec is not None:
                 if state.proto is None:
-                    state.proto = _l2_normalize(embedding.copy())
-                else:
-                    mixed = self.config.proto_momentum * state.proto + (1.0 - self.config.proto_momentum) * embedding
+                    state.proto = _l2_normalize(embedding_vec.copy())
+                    if _embedding_is_valid(state.proto):
+                        state.frames_since_embed = 0
+                    else:
+                        state.proto = None
+                elif similarity is not None and similarity >= PROTO_UPDATE_MIN_SIM and not low_similarity:
+                    mixed = self.config.proto_momentum * state.proto + (1.0 - self.config.proto_momentum) * embedding_vec
                     state.proto = _l2_normalize(mixed)
-                state.frames_since_embed = 0  # Reset counter when embedding used
+                    if _embedding_is_valid(state.proto):
+                        state.frames_since_embed = 0  # Reset counter when embedding used
+                    else:
+                        state.proto = None
         state.last_box = bbox_arr
         return split, reason, similarity, iou
 
@@ -1963,11 +2008,13 @@ class TrackRecorder:
         self._mapping: dict[int, dict[str, int]] = {}
         self._active_exports: set[int] = set()
         self._accumulators: dict[int, TrackAccumulator] = {}
+        self._last_recorded: dict[int, dict] = {}  # B4: Track last recorded state
         self.metrics = {
             "tracks_born": 0,
             "tracks_lost": 0,
             "id_switches": 0,
             "forced_splits": 0,
+            "updates_skipped": 0,  # B4: Track redundant updates skipped
         }
 
     def _spawn_export_id(self) -> int:
@@ -1993,9 +2040,23 @@ class TrackRecorder:
         landmarks: list[float] | None = None,
         confidence: float | None = None,
         force_new_track: bool = False,
+        skip_if_unchanged: bool = False,  # B4: Skip if bbox hasn't changed
+        gate_embedding: np.ndarray | None = None,  # G3: Accept gate embedding
     ) -> int:
         if isinstance(bbox, np.ndarray):
             bbox_values = bbox.tolist()
+
+        # B4: Skip update if bbox hasn't changed significantly
+        if skip_if_unchanged and tracker_track_id in self._last_recorded:
+            last = self._last_recorded[tracker_track_id]
+            frame_gap = frame_idx - last["frame_idx"]
+            if frame_gap < 5:  # Only check recent frames
+                import numpy as np
+                bbox_similar = np.allclose(bbox_values, last["bbox"], rtol=0.05)
+                if bbox_similar:
+                    self.metrics["updates_skipped"] += 1
+                    return last["export_id"]
+
         else:
             bbox_values = bbox
         export_id: int
@@ -2037,6 +2098,19 @@ class TrackRecorder:
             track = TrackAccumulator(track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts)
             self._accumulators[export_id] = track
         track.add(ts, frame_idx, bbox_values, confidence=confidence, landmarks=landmarks)
+
+        # G3: Store gate embedding if provided
+        if gate_embedding is not None:
+            track.gate_embedding = gate_embedding.tolist()
+
+
+        # B4: Update last recorded state
+        self._last_recorded[tracker_track_id] = {
+            "frame_idx": frame_idx,
+            "bbox": bbox_values,
+            "export_id": export_id,
+        }
+
         return export_id
 
     def finalize(self) -> None:
@@ -2054,6 +2128,7 @@ class TrackRecorder:
             self._complete_track(mapping["export_id"])
             forced += 1
         self._mapping.clear()
+        self._last_recorded.clear()  # B4: Clear cached state on scene cuts
         if forced:
             self.metrics["forced_splits"] += forced
 
@@ -2641,6 +2716,21 @@ class FrameExporter:
         self.min_face_size = 50  # pixels
         self._quality_filtered_count = 0
 
+
+        # C3: Async export queue and worker thread
+        self._export_queue: queue.Queue = queue.Queue(maxsize=64)
+        self._worker_thread: threading.Thread | None = None
+        self._shutdown = False
+
+        if save_frames or save_crops:
+            self._worker_thread = threading.Thread(
+                target=self._export_worker,
+                name="frame-export-worker",
+                daemon=True,
+            )
+            self._worker_thread.start()
+            LOGGER.info("Started async frame/crop export worker thread")
+
     def _log_image_stats(self, kind: str, path: Path, image) -> None:
         if self._stat_samples >= self._stat_limit:
             return
@@ -3181,6 +3271,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=int,
         default=SCENE_WARMUP_DETS_DEFAULT,
         help="Frames of forced detection after each cut",
+    )
+    parser.add_argument(
+        "--scene-cut-cooldown",
+        type=int,
+        default=24,
+        help="Minimum frames between scene cut resets (default: 24, prevents reset thrashing)",
     )
     parser.add_argument(
         "--det-thresh",
@@ -3735,6 +3831,8 @@ def _run_full_pipeline(
     cut_ix = 0
     next_cut = scene_cuts[cut_ix] if scene_cuts else None
     frames_since_cut = 10**9
+    last_cut_reset = -999  # F1: Track last reset to prevent thrashing
+    scene_cut_cooldown = getattr(args, "scene_cut_cooldown", 24)
     max_gap_sec_arg = getattr(args, "max_gap_sec", None)
     max_gap_frames = _resolved_max_gap(args.max_gap, analyzed_fps, max_gap_sec=max_gap_sec_arg)
     if max_gap_frames != max(1, int(args.max_gap)):
@@ -3799,9 +3897,34 @@ def _run_full_pipeline(
     try:
         with det_path.open("w", encoding="utf-8") as det_handle:
             while True:
-                ok, frame = cap.read()
+                # D1: Use grab() to skip frame decode for frames we won't analyze
+                # This avoids decoding ~83% of frames when stride=6
+                ok = cap.grab()
                 if not ok:
                     break
+
+                # Determine if we need to actually decode this frame
+                force_detect = frames_since_cut < scene_warmup
+                should_sample = frame_idx % frame_stride == 0
+                at_scene_cut = next_cut is not None and frame_idx >= next_cut
+
+                # Skip decode if we won't process this frame
+                if not (should_sample or force_detect or at_scene_cut):
+                    frame_idx += 1
+                    frames_since_cut += 1
+                    continue
+
+                # Retrieve (decode) only frames we'll actually process
+                frame_ok, frame = cap.retrieve()
+                if not frame_ok:
+                    LOGGER.warning(
+                        "Failed to retrieve frame %d for %s after successful grab",
+                        frame_idx,
+                        args.ep_id,
+                    )
+                    frame_idx += 1
+                    frames_since_cut += 1
+                    continue
 
                 # Guard against empty/None frames before detection
                 if frame is None or frame.size == 0:
@@ -3815,13 +3938,39 @@ def _run_full_pipeline(
                     continue
 
                 if next_cut is not None and frame_idx >= next_cut:
-                    reset_tracker = getattr(tracker_adapter, "reset", None)
-                    if callable(reset_tracker):
-                        reset_tracker()
-                    if appearance_gate:
-                        appearance_gate.reset_all()
-                    recorder.on_cut(frame_idx)
-                    frames_since_cut = 0
+                    # F1: Only reset if we're past cooldown period
+                    if frame_idx - last_cut_reset >= scene_cut_cooldown:
+                        reset_tracker = getattr(tracker_adapter, "reset", None)
+                        if callable(reset_tracker):
+                            reset_tracker()
+                        if appearance_gate:
+                            appearance_gate.reset_all()
+                        recorder.on_cut(frame_idx)
+                        frames_since_cut = 0
+                        last_cut_reset = frame_idx  # F1: Record reset time
+                        if progress:
+                            emit_frames, video_meta = _progress_value(frame_idx, include_current=False)
+                            progress.emit(
+                                emit_frames,
+                                phase="track",
+                                device=device,
+                                detector=detector_choice,
+                                tracker=tracker_label,
+                                resolved_device=detector_device,
+                                summary={"event": "reset_on_cut", "frame": frame_idx},
+                                force=True,
+                                extra=video_meta,
+                            )
+                    else:
+                        # F1: Cut detected but within cooldown - skip reset
+                        LOGGER.debug(
+                            "Skipping scene cut reset at frame %d (last reset at %d, cooldown=%d)",
+                            frame_idx,
+                            last_cut_reset,
+                            scene_cut_cooldown,
+                        )
+                
+                    # Always advance to next cut (even if we skipped reset)
                     cut_ix += 1
                     next_cut = scene_cuts[cut_ix] if cut_ix < len(scene_cuts) else None
                     if progress:
@@ -3837,12 +3986,6 @@ def _run_full_pipeline(
                             force=True,
                             extra=video_meta,
                         )
-                force_detect = frames_since_cut < scene_warmup
-                should_sample = frame_idx % frame_stride == 0
-                if not (should_sample or force_detect):
-                    frame_idx += 1
-                    frames_since_cut += 1
-                    continue
 
                 frames_sampled += 1
                 detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
@@ -4098,11 +4241,9 @@ def _run_full_pipeline(
 
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
+                            embed_signatures: list[np.ndarray | None] = []
+                            embed_frame_idxs: list[int] = []
                             for obj in tracked_objects:
-                                # Throttle: check if we should extract embeddings for this track
-                                if not appearance_gate.should_extract_embedding(obj.track_id):
-                                    continue
-                                
                                 # Validate bbox before cropping to prevent NoneType multiply errors
                                 validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
                                 if validated_bbox is None:
@@ -4135,17 +4276,80 @@ def _run_full_pipeline(
                                             crop_err,
                                         )
                                     continue
+
+                                yaw, pitch, expression = _analyze_pose_expression(landmarks_list)
+                                if yaw is not None and abs(yaw) > FACE_EMBED_MAX_YAW:
+                                    LOGGER.debug(
+                                        "Gate embedding skipped for track %s frame %d: yaw %.2f exceeds %.2f",
+                                        obj.track_id,
+                                        frame_idx,
+                                        yaw,
+                                        FACE_EMBED_MAX_YAW,
+                                    )
+                                    continue
+                                if pitch is not None and abs(pitch) > FACE_EMBED_MAX_PITCH:
+                                    LOGGER.debug(
+                                        "Gate embedding skipped for track %s frame %d: pitch %.2f exceeds %.2f",
+                                        obj.track_id,
+                                        frame_idx,
+                                        pitch,
+                                        FACE_EMBED_MAX_PITCH,
+                                    )
+                                    continue
+                                if expression not in FACE_EMBED_ALLOWED_EXPRESSIONS and expression != "unknown":
+                                    LOGGER.debug(
+                                        "Gate embedding skipped for track %s frame %d: disallowed expression=%s",
+                                        obj.track_id,
+                                        frame_idx,
+                                        expression,
+                                    )
+                                    continue
+
+                                quality_score = _estimate_crop_quality_score(crop)
+                                if quality_score < FACE_EMBED_MIN_QUALITY:
+                                    LOGGER.debug(
+                                        "Gate embedding skipped for track %s frame %d: low quality %.2f (< %.2f)",
+                                        obj.track_id,
+                                        frame_idx,
+                                        quality_score,
+                                        FACE_EMBED_MIN_QUALITY,
+                                    )
+                                    continue
+
+                                should_embed, signature = appearance_gate.should_extract_embedding(
+                                    obj.track_id,
+                                    crop,
+                                    frame_idx,
+                                )
+                                if not should_embed:
+                                    continue
+
                                 aligned = _resize_for_arcface(crop)
                                 embed_inputs.append(aligned)
                                 embed_track_ids.append(obj.track_id)
+                                embed_signatures.append(signature)
+                                embed_frame_idxs.append(frame_idx)
                             if embed_inputs:
                                 encoded = gate_embedder.encode(embed_inputs)
                                 for idx, tid in enumerate(embed_track_ids):
                                     embedding_vec = encoded[idx]
+                                    signature = embed_signatures[idx]
+                                    embed_frame_val = embed_frame_idxs[idx]
+                                    success = False
                                     # Validate embedding contains finite values before storing
                                     try:
                                         if embedding_vec is not None and np.all(np.isfinite(embedding_vec)):
-                                            gate_embeddings[tid] = embedding_vec
+                                            normed = np.asarray(embedding_vec, dtype=np.float32)
+                                            if _embedding_is_valid(normed):
+                                                gate_embeddings[tid] = normed
+                                                success = True
+                                            else:
+                                                gate_embeddings[tid] = None
+                                                LOGGER.warning(
+                                                    "Gate embedding for track %s at frame %d is zero-norm; discarding",
+                                                    tid,
+                                                    frame_idx,
+                                                )
                                         else:
                                             gate_embeddings[tid] = None
                                             if embedding_vec is not None:
@@ -4161,6 +4365,13 @@ def _run_full_pipeline(
                                             "Gate embedding for track %s at frame %d is not a valid numeric array, discarding",
                                             tid,
                                             frame_idx,
+                                        )
+                                    finally:
+                                        appearance_gate.note_embedding_extracted(
+                                            tid,
+                                            embed_frame_val,
+                                            signature,
+                                            success=success,
                                         )
                         for obj in tracked_objects:
                             gate_embeddings.setdefault(obj.track_id, None)
