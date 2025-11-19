@@ -498,6 +498,45 @@ def _init_retinaface(
     return model, resolved
 
 
+def _insightface_model_dir(model_name: str) -> Path:
+    root = Path(os.environ.get("INSIGHTFACE_HOME", str(Path.home() / ".insightface"))).expanduser()
+    return root / "models" / model_name
+
+
+def _compute_file_sha256(path: Path) -> str:
+    sha = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def _verify_model_checksum(model_name: str) -> None:
+    """Ensure the InsightFace model file matches the recorded checksum."""
+    model_dir = _insightface_model_dir(model_name)
+    onnx_files = sorted(model_dir.glob("*.onnx"))
+    if not onnx_files:
+        LOGGER.warning("No ONNX weights found for %s in %s", model_name, model_dir)
+        return
+    for onnx_path in onnx_files:
+        checksum_path = onnx_path.with_suffix(onnx_path.suffix + ".sha256")
+        if not checksum_path.exists():
+            raise RuntimeError(
+                f"Checksum missing for {onnx_path}. Re-run scripts/fetch_models.py to refresh weights."
+            )
+        expected = checksum_path.read_text(encoding="utf-8").strip()
+        actual = _compute_file_sha256(onnx_path)
+        if not expected:
+            raise RuntimeError(
+                f"Checksum file {checksum_path} is empty. Re-run scripts/fetch_models.py to refresh weights."
+            )
+        if actual != expected:
+            raise RuntimeError(
+                f"ArcFace model checksum mismatch for {onnx_path}. "
+                "The file appears corrupted. Re-run scripts/fetch_models.py."
+            )
+
+
 def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = True):
     try:
         from insightface.model_zoo import get_model  # type: ignore
@@ -510,6 +549,7 @@ def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = True)
         raise RuntimeError(
             f"ArcFace weights '{model_name}' not found. Install insightface models or run scripts/fetch_models.py."
         )
+    _verify_model_checksum(model_name)
     ctx_id = 0 if resolved == "cuda" else -1
     model.prepare(ctx_id=ctx_id, providers=providers)
     return model, resolved
@@ -1094,19 +1134,12 @@ class AppearanceGate:
         signature = _compute_crop_signature(crop)
         if signature is None:
             return False, None
+        changed = _signature_changed(state.last_crop_signature, signature, self.embed_change_threshold)
         if state.last_embed_frame_idx >= 0:
             frame_gap = frame_idx - state.last_embed_frame_idx
-            if frame_gap < self.embed_throttle_interval and not _signature_changed(
-                state.last_crop_signature,
-                signature,
-                self.embed_change_threshold,
-            ):
+            if frame_gap < self.embed_throttle_interval and not changed:
                 return False, None
-        if state.last_crop_signature is not None and not _signature_changed(
-            state.last_crop_signature,
-            signature,
-            self.embed_change_threshold,
-        ):
+        if state.last_crop_signature is not None and not changed:
             # Crop hasn't changed materially; skip redundant embedding
             return False, None
         return True, signature
@@ -1230,21 +1263,104 @@ def _load_show_seeds(show_id: str) -> List[Dict[str, Any]]:
         facebank_svc = FacebankService(data_root=DATA_ROOT)
         seeds = facebank_svc.get_all_seeds_for_show(show_id)
         return seeds
-    except Exception as exc:
-        LOGGER.debug("Failed to load seeds for show %s: %s", show_id, exc)
-        return []
+        except Exception as exc:
+            LOGGER.debug("Failed to load seeds for show %s: %s", show_id, exc)
+            return []
+
+
+class SeedMatcher:
+    """Approximate nearest neighbour search over seed embeddings."""
+
+    def __init__(self, seeds: List[Dict[str, Any]], rejection_sim: float = SEED_REJECTION_MIN_SIM):
+        self._seeds = seeds or []
+        self._rejection_sim = rejection_sim
+        self._ids: list[str] = []
+        self._embeddings: np.ndarray | None = None
+        self._index = None
+        self._build_index()
+
+    def _build_index(self) -> None:
+        if not self._seeds:
+            return
+        vectors: list[np.ndarray] = []
+        ids: list[str] = []
+        for seed in self._seeds:
+            embedding = seed.get("embedding")
+            cast_id = seed.get("cast_id") or seed.get("fb_id")
+            if embedding is None or cast_id is None:
+                continue
+            normed = _l2_normalize(np.asarray(embedding, dtype=np.float32))
+            if not _embedding_is_valid(normed):
+                continue
+            vectors.append(normed)
+            ids.append(str(cast_id))
+        if not vectors:
+            return
+        self._embeddings = np.vstack(vectors)
+        self._ids = ids
+        try:
+            import faiss  # type: ignore
+
+            index = faiss.IndexFlatIP(self._embeddings.shape[1])
+            index.add(self._embeddings.astype(np.float32))
+            self._index = index
+        except Exception as exc:  # pragma: no cover - faiss optional
+            LOGGER.warning("FAISS unavailable for seed matching (%s); using brute-force fallback.", exc)
+            self._index = None
+
+    @property
+    def ready(self) -> bool:
+        return self._embeddings is not None and self._embeddings.size > 0
+
+    def query(self, embedding: np.ndarray | None) -> Optional[Tuple[str, float]]:
+        if not self.ready or not _embedding_is_valid(embedding):
+            return None
+        vec = _l2_normalize(np.asarray(embedding, dtype=np.float32))
+        if not _embedding_is_valid(vec):
+            return None
+        if self._index is not None:
+            try:
+                sims, idxs = self._index.search(vec[np.newaxis, :], 1)
+            except Exception as exc:  # pragma: no cover - faiss runtime guard
+                LOGGER.warning("FAISS search failed (%s); falling back to brute-force.", exc)
+                sims = None
+                idxs = None
+            else:
+                score = float(sims[0][0])
+                best_idx = int(idxs[0][0])
+                if score >= self._rejection_sim:
+                    return self._ids[best_idx], score
+                return None
+        assert self._embeddings is not None
+        sims = np.dot(self._embeddings, vec)
+        best_idx = int(np.argmax(sims))
+        score = float(sims[best_idx])
+        if score >= self._rejection_sim:
+            return self._ids[best_idx], score
+        return None
 
 
 def _find_best_seed_match(
     embedding: np.ndarray,
     seeds: List[Dict[str, Any]],
     min_sim: float = SEED_BOOST_MIN_SIM,
+    matcher: SeedMatcher | None = None,
 ) -> Optional[Tuple[str, float]]:
     """Find the best matching seed for an embedding.
 
     Returns (cast_id, similarity) if match found above threshold, else None.
     """
     if not seeds or embedding is None:
+        return None
+
+    threshold = max(min_sim, SEED_REJECTION_MIN_SIM)
+    if matcher and matcher.ready:
+        match = matcher.query(embedding)
+        if match is None:
+            return None
+        cast_id, score = match
+        if score >= threshold:
+            return cast_id, score
         return None
 
     best_sim = -1.0
@@ -1262,7 +1378,7 @@ def _find_best_seed_match(
             best_sim = sim
             best_cast_id = seed.get("cast_id")
 
-    if best_sim >= min_sim and best_cast_id:
+    if best_sim >= threshold and best_cast_id:
         return (best_cast_id, best_sim)
 
     return None
@@ -5084,6 +5200,7 @@ def _run_faces_embed_stage(
 
     # Load seeds for seed-based face matching
     show_seeds = []
+    seed_matcher: SeedMatcher | None = None
     seed_match_stats = {"enabled": SEED_BOOST_ENABLED, "matches": 0, "total": 0}
     if SEED_BOOST_ENABLED:
         show_id = _parse_ep_id_for_show(args.ep_id)
@@ -5091,6 +5208,7 @@ def _run_faces_embed_stage(
             show_seeds = _load_show_seeds(show_id)
             if show_seeds:
                 LOGGER.info("Loaded %d seed embeddings for show %s", len(show_seeds), show_id)
+                seed_matcher = SeedMatcher(show_seeds)
 
     faces_done = 0
     started_at = _utcnow_iso()
@@ -5246,6 +5364,83 @@ def _run_faces_embed_stage(
                     faces_done = min(faces_total, faces_done + 1)
                     continue
 
+                pose_yaw, pose_pitch, expression = _analyze_pose_expression(landmarks)
+                if pose_yaw is not None and abs(pose_yaw) > FACE_EMBED_MAX_YAW:
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox,
+                            detector_choice,
+                            f"pose_yaw:{pose_yaw:.1f}",
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=thumb_rel_path,
+                            thumb_s3_key=thumb_s3_key,
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
+                    continue
+                if pose_pitch is not None and abs(pose_pitch) > FACE_EMBED_MAX_PITCH:
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox,
+                            detector_choice,
+                            f"pose_pitch:{pose_pitch:.1f}",
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=thumb_rel_path,
+                            thumb_s3_key=thumb_s3_key,
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
+                    continue
+                if expression is not None and expression not in FACE_EMBED_ALLOWED_EXPRESSIONS and expression != "unknown":
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox,
+                            detector_choice,
+                            f"expression:{expression}",
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=thumb_rel_path,
+                            thumb_s3_key=thumb_s3_key,
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
+                    continue
+
+                quality_score = _estimate_crop_quality_score(crop)
+                if quality_score < FACE_EMBED_MIN_QUALITY:
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox,
+                            detector_choice,
+                            f"low_quality:{quality_score:.2f}",
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=thumb_rel_path,
+                            thumb_s3_key=thumb_s3_key,
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
+                    continue
+
+                quality = min(1.0, max(quality, quality_score / 10.0))
                 crop_std = float(np.std(crop))
                 blur_score = _estimate_blur_score(crop)
                 skip_reason: str | None = None
@@ -5318,9 +5513,8 @@ def _run_faces_embed_stage(
                     ts_val = meta["ts_val"]
                     bbox = meta["bbox"]
                     
-                    # Check for zero-norm embedding (invalid)
-                    embedding_norm = float(np.linalg.norm(embedding_vec))
-                    if embedding_norm < 1e-6:
+                    # Check for invalid embeddings (NaN/Inf/zero)
+                    if not _embedding_is_valid(embedding_vec):
                         rows.append(
                             _make_skip_face_row(
                                 args.ep_id,
@@ -5329,7 +5523,7 @@ def _run_faces_embed_stage(
                                 ts_val,
                                 bbox,
                                 detector_choice,
-                                "zero_norm_embedding",
+                                "invalid_embedding",
                                 crop_rel_path=meta["crop_rel_path"],
                                 crop_s3_key=meta["crop_s3_key"],
                                 thumb_rel_path=meta["thumb_rel_path"],
@@ -5347,7 +5541,12 @@ def _run_faces_embed_stage(
                     seed_similarity = None
                     if show_seeds and SEED_BOOST_ENABLED:
                         seed_match_stats["total"] += 1
-                        match_result = _find_best_seed_match(embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM)
+                        match_result = _find_best_seed_match(
+                            embedding_vec,
+                            show_seeds,
+                            min_sim=SEED_BOOST_MIN_SIM,
+                            matcher=seed_matcher,
+                        )
                         if match_result:
                             seed_cast_id, seed_similarity = match_result
                             seed_match_stats["matches"] += 1
@@ -5565,7 +5764,7 @@ def _select_track_prototype(
     weights: list[float] = []
     for score, vec in capped:
         normed = _l2_normalize(vec)
-        if normed is None:
+        if not _embedding_is_valid(normed):
             continue
         vectors.append(normed)
         weights.append(max(float(score), 1e-3))
@@ -5580,7 +5779,7 @@ def _select_track_prototype(
         weight_arr = weight_arr / weight_sum
     proto = np.sum(stack * weight_arr[:, None], axis=0)
     proto = _l2_normalize(proto)
-    if proto is None:
+    if not _embedding_is_valid(proto):
         return None, stack.shape[0], None
     sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
     sims = np.clip(sims, -1.0, 1.0)
@@ -5594,6 +5793,8 @@ def _select_track_prototype(
             weight_arr = weight_arr / max(float(weight_arr.sum()), 1e-6)
             proto = np.sum(stack * weight_arr[:, None], axis=0)
             proto = _l2_normalize(proto)
+            if not _embedding_is_valid(proto):
+                return None, stack.shape[0], None
             sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
             sims = np.clip(sims, -1.0, 1.0)
     spread = _max_pairwise_cosine_distance(stack)

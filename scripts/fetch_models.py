@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 from insightface.app import FaceAnalysis
+from insightface.model_zoo import get_model
 
 
 def compute_file_checksum(filepath: Path) -> str:
@@ -51,6 +52,8 @@ def generate_manifest(models_dir: Path, output_path: Path) -> dict:
     for model_file in models_dir.rglob("*.onnx"):
         rel_path = model_file.relative_to(models_dir)
         checksum = compute_file_checksum(model_file)
+        checksum_path = model_file.with_suffix(model_file.suffix + ".sha256")
+        checksum_path.write_text(checksum, encoding="utf-8")
         manifest["models"][str(rel_path)] = {
             "checksum": checksum,
             "size": model_file.stat().st_size,
@@ -93,6 +96,19 @@ def main():
     print("\nGenerating model manifest with checksums...")
     manifest_path = Path(root) / "models" / f"{pack}_manifest.json"
     generate_manifest(models_dir, manifest_path)
+
+    # Ensure standalone ArcFace + RetinaFace weights are ready with sidecar checksums
+    print("\nEnsuring standalone ArcFace weights are downloaded...")
+    arcface = get_model("arcface_r100_v1")
+    arcface.prepare(ctx_id=0, providers=["CPUExecutionProvider"])
+    arcface_dir = Path(root) / "models" / "arcface_r100_v1"
+    generate_manifest(arcface_dir, arcface_dir / "arcface_manifest.json")
+
+    print("\nEnsuring standalone RetinaFace weights are downloaded...")
+    retina = get_model("retinaface_r50_v1")
+    retina.prepare(ctx_id=0, providers=["CPUExecutionProvider"])
+    retina_dir = Path(root) / "models" / "retinaface_r50_v1"
+    generate_manifest(retina_dir, retina_dir / "retinaface_manifest.json")
 
     print("\n✓ Model fetch complete!")
     print(f"  Models: {models_dir}")

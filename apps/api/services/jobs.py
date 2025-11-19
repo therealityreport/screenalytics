@@ -45,8 +45,13 @@ _SCENE_DETECTOR_ENV = os.getenv("SCENE_DETECTOR", "pyscenedetect").strip().lower
 if _SCENE_DETECTOR_ENV not in SCENE_DETECTOR_CHOICES:
     _SCENE_DETECTOR_ENV = "pyscenedetect"
 SCENE_DETECTOR_DEFAULT = getattr(episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV)
+_CPULIMIT_ENV = (
+    os.getenv("SCREENALYTICS_CPULIMIT_PERCENT")
+    or os.getenv("SCREANALYTICS_CPULIMIT_PERCENT")
+    or "250"
+)
 try:
-    _CPULIMIT_PERCENT = int(os.environ.get("SCREANALYTICS_CPULIMIT_PERCENT", "250"))
+    _CPULIMIT_PERCENT = int(_CPULIMIT_ENV)
 except ValueError:
     _CPULIMIT_PERCENT = 250  # Default to 250% even on ValueError
 
@@ -69,6 +74,52 @@ def _maybe_wrap_with_cpulimit(command: list[str]) -> list[str]:
         )
         return command
     return [binary, "-l", str(_CPULIMIT_PERCENT), "-i", "--", *command]
+
+
+def _apply_cpu_affinity_fallback(pid: int, limit_percent: int) -> None:
+    """
+    Best-effort CPU affinity throttling when cpulimit is unavailable.
+
+    Pins the process to a subset of logical CPUs proportional to limit_percent.
+    Fails silently if psutil/affinity is not supported on the current platform.
+    """
+
+    if not _PSUTIL_AVAILABLE:
+        LOGGER.warning(
+            "cpulimit unavailable and psutil not installed; cannot enforce CPU cap for pid=%s",
+            pid,
+        )
+        return
+    try:
+        proc = psutil.Process(pid)
+    except Exception as exc:  # pragma: no cover - psutil/process specific
+        LOGGER.debug("Failed to inspect process %s for CPU affinity fallback: %s", pid, exc)
+        return
+
+    if not hasattr(proc, "cpu_affinity"):
+        LOGGER.warning(
+            "cpulimit unavailable and psutil.cpu_affinity unsupported on this platform; running pid=%s uncapped",
+            pid,
+        )
+        return
+
+    try:
+        current_affinity = proc.cpu_affinity()
+        if not current_affinity:
+            cpu_total = psutil.cpu_count(logical=True) or 1
+            current_affinity = list(range(cpu_total))
+        cpu_total = len(current_affinity)
+        target_cores = max(1, min(cpu_total, int(math.ceil(limit_percent / 100.0))))
+        proc.cpu_affinity(current_affinity[:target_cores])
+        LOGGER.info(
+            "Applied CPU affinity fallback for pid=%s using %d/%d cores (limit=%d%%)",
+            pid,
+            target_cores,
+            cpu_total,
+            limit_percent,
+        )
+    except Exception as exc:  # pragma: no cover - affinity platform specific
+        LOGGER.warning("Failed to apply CPU affinity fallback for pid=%s: %s", pid, exc)
 
 
 def _env_float(name: str, default: float) -> float:
