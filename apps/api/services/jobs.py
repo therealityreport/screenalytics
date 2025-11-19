@@ -287,6 +287,25 @@ class JobService:
         except json.JSONDecodeError:
             return None
 
+    def _read_track_metrics(self, ep_id: str) -> Optional[Dict[str, Any]]:
+        """Read track_metrics.json for an episode if it exists.
+
+        Returns the metrics payload which includes:
+        - metrics: detect/track metrics (tracks_per_minute, short_track_fraction, id_switch_rate)
+        - cluster_metrics: cluster metrics (singleton_fraction, largest_cluster_fraction, etc.)
+        - scene_cuts: scene detection summary
+        - crop_stats: crop quality statistics
+        """
+        try:
+            manifests_dir = get_path(ep_id, "detections").parent
+            metrics_path = manifests_dir / "track_metrics.json"
+            if not metrics_path.exists():
+                return None
+            return json.loads(metrics_path.read_text(encoding="utf-8"))
+        except Exception:
+            # Metrics file is optional; fail silently if unavailable
+            return None
+
     def _launch_job(
         self,
         *,
@@ -830,11 +849,26 @@ class JobService:
 
     # ------------------------------------------------------------------
     def get(self, job_id: str) -> JobRecord:
-        return self._read_job(job_id)
+        record = self._read_job(job_id)
+        # Include track_metrics.json if available
+        ep_id = record.get("ep_id")
+        if ep_id:
+            metrics = self._read_track_metrics(ep_id)
+            if metrics:
+                record["track_metrics"] = metrics
+        return record
 
     def get_progress(self, job_id: str) -> Optional[Dict[str, Any]]:
         record = self._read_job(job_id)
-        return self._read_progress(Path(record["progress_file"]))
+        progress = self._read_progress(Path(record["progress_file"]))
+        # Include track_metrics.json if available
+        if progress:
+            ep_id = record.get("ep_id")
+            if ep_id:
+                metrics = self._read_track_metrics(ep_id)
+                if metrics:
+                    progress["track_metrics"] = metrics
+        return progress
 
     def cancel(self, job_id: str) -> JobRecord:
         def _apply(record: JobRecord) -> None:
