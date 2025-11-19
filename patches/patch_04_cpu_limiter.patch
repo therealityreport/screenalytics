@@ -1,0 +1,61 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -13,6 +13,7 @@ import platform
+ from collections import Counter, defaultdict, OrderedDict
+ from dataclasses import dataclass, field
+ from datetime import datetime
++import threading
+ from pathlib import Path
+ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+ 
+@@ -20,6 +21,7 @@ import logging
+ 
+ # Force thread limits before importing ML libraries
++import psutil
+ os.environ.setdefault("OMP_NUM_THREADS", "2")
+ os.environ.setdefault("MKL_NUM_THREADS", "2") 
+ os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+@@ -300,6 +302,30 @@ def _normalize_device_label(device: str | None) -> str:
+     return normalized
+ 
+ 
++class CPULimiter:
++    """Enforce global CPU usage cap across all processes."""
++    def __init__(self, max_cpu_percent: float = 250.0):
++        self.max_cpu_percent = max_cpu_percent
++        self._lock = threading.Lock()
++    
++    def check_and_throttle(self):
++        """Check total CPU usage and throttle if needed."""
++        with self._lock:
++            try:
++                total_cpu = psutil.cpu_percent(interval=0.1) * psutil.cpu_count()
++                if total_cpu > self.max_cpu_percent:
++                    # Throttle by sleeping briefly
++                    time.sleep(0.01)
++            except Exception:
++                # If psutil fails, continue without throttling
++                pass
+    
++    def get_current_usage(self) -> float:
++        """Get current total CPU usage percentage."""
++        try:
++            return psutil.cpu_percent(interval=0.1) * psutil.cpu_count()
++        except Exception:
++            return 0.0
++
++# Global CPU limiter instance
++_CPU_LIMITER = CPULimiter(max_cpu_percent=250.0)
++
++
+ def _filter_providers(providers: list[str]) -> list[str]:
+@@ -3275,6 +3301,9 @@ def _run_full_pipeline(
+                 ok, frame = cap.read()
+                 if not ok:
+                     break
++                
++                # Throttle if CPU usage too high
++                _CPU_LIMITER.check_and_throttle()
+ 
+                 # Guard against empty/None frames before detection
+                 if frame is None or frame.size == 0:

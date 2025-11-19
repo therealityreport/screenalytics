@@ -1,0 +1,43 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -1484,6 +1484,7 @@ class TrackRecorder:
+         self._next_export_id = 1
+         self._mapping: dict[int, dict[str, int]] = {}
+         self._active_exports: set[int] = set()
++        self._last_recorded: dict[int, dict] = {}  # track_id -> {frame_idx, bbox, conf}
+         self._accumulators: dict[int, TrackAccumulator] = {}
+         self.metrics = {
+             "tracks_born": 0,
+@@ -1520,6 +1521,7 @@ class TrackRecorder:
+         landmarks: list[float] | None = None,
+         confidence: float | None = None,
+         force_new_track: bool = False,
++        skip_if_unchanged: bool = True,  # Skip recording if track unchanged
+     ) -> int:
+         if isinstance(bbox, np.ndarray):
+             bbox_values = bbox.tolist()
+@@ -1559,6 +1561,15 @@ class TrackRecorder:
+             else:
+                 export_id = mapping["export_id"]
+                 mapping["last_frame"] = frame_idx
++        
++        # Skip recording if track unchanged and skip_if_unchanged=True
++        if skip_if_unchanged and export_id in self._last_recorded:
++            last = self._last_recorded[export_id]
++            if (frame_idx - last["frame_idx"] < 5 and  # Within 5 frames
++                np.allclose(bbox_values, last["bbox"], rtol=0.05)):  # Bbox similar (5% tolerance)
++                return export_id
++        
+         track = self._accumulators.get(export_id)
+         if track is None:
+             track = TrackAccumulator(track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts)
+             self._accumulators[export_id] = track
+         track.add(ts, frame_idx, bbox_values, confidence=confidence, landmarks=landmarks)
++        
++        # Update last recorded state
++        self._last_recorded[export_id] = {
++            "frame_idx": frame_idx,
++            "bbox": bbox_values,
++            "conf": confidence,
++        }
+         return export_id

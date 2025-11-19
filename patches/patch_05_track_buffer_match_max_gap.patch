@@ -1,0 +1,13 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -930,7 +930,11 @@ class ByteTrackRuntimeConfig:
+     
+     def scaled_buffer(self, stride: int) -> int:
+         """Scale buffer by stride, ensuring it's at least max_gap_frames."""
+-        effective = max(int(round(self.track_buffer_base * stride)), self.track_buffer_base)
++        effective = max(int(round(self.track_buffer_base * stride)), self.track_buffer_base)
++        # Ensure buffer is at least as large as max gap to prevent premature track death
++        # Assume 30fps if fps unknown (conservative estimate)
++        max_gap_frames = int(round(30.0 * TRACK_MAX_GAP_SEC))
++        effective = max(effective, max_gap_frames)
+         return effective

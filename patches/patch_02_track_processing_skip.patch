@@ -1,0 +1,87 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -79,6 +79,7 @@ TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTE
+ LOGGER = logging.getLogger("episode_run")
+ DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+ DETECTOR_CHOICES = ("retinaface",)
++TRACK_PROCESS_SKIP = max(int(os.environ.get("SCREENALYTICS_TRACK_PROCESS_SKIP", "6")), 1)  # Process every Nth track
+ DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
+ TRACKER_CHOICES = ("bytetrack", "strongsort")
+ DEFAULT_TRACKER = TRACKER_CHOICES[0]
+@@ -3651,7 +3652,7 @@ def _run_full_pipeline(
+                     if appearance_gate:
+                         appearance_gate.prune(active_ids)
+ 
+-                    active_ids: set[int] = set()
++                    active_ids: set[int] = set()
+                     for obj in tracked_objects:
+                         active_ids.add(obj.track_id)
+                         class_value = FACE_CLASS_LABEL
+@@ -3652,6 +3653,15 @@ def _run_full_pipeline(
+                     active_ids: set[int] = set()
+                     for obj_idx, obj in enumerate(tracked_objects):
++                        # Skip processing every Nth track to reduce CPU/GPU load
++                        if obj_idx % TRACK_PROCESS_SKIP != 0:
++                            # Still record track for continuity, but skip expensive operations
++                            active_ids.add(obj.track_id)
++                            export_id = recorder.record(
++                                tracker_track_id=obj.track_id,
++                                frame_idx=frame_idx,
++                                ts=ts,
++                                bbox=obj.bbox,
++                                class_label=FACE_CLASS_LABEL,
++                                landmarks=None,
++                                confidence=(float(obj.conf) if obj.conf is not None else None),
++                                force_new_track=False,
++                            )
++                            continue
++                        
+                         active_ids.add(obj.track_id)
+                         class_value = FACE_CLASS_LABEL
+                         landmarks = None
+                         if obj.landmarks is not None:
+                             landmarks = (
+                                 obj.landmarks.tolist() if isinstance(obj.landmarks, np.ndarray) else obj.landmarks
+                             )
+                         force_split = False
+                         if appearance_gate:
+                             embedding_vec = gate_embeddings.get(obj.track_id)
+                             force_split, _, _, _ = appearance_gate.process(
+                                 obj.track_id,
+                                 obj.bbox,
+                                 embedding_vec,
+                                 frame_idx,
+                             )
+                         export_id = recorder.record(
+                             tracker_track_id=obj.track_id,
+                             frame_idx=frame_idx,
+                             ts=ts,
+                             bbox=obj.bbox,
+                             class_label=class_value,
+                             landmarks=landmarks,
+                             confidence=(float(obj.conf) if obj.conf is not None else None),
+                             force_new_track=force_split,
+                         )
+                         bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
+                         conf_value = float(obj.conf)
+
+                         row = {
+                             "ep_id": args.ep_id,
+                             "ts": round(float(ts), 4),
+                             "frame_idx": frame_idx,
+                             "class": class_value,
+                             "conf": round(conf_value, 4),
+                             "bbox_xyxy": bbox_list,
+                             "track_id": export_id,
+                             "model": detector_backend.model_name,
+                             "detector": detector_choice,
+                             "tracker": tracker_label,
+                             "pipeline_ver": PIPELINE_VERSION,
+                             "fps": (round(float(analyzed_fps), 4) if analyzed_fps else None),
+                         }
+                         if landmarks:
+                             row["landmarks"] = [round(float(val), 4) for val in landmarks]
+                         det_handle.write(json.dumps(row) + "\n")
+                         det_count += 1
+                         if frame_exporter and frame_exporter.save_crops:
+                             crop_records.append((export_id, bbox_list))

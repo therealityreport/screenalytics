@@ -1,0 +1,25 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -79,6 +79,7 @@ TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTE
+ LOGGER = logging.getLogger("episode_run")
+ DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+ DETECTOR_CHOICES = ("retinaface",)
++EMBEDDING_BATCH_SIZE = max(int(os.environ.get("SCREENALYTICS_EMBEDDING_BATCH_SIZE", "32")), 1)
+ TRACK_CROP_SKIP = max(int(os.environ.get("SCREENALYTICS_TRACK_CROP_SKIP", "8")), 1)  # Save crops every Nth track
+ TRACK_PROCESS_SKIP = max(int(os.environ.get("SCREENALYTICS_TRACK_PROCESS_SKIP", "6")), 1)  # Process every Nth track
+ DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
+@@ -3612,7 +3613,14 @@ def _run_full_pipeline(
+                                 embed_inputs.append(aligned)
+                                 embed_track_ids.append(obj.track_id)
+                             if embed_inputs:
+-                                encoded = gate_embedder.encode(embed_inputs)
++                                # Process in batches for better GPU utilization
++                                encoded_list = []
++                                for batch_start in range(0, len(embed_inputs), EMBEDDING_BATCH_SIZE):
++                                    batch_end = min(batch_start + EMBEDDING_BATCH_SIZE, len(embed_inputs))
++                                    batch_inputs = embed_inputs[batch_start:batch_end]
++                                    batch_encoded = gate_embedder.encode(batch_inputs)
++                                    encoded_list.extend(batch_encoded)
++                                encoded = encoded_list
+                                 for idx, tid in enumerate(embed_track_ids):
+                                     embedding_vec = encoded[idx]

@@ -1,0 +1,11 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -218,7 +218,7 @@ TRACK_NEW_THRESH_DEFAULT = _env_float(
+     "SCREENALYTICS_NEW_TRACK_THRESH",
+     _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
+ )
+-TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
++TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "2.0"))  # Increased from 0.5 to 2.0 seconds for longer tracks
+ TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
+ TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
+ TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))

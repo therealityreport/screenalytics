@@ -1,0 +1,18 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -79,6 +79,7 @@ TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTE
+ LOGGER = logging.getLogger("episode_run")
+ DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+ DETECTOR_CHOICES = ("retinaface",)
++TRACK_CROP_SKIP = max(int(os.environ.get("SCREENALYTICS_TRACK_CROP_SKIP", "8")), 1)  # Save crops every Nth track
+ TRACK_PROCESS_SKIP = max(int(os.environ.get("SCREENALYTICS_TRACK_PROCESS_SKIP", "6")), 1)  # Process every Nth track
+ DEFAULT_DETECTOR = DETECTOR_CHOICES[0]
+ TRACKER_CHOICES = ("bytetrack", "strongsort")
+@@ -3699,7 +3700,8 @@ def _run_full_pipeline(
+                             force_new_track=force_split,
+                         )
+                         bbox_list = [round(float(coord), 4) for coord in obj.bbox.tolist()]
+-                        if frame_exporter and frame_exporter.save_crops:
++                        # Only save crops for every Nth track to reduce disk I/O
++                        if frame_exporter and frame_exporter.save_crops and (obj_idx % TRACK_CROP_SKIP == 0):
+                             crop_records.append((export_id, bbox_list))

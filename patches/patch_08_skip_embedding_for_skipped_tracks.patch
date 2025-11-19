@@ -1,0 +1,12 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -3558,6 +3558,7 @@ def _run_full_pipeline(
+                         embed_inputs: list[np.ndarray] = []
+                         embed_track_ids: list[int] = []
+-                        for obj in tracked_objects:
++                        for obj_idx, obj in enumerate(tracked_objects):
++                            # Skip embedding for tracks that will be skipped in processing
++                            if obj_idx % TRACK_PROCESS_SKIP != 0:
++                                continue
+                             # Validate bbox before cropping to prevent NoneType multiply errors
+                             validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
