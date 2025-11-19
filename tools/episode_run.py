@@ -111,6 +111,60 @@ def _load_performance_profile(profile_name: str | None = None) -> dict[str, Any]
         return {}
 
 
+def _load_quality_gating_config() -> dict[str, Any]:
+    """
+    Load quality gating configuration from faces_embed_sampling.yaml.
+
+    Returns:
+        Dictionary of quality gating settings
+    """
+    config_path = REPO_ROOT / "config" / "pipeline" / "faces_embed_sampling.yaml"
+    if not config_path.exists():
+        LOGGER.debug("Quality gating config YAML not found at %s, using defaults", config_path)
+        return {}
+
+    try:
+        import yaml
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        if config and "quality_gating" in config:
+            LOGGER.info("Loaded quality gating config from %s", config_path)
+            return config["quality_gating"]
+    except Exception as exc:
+        LOGGER.warning("Failed to load quality gating config YAML: %s", exc)
+
+    return {}
+
+
+def _load_clustering_config() -> dict[str, Any]:
+    """
+    Load clustering configuration from clustering.yaml.
+
+    Returns:
+        Dictionary of clustering settings
+    """
+    config_path = REPO_ROOT / "config" / "pipeline" / "clustering.yaml"
+    if not config_path.exists():
+        LOGGER.debug("Clustering config YAML not found at %s, using defaults", config_path)
+        return {}
+
+    try:
+        import yaml
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        if config:
+            LOGGER.info("Loaded clustering config from %s", config_path)
+            return config
+    except Exception as exc:
+        LOGGER.warning("Failed to load clustering config YAML: %s", exc)
+
+    return {}
+
+
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
@@ -264,9 +318,11 @@ TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "2.0"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
+# Load clustering config early to use for DEFAULT_CLUSTER_SIMILARITY
+_CLUSTERING_CONFIG_EARLY = _load_clustering_config()
 DEFAULT_CLUSTER_SIMILARITY = float(
-    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75")
-)  # Increased to prevent multiple people in same cluster
+    os.environ.get("SCREENALYTICS_CLUSTER_SIM", _CLUSTERING_CONFIG_EARLY.get("cluster_thresh", 0.58))
+)
 
 # Load and apply YAML config overrides if available (only if env vars not set)
 _YAML_CONFIG = _load_tracking_config_yaml()
@@ -286,10 +342,26 @@ if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTIC
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
         LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
-MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
-FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
-FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
-FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
+
+MIN_IDENTITY_SIMILARITY = float(
+    os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", _CLUSTERING_CONFIG_EARLY.get("min_identity_sim", 0.50))
+)
+
+# Load quality gating config from YAML
+_QUALITY_GATING_CONFIG = _load_quality_gating_config()
+
+# Face quality gating thresholds (config-driven, env var overrides)
+FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", _QUALITY_GATING_CONFIG.get("min_confidence", 0.60)))
+FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", _QUALITY_GATING_CONFIG.get("min_blur_score", 35.0)))
+FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", _QUALITY_GATING_CONFIG.get("min_std", 1.0)))
+FACE_EMBED_MIN_QUALITY = float(os.environ.get("FACES_MIN_QUALITY", _QUALITY_GATING_CONFIG.get("min_quality_score", 3.0)))
+FACE_EMBED_MAX_YAW = float(os.environ.get("FACES_MAX_YAW", _QUALITY_GATING_CONFIG.get("max_yaw_angle", 45.0)))
+FACE_EMBED_MAX_PITCH = float(os.environ.get("FACES_MAX_PITCH", _QUALITY_GATING_CONFIG.get("max_pitch_angle", 30.0)))
+FACE_EMBED_ALLOWED_EXPRESSIONS = os.environ.get(
+    "FACES_ALLOWED_EXPRESSIONS",
+    ",".join(_QUALITY_GATING_CONFIG.get("allowed_expressions", ["neutral", "smile", "happy", "unknown"])),
+).split(",") if os.environ.get("FACES_ALLOWED_EXPRESSIONS") else _QUALITY_GATING_CONFIG.get("allowed_expressions", ["neutral", "smile", "happy", "unknown"])
+
 BYTE_TRACK_BUFFER_DEFAULT = TRACK_BUFFER_BASE_DEFAULT
 BYTE_TRACK_HIGH_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
 BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = TRACK_NEW_THRESH_DEFAULT
@@ -3281,6 +3353,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
     parser.add_argument(
+        "--profile",
+        choices=["fast_cpu", "low_power", "balanced", "high_accuracy"],
+        default=None,
+        help=(
+            "Performance profile (fast_cpu/low_power/balanced/high_accuracy). "
+            "Automatically adjusts stride, FPS limit, and min_size for target hardware. "
+            "Defaults to 'balanced'. Override specific settings with CLI flags."
+        ),
+    )
+    parser.add_argument(
         "--stride",
         type=int,
         default=6,
@@ -3526,6 +3608,26 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Apply performance profile settings (if not overridden by CLI flags)
+    if hasattr(args, "profile") and args.profile:
+        profile = _load_performance_profile(args.profile)
+        if profile:
+            # Apply profile defaults only if not explicitly set via CLI
+            if not hasattr(args, "stride") or args.stride == 6:  # 6 is default
+                args.stride = profile.get("frame_stride", args.stride)
+                LOGGER.info("[PROFILE] Applied frame_stride=%d from %s profile", args.stride, args.profile)
+
+            if not hasattr(args, "fps") or args.fps is None:
+                detection_fps_limit = profile.get("detection_fps_limit")
+                if detection_fps_limit:
+                    args.fps = float(detection_fps_limit)
+                    LOGGER.info("[PROFILE] Applied fps=%.1f from %s profile", args.fps, args.profile)
+
+            # Apply detection min_size if not explicitly set
+            # Note: min_size is not a CLI arg yet, but profiles can influence other detection settings
+            LOGGER.info("[PROFILE] Loaded %s profile: %s", args.profile, profile.get("description", ""))
+
     coreml_size_arg = getattr(args, "coreml_det_size", None)
     if coreml_size_arg:
         args.coreml_det_size = _parse_retinaface_det_size(coreml_size_arg)
@@ -4827,13 +4929,79 @@ def _run_full_pipeline(
         row["detector"] = detector_choice
         row["tracker"] = tracker_label
     _write_jsonl(track_path, track_rows)
+
+    # Calculate derived metrics
+    tracks_born = recorder.metrics["tracks_born"]
+    tracks_lost = recorder.metrics["tracks_lost"]
+    id_switches = recorder.metrics["id_switches"]
+    forced_splits = recorder.metrics.get("forced_splits", 0)
+
+    # Episode duration in minutes (from frames sampled and FPS)
+    duration_min = 0.0
+    if analyzed_fps and analyzed_fps > 0 and frames_sampled > 0:
+        duration_min = (frames_sampled / analyzed_fps) / 60.0
+
+    # Tracks per minute
+    tracks_per_minute = 0.0
+    if duration_min > 0:
+        tracks_per_minute = tracks_born / duration_min
+
+    # Short track fraction (tracks filtered out due to min_track_length)
+    short_track_fraction = 0.0
+    if len(all_track_rows) > 0:
+        short_track_count = len(all_track_rows) - len(track_rows)
+        short_track_fraction = short_track_count / len(all_track_rows)
+
+    # ID switch rate
+    id_switch_rate = 0.0
+    if tracks_born > 0:
+        id_switch_rate = id_switches / tracks_born
+
+    # Guardrails: Emit warnings when metrics exceed thresholds
+    # (based on docs/ops/troubleshooting_faces_pipeline.md and ACCEPTANCE_MATRIX.md)
+    if tracks_per_minute > 50:
+        LOGGER.warning(
+            "[GUARDRAIL] High track count detected: %.1f tracks/min (threshold: 50). "
+            "This may indicate track explosion. Consider increasing track_thresh to 0.75-0.85 "
+            "or new_track_thresh to 0.85-0.90. See docs/ops/troubleshooting_faces_pipeline.md",
+            tracks_per_minute,
+        )
+
+    if short_track_fraction > 0.3:
+        LOGGER.warning(
+            "[GUARDRAIL] High short track fraction: %.2f (threshold: 0.30). "
+            "%.1f%% of tracks are ghost tracks (<%d frames). "
+            "Consider increasing min_box_area to 400 or new_track_thresh to 0.85-0.90. "
+            "See docs/ops/troubleshooting_faces_pipeline.md",
+            short_track_fraction,
+            short_track_fraction * 100,
+            min_track_length,
+        )
+
+    if id_switch_rate > 0.1:
+        LOGGER.warning(
+            "[GUARDRAIL] High ID switch rate: %.3f (threshold: 0.10). "
+            "Tracker is unstable with %.1f%% of tracks experiencing ID switches. "
+            "Consider increasing match_thresh to 0.85-0.90, track_buffer to 120-180, "
+            "or decreasing TRACK_GATE_APPEAR_HARD to 0.60. "
+            "See docs/ops/troubleshooting_faces_pipeline.md",
+            id_switch_rate,
+            id_switch_rate * 100,
+        )
+
     metrics = {
-        "tracks_born": recorder.metrics["tracks_born"],
-        "tracks_lost": recorder.metrics["tracks_lost"],
-        "id_switches": recorder.metrics["id_switches"],
-        "forced_splits": recorder.metrics.get("forced_splits", 0),
+        "tracks_born": tracks_born,
+        "tracks_lost": tracks_lost,
+        "id_switches": id_switches,
+        "forced_splits": forced_splits,
         "longest_tracks": recorder.top_long_tracks(),
         "max_gap_frames": recorder.max_gap,
+        # Derived metrics
+        "duration_minutes": round(duration_min, 2),
+        "tracks_per_minute": round(tracks_per_minute, 2),
+        "short_track_count": len(all_track_rows) - len(track_rows),
+        "short_track_fraction": round(short_track_fraction, 3),
+        "id_switch_rate": round(id_switch_rate, 3),
     }
     if tracker_config_summary:
         metrics["tracker_config"] = tracker_config_summary
@@ -5811,6 +5979,11 @@ def _update_track_embeddings(
         return
     rows = list(_iter_jsonl(track_path))
     updated: List[dict] = []
+
+    # Collect track embeddings for writing to tracks.npy
+    track_embeds_array: List[np.ndarray] = []
+    track_ids_array: List[int] = []
+
     for row in rows:
         track_id = int(row.get("track_id", -1))
         samples = track_embeddings.get(track_id) or []
@@ -5823,6 +5996,10 @@ def _update_track_embeddings(
                 row["face_embedding_samples"] = sample_count
                 if spread is not None:
                     row["face_embedding_spread"] = round(float(spread), 4)
+
+                # Collect for tracks.npy
+                track_embeds_array.append(proto_vec)
+                track_ids_array.append(track_id)
         thumb_info = track_best_thumb.get(track_id)
         if thumb_info:
             _, rel_path, s3_key = thumb_info
@@ -5832,6 +6009,29 @@ def _update_track_embeddings(
         updated.append(row)
     if updated:
         _write_jsonl(track_path, updated)
+
+    # Write track embeddings to tracks.npy (for clustering)
+    # This provides a consolidated array of track-level embeddings
+    if track_embeds_array:
+        ep_id = track_path.parent.parent.name  # Extract ep_id from path
+        embeds_dir = track_path.parents[2] / "embeds" / ep_id
+        embeds_dir.mkdir(parents=True, exist_ok=True)
+        tracks_npy_path = embeds_dir / "tracks.npy"
+        track_ids_path = embeds_dir / "track_ids.json"
+
+        np.save(tracks_npy_path, np.vstack(track_embeds_array))
+
+        # Write track_ids.json mapping (index → track_id)
+        import json
+        with open(track_ids_path, 'w') as f:
+            json.dump(track_ids_array, f)
+
+        LOGGER.info(
+            "Wrote %d track embeddings to %s (shape: %s)",
+            len(track_embeds_array),
+            tracks_npy_path,
+            np.vstack(track_embeds_array).shape
+        )
 
 
 def _run_cluster_stage(
@@ -6077,6 +6277,69 @@ def _run_cluster_stage(
 
         identities_path = manifests_dir / "identities.json"
         low_cohesion_count = sum(1 for identity in identity_payload if identity.get("low_cohesion"))
+
+        # Compute cluster metrics
+        total_clusters = len(identity_payload)
+        total_tracks = sum(len(identity.get("track_ids", [])) for identity in identity_payload)
+
+        # Singleton fraction (identities with only 1 track)
+        singleton_count = sum(1 for identity in identity_payload if len(identity.get("track_ids", [])) == 1)
+        singleton_fraction = singleton_count / total_clusters if total_clusters > 0 else 0.0
+
+        # Largest cluster fraction (largest identity's track count / total tracks)
+        largest_cluster_size = max((len(identity.get("track_ids", [])) for identity in identity_payload), default=0)
+        largest_cluster_fraction = largest_cluster_size / total_tracks if total_tracks > 0 else 0.0
+
+        # Guardrails: Emit warnings when cluster metrics exceed thresholds
+        # (based on docs/ops/troubleshooting_faces_pipeline.md and ACCEPTANCE_MATRIX.md)
+        cluster_thresholds = _CLUSTERING_CONFIG_EARLY.get("metrics_thresholds", {})
+
+        if singleton_fraction > cluster_thresholds.get("max_singleton_fraction", 0.50):
+            LOGGER.warning(
+                "[GUARDRAIL] High singleton fraction: %.2f (threshold: %.2f). "
+                "%.1f%% of identities are singletons (single-track clusters). "
+                "Consider decreasing cluster_thresh to %.2f-%.2f or increasing min_quality in faces_embed. "
+                "See docs/ops/troubleshooting_faces_pipeline.md",
+                singleton_fraction,
+                cluster_thresholds.get("max_singleton_fraction", 0.50),
+                singleton_fraction * 100,
+                args.cluster_thresh - 0.05,
+                args.cluster_thresh - 0.08,
+            )
+
+        if largest_cluster_fraction > cluster_thresholds.get("max_largest_cluster_fraction", 0.60):
+            LOGGER.warning(
+                "[GUARDRAIL] Over-merged largest cluster: %.2f (threshold: %.2f). "
+                "One identity contains %.1f%% of all tracks (possibly multiple people). "
+                "Consider increasing cluster_thresh to %.2f-%.2f. "
+                "See docs/ops/troubleshooting_faces_pipeline.md",
+                largest_cluster_fraction,
+                cluster_thresholds.get("max_largest_cluster_fraction", 0.60),
+                largest_cluster_fraction * 100,
+                args.cluster_thresh + 0.05,
+                args.cluster_thresh + 0.10,
+            )
+
+        if total_clusters < cluster_thresholds.get("min_cluster_count", 3):
+            LOGGER.warning(
+                "[GUARDRAIL] Very few identities detected: %d (threshold: %d). "
+                "This may indicate under-segmentation. "
+                "Consider decreasing cluster_thresh or reviewing embedding quality. "
+                "See docs/ops/troubleshooting_faces_pipeline.md",
+                total_clusters,
+                cluster_thresholds.get("min_cluster_count", 3),
+            )
+
+        if total_clusters > cluster_thresholds.get("max_cluster_count", 50):
+            LOGGER.warning(
+                "[GUARDRAIL] Very many identities detected: %d (threshold: %d). "
+                "This may indicate over-segmentation. "
+                "Consider increasing cluster_thresh or reviewing track quality. "
+                "See docs/ops/troubleshooting_faces_pipeline.md",
+                total_clusters,
+                cluster_thresholds.get("max_cluster_count", 50),
+            )
+
         payload = {
             "ep_id": args.ep_id,
             "pipeline_ver": PIPELINE_VERSION,
@@ -6087,10 +6350,16 @@ def _run_cluster_stage(
             },
             "stats": {
                 "faces": faces_total,
-                "clusters": len(identity_payload),
+                "clusters": total_clusters,
+                "total_tracks": total_tracks,
                 "mixed_tracks": len(flagged_tracks),
                 "outlier_tracks": len(outlier_tracks),
                 "low_cohesion_identities": low_cohesion_count,
+                # Cluster metrics
+                "singleton_count": singleton_count,
+                "singleton_fraction": round(singleton_fraction, 3),
+                "largest_cluster_size": largest_cluster_size,
+                "largest_cluster_fraction": round(largest_cluster_fraction, 3),
             },
             "identities": identity_payload,
         }

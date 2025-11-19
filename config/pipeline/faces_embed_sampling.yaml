@@ -2,6 +2,32 @@
 # This controls how many samples per track get embedded/exported,
 # independent of detection/tracking which runs on every frame.
 
+# Quality gating thresholds
+# These control which faces are accepted for embedding based on quality metrics
+quality_gating:
+  # Combined quality score threshold (0.0-10.0, higher = stricter)
+  # Quality score combines: blur + contrast + face size
+  min_quality_score: 3.0
+
+  # Individual component thresholds
+  min_confidence: 0.60      # Detection confidence (0.0-1.0)
+  min_blur_score: 35.0      # Laplacian variance (higher = sharper)
+  min_std: 1.0              # Image standard deviation (contrast)
+
+  # Pose filtering (degrees)
+  max_yaw_angle: 45.0       # Maximum head rotation (left/right)
+  max_pitch_angle: 30.0     # Maximum head tilt (up/down)
+
+  # Expression filtering (list of allowed expressions, or empty for all)
+  allowed_expressions:
+    - neutral
+    - smile
+    - happy
+    - unknown
+
+  # Sampling strategy: "uniform", "quality_weighted", "stratified"
+  sampling_mode: "quality_weighted"
+
 detect_track_presets:
   bravo_24fps_default:
     # Detection/tracking runs on EVERY frame (stride=1)
