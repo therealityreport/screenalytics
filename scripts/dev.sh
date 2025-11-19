@@ -22,21 +22,10 @@ if command -v cpulimit >/dev/null 2>&1 && [[ "${CPULIMIT_PERCENT}" =~ ^[0-9]+$ ]
 else
   CPULIMIT_PREFIX=()
 fi
-# Cap math/BLAS thread pools to keep local detect/track runs from overheating laptops.
-# Aggressive thread limits to prevent 400%+ CPU usage during faces harvest
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
-export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-2}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-2}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
-
-# OpenCV thread control (for PySceneDetect video decoding)
-export OPENCV_NUM_THREADS="${OPENCV_NUM_THREADS:-2}"
-
-# ONNX Runtime thread control (for insightface ArcFace embeddings)
-export ORT_SESS_THREADS="${ORT_SESS_THREADS:-1}"
-export ORT_INTRA_OP_NUM_THREADS="${ORT_INTRA_OP_NUM_THREADS:-2}"
-export ORT_INTER_OP_NUM_THREADS="${ORT_INTER_OP_NUM_THREADS:-1}"
+# CPU thread limits are now managed by apps/common/cpu_limits.py
+# Override the default (3 threads = ~300% CPU) by setting SCREANALYTICS_MAX_CPU_THREADS
+# Example: export SCREENALYTICS_MAX_CPU_THREADS=5  # for ~500% CPU usage
+export SCREANALYTICS_MAX_CPU_THREADS="${SCREANALYTICS_MAX_CPU_THREADS:-3}"
 
 if [[ "$STORAGE_BACKEND" == "s3" && -z "$AWS_S3_BUCKET" ]]; then
   echo "AWS_S3_BUCKET must be set when STORAGE_BACKEND=s3" >&2

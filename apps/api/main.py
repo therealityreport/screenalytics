@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# Apply global CPU limits BEFORE importing any ML libraries or heavy dependencies
+# Uses centralized configuration from apps.common.cpu_limits (default: 3 threads = ~300% CPU)
+# Override with env var: SCREANALYTICS_MAX_CPU_THREADS=N
+from apps.common.cpu_limits import apply_global_cpu_limits
+apply_global_cpu_limits()
+
 import asyncio
 import logging
 import os

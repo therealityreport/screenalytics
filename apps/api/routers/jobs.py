@@ -104,7 +104,7 @@ class TrackRequest(BaseModel):
 
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stride: int = Field(4, description="Frame stride for detection sampling")
+    stride: int = Field(6, description="Frame stride for detection sampling (default: 6)")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
     device: DEVICE_LITERAL = Field(
         "auto",

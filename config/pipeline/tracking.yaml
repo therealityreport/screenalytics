@@ -2,13 +2,29 @@
 # Higher thresholds for better accuracy, less multi-person contamination
 
 # ByteTrack spatial matching
-track_thresh: 0.65      # Min confidence to track (was 0.5) - filters low-quality detections
-match_thresh: 0.90      # IoU threshold for bbox matching (was 0.85) - prevents track jumping
-track_buffer: 25        # Frames to keep track alive (was 15) - reduces track fragmentation
+track_thresh: 0.70      # Min confidence to track (was 0.65) - filters low-quality detections
+match_thresh: 0.85      # T3: IoU threshold for bbox matching (increased from 0.80 for stricter consistency)
+track_buffer: 90        # Frames to keep track alive (≈3-4s at typical TV FPS) - reduces track fragmentation
+max_track_buffer: 300   # T10: Maximum buffer cap (prevents runaway memory on high-stride runs)
 
+# T4: Separate thresholds for new vs. continuing tracks
+new_track_thresh: 0.85  # Higher threshold for starting new tracks (makes false positives less persistent)
+# track_thresh (0.70) is used for continuing existing tracks (easier to maintain than to start)
+
+# T2: AppearanceGate enabled by default
+gate_enabled: true      # Enable appearance-based track splitting
+
+# T7: Softer appearance thresholds (prevent splits on temporary pose changes)
 # Appearance gate thresholds set via environment variables in episode_run.py:
-# - TRACK_GATE_APPEAR_HARD: default 0.75 (was 0.60) - hard split if similarity < 75%
-# - TRACK_GATE_APPEAR_SOFT: default 0.82 (was 0.70) - soft split if similarity < 82%
-# - TRACK_GATE_APPEAR_STREAK: default 2 - consecutive low-sim frames before split
+# - TRACK_GATE_APPEAR_HARD: default 0.65 (was 0.75) - hard split if similarity < 65%
+# - TRACK_GATE_APPEAR_SOFT: default 0.75 (was 0.82) - soft split if similarity < 75%
+# - TRACK_GATE_APPEAR_STREAK: default 3 (was 2) - consecutive low-sim frames before split
 # - TRACK_GATE_IOU: default 0.50 (was 0.40) - split if spatial jump (IoU < 50%)
-# - TRACK_GATE_EMB_EVERY: default 10 - extract embeddings every 10 frames (reduced from 5 for thermal performance)
+# - TRACK_GATE_EMB_EVERY: default 24 - extract embeddings every 24 frames (reduced from 10 for thermal performance)
+
+# T5: Global Motion Compensation (GMC) for camera pans/zooms
+# Set via SCREENALYTICS_GMC_METHOD environment variable (default: "sparseOptFlow")
+# Options: "sparseOptFlow", "orb", "off"
+
+# T6: FPS-scaled max gap
+# TRACK_MAX_GAP_SEC: default 2.0 seconds (ensures gap is time-based, not frame-based)

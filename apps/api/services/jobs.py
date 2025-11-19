@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import shutil
 import signal
@@ -13,6 +15,14 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
+
+try:
+    import psutil  # type: ignore
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _PSUTIL_AVAILABLE = False
+
+LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -36,17 +46,27 @@ if _SCENE_DETECTOR_ENV not in SCENE_DETECTOR_CHOICES:
     _SCENE_DETECTOR_ENV = "pyscenedetect"
 SCENE_DETECTOR_DEFAULT = getattr(episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV)
 try:
-    _CPULIMIT_PERCENT = int(os.environ.get("SCREENALYTICS_CPULIMIT_PERCENT", "250"))
+    _CPULIMIT_PERCENT = int(os.environ.get("SCREANALYTICS_CPULIMIT_PERCENT", "250"))
 except ValueError:
-    _CPULIMIT_PERCENT = 0
+    _CPULIMIT_PERCENT = 250  # Default to 250% even on ValueError
 
 
 def _maybe_wrap_with_cpulimit(command: list[str]) -> list[str]:
-    """Prefix detect jobs with cpulimit when configured."""
+    """Prefix detect jobs with cpulimit when configured.
+    
+    Logs a warning if SCREANALYTICS_CPULIMIT_PERCENT is set but cpulimit
+    binary is unavailable, so operators know the CPU cap is not enforced.
+    """
     if _CPULIMIT_PERCENT <= 0:
         return command
     binary = shutil.which("cpulimit")
     if not binary:
+        LOGGER.warning(
+            "SCREANALYTICS_CPULIMIT_PERCENT=%d is set but 'cpulimit' binary not found. "
+            "CPU usage will NOT be capped. Install cpulimit (brew install cpulimit / apt install cpulimit) "
+            "or the process will use fallback CPU affinity if psutil is available.",
+            _CPULIMIT_PERCENT,
+        )
         return command
     return [binary, "-l", str(_CPULIMIT_PERCENT), "-i", "--", *command]
 
@@ -251,6 +271,11 @@ class JobService:
             stderr=stderr_file,
             stdout=subprocess.DEVNULL,  # Stdout goes to progress.json via ProgressEmitter
         )  # noqa: S603
+        
+        # Apply CPU affinity fallback if cpulimit wrapper wasn't applied
+        if _CPULIMIT_PERCENT > 0 and effective_command == command:
+            # cpulimit wasn't available, try psutil affinity fallback
+            _apply_cpu_affinity_fallback(proc.pid, _CPULIMIT_PERCENT)
 
         record: JobRecord = {
             "job_id": job_id,
