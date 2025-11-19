@@ -8,9 +8,10 @@ import math
 import mimetypes
 import numbers
 import os
-import re
-import time
 import platform
+import re
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -19,15 +20,20 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner.script_run_context import (
+    add_script_run_ctx,
+    get_script_run_ctx,
+)
+from streamlit.runtime.scriptrunner.script_requests import RerunData
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DEFAULT_STRIDE = 4
+DEFAULT_STRIDE = 6
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
-DEFAULT_DEVICE = "auto"
-DEFAULT_DEVICE_LABEL = "Auto"
-DEFAULT_DET_THRESH = 0.5
+DEFAULT_DEVICE = "coreml"
+DEFAULT_DEVICE_LABEL = "CoreML"
+DEFAULT_DET_THRESH = 0.65
 DEFAULT_MAX_GAP = 60
 DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
@@ -83,6 +89,9 @@ MIN_BOX_AREA_DEFAULT = max(
 # Thumbnail constants
 THUMB_W, THUMB_H = 200, 250
 _PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
+_THUMB_CACHE_STATE_KEY = "_thumb_async_cache"
+_THUMB_JOB_STATE_KEY = "_thumb_async_jobs"
+_MAX_ASYNC_THUMB_WORKERS = 8
 
 LABEL = {
     DEFAULT_DETECTOR: "RetinaFace (recommended)",
@@ -111,6 +120,10 @@ TRACKER_OPTIONS = [
 TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
 TRACKER_VALUE_MAP = {label: value for label, value in TRACKER_OPTIONS}
 TRACKER_LABEL_MAP = {value: label for label, value in TRACKER_OPTIONS}
+SUPPORTED_PIPELINE_COMBOS = {
+    "harvest": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
+    "cluster": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
+}
 SCENE_DETECTOR_OPTIONS = [
     ("PySceneDetect (recommended)", "pyscenedetect"),
     ("HSV histogram (fallback)", "internal"),
@@ -858,6 +871,29 @@ def tracks_tracker_value(ep_id: str) -> str | None:
     except OSError:
         return None
     return None
+
+
+def detect_tracker_combo(ep_id: str, detect_status: Dict[str, Any] | None = None) -> tuple[str | None, str | None]:
+    detector = tracks_detector_value(ep_id)
+    tracker = tracks_tracker_value(ep_id)
+    if not detector and detect_status:
+        detector = detect_status.get("detector")
+    if not tracker and detect_status:
+        tracker = detect_status.get("tracker")
+    det_value = str(detector).lower() if detector else None
+    tracker_value = str(tracker).lower() if tracker else None
+    return det_value, tracker_value
+
+
+def pipeline_combo_supported(stage: str, detector: str | None, tracker: str | None) -> bool:
+    det_value = str(detector).lower() if detector else None
+    tracker_value = str(tracker).lower() if tracker else None
+    if not det_value or not tracker_value:
+        return False
+    combos = SUPPORTED_PIPELINE_COMBOS.get(stage.lower())
+    if not combos:
+        return True
+    return (det_value, tracker_value) in combos
 
 
 def detector_is_face_only(ep_id: str, detect_status: Dict[str, Any] | None = None) -> bool:
@@ -1698,6 +1734,121 @@ def inject_thumb_css() -> None:
     """,
         unsafe_allow_html=True,
     )
+def _thumb_async_cache() -> Dict[str, Dict[str, Any]]:
+    cache = st.session_state.setdefault(_THUMB_CACHE_STATE_KEY, {})
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state[_THUMB_CACHE_STATE_KEY] = cache
+    return cache
+
+
+def _thumb_job_state() -> Dict[str, str]:
+    jobs = st.session_state.setdefault(_THUMB_JOB_STATE_KEY, {})
+    if not isinstance(jobs, dict):
+        jobs = {}
+        st.session_state[_THUMB_JOB_STATE_KEY] = jobs
+    return jobs
+
+
+def thumb_is_pending(src: str | None) -> bool:
+    if not src:
+        return False
+    entry = _thumb_async_cache().get(src)
+    return bool(entry and entry.get("status") == "pending")
+
+
+def _store_thumb_result(src: str, url: str | None, *, error: str | None = None) -> None:
+    cache = _thumb_async_cache()
+    cache[src] = {
+        "status": "ready" if url else "error",
+        "url": url,
+        "error": error,
+        "updated": time.time(),
+    }
+    jobs = _thumb_job_state()
+    jobs.pop(src, None)
+
+
+def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | None:
+    params = {"key": src, "ttl": ttl}
+    inferred_mime = _infer_mime(src)
+    response = requests.get(f"{api_base}/files/presign", params=params, timeout=3)
+    response.raise_for_status()
+    data = response.json()
+    presigned_url = data.get("url")
+    resolved_mime = data.get("content_type") or inferred_mime
+    if not presigned_url:
+        return None
+    if presigned_url.startswith("https://"):
+        return presigned_url
+    img_response = requests.get(presigned_url, timeout=5)
+    img_response.raise_for_status()
+    encoded = base64.b64encode(img_response.content).decode("ascii")
+    content_type = img_response.headers.get("content-type") or resolved_mime or "image/jpeg"
+    return f"data:{content_type};base64,{encoded}"
+
+
+def _thumb_worker_runner(src: str, api_base: str, ttl: int) -> None:
+    ctx = get_script_run_ctx()
+    if ctx is None:
+        return
+    error: str | None = None
+    url: str | None = None
+    try:
+        url = _blocking_thumb_fetch(src, api_base, ttl=ttl)
+    except requests.RequestException as exc:  # pragma: no cover - network errors
+        error = str(exc)
+        _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=error)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        error = str(exc)
+        _diag("UI_RESOLVE_FAIL", src=src, reason="thumb_worker_error", error=error)
+    _store_thumb_result(src, url, error=error)
+    if ctx.script_requests:
+        ctx.script_requests.request_rerun(
+            RerunData(query_string=ctx.query_string, page_script_hash=ctx.page_script_hash)
+        )
+
+
+def _start_thumb_worker(src: str, api_base: str, ttl: int = 3600) -> None:
+    jobs = _thumb_job_state()
+    status = jobs.get(src)
+    if status == "running":
+        return
+    running_now = sum(1 for value in jobs.values() if value == "running")
+    if running_now >= _MAX_ASYNC_THUMB_WORKERS:
+        jobs[src] = "queued"
+        return
+    ctx = get_script_run_ctx()
+    if ctx is None or ctx.script_requests is None:
+        err: str | None = None
+        try:
+            url = _blocking_thumb_fetch(src, api_base, ttl=ttl)
+        except Exception as exc:  # pragma: no cover
+            err = str(exc)
+            _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=err)
+            url = None
+        _store_thumb_result(src, url, error=err or (None if url else "presign_failed"))
+        return
+    jobs[src] = "running"
+    worker = threading.Thread(target=_thumb_worker_runner, args=(src, api_base, ttl), daemon=True)
+    add_script_run_ctx(worker, ctx)
+    worker.start()
+
+
+def _resolve_thumb_async(src: str, api_base: str) -> str | None:
+    cache = _thumb_async_cache()
+    entry = cache.get(src)
+    if entry:
+        status = entry.get("status")
+        if status == "ready":
+            return entry.get("url")
+        if status == "error":
+            cache.pop(src, None)
+            entry = None
+    if not entry:
+        cache[src] = {"status": "pending", "url": None, "error": None, "updated": time.time()}
+    _start_thumb_worker(src, api_base)
+    return None
 
 
 def resolve_thumb(src: str | None) -> str | None:
@@ -1708,22 +1859,17 @@ def resolve_thumb(src: str | None) -> str | None:
     2. HTTPS URL (S3 presigned) → return as-is (CORS-safe)
     3. HTTP localhost API URL → fetch and convert to data URL
     4. Local file path exists → convert to data URL
-    5. S3 key (artifacts/**) → presign via API → fetch and convert to data URL
+    5. S3 key (artifacts/**) → presign via API asynchronously
     6. None → return None for placeholder
     """
     if not src:
         return None
 
-    # Already a data URL? Return as-is
     if isinstance(src, str) and src.startswith("data:"):
         return src
-
-    # HTTPS URLs (S3 presigned) can be loaded directly - return as-is
     if isinstance(src, str) and src.startswith("https://"):
         return src
 
-    # HTTP localhost API URLs need to be fetched and converted to data URLs
-    # (Streamlit at :8501 can't load images from :8000 without CORS)
     if isinstance(src, str) and src.startswith("http://localhost:"):
         try:
             response = requests.get(src, timeout=2)
@@ -1732,14 +1878,8 @@ def resolve_thumb(src: str | None) -> str | None:
                 content_type = response.headers.get("content-type") or _infer_mime(src) or "image/jpeg"
                 return f"data:{content_type};base64,{encoded}"
         except Exception as exc:
-            _diag(
-                "UI_RESOLVE_FAIL",
-                src=src,
-                reason="localhost_fetch_error",
-                error=str(exc),
-            )
+            _diag("UI_RESOLVE_FAIL", src=src, reason="localhost_fetch_error", error=str(exc))
 
-    # Try as local file path
     try:
         path = Path(src)
         if path.exists() and path.is_file():
@@ -1749,33 +1889,13 @@ def resolve_thumb(src: str | None) -> str | None:
     except (OSError, ValueError) as exc:
         _diag("UI_RESOLVE_FAIL", src=src, reason="local_file_error", error=str(exc))
 
-    # Try as S3 key - call presign endpoint and then fetch
     if isinstance(src, str) and (
         src.startswith("artifacts/")
         or src.startswith("raw/")
         or ("/" in src and not src.startswith("/") and not src.startswith("http"))
     ):
-        try:
-            api_base = st.session_state.get("api_base") or "http://localhost:8000"
-            params = {"key": src, "ttl": 3600}
-            inferred_mime = _infer_mime(src)
-            response = requests.get(f"{api_base}/files/presign", params=params, timeout=2)
-            if response.ok:
-                data = response.json()
-                presigned_url = data.get("url")
-                resolved_mime = data.get("content_type") or inferred_mime
-                if presigned_url:
-                    # For HTTPS presigned URLs, return directly
-                    if presigned_url.startswith("https://"):
-                        return presigned_url
-                    # For HTTP URLs, fetch and convert to data URL
-                    img_response = requests.get(presigned_url, timeout=5)
-                    if img_response.ok and img_response.content:
-                        encoded = base64.b64encode(img_response.content).decode("ascii")
-                        content_type = img_response.headers.get("content-type") or resolved_mime or "image/jpeg"
-                        return f"data:{content_type};base64,{encoded}"
-        except Exception as exc:
-            _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=str(exc))
+        api_base = st.session_state.get("api_base") or _api_base()
+        return _resolve_thumb_async(src, api_base)
 
     _diag("UI_RESOLVE_FAIL", src=src, reason="all_methods_failed")
     return None
@@ -1819,6 +1939,7 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
     """
     placeholder = _placeholder_thumb_url()
     img = resolve_thumb(src)
+    pending = thumb_is_pending(src)
     if not img:
         if hide_if_missing:
             return ""
@@ -1830,9 +1951,12 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
     else:
         escaped_placeholder = placeholder.replace("'", "\\'")
         onerror_handler = f"this.onerror=null;this.src='{escaped_placeholder}';"
+    wrapper_class = "thumb"
+    if pending and img == placeholder:
+        wrapper_class = "thumb thumb-skeleton"
 
     return (
-        '<div class="thumb">'
+        f'<div class="{wrapper_class}">'
         f'<img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
         "</div>"
     )
