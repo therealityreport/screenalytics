@@ -680,6 +680,7 @@ class JobService:
         normalized_actions = [action for action in actions if action in CLEANUP_ACTIONS] or list(CLEANUP_ACTIONS)
         command += ["--actions", *normalized_actions]
         requested = {
+            "profile": profile,
             "stride": stride,
             "fps": fps,
             "device": device,
