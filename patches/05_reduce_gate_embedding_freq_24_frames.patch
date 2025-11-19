@@ -1,0 +1,11 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -203,8 +203,8 @@ GATE_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
+ GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
+ GATE_EMB_EVERY_DEFAULT = max(
+-    int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0
+-)  # Reduced from 5 to 10 for better thermal performance
++    int(os.environ.get("TRACK_GATE_EMB_EVERY", "24")), 0
++)  # Compute embeddings every 24 frames (~1 second at 24fps) for better performance balance
+ # ByteTrack spatial matching - strict defaults
+ TRACK_BUFFER_BASE_DEFAULT = max(

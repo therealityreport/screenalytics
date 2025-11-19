@@ -1,0 +1,44 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -3270,15 +3270,35 @@ def _run_detect_track_stage(
+         detection_conf_hist["0.9-1.0"] += 1
+ 
+     cap = cv2.VideoCapture(str(video_dest))
+     if not cap.isOpened():
+         raise FileNotFoundError(f"Unable to open video {video_dest}")
+ 
++    # Track whether frame seeking is reliable for this video codec
++    seeking_enabled = frame_stride > 1
++    seeking_failed_count = 0
++    max_seeking_failures = 5  # Disable seeking after 5 consecutive failures
++
+     try:
+         with det_path.open("w", encoding="utf-8") as det_handle:
+             while True:
+-                ok, frame = cap.read()
+-                if not ok:
+-                    break
++                # Smart frame seeking: skip frames at the decoder level when stride > 1
++                # This avoids unnecessary I/O for frames we won't process
++                if seeking_enabled and frame_idx > 0:
++                    # Seek to next target frame (frame_idx + frame_stride)
++                    target_frame = frame_idx + frame_stride
++                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame - 1)
++                    ok, frame = cap.read()
++                    actual_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
++                    
++                    # Verify seeking worked correctly (within 2 frames tolerance)
++                    if abs(actual_frame - target_frame) > 2:
++                        seeking_failed_count += 1
++                        if seeking_failed_count >= max_seeking_failures:
++                            LOGGER.warning("Frame seeking unreliable for this codec, falling back to sequential read")
++                            seeking_enabled = False
++                    frame_idx = actual_frame
++                else:
++                    ok, frame = cap.read()
++                
++                if not ok:
++                    break
+ 
+                 # Guard against empty/None frames before detection
+                 if frame is None or frame.size == 0:

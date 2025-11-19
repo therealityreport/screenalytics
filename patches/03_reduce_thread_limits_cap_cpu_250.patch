@@ -1,0 +1,27 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -20,14 +20,14 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+ import logging
+ 
+-# Force thread limits before importing ML libraries
+-os.environ.setdefault("OMP_NUM_THREADS", "2")
+-os.environ.setdefault("MKL_NUM_THREADS", "2") 
+-os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "2")
+-os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+-os.environ.setdefault("OPENCV_NUM_THREADS", "2")
+-os.environ.setdefault("ORT_INTRA_OP_NUM_THREADS", "2")
+-os.environ.setdefault("ORT_INTER_OP_NUM_THREADS", "1")
++# Force thread limits to cap at ~250% CPU (2.5 cores total)
++# 1 thread per library for most, reserve extra threads for ONNX inference
++os.environ.setdefault("OMP_NUM_THREADS", "1")
++os.environ.setdefault("MKL_NUM_THREADS", "1") 
++os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
++os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
++os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
++os.environ.setdefault("OPENCV_NUM_THREADS", "1")
++os.environ.setdefault("ORT_INTRA_OP_NUM_THREADS", "2")  # ONNX gets 2 threads for inference
++os.environ.setdefault("ORT_INTER_OP_NUM_THREADS", "1")  # 1 thread for graph execution
+ 
+ 
+ import numpy as np

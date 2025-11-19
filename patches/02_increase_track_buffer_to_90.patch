@@ -1,0 +1,26 @@
+--- a/config/pipeline/tracking.yaml
++++ b/config/pipeline/tracking.yaml
+@@ -4,7 +4,7 @@
+ # ByteTrack spatial matching
+ track_thresh: 0.65      # Min confidence to track (was 0.5) - filters low-quality detections
+ match_thresh: 0.90      # IoU threshold for bbox matching (was 0.85) - prevents track jumping
+-track_buffer: 25        # Frames to keep track alive (was 15) - reduces track fragmentation
++track_buffer: 90        # Frames to keep track alive (~3.75 seconds at 24fps) - maintains tracks through brief occlusions
+ 
+ # Appearance gate thresholds set via environment variables in episode_run.py:
+ # - TRACK_GATE_APPEAR_HARD: default 0.75 (was 0.60) - hard split if similarity < 75%
+@@ -12,4 +12,4 @@ track_buffer: 25        # Frames to keep track alive (was 15) - reduces track f
+ # - TRACK_GATE_APPEAR_STREAK: default 2 - consecutive low-sim frames before split
+ # - TRACK_GATE_IOU: default 0.50 (was 0.40) - split if spatial jump (IoU < 50%)
+-# - TRACK_GATE_EMB_EVERY: default 10 - extract embeddings every 10 frames (reduced from 5 for thermal performance)
++# - TRACK_GATE_EMB_EVERY: default 24 - extract embeddings every 24 frames (~1 sec, reduced for performance)
+
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -207,7 +207,7 @@ GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_M
+ # ByteTrack spatial matching - strict defaults
+ TRACK_BUFFER_BASE_DEFAULT = max(
+-    _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
++    _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 90)),
+     1,
+ )

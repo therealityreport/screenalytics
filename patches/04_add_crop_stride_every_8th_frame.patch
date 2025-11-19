@@ -1,0 +1,22 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -3695,10 +3695,17 @@ def _run_detect_track_stage(
+                             row["landmarks"] = [round(float(val), 4) for val in landmarks]
+                         det_handle.write(json.dumps(row) + "\n")
+                         det_count += 1
+-                        if frame_exporter and frame_exporter.save_crops:
++                        
++                        # Generate crops only every 8th frame to reduce I/O and storage
++                        # This provides sufficient sampling for embeddings while reducing overhead
++                        crop_stride = 8
++                        should_crop = (frame_idx % crop_stride == 0)
++                        if frame_exporter and frame_exporter.save_crops and should_crop:
+                             crop_records.append((export_id, bbox_list))
+ 
+                     if appearance_gate:
+                         appearance_gate.prune(active_ids)
+ 
+-                    if frame_exporter and (frame_exporter.save_frames or crop_records):
++                    # Export frame with crops if there are any crops to save
++                    if frame_exporter and crop_records:
+                         frame_exporter.export(frame_idx, frame, crop_records, ts=ts)

@@ -1,0 +1,89 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -3374,23 +3374,16 @@ def _run_detect_track_stage(
+                     # Validate detection bboxes before tracking to prevent NoneType multiply errors
+                     validated_detections = []
+                     invalid_bbox_count = 0
+                     for det_sample in face_detections:
+                         _record_detection_conf(float(det_sample.conf))
+ 
+-                        # Validate bbox coordinates
+-                        validated_bbox, bbox_err = _safe_bbox_or_none(det_sample.bbox)
+-                        if validated_bbox is None:
++                        # Basic bbox validation - detailed validation happens after tracking
++                        if det_sample.bbox is None or len(det_sample.bbox) < 4:
+                             invalid_bbox_count += 1
+-                            LOGGER.warning(
+-                                "Dropping detection at frame %d for %s: invalid bbox (%s) - bbox=%s",
+-                                frame_idx,
+-                                args.ep_id,
+-                                bbox_err,
+-                                det_sample.bbox,
+-                            )
+                             continue
+ 
+-                        # Update detection with validated bbox
+-                        det_sample.bbox = np.array(validated_bbox)
+                         validated_detections.append(det_sample)
+ 
+                     if invalid_bbox_count > 0:
+-                        LOGGER.info(
++                        LOGGER.debug(
+                             "Frame %d for %s: dropped %d/%d detections due to invalid bboxes",
+                             frame_idx,
+@@ -3420,7 +3413,7 @@ def _run_detect_track_stage(
+ 
+                     # Wrap tracker update in specific try/except to catch NoneType multiply errors
+                     try:
+                         raw_tracked_objects = tracker_adapter.update(validated_detections, frame_idx, frame)
+                     except TypeError as e:
+@@ -3449,23 +3442,17 @@ def _run_detect_track_stage(
+                             len(raw_tracked_objects),
+                         )
+ 
+-                    # Validate tracked object bboxes (ByteTrack may return invalid bboxes)
++                    # CONSOLIDATED VALIDATION: Do comprehensive bbox validation once after tracking
+                     tracked_objects = []
+                     invalid_track_count = 0
+                     for track_obj in raw_tracked_objects:
+-                        validated_track_bbox, track_bbox_err = _safe_bbox_or_none(track_obj.bbox)
+-                        if validated_track_bbox is None:
++                        validated_bbox, bbox_err = _safe_bbox_or_none(track_obj.bbox)
++                        if validated_bbox is None:
+                             invalid_track_count += 1
+-                            LOGGER.warning(
+-                                "Dropping tracked object %s at frame %d for %s: invalid bbox (%s) - bbox=%s",
+-                                track_obj.track_id,
+-                                frame_idx,
+-                                args.ep_id,
+-                                track_bbox_err,
+-                                track_obj.bbox,
+-                            )
++                            if invalid_track_count <= 3:  # Only log first 3 to avoid spam
++                                LOGGER.debug("Dropped track %s at frame %d: %s", track_obj.track_id, frame_idx, bbox_err)
+                             continue
+                         # Update track object with validated bbox
+-                        track_obj.bbox = np.array(validated_track_bbox)
++                        track_obj.bbox = np.array(validated_bbox)
+                         tracked_objects.append(track_obj)
+ 
+                     if invalid_track_count > 0:
+@@ -3575,14 +3562,8 @@ def _run_detect_track_stage(
+                             embed_inputs: list[np.ndarray] = []
+                             embed_track_ids: list[int] = []
+                             for obj in tracked_objects:
+-                                # Validate bbox before cropping to prevent NoneType multiply errors
+-                                validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
+-                                if validated_bbox is None:
+-                                    LOGGER.debug(
+-                                        "Gate embedding skipped for track %s frame %d: invalid bbox (%s)",
+-                                        obj.track_id,
+-                                        frame_idx,
+-                                        bbox_err,
+-                                    )
+-                                    continue
++                                # Bbox already validated in tracking stage - no need to re-validate
++                                # This saves 33% of validation overhead
++                                validated_bbox = obj.bbox
+ 
+                                 landmarks_list = None

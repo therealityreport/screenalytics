@@ -1,0 +1,170 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -680,6 +680,40 @@ class AppearanceGate:
+         self._states: Dict[int, GateTrackState] = {}
+         self._counters = Counter()
+ 
++
++class EmbeddingBatchQueue:
++    """Queue for batching embeddings across multiple frames for better GPU utilization."""
++    
++    def __init__(self, max_batch_size: int = 32):
++        self.max_batch_size = max_batch_size
++        self.queue: List[Tuple[int, int, np.ndarray]] = []  # (track_id, frame_idx, crop)
++        
++    def add(self, track_id: int, frame_idx: int, crop: np.ndarray) -> None:
++        """Add a crop to the processing queue."""
++        self.queue.append((track_id, frame_idx, crop))
++    
++    def should_flush(self) -> bool:
++        """Check if queue is full and ready to process."""
++        return len(self.queue) >= self.max_batch_size
++    
++    def flush(self, embedder) -> Dict[Tuple[int, int], np.ndarray]:
++        """Process all queued crops and return embeddings indexed by (track_id, frame_idx)."""
++        if not self.queue:
++            return {}
++        
++        # Extract crops and process in a single batch
++        crops = [item[2] for item in self.queue]
++        embeddings = embedder.encode(crops)
++        
++        # Map embeddings back to (track_id, frame_idx)
++        result = {}
++        for idx, (track_id, frame_idx, _) in enumerate(self.queue):
++            result[(track_id, frame_idx)] = embeddings[idx]
++        
++        self.queue.clear()
++        return result
++
++
+     def reset_all(self) -> None:
+         """Reset all track states (e.g. on scene cuts)."""
+         self._states.clear()
+@@ -3180,6 +3214,9 @@ def _run_detect_track_stage(
+     gate_embed_stride = frame_stride
+     if tracker_choice == "bytetrack":
+         gate_config = _gate_config_from_args(args, frame_stride)
+         appearance_gate = AppearanceGate(gate_config)
++        # Initialize batch queue for cross-frame embedding optimization
++        embedding_batch_queue = EmbeddingBatchQueue(max_batch_size=32)
+         gate_embed_stride = gate_config.emb_every or frame_stride
+         try:
+             gate_embedder = ArcFaceEmbedder(device)
+@@ -3294,6 +3331,9 @@ def _run_detect_track_stage(
+                 if next_cut is not None and frame_idx >= next_cut:
+                     reset_tracker = getattr(tracker_adapter, "reset", None)
+                     if callable(reset_tracker):
+                         reset_tracker()
++                    # Flush embedding queue on scene cuts to avoid mixing identities
++                    if appearance_gate and embedding_batch_queue:
++                        embedding_batch_queue.queue.clear()
+                     if appearance_gate:
+                         appearance_gate.reset_all()
+@@ -3555,47 +3595,39 @@ def _run_detect_track_stage(
+                     crop_records: list[tuple[int, list[float]]] = []
+                     gate_embeddings: dict[int, np.ndarray | None] = {}
+-                    should_embed_gate = False
+                     if appearance_gate:
+                         should_embed_gate = True if frames_since_cut < scene_warmup else False
+                         stride_for_gate = gate_embed_stride or frame_stride
+                         if stride_for_gate > 1 and not should_embed_gate:
+                             should_embed_gate = frame_idx % stride_for_gate == 0
+                         else:
+                             should_embed_gate = True
++                        
+                         if should_embed_gate and gate_embedder and tracked_objects:
+-                            # DEBUG: Show gate embedding processing
+-                            if frames_sampled < 5:
+-                                LOGGER.error(
+-                                    "[DEBUG] Frame %d: processing gate embeddings for %d tracks",
+-                                    frame_idx,
+-                                    len(tracked_objects),
+-                                )
+-
+-                            embed_inputs: list[np.ndarray] = []
+-                            embed_track_ids: list[int] = []
++                            # Queue embeddings for batch processing across frames
+                             for obj in tracked_objects:
+                                 # Bbox already validated in tracking stage
+                                 validated_bbox = obj.bbox
+-
+                                 landmarks_list = None
+                                 if obj.landmarks is not None:
+                                     landmarks_list = (
+                                         obj.landmarks.tolist()
+                                         if isinstance(obj.landmarks, np.ndarray)
+                                         else obj.landmarks
+                                     )
+                                 crop, crop_err = _prepare_face_crop(
+                                     frame,
+                                     validated_bbox,
+                                     landmarks_list,
+                                     margin=0.2,
+                                 )
+-                                if crop is None:
+-                                    if crop_err:
+-                                        LOGGER.debug(
+-                                            "Gate crop failed for track %s: %s",
+-                                            obj.track_id,
+-                                            crop_err,
+-                                        )
+-                                    continue
++                                if crop is not None:
+                                 aligned = _resize_for_arcface(crop)
+-                                embed_inputs.append(aligned)
+-                                embed_track_ids.append(obj.track_id)
+-                            if embed_inputs:
+-                                encoded = gate_embedder.encode(embed_inputs)
+-                                for idx, tid in enumerate(embed_track_ids):
+-                                    embedding_vec = encoded[idx]
++                                    embedding_batch_queue.add(obj.track_id, frame_idx, aligned)
++                            
++                            # Process batch if queue is full
++                            if embedding_batch_queue.should_flush():
++                                batch_embeddings = embedding_batch_queue.flush(gate_embedder)
++                                # Extract embeddings for current frame only
++                                for (tid, fid), embedding_vec in batch_embeddings.items():
++                                    if fid == frame_idx:
+                                     # Validate embedding contains finite values before storing
+                                     try:
+                                         if embedding_vec is not None and np.all(np.isfinite(embedding_vec)):
+                                             gate_embeddings[tid] = embedding_vec
+                                         else:
+-                                            gate_embeddings[tid] = None
+-                                            if embedding_vec is not None:
+-                                                LOGGER.warning(
+-                                                    "Gate embedding for track %s at frame %d contains invalid values (NaN/Inf/None), discarding",
+-                                                    tid,
+-                                                    frame_idx,
+-                                                )
++                                                gate_embeddings[tid] = None
+                                     except (TypeError, ValueError):
+-                                        # Embedding contains None or non-numeric values
+                                         gate_embeddings[tid] = None
+-                                        LOGGER.warning(
+-                                            "Gate embedding for track %s at frame %d is not a valid numeric array, discarding",
+-                                            tid,
+-                                            frame_idx,
+-                                        )
++                        
+                         for obj in tracked_objects:
+                             gate_embeddings.setdefault(obj.track_id, None)
+-                        # TODO(perf): Persist gate_embeddings to reuse in faces embed stage.
+-                        # Would require: (1) extending tracks.jsonl schema to include gate_embedding,
+-                        # (2) saving embeddings in TrackRecorder, (3) loading in faces embed, (4)
+-                        # matching gate embedding to appropriate face sample per track. Requires
+-                        # invasive schema changes and careful handling of missing/mismatched cases.
+ 
+                     if not validated_detections:
+                         if frame_exporter and frame_exporter.save_frames:
+@@ -3860,6 +3892,10 @@ def _run_detect_track_stage(
+                 frame_idx += 1
+                 frames_since_cut += 1
++        
++        # Flush any remaining embeddings at end of video
++        if appearance_gate and embedding_batch_queue and embedding_batch_queue.queue:
++            embedding_batch_queue.flush(gate_embedder)
++
+     finally:
+         cap.release()

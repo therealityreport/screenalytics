@@ -1,0 +1,13 @@
+--- a/tools/episode_run.py
++++ b/tools/episode_run.py
+@@ -2586,8 +2586,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+     parser.add_argument(
+         "--stride",
+         type=int,
+-        default=1,
+-        help="Frame stride for detection (default: 1 = every frame)",
++        default=6,
++        help="Frame stride for detection (default: 6 = every 6th frame, ~4fps for 24fps video)",
+     )
+     parser.add_argument(
+         "--fps",
