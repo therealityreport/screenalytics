@@ -186,6 +186,26 @@ quality_score = (
 - **blur_score:** Laplacian variance normalized (higher variance = sharper = better)
 - **pose_score:** Based on yaw angle from landmarks (frontal = 1.0, extreme = 0.0)
 
+> **⚠️ CURRENT LIMITATION: Pose/Expression Gating Disabled**
+> 
+> Pose and expression extraction is **not currently implemented** in `tools/episode_run.py`.
+> The `_analyze_pose_expression()` function returns `(None, None, None)`, which means:
+> - **pose_score** is effectively 0 in the quality score calculation
+> - Yaw/pitch angle checks are **skipped** (no pose-based rejection)
+> - Expression filtering is **disabled**
+> 
+> **Impact on Quality:**
+> - Profile views, extreme head rotations, and unusual expressions are included
+> - May reduce clustering accuracy by mixing frontal and profile embeddings
+> - ArcFace embeddings from extreme poses can differ significantly from frontal views
+> 
+> **Configuration Exists But Not Enforced:**
+> - `max_yaw_angle: 45.0` (degrees) - defined but not checked
+> - `max_pitch_angle: 30.0` (degrees) - defined but not checked
+> - `allowed_expressions: [neutral, smile, happy, unknown]` - defined but not checked
+> 
+> See [tools/episode_run.py:628-685](../tools/episode_run.py) for implementation details.
+
 ### 7.2 Rejection Criteria
 Faces are **rejected** (not embedded) if:
 - `quality_score < min_quality` (default: 0.7)

@@ -577,33 +577,142 @@ def _insightface_model_dir(model_name: str) -> Path:
     return root / "models" / model_name
 
 
-def _embedding_is_valid(embedding: Optional[np.ndarray]) -> bool:
+def _embedding_is_valid(embedding: Optional[np.ndarray], expected_dim: int = 512) -> bool:
     """
-    Check if an embedding vector is valid.
+    Check if an embedding vector is valid and meets quality standards.
+
+    Validates that the embedding is:
+    - A non-None numpy array
+    - 1-dimensional with the expected dimension (default 512 for ArcFace)
+    - Contains only finite values (no NaN or inf)
+    - Has reasonable L2 norm (0.9-1.1 for normalized embeddings)
 
     Args:
         embedding: Numpy array embedding vector or None
+        expected_dim: Expected embedding dimension (default 512)
 
     Returns:
-        True if embedding is a non-None numpy array with at least one element
+        True if embedding passes all validation checks, False otherwise
     """
-    return embedding is not None and isinstance(embedding, np.ndarray) and embedding.size > 0
+    if embedding is None:
+        return False
+
+    if not isinstance(embedding, np.ndarray):
+        LOGGER.debug("Embedding validation failed: not a numpy array (type=%s)", type(embedding))
+        return False
+
+    # Check shape - must be 1D vector of expected dimension
+    if embedding.ndim != 1:
+        LOGGER.debug("Embedding validation failed: wrong ndim=%d (expected 1)", embedding.ndim)
+        return False
+
+    if embedding.shape[0] != expected_dim:
+        LOGGER.debug("Embedding validation failed: wrong dimension=%d (expected %d)", embedding.shape[0], expected_dim)
+        return False
+
+    # Check for NaN or inf values
+    if not np.isfinite(embedding).all():
+        LOGGER.debug("Embedding validation failed: contains NaN or inf values")
+        return False
+
+    # Check L2 norm - should be close to 1.0 for normalized embeddings
+    # Allow some tolerance for numerical precision
+    norm = np.linalg.norm(embedding)
+    if not (0.9 <= norm <= 1.1):
+        LOGGER.debug("Embedding validation failed: L2 norm=%.3f outside acceptable range [0.9, 1.1]", norm)
+        return False
+
+    return True
 
 
 def _analyze_pose_expression(landmarks: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     """
     Analyze facial landmarks to extract pose (yaw, pitch) and expression.
 
-    TODO: Implement actual pose/expression analysis from landmarks.
-    For now, returns None values to skip quality checks.
+    **CURRENT STATUS:** Pose and expression extraction is not implemented.
+    This function returns (None, None, None) to skip pose/expression quality gating.
+
+    **IMPACT ON QUALITY:**
+    - Pose gating is currently DISABLED (no filtering by head rotation)
+    - Expression gating is currently DISABLED (no filtering by facial expression)
+    - Config thresholds (max_yaw_angle=45°, max_pitch_angle=30°) are defined but not enforced
+    - This may reduce clustering quality by allowing extreme poses and occlusions
+    - Embeddings from profile views or unusual expressions will be included in clustering
+
+    **CONFIGURATION:**
+    Quality gating thresholds are defined in config/pipeline/faces_embed_sampling.yaml:
+    - max_yaw_angle: 45.0 (degrees) - Maximum head rotation left/right
+    - max_pitch_angle: 30.0 (degrees) - Maximum head tilt up/down
+    - allowed_expressions: [neutral, smile, happy, unknown]
+
+    These thresholds are loaded but not currently enforced because this function
+    returns None values.
+
+    **TODO - IMPLEMENTATION OPTIONS:**
+    
+    Option A: Geometric pose estimation from landmarks
+    - Extract 5-point landmarks (eyes, nose, mouth corners)
+    - Estimate yaw/pitch using geometric relationships
+    - Fast but less accurate for extreme poses
+    
+    Option B: Pose regression model
+    - Use dedicated head pose estimation model (e.g., FSA-Net, WHENet)
+    - More accurate across wide pose range
+    - Adds model loading overhead
+    
+    Option C: Explicit configuration flag
+    - Add enable_pose_gating config flag
+    - Make pose gating opt-in rather than silently disabled
+    - Document current limitation in pipeline docs
 
     Args:
-        landmarks: Facial landmark points from face detection
+        landmarks: Facial landmark points from face detection (currently unused)
 
     Returns:
-        Tuple of (yaw, pitch, expression) - all None for now
+        Tuple of (yaw, pitch, expression):
+        - yaw: Head rotation in degrees (None = not implemented)
+        - pitch: Head tilt in degrees (None = not implemented)
+        - expression: Facial expression label (None = not implemented)
     """
+    # POSE GATING CURRENTLY DISABLED - returns None to skip quality checks
     return (None, None, None)
+
+
+
+def _parse_track_id(track_id: Any) -> int:
+    """
+    Parse track_id from various formats (int, str like 'track-00000', etc).
+    
+    Args:
+        track_id: Track ID in any format (int, str, etc.)
+    
+    Returns:
+        Integer track ID
+    
+    Raises:
+        ValueError: If track_id cannot be parsed
+    """
+    if isinstance(track_id, int):
+        return track_id
+    
+    if isinstance(track_id, str):
+        # Handle "track-XXXXX" format
+        if track_id.startswith("track-"):
+            try:
+                return int(track_id.split("-")[1])
+            except (IndexError, ValueError) as exc:
+                raise ValueError(f"Invalid track ID format: {track_id}") from exc
+        # Handle plain numeric string
+        try:
+            return int(track_id)
+        except ValueError as exc:
+            raise ValueError(f"Invalid track ID: {track_id}") from exc
+    
+    # Try direct int conversion as fallback
+    try:
+        return int(track_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Cannot parse track_id: {track_id} (type={type(track_id)})") from exc
 
 
 def _compute_file_sha256(path: Path) -> str:
@@ -5326,7 +5435,7 @@ def _run_detect_track_stage(
                 "detector": detector_choice,
                 "tracker": tracker_choice,
                 "stride": args.stride,
-                "det_thresh": det_thresh,
+                "det_thresh": args.det_thresh,
                 "max_gap": getattr(args, "max_gap", None),
                 "scene_detector": args.scene_detector,
                 "scene_threshold": args.scene_threshold,
@@ -6045,7 +6154,7 @@ def _update_track_embeddings(
     track_ids_array: List[int] = []
 
     for row in rows:
-        track_id = int(row.get("track_id", -1))
+        track_id = _parse_track_id(row.get("track_id", -1))
         samples = track_embeddings.get(track_id) or []
         if samples:
             proto_vec, sample_count, spread = _select_track_prototype(samples)
@@ -6177,7 +6286,7 @@ def _run_cluster_stage(
         tracks_with_embeddings: Set[int] = set()
 
         for row in track_rows:
-            track_id = int(row.get("track_id", -1))
+            track_id = _parse_track_id(row.get("track_id", -1))
             track_index[track_id] = row
             if track_id in flagged_tracks:
                 forced_singletons.append([track_id])
@@ -6639,7 +6748,7 @@ def _load_track_samples(
     tracks_samples: Dict[int, List[Dict[str, Any]]] = {}
 
     for row in _iter_jsonl(track_path):
-        track_id = int(row.get("track_id", -1))
+        track_id = _parse_track_id(row.get("track_id", -1))
         bbox_samples = row.get("bboxes_sampled") or []
         if not bbox_samples:
             fallback = {
