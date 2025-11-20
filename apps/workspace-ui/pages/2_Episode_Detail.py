@@ -964,7 +964,6 @@ with col_detect:
         "Stride",
         min_value=1,
         max_value=50,
-        value=int(st.session_state[stride_field]),
         step=1,
         key=stride_field,
     )
@@ -979,7 +978,6 @@ with col_detect:
         "FPS",
         min_value=0.0,
         max_value=120.0,
-        value=float(st.session_state[fps_field]),
         step=1.0,
         key=fps_field,
     )
@@ -1411,6 +1409,11 @@ with col_faces:
     # Improved messaging for when Harvest Faces is disabled
     if not local_video_exists:
         st.info("Local mirror missing; video will be mirrored from S3 automatically when Faces Harvest starts.")
+    elif faces_status_value == "stale":
+        st.warning(
+            "**Harvest Faces is outdated**: Detect/Track was rerun after the last faces harvest.\n\n"
+            "Track IDs have changed. Rerun **Faces Harvest** to rebuild embeddings for the new tracks."
+        )
     elif not tracks_ready:
         st.warning(
             "**Harvest Faces is unavailable**: Face detection/tracking has not run yet.\n\n"
@@ -1595,6 +1598,16 @@ with col_cluster:
 
     if zero_faces_success:
         st.info("Faces harvest completed with 0 faces. Clustering is disabled until faces are available.")
+    elif cluster_status_value == "stale":
+        st.warning(
+            "**Cluster is outdated**: Detect/Track was rerun after the last clustering.\n\n"
+            "Track IDs have changed. Rerun **Faces Harvest** and then **Cluster** to rebuild identities."
+        )
+    elif faces_status_value == "stale":
+        st.warning(
+            "**Faces are outdated**: Detect/Track was rerun after the last faces harvest.\n\n"
+            "Rerun **Faces Harvest** first, then cluster."
+        )
     elif not faces_ready:
         if faces_status_value == "running":
             st.caption("Faces harvest is running — wait for it to finish before clustering.")
@@ -1627,6 +1640,8 @@ with col_cluster:
         or job_running
         or zero_faces_success
         or (not combo_supported_cluster)
+        or faces_status_value == "stale"
+        or cluster_status_value == "stale"
     )
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True

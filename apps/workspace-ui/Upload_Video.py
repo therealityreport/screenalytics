@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - UI fallback when API helper missing
         season = int(match.group("season"))
         episode = int(match.group("episode"))
         return {
-            "ep_id": f"{show.lower()}-s{season:02d}e{episode:02d}",
+            "ep_id": f"{show}-s{season:02d}e{episode:02d}",
             "show": show,
             "show_slug": show,
             "season": season,

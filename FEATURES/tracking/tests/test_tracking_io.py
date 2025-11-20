@@ -29,7 +29,11 @@ def test_build_tracks_generates_ids():
     cfg = {"track_thresh": 0.0, "match_thresh": 0.1, "track_buffer": 1}
     tracks = list(build_tracks(detections, cfg))
     assert len(tracks) == 1
-    assert tracks[0]["track_id"].startswith("track-")
+    track = tracks[0]
+    assert isinstance(track["track_id"], int)
+    assert track["track_id"] > 0
+    # track_label is the formatted string used for artifacts
+    assert track.get("track_label", "").startswith("track_")
     assert tracks[0]["schema_version"] == "track_v1"
 
 

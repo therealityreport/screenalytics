@@ -2,6 +2,12 @@
 - Include tests and documentation before promoting any module.
 - Follow `SETUP.md` to bootstrap your environment and run services locally.
 
+## Dev loop (API + UI)
+
+- Run `scripts/dev_auto.sh` from the repo root to start uvicorn with reload and the Streamlit UI with runOnSave (see `.streamlit/config.toml`).
+- Watch `api_server.log` to confirm API reloads when you edit files under `apps/` or `tools/`; Streamlit pages refresh automatically on save.
+- Stop with `Ctrl+C` when you are done; the script cleans up the background API process.
+
 ## Testing
 
 ### Overview

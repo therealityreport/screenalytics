@@ -1498,6 +1498,9 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
             continue
         if q and q.lower() not in ep_id.lower():
             continue
+        key_version = obj.get("key_version")
+        if key_version not in {"v1", "v2"}:
+            continue
         items.append(
             S3VideoItem(
                 bucket=obj.get("bucket", STORAGE.bucket),
@@ -1510,7 +1513,7 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
                 last_modified=(str(obj.get("last_modified")) if obj.get("last_modified") else None),
                 etag=obj.get("etag"),
                 exists_in_store=EPISODE_STORE.exists(ep_id),
-                key_version=obj.get("key_version"),
+                key_version=key_version,
             )
         )
         if len(items) >= limit:
@@ -1651,8 +1654,30 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         detect_track_payload["status"] = "stale"
         detect_track_payload["source"] = "missing_artifact"
     detect_track_status = PhaseStatus(**detect_track_payload)
-    faces_status = PhaseStatus(**_faces_phase_status(ep_id))
-    cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
+    faces_payload = _faces_phase_status(ep_id)
+    cluster_payload = _cluster_phase_status(ep_id)
+
+    # Check for stale downstream artifacts based on timestamps
+    # If detect/track finished after faces_embed, faces are stale (referencing old track IDs)
+    if (
+        detect_track_status.finished_at
+        and faces_payload.get("finished_at")
+        and detect_track_status.finished_at > faces_payload["finished_at"]
+    ):
+        faces_payload["status"] = "stale"
+        faces_payload["source"] = "outdated_after_redetect"
+
+    # If detect/track finished after cluster, clusters are stale
+    if (
+        detect_track_status.finished_at
+        and cluster_payload.get("finished_at")
+        and detect_track_status.finished_at > cluster_payload["finished_at"]
+    ):
+        cluster_payload["status"] = "stale"
+        cluster_payload["source"] = "outdated_after_redetect"
+
+    faces_status = PhaseStatus(**faces_payload)
+    cluster_status = PhaseStatus(**cluster_payload)
 
     # Compute pipeline state indicators
     # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
@@ -1663,8 +1688,10 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     # tracks_ready: True only when tracks manifest exists and API reports success
     tracks_ready = tracks_manifest_ready and detect_track_status.status == "success"
 
-    # faces_harvested: True if faces.jsonl exists and has content
-    faces_harvested = faces_status.faces is not None and faces_status.faces > 0
+    # faces_harvested: True if faces.jsonl exists and has content AND not stale
+    faces_harvested = (
+        faces_status.faces is not None and faces_status.faces > 0 and faces_status.status != "stale"
+    )
 
     coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
 

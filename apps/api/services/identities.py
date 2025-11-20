@@ -547,6 +547,17 @@ def _persist_identity_name(
 
             # Use alias-aware lookup to find existing person
             existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
+            if not existing_person:
+                # Fallback to case-insensitive primary-name match
+                existing_person = next(
+                    (
+                        person
+                        for person in people_service.list_people(show_slug)
+                        if people_service.normalize_name(person.get("name"))
+                        == people_service.normalize_name(trimmed_name)
+                    ),
+                    None,
+                )
 
             if existing_person:
                 # Add cluster to existing person (if not already present)

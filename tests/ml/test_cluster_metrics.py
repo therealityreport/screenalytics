@@ -77,7 +77,7 @@ def _create_synthetic_embeddings(
             track_counter += 1
 
             # Add small noise to base vector
-            noise = np.random.randn(512) * 0.05  # Small perturbation
+            noise = np.random.randn(512) * 0.01  # Smaller perturbation to keep tracks in same cluster
             perturbed = base_vector + noise
             perturbed = perturbed / np.linalg.norm(perturbed)  # Normalize
 

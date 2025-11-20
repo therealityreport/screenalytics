@@ -37,8 +37,12 @@ def _make_sample_video(target: Path, frame_count: int = 5, size: tuple[int, int]
 
 
 class _FakeArcFaceEmbedder:
-    def __init__(self, device: str) -> None:  # noqa: D401
+    def __init__(self, device: str, **_: object) -> None:  # noqa: D401
         self.device = device
+        self.resolved_device = device
+
+    def ensure_ready(self) -> None:
+        return None
 
     def encode(self, crops):
         base = np.linspace(-1.0, 1.0, 512, dtype=np.float32)

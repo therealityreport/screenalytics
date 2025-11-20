@@ -17,7 +17,7 @@ All pipeline behavior is **config-driven** (no hardcoded thresholds). Configs li
 | **detection.yaml** | RetinaFace detection | `min_size`, `confidence_th`, `iou_th`, `nms_mode` |
 | **tracking.yaml** | ByteTrack association | `track_thresh`, `match_thresh`, `track_buffer`, `gate_enabled` |
 | **faces_embed_sampling.yaml** | Face quality gating | `min_quality`, `max_crops_per_track`, `sampling_mode` |
-| **performance_profiles.yaml** | Device-aware profiles | `fast_cpu`, `balanced`, `high_accuracy` |
+| **performance_profiles.yaml** | Device-aware profiles | `fast_cpu`, `low_power`, `balanced`, `high_accuracy` |
 | **screen_time_v2.yaml** | Screentime aggregation | `quality_min`, `gap_tolerance_s`, `track_coverage_min` |
 
 ---
@@ -34,6 +34,12 @@ fast_cpu:
   frame_stride: 10
   detection_fps_limit: 15
   min_size: 120
+
+low_power:
+  # Background-safe profile
+  frame_stride: 12
+  detection_fps_limit: 12
+  min_size: 140
 
 balanced:
   # Standard local dev

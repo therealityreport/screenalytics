@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 from typing import Any, List, Literal
 
@@ -283,13 +284,23 @@ def _artifact_summary(ep_id: str) -> dict:
 
 
 def _validate_episode_ready(ep_id: str) -> Path:
-    record = EPISODE_STORE.get(ep_id)
-    if not record:
-        raise HTTPException(
-            status_code=400,
-            detail="Episode not tracked yet; create it via /episodes/upsert_by_id.",
-        )
     video_path = get_path(ep_id, "video")
+    flat_video_path = video_path.parent.parent / f"{ep_id}.mp4"
+    record = EPISODE_STORE.get(ep_id)
+    if not record and not video_path.exists() and flat_video_path.exists():
+        try:
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(flat_video_path, video_path)
+            LOGGER.info("Mirrored %s into canonical episode path %s", flat_video_path, video_path)
+        except OSError:
+            video_path = flat_video_path
+        try:
+            EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug=ep_id, season=0, episode=0)
+        except Exception as exc:
+            LOGGER.debug("Failed to upsert ep_id=%s into EpisodeStore during validation: %s", ep_id, exc)
+            record = None
+        else:
+            record = EPISODE_STORE.get(ep_id)
     if not video_path.exists():
         raise HTTPException(
             status_code=400,
@@ -348,18 +359,32 @@ def _build_detect_track_command(
     req: DetectTrackRequest,
     video_path: Path,
     progress_path: Path,
-    detector_value: str,
-    tracker_value: str,
-    det_thresh: float | None,
-    scene_detector: str,
-    scene_threshold: float,
-    scene_min_len: int,
-    scene_warmup_dets: int,
-    track_high_thresh: float | None,
-    new_track_thresh: float | None,
-    track_buffer: int | None,
-    min_box_area: float | None,
+    detector_value: str | None = None,
+    tracker_value: str | None = None,
+    det_thresh: float | None = None,
+    scene_detector: str | None = None,
+    scene_threshold: float | None = None,
+    scene_min_len: int | None = None,
+    scene_warmup_dets: int | None = None,
+    track_high_thresh: float | None = None,
+    new_track_thresh: float | None = None,
+    track_buffer: int | None = None,
+    min_box_area: float | None = None,
+    device_value: str | None = None,
 ) -> List[str]:
+    detector_value = _normalize_detector(detector_value or req.detector)
+    tracker_value = _normalize_tracker(tracker_value or req.tracker)
+    device_value = device_value or req.device or "auto"
+    scene_detector = _normalize_scene_detector(scene_detector or req.scene_detector)
+    scene_threshold = scene_threshold if scene_threshold is not None else req.scene_threshold
+    scene_min_len = scene_min_len if scene_min_len is not None else req.scene_min_len
+    scene_warmup_dets = scene_warmup_dets if scene_warmup_dets is not None else req.scene_warmup_dets
+    det_thresh_value = det_thresh if det_thresh is not None else req.det_thresh
+    track_high_thresh = track_high_thresh if track_high_thresh is not None else req.track_high_thresh
+    new_track_thresh = new_track_thresh if new_track_thresh is not None else req.new_track_thresh
+    track_buffer = track_buffer if track_buffer is not None else req.track_buffer
+    min_box_area = min_box_area if min_box_area is not None else req.min_box_area
+
     command: List[str] = [
         sys.executable,
         str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -370,7 +395,7 @@ def _build_detect_track_command(
         "--stride",
         str(req.stride),
         "--device",
-        req.device,
+        device_value,
         "--progress-file",
         str(progress_path),
     ]
@@ -396,8 +421,8 @@ def _build_detect_track_command(
         command += ["--min-box-area", str(min_box_area)]
     if req.max_gap:
         command += ["--max-gap", str(req.max_gap)]
-    if det_thresh is not None:
-        command += ["--det-thresh", str(det_thresh)]
+    if det_thresh_value is not None:
+        command += ["--det-thresh", str(det_thresh_value)]
     command += ["--scene-detector", scene_detector]
     command += ["--scene-threshold", str(scene_threshold)]
     command += ["--scene-min-len", str(max(scene_min_len, 1))]
@@ -723,8 +748,14 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
     scene_detector_value = _normalize_scene_detector(req.scene_detector)
+    resolved_device = req.device
     try:
-        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.device, req.det_thresh)
+        if getattr(jobs_service, "episode_run", None) and hasattr(jobs_service.episode_run, "resolve_device"):
+            resolved_device = jobs_service.episode_run.resolve_device(req.device, LOGGER)  # type: ignore[attr-defined]
+    except Exception:
+        resolved_device = req.device
+    try:
+        JOB_SERVICE.ensure_retinaface_ready(detector_value, resolved_device, req.det_thresh)
     except ValueError as exc:
         # Model validation failed - provide actionable error message
         raise HTTPException(
@@ -748,12 +779,23 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     except FileNotFoundError:
         # Missing progress files are normal when a prior run never started.
         pass
-    # Remove stale manifests before launching a new detect/track run
-    stale_paths = [get_path(req.ep_id, "detections"), get_path(req.ep_id, "tracks")]
+    # Remove downstream artifacts before launching a new detect/track run
+    # This ensures faces/cluster artifacts don't reference obsolete track IDs
+    # NOTE: detections.jsonl and tracks.jsonl are NOT deleted here - they are written
+    # atomically via temp files and will only be replaced on successful completion
+    manifests_dir = get_path(req.ep_id, "detections").parent
+    embeds_dir = manifests_dir.parent / "embeds" / req.ep_id
+    stale_paths = [
+        manifests_dir / "faces.jsonl",
+        manifests_dir / "identities.json",
+        embeds_dir / "faces.npy",
+        embeds_dir / "tracks.npy",
+        embeds_dir / "track_ids.json",
+    ]
     for stale_path in stale_paths:
         try:
             stale_path.unlink()
-            LOGGER.info("Removed stale artifact before rerun: %s", stale_path)
+            LOGGER.info("Removed stale artifact before detect/track rerun: %s", stale_path)
         except FileNotFoundError:
             continue
         except OSError as exc:
@@ -773,6 +815,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         req.new_track_thresh,
         req.track_buffer,
         req.min_box_area,
+        resolved_device,
     )
     result = _run_job_with_optional_sse(command, request, progress_file=progress_path, cpu_threads=req.cpu_threads)
     if isinstance(result, StreamingResponse):
@@ -781,14 +824,15 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     detections_count = _count_lines(Path(artifacts["detections"]))
     tracks_count = _count_lines(Path(artifacts["tracks"]))
     progress_payload = _load_progress_payload(progress_path)
-    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
+    progress_resolved_device = progress_payload.get("resolved_device") if progress_payload else None
+    resolved_device_out = progress_resolved_device or resolved_device
 
     return {
         "job": "detect_track",
         "ep_id": req.ep_id,
         "command": command,
         "device": req.device,
-        "resolved_device": resolved_device,
+        "resolved_device": resolved_device_out,
         "detector": detector_value,
         "tracker": tracker_value,
         "scene_detector": scene_detector_value,
@@ -802,6 +846,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
 @router.post("/faces_embed")
 async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     await _reject_legacy_payload(request)
+    _validate_episode_ready(req.ep_id)
     track_path = get_path(req.ep_id, "tracks")
     if not track_path.exists():
         raise HTTPException(status_code=400, detail="tracks.jsonl not found; run detect/track first")
@@ -927,6 +972,7 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             track_buffer=req.track_buffer,
             min_box_area=req.min_box_area,
             profile=req.profile,
+            cpu_threads=req.cpu_threads,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1119,12 +1165,16 @@ def get_job_progress(job_id: str) -> dict:
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail="Job not found")
     progress = JOB_SERVICE.get_progress(job_id) or {}
+    track_metrics = job.get("track_metrics")
+    if not track_metrics and isinstance(progress, dict):
+        track_metrics = progress.get("track_metrics")
     return {
         "job_id": job_id,
         "ep_id": job["ep_id"],
         "state": job["state"],
         "started_at": job["started_at"],
         "ended_at": job.get("ended_at"),
+        "track_metrics": track_metrics,
         "progress": progress,
     }
 
@@ -1143,6 +1193,7 @@ def job_details(job_id: str) -> dict:
         "ended_at": job.get("ended_at"),
         "summary": job.get("summary"),
         "error": job.get("error"),
+        "track_metrics": job.get("track_metrics"),
         "requested": job.get("requested"),
         "progress_file": job.get("progress_file"),
     }

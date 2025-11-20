@@ -314,6 +314,7 @@ class JobService:
         command: list[str],
         progress_path: Path,
         requested: Dict[str, Any],
+        cpu_threads: int | None = None,
     ) -> JobRecord:
         ensure_dirs(ep_id)
         progress_path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,6 +332,16 @@ class JobService:
         stderr_log_path = stderr_log_dir / f"job-{job_id}.stderr.log"
 
         env = os.environ.copy()
+        # Apply CPU thread limits if specified (same as sync SSE path)
+        if cpu_threads is not None:
+            env["OMP_NUM_THREADS"] = str(cpu_threads)
+            env["MKL_NUM_THREADS"] = str(cpu_threads)
+            env["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+            env["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+            env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+            env["OPENCV_NUM_THREADS"] = str(cpu_threads)
+            env["ORT_INTRA_OP_NUM_THREADS"] = str(cpu_threads)
+            env["ORT_INTER_OP_NUM_THREADS"] = "1"  # Keep inter-op at 1 for stability
         # Open stderr log for subprocess (will be closed automatically when process exits)
         stderr_file = open(stderr_log_path, "w", encoding="utf-8")  # noqa: SIM115
         effective_command = _maybe_wrap_with_cpulimit(command)
@@ -402,13 +413,42 @@ class JobService:
         track_buffer: int | None = None,
         min_box_area: float | None = None,
         profile: str | None = None,
+        cpu_threads: int | None = None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
-        resolved_detect_device = self.ensure_retinaface_ready(detector_value, device, det_thresh)
+        requested_device = device
+        resolved_device = requested_device
+        if episode_run and hasattr(episode_run, "resolve_device"):
+            try:
+                resolved_device = episode_run.resolve_device(requested_device, LOGGER)  # type: ignore[attr-defined]
+            except Exception:
+                resolved_device = requested_device
+        resolved_detect_device = self.ensure_retinaface_ready(detector_value, resolved_device, det_thresh)
         progress_path = self._progress_path(ep_id)
+        # Remove downstream artifacts before launching a new detect/track run
+        # This ensures faces/cluster artifacts don't reference obsolete track IDs
+        # NOTE: detections.jsonl and tracks.jsonl are NOT deleted here - they are written
+        # atomically via temp files and will only be replaced on successful completion
+        manifests_dir = get_path(ep_id, "detections").parent
+        embeds_dir = manifests_dir.parent / "embeds" / ep_id
+        stale_paths = [
+            manifests_dir / "faces.jsonl",
+            manifests_dir / "identities.json",
+            embeds_dir / "faces.npy",
+            embeds_dir / "tracks.npy",
+            embeds_dir / "track_ids.json",
+        ]
+        for stale_path in stale_paths:
+            try:
+                stale_path.unlink()
+                LOGGER.info("Removed stale artifact before detect/track rerun: %s", stale_path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                LOGGER.warning("Failed to remove stale artifact %s: %s", stale_path, exc)
         scene_detector_value = self._normalize_scene_detector(scene_detector)
         scene_min_len = max(int(scene_min_len), 1)
         scene_warmup_dets = max(int(scene_warmup_dets), 0)
@@ -427,7 +467,7 @@ class JobService:
             "--stride",
             str(stride),
             "--device",
-            device,
+            requested_device,
             "--progress-file",
             str(progress_path),
         ]
@@ -459,8 +499,10 @@ class JobService:
         requested = {
             "stride": stride,
             "fps": fps,
-            "device": device,
-            "resolved_detect_device": resolved_detect_device or device,
+            "device": requested_device,
+            "device_resolved": resolved_detect_device or resolved_device,
+            "resolved_detect_device": resolved_detect_device or resolved_device,
+            "cpu_threads": cpu_threads,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -483,6 +525,7 @@ class JobService:
             command=command,
             progress_path=progress_path,
             requested=requested,
+            cpu_threads=cpu_threads,
         )
 
     def start_faces_embed_job(

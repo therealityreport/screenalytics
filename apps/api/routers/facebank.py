@@ -201,10 +201,12 @@ def _prepare_display_crop(
     bbox: list[float],
     detector_mode: str,
 ) -> tuple[np.ndarray, list[int]]:
-    """Return full frame for display (cropping happens at render time)."""
+    """Crop around the detected face for display thumbnails."""
     h, w = image_bgr.shape[:2]
-    full_box = [0, 0, w, h]
-    return np.ascontiguousarray(image_bgr.copy()), full_box
+    crop_box = _expand_square_bbox(bbox, margin=0.15, width=w, height=h)
+    x1, y1, x2, y2 = crop_box
+    cropped = image_bgr[y1:y2, x1:x2]
+    return np.ascontiguousarray(cropped.copy()), crop_box
 
 
 def _save_derivative(image_bgr: np.ndarray, path: Path, fmt: str) -> None:

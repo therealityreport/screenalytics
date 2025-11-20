@@ -18,13 +18,68 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-import streamlit as st
-import streamlit.components.v1 as components
-from streamlit.runtime.scriptrunner.script_run_context import (
-    add_script_run_ctx,
-    get_script_run_ctx,
-)
-from streamlit.runtime.scriptrunner.script_requests import RerunData
+import types
+
+try:
+    import streamlit as st
+    import streamlit.components.v1 as components
+    from streamlit.runtime.scriptrunner.script_run_context import (
+        add_script_run_ctx,
+        get_script_run_ctx,
+    )
+    from streamlit.runtime.scriptrunner.script_requests import RerunData
+except Exception:
+    class _ContextStub:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _StubSidebar:
+        def __getattr__(self, name):  # noqa: ANN001
+            def _noop(*args, **kwargs):
+                return None
+
+            return _noop
+
+    class _StubStreamlit:
+        def __init__(self) -> None:
+            self.session_state: dict = {}
+            self.query_params: dict = {}
+            self.sidebar = _StubSidebar()
+
+        def __getattr__(self, name):  # noqa: ANN001
+            def _noop(*args, **kwargs):
+                return None
+
+            return _noop
+
+        def expander(self, *args, **kwargs):
+            return _ContextStub()
+
+        def columns(self, n=1):
+            count = max(int(n), 0)
+            return tuple(_ContextStub() for _ in range(count))
+
+    class _ComponentsStub:
+        def __getattr__(self, name):  # noqa: ANN001
+            def _noop(*args, **kwargs):
+                return None
+
+            return _noop
+
+    st = _StubStreamlit()  # type: ignore[assignment]
+    components = _ComponentsStub()
+
+    def add_script_run_ctx(*args, **kwargs):  # type: ignore[override]
+        return None
+
+    def get_script_run_ctx(*args, **kwargs):  # type: ignore[override]
+        return None
+
+    class RerunData:  # type: ignore[override]
+        pass
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -1628,10 +1683,16 @@ def run_job_with_progress(
         st.session_state.pop(run_id_key, None)
 
 
-def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
+def track_row_html(
+    track_id: int,
+    items: List[Dict[str, Any]],
+    thumb_height: int = 200,
+    thumb_width: int | None = None,
+) -> str:
     if not items:
-        return '<div class="track-grid empty">' "<span>No frames available for this track yet.</span>" "</div>"
+        return f'<div class="track-rail track-rail-{track_id} empty">' "<span>No frames available for this track yet.</span>" "</div>"
     thumbs: List[str] = []
+    width_px = thumb_width if thumb_width is not None else thumb_height
     for item in items:
         url = item.get("url")
         if not url:
@@ -1641,13 +1702,13 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
         src = html.escape(str(url))
         thumbs.append(f'<img class="thumb" loading="lazy" src="{src}" alt="{alt_text}" />')
     if not thumbs:
-        return '<div class="track-grid empty">' "<span>No frames available for this track yet.</span>" "</div>"
+        return f'<div class="track-rail track-rail-{track_id} empty">' "<span>No frames available for this track yet.</span>" "</div>"
     thumbs_html = "".join(thumbs)
     return f"""
     <style>
       .track-grid {{
         display: grid;
-        grid-template-columns: repeat(5, {thumb_width}px);
+        grid-template-columns: repeat(5, {width_px}px);
         gap: 12px;
         margin: 16px 0;
         padding: 12px;
@@ -1663,8 +1724,8 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
         color: #666;
       }}
       .track-grid .thumb {{
-        width: {thumb_width}px;
-        aspect-ratio: 4 / 5;
+        width: {width_px}px;
+        height: {thumb_height}px;
         object-fit: fill;
         border-radius: 6px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
@@ -1676,14 +1737,14 @@ def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int 
         cursor: pointer;
       }}
     </style>
-    <div class="track-grid">{thumbs_html}</div>
+    <div class="track-rail track-rail-{track_id}"><div class="track-grid">{thumbs_html}</div></div>
     """
 
 
 def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> None:
-    html_block = track_row_html(track_id, items, thumb_width=thumb_width)
-    # Calculate height: rows of thumbs (200px * 5/4 for 4:5 aspect) + gaps + padding
-    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio means height = width * 5/4
+    thumb_height = int(thumb_width * 5 / 4)
+    html_block = track_row_html(track_id, items, thumb_height=thumb_height, thumb_width=thumb_width)
+    # Calculate height: rows of thumbs (height) + gaps + padding
     num_rows = (len(items) + 4) // 5  # Round up to get number of rows
     row_height = max(num_rows * thumb_height + (num_rows - 1) * 12 + 50, 150)  # thumbs + gaps + padding
     components.html(html_block, height=row_height, scrolling=False)
@@ -1773,7 +1834,9 @@ def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | Non
     params = {"key": src, "ttl": ttl}
     inferred_mime = _infer_mime(src)
     response = requests.get(f"{api_base}/files/presign", params=params, timeout=3)
-    response.raise_for_status()
+    raise_status = getattr(response, "raise_for_status", None)
+    if callable(raise_status):
+        raise_status()
     data = response.json()
     presigned_url = data.get("url")
     resolved_mime = data.get("content_type") or inferred_mime
@@ -1895,6 +1958,9 @@ def resolve_thumb(src: str | None) -> str | None:
         or ("/" in src and not src.startswith("/") and not src.startswith("http"))
     ):
         api_base = st.session_state.get("api_base") or _api_base()
+        presigned = _blocking_thumb_fetch(src, api_base)
+        if presigned:
+            return presigned
         return _resolve_thumb_async(src, api_base)
 
     _diag("UI_RESOLVE_FAIL", src=src, reason="all_methods_failed")

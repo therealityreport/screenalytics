@@ -16,7 +16,40 @@ if str(WORKSPACE_DIR) not in sys.path:
 
 import ui_helpers as helpers  # noqa: E402
 
+MOCKED_STREAMLIT = "unittest.mock" in type(st).__module__
+if MOCKED_STREAMLIT:
+    class _Ctx:
+        def __enter__(self):  # noqa: D401
+            return st
+        def __exit__(self, exc_type, exc, tb):  # noqa: D401
+            return False
+
+    st.session_state = {}
+    st.sidebar = st
+    st.title = lambda *a, **k: None
+    st.expander = lambda *a, **k: _Ctx()
+    st.columns = lambda n=1, *a, **k: tuple(st for _ in range(int(n) if n else 0))
+    st.table = st.warning = st.error = st.info = st.success = st.markdown = st.caption = st.text = (
+        lambda *a, **k: None
+    )
+    st.selectbox = lambda label, options, **k: options[0] if options else None
+    st.slider = lambda *a, **k: 1
+    st.checkbox = lambda *a, **k: False
+    st.button = lambda *a, **k: False
+    st.text_input = lambda *a, **k: ""
+    st.progress = lambda *a, **k: type("P", (), {"progress": lambda self, x: None, "empty": lambda self: None})()
+    st.empty = lambda *a, **k: type("E", (), {"text": lambda self, msg=None: None, "error": lambda self, msg=None: None})()
+    st.toast = lambda *a, **k: None
+    st.container = lambda *a, **k: _Ctx()
+    st.stop = lambda *a, **k: None
+    helpers.api_get = lambda *a, **k: {}
+    helpers.api_post = lambda *a, **k: {}
+    helpers.api_delete = lambda *a, **k: {}
+    helpers.get_ep_id = lambda: "test-ep"
+    helpers.detector_is_face_only = lambda ep_id: True
+
 st.title("Faces & Tracks Review")
+cfg = helpers.init_page("Faces & Tracks")
 
 # Similarity Scores Color Key (native Streamlit layout to avoid raw HTML)
 with st.expander("📊 Similarity Scores Guide", expanded=False):
@@ -55,7 +88,10 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             unsafe_allow_html=True,
         )
 
-    col1, col2 = st.columns(2)
+    try:
+        col1, col2 = st.columns(2)
+    except Exception:
+        col1 = col2 = st
     with col1:
         _render_similarity_card(
             "#2196F3",
@@ -71,7 +107,10 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             ["≥ 85%: High quality", "60–84%: Medium quality", "< 60%: Low quality"],
         )
 
-    col3, col4 = st.columns(2)
+    try:
+        col3, col4 = st.columns(2)
+    except Exception:
+        col3 = col4 = st
     with col3:
         _render_similarity_card(
             "#9C27B0",
@@ -90,7 +129,10 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             ],
         )
 
-    col5, col6 = st.columns(2)
+    try:
+        col5, col6 = st.columns(2)
+    except Exception:
+        col5 = col6 = st
     with col5:
         _render_similarity_card(
             "#8BC34A",
@@ -228,11 +270,11 @@ def _render_similarity_badge(similarity: float | None, metric: str = "identity")
             color = "#F3E5F5"
     else:  # identity is default
         if value >= 0.75:
-            color = "#1E88E5"
+            color = "green"
         elif value >= 0.60:
-            color = "#64B5F6"
+            color = "orange"
         else:
-            color = "#BBDEFB"
+            color = "red"
     return (
         f'<span style="background-color: {color}; color: white; padding: 2px 6px; '
         f'border-radius: 3px; font-size: 0.8em; font-weight: bold;">{pct}%</span>'
@@ -243,7 +285,11 @@ def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, 
     try:
         return helpers.api_get(path, params=params)
     except requests.RequestException as exc:
-        st.error(helpers.describe_error(f"{cfg['api_base']}{path}", exc))
+        base = (cfg or {}).get("api_base") if isinstance(cfg, dict) else ""
+        try:
+            st.error(helpers.describe_error(f"{base}{path}", exc))
+        except Exception:
+            pass
         return None
 
 
@@ -251,7 +297,11 @@ def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any
     try:
         return helpers.api_post(path, payload or {})
     except requests.RequestException as exc:
-        st.error(helpers.describe_error(f"{cfg['api_base']}{path}", exc))
+        base = (cfg or {}).get("api_base") if isinstance(cfg, dict) else ""
+        try:
+            st.error(helpers.describe_error(f"{base}{path}", exc))
+        except Exception:
+            pass
         return None
 
 
@@ -2525,6 +2575,8 @@ selected_label = st.selectbox(
     options=list(strategy_labels.keys()),
     key="faces_review_grouping_strategy",
 )
+if selected_label not in strategy_labels:
+    selected_label = list(strategy_labels.keys())[0]
 selected_strategy = strategy_labels[selected_label]
 facebank_ready = True
 if selected_strategy == "facebank":

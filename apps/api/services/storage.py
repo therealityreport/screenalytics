@@ -159,7 +159,7 @@ def parse_v2_episode_key(key: str) -> Dict[str, object] | None:
     show = match.group("show")
     season = int(match.group("season"))
     episode = int(match.group("episode"))
-    ep_id = f"{show.lower()}-s{season:02d}e{episode:02d}"
+    ep_id = f"{show}-s{season:02d}e{episode:02d}"
     return {
         "ep_id": ep_id,
         "show": show,

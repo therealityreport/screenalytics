@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -64,7 +65,14 @@ def _create_test_video(target: Path, duration_sec: int = 10, fps: int = 24) -> P
 
 def _start_api_server(data_root: Path) -> tuple[subprocess.Popen, int]:
     """Start API server in background, return process and port."""
-    port = 8765  # Use non-standard port to avoid conflicts
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        pytest.skip("requests library not installed")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
 
     cmd = [
         sys.executable,
@@ -87,15 +95,32 @@ def _start_api_server(data_root: Path) -> tuple[subprocess.Popen, int]:
         stderr=subprocess.PIPE,
     )
 
-    # Wait for server to start
-    time.sleep(3)
+    max_attempts = 60  # ~30s with 0.5s sleep
+    last_stdout = b""
+    last_stderr = b""
+    health_url = f"http://127.0.0.1:{port}/health"
+    for _ in range(max_attempts):
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate()
+            raise RuntimeError(
+                f"API server failed to start:\nSTDOUT:\n{stdout.decode()}\n\nSTDERR:\n{stderr.decode()}"
+            )
+        try:
+            resp = requests.get(health_url, timeout=1)
+            if resp.status_code == 200:
+                return proc, port
+        except Exception:
+            # Capture logs on exit; avoid blocking reads inside loop
+            time.sleep(0.5)
 
-    # Check if server started successfully
-    if proc.poll() is not None:
-        stdout, stderr = proc.communicate()
-        raise RuntimeError(f"API server failed to start:\nSTDOUT:\n{stdout.decode()}\n\nSTDERR:\n{stderr.decode()}")
-
-    return proc, port
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    raise RuntimeError(
+        f"API server did not become ready within timeout.\nSTDOUT:\n{last_stdout.decode(errors='ignore')}\n\nSTDERR:\n{last_stderr.decode(errors='ignore')}"
+    )
 
 
 def _api_request(method: str, path: str, port: int, data: dict | None = None) -> dict:
@@ -108,9 +133,9 @@ def _api_request(method: str, path: str, port: int, data: dict | None = None) ->
     url = f"http://127.0.0.1:{port}{path}"
 
     if method == "GET":
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=30)
     elif method == "POST":
-        response = requests.post(url, json=data, timeout=10)
+        response = requests.post(url, json=data, timeout=30)
     else:
         raise ValueError(f"Unsupported method: {method}")
 

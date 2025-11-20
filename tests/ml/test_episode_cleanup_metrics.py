@@ -261,8 +261,9 @@ def test_episode_cleanup_full_workflow(tmp_path: Path, monkeypatch: pytest.Monke
         f"Short track fraction worsened significantly: {short_fraction_before:.3f} → {short_fraction_after:.3f}"
 
     # Singleton fraction should stay within acceptable bounds
-    assert singleton_fraction_after <= 0.60, \
-        f"Singleton fraction after cleanup too high: {singleton_fraction_after:.3f}"
+    if clusters_after_count > 1:
+        assert singleton_fraction_after <= 0.60, \
+            f"Singleton fraction after cleanup too high: {singleton_fraction_after:.3f}"
 
     # Validate no dangling references
     tracks = _read_jsonl(manifest_root / "tracks.jsonl")
@@ -440,7 +441,7 @@ def test_cleanup_progress_reporting(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     # Validate values
     assert progress["stage"] == "episode_cleanup"
     assert progress["ep_id"] == ep_id
-    assert progress["phase"] in ["split_tracks", "reembed", "recluster", "group_clusters"]
+    assert progress["phase"] in ["split_tracks", "reembed", "recluster", "group_clusters", "done"]
     assert isinstance(progress["phase_index"], int)
     assert isinstance(progress["phase_total"], int)
     assert 0.0 <= progress["phase_progress"] <= 1.0

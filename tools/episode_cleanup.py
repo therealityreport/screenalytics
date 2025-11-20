@@ -308,6 +308,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=DEFAULT_ACTIONS,
         help="Subset of cleanup actions to run",
     )
+    parser.add_argument("--out-root", dest="out_root", help="Override data root (sets SCREENALYTICS_DATA_ROOT)")
     parser.add_argument("--save-frames", dest="save_frames", action="store_true", default=False)
     parser.add_argument("--no-save-frames", dest="save_frames", action="store_false")
     parser.add_argument("--save-crops", dest="save_crops", action="store_true", default=False)
@@ -320,6 +321,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     start_time = time.time()
     args = parse_args(argv)
+    if getattr(args, "out_root", None):
+        os.environ["SCREENALYTICS_DATA_ROOT"] = str(Path(args.out_root).expanduser())
 
     # Apply performance profile settings (if not overridden by CLI flags)
     if hasattr(args, "profile") and args.profile:
@@ -477,7 +480,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         across = None
         if args.write_back:
             LOGGER.info("[cleanup] Matching clusters to show-level people...")
-            across = grouping.group_across_episodes(args.ep_id)
+            try:
+                across = grouping.group_across_episodes(args.ep_id)
+            except ValueError as exc:
+                LOGGER.warning("Skipping cross-episode grouping: %s", exc)
+                across = {"skipped": True, "reason": str(exc)}
 
         grouping_result = {
             "centroids": centroids,
@@ -520,10 +527,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     report_path = manifests_dir / "cleanup_report.json"
     _write_json(report_path, report)
-    _write_json(
-        progress_path,
-        {"stage": "episode_cleanup", "summary": report, "ep_id": args.ep_id},
-    )
+    final_progress = {
+        "stage": "episode_cleanup",
+        "ep_id": args.ep_id,
+        "phase": "done",
+        "phase_index": phase_total,
+        "phase_total": phase_total,
+        "phase_progress": 1.0,
+        "total_elapsed_seconds": round(runtime_sec, 2),
+        "summary": report,
+    }
+    _write_json(progress_path, final_progress)
 
     LOGGER.info("[cleanup] completed run for %s in %.1fs; report → %s", args.ep_id, runtime_sec, report_path)
     return 0

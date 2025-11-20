@@ -39,6 +39,7 @@ class _FakeTracker:
     def __init__(self) -> None:
         self.reset_calls = 0
         self.update_calls: list[int] = []
+        self.config_summary = {"adapter": "fake"}
 
     def reset(self) -> None:
         self.reset_calls += 1
@@ -83,7 +84,7 @@ def test_tracker_resets_on_scene_cuts(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(episode_run, "detect_scene_cuts", lambda *a, **k: [2, 5])
     tracker_holder: dict[str, _FakeTracker] = {}
 
-    def _build_tracker_sim(name: str, frame_rate: float):  # noqa: ANN001
+    def _build_tracker_sim(name: str, frame_rate: float, stride: int = 1, config=None):  # noqa: ANN001
         tracker = _FakeTracker()
         tracker_holder["instance"] = tracker
         return tracker
@@ -117,7 +118,7 @@ def test_tracker_resets_on_scene_cuts(tmp_path, monkeypatch) -> None:
         target_fps=None,
         frame_exporter=None,
     )
-    (*_, scene_summary) = result
+    scene_summary = result[7]
 
     tracker = tracker_holder.get("instance")
     assert tracker is not None
