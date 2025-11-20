@@ -4313,9 +4313,7 @@ def _run_full_pipeline(
     if progress:
         progress.set_static_fields(
             {
-                "device_resolved": detector_device,
-                "detector_resolved": detector_choice,
-                "tracker_resolved": tracker_choice,
+                "detector_device": detector_device,
             }
         )
     tracker_label = tracker_choice
@@ -4327,7 +4325,7 @@ def _run_full_pipeline(
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
-            resolved_device=detector_device,
+            resolved_device=device,
             force=True,
             extra=video_meta,
         )
@@ -4509,7 +4507,7 @@ def _run_full_pipeline(
                                 device=device,
                                 detector=detector_choice,
                                 tracker=tracker_label,
-                                resolved_device=detector_device,
+                                resolved_device=device,
                                 summary={"event": "reset_on_cut", "frame": frame_idx},
                                 force=True,
                                 extra=video_meta,
@@ -4534,7 +4532,7 @@ def _run_full_pipeline(
                             device=device,
                             detector=detector_choice,
                             tracker=tracker_label,
-                            resolved_device=detector_device,
+                            resolved_device=device,
                             summary={"event": "reset_on_cut", "frame": frame_idx},
                             force=True,
                             extra=video_meta,
@@ -4751,7 +4749,7 @@ def _run_full_pipeline(
                             device=device,
                             detector=detector_choice,
                             tracker=tracker_label,
-                            resolved_device=detector_device,
+                            resolved_device=device,
                             extra=detect_extra,
                         )
 
@@ -5157,7 +5155,7 @@ def _run_full_pipeline(
                                 device=device,
                                 detector=detector_choice,
                                 tracker=tracker_label,
-                                resolved_device=detector_device,
+                                resolved_device=device,
                                 summary={
                                     "event": "none_multiply_skip",
                                     "frame": frame_idx,
@@ -5195,7 +5193,7 @@ def _run_full_pipeline(
                         device=device,
                         detector=detector_choice,
                         tracker=tracker_label,
-                        resolved_device=detector_device,
+                        resolved_device=device,
                         summary={
                             "tracks_born": recorder.metrics["tracks_born"],
                             "tracks_lost": recorder.metrics["tracks_lost"],
@@ -5231,7 +5229,7 @@ def _run_full_pipeline(
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
-            resolved_device=detector_device,
+            resolved_device=device,
             force=True,
             extra=detect_done_meta,
         )
@@ -5379,7 +5377,7 @@ def _run_full_pipeline(
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
-            resolved_device=detector_device,
+            resolved_device=device,
             summary=metrics,
             force=True,
             extra=track_done_meta,
@@ -5582,7 +5580,7 @@ def _run_detect_track_stage(
             device=pipeline_device,
             detector=detector_choice,
             tracker=tracker_choice,
-            resolved_device=detector_device,
+            resolved_device=resolved_device,
         )
         track_ratio = round(track_count / det_count, 3) if det_count > 0 else 0.0
         summary: Dict[str, Any] = {
@@ -5601,8 +5599,9 @@ def _run_detect_track_stage(
             "frames_exported": frame_exporter.frames_written if frame_exporter else 0,
             "crops_exported": frame_exporter.crops_written if frame_exporter else 0,
             "device": pipeline_device,
-            "requested_device": args.device,
-            "resolved_device": detector_device,
+            "requested_device": requested_device,
+            "resolved_device": resolved_device,
+            "detector_device": detector_device,
             "analyzed_fps": analyzed_fps,
             "detector": detector_choice,
             "tracker": tracker_choice,
@@ -5694,7 +5693,7 @@ def _run_detect_track_stage(
             device=pipeline_device,
             detector=detector_choice,
             tracker=tracker_choice,
-            resolved_device=detector_device,
+            resolved_device=resolved_device,
             step="detect_track",
             extra=completion_extra or None,
         )
@@ -5726,8 +5725,9 @@ def _run_detect_track_stage(
                 "save_crops": save_crops,
                 "jpeg_quality": jpeg_quality,
                 "device": pipeline_device,
-                "requested_device": args.device,
-                "resolved_device": detector_device,
+                "requested_device": requested_device,
+                "resolved_device": resolved_device,
+                "detector_device": detector_device,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },

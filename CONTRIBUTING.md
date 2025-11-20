@@ -4,9 +4,9 @@
 
 ## Dev loop (API + UI)
 
-- Run `scripts/dev_auto.sh` from the repo root to start uvicorn with reload and the Streamlit UI with runOnSave (see `.streamlit/config.toml`).
-- Watch `api_server.log` to confirm API reloads when you edit files under `apps/` or `tools/`; Streamlit pages refresh automatically on save.
-- Stop with `Ctrl+C` when you are done; the script cleans up the background API process.
+- Run `scripts/dev_auto.sh` from the repo root to start uvicorn with reload and the Streamlit UI (`apps/workspace-ui/streamlit_app.py`) with runOnSave (see `.streamlit/config.toml`, port 8505).
+- Tail `api_server.log` to confirm API reloads when you edit files under `apps/`, `tools/`, or `config/` (data/.venv are excluded); streamlit prints “Rerunning...” in the terminal when pages refresh after a save.
+- Stop with `Ctrl+C` when you are done; the script cleans up the background API process before exiting.
 
 ## Testing
 

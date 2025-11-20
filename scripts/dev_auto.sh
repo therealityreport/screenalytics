@@ -21,7 +21,7 @@ echo "[dev_auto] Starting API (auto-reload)"
 API_PID=$!
 
 echo "[dev_auto] Starting Streamlit UI (auto-rerun)"
-"$PYTHON" -m streamlit run apps/workspace-ui/app.py \
+"$PYTHON" -m streamlit run apps/workspace-ui/streamlit_app.py \
   --server.port 8505 \
   --server.address 0.0.0.0 || true
 
