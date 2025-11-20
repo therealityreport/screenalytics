@@ -1323,26 +1323,37 @@ def fallback_poll_progress(
     job_started: bool,
     async_endpoint: str,
 ) -> tuple[Dict[str, Any] | None, str | None]:
+    job_id: str | None = None
     if not job_started:
         try:
-            requests.post(f"{_api_base()}{async_endpoint}", json=payload, timeout=30).raise_for_status()
+            resp = requests.post(f"{_api_base()}{async_endpoint}", json=payload, timeout=30)
+            resp.raise_for_status()
+            try:
+                body = resp.json()
+                if isinstance(body, dict):
+                    job_id = body.get("job_id")
+            except ValueError:
+                job_id = None
         except requests.RequestException as exc:
             return None, describe_error(f"{_api_base()}{async_endpoint}", exc)
 
     progress_url = f"{_api_base()}/episodes/{ep_id}/progress"
+    job_progress_url = f"{_api_base()}/jobs/{job_id}/progress" if job_id else None
+    job_detail_url = f"{_api_base()}/jobs/{job_id}" if job_id else None
     phase_hint = _phase_from_endpoint(async_endpoint) or "detect_track"
     last_progress: Dict[str, Any] | None = None
     poll_attempts = 0
     max_poll_attempts = 60  # 30 seconds (60 attempts * 0.5s sleep)
     while True:
         try:
-            resp = requests.get(progress_url, timeout=5)
+            if job_progress_url:
+                resp = requests.get(job_progress_url, timeout=5)
+            else:
+                resp = requests.get(progress_url, timeout=5)
             if resp.status_code == 404:
                 poll_attempts += 1
                 if poll_attempts > max_poll_attempts:
-                    # Timeout: progress file never appeared, job likely failed during init
-                    # Fetch job record to surface actual error
-                    job_error = _fetch_async_job_error(ep_id, phase_hint)
+                    job_error = _fetch_async_job_error(ep_id, phase_hint) if not job_progress_url else None
                     return (
                         None,
                         job_error
@@ -1353,18 +1364,47 @@ def fallback_poll_progress(
                 continue
             resp.raise_for_status()
         except requests.RequestException as exc:
-            return None, describe_error(progress_url, exc)
+            return None, describe_error(job_progress_url or progress_url, exc)
         payload_body = resp.json()
-        progress = payload_body.get("progress") or payload_body
-        if not isinstance(progress, dict):
-            time.sleep(0.5)
-            continue
-        update_cb(progress)
-        last_progress = progress
-        phase = str(progress.get("phase", "")).lower()
-        if phase == "error":
-            return None, progress.get("error") or "Job failed"
-        if _is_phase_done(progress):
+        progress = payload_body.get("progress") if isinstance(payload_body, dict) else None
+        if progress is None and isinstance(payload_body, dict):
+            progress = payload_body
+        if isinstance(progress, dict) and progress:
+            update_cb(progress)
+            last_progress = progress
+            phase = str(progress.get("phase", "")).lower()
+            if phase == "error":
+                return None, progress.get("error") or "Job failed"
+            if _is_phase_done(progress):
+                summary_block = progress.get("summary")
+                if isinstance(summary_block, dict):
+                    return summary_block, None
+        state = str(payload_body.get("state", "")).lower() if isinstance(payload_body, dict) else ""
+        if job_progress_url and state in {"succeeded", "failed", "canceled"}:
+            if state != "succeeded":
+                return None, payload_body.get("error") or f"Job {state}"
+            summary_payload: Dict[str, Any] | None = None
+            if isinstance(payload_body.get("track_metrics"), dict):
+                summary_payload = {"track_metrics": payload_body["track_metrics"]}
+            if not summary_payload and isinstance(progress, dict):
+                summary_candidate = progress.get("summary") if isinstance(progress.get("summary"), dict) else progress
+                if _is_complete_summary(summary_candidate):
+                    summary_payload = summary_candidate
+            if not summary_payload and job_detail_url:
+                try:
+                    job_detail = requests.get(job_detail_url, timeout=5).json()
+                    if isinstance(job_detail, dict):
+                        detail_summary = job_detail.get("summary") if isinstance(job_detail.get("summary"), dict) else None
+                        if detail_summary:
+                            summary_payload = detail_summary
+                        elif isinstance(job_detail.get("track_metrics"), dict):
+                            summary_payload = {"track_metrics": job_detail["track_metrics"]}
+                        elif isinstance(progress, dict):
+                            summary_payload = progress
+                except Exception:
+                    summary_payload = summary_payload or None
+            return summary_payload or progress or payload_body, None
+        if not job_progress_url and isinstance(progress, dict) and _is_phase_done(progress):
             summary_block = progress.get("summary")
             if isinstance(summary_block, dict):
                 return summary_block, None

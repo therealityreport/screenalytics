@@ -863,10 +863,10 @@ detect_tracker_value = _choose_value(
 )
 detect_device_default_value = _choose_value(
     device_override,
-    detect_job_defaults.get("device"),
     detect_job_defaults.get("requested_device"),
-    detect_phase_status.get("device"),
     detect_phase_status.get("requested_device"),
+    detect_job_defaults.get("device"),
+    detect_phase_status.get("device"),
     fallback=helpers.DEFAULT_DEVICE,
 )
 detect_device_label_default = helpers.device_label_from_value(detect_device_default_value)
@@ -875,11 +875,11 @@ detect_detector_label = helpers.detector_label_from_value(detect_detector_value)
 detect_tracker_label = helpers.tracker_label_from_value(detect_tracker_value)
 
 faces_device_default_value = _choose_value(
-    faces_job_defaults.get("device"),
     faces_job_defaults.get("requested_device"),
+    faces_job_defaults.get("device"),
     faces_job_defaults.get("embed_device"),
-    faces_phase_status.get("device"),
     faces_phase_status.get("requested_device"),
+    faces_phase_status.get("device"),
     faces_phase_status.get("embed_device"),
     fallback=detect_device_default_value,
 )
@@ -894,9 +894,9 @@ if faces_save_crops_default is None:
 faces_jpeg_quality_default = helpers.coerce_int(faces_job_defaults.get("jpeg_quality")) or 85
 
 cluster_device_default_value = _choose_value(
+    cluster_phase_status.get("requested_device"),
     cluster_job_defaults.get("device"),
     cluster_phase_status.get("device"),
-    cluster_phase_status.get("requested_device"),
     fallback=faces_device_default_value,
 )
 cluster_device_label_default = helpers.device_label_from_value(cluster_device_default_value)
