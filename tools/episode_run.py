@@ -21,8 +21,6 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import logging
 
-import queue
-import threading
 # Add project root to path for imports BEFORE applying CPU limits
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -3127,20 +3125,7 @@ class FrameExporter:
         self.min_face_size = 50  # pixels
         self._quality_filtered_count = 0
 
-
-        # C3: Async export queue and worker thread
-        self._export_queue: queue.Queue = queue.Queue(maxsize=64)
-        self._worker_thread: threading.Thread | None = None
-        self._shutdown = False
-
-        if save_frames or save_crops:
-            self._worker_thread = threading.Thread(
-                target=self._export_worker,
-                name="frame-export-worker",
-                daemon=True,
-            )
-            self._worker_thread.start()
-            LOGGER.info("Started async frame/crop export worker thread")
+        # Exports run synchronously to keep writes deterministic and avoid missing worker hooks.
 
     def _log_image_stats(self, kind: str, path: Path, image) -> None:
         if self._stat_samples >= self._stat_limit:
