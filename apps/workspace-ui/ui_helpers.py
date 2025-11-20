@@ -1174,8 +1174,10 @@ def _fetch_async_job_error(ep_id: str, phase: str) -> str | None:
             timeout=5,
         )
         resp.raise_for_status()
-        jobs = resp.json()
-        if not isinstance(jobs, list) or not jobs:
+        raw_payload = resp.json()
+        jobs_block = raw_payload.get("jobs") if isinstance(raw_payload, dict) else raw_payload
+        jobs = jobs_block if isinstance(jobs_block, list) else None
+        if not jobs:
             return None
         # Get most recent job (jobs are typically sorted by creation time)
         job = jobs[0]
@@ -1284,34 +1286,39 @@ def attempt_sse_run(
         return summary, None, False
 
     final_summary: Dict[str, Any] | None = None
+    events_seen = False
+    progress_events_seen = False
     try:
         for event_name, event_payload in iter_sse_events(response):
             if not isinstance(event_payload, dict):
                 continue
             update_cb(event_payload)
+            events_seen = True
+            phase = str(event_payload.get("phase", "")).lower()
+            if event_name != "log" and phase != "log":
+                progress_events_seen = True
             summary_candidate = event_payload.get("summary")
             if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
                 final_summary = summary_candidate
-            phase = str(event_payload.get("phase", "")).lower()
             if event_name == "error" or phase == "error":
-                return None, event_payload.get("error") or "Job failed", True
+                return None, event_payload.get("error") or "Job failed", progress_events_seen
             if event_name == "done" or _is_phase_done(event_payload):
                 if final_summary:
-                    return final_summary, None, True
+                    return final_summary, None, progress_events_seen
                 if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
-                    return summary_candidate, None, True
-                return None, None, True
+                    return summary_candidate, None, progress_events_seen
+                return None, None, progress_events_seen
     finally:
         response.close()
     if final_summary:
-        return final_summary, None, True
+        return final_summary, None, progress_events_seen
     ep_id_value = payload.get("ep_id")
     if isinstance(ep_id_value, str):
         phase_hint = _phase_from_endpoint(endpoint_path) or "detect_track"
         status_summary = _summary_from_status(ep_id_value, phase_hint)
         if status_summary:
-            return status_summary, None, True
-    return None, None, True
+            return status_summary, None, progress_events_seen
+    return None, None, progress_events_seen
 
 
 def fallback_poll_progress(
@@ -1322,9 +1329,24 @@ def fallback_poll_progress(
     status_placeholder,
     job_started: bool,
     async_endpoint: str,
+    force_async_start: bool = False,
 ) -> tuple[Dict[str, Any] | None, str | None]:
     job_id: str | None = None
-    if not job_started:
+
+    def _read_stderr_tail(path: str | None, max_lines: int = 20) -> str | None:
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return None
+        if not lines:
+            return None
+        return "".join(lines[-max_lines:]).strip()
+
+    should_start_async = force_async_start or not job_started
+    if should_start_async:
         try:
             resp = requests.post(f"{_api_base()}{async_endpoint}", json=payload, timeout=30)
             resp.raise_for_status()
@@ -1336,6 +1358,8 @@ def fallback_poll_progress(
                 job_id = None
         except requests.RequestException as exc:
             return None, describe_error(f"{_api_base()}{async_endpoint}", exc)
+        if not job_id:
+            return None, f"Async endpoint {async_endpoint} did not return a job_id"
 
     progress_url = f"{_api_base()}/episodes/{ep_id}/progress"
     job_progress_url = f"{_api_base()}/jobs/{job_id}/progress" if job_id else None
@@ -1382,7 +1406,17 @@ def fallback_poll_progress(
         state = str(payload_body.get("state", "")).lower() if isinstance(payload_body, dict) else ""
         if job_progress_url and state in {"succeeded", "failed", "canceled"}:
             if state != "succeeded":
-                return None, payload_body.get("error") or f"Job {state}"
+                error_msg = payload_body.get("error") or f"Job {state}"
+                if job_detail_url:
+                    try:
+                        job_detail = requests.get(job_detail_url, timeout=5).json()
+                    except Exception:
+                        job_detail = None
+                    if isinstance(job_detail, dict):
+                        stderr_tail = _read_stderr_tail(job_detail.get("stderr_log"))
+                        if stderr_tail:
+                            error_msg = f"{error_msg}\n\nstderr tail:\n{stderr_tail}"
+                return None, error_msg
             summary_payload: Dict[str, Any] | None = None
             if isinstance(payload_body.get("track_metrics"), dict):
                 summary_payload = {"track_metrics": payload_body["track_metrics"]}
@@ -1680,7 +1714,7 @@ def run_job_with_progress(
                 async_endpoint=target_endpoint,
             )
         else:
-            summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
+            summary, error_message, progress_seen = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
             if not events_seen:
                 if error_message:
                     _append_log(f"Request failed before any realtime updates ({_mode_context()}): {error_message}")
@@ -1693,13 +1727,15 @@ def run_job_with_progress(
                     )
             if async_endpoint and (summary is None or error_message):
                 _append_log(f"Falling back to async endpoint {async_endpoint} for {endpoint_path} ({_mode_context()})…")
+                force_async_start = bool(error_message) or not progress_seen
                 fallback_summary, fallback_error = fallback_poll_progress(
                     ep_id,
                     payload,
                     update_cb=_cb,
                     status_placeholder=status_placeholder,
-                    job_started=job_started,
+                    job_started=progress_seen,
                     async_endpoint=async_endpoint,
+                    force_async_start=force_async_start,
                 )
                 if fallback_summary is not None or fallback_error is None:
                     summary = fallback_summary

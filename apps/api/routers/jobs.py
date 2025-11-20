@@ -823,8 +823,8 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
 
     detections_count = _count_lines(Path(artifacts["detections"]))
     tracks_count = _count_lines(Path(artifacts["tracks"]))
-    progress_payload = _load_progress_payload(progress_path)
-    progress_resolved_device = progress_payload.get("resolved_device") if progress_payload else None
+    progress_payload = _load_progress_payload(progress_path) or {}
+    progress_resolved_device = progress_payload.get("resolved_device")
     resolved_device_out = progress_resolved_device or resolved_device
 
     return {
