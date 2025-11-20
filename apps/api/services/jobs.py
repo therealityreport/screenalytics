@@ -496,12 +496,14 @@ class JobService:
         command += ["--scene-threshold", str(scene_threshold)]
         command += ["--scene-min-len", str(scene_min_len)]
         command += ["--scene-warmup-dets", str(scene_warmup_dets)]
+        detector_device = resolved_detect_device or resolved_device
         requested = {
             "stride": stride,
             "fps": fps,
             "device": requested_device,
-            "device_resolved": resolved_detect_device or resolved_device,
-            "resolved_detect_device": resolved_detect_device or resolved_device,
+            "device_resolved": resolved_device,
+            "detector_device": detector_device,
+            "resolved_detect_device": detector_device,
             "cpu_threads": cpu_threads,
             "save_frames": save_frames,
             "save_crops": save_crops,

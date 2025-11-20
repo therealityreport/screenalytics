@@ -10,17 +10,18 @@ Tests the full pipeline workflow via API (not CLI):
 
 from __future__ import annotations
 
-import json
 import os
-import socket
-import subprocess
-import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from apps.api.main import app
+from apps.api.routers import jobs as jobs_router
+from apps.api.services.jobs import JobService
+
 RUN_ML_TESTS = os.environ.get("RUN_ML_TESTS") == "1"
 pytestmark = pytest.mark.skipif(
     not RUN_ML_TESTS,
@@ -63,99 +64,78 @@ def _create_test_video(target: Path, duration_sec: int = 10, fps: int = 24) -> P
     return target
 
 
-def _start_api_server(data_root: Path) -> tuple[subprocess.Popen, int]:
-    """Start API server in background, return process and port."""
-    try:
-        import requests  # noqa: F401
-    except ImportError:
-        pytest.skip("requests library not installed")
+@contextmanager
+def _api_client(data_root: Path) -> TestClient:
+    """Yield a TestClient bound to a fresh JobService rooted at data_root."""
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        "apps.api.main:app",
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "--log-level", "warning",
-    ]
-
-    env = os.environ.copy()
-    env["SCREENALYTICS_DATA_ROOT"] = str(data_root)
-
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(PROJECT_ROOT),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    max_attempts = 60  # ~30s with 0.5s sleep
-    last_stdout = b""
-    last_stderr = b""
-    health_url = f"http://127.0.0.1:{port}/health"
-    for _ in range(max_attempts):
-        if proc.poll() is not None:
-            stdout, stderr = proc.communicate()
-            raise RuntimeError(
-                f"API server failed to start:\nSTDOUT:\n{stdout.decode()}\n\nSTDERR:\n{stderr.decode()}"
-            )
-        try:
-            resp = requests.get(health_url, timeout=1)
-            if resp.status_code == 200:
-                return proc, port
-        except Exception:
-            # Capture logs on exit; avoid blocking reads inside loop
-            time.sleep(0.5)
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    raise RuntimeError(
-        f"API server did not become ready within timeout.\nSTDOUT:\n{last_stdout.decode(errors='ignore')}\n\nSTDERR:\n{last_stderr.decode(errors='ignore')}"
-    )
+    os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
+    jobs_router.JOB_SERVICE = JobService(data_root=data_root)
+    with TestClient(app) as client:
+        yield client
 
 
-def _api_request(method: str, path: str, port: int, data: dict | None = None) -> dict:
-    """Make API request using requests library."""
-    try:
-        import requests
-    except ImportError:
-        pytest.skip("requests library not installed")
-
-    url = f"http://127.0.0.1:{port}{path}"
-
+def _api_request(client: TestClient, method: str, path: str, data: dict | None = None) -> dict:
+    """Make API request using FastAPI TestClient."""
     if method == "GET":
-        response = requests.get(url, timeout=30)
+        response = client.get(path)
     elif method == "POST":
-        response = requests.post(url, json=data, timeout=30)
+        response = client.post(path, json=data or {})
     else:
         raise ValueError(f"Unsupported method: {method}")
 
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise AssertionError(f"Expected dict response, got {type(payload)}")
+    return payload
 
 
-def _poll_job_until_done(job_id: str, port: int, timeout_sec: int = 300) -> dict:
-    """Poll job status until it reaches terminal state."""
+def _poll_job_until_done(
+    client: TestClient,
+    job_id: str,
+    *,
+    timeout_sec: int = 180,
+    poll_interval: float = 2.0,
+) -> dict:
+    """Poll job status until it reaches terminal state, logging progress periodically."""
     start_time = time.time()
+    last_log = -poll_interval
+    last_progress: dict = {}
+    status: dict = {"state": "unknown"}
 
     while time.time() - start_time < timeout_sec:
-        status = _api_request("GET", f"/jobs/{job_id}", port)
+        status = _api_request(client, "GET", f"/jobs/{job_id}")
+        state = status.get("state")
 
-        if status["state"] in ["succeeded", "failed", "canceled"]:
+        if state in {"succeeded", "failed", "canceled"}:
+            progress_payload = _api_request(client, "GET", f"/jobs/{job_id}/progress")
+            status.setdefault("track_metrics", progress_payload.get("track_metrics"))
+            status.setdefault("progress", progress_payload.get("progress"))
             return status
 
-        time.sleep(2)  # Poll every 2 seconds
+        elapsed = time.time() - start_time
+        if elapsed - last_log >= 10:
+            progress_payload = _api_request(client, "GET", f"/jobs/{job_id}/progress")
+            last_progress = progress_payload.get("progress") or {}
+            phase = last_progress.get("phase")
+            frames_done = last_progress.get("frames_done")
+            frames_total = last_progress.get("frames_total")
+            print(
+                f"    state={state} phase={phase} frames={frames_done}/{frames_total} "
+                f"elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+            last_log = elapsed
 
-    raise TimeoutError(f"Job {job_id} did not complete within {timeout_sec}s")
+        time.sleep(poll_interval)
+
+    progress_payload = _api_request(client, "GET", f"/jobs/{job_id}/progress")
+    progress = progress_payload.get("progress") or last_progress
+    raise TimeoutError(
+        f"Job {job_id} did not complete within {timeout_sec}s "
+        f"(state={status.get('state')} phase={progress.get('phase')} "
+        f"frames={progress.get('frames_done')}/{progress.get('frames_total')})"
+    )
 
 
 @pytest.mark.timeout(900)
@@ -175,7 +155,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     data_root.mkdir(parents=True, exist_ok=True)
 
     # Create test video
-    video_path = _create_test_video(tmp_path / "test.mp4", duration_sec=10, fps=24)
+    video_path = _create_test_video(tmp_path / "test.mp4", duration_sec=8, fps=24)
 
     # Copy video to data directory for API access
     video_dest = data_root / "videos" / "api-smoke-test.mp4"
@@ -185,11 +165,9 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     shutil.copy(video_path, video_dest)
 
     ep_id = "api-smoke-test"
+    manifest_root = data_root / "manifests" / ep_id
 
-    # Start API server
-    server_proc, port = _start_api_server(data_root)
-
-    try:
+    with _api_client(data_root) as client:
         # Step 1: Submit detect_track job
         print("\n=== Step 1: Submitting detect_track job ===")
         detect_request = {
@@ -201,7 +179,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             "save_crops": False,
         }
 
-        detect_response = _api_request("POST", "/jobs/detect_track_async", port, detect_request)
+        detect_response = _api_request(client, "POST", "/jobs/detect_track_async", detect_request)
         detect_job_id = detect_response["job_id"]
 
         print(f"  Job ID: {detect_job_id}")
@@ -209,7 +187,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
         # Poll until detect_track completes
         print("  Polling for completion...")
-        detect_final = _poll_job_until_done(detect_job_id, port, timeout_sec=300)
+        detect_final = _poll_job_until_done(client, detect_job_id, timeout_sec=180)
 
         assert detect_final["state"] == "succeeded", \
             f"detect_track job failed: {detect_final.get('error', 'unknown error')}"
@@ -222,14 +200,19 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         metrics = track_metrics["metrics"]
 
         # Verify key metric fields exist
-        required_metrics = ["total_detections", "total_tracks", "tracks_per_minute", "short_track_fraction", "id_switch_rate"]
+        required_metrics = [
+            "total_detections",
+            "total_tracks",
+            "tracks_per_minute",
+            "short_track_fraction",
+            "id_switch_rate",
+        ]
         for metric in required_metrics:
             assert metric in metrics, f"Missing metric: {metric}"
 
         print(f"  ✓ detect_track completed: {metrics['total_tracks']} tracks, {metrics['total_detections']} detections")
 
         # Verify artifacts exist
-        manifest_root = data_root / "manifests" / ep_id
         assert (manifest_root / "detections.jsonl").exists(), "detections.jsonl not created"
         assert (manifest_root / "tracks.jsonl").exists(), "tracks.jsonl not created"
         assert (manifest_root / "track_metrics.json").exists(), "track_metrics.json not created"
@@ -244,7 +227,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             "save_crops": False,
         }
 
-        faces_response = _api_request("POST", "/jobs/faces_embed_async", port, faces_request)
+        faces_response = _api_request(client, "POST", "/jobs/faces_embed_async", faces_request)
         faces_job_id = faces_response["job_id"]
 
         print(f"  Job ID: {faces_job_id}")
@@ -252,12 +235,12 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
         # Poll until faces_embed completes
         print("  Polling for completion...")
-        faces_final = _poll_job_until_done(faces_job_id, port, timeout_sec=240)
+        faces_final = _poll_job_until_done(client, faces_job_id, timeout_sec=150)
 
         assert faces_final["state"] == "succeeded", \
             f"faces_embed job failed: {faces_final.get('error', 'unknown error')}"
 
-        print(f"  ✓ faces_embed completed")
+        print("  ✓ faces_embed completed")
 
         # Verify artifacts exist
         assert (manifest_root / "faces.jsonl").exists(), "faces.jsonl not created"
@@ -274,7 +257,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             "min_identity_sim": 0.45,
         }
 
-        cluster_response = _api_request("POST", "/jobs/cluster_async", port, cluster_request)
+        cluster_response = _api_request(client, "POST", "/jobs/cluster_async", cluster_request)
         cluster_job_id = cluster_response["job_id"]
 
         print(f"  Job ID: {cluster_job_id}")
@@ -282,7 +265,7 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
         # Poll until cluster completes
         print("  Polling for completion...")
-        cluster_final = _poll_job_until_done(cluster_job_id, port, timeout_sec=120)
+        cluster_final = _poll_job_until_done(client, cluster_job_id, timeout_sec=120)
 
         assert cluster_final["state"] == "succeeded", \
             f"cluster job failed: {cluster_final.get('error', 'unknown error')}"
@@ -308,25 +291,17 @@ def test_api_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
         # Test GET /jobs/{job_id}/progress endpoint
         print("\n=== Testing progress endpoint ===")
-        progress = _api_request("GET", f"/jobs/{cluster_job_id}/progress", port)
+        progress = _api_request(client, "GET", f"/jobs/{cluster_job_id}/progress")
 
         # Progress should include metrics after completion
         assert "track_metrics" in progress, "track_metrics missing from progress endpoint"
 
-        print(f"  ✓ Progress endpoint returns metrics")
+        print("  ✓ Progress endpoint returns metrics")
 
         print("\n=== API smoke test PASSED ===")
-        print(f"  All 3 jobs completed successfully")
-        print(f"  Metrics exposed via API")
-        print(f"  All artifacts created")
-
-    finally:
-        # Clean up: terminate API server
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
+        print("  All 3 jobs completed successfully")
+        print("  Metrics exposed via API")
+        print("  All artifacts created")
 
 
 @pytest.mark.timeout(300)
@@ -336,28 +311,12 @@ def test_api_job_not_found(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     data_root.mkdir(parents=True, exist_ok=True)
 
-    server_proc, port = _start_api_server(data_root)
-
-    try:
-        import requests
-
-        # Request non-existent job
-        url = f"http://127.0.0.1:{port}/jobs/nonexistent-job-id"
-        response = requests.get(url, timeout=10)
-
+    with _api_client(data_root) as client:
+        response = client.get("/jobs/nonexistent-job-id")
         assert response.status_code == 404, \
             f"Expected 404 for non-existent job, got {response.status_code}"
 
         print("\n✓ API correctly returns 404 for non-existent job")
-
-    except ImportError:
-        pytest.skip("requests library not installed")
-    finally:
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
 
 
 @pytest.mark.timeout(300)
@@ -367,32 +326,17 @@ def test_api_profile_validation(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     data_root.mkdir(parents=True, exist_ok=True)
 
-    server_proc, port = _start_api_server(data_root)
-
-    try:
-        import requests
-
-        # Submit job with invalid profile
-        url = f"http://127.0.0.1:{port}/jobs/detect_track_async"
+    with _api_client(data_root) as client:
         invalid_request = {
             "ep_id": "test",
             "profile": "invalid_profile_name",
             "device": "cpu",
         }
 
-        response = requests.post(url, json=invalid_request, timeout=10)
+        response = client.post("/jobs/detect_track_async", json=invalid_request)
 
         # Should be rejected with 422 (validation error)
         assert response.status_code == 422, \
             f"Expected 422 for invalid profile, got {response.status_code}"
 
         print("\n✓ API correctly rejects invalid profile names")
-
-    except ImportError:
-        pytest.skip("requests library not installed")
-    finally:
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
