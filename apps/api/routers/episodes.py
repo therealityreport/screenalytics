@@ -195,6 +195,29 @@ def _safe_float(value) -> float | None:
         return None
 
 
+def _parse_iso8601(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    candidate = value
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(candidate)
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_from_times(started_at: str | None, finished_at: str | None) -> float | None:
+    start_dt = _parse_iso8601(started_at)
+    end_dt = _parse_iso8601(finished_at)
+    if not start_dt or not end_dt:
+        return None
+    delta = end_dt - start_dt
+    if delta.total_seconds() < 0:
+        return None
+    return round(delta.total_seconds(), 3)
+
+
 def _safe_mtime(path: Path) -> float:
     try:
         return path.stat().st_mtime
@@ -268,6 +291,8 @@ def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
 
 def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, Any]:
     status_value = str(marker.get("status") or "unknown").lower()
+    started_at = marker.get("started_at")
+    finished_at = marker.get("finished_at")
     return {
         "phase": phase,
         "status": status_value,
@@ -295,8 +320,9 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
         "cluster_thresh": _safe_float(marker.get("cluster_thresh")),
         "min_cluster_size": _safe_int(marker.get("min_cluster_size")),
         "min_identity_sim": _safe_float(marker.get("min_identity_sim")),
-        "started_at": marker.get("started_at"),
-        "finished_at": marker.get("finished_at"),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "runtime_sec": _runtime_from_times(started_at, finished_at),
         "version": marker.get("version"),
         "source": "marker",
     }
@@ -395,6 +421,7 @@ def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
         "version": marker.get("version") if marker else episode_run.APP_VERSION,
         "source": source,
     }
+    status_payload["runtime_sec"] = _runtime_from_times(status_payload.get("started_at"), status_payload.get("finished_at"))
 
     if latest_source_mtime > marker_mtime:
         try:
@@ -509,6 +536,7 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         "version": marker.get("version") if marker else episode_run.APP_VERSION,
         "source": source,
     }
+    status_payload["runtime_sec"] = _runtime_from_times(status_payload.get("started_at"), status_payload.get("finished_at"))
 
     if status_payload["source"] != "progress" and marker and marker_identities_match:
         status_payload["source"] = "marker"
@@ -687,6 +715,7 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         "version": marker.get("version") if marker else episode_run.APP_VERSION,
         "source": "progress" if progress_payload else source,
     }
+    status_payload["runtime_sec"] = _runtime_from_times(status_payload.get("started_at"), status_payload.get("finished_at"))
 
     if latest_source_mtime > marker_mtime:
         try:
@@ -1685,6 +1714,7 @@ class PhaseStatus(BaseModel):
     min_identity_sim: float | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    runtime_sec: float | None = None
     version: str | None = None
     source: str | None = None
 

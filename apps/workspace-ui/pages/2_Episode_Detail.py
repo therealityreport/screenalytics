@@ -50,6 +50,24 @@ def _format_timestamp(value: str | None) -> str | None:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _format_runtime(runtime_sec: Any) -> str | None:
+    try:
+        total = float(runtime_sec)
+    except (TypeError, ValueError):
+        return None
+    if total < 0:
+        return None
+    seconds = int(round(total))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 3600:
+        minutes, rem = divmod(seconds, 60)
+        return f"{minutes}m {rem:02d}s"
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes:02d}m"
+
+
 def _choose_value(*candidates: Any, fallback: str) -> str:
     for candidate in candidates:
         if isinstance(candidate, str):
@@ -704,12 +722,14 @@ if status_payload:
         device_state = detect_phase_status.get("device")
         requested_device_state = detect_phase_status.get("requested_device")
         resolved_device_state = detect_phase_status.get("resolved_device")
+        detect_runtime = _format_runtime(detect_phase_status.get("runtime_sec"))
         if requested_device_state and requested_device_state != device_state:
             detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
         if device_state:
             detect_params.append(f"device={helpers.device_label_from_value(device_state)}")
         if detect_status_value == "success":
-            st.success("✅ **Detect/Track**: Complete")
+            runtime_label = detect_runtime or "n/a"
+            st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
             det = detect_phase_status.get("detector") or "--"
             trk = detect_phase_status.get("tracker") or "--"
             st.caption(f"{det} + {trk}")
@@ -754,12 +774,17 @@ if status_payload:
         finished = _format_timestamp(detect_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
+        if detect_status_value != "success" and detect_runtime:
+            st.caption(f"Runtime: {detect_runtime}")
+        elif detect_status_value == "success" and detect_runtime is None:
+            st.caption("Runtime: n/a")
 
     with col2:
         faces_params: list[str] = []
         faces_device_state = faces_phase_status.get("device")
         faces_device_request = faces_phase_status.get("requested_device")
         faces_resolved_state = faces_phase_status.get("resolved_device")
+        faces_runtime = _format_runtime(faces_phase_status.get("runtime_sec"))
         if faces_device_request and faces_device_request != faces_device_state:
             faces_params.append(f"requested={helpers.device_label_from_value(faces_device_request)}")
         if faces_device_state:
@@ -777,7 +802,8 @@ if status_payload:
         if jpeg_state:
             faces_params.append(f"jpeg={jpeg_state}")
         if faces_ready_state:
-            st.success("✅ **Faces Harvest**: Complete")
+            runtime_label = faces_runtime or "n/a"
+            st.success(f"✅ **Faces Harvest**: Complete (Runtime: {runtime_label})")
             face_count_label = helpers.format_count(faces_count_value) or "0"
             st.caption(f"Faces: {face_count_label} (harvest completed)")
         elif faces_status_value == "success":
@@ -799,12 +825,18 @@ if status_payload:
         finished = _format_timestamp(faces_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
+        if not faces_ready_state:
+            if faces_runtime:
+                st.caption(f"Runtime: {faces_runtime}")
+            elif faces_status_value == "success":
+                st.caption("Runtime: n/a")
 
     with col3:
         cluster_params: list[str] = []
         cluster_device_state = cluster_phase_status.get("device")
         cluster_device_request = cluster_phase_status.get("requested_device")
         cluster_resolved_state = cluster_phase_status.get("resolved_device")
+        cluster_runtime = _format_runtime(cluster_phase_status.get("runtime_sec"))
         if cluster_device_request and cluster_device_request != cluster_device_state:
             cluster_params.append(f"requested={helpers.device_label_from_value(cluster_device_request)}")
         if cluster_device_state:
@@ -817,7 +849,8 @@ if status_payload:
             cluster_params.append(f"min_cluster={min_cluster_state}")
         identities_label = helpers.format_count(identities_count_value) or "0"
         if cluster_status_value == "success":
-            st.success("✅ **Cluster**: Complete")
+            runtime_label = cluster_runtime or "n/a"
+            st.success(f"✅ **Cluster**: Complete (Runtime: {runtime_label})")
             st.caption(f"Identities: {identities_label}")
         elif cluster_status_value not in {"missing", "unknown"}:
             st.warning(f"⚠️ **Cluster**: {cluster_status_value.title()}")
@@ -839,6 +872,10 @@ if status_payload:
         finished = _format_timestamp(cluster_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
+        if cluster_status_value != "success" and cluster_runtime:
+            st.caption(f"Runtime: {cluster_runtime}")
+        elif cluster_status_value == "success" and cluster_runtime is None:
+            st.caption("Runtime: n/a")
 
     st.divider()
 

@@ -23,11 +23,11 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     run_dir = manifests_dir / "runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "faces_embed.json").write_text(
-        '{"phase": "faces_embed", "status": "success", "faces": 6, "finished_at": "2024-12-01T10:00:00Z"}',
+        '{"phase": "faces_embed", "status": "success", "faces": 6, "started_at": "2024-12-01T09:55:00Z", "finished_at": "2024-12-01T10:00:00Z"}',
         encoding="utf-8",
     )
     (run_dir / "cluster.json").write_text(
-        '{"phase": "cluster", "status": "success", "faces": 6, "identities": 2, "finished_at": "2024-12-01T10:05:00Z"}',
+        '{"phase": "cluster", "status": "success", "faces": 6, "identities": 2, "started_at": "2024-12-01T10:00:00Z", "finished_at": "2024-12-01T10:05:00Z"}',
         encoding="utf-8",
     )
 
@@ -49,11 +49,13 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     assert faces_status.get("status") == "success"
     assert isinstance(faces_status.get("faces"), int) and faces_status["faces"] > 0
     assert faces_status.get("finished_at")
+    assert faces_status.get("runtime_sec") == 300.0
     assert faces_status.get("source") == "marker"
 
     cluster_status = payload.get("cluster", {})
     assert cluster_status.get("status") == "success"
     assert isinstance(cluster_status.get("identities"), int) and cluster_status["identities"] > 0
+    assert cluster_status.get("runtime_sec") == 300.0
     assert cluster_status.get("source") == "marker"
 
     if run_dir.exists():
@@ -64,5 +66,7 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     inferred = inferred_resp.json()
     assert inferred["faces_embed"]["status"] == "success"
     assert inferred["faces_embed"].get("source") == "output"
+    assert inferred["faces_embed"].get("runtime_sec") is None
     assert inferred["cluster"]["status"] == "success"
     assert inferred["cluster"].get("source") == "output"
+    assert inferred["cluster"].get("runtime_sec") is None

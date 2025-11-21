@@ -201,6 +201,12 @@ class FacesEmbedRequest(BaseModel):
     save_crops: bool = Field(False, description="Export crops to data/frames + S3")
     jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for face crops")
     thumb_size: int = Field(256, ge=64, le=512, description="Square thumbnail size")
+    cpu_threads: int | None = Field(
+        None,
+        ge=1,
+        le=16,
+        description="CPU thread limit for ML libraries (OMP, MKL, etc.)",
+    )
 
 
 class ClusterRequest(BaseModel):
@@ -872,7 +878,7 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
         ) from exc
     progress_path = _progress_file_path(req.ep_id)
     command = _build_faces_command(req, progress_path)
-    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
+    result = _run_job_with_optional_sse(command, request, progress_file=progress_path, cpu_threads=req.cpu_threads)
     if isinstance(result, StreamingResponse):
         return result
 
@@ -1001,6 +1007,7 @@ async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) ->
             jpeg_quality=req.jpeg_quality,
             thumb_size=req.thumb_size,
             profile=req.profile,
+            cpu_threads=req.cpu_threads,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

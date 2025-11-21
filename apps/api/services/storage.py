@@ -293,6 +293,21 @@ class StorageService:
     def s3_enabled(self) -> bool:
         return self.backend in {"s3", "minio"} and self._client is not None
 
+    def upload_bytes(self, data: bytes, key: str, *, content_type: str | None = None) -> bool:
+        """Directly upload a small object to S3/MinIO without touching disk."""
+        if not self.s3_enabled() or not self.write_enabled or not self._client:
+            return False
+        extra_args: Dict[str, str] = {"Bucket": self.bucket, "Key": key, "Body": data}
+        if content_type:
+            extra_args["ContentType"] = content_type
+        extra_args["CacheControl"] = CACHE_CONTROL_IMMUTABLE
+        try:
+            self._client.put_object(**extra_args)  # type: ignore[union-attr]
+            return True
+        except Exception as exc:  # pragma: no cover - network/service errors are env-specific
+            LOGGER.warning("Failed to upload bytes to s3://%s/%s: %s", self.bucket, key, exc)
+            return False
+
     def _object_extra_args(self, local_path: Path, *, content_type_hint: str | None = None) -> Dict[str, str]:
         mime = content_type_hint or guess_type(str(local_path))[0]
         if not mime:

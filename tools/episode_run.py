@@ -117,6 +117,15 @@ def _load_quality_gating_config() -> dict[str, Any]:
     Returns:
         Dictionary of quality gating settings
     """
+    config = _load_faces_embed_config()
+    quality = config.get("quality_gating") if isinstance(config, dict) else None
+    return quality if isinstance(quality, dict) else {}
+
+
+def _load_faces_embed_config() -> dict[str, Any]:
+    """
+    Load faces_embed sampling configuration (quality gates + limits).
+    """
     config_path = REPO_ROOT / "config" / "pipeline" / "faces_embed_sampling.yaml"
     if not config_path.exists():
         LOGGER.debug("Quality gating config YAML not found at %s, using defaults", config_path)
@@ -128,11 +137,11 @@ def _load_quality_gating_config() -> dict[str, Any]:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
 
-        if config and "quality_gating" in config:
-            LOGGER.info("Loaded quality gating config from %s", config_path)
-            return config["quality_gating"]
+        if config:
+            LOGGER.info("Loaded faces_embed config from %s", config_path)
+            return config
     except Exception as exc:
-        LOGGER.warning("Failed to load quality gating config YAML: %s", exc)
+        LOGGER.warning("Failed to load faces_embed config YAML: %s", exc)
 
     return {}
 
@@ -183,6 +192,11 @@ MIN_FACE_AREA = 20.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
 RETINAFACE_SCORE_THRESHOLD = 0.65
 RETINAFACE_NMS = 0.45
+
+FACE_SAMPLES_PER_TRACK_DEFAULT = 16
+FACE_MIN_SAMPLES_PER_TRACK_DEFAULT = 4
+FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT = 4
+FACE_MAX_PER_EPISODE_DEFAULT = 10000
 
 RUN_MARKERS_SUBDIR = "runs"
 
@@ -3095,6 +3109,9 @@ class FrameExporter:
         save_crops: bool,
         jpeg_quality: int,
         debug_logger: JsonlLogger | NullLogger | None = None,
+        storage: StorageService | None = None,
+        s3_prefixes: Dict[str, str] | None = None,
+        direct_to_s3: bool | None = None,
     ) -> None:
         self.ep_id = ep_id
         self.save_frames = save_frames
@@ -3103,9 +3120,17 @@ class FrameExporter:
         self.root_dir = get_path(ep_id, "frames_root")
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
-        if self.save_frames:
+        self.storage = storage if storage and storage.s3_enabled() and storage.write_enabled else None
+        self.s3_prefixes = s3_prefixes or {}
+        self.frames_prefix = (self.s3_prefixes.get("frames") or "").rstrip("/")
+        self.crops_prefix = (self.s3_prefixes.get("crops") or "").rstrip("/")
+        use_storage_for_media = self.storage is not None and (self.frames_prefix or self.crops_prefix)
+        self.direct_to_s3 = bool(direct_to_s3) if direct_to_s3 is not None else use_storage_for_media
+        self._write_local_frames = self.save_frames and not self.direct_to_s3
+        self._write_local_crops = self.save_crops and not self.direct_to_s3
+        if self._write_local_frames:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
-        if self.save_crops:
+        if self._write_local_crops:
             self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.frames_written = 0
         self.crops_written = 0
@@ -3153,13 +3178,25 @@ class FrameExporter:
         if not (self.save_frames or self.save_crops):
             return
         if self.save_frames:
-            frame_path = self.frames_dir / f"frame_{frame_idx:06d}.jpg"
-            try:
-                self._log_image_stats("frame", frame_path, image)
-                save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
-                self.frames_written += 1
-            except Exception as exc:  # pragma: no cover - best effort
-                LOGGER.warning("Failed to save frame %s: %s", frame_path, exc)
+            frame_component = self.frame_component(frame_idx)
+            if self.direct_to_s3 and self.storage and self.frames_prefix:
+                data, err = self._encode_jpeg_bytes(image)
+                if data is None:
+                    LOGGER.warning("Skipping frame %s: %s", frame_idx, err or "encode_failed")
+                else:
+                    key = self._s3_key(self.frames_prefix, frame_component)
+                    if self.storage.upload_bytes(data, key, content_type="image/jpeg"):
+                        self.frames_written += 1
+                    else:
+                        LOGGER.warning("Failed to upload frame %s to %s", frame_idx, key)
+            else:
+                frame_path = self.frames_dir / frame_component
+                try:
+                    self._log_image_stats("frame", frame_path, image)
+                    save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
+                    self.frames_written += 1
+                except Exception as exc:  # pragma: no cover - best effort
+                    LOGGER.warning("Failed to save frame %s: %s", frame_path, exc)
         if self.save_crops and crops:
             for track_id, bbox in crops:
                 if track_id is None:
@@ -3182,6 +3219,16 @@ class FrameExporter:
                 if saved:
                     self.crops_written += 1
                     self._record_crop_index(track_id, frame_idx, ts)
+
+    def frame_component(self, frame_idx: int) -> str:
+        return f"frame_{frame_idx:06d}.jpg"
+
+    def frame_rel_path(self, frame_idx: int) -> str:
+        return f"frames/{self.frame_component(frame_idx)}"
+
+    def _s3_key(self, prefix: str, component: str) -> str:
+        prefix_clean = prefix.rstrip("/")
+        return f"{prefix_clean}/{component}" if prefix_clean else component
 
     def crop_component(self, track_id: int, frame_idx: int) -> str:
         return f"track_{track_id:04d}/frame_{frame_idx:06d}.jpg"
@@ -3209,10 +3256,21 @@ class FrameExporter:
         for track_id, entries in self._track_indexes.items():
             if not entries:
                 continue
+            ordered = sorted(entries.values(), key=lambda item: item["frame_idx"])
+            if self.direct_to_s3 and self.storage and self.crops_prefix:
+                key = self._s3_key(self.crops_prefix, f"track_{track_id:04d}/index.json")
+                try:
+                    payload = json.dumps(ordered, indent=2).encode("utf-8")
+                except Exception as exc:  # pragma: no cover - best effort
+                    LOGGER.warning("Failed to serialize crop index for track %s: %s", track_id, exc)
+                    continue
+                if not self.storage.upload_bytes(payload, key, content_type="application/json"):
+                    LOGGER.warning("Failed to upload crop index for track %s to %s", track_id, key)
+                continue
+
             track_dir = self.crops_dir / f"track_{track_id:04d}"
             if not track_dir.exists():
                 continue
-            ordered = sorted(entries.values(), key=lambda item: item["frame_idx"])
             index_path = track_dir / "index.json"
             try:
                 index_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
@@ -3270,8 +3328,17 @@ class FrameExporter:
                 self._emit_debug(debug_payload)
             return False
 
-        ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
-        reason = save_err if not ok else None
+        if self.direct_to_s3 and self.storage and self.crops_prefix:
+            encoded, encode_err = self._encode_jpeg_bytes(crop)
+            ok = False
+            reason = encode_err
+            if encoded is not None:
+                key = self._s3_key(self.crops_prefix, self.crop_component(track_id, frame_idx))
+                ok = self.storage.upload_bytes(encoded, key, content_type="image/jpeg")
+                reason = None if ok else "upload_failed"
+        else:
+            ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
+            reason = save_err if not ok else None
         self._register_crop_attempt(reason)
 
         if debug_payload is not None:
@@ -3284,16 +3351,39 @@ class FrameExporter:
                     "max": mx,
                     "mean": mean,
                     "save_ok": bool(ok),
-                    "save_err": save_err,
+                    "save_err": reason,
                     "file_size": (crop_path.stat().st_size if ok and crop_path.exists() else None),
                     "ms": int((time.time() - start) * 1000),
                 }
             )
             self._emit_debug(debug_payload)
 
-        if not ok and save_err:
-            LOGGER.warning("Failed to save crop %s: %s", crop_path, save_err)
+        if not ok and reason:
+            LOGGER.warning("Failed to save crop %s: %s", crop_path, reason)
         return bool(ok)
+
+    def _encode_jpeg_bytes(self, image) -> tuple[bytes | None, str | None]:
+        import cv2  # type: ignore
+
+        arr = np.asarray(image)
+        if arr.size == 0:
+            return None, "empty_image"
+        arr = _normalize_to_uint8(arr)
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            return None, "invalid_image_shape"
+        variance = float(np.std(arr)) if arr.size else 0.0
+        range_val = float(np.nanmax(arr)) - float(np.nanmin(arr)) if arr.size else 0.0
+        ok, buf = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        if not ok or buf is None:
+            return None, "imencode_failed"
+        data = buf.tobytes()
+        if len(data) < 1024:
+            return None, "tiny_file"
+        if variance <= 0.05 and range_val <= 1.0:
+            return None, "near_uniform_gray"
+        return data, None
 
     def _emit_debug(self, payload: Dict[str, Any]) -> None:
         if not self.debug_logger:
@@ -3511,10 +3601,16 @@ def _sync_artifacts_to_s3(
     # Only upload frames/crops if they were actually produced in this run
     # The elif branches that uploaded stale artifacts have been removed to prevent
     # publishing old frames/crops from prior runs when exports are disabled
-    if exporter and exporter.save_frames and exporter.frames_dir.exists():
-        stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
-    if exporter and exporter.save_crops and exporter.crops_dir.exists():
-        stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
+    if exporter and exporter.direct_to_s3:
+        if exporter.save_frames:
+            stats["frames"] = exporter.frames_written
+        if exporter.save_crops:
+            stats["crops"] = exporter.crops_written
+    else:
+        if exporter and exporter.save_frames and exporter.frames_dir.exists():
+            stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
+        if exporter and exporter.save_crops and exporter.crops_dir.exists():
+            stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
     if thumb_dir is not None and thumb_dir.exists():
         identities_dir = thumb_dir / "identities"
         stats["thumbs_tracks"] = storage.upload_dir(
@@ -3717,20 +3813,26 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-samples-per-track",
         type=int,
-        default=16,
+        default=FACE_SAMPLES_PER_TRACK_DEFAULT,
         help="Maximum samples per track for embedding/export (default: 16)",
     )
     parser.add_argument(
         "--min-samples-per-track",
         type=int,
-        default=4,
+        default=FACE_MIN_SAMPLES_PER_TRACK_DEFAULT,
         help="Minimum samples per track if track is long enough (default: 4)",
     )
     parser.add_argument(
         "--sample-every-n-frames",
         type=int,
-        default=4,
+        default=FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT,
         help="Sample interval for per-track sampling (default: 4)",
+    )
+    parser.add_argument(
+        "--max-faces-per-episode",
+        type=int,
+        default=FACE_MAX_PER_EPISODE_DEFAULT,
+        help="Hard cap on total faces embedded/exported per episode",
     )
     parser.add_argument("--thumb-size", type=int, default=256, help="Square thumbnail size for faces")
     parser.add_argument(
@@ -5512,6 +5614,8 @@ def _run_detect_track_stage(
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
             debug_logger=None,
+            storage=storage,
+            s3_prefixes=s3_prefixes,
         )
         if (save_frames or save_crops)
         else None
@@ -5597,15 +5701,20 @@ def _run_detect_track_stage(
                     "tracks": str(get_path(args.ep_id, "tracks")),
                     "manifests_dir": str(manifests_dir),
                     "frames_dir": (
-                        str(frame_exporter.frames_dir) if frame_exporter and frame_exporter.save_frames else None
+                        str(frame_exporter.frames_dir)
+                        if frame_exporter and frame_exporter.save_frames and not frame_exporter.direct_to_s3
+                        else None
                     ),
                     "crops_dir": (
-                        str(frame_exporter.crops_dir) if frame_exporter and frame_exporter.save_crops else None
+                        str(frame_exporter.crops_dir)
+                        if frame_exporter and frame_exporter.save_crops and not frame_exporter.direct_to_s3
+                        else None
                     ),
                 },
                 "s3_prefixes": s3_prefixes,
                 "s3_uploads": s3_stats,
             },
+            "direct_s3": bool(frame_exporter.direct_to_s3) if frame_exporter else False,
         }
         if detect_track_stats:
             summary["detect_track_stats"] = detect_track_stats
@@ -5725,6 +5834,81 @@ def _run_detect_track_stage(
         progress.close()
 
 
+def _resolve_face_sampling_params(args: argparse.Namespace) -> Dict[str, int | None]:
+    config = _load_faces_embed_config()
+    limits_cfg = config.get("limits") if isinstance(config, dict) else {}
+    default_limits = limits_cfg.get("default") if isinstance(limits_cfg, dict) else {}
+    profile_name = getattr(args, "profile", None) or os.environ.get("SCREENALYTICS_PERF_PROFILE")
+    profile = profile_name.lower().strip() if isinstance(profile_name, str) and profile_name else None
+    profile_limits = {}
+    if profile and isinstance(limits_cfg, dict):
+        raw_profiles = limits_cfg.get("profiles")
+        if isinstance(raw_profiles, dict):
+            profile_limits = raw_profiles.get(profile, {}) or {}
+
+    def _as_int(value: Any) -> int | None:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _pick(
+        arg_value: Any,
+        *,
+        key: str,
+        parser_default: int,
+        fallback: int,
+    ) -> int:
+        profile_val = _as_int(profile_limits.get(key)) if profile_limits else None
+        default_val = _as_int(default_limits.get(key)) if default_limits else None
+        arg_numeric = _as_int(arg_value)
+        if arg_numeric is not None and arg_numeric != parser_default:
+            return arg_numeric
+        if profile_val is not None:
+            return profile_val
+        if default_val is not None:
+            return default_val
+        if arg_numeric is not None:
+            return arg_numeric
+        return fallback
+
+    max_per_track = _pick(
+        getattr(args, "max_samples_per_track", None),
+        key="max_samples_per_track",
+        parser_default=FACE_SAMPLES_PER_TRACK_DEFAULT,
+        fallback=FACE_SAMPLES_PER_TRACK_DEFAULT,
+    )
+    min_per_track = _pick(
+        getattr(args, "min_samples_per_track", None),
+        key="min_samples_per_track",
+        parser_default=FACE_MIN_SAMPLES_PER_TRACK_DEFAULT,
+        fallback=FACE_MIN_SAMPLES_PER_TRACK_DEFAULT,
+    )
+    sample_every = _pick(
+        getattr(args, "sample_every_n_frames", None),
+        key="sample_every_n_frames",
+        parser_default=FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT,
+        fallback=FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT,
+    )
+    max_faces_total_val = _pick(
+        getattr(args, "max_faces_per_episode", None),
+        key="max_faces_per_episode",
+        parser_default=FACE_MAX_PER_EPISODE_DEFAULT,
+        fallback=FACE_MAX_PER_EPISODE_DEFAULT,
+    )
+    max_faces_total = max_faces_total_val if max_faces_total_val and max_faces_total_val > 0 else None
+    if min_per_track > max_per_track:
+        min_per_track = max_per_track
+    return {
+        "max_samples_per_track": max(1, int(max_per_track)),
+        "min_samples_per_track": max(1, int(min_per_track)),
+        "sample_every_n_frames": max(1, int(sample_every)),
+        "max_faces_per_episode": max_faces_total,
+    }
+
+
 def _run_faces_embed_stage(
     args: argparse.Namespace,
     storage: StorageService | None,
@@ -5734,14 +5918,16 @@ def _run_faces_embed_stage(
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
+    sampling_params = _resolve_face_sampling_params(args)
     # Sort samples by frame to enable batch embedding per frame
     # Apply per-track sampling to limit embedding/export volume
     samples = _load_track_samples(
         track_path,
         sort_by_frame=True,
-        max_samples_per_track=getattr(args, "max_samples_per_track", 16),
-        min_samples_per_track=getattr(args, "min_samples_per_track", 4),
-        sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
+        max_samples_per_track=sampling_params["max_samples_per_track"],
+        min_samples_per_track=sampling_params["min_samples_per_track"],
+        sample_every_n_frames=sampling_params["sample_every_n_frames"],
+        max_faces_total=sampling_params.get("max_faces_per_episode"),
     )
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
@@ -5854,6 +6040,8 @@ def _run_faces_embed_stage(
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
             debug_logger=debug_logger_obj,
+            storage=storage,
+            s3_prefixes=s3_prefixes,
         )
         if (save_frames or save_crops)
         else None
@@ -6353,14 +6541,27 @@ def _run_faces_embed_stage(
                     "faces": str(faces_path),
                     "tracks": str(track_path),
                     "manifests_dir": str(manifests_dir),
-                    "frames_dir": (str(exporter.frames_dir) if exporter and exporter.save_frames else None),
-                    "crops_dir": (str(exporter.crops_dir) if exporter and exporter.save_crops else None),
+                    "frames_dir": (
+                        str(exporter.frames_dir)
+                        if exporter and exporter.save_frames and not exporter.direct_to_s3
+                        else None
+                    ),
+                    "crops_dir": (
+                        str(exporter.crops_dir)
+                        if exporter and exporter.save_crops and not exporter.direct_to_s3
+                        else None
+                    ),
                     "thumbs_dir": str(thumb_writer.root_dir),
                     "faces_embeddings": str(embed_path),
                 },
                 "s3_prefixes": s3_prefixes,
             },
-            "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
+            "stats": {
+                "faces": len(rows),
+                "embedding_model": embedding_model_name,
+                "sampling": sampling_params,
+            },
+            "direct_s3": bool(exporter.direct_to_s3) if exporter else False,
         }
 
         # Emit completion BEFORE S3 sync (which might hang or take long)
@@ -6403,6 +6604,10 @@ def _run_faces_embed_stage(
                 "jpeg_quality": jpeg_quality,
                 "thumb_size": thumb_writer.size,
                 "device": device,
+                "max_faces_per_episode": sampling_params.get("max_faces_per_episode"),
+                "max_samples_per_track": sampling_params["max_samples_per_track"],
+                "min_samples_per_track": sampling_params["min_samples_per_track"],
+                "sample_every_n_frames": sampling_params["sample_every_n_frames"],
                 "requested_device": requested_embed_device,
                 "resolved_device": embed_device,
                 "started_at": started_at,
@@ -7198,6 +7403,7 @@ def _load_track_samples(
     max_samples_per_track: int | None = None,
     min_samples_per_track: int | None = None,
     sample_every_n_frames: int | None = None,
+    max_faces_total: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Load track samples from tracks.jsonl with optional per-track sampling.
 
@@ -7207,6 +7413,7 @@ def _load_track_samples(
         max_samples_per_track: Maximum samples per track (None = no limit)
         min_samples_per_track: Minimum samples per track if track is long enough
         sample_every_n_frames: Fallback interval for uniform sampling
+        max_faces_total: Optional cap on total samples across all tracks
 
     Returns:
         List of sample dicts with track_id, frame_idx, bbox_xyxy, etc.
@@ -7266,10 +7473,76 @@ def _load_track_samples(
         )
         samples.extend(sampled)
 
+    if max_faces_total is not None and max_faces_total > 0 and len(samples) > max_faces_total:
+        samples = _downsample_episode_samples(samples, max_faces_total)
+
     if sort_by_frame:
         samples.sort(key=lambda s: s["frame_idx"])
 
     return samples
+
+
+def _uniform_indices(count: int, target: int) -> List[int]:
+    if target <= 0:
+        return []
+    if count <= target:
+        return list(range(count))
+    if target == 1:
+        return [count // 2]
+    step = (count - 1) / float(target - 1)
+    raw = [int(round(i * step)) for i in range(target)]
+    indices: List[int] = []
+    seen: set[int] = set()
+    for idx in raw:
+        fixed = min(max(idx, 0), count - 1)
+        if fixed not in seen:
+            seen.add(fixed)
+            indices.append(fixed)
+    # Fill gaps if rounding collapsed indices
+    while len(indices) < target and indices[-1] < count - 1:
+        candidate = indices[-1] + 1
+        if candidate not in seen:
+            indices.append(candidate)
+            seen.add(candidate)
+        else:
+            break
+    return indices[:target]
+
+
+def _downsample_episode_samples(samples: List[Dict[str, Any]], max_total: int) -> List[Dict[str, Any]]:
+    if max_total <= 0 or len(samples) <= max_total:
+        return samples
+    by_track: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for sample in samples:
+        track_id = _parse_track_id(sample.get("track_id", -1))
+        by_track[track_id].append(sample)
+    for track_samples in by_track.values():
+        track_samples.sort(key=lambda s: s["frame_idx"])
+
+    kept: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    for track_samples in by_track.values():
+        if not track_samples:
+            continue
+        # Always keep at least one sample per track
+        kept.append(track_samples[0])
+        remaining.extend(track_samples[1:])
+
+    if len(kept) >= max_total:
+        return sorted(kept[:max_total], key=lambda s: s["frame_idx"])
+
+    budget = max_total - len(kept)
+    if remaining:
+        remaining.sort(key=lambda s: s["frame_idx"])
+        chosen: List[Dict[str, Any]]
+        if len(remaining) > budget:
+            indices = _uniform_indices(len(remaining), budget)
+            chosen = [remaining[idx] for idx in indices if 0 <= idx < len(remaining)]
+        else:
+            chosen = remaining
+        kept.extend(chosen[:budget])
+
+    return sorted(kept[:max_total], key=lambda s: s["frame_idx"])
 
 
 def _infer_detector_from_tracks(track_path: Path) -> str | None:

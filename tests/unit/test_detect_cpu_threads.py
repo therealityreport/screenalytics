@@ -119,6 +119,51 @@ def test_detect_track_async_propagates_cpu_threads(monkeypatch, tmp_path):
             "device": "cpu",
             "save_frames": False,
             "save_crops": False,
+        "cpu_threads": 2,
+    },
+)
+    assert resp.status_code == 200
+    assert captured_requested.get("cpu_threads") == 2
+
+
+def test_faces_embed_async_propagates_cpu_threads(monkeypatch, tmp_path):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    jobs_router.JOB_SERVICE = JobService(data_root=data_root)
+    jobs_router.EPISODE_STORE = EpisodeStore()
+    ep_id = EpisodeStore.make_ep_id("demo", 1, 5)
+    jobs_router.EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug="demo", season=1, episode=5)
+
+    track_path = get_path(ep_id, "tracks")
+    track_path.parent.mkdir(parents=True, exist_ok=True)
+    track_path.write_text("{}", encoding="utf-8")
+    video_path = get_path(ep_id, "video")
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"\x00\x01video")
+
+    captured_requested = {}
+
+    def _fake_launch_job(self, **kwargs):
+        captured_requested.update(kwargs.get("requested", {}))
+        return {
+            "job_id": "faces-cpu-job",
+            "state": "running",
+            "started_at": "now",
+            "progress_file": str(kwargs.get("progress_path")),
+            "requested": kwargs.get("requested"),
+        }
+
+    monkeypatch.setattr(JobService, "_launch_job", _fake_launch_job)
+    monkeypatch.setattr(JobService, "ensure_arcface_ready", lambda *args, **kwargs: "cpu")
+
+    client = TestClient(app)
+    resp = client.post(
+        "/jobs/faces_embed_async",
+        json={
+            "ep_id": ep_id,
+            "device": "cpu",
+            "save_frames": False,
+            "save_crops": False,
             "cpu_threads": 2,
         },
     )

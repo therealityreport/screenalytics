@@ -540,6 +540,7 @@ class JobService:
         jpeg_quality: int,
         thumb_size: int,
         profile: str | None = None,
+        cpu_threads: int | None = None,
     ) -> JobRecord:
         track_path = get_path(ep_id, "tracks")
         if not track_path.exists():
@@ -575,6 +576,7 @@ class JobService:
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
             "thumb_size": thumb_size,
+            "cpu_threads": cpu_threads,
         }
         return self._launch_job(
             job_type="faces_embed",
@@ -582,6 +584,7 @@ class JobService:
             command=command,
             progress_path=progress_path,
             requested=requested,
+            cpu_threads=cpu_threads,
         )
 
     def start_cluster_job(
