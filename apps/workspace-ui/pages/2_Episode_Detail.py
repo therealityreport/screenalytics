@@ -1641,7 +1641,6 @@ with col_cluster:
         or zero_faces_success
         or (not combo_supported_cluster)
         or faces_status_value == "stale"
-        or cluster_status_value == "stale"
     )
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True

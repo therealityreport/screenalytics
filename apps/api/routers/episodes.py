@@ -81,6 +81,10 @@ def _runs_dir(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "runs"
 
 
+def _progress_path(ep_id: str) -> Path:
+    return _manifests_dir(ep_id) / "progress.json"
+
+
 def _tracks_path(ep_id: str) -> Path:
     return get_path(ep_id, "tracks")
 
@@ -191,6 +195,23 @@ def _safe_float(value) -> float | None:
         return None
 
 
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _load_progress_payload(ep_id: str) -> tuple[Dict[str, Any] | None, float]:
+    progress_path = _progress_path(ep_id)
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        mtime = progress_path.stat().st_mtime
+    except (OSError, json.JSONDecodeError):
+        return None, 0.0
+    return payload if isinstance(payload, dict) else None, mtime
+
+
 def _count_nonempty_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -282,36 +303,135 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
 
 
 def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
+    marker_path = _runs_dir(ep_id) / "faces_embed.json"
+    marker_mtime = _safe_mtime(marker_path)
     marker = _load_run_marker(ep_id, "faces_embed")
-    if marker:
-        return _phase_status_from_marker("faces_embed", marker)
+    progress_payload, progress_mtime = _load_progress_payload(ep_id)
+    progress_phase = ""
+    progress_step = ""
+    if isinstance(progress_payload, dict):
+        progress_phase = str(progress_payload.get("phase") or "").lower()
+        progress_step = str(progress_payload.get("step") or "").lower()
+    progress_summary = progress_payload.get("summary") if isinstance(progress_payload, dict) else None
+    progress_stage = ""
+    if isinstance(progress_summary, dict):
+        progress_stage = str(progress_summary.get("stage") or "").lower()
+    progress_is_faces = (
+        progress_phase.startswith("faces")
+        or progress_step == "faces_embed"
+        or progress_stage == "faces_embed"
+    )
+    if not progress_is_faces:
+        progress_payload = None
+        progress_summary = None
+        progress_mtime = 0.0
+
     faces_path = _faces_path(ep_id)
     faces_count = _count_nonempty_lines(faces_path)
+    latest_source_mtime = max(progress_mtime, _safe_mtime(faces_path))
+    marker_faces_match = marker and _safe_int(marker.get("faces")) == faces_count
+    if marker and marker_mtime >= latest_source_mtime and marker_faces_match:
+        return _phase_status_from_marker("faces_embed", marker)
+
     status_value = "success" if faces_count > 0 else "missing"
-    source = "output" if faces_path.exists() else "absent"
-    return {
+    requested_device = None
+    resolved_device = None
+    save_frames = None
+    save_crops = None
+    jpeg_quality = None
+    thumb_size = None
+    updated_at_value = None
+
+    if isinstance(progress_payload, dict):
+        requested_device = progress_payload.get("device_requested") or progress_payload.get("device")
+        resolved_device = (
+            progress_payload.get("resolved_device")
+            or progress_payload.get("device_resolved")
+            or progress_payload.get("device")
+            or requested_device
+        )
+        updated_at_value = progress_payload.get("updated_at")
+    if isinstance(progress_summary, dict):
+        requested_device = progress_summary.get("requested_device") or requested_device
+        resolved_device = progress_summary.get("resolved_device") or resolved_device
+        faces_from_summary = _safe_int(progress_summary.get("faces"))
+        if faces_from_summary is not None:
+            faces_count = faces_from_summary
+            status_value = "success" if faces_count > 0 else "missing"
+        if progress_summary.get("save_frames") is not None:
+            save_frames = bool(progress_summary.get("save_frames"))
+        if progress_summary.get("save_crops") is not None:
+            save_crops = bool(progress_summary.get("save_crops"))
+        jpeg_quality = _safe_int(progress_summary.get("jpeg_quality")) or jpeg_quality
+        thumb_size = _safe_int(progress_summary.get("thumb_size")) or thumb_size
+
+    if marker:
+        requested_device = requested_device or marker.get("requested_device")
+        resolved_device = resolved_device or marker.get("resolved_device")
+        if save_frames is None:
+            save_frames = marker.get("save_frames")
+        if save_crops is None:
+            save_crops = marker.get("save_crops")
+        jpeg_quality = jpeg_quality or _safe_int(marker.get("jpeg_quality"))
+        thumb_size = thumb_size or _safe_int(marker.get("thumb_size"))
+
+    source = "progress" if progress_payload else ("output" if faces_path.exists() else "absent")
+    status_payload = {
         "phase": "faces_embed",
         "status": status_value,
         "faces": faces_count,
         "identities": None,
-        "device": None,
-        "requested_device": None,
-        "resolved_device": None,
-        "save_frames": None,
-        "save_crops": None,
-        "jpeg_quality": None,
-        "thumb_size": None,
-        "started_at": None,
-        "finished_at": None,
-        "version": None,
+        "device": resolved_device,
+        "requested_device": requested_device,
+        "resolved_device": resolved_device,
+        "save_frames": save_frames,
+        "save_crops": save_crops,
+        "jpeg_quality": jpeg_quality,
+        "thumb_size": thumb_size,
+        "started_at": marker.get("started_at") if marker else None,
+        "finished_at": updated_at_value
+        or (datetime.utcfromtimestamp(progress_mtime).replace(microsecond=0).isoformat() + "Z" if progress_mtime else None)
+        or (marker.get("finished_at") if marker else None),
+        "version": marker.get("version") if marker else episode_run.APP_VERSION,
         "source": source,
     }
 
+    if latest_source_mtime > marker_mtime:
+        try:
+            marker_payload = dict(status_payload)
+            marker_payload["phase"] = "faces_embed"
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - best effort
+            LOGGER.warning("Failed to refresh faces marker for %s: %s", ep_id, exc)
+
+    return status_payload
+
 
 def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
+    marker_path = _runs_dir(ep_id) / "cluster.json"
+    marker_mtime = _safe_mtime(marker_path)
     marker = _load_run_marker(ep_id, "cluster")
-    if marker:
-        return _phase_status_from_marker("cluster", marker)
+    progress_payload, progress_mtime = _load_progress_payload(ep_id)
+    progress_phase = ""
+    progress_step = ""
+    if isinstance(progress_payload, dict):
+        progress_phase = str(progress_payload.get("phase") or "").lower()
+        progress_step = str(progress_payload.get("step") or "").lower()
+    progress_summary = progress_payload.get("summary") if isinstance(progress_payload, dict) else None
+    progress_stage = ""
+    if isinstance(progress_summary, dict):
+        progress_stage = str(progress_summary.get("stage") or "").lower()
+    progress_is_cluster = (
+        progress_phase.startswith("cluster")
+        or progress_step == "cluster"
+        or progress_stage == "cluster"
+    )
+    if not progress_is_cluster:
+        progress_payload = None
+        progress_summary = None
+        progress_mtime = 0.0
+
     identities_path = _identities_path(ep_id)
     faces_total = 0
     identities_count = 0
@@ -326,24 +446,83 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         stats_block = payload.get("stats") if isinstance(payload, dict) else None
         if isinstance(stats_block, dict):
             faces_total = _safe_int(stats_block.get("faces")) or 0
+
+    latest_source_mtime = max(progress_mtime, _safe_mtime(identities_path))
+    marker_identities_match = marker and _safe_int(marker.get("identities")) == identities_count
+    if marker and marker_mtime >= latest_source_mtime and marker_identities_match:
+        return _phase_status_from_marker("cluster", marker)
+
     status_value = "success" if identities_count > 0 else "missing"
-    source = "output" if identities_path.exists() else "absent"
-    return {
+    requested_device = None
+    resolved_device = None
+    cluster_thresh = None
+    min_cluster_size = None
+    min_identity_sim = None
+    updated_at_value = None
+
+    if isinstance(progress_payload, dict):
+        requested_device = progress_payload.get("device_requested") or progress_payload.get("device")
+        resolved_device = (
+            progress_payload.get("resolved_device")
+            or progress_payload.get("device_resolved")
+            or progress_payload.get("device")
+            or requested_device
+        )
+        updated_at_value = progress_payload.get("updated_at")
+    if isinstance(progress_summary, dict):
+        requested_device = progress_summary.get("requested_device") or requested_device
+        resolved_device = progress_summary.get("resolved_device") or resolved_device
+        faces_from_summary = _safe_int(progress_summary.get("faces"))
+        identities_from_summary = _safe_int(progress_summary.get("identities") or progress_summary.get("identities_count"))
+        if faces_from_summary is not None:
+            faces_total = faces_from_summary
+        if identities_from_summary is not None:
+            identities_count = identities_from_summary
+            status_value = "success" if identities_count > 0 else "missing"
+        cluster_thresh = _safe_float(progress_summary.get("cluster_thresh")) or cluster_thresh
+        min_cluster_size = _safe_int(progress_summary.get("min_cluster_size")) or min_cluster_size
+        min_identity_sim = _safe_float(progress_summary.get("min_identity_sim")) or min_identity_sim
+
+    if marker:
+        requested_device = requested_device or marker.get("requested_device")
+        resolved_device = resolved_device or marker.get("resolved_device")
+        cluster_thresh = cluster_thresh or _safe_float(marker.get("cluster_thresh"))
+        min_cluster_size = min_cluster_size or _safe_int(marker.get("min_cluster_size"))
+        min_identity_sim = min_identity_sim or _safe_float(marker.get("min_identity_sim"))
+
+    source = "progress" if progress_payload else ("output" if identities_path.exists() else "absent")
+    status_payload = {
         "phase": "cluster",
         "status": status_value,
         "faces": faces_total,
         "identities": identities_count,
-        "device": None,
-        "requested_device": None,
-        "resolved_device": None,
-        "cluster_thresh": None,
-        "min_cluster_size": None,
-        "min_identity_sim": None,
-        "started_at": None,
-        "finished_at": None,
-        "version": None,
+        "device": resolved_device,
+        "requested_device": requested_device,
+        "resolved_device": resolved_device,
+        "cluster_thresh": cluster_thresh,
+        "min_cluster_size": min_cluster_size,
+        "min_identity_sim": min_identity_sim,
+        "started_at": marker.get("started_at") if marker else None,
+        "finished_at": updated_at_value
+        or (datetime.utcfromtimestamp(progress_mtime).replace(microsecond=0).isoformat() + "Z" if progress_mtime else None)
+        or (marker.get("finished_at") if marker else None),
+        "version": marker.get("version") if marker else episode_run.APP_VERSION,
         "source": source,
     }
+
+    if status_payload["source"] != "progress" and marker and marker_identities_match:
+        status_payload["source"] = "marker"
+
+    if latest_source_mtime > marker_mtime:
+        try:
+            marker_payload = dict(status_payload)
+            marker_payload["phase"] = "cluster"
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - best effort
+            LOGGER.warning("Failed to refresh cluster marker for %s: %s", ep_id, exc)
+
+    return status_payload
 
 
 def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
@@ -352,16 +531,54 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     IMPORTANT: Returns the FACE detector (e.g., retinaface), NOT the scene detector.
     Scene detection (pyscenedetect) is a preliminary step, not the main detect/track operation.
     """
+    marker_path = _runs_dir(ep_id) / "detect_track.json"
+    marker_mtime = _safe_mtime(marker_path)
     marker = _load_run_marker(ep_id, "detect_track")
-    if marker:
-        return _phase_status_from_marker("detect_track", marker)
-    from py_screenalytics.artifacts import get_path
+    progress_payload, progress_mtime = _load_progress_payload(ep_id)
+    progress_phase = ""
+    progress_step = ""
+    if isinstance(progress_payload, dict):
+        raw_phase = progress_payload.get("phase") or ""
+        progress_phase = str(raw_phase).lower()
+        progress_step = str(progress_payload.get("step") or "").lower()
+    progress_summary = progress_payload.get("summary") if isinstance(progress_payload, dict) else None
+    progress_stage = ""
+    if isinstance(progress_summary, dict):
+        progress_stage = str(progress_summary.get("stage") or "").lower()
+    progress_is_detect = progress_phase.startswith("detect") or progress_phase.startswith("scene") or progress_step == "detect_track" or progress_stage == "detect_track"
+    if not progress_is_detect:
+        progress_payload = None
+        progress_summary = None
+        progress_tracker_cfg = None
+        progress_mtime = 0.0
+    else:
+        progress_tracker_cfg = None
+        if isinstance(progress_payload, dict):
+            stats_block = progress_payload.get("detect_track_stats")
+            if isinstance(stats_block, dict):
+                progress_tracker_cfg = stats_block.get("tracker_config")
+        if isinstance(progress_summary, dict) and not progress_tracker_cfg:
+            cfg_block = progress_summary.get("tracker_config")
+            progress_tracker_cfg = cfg_block if isinstance(cfg_block, dict) else None
 
     tracks_path = get_path(ep_id, "tracks")
     detections_path = get_path(ep_id, "detections")
 
     detections_count = _count_nonempty_lines(detections_path)
     tracks_count = _count_nonempty_lines(tracks_path)
+
+    latest_source_mtime = max(
+        progress_mtime,
+        _safe_mtime(tracks_path),
+        _safe_mtime(detections_path),
+    )
+    marker_counts_match = (
+        marker
+        and _safe_int(marker.get("detections")) == detections_count
+        and _safe_int(marker.get("tracks")) == tracks_count
+    )
+    if marker and marker_mtime >= latest_source_mtime and marker_counts_match:
+        return _phase_status_from_marker("detect_track", marker)
 
     # Infer detector/tracker from tracks.jsonl if available
     # Only accept FACE detectors (retinaface, yolov8face, etc.), NOT scene detectors
@@ -385,6 +602,52 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         track_id_value = track_row.get("track_id")
         tracks_manifest_valid = detector is not None and tracker is not None and track_id_value is not None
 
+    requested_device = None
+    resolved_device = None
+    stride_value = None
+    scene_detector_value = None
+    scene_threshold_value = None
+    scene_min_len_value = None
+    scene_warmup_value = None
+    det_thresh_value = None
+    tracker_high_value = None
+    tracker_new_value = None
+    updated_at_value = None
+
+    if isinstance(progress_payload, dict):
+        requested_device = progress_payload.get("device_requested") or progress_payload.get("device")
+        resolved_device = (
+            progress_payload.get("resolved_device")
+            or progress_payload.get("device_resolved")
+            or progress_payload.get("device")
+            or requested_device
+        )
+        stride_value = _safe_int(progress_payload.get("stride"))
+        scene_detector_value = progress_payload.get("scene_mode_resolved") or progress_payload.get(
+            "scene_mode_requested"
+        )
+        updated_at_value = progress_payload.get("updated_at")
+
+    if isinstance(progress_summary, dict):
+        requested_device = progress_summary.get("requested_device") or requested_device
+        resolved_device = progress_summary.get("resolved_device") or resolved_device
+        detector = progress_summary.get("detector") or detector
+        tracker = progress_summary.get("tracker") or tracker
+        stride_value = _safe_int(progress_summary.get("stride")) or stride_value
+        det_thresh_value = _safe_float(progress_summary.get("det_thresh")) or det_thresh_value
+        scene_detector_value = progress_summary.get("scene_detector") or scene_detector_value
+        scene_threshold_value = _safe_float(progress_summary.get("scene_threshold")) or scene_threshold_value
+        scene_min_len_value = _safe_int(progress_summary.get("scene_min_len")) or scene_min_len_value
+        scene_warmup_value = _safe_int(progress_summary.get("scene_warmup_dets")) or scene_warmup_value
+        tracker_config = progress_summary.get("tracker_config")
+        if isinstance(tracker_config, dict):
+            tracker_high_value = _safe_float(tracker_config.get("track_high_thresh"))
+            tracker_new_value = _safe_float(tracker_config.get("new_track_thresh"))
+
+    if isinstance(progress_tracker_cfg, dict) and not tracker_high_value:
+        tracker_high_value = _safe_float(progress_tracker_cfg.get("track_high_thresh"))
+        tracker_new_value = _safe_float(progress_tracker_cfg.get("new_track_thresh"))
+
     # Determine status
     if tracks_count > 0 and not tracks_manifest_valid:
         status_value = "invalid"
@@ -397,31 +660,44 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
 
     source = "output" if tracks_path.exists() or detections_path.exists() else "absent"
 
-    return {
+    status_payload = {
         "phase": "detect_track",
         "status": status_value,
         "detections": detections_count,
         "tracks": tracks_count,
         "detector": detector,
         "tracker": tracker,
-        "device": None,
-        "requested_device": None,
-        "resolved_device": None,
-        "stride": None,
-        "det_thresh": None,
+        "device": resolved_device,
+        "requested_device": requested_device,
+        "resolved_device": resolved_device,
+        "stride": stride_value,
+        "det_thresh": det_thresh_value,
         "max_gap": None,
-        "scene_threshold": None,
-        "scene_min_len": None,
-        "scene_warmup_dets": None,
-        "track_high_thresh": None,
-        "new_track_thresh": None,
+        "scene_threshold": scene_threshold_value,
+        "scene_min_len": scene_min_len_value,
+        "scene_warmup_dets": scene_warmup_value,
+        "track_high_thresh": tracker_high_value,
+        "new_track_thresh": tracker_new_value,
         "faces": None,
         "identities": None,
-        "started_at": None,
-        "finished_at": None,
-        "version": None,
-        "source": source,
+        "started_at": marker.get("started_at") if marker else None,
+        "finished_at": updated_at_value
+        or (datetime.utcfromtimestamp(progress_mtime).replace(microsecond=0).isoformat() + "Z" if progress_mtime else None)
+        or (marker.get("finished_at") if marker else None),
+        "version": marker.get("version") if marker else episode_run.APP_VERSION,
+        "source": "progress" if progress_payload else source,
     }
+
+    if latest_source_mtime > marker_mtime:
+        try:
+            marker_payload = dict(status_payload)
+            marker_payload["phase"] = "detect_track"
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - best effort
+            LOGGER.warning("Failed to refresh detect/track marker for %s: %s", ep_id, exc)
+
+    return status_payload
 
 
 def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:

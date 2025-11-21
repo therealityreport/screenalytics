@@ -33,6 +33,36 @@ Screenalytics ingests an episode, detects and tracks faces, recognizes cast memb
 
 ---
 
+## Project Layout
+
+This repository now hosts two main code paths:
+
+- **Python ML/Streamlit** (existing): pipelines, API, and tools at the repo root.
+- **Next.js + TypeScript + Prisma** web app under `web/` for the Youth League Team Builder (event/division admin and agents).
+
+Quickstart for the web app:
+
+```bash
+cd web
+npm install
+cp .env.example .env.local    # provide DATABASE_URL, OPENAI_API_KEY, etc.
+npx prisma generate
+npx prisma migrate dev        # creates local schema; requires DATABASE_URL
+npm run dev                   # http://localhost:3000
+```
+
+API stubs available at:
+- `GET /api/events`
+- `GET /api/divisions?eventId=...`
+- `POST /api/agent-run`
+- `GET /api/agent-status`
+
+UI stubs:
+- Home (`/`) lists events.
+- Request Analysis (`/request-analysis`) can start a dummy agent run and poll status.
+
+---
+
 ## Core Stack
 
 - **Detection**: RetinaFace (InsightFace)

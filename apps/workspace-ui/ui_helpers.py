@@ -1330,6 +1330,7 @@ def fallback_poll_progress(
     job_started: bool,
     async_endpoint: str,
     force_async_start: bool = False,
+    log_fn=None,
 ) -> tuple[Dict[str, Any] | None, str | None]:
     job_id: str | None = None
 
@@ -1354,6 +1355,8 @@ def fallback_poll_progress(
                 body = resp.json()
                 if isinstance(body, dict):
                     job_id = body.get("job_id")
+                    if log_fn and job_id:
+                        log_fn(f"Async job id: {job_id} (via {async_endpoint})")
             except ValueError:
                 job_id = None
         except requests.RequestException as exc:
@@ -1712,6 +1715,7 @@ def run_job_with_progress(
                 status_placeholder=status_placeholder,
                 job_started=False,
                 async_endpoint=target_endpoint,
+                log_fn=_append_log,
             )
         else:
             summary, error_message, progress_seen = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
@@ -1736,10 +1740,10 @@ def run_job_with_progress(
                     job_started=progress_seen,
                     async_endpoint=async_endpoint,
                     force_async_start=force_async_start,
+                    log_fn=_append_log,
                 )
-                if fallback_summary is not None or fallback_error is None:
-                    summary = fallback_summary
-                    error_message = fallback_error
+                summary = fallback_summary if fallback_summary is not None else summary
+                error_message = fallback_error or error_message
                 if fallback_error:
                     _append_log(
                         f"Async endpoint {async_endpoint} reported an error ({_mode_context()}): {fallback_error}"
@@ -1753,6 +1757,8 @@ def run_job_with_progress(
             status_summary = _summary_from_status(ep_id, phase_hint)
             if status_summary:
                 summary = status_summary
+        if summary is None and not error_message:
+            error_message = f"No progress or summary returned from {endpoint_path}; check API logs."
         return summary, error_message
     finally:
         st.session_state.pop(dedupe_key, None)
