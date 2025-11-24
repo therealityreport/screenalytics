@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 from datetime import datetime, timedelta
 
-DEBUG_UPLOAD = False
+DEBUG_UPLOAD = os.getenv("DEBUG_UPLOAD", "").lower() in {"1", "true", "yes", "on"}
 
 # Global lock for thread-safe session state updates
 _session_state_lock = threading.Lock()
@@ -806,11 +806,16 @@ def _cleanup_stale_progress_keys() -> int:
             upload_info = st.session_state.get(key, {})
             # Check if entry has a timestamp
             if "timestamp" in upload_info:
-                timestamp = upload_info["timestamp"]
-                age_seconds = (now - timestamp).total_seconds()
-                # Remove if older than TTL
-                if age_seconds > UPLOAD_PROGRESS_TTL_SECONDS:
+                try:
+                    timestamp = upload_info["timestamp"]
+                    age_seconds = (now - timestamp).total_seconds()
+                except Exception:
+                    # If timestamp is malformed, drop the key to avoid crashes.
                     keys_to_remove.append(key)
+                else:
+                    # Remove if older than TTL
+                    if age_seconds > UPLOAD_PROGRESS_TTL_SECONDS:
+                        keys_to_remove.append(key)
             # Also remove completed/failed uploads after they've been displayed for a while
             elif upload_info.get("status") in {"completed", "failed"}:
                 # If no timestamp but completed/failed, assume it's old and clean up
@@ -889,19 +894,6 @@ def handle_episode_upload(
         )
         return {"status": "error", "reason": "too_large"}
 
-    # Validate AWS credentials early (before user waits for upload)
-    creds_valid, creds_error = _validate_s3_credentials()
-    if not creds_valid:
-        detail = f"{type(creds_error).__name__}: {creds_error}" if creds_error else "Unknown credential error"
-        st.error(f"AWS credentials check failed: {detail}")
-        st.info(
-            "To configure AWS credentials:\n"
-            "1. Run `aws configure` in terminal\n"
-            "2. Or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables\n"
-            "3. Or use IAM instance role (for EC2/ECS deployments)"
-        )
-        return {"status": "error", "reason": "credentials"}
-
     air_date_payload = air_date_value.isoformat() if include_air_date else None
     payload = {
         "show_slug_or_id": show_ref.strip(),
@@ -964,6 +956,17 @@ def handle_episode_upload(
         _rollback_episode_creation(ep_id, bucket, key)
         return {"status": "error", "reason": "no_upload_method", "ep_id": ep_id}
 
+    # Credential validation only applies to direct boto3 uploads; presigned/local paths must not block on AWS creds.
+    requires_boto3 = upload_method not in {"PUT", "FILE"} and bool(bucket and key)
+    if requires_boto3:
+        creds_valid, creds_error = _validate_s3_credentials()
+        if not creds_valid:
+            detail = f"{type(creds_error).__name__}: {creds_error}" if creds_error else "Unknown credential error"
+            st.error("Direct S3 upload requires AWS credentials.")
+            st.error(f"Credential check failed: {detail}")
+            st.info("Configure AWS credentials or switch to a presigned/local upload method.")
+            return {"status": "error", "reason": "credentials", "ep_id": ep_id}
+
     # Route to appropriate upload method based on presign response
     needs_mirror = False  # Track if we need to call mirror endpoint after upload
     cloud_result = {
@@ -1014,6 +1017,9 @@ def handle_episode_upload(
         st.info("📦 Saving video to local storage...")
         local_write = _write_local_copy_with_progress(ep_id, uploaded_file, local_video_path, file_size)
         local_result.update(local_write)
+        cloud_result["status_label"] = "LOCAL ONLY"
+        cloud_result["succeeded"] = True
+        cloud_result["attempted"] = False
         cloud_result["error_type"] = "not_attempted"
         cloud_result["error_message"] = "Presign provided a local-only path (no cloud upload attempted)."
         if not local_result["succeeded"]:
@@ -1104,8 +1110,10 @@ def handle_episode_upload(
         _rollback_episode_creation(ep_id, cloud_result.get("bucket"), cloud_result.get("key"))
         return {"status": outcome_state, "ep_id": ep_id, "cloud_ok": cloud_ok, "local_ok": local_ok}
 
+    cloud_label = cloud_result.get("status_label")
+    cloud_status_text = cloud_label or ("OK" if cloud_ok else "FAILED" if cloud_result.get("attempted") else "NOT ATTEMPTED")
     st.caption(
-        f"Upload status → Cloud: {'OK' if cloud_ok else 'FAILED' if cloud_result.get('attempted') else 'NOT ATTEMPTED'}, "
+        f"Upload status → Cloud: {cloud_status_text}, "
         f"Local: {'OK' if local_ok else 'FAILED'}"
     )
 
@@ -1151,8 +1159,15 @@ def main():
         if DEBUG_UPLOAD:
             st.write("DEBUG: layout start")
         global cfg
-        cfg = helpers.init_page("Screenalytics Upload")
+        try:
+            cfg = helpers.init_page("Screenalytics Upload")
+        except Exception as init_exc:
+            st.error("Failed to initialize upload page.")
+            st.exception(init_exc)
+            logging.exception("init_page failed in Upload_Video")
+            st.stop()
         st.title("Upload & Run")
+        st.caption("Upload page initialized.")
         if DEBUG_UPLOAD:
             st.write("DEBUG: init_page complete")
 
@@ -1167,11 +1182,13 @@ def main():
             del st.session_state["tracker"]
         st.cache_data.clear()
         # Remove ep_id from state/query params on upload page to avoid stale episode IDs causing reruns.
-        st.session_state["ep_id"] = ""
-        if "ep_id" in st.query_params:
-            params = st.query_params
-            params.pop("ep_id", None)
-            st.query_params = params
+        if not st.session_state.get("upload_ep_params_cleaned"):
+            st.session_state["ep_id"] = ""
+            if "ep_id" in st.query_params:
+                params = st.query_params
+                params.pop("ep_id", None)
+                st.query_params = params
+            st.session_state["upload_ep_params_cleaned"] = True
 
         flash_message = st.session_state.pop("upload_flash", None)
         if flash_message:
@@ -1187,11 +1204,12 @@ def main():
 
         # Render S3 upload progress for any ongoing background uploads
         s3_uploads_in_progress = False
-        s3_progress_keys = [k for k in st.session_state.keys() if k.startswith("s3_upload_")]
-        if s3_progress_keys:
+        with _session_state_lock:
+            s3_progress_keys = [k for k in st.session_state.keys() if k.startswith("s3_upload_")]
+            progress_snap = {k: st.session_state.get(k, {}) for k in s3_progress_keys}
+        if progress_snap:
             st.subheader("Background S3 Uploads")
-            for progress_key in s3_progress_keys:
-                upload_info = st.session_state[progress_key]
+            for progress_key, upload_info in progress_snap.items():
                 ep_id = progress_key.replace("s3_upload_", "")
 
                 status = upload_info.get("status", "unknown")
@@ -1211,38 +1229,22 @@ def main():
                 elif status == "completed":
                     st.success(f"✅ Upload complete: {total_bytes / (1024**2):.1f} MB")
                     if st.button(f"Dismiss", key=f"dismiss_s3_{ep_id}"):
-                        del st.session_state[progress_key]
-                        if f"s3_future_{ep_id}" in st.session_state:
-                            del st.session_state[f"s3_future_{ep_id}"]
+                        with _session_state_lock:
+                            st.session_state.pop(progress_key, None)
+                            st.session_state.pop(f"s3_future_{ep_id}", None)
                         st.rerun()
                 elif status == "failed":
                     st.error(f"❌ Upload failed: {error}")
                     if st.button(f"Dismiss", key=f"dismiss_s3_{ep_id}"):
-                        del st.session_state[progress_key]
-                        if f"s3_future_{ep_id}" in st.session_state:
-                            del st.session_state[f"s3_future_{ep_id}"]
+                        with _session_state_lock:
+                            st.session_state.pop(progress_key, None)
+                            st.session_state.pop(f"s3_future_{ep_id}", None)
                         st.rerun()
 
                 st.divider()
 
-        # Auto-refresh if uploads in progress with iteration limit and exponential backoff
-        MAX_UPLOAD_ITERATIONS = 300
-        if s3_uploads_in_progress:
-            upload_iteration = st.session_state.get("upload_rerun_count", 0)
-            if upload_iteration >= MAX_UPLOAD_ITERATIONS:
-                st.warning(
-                    f"Upload monitoring has reached maximum auto-refresh limit ({MAX_UPLOAD_ITERATIONS} iterations). "
-                    "Refresh the page manually to continue monitoring."
-                )
-            else:
-                st.session_state["upload_rerun_count"] = upload_iteration + 1
-                # Exponential backoff: 2s, 2s, 4s, 4s, 8s, 8s, 16s (capped at 16s)
-                sleep_time = min(16, 2 * (2 ** (upload_iteration // 2)))
-                time.sleep(sleep_time)
-                st.rerun()
-        else:
-            # Reset counter when no uploads in progress
-            st.session_state.pop("upload_rerun_count", None)
+        # Auto-refresh disabled for stability; manually refresh if needed.
+        st.session_state.pop("upload_rerun_count", None)
 
 
         new_show_name = ""
@@ -1524,21 +1526,13 @@ def main():
         else:
             st.info("No S3 videos found (or API error).")
 
-        # Auto-refresh if jobs running with iteration limit and exponential backoff
-        MAX_JOB_ITERATIONS = 600
+        # Auto-refresh if jobs running with lightweight backoff (capped at 0.5s to avoid UI freeze)
         if jobs_running:
             job_iteration = st.session_state.get("job_rerun_count", 0)
-            if job_iteration >= MAX_JOB_ITERATIONS:
-                st.warning(
-                    f"Job monitoring has reached maximum auto-refresh limit ({MAX_JOB_ITERATIONS} iterations). "
-                    "Refresh the page manually to continue monitoring."
-                )
-            else:
-                st.session_state["job_rerun_count"] = job_iteration + 1
-                # Exponential backoff: 0.5s, 0.5s, 1s, 1s, 2s, 2s, 4s, 4s, 8s (capped at 8s)
-                sleep_time = min(8, 0.5 * (2 ** (job_iteration // 2)))
-                time.sleep(sleep_time)
-                st.rerun()
+            st.session_state["job_rerun_count"] = job_iteration + 1
+            sleep_time = min(0.5, 0.1 * (2 ** (job_iteration // 2)))
+            time.sleep(sleep_time)
+            st.rerun()
         else:
             # Reset counter when no jobs running
             st.session_state.pop("job_rerun_count", None)
@@ -1552,7 +1546,7 @@ def main():
             st.exception(exc)
         st.info("Try refreshing the page. If the problem persists, please report this issue.")
         logging.exception("Unexpected error in Upload page main()")
-
-
-if __name__ == "__main__":
-    main()
+ 
+ 
+# Always run main; in Streamlit multipage __name__ is not "__main__".
+main()
