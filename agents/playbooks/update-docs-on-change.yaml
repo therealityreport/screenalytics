@@ -1,0 +1,33 @@
+name: update-docs-on-change
+inputs:
+  changed_files: array
+steps:
+  - summarize_changes:
+      into: "docs_summary"
+      from: "${changed_files}"
+  - write:
+      path: "SOLUTION_ARCHITECTURE.md"
+      mode: patch
+      content_from_prompt: |
+        Update affected components/paths based on:
+        ${docs_summary}
+  - write:
+      path: "DIRECTORY_STRUCTURE.md"
+      mode: patch
+      content_from_prompt: |
+        Update tree map and folder descriptions for:
+        ${docs_summary}
+  - write:
+      path: "PRD.md"
+      mode: patch
+      content_from_prompt: |
+        Reflect feature additions/removals under Core Features for:
+        ${docs_summary}
+  - write:
+      path: "README.md"
+      mode: patch
+      content_from_prompt: |
+        Update "Repository layout" and highlights reflecting:
+        ${docs_summary}
+  - commit:
+      message: "docs(sync): auto-update architecture and directory docs after file changes"

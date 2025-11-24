@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.env.*
+.mypy_cache/
+pytest_cache/
+.cache/
+
+# Node / UI
+node_modules/
+.pnpm-store/
+.next/
+dist/
+out/
+build/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+*.swp
+
+# Data / Artifacts
+data/
+videos/
+frames/
+chips/
+reports/
+manifests/
+logs/
+
+# Docker
+docker-compose.override.yml
+*.pid
+
+# Coverage / reports
+htmlcov/
+.coverage
+coverage.xml
+
+# CI / Temp
+tmp/
+__temp__/
+*.pt

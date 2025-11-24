@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+import ast
+
+import numpy as np
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RUN_ML_TESTS = os.environ.get("RUN_ML_TESTS") == "1"
+pytestmark = pytest.mark.skipif(not RUN_ML_TESTS, reason="set RUN_ML_TESTS=1 to run ML integration tests")
+
+
+def _make_sample_video(target: Path, frame_count: int = 12, size: tuple[int, int] = (96, 96)) -> Path:
+    import cv2  # type: ignore
+
+    width, height = size
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(target), fourcc, 10, (width, height))
+    if not writer.isOpened():  # pragma: no cover - sanity guard
+        raise RuntimeError("Unable to create synthetic video for ML test")
+    for idx in range(frame_count):
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        offset = 5 + idx * 2
+        cv2.rectangle(frame, (offset, offset), (offset + 20, offset + 30), (0, 255, 0), -1)
+        writer.write(frame)
+    writer.release()
+    return target
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+@pytest.mark.timeout(120)
+def test_detect_track_real_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+    data_root = tmp_path / "data"
+    video_path = _make_sample_video(tmp_path / "sample.mp4")
+    ep_id = "ml-test-episode"
+
+    try:
+        import torch  # type: ignore
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        if hasattr(torch.backends, "mps"):
+            monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    except Exception:  # pragma: no cover - torch missing
+        pass
+
+    cmd = [
+        sys.executable,
+        "tools/episode_run.py",
+        "--ep-id",
+        ep_id,
+        "--video",
+        str(video_path),
+        "--stride",
+        "1",
+        "--device",
+        "cpu",
+        "--out-root",
+        str(data_root),
+    ]
+    env = os.environ.copy()
+    completed = subprocess.run(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    summary_line = next(
+        (line for line in completed.stdout.splitlines() if line.startswith("[episode_run]")),
+        "",
+    )
+    if summary_line.startswith("[episode_run]"):
+        try:
+            summary_json = ast.literal_eval(summary_line.split("[episode_run]")[-1].strip())
+        except Exception:
+            summary_json = {}
+        assert summary_json.get("analyzed_fps", 0) > 0
+
+    manifest_root = data_root / "manifests" / ep_id
+    detections_path = manifest_root / "detections.jsonl"
+    tracks_path = manifest_root / "tracks.jsonl"
+
+    assert detections_path.exists(), completed.stderr
+    assert tracks_path.exists(), completed.stderr
+
+    det_rows = _read_jsonl(detections_path)
+    track_rows = _read_jsonl(tracks_path)
+
+    assert det_rows, "Expected at least one detection from detection pipeline"
+    assert track_rows, "Expected at least one track from ByteTrack pipeline"
+
+    model_val = det_rows[0].get("model", "")
+    assert model_val.startswith(("yolov8", "retinaface"))
+    assert det_rows[0]["tracker"] == "bytetrack"
+    assert any(row.get("track_id") is not None for row in det_rows), "Detections lack track IDs"
+    assert track_rows[0]["frame_count"] >= 1
+    assert track_rows[0]["pipeline_ver"]

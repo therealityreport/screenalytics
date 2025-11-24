@@ -1,0 +1,14 @@
+# DEPRECATED: Strict tracking config is now the DEFAULT
+#
+# This file is kept for backwards compatibility but is identical to
+# config/pipeline/tracking.yaml (the default).
+#
+# For ULTRA-STRICT mode (embeddings every frame instead of every 5):
+#   Use: ./scripts/detect_track_strict.sh <ep_id>
+#
+# Default tracking configuration for single-person tracks:
+
+# ByteTrack spatial matching
+track_thresh: 0.65      # Min confidence to track - filters low-quality detections
+match_thresh: 0.85      # IoU threshold for bbox matching - tighter spatial matching
+track_buffer: 15        # Frames to keep track alive - reduces incorrect associations

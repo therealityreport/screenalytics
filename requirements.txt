@@ -1,0 +1,3 @@
+-r requirements-core.txt
+# For the full ML pipeline run:
+# pip install -r requirements-ml.txt

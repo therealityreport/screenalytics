@@ -1,0 +1,29 @@
+version: 1
+defaults:
+  feature_ttl_days: 30
+  allow_write_paths:
+    - "FEATURES/**/docs/**"
+    - "FEATURES/**/TODO.md"
+    - "MASTER_TODO.md"
+  deny_write_paths:
+    - "docs/**"
+    - "db/migrations/**"
+    - "infra/**"
+    - ".github/**"
+modes:
+  promote:
+    allow_write_paths:
+      - "docs/**"
+      - "FEATURES/**/docs/**"
+      - "FEATURES/**/TODO.md"
+      - "MASTER_TODO.md"
+    deny_write_paths:
+      - "db/migrations/**"
+rules:
+  - name: docs-placement
+    match:
+      - "*.md"
+    mode_required_for:
+      - "docs/**"
+messages:
+  preamble: "Write feature docs to FEATURES/<feature>/docs/; root docs only in promote mode."

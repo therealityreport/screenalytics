@@ -1,0 +1,246 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  events    Event[]
+  users     User[]
+}
+
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  name           String?
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Event {
+  id             String     @id @default(cuid())
+  name           String
+  season         String?
+  year           Int?
+  startDate      DateTime?
+  endDate        DateTime?
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  divisions      Division[]
+  players        Player[]
+  coaches        Coach[]
+  requests       Request[]
+  auditLogs      AuditLog[]
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+}
+
+model Division {
+  id             String           @id @default(cuid())
+  name           String
+  eventPrice     String
+  gender         String?
+  eventId        String
+  event          Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  players        Player[]
+  coaches        Coach[]
+  divisionConfig DivisionConfig?
+  requests       Request[]
+  teams          Team[]
+  agentRuns      AgentRun[]
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@index([eventId])
+}
+
+model DivisionConfig {
+  id             String   @id @default(cuid())
+  divisionId     String   @unique
+  targetPlayersPerTeam Int
+  minPlayersPerTeam    Int
+  maxPlayersPerTeam    Int
+  teamCount            Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  division       Division @relation(fields: [divisionId], references: [id], onDelete: Cascade)
+}
+
+model Player {
+  id         String   @id @default(cuid())
+  firstName  String
+  lastName   String
+  email      String?
+  phone      String?
+  gender     String?
+  status     String   @default("pending")
+  regId      String?  @unique
+  eventPrice String?
+  participantStatus String?
+  dobRaw     String?
+  currentGrade String?
+  schoolName String?
+  city       String?
+  state      String?
+  parentName String?
+  parentPhone String?
+  parentEmail String?
+  primaryEmail String?
+  playerRequest String?
+  mismatchedGender Boolean @default(false)
+  eventId    String
+  divisionId String?
+  event      Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  division   Division? @relation(fields: [divisionId], references: [id], onDelete: SetNull)
+  coachId    String?
+  coach      Coach?   @relation(fields: [coachId], references: [id], onDelete: SetNull)
+  requests   Request[]
+  candidateMatches RequestMatchCandidate[] @relation("PlayerCandidates")
+  teamAssignments TeamAssignment[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([eventId])
+  @@index([divisionId])
+}
+
+model Coach {
+  id        String   @id @default(cuid())
+  name      String
+  email     String?
+  phone     String?
+  coachKey  String   @unique
+  eventId   String
+  divisionId String?
+  event     Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  division  Division? @relation(fields: [divisionId], references: [id], onDelete: SetNull)
+  players   Player[]
+  teamCoaches TeamCoach[]
+  candidateMatches RequestMatchCandidate[] @relation("CoachCandidates")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId])
+}
+
+model Team {
+  id         String   @id @default(cuid())
+  name       String
+  divisionId String
+  eventId    String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  division   Division @relation(fields: [divisionId], references: [id], onDelete: Cascade)
+  event      Event?   @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  assignments TeamAssignment[]
+  coaches    TeamCoach[]
+
+  @@index([divisionId])
+}
+
+model TeamCoach {
+  id       String @id @default(cuid())
+  teamId   String
+  coachId  String
+  role     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  team     Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  coach    Coach  @relation(fields: [coachId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, coachId])
+}
+
+model TeamAssignment {
+  id        String   @id @default(cuid())
+  teamId    String
+  playerId  String
+  role      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  player    Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, playerId])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  eventType   String
+  message     String?
+  payload     Json?
+  eventId     String?
+  divisionId  String?
+  createdAt   DateTime @default(now())
+  event       Event?    @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  division    Division? @relation(fields: [divisionId], references: [id], onDelete: SetNull)
+}
+
+model AgentRun {
+  id          String   @id @default(cuid())
+  runType     String
+  divisionId  String?
+  status      String   @default("started")
+  error       String?
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  division    Division? @relation(fields: [divisionId], references: [id], onDelete: SetNull)
+  auditLogId  String?
+  auditLog    AuditLog? @relation(fields: [auditLogId], references: [id], onDelete: SetNull)
+}
+
+enum RequestStatus {
+  UNPROCESSED
+  PROCESSED
+  RESOLVED
+  ERROR
+}
+
+model Request {
+  id          String         @id @default(cuid())
+  eventId     String
+  divisionId  String
+  playerId    String
+  rawText     String
+  status      RequestStatus  @default(UNPROCESSED)
+  notes       String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  event       Event          @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  division    Division       @relation(fields: [divisionId], references: [id], onDelete: Cascade)
+  player      Player         @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  candidates  RequestMatchCandidate[]
+
+  @@index([divisionId])
+  @@unique([playerId, divisionId])
+}
+
+model RequestMatchCandidate {
+  id              String   @id @default(cuid())
+  requestId       String
+  targetType      String
+  targetPlayerId  String?
+  targetCoachId   String?
+  llmConfidence   Float?
+  similarityScore Float?
+  finalConfidence Float?
+  autoStatus      String?
+  adminDecision   String?
+  decisionReason  String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  request         Request  @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  targetPlayer    Player?  @relation("PlayerCandidates", fields: [targetPlayerId], references: [id], onDelete: SetNull)
+  targetCoach     Coach?   @relation("CoachCandidates", fields: [targetCoachId], references: [id], onDelete: SetNull)
+
+  @@index([requestId])
+}

@@ -1,0 +1,22 @@
+# Optional ML stack; not needed for API-only workflows
+numpy==1.26.4
+pandas==2.2.3
+torch==2.3.1
+torchvision==0.18.1
+ultralytics>=8.2.70
+scikit-learn==1.5.1
+pyannote.audio==3.1.1
+faster-whisper==1.0.1
+ffmpeg-python==0.2.0
+opencv-python-headless==4.10.0.84
+scenedetect>=0.6.4
+onnx==1.16.1
+faiss-cpu==1.8.0
+pgvector==0.2.5
+pyyaml==6.0.1
+tomlkit==0.13.2
+insightface>=0.7.3  # run python scripts/fetch_models.py after installing
+onnxruntime>=1.17.0
+# Optional CUDA acceleration for ONNX Runtime:
+# onnxruntime-gpu==1.17.*
+tensorboard==2.20.0

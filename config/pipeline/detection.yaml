@@ -1,0 +1,26 @@
+model_id: retinaface_r50
+min_size: 90
+confidence_th: 0.8
+iou_th: 0.5  # D5: Increased from 0.4 for better NMS consistency
+
+# D1: Adaptive confidence threshold (fixes low-light/high-contrast detection)
+adaptive_confidence: false  # Set to true to enable adaptive thresholding
+min_confidence: 0.6  # Minimum threshold for very dark scenes
+max_confidence: 0.9  # Maximum threshold for well-lit scenes
+
+# D2: Configurable minimum face size (fixes small background faces)
+# Lower this value to detect smaller/background faces (e.g., 32 or 24)
+# Note: Lower values increase false positives and processing time
+min_size_small_faces: 32  # Alternative min_size for background face detection
+
+# D7: NMS mode selection (fixes overlapping faces in crowds/hugs)
+nms_mode: hard  # Options: "hard" or "soft"
+soft_nms_sigma: 0.5  # Gaussian decay parameter for soft-NMS (lower = more aggressive)
+
+# D10: Pose quality check (fixes unreliable landmarks for extreme profiles)
+check_pose_quality: true  # Enable pose-based landmark filtering
+max_yaw_angle: 45.0  # Maximum head rotation angle (degrees) before discarding landmarks
+
+# D9: Letterbox/pillarbox detection and removal (fixes detection on letterboxed video)
+auto_crop_letterbox: false  # Set to true to automatically detect and crop black bars
+letterbox_threshold: 20  # Pixel intensity threshold for detecting black bars (0-255)

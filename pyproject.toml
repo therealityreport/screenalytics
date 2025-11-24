@@ -1,0 +1,15 @@
+[tool.ruff]
+# Set line length to match black
+line-length = 120
+
+[tool.ruff.lint]
+# Ignore common patterns in this codebase:
+# - E402: module level import not at top (many files modify sys.path first)
+# - F841: unused variables (keeping for debugging/future use)
+# - E731: lambda assignments (acceptable for sort keys and simple functions)
+# - F821: undefined names (some files have conditional imports)
+# - F401: unused imports (some are for availability checks or stubs)
+ignore = ["E402", "F841", "E731", "F821", "F401"]
+
+[tool.black]
+line-length = 120

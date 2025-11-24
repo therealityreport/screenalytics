@@ -1,0 +1,1 @@
+"""Screenalytics FastAPI application."""
