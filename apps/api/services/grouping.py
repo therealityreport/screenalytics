@@ -674,7 +674,8 @@ class GroupingService:
 
             for cid in group:
                 centroid_vec = centroids_map.get(cid)
-                if assigned_map.get(cid) != base_person:
+                previous_person = assigned_map.get(cid)
+                if previous_person and previous_person != base_person:
                     merged_clusters += 1
                 self.people_service.add_cluster_to_person(
                     show_id,
@@ -689,6 +690,11 @@ class GroupingService:
         final_assignments = [{"cluster_id": cid, "person_id": pid} for cid, pid in assigned_map.items()]
         self._update_identities_with_people(ep_id, final_assignments)
         pruned_people = self._prune_empty_people(show_id)
+
+        if isinstance(across_result, dict):
+            across_result["assigned"] = final_assignments
+            across_result["new_people_count"] = new_people_count
+            across_result["pruned_people_count"] = pruned_people
 
         log["steps"].append(
             {
