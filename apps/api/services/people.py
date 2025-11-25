@@ -275,10 +275,17 @@ class PeopleService:
             old_proto = np.array(prototype, dtype=np.float32)
             new_centroid = np.array(cluster_centroid, dtype=np.float32)
 
-            # Momentum update
-            updated = momentum * old_proto + (1.0 - momentum) * new_centroid
-            updated = l2_normalize(updated)
-            prototype = updated.tolist()
+            # Validate dimensions match before momentum update
+            if old_proto.shape != new_centroid.shape:
+                LOGGER.warning(
+                    f"Dimension mismatch in add_cluster_to_person for {person_id}: "
+                    f"old_proto={old_proto.shape}, new_centroid={new_centroid.shape} - skipping prototype update"
+                )
+            else:
+                # Momentum update
+                updated = momentum * old_proto + (1.0 - momentum) * new_centroid
+                updated = l2_normalize(updated)
+                prototype = updated.tolist()
         elif update_prototype and cluster_centroid is not None:
             # First cluster for this person
             prototype = l2_normalize(np.array(cluster_centroid, dtype=np.float32)).tolist()
@@ -306,6 +313,15 @@ class PeopleService:
                 continue
 
             proto_vec = np.array(prototype, dtype=np.float32)
+
+            # Validate dimensions match before computing distance
+            if proto_vec.shape != cluster_centroid.shape:
+                LOGGER.warning(
+                    f"Dimension mismatch for person {person.get('person_id')}: "
+                    f"prototype={proto_vec.shape}, centroid={cluster_centroid.shape} - skipping"
+                )
+                continue
+
             distance = cosine_distance(cluster_centroid, proto_vec)
 
             if distance < best_distance:

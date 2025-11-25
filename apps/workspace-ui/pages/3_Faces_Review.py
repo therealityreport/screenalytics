@@ -219,6 +219,7 @@ TRACK_MEDIA_BATCH_LIMIT = int(os.environ.get("SCREENALYTICS_TRACK_MEDIA_BATCH_LI
 _CAST_CAROUSEL_CACHE_KEY = "cast_carousel_cache"
 _CAST_PEOPLE_CACHE_KEY = "cast_carousel_people_cache"
 _TRACK_MEDIA_CACHE_KEY = "track_media_cache"
+_TRACK_MEDIA_MAX_ENTRIES = 50  # Maximum cached tracks to prevent memory bloat
 
 
 def _cast_carousel_cache() -> Dict[str, Any]:
@@ -233,18 +234,39 @@ def _track_media_cache() -> Dict[str, Dict[str, Any]]:
     return st.session_state.setdefault(_TRACK_MEDIA_CACHE_KEY, {})
 
 
+def _evict_oldest_cache_entries(cache: Dict[str, Dict[str, Any]], max_entries: int) -> None:
+    """Evict oldest entries when cache exceeds max size (LRU-style based on access time)."""
+    if len(cache) <= max_entries:
+        return
+    # Sort by access_time (oldest first), remove excess
+    entries_with_time = [
+        (k, v.get("access_time", 0)) for k, v in cache.items()
+    ]
+    entries_with_time.sort(key=lambda x: x[1])
+    to_remove = len(cache) - max_entries
+    for key, _ in entries_with_time[:to_remove]:
+        cache.pop(key, None)
+
+
 def _track_media_state(ep_id: str, track_id: int, sample: int = 1) -> Dict[str, Any]:
     """Get or create cache state for track media, keyed by ep_id, track_id, AND sample rate."""
+    import time
     cache = _track_media_cache()
     key = f"{ep_id}::{track_id}::s{sample}"
     if key not in cache:
+        # Evict old entries before adding new one
+        _evict_oldest_cache_entries(cache, _TRACK_MEDIA_MAX_ENTRIES - 1)
         cache[key] = {
             "items": [],
             "cursor": None,
             "initialized": False,
             "sample": sample,
             "batch_limit": TRACK_MEDIA_BATCH_LIMIT,
+            "access_time": time.time(),
         }
+    else:
+        # Update access time for LRU tracking
+        cache[key]["access_time"] = time.time()
     return cache[key]
 
 
@@ -542,6 +564,40 @@ def _assign_track_name(ep_id: str, track_id: int, name: str, show: str | None, c
     st.rerun()
 
 
+def _bulk_assign_tracks(
+    ep_id: str, track_ids: List[int], name: str, show: str | None, cast_id: str | None = None,
+    identity_id: str | None = None,
+) -> None:
+    """Bulk assign multiple tracks to a cast member."""
+    cleaned = name.strip()
+    if not cleaned:
+        st.warning("Provide a non-empty name before saving.")
+        return
+    if not track_ids:
+        st.warning("No tracks selected.")
+        return
+    payload: Dict[str, Any] = {"track_ids": track_ids, "name": cleaned}
+    if show:
+        payload["show"] = show
+    if cast_id:
+        payload["cast_id"] = cast_id
+    resp = _api_post(f"/episodes/{ep_id}/tracks/bulk_assign", payload)
+    if resp is None:
+        return
+    assigned = resp.get("assigned", 0)
+    failed = resp.get("failed", 0)
+    if assigned > 0:
+        st.toast(f"Assigned {assigned} track(s) to '{cleaned}'")
+    if failed > 0:
+        st.warning(f"{failed} track(s) failed to assign. Check logs.")
+    # Clear bulk selection state for all identity keys
+    for key in list(st.session_state.keys()):
+        if key.startswith("bulk_track_sel::"):
+            st.session_state[key] = set()
+    _refresh_roster_names(show)
+    st.rerun()
+
+
 def _create_and_assign_to_new_cast(
     ep_id: str, track_id: int, cast_name: str, show: str | None
 ) -> None:
@@ -786,25 +842,25 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
             cleanup_actions = {
                 "split_tracks": {
                     "label": "Fix tracking issues (split_tracks)",
-                    "help": "Split incorrectly merged tracks. Low risk - usually beneficial.",
+                    "help": "Use when: A track contains multiple different people (identity switch mid-track). Splits incorrectly merged tracks. Low risk - usually beneficial.",
                     "default": True,
                     "risk": "low",
                 },
                 "reembed": {
                     "label": "Regenerate embeddings (reembed)",
-                    "help": "Recalculate face embeddings. Low risk - just regenerates vectors.",
+                    "help": "Use when: Face quality has changed or embeddings seem outdated. Recalculates face embeddings. Low risk - just regenerates vectors.",
                     "default": True,
                     "risk": "low",
                 },
                 "recluster": {
                     "label": "Re-cluster faces (recluster)",
-                    "help": "⚠️ HIGH RISK: Regenerates identities.json, may undo manual splits.",
+                    "help": "Use when: Starting fresh after major changes. ⚠️ HIGH RISK: Regenerates identities.json, may undo manual splits and assignments.",
                     "default": False,
                     "risk": "high",
                 },
                 "group_clusters": {
                     "label": "Auto-group clusters (group_clusters)",
-                    "help": "Group similar clusters into people. Medium risk - respects seed matching.",
+                    "help": "Use when: You have unassigned clusters that need to be matched to people. Groups similar clusters into people. Medium risk - respects seed matching.",
                     "default": True,
                     "risk": "medium",
                 },
@@ -1006,16 +1062,65 @@ def _fetch_track_media(
     limit: int = TRACK_MEDIA_BATCH_LIMIT,
     cursor: str | None = None,
 ) -> tuple[List[Dict[str, Any]], str | None]:
-    params: Dict[str, Any] = {"sample": int(sample), "limit": int(limit)}
+    """Fetch track media using face-metadata-backed URLs for correct track scoping.
+
+    Uses /frames endpoint instead of /crops to ensure we get track-specific URLs
+    from face metadata, which correctly identifies which crop belongs to which track
+    even when multiple tracks share the same frame.
+    """
+    # Parse cursor for page-based pagination
+    page = 1
     if cursor:
-        # The backend returns pagination with a 'next_start_after' cursor
-        params["start_after"] = cursor
-    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/crops", params=params) or {}
+        try:
+            page = int(cursor)
+        except (TypeError, ValueError):
+            page = 1
+
+    # Use /frames endpoint which provides face-metadata-backed URLs
+    # This ensures correct track-specific crops even for shared frames
+    params: Dict[str, Any] = {
+        "sample": int(sample),
+        "page": page,
+        "page_size": int(limit),
+    }
+    payload = _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/frames", params=params) or {}
     items = payload.get("items", []) if isinstance(payload, dict) else []
-    next_cursor = payload.get("next_start_after") if isinstance(payload, dict) else None
+    total = payload.get("total", 0)
+    current_page = payload.get("page", 1)
+    page_size = payload.get("page_size", limit)
+
+    # Determine next cursor (next page number) if there are more items
+    next_cursor: str | None = None
+    if total > current_page * page_size:
+        next_cursor = str(current_page + 1)
+
     normalized: List[Dict[str, Any]] = []
     for item in items:
-        url = item.get("media_url") or item.get("url") or item.get("thumbnail_url")
+        # Get track-specific URL from face metadata (media_url/thumbnail_url)
+        # These URLs are resolved from crop_rel_path which is track-specific
+        # and fall back to thumb_rel_path if crop unavailable
+        faces = item.get("faces", [])
+        # Find the face for this specific track
+        face_for_track = None
+        for face in faces if isinstance(faces, list) else []:
+            face_tid = face.get("track_id")
+            try:
+                face_tid_int = int(face_tid) if face_tid is not None else None
+            except (TypeError, ValueError):
+                face_tid_int = None
+            if face_tid_int == track_id:
+                face_for_track = face
+                break
+
+        # Use face-specific URL if available, otherwise fall back to item-level URL
+        if face_for_track:
+            url = face_for_track.get("media_url") or face_for_track.get("thumbnail_url")
+        else:
+            url = item.get("media_url") or item.get("thumbnail_url")
+
+        if not url:
+            continue
+
         resolved = helpers.resolve_thumb(url)
         # Include all crops, even if URL resolution fails temporarily
         # The UI can handle missing images gracefully
@@ -2819,6 +2924,87 @@ def _render_cluster_tracks(
     move_options: List[tuple[str, str]] = [("Select Cast Member", "")] + cast_entries_sorted
     move_options.append(("➕ Add New Cast Member", "__new_cast__"))
 
+    # --- Bulk Selection UI ---
+    bulk_sel_key = f"bulk_track_sel::{identity_id}"
+    if bulk_sel_key not in st.session_state:
+        st.session_state[bulk_sel_key] = set()
+    selected_tracks: set = st.session_state[bulk_sel_key]
+
+    # Collect all valid track IDs for select all
+    all_track_ids: List[int] = []
+    for tr in track_reps:
+        tid_str = tr.get("track_id", "")
+        if isinstance(tid_str, str) and tid_str.startswith("track_"):
+            tid_str = tid_str.replace("track_", "")
+        try:
+            all_track_ids.append(int(tid_str))
+        except (TypeError, ValueError):
+            pass
+
+    with st.container(border=True):
+        st.markdown("### 📦 Bulk Track Assignment")
+        sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
+        with sel_col1:
+            if st.button("☑️ Select All", key=f"bulk_select_all_{identity_id}", use_container_width=True):
+                st.session_state[bulk_sel_key] = set(all_track_ids)
+                st.rerun()
+        with sel_col2:
+            if st.button("☐ Deselect All", key=f"bulk_deselect_all_{identity_id}", use_container_width=True):
+                st.session_state[bulk_sel_key] = set()
+                st.rerun()
+        with sel_col3:
+            st.caption(f"**{len(selected_tracks)}** of {len(all_track_ids)} tracks selected")
+
+        if selected_tracks:
+            st.markdown("---")
+            assign_col1, assign_col2 = st.columns([2, 1])
+            with assign_col1:
+                bulk_cast_key = f"bulk_cast_select_{identity_id}"
+                bulk_choice = st.selectbox(
+                    "Assign selected tracks to",
+                    move_options,
+                    format_func=lambda opt: opt[0],
+                    index=0,
+                    key=bulk_cast_key,
+                )
+                bulk_cast_id = bulk_choice[1] if bulk_choice else None
+                bulk_cast_name = bulk_choice[0] if bulk_choice else None
+
+                if bulk_cast_id == "__new_cast__":
+                    new_bulk_cast_key = f"new_bulk_cast_name_{identity_id}"
+                    new_bulk_name = st.text_input(
+                        "New cast member name",
+                        key=new_bulk_cast_key,
+                        placeholder="Enter cast member name",
+                    )
+                    if new_bulk_name and new_bulk_name.strip():
+                        if st.button(
+                            f"Create & Assign {len(selected_tracks)} Track(s)",
+                            key=f"bulk_create_assign_{identity_id}",
+                            type="primary",
+                        ):
+                            # Create cast member first
+                            cast_resp = _api_post(f"/shows/{show_slug}/cast", {"name": new_bulk_name.strip()})
+                            if cast_resp and cast_resp.get("cast_id"):
+                                new_cast_id = cast_resp.get("cast_id")
+                                st.toast(f"Created cast member '{new_bulk_name.strip()}'")
+                                _bulk_assign_tracks(
+                                    ep_id, list(selected_tracks), new_bulk_name.strip(), show_slug, new_cast_id
+                                )
+                            else:
+                                st.error("Failed to create cast member.")
+
+            with assign_col2:
+                if bulk_cast_id and bulk_cast_id != "__new_cast__" and bulk_cast_name:
+                    if st.button(
+                        f"Assign {len(selected_tracks)} Track(s)",
+                        key=f"bulk_assign_btn_{identity_id}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        _bulk_assign_tracks(ep_id, list(selected_tracks), bulk_cast_name, show_slug, bulk_cast_id)
+    st.markdown("---")
+
     # Sort tracks by similarity (lowest to highest) - worst matches first for easier review
     sorted_track_reps = sorted(
         track_reps,
@@ -2855,6 +3041,20 @@ def _render_cluster_tracks(
                 resolved = helpers.resolve_thumb(crop_url)
                 thumb_markup = helpers.thumb_html(resolved, alt=f"Track {track_num}", hide_if_missing=False)
                 st.markdown(thumb_markup, unsafe_allow_html=True)
+
+                # Checkbox for bulk selection
+                if track_id_int is not None:
+                    is_selected = track_id_int in selected_tracks
+                    if st.checkbox(
+                        f"Select",
+                        value=is_selected,
+                        key=checkbox_key,
+                        help="Select for bulk assignment",
+                    ):
+                        if track_id_int not in selected_tracks:
+                            selected_tracks.add(track_id_int)
+                    else:
+                        selected_tracks.discard(track_id_int)
 
                 # Display track ID and similarity badge
                 badge_html = _render_similarity_badge(similarity)

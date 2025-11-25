@@ -63,7 +63,31 @@ def _thumbs_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "thumbs"
 
 
+def _crops_root(ep_id: str) -> Path:
+    return get_path(ep_id, "frames_root") / "crops"
+
+
+def _crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    """Resolve a crop URL, prioritizing S3, then local files."""
+    if s3_key:
+        url = STORAGE.presign_get(str(s3_key))
+        if url:
+            return url
+    if not rel_path:
+        return None
+    frames_root = get_path(ep_id, "frames_root")
+    # Handle paths with or without "crops/" prefix
+    if rel_path.startswith("crops/"):
+        local = frames_root / rel_path
+    else:
+        local = _crops_root(ep_id) / rel_path
+    if local.exists():
+        return str(local)
+    return None
+
+
 def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    """Resolve a thumbnail URL. Can handle both thumb and crop paths."""
     if s3_key:
         url = STORAGE.presign_get(str(s3_key))
         if url:
@@ -79,6 +103,21 @@ def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str 
     if local.exists():
         return str(local)
     return None
+
+
+def _track_media_url(ep_id: str, track_row: Dict[str, Any] | None) -> str | None:
+    """Resolve the best media URL for a track, prioritizing crops over thumbs.
+
+    IMPORTANT: Crops are authoritative. best_crop_rel_path should be used first.
+    """
+    if not track_row:
+        return None
+    # Prioritize best crop - authoritative source for track preview
+    crop = _crop_url(ep_id, track_row.get("best_crop_rel_path"), track_row.get("best_crop_s3_key"))
+    if crop:
+        return crop
+    # Fall back to thumb only if crop is unavailable
+    return _thumbnail_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
 
 
 def _analytics_root(ep_id: str) -> Path:
@@ -335,7 +374,8 @@ def cluster_track_summary(
             track_row = track_lookup.get(tid)
             if not track_row:
                 continue
-            thumb_url = _thumbnail_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
+            # Use _track_media_url to prioritize crops (authoritative) over thumbs
+            thumb_url = _track_media_url(ep_id, track_row)
             tracks_payload.append(
                 {
                     "track_id": tid,
@@ -653,6 +693,17 @@ def _persist_identity_name(
         except Exception as exc:
             # Don't fail the naming operation if People service fails
             LOGGER.warning(f"Failed to create/update People record for {trimmed_name}: {exc}")
+
+        # Mark assignment as manual so it's protected during cleanup operations
+        try:
+            from apps.api.services.grouping import GroupingService
+
+            grouping_service = GroupingService()
+            grouping_service.mark_assignment_manual(ep_id, identity_id, cast_id=cast_id)
+            LOGGER.info(f"Marked cluster {identity_id} as manually assigned (cast_id={cast_id})")
+        except Exception as exc:
+            # Don't fail the naming operation if marking manual fails
+            LOGGER.warning(f"Failed to mark cluster {identity_id} as manual: {exc}")
 
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
 

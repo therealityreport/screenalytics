@@ -61,12 +61,21 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                     }
                 )
 
-            result = grouping_service.group_clusters_auto(
-                ep_id,
-                progress_callback=progress_callback,
-                protect_manual=body.protect_manual,
-                facebank_first=body.facebank_first,
-            )
+            try:
+                result = grouping_service.group_clusters_auto(
+                    ep_id,
+                    progress_callback=progress_callback,
+                    protect_manual=body.protect_manual,
+                    facebank_first=body.facebank_first,
+                )
+            except Exception as inner_exc:
+                import traceback
+                import logging
+                logging.getLogger(__name__).error(
+                    f"[{ep_id}] group_clusters_auto failed: {type(inner_exc).__name__}: {inner_exc}\n"
+                    f"Traceback:\n{traceback.format_exc()}"
+                )
+                raise
             affected_clusters = set()
             within = (
                 (result.get("within_episode") or {}).get("groups")
@@ -105,7 +114,10 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                 cast_id=body.cast_id,
                 name=body.name,
             )
-            _trigger_similarity_refresh(ep_id, body.cluster_ids)
+            # NOTE: Skip _trigger_similarity_refresh for manual assignments.
+            # The full regeneration of all track reps is expensive (60s+ timeout).
+            # Manual assignments update identities and people directly, so similarity
+            # indexes can be refreshed on next auto-cluster or explicit refresh.
             return {
                 "status": "success",
                 "strategy": "manual",

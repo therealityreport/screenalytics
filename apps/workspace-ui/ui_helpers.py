@@ -417,6 +417,97 @@ def describe_error(url: str, exc: requests.RequestException) -> str:
     return f"{url} → {detail}"
 
 
+# ============================================================================
+# Unified Error Display Component
+# ============================================================================
+
+def show_error(
+    message: str,
+    *,
+    context: str | None = None,
+    severity: str = "error",
+    show_timestamp: bool = False,
+    details: str | None = None,
+) -> None:
+    """Display a consistent error message in the UI.
+
+    Args:
+        message: The main error message
+        context: Optional context (e.g., "while loading cast data")
+        severity: One of "error", "warning", "info"
+        show_timestamp: Whether to include a timestamp
+        details: Optional technical details (shown in expandable section)
+    """
+    # Build the message
+    parts = []
+    if show_timestamp:
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        parts.append(f"[{timestamp}]")
+    if context:
+        parts.append(f"{context}:")
+    parts.append(message)
+    full_message = " ".join(parts)
+
+    # Display with appropriate severity
+    if severity == "warning":
+        st.warning(full_message)
+    elif severity == "info":
+        st.info(full_message)
+    else:
+        st.error(full_message)
+
+    # Show technical details if provided
+    if details:
+        with st.expander("Technical details", expanded=False):
+            st.code(details, language="text")
+
+
+def show_api_error(
+    exc: Exception,
+    *,
+    context: str | None = None,
+    url: str | None = None,
+) -> None:
+    """Display an API error with consistent formatting.
+
+    Args:
+        exc: The exception that occurred
+        context: Optional context (e.g., "loading cast members")
+        url: Optional URL that was being accessed
+    """
+    if isinstance(exc, requests.HTTPError) and hasattr(exc, "response"):
+        resp = exc.response
+        status = resp.status_code if resp else "unknown"
+        if status >= 500:
+            message = f"Server error ({status}). Please try again later."
+        elif status == 404:
+            message = "Resource not found."
+        elif status == 422:
+            message = "Invalid request data."
+        elif status >= 400:
+            message = f"Request failed ({status})."
+        else:
+            message = str(exc)
+    elif isinstance(exc, requests.Timeout):
+        message = "Request timed out. Please try again."
+    elif isinstance(exc, requests.ConnectionError):
+        message = "Could not connect to server. Check your network connection."
+    elif isinstance(exc, requests.RequestException):
+        message = f"Network error: {exc}"
+    else:
+        message = str(exc)
+
+    details = None
+    if url:
+        details = f"URL: {url}\n"
+    if hasattr(exc, "__traceback__"):
+        import traceback
+        details = (details or "") + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+    show_error(message, context=context, details=details)
+
+
 def _api_base() -> str:
     base = st.session_state.get("api_base")
     if not base:

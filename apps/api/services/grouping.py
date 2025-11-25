@@ -28,9 +28,9 @@ from .people import PeopleService, l2_normalize, cosine_distance
 LOGGER = logging.getLogger(__name__)
 
 # Config from environment
-GROUP_WITHIN_EP_DISTANCE = float(os.getenv("GROUP_WITHIN_EP_DISTANCE", "0.40"))  # Increased from 0.35 for better recall
-PEOPLE_MATCH_DISTANCE = float(os.getenv("PEOPLE_MATCH_DISTANCE", "0.40"))  # Increased from 0.35 for better matching
-PEOPLE_PROTO_MOMENTUM = float(os.getenv("PEOPLE_PROTO_MOMENTUM", "0.9"))
+GROUP_WITHIN_EP_DISTANCE = float(os.getenv("GROUP_WITHIN_EP_DISTANCE", "0.42"))  # Relaxed from 0.40 for better within-episode merging
+PEOPLE_MATCH_DISTANCE = float(os.getenv("PEOPLE_MATCH_DISTANCE", "0.40"))  # Keep strict for precision in cross-episode matching
+PEOPLE_PROTO_MOMENTUM = float(os.getenv("PEOPLE_PROTO_MOMENTUM", "0.8"))  # Lowered from 0.9 to allow prototypes to adapt (20% new data weight)
 SEED_CLUSTER_DELTA = float(os.getenv("SEED_CLUSTER_DELTA", "0.08"))  # Increased from 0.05 for stronger seed preference
 # Apply seed delta in across-episode matching (consistent with within-episode)
 USE_SEED_IN_ACROSS_EPISODE = os.getenv("USE_SEED_IN_ACROSS_EPISODE", "1").lower() in ("1", "true", "yes")
@@ -161,12 +161,12 @@ def _compute_cohesion_bonus(
     avg_cohesion = (cohesion_i + cohesion_j) / 2.0
 
     # Scale bonus: higher cohesion = bigger bonus (more likely to match)
-    # cohesion of 0.9+ gets full bonus, 0.7 gets half, below 0.5 gets none
+    # cohesion of 0.9+ gets full bonus, linear scale from 0.6 to 0.9
     if avg_cohesion >= 0.9:
         return COHESION_BONUS_MAX
-    elif avg_cohesion >= 0.7:
-        # Linear interpolation between 0.7 and 0.9
-        return COHESION_BONUS_MAX * (avg_cohesion - 0.7) / 0.2
+    elif avg_cohesion >= 0.6:
+        # Linear interpolation between 0.6 and 0.9 (extended range for better coverage)
+        return COHESION_BONUS_MAX * (avg_cohesion - 0.6) / 0.3
     else:
         return 0.0
 
@@ -821,109 +821,125 @@ class GroupingService:
                 cast_person_map[cast_id] = person["person_id"]
 
         for cluster_id, centroid_data in centroids_map.items():
-            centroid = centroid_data["centroid"]
-            seed_cast_id = centroid_data.get("seed_cast_id")
+            try:
+                centroid = centroid_data["centroid"]
+                seed_cast_id = centroid_data.get("seed_cast_id")
 
-            # Try to find matching person
-            match = self.people_service.find_matching_person(show_id, centroid, max_distance)
+                # Try to find matching person
+                match = self.people_service.find_matching_person(show_id, centroid, max_distance)
 
-            # Apply seed-based matching: if cluster has a seed, prefer matching to a person
-            # linked to that cast member (with reduced distance threshold)
-            if USE_SEED_IN_ACROSS_EPISODE and seed_cast_id:
-                # Check if there's a person already linked to this cast
-                seed_person_id = cast_person_map.get(seed_cast_id)
-                if seed_person_id:
-                    # Check distance to this person specifically
-                    seed_person = self.people_service.get_person(show_id, seed_person_id)
-                    if seed_person and seed_person.get("prototype"):
-                        proto_vec = np.array(seed_person["prototype"], dtype=np.float32)
-                        seed_distance = cosine_distance(centroid, proto_vec)
-                        # Apply seed delta bonus - reduce threshold for seed matches
-                        adjusted_threshold = max_distance + SEED_CLUSTER_DELTA
-                        if seed_distance <= adjusted_threshold:
-                            # Prefer seed match over regular match
-                            if not match or seed_distance < match[1]:
-                                match = (seed_person_id, seed_distance)
-                                LOGGER.debug(
-                                    f"Seed match: cluster {cluster_id} -> person {seed_person_id} "
-                                    f"(seed={seed_cast_id}, dist={seed_distance:.3f})"
+                # Apply seed-based matching: if cluster has a seed, prefer matching to a person
+                # linked to that cast member (with reduced distance threshold)
+                if USE_SEED_IN_ACROSS_EPISODE and seed_cast_id:
+                    # Check if there's a person already linked to this cast
+                    seed_person_id = cast_person_map.get(seed_cast_id)
+                    if seed_person_id:
+                        # Check distance to this person specifically
+                        seed_person = self.people_service.get_person(show_id, seed_person_id)
+                        if seed_person and seed_person.get("prototype"):
+                            proto_vec = np.array(seed_person["prototype"], dtype=np.float32)
+                            # Validate dimensions match before computing distance
+                            if proto_vec.shape != centroid.shape:
+                                LOGGER.warning(
+                                    f"[{ep_id}] Dimension mismatch for seed person {seed_person_id}: "
+                                    f"prototype={proto_vec.shape}, centroid={centroid.shape} - skipping seed match"
                                 )
+                            else:
+                                seed_distance = cosine_distance(centroid, proto_vec)
+                                # Apply seed delta bonus - reduce threshold for seed matches
+                                adjusted_threshold = max_distance + SEED_CLUSTER_DELTA
+                                if seed_distance <= adjusted_threshold:
+                                    # Prefer seed match over regular match
+                                    if not match or seed_distance < match[1]:
+                                        match = (seed_person_id, seed_distance)
+                                        LOGGER.debug(
+                                            f"Seed match: cluster {cluster_id} -> person {seed_person_id} "
+                                            f"(seed={seed_cast_id}, dist={seed_distance:.3f})"
+                                        )
 
-            if match:
-                person_id, distance = match
+                if match:
+                    person_id, distance = match
 
-                if auto_assign:
-                    # Assign to existing person
-                    full_cluster_id = f"{ep_id}:{cluster_id}"
-                    self.people_service.add_cluster_to_person(
-                        show_id,
-                        person_id,
-                        full_cluster_id,
-                        update_prototype=True,
-                        cluster_centroid=centroid,
-                        momentum=momentum,
-                    )
-                    assigned.append(
-                        {
-                            "cluster_id": cluster_id,
-                            "person_id": person_id,
-                            "distance": float(distance),
-                            "suggested": False,
-                            "seed_match": seed_cast_id is not None and cast_person_map.get(seed_cast_id) == person_id,
-                        }
-                    )
-                    # Update cast_person_map if this person now has a cast_id
-                    if person_id not in person_cast_map and seed_cast_id:
-                        # Consider linking this person to the cast member
-                        pass  # Done separately via manual assignment
+                    if auto_assign:
+                        # Assign to existing person
+                        full_cluster_id = f"{ep_id}:{cluster_id}"
+                        self.people_service.add_cluster_to_person(
+                            show_id,
+                            person_id,
+                            full_cluster_id,
+                            update_prototype=True,
+                            cluster_centroid=centroid,
+                            momentum=momentum,
+                        )
+                        assigned.append(
+                            {
+                                "cluster_id": cluster_id,
+                                "person_id": person_id,
+                                "distance": float(distance),
+                                "suggested": False,
+                                "seed_match": seed_cast_id is not None and cast_person_map.get(seed_cast_id) == person_id,
+                            }
+                        )
+                        # Update cast_person_map if this person now has a cast_id
+                        if person_id not in person_cast_map and seed_cast_id:
+                            # Consider linking this person to the cast member
+                            pass  # Done separately via manual assignment
+                    else:
+                        # Just store suggestion without assigning
+                        suggestions.append(
+                            {
+                                "cluster_id": cluster_id,
+                                "suggested_person_id": person_id,
+                                "distance": float(distance),
+                            }
+                        )
                 else:
-                    # Just store suggestion without assigning
-                    suggestions.append(
-                        {
-                            "cluster_id": cluster_id,
-                            "suggested_person_id": person_id,
-                            "distance": float(distance),
-                        }
-                    )
-            else:
-                if auto_assign:
-                    # Create new person with the cluster's seed_cast_id if available
-                    full_cluster_id = f"{ep_id}:{cluster_id}"
-                    person = self.people_service.create_person(
-                        show_id,
-                        prototype=centroid.tolist(),
-                        cluster_ids=[full_cluster_id],
-                        cast_id=seed_cast_id if seed_cast_id and seed_cast_id not in cast_person_map else None,
-                    )
-                    new_people.append(person)
-                    assigned.append(
-                        {
-                            "cluster_id": cluster_id,
-                            "person_id": person["person_id"],
-                            "distance": None,
-                            "suggested": False,
-                            "seed_match": False,
-                        }
-                    )
-                    # Track the new person's cast link
-                    if seed_cast_id and seed_cast_id not in cast_person_map:
-                        cast_person_map[seed_cast_id] = person["person_id"]
-                        person_cast_map[person["person_id"]] = seed_cast_id
+                    if auto_assign:
+                        # Create new person with the cluster's seed_cast_id if available
+                        full_cluster_id = f"{ep_id}:{cluster_id}"
+                        person = self.people_service.create_person(
+                            show_id,
+                            prototype=centroid.tolist(),
+                            cluster_ids=[full_cluster_id],
+                            cast_id=seed_cast_id if seed_cast_id and seed_cast_id not in cast_person_map else None,
+                        )
+                        new_people.append(person)
+                        assigned.append(
+                            {
+                                "cluster_id": cluster_id,
+                                "person_id": person["person_id"],
+                                "distance": None,
+                                "suggested": False,
+                                "seed_match": False,
+                            }
+                        )
+                        # Track the new person's cast link
+                        if seed_cast_id and seed_cast_id not in cast_person_map:
+                            cast_person_map[seed_cast_id] = person["person_id"]
+                            person_cast_map[person["person_id"]] = seed_cast_id
 
-            processed_clusters += 1
-            if progress_callback and total_clusters:
-                pct = processed_clusters / max(total_clusters, 1)
-                progress_callback(
-                    "group_across_episodes",
-                    0.7 + 0.2 * pct,
-                    f"Processed {processed_clusters}/{total_clusters} clusters; assigned {len(assigned)}",
-                    {
-                        "total_clusters": total_clusters,
-                        "processed_clusters": processed_clusters,
-                        "assigned_clusters": len(assigned),
-                        "new_people": len(new_people),
-                    },
+                processed_clusters += 1
+                if progress_callback and total_clusters:
+                    pct = processed_clusters / max(total_clusters, 1)
+                    progress_callback(
+                        "group_across_episodes",
+                        0.7 + 0.2 * pct,
+                        f"Processed {processed_clusters}/{total_clusters} clusters; assigned {len(assigned)}",
+                        {
+                            "total_clusters": total_clusters,
+                            "processed_clusters": processed_clusters,
+                            "assigned_clusters": len(assigned),
+                            "new_people": len(new_people),
+                        },
+                    )
+            except Exception as e:
+                LOGGER.error(
+                    f"[{ep_id}] Error processing cluster {cluster_id} "
+                    f"(processed {processed_clusters}/{total_clusters}): {type(e).__name__}: {e}"
                 )
+                import traceback
+                LOGGER.error(f"[{ep_id}] Traceback:\n{traceback.format_exc()}")
+                raise
 
         # Update identities.json with person_id assignments (only if auto_assign=True)
         if auto_assign:
@@ -1301,7 +1317,16 @@ class GroupingService:
 
         # Ensure all clusters that were grouped within the episode point at the same person
         # FIX: Use batch centroid computation to avoid momentum race condition
-        for group in groups:
+        total_groups = len(groups)
+        for idx, group in enumerate(groups):
+            # Emit progress updates every 20 groups or at the end to avoid UI stall
+            if idx % 20 == 0 or idx == total_groups - 1:
+                _progress(
+                    "apply_within_groups",
+                    0.9 + 0.1 * (idx / max(total_groups, 1)),  # 90% to 100%
+                    f"Processing group {idx + 1}/{total_groups}",
+                    {"processed_groups": idx, "total_groups": total_groups},
+                )
             if not group:
                 continue
             base_cluster = group[0]

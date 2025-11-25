@@ -124,21 +124,35 @@ def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> s
 
 
 def _resolve_face_media_url(ep_id: str, row: Dict[str, Any] | None) -> str | None:
+    """Resolve the best media URL for a face, prioritizing crops over thumbs.
+
+    IMPORTANT: Crops are the authoritative source for face images. Thumbs may
+    have been generated from different sources and could show the wrong face
+    when multiple tracks share the same frame. Always prefer crops.
+    """
     if not row:
         return None
-    thumb = _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
-    if thumb:
-        return thumb
-    return _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
+    # Prioritize crop files - they are track-specific and authoritative
+    crop = _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
+    if crop:
+        return crop
+    # Fall back to thumb only if crop is unavailable
+    return _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
 
 
 def _resolve_track_media_url(ep_id: str, track_row: Dict[str, Any] | None) -> str | None:
+    """Resolve the best media URL for a track, prioritizing crops over thumbs.
+
+    IMPORTANT: Crops are authoritative. best_crop_rel_path should be used first.
+    """
     if not track_row:
         return None
-    url = _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
-    if url:
-        return url
-    return _resolve_thumb_url(ep_id, track_row.get("best_crop_rel_path"), track_row.get("best_crop_s3_key"))
+    # Prioritize best crop - authoritative source for track preview
+    crop = _resolve_crop_url(ep_id, track_row.get("best_crop_rel_path"), track_row.get("best_crop_s3_key"))
+    if crop:
+        return crop
+    # Fall back to thumb only if crop is unavailable
+    return _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
 
 
 def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
@@ -1972,6 +1986,13 @@ class IdentityNameRequest(BaseModel):
     cast_id: str | None = Field(None, description="Optional cast_id for linking person to cast member")
 
 
+class BulkTrackAssignRequest(BaseModel):
+    track_ids: List[int] = Field(..., min_length=1, description="List of track IDs to assign")
+    name: str = Field(..., min_length=1, max_length=200, description="Name to assign")
+    show: str | None = Field(None, description="Optional show slug override")
+    cast_id: str | None = Field(None, description="Optional cast_id for linking to cast member")
+
+
 class IdentityMergeRequest(BaseModel):
     source_id: str
     target_id: str
@@ -2739,6 +2760,46 @@ def list_tracks_batch(
     return {"tracks": tracks}
 
 
+def _get_faces_for_track_frames(
+    ep_id: str, needed: set[tuple[int, int]]
+) -> Dict[tuple[int, int], Dict[str, Any]]:
+    """Efficiently get face metadata for specific (track_id, frame_idx) pairs.
+
+    Streams through faces.jsonl once and collects only the faces we need.
+    Much faster than loading all faces when we only need a few.
+    """
+    if not needed:
+        return {}
+    path = _faces_path(ep_id)
+    if not path.exists():
+        return {}
+    result: Dict[tuple[int, int], Dict[str, Any]] = {}
+    remaining = set(needed)
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not remaining:
+                break  # Found all we need
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict) or obj.get("skip"):
+                continue
+            try:
+                tid = int(obj.get("track_id", -1))
+                fidx = int(obj.get("frame_idx", -1))
+            except (TypeError, ValueError):
+                continue
+            key = (tid, fidx)
+            if key in remaining:
+                result[key] = obj
+                remaining.discard(key)
+    return result
+
+
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
 def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
     """Get representative frames with similarity scores for all tracks in a cluster."""
@@ -2754,13 +2815,53 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
 
         result = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
 
-        # Resolve crop URLs
+        # Collect all (track_id, frame_idx) pairs we need to look up
+        needed_faces: set[tuple[int, int]] = set()
         for track in result.get("tracks", []):
+            track_id_str = track.get("track_id", "")
+            rep_frame = track.get("rep_frame")
+            if rep_frame is None:
+                continue
+            try:
+                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                    track_id_int = int(track_id_str.replace("track_", ""))
+                else:
+                    track_id_int = int(track_id_str)
+                needed_faces.add((track_id_int, rep_frame))
+            except (TypeError, ValueError):
+                continue
+
+        # Efficiently load only the faces we need (single file scan)
+        face_lookup = _get_faces_for_track_frames(ep_id, needed_faces)
+
+        # Resolve crop URLs using face metadata for track-specific accuracy
+        for track in result.get("tracks", []):
+            track_id_str = track.get("track_id", "")
+            rep_frame = track.get("rep_frame")
             crop_key = track.get("crop_key")
-            if crop_key:
-                # Use existing _resolve_crop_url helper
+
+            # Parse track_id from string format (e.g., "track_1150")
+            try:
+                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                    track_id_int = int(track_id_str.replace("track_", ""))
+                else:
+                    track_id_int = int(track_id_str)
+            except (TypeError, ValueError):
+                track_id_int = None
+
+            # Try to get URL from face metadata first (most accurate for track-specific crops)
+            url = None
+            if track_id_int is not None and rep_frame is not None:
+                face_meta = face_lookup.get((track_id_int, rep_frame))
+                if face_meta:
+                    # Use face-metadata-backed URL which is track-specific
+                    url = _resolve_face_media_url(ep_id, face_meta)
+
+            # Fall back to crop_key if face metadata lookup fails
+            if not url and crop_key:
                 url = _resolve_crop_url(ep_id, crop_key, None)
-                track["crop_url"] = url
+
+            track["crop_url"] = url
 
         return result
     except Exception as exc:
@@ -2817,47 +2918,76 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
 
         # Load identities for face counts
         identities_data = _load_identities(ep_id)
-        LOGGER.info(
-            f"identities_data type: {type(identities_data)}, keys: {list(identities_data.keys()) if isinstance(identities_data, dict) else 'not a dict'}"
-        )
         identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
-        LOGGER.info(
-            f"identities_list type: {type(identities_list)}, length: {len(identities_list) if isinstance(identities_list, list) else 'not a list'}"
-        )
-        identity_index = {}
-        for ident in identities_list:
-            if isinstance(ident, dict) and "identity_id" in ident:
-                identity_index[ident["identity_id"]] = ident
-            else:
-                LOGGER.warning(f"Skipping malformed identity: {type(ident)}")
+        identity_index = {
+            ident["identity_id"]: ident
+            for ident in identities_list
+            if isinstance(ident, dict) and "identity_id" in ident
+        }
+
+        # First pass: collect all cluster data and find ONLY first track's face per cluster
+        # UI only displays first track as cluster thumbnail, so we only need those
+        clusters_data_list = []
+        needed_faces: set[tuple[int, int]] = set()
+
+        for cluster_id in episode_clusters:
+            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+            clusters_data_list.append((cluster_id, cluster_data))
+
+            # Only need first track's face for cluster thumbnail
+            tracks_list = cluster_data.get("tracks", []) if isinstance(cluster_data, dict) else []
+            if tracks_list and isinstance(tracks_list[0], dict):
+                first_track = tracks_list[0]
+                track_id_str = first_track.get("track_id", "")
+                rep_frame = first_track.get("rep_frame")
+                if rep_frame is not None:
+                    try:
+                        if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                            track_id_int = int(track_id_str.replace("track_", ""))
+                        else:
+                            track_id_int = int(track_id_str)
+                        needed_faces.add((track_id_int, rep_frame))
+                    except (TypeError, ValueError):
+                        pass
+
+        # Efficiently load only first track's face per cluster (single file scan)
+        face_lookup = _get_faces_for_track_frames(ep_id, needed_faces)
 
         clusters_output = []
         total_tracks = 0
 
-        for cluster_id in episode_clusters:
-            LOGGER.info(f"Processing cluster {cluster_id}")
-            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
-            LOGGER.info(
-                f"cluster_data type: {type(cluster_data)}, keys: {list(cluster_data.keys()) if isinstance(cluster_data, dict) else 'not a dict'}"
-            )
-
-            # Resolve crop URLs
+        # Second pass: resolve URLs (only first track uses face lookup, rest use crop_key)
+        for cluster_id, cluster_data in clusters_data_list:
             tracks_list = cluster_data.get("tracks", []) if isinstance(cluster_data, dict) else []
-            for track in tracks_list:
+            for idx, track in enumerate(tracks_list):
                 if isinstance(track, dict):
+                    track_id_str = track.get("track_id", "")
+                    rep_frame = track.get("rep_frame")
                     crop_key = track.get("crop_key")
-                    if crop_key:
+
+                    url = None
+                    # Only use face metadata lookup for first track (visible thumbnail)
+                    if idx == 0 and rep_frame is not None:
+                        try:
+                            if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                                track_id_int = int(track_id_str.replace("track_", ""))
+                            else:
+                                track_id_int = int(track_id_str)
+                            face_meta = face_lookup.get((track_id_int, rep_frame))
+                            if face_meta:
+                                url = _resolve_face_media_url(ep_id, face_meta)
+                        except (TypeError, ValueError):
+                            pass
+
+                    # Fall back to crop_key (fast path for non-visible tracks)
+                    if not url and crop_key:
                         url = _resolve_crop_url(ep_id, crop_key, None)
-                        track["crop_url"] = url
+
+                    track["crop_url"] = url
 
             # Get face count from identities
             identity = identity_index.get(cluster_id, {})
-            LOGGER.info(f"identity for {cluster_id}: type={type(identity)}")
-            if isinstance(identity, dict):
-                faces_count = identity.get("size") or 0
-            else:
-                LOGGER.error(f"identity is not a dict for cluster {cluster_id}: {type(identity)}")
-                faces_count = 0
+            faces_count = identity.get("size") or 0 if isinstance(identity, dict) else 0
 
             clusters_output.append(
                 {
@@ -2877,6 +3007,8 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             "total_clusters": len(clusters_output),
             "total_tracks": total_tracks,
         }
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions (like 404) as-is without wrapping
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -2991,11 +3123,34 @@ def track_detail(ep_id: str, track_id: int) -> dict:
                 "similarity": row.get("similarity"),  # Include frame similarity score
             }
         )
+
+    # Fallback: if no faces in faces.jsonl, discover crops from disk
+    if not frames:
+        crop_entries = _discover_crop_entries(ep_id, track_id)
+        for entry in crop_entries:
+            rel_path = entry.get("rel_path")
+            media_url = _resolve_crop_url(ep_id, rel_path, None) if rel_path else None
+            frames.append(
+                {
+                    "face_id": None,
+                    "frame_idx": entry.get("frame_idx"),
+                    "ts": entry.get("ts"),
+                    "thumbnail_url": media_url,
+                    "media_url": media_url,
+                    "skip": False,
+                    "crop_rel_path": rel_path,
+                    "crop_s3_key": None,
+                    "similarity": None,
+                }
+            )
+
     track_row = next(
         (row for row in _load_tracks(ep_id) if int(row.get("track_id", -1)) == track_id),
         None,
     )
     preview_url = _resolve_face_media_url(ep_id, faces[0] if faces else None)
+    if not preview_url and frames:
+        preview_url = frames[0].get("media_url")
     if not preview_url:
         preview_url = _resolve_track_media_url(ep_id, track_row)
     return {
@@ -3232,6 +3387,28 @@ def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> d
         return identity_service.assign_track_name(ep_id, track_id, body.name, body.show, body.cast_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/episodes/{ep_id}/tracks/bulk_assign")
+def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
+    """Assign multiple tracks to a cast member in a single operation.
+
+    All tracks will be moved to new identities with the specified name/cast_id.
+    """
+    results = []
+    errors = []
+    for track_id in body.track_ids:
+        try:
+            result = identity_service.assign_track_name(ep_id, track_id, body.name, body.show, body.cast_id)
+            results.append({"track_id": track_id, "success": True, **result})
+        except ValueError as exc:
+            errors.append({"track_id": track_id, "success": False, "error": str(exc)})
+    return {
+        "assigned": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+    }
 
 
 @router.post("/episodes/{ep_id}/identities/merge")

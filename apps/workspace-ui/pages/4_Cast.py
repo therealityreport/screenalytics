@@ -466,7 +466,12 @@ if show_add_form:
 
         # Step 2: Upload seed images (optional)
         else:
-            new_cast_id = st.session_state["new_cast_created"]
+            new_cast_id = st.session_state.get("new_cast_created")
+            if not new_cast_id:
+                # State was unexpectedly cleared - return to step 1
+                st.warning("Cast creation state was lost. Please create the cast member again.")
+                st.session_state.pop("cast_show_add_form", None)
+                st.rerun()
             new_cast_name = st.session_state.get("new_cast_name_stored", "new member")
 
             st.success(f"✓ Created cast member: **{new_cast_name}**")
@@ -501,9 +506,13 @@ if show_add_form:
                             except requests.HTTPError as exc:
                                 if resp.status_code == 422:
                                     st.error(_format_seed_upload_error(resp, exc))
-                                    handled_error = True
+                                elif resp.status_code >= 500:
+                                    st.error(f"Server error ({resp.status_code}): Please try again later.")
+                                elif resp.status_code >= 400:
+                                    st.error(f"Upload failed ({resp.status_code}): {exc}")
                                 else:
-                                    raise
+                                    st.error(f"Unexpected error: {exc}")
+                                handled_error = True
 
                             if not handled_error:
                                 result = resp.json()
@@ -752,9 +761,13 @@ if selected_cast_id:
                             except requests.HTTPError as exc:
                                 if resp.status_code == 422:
                                     st.error(_format_seed_upload_error(resp, exc))
-                                    handled_error = True
+                                elif resp.status_code >= 500:
+                                    st.error(f"Server error ({resp.status_code}): Please try again later.")
+                                elif resp.status_code >= 400:
+                                    st.error(f"Upload failed ({resp.status_code}): {exc}")
                                 else:
-                                    raise
+                                    st.error(f"Unexpected error: {exc}")
+                                handled_error = True
 
                             if not handled_error:
                                 result = resp.json()

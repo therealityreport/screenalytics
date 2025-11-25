@@ -79,6 +79,20 @@ def health() -> dict:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    coreml_available = bool(getattr(episode_run, "COREML_PROVIDER_AVAILABLE", False))
-    apple_silicon = bool(getattr(episode_run, "APPLE_SILICON_HOST", False))
+    """Lightweight health check - must not block on heavy imports or GIL-holding operations."""
+    # Avoid accessing episode_run during startup warmup - it can block due to GIL contention
+    # These values are computed lazily only if warmup has completed
+    try:
+        # Only access these if the module attributes are already computed (non-blocking check)
+        import sys
+        if "tools.episode_run" in sys.modules:
+            er = sys.modules["tools.episode_run"]
+            coreml_available = bool(getattr(er, "COREML_PROVIDER_AVAILABLE", False))
+            apple_silicon = bool(getattr(er, "APPLE_SILICON_HOST", False))
+        else:
+            coreml_available = None
+            apple_silicon = None
+    except Exception:
+        coreml_available = None
+        apple_silicon = None
     return {"ok": True, "coreml_available": coreml_available, "apple_silicon": apple_silicon}

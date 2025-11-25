@@ -2,12 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-
-def coerce_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+# Use the robust coerce_int from ui_helpers to handle edge cases (NaN, Inf, bool)
+from ui_helpers import coerce_int  # noqa: F401 - re-exported for backwards compatibility
 
 
 def quality_score(face_meta: Dict[str, Any]) -> float | None:
@@ -30,18 +26,27 @@ def scope_track_frames(frames: List[Dict[str, Any]], track_id: int) -> Tuple[Lis
         faces = frame.get("faces") if isinstance(frame.get("faces"), list) else []
         candidates = [face for face in faces if isinstance(face, dict)]
 
-        # Include the top-level frame meta as a candidate when it already points to this track
-        # BUT: Only include face-level fields, not nested frame structures
-        top_level_tid = coerce_int(frame.get("track_id"))
-        if top_level_tid in (None, track_id):
-            # Extract face fields from frame-level, excluding nested structures
-            frame_as_face = {
-                k: v
-                for k, v in frame.items()
-                if k not in ("faces", "other_tracks")  # Exclude nested lists
-            }
-            if frame_as_face.get("face_id"):  # Only include if it has face metadata
-                candidates.append(frame_as_face)
+        # First, check if we have explicit face data for this track in the faces list
+        # CRITICAL: Only use face-level data when available - it has the correct track-specific URLs
+        faces_from_list = [
+            face for face in candidates
+            if coerce_int(face.get("track_id")) == track_id
+        ]
+
+        # Only fall back to frame-level data as a candidate if no explicit face data exists
+        # This prevents frame-level URLs (which may point to wrong track) from overriding
+        # face-level URLs when both are present
+        if not faces_from_list:
+            top_level_tid = coerce_int(frame.get("track_id"))
+            if top_level_tid in (None, track_id):
+                # Extract face fields from frame-level, excluding nested structures
+                frame_as_face = {
+                    k: v
+                    for k, v in frame.items()
+                    if k not in ("faces", "other_tracks")  # Exclude nested lists
+                }
+                if frame_as_face.get("face_id"):  # Only include if it has face metadata
+                    candidates.append(frame_as_face)
 
         faces_for_track = []
         for face in candidates:

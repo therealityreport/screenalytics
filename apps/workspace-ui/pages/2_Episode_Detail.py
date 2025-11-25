@@ -722,7 +722,8 @@ if cluster_status_value in {"missing", "unknown"}:
             identities_list = payload.get("identities") if isinstance(payload, dict) else None
             if isinstance(identities_list, list):
                 identities_count_manifest = len(identities_list)
-        except Exception:
+        except (json.JSONDecodeError, OSError, KeyError):
+            # File may be corrupted or in unexpected format - silently skip
             pass
         try:
             artifact_mtime = identities_path.stat().st_mtime
@@ -734,7 +735,8 @@ if cluster_status_value in {"missing", "unknown"}:
             if isinstance(metrics_data, dict):
                 block = metrics_data.get("cluster_metrics")
                 cluster_metrics_block = block if isinstance(block, dict) else None
-        except Exception:
+        except (json.JSONDecodeError, OSError, KeyError):
+            # File may be corrupted or in unexpected format - silently skip
             cluster_metrics_block = None
         try:
             artifact_mtime = max(artifact_mtime, _track_metrics_path.stat().st_mtime)
@@ -756,10 +758,33 @@ if cluster_status_value in {"missing", "unknown"}:
         cluster_phase_status["status"] = "success"
         cluster_phase_status["identities"] = identities_count_manifest
         cluster_phase_status["source"] = cluster_phase_status.get("source") or "manifest_fallback"
+        # Read marker file for timestamps and device info FIRST (most authoritative source)
+        _cluster_marker_path = _runs_dir / "cluster.json"
+        if _cluster_marker_path.exists():
+            try:
+                _marker_data = json.loads(_cluster_marker_path.read_text(encoding="utf-8"))
+                if isinstance(_marker_data, dict):
+                    if not cluster_phase_status.get("started_at"):
+                        cluster_phase_status["started_at"] = _marker_data.get("started_at")
+                    if not cluster_phase_status.get("finished_at"):
+                        cluster_phase_status["finished_at"] = _marker_data.get("finished_at")
+                    if not cluster_phase_status.get("device"):
+                        cluster_phase_status["device"] = _marker_data.get("device")
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Fallback to artifact mtime for finished_at if marker didn't have it
         if not cluster_phase_status.get("finished_at") and artifact_mtime:
             cluster_phase_status["finished_at"] = (
                 datetime.utcfromtimestamp(artifact_mtime).replace(microsecond=0).isoformat() + "Z"
             )
+        # Compute runtime_sec if timestamps are available
+        if not cluster_phase_status.get("runtime_sec"):
+            _runtime = _runtime_from_iso(
+                cluster_phase_status.get("started_at"),
+                cluster_phase_status.get("finished_at"),
+            )
+            if _runtime is not None:
+                cluster_phase_status["runtime_sec"] = _runtime
         cluster_status_value = "success"
 jpeg_state = helpers.coerce_int(detect_phase_status.get("jpeg_quality"))
 device_state = detect_phase_status.get("device")
