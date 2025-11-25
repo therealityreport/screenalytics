@@ -1599,6 +1599,32 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
             return []
         return sorted(tid for tid in tracks if tid != track_id)
 
+    def _scoped_faces(faces: List[Dict[str, Any]], frame_idx: int, source: str) -> List[Dict[str, Any]]:
+        scoped: List[Dict[str, Any]] = []
+        dropped: List[int] = []
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+            tid = _safe_int(face.get("track_id"))
+            if tid in (None, track_id):
+                normalized = dict(face)
+                normalized["track_id"] = track_id if tid is None else tid
+                scoped.append(normalized)
+            else:
+                dropped.append(tid)
+        if dropped:
+            LOGGER.warning(
+                "Dropped mismatched faces from track frame listing",
+                extra={
+                    "ep_id": ep_id,
+                    "track_id": track_id,
+                    "frame_idx": frame_idx,
+                    "dropped_track_ids": sorted({tid for tid in dropped if tid is not None}),
+                    "source": source,
+                },
+            )
+        return scoped
+
     face_rows = _track_face_rows(ep_id, track_id)
     crops = _discover_crop_entries(ep_id, track_id)
     ctx, prefixes = _require_episode_context(ep_id)
@@ -1681,7 +1707,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     meta = {}
                 elif meta_track_id in (None, -1):
                     meta = {**meta, "track_id": track_id}
-            faces_for_track = [meta] if meta else []
+            faces_for_track = _scoped_faces([meta] if meta else [], idx, "manifest")
             item_track_id = meta_track_id if meta_track_id == track_id else track_id
             media_url = _resolve_face_media_url(ep_id, meta)
             fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
@@ -1790,7 +1816,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 meta = {}
             elif meta_track_id in (None, -1):
                 meta = {**meta, "track_id": track_id}
-        faces_for_track = [meta] if meta else []
+        faces_for_track = _scoped_faces([meta] if meta else [], frame_idx, "manifest")
         item_track_id = meta_track_id if meta_track_id == track_id else track_id
         local_path = entry.get("abs_path")
         local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None

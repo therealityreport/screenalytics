@@ -57,7 +57,7 @@ if MOCKED_STREAMLIT:
     helpers.api_post = lambda *a, **k: {}
     helpers.api_delete = lambda *a, **k: {}
     helpers.get_ep_id = lambda: "test-ep"
-helpers.detector_is_face_only = lambda ep_id: True
+    helpers.detector_is_face_only = lambda ep_id, detect_status=None: True
 
 cfg = helpers.init_page("Faces & Tracks")
 st.title("Faces & Tracks Review")
@@ -2293,7 +2293,10 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         "debug_track_frames"
     )
     if debug_frames:
-        st.write(f"DEBUG frames for track {track_id}")
+        st.write("DEBUG raw track frames (first 5 items)")
+        st.write(frames_payload.get("items", [])[:5])
+        st.write(f"DEBUG scoped frames for track {track_id}")
+        st.write(frames[:5])
         for line in track_faces_debug(frames, track_id):
             st.write(line)
     best_frame_idx = best_track_frame_idx(frames, track_id, frames_payload.get("best_frame_idx"))
@@ -2420,14 +2423,34 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             row_frames = frames[row_start : row_start + cols_per_row]
             row_cols = st.columns(len(row_frames))
             for idx, frame_meta in enumerate(row_frames):
-                face_id = frame_meta.get("face_id")
+                raw_faces = frame_meta.get("faces") if isinstance(frame_meta.get("faces"), list) else []
+                faces_for_track = [face for face in raw_faces if coerce_int(face.get("track_id")) == track_id]
+                invalid_faces = [face for face in raw_faces if coerce_int(face.get("track_id")) not in (track_id,)]
                 frame_idx = frame_meta.get("frame_idx")
+                if invalid_faces and debug_frames:
+                    st.warning(
+                        "Skipping frame "
+                        f"{frame_idx} with mismatched track faces: "
+                        f"{[coerce_int(f.get('track_id')) for f in invalid_faces]}"
+                    )
+                    continue
+                if not faces_for_track:
+                    if debug_frames:
+                        st.warning(f"Skipping frame {frame_idx}: no faces for track {track_id}")
+                    continue
+                best_face = faces_for_track[0]
+                face_id = best_face.get("face_id")
                 try:
                     frame_idx_int = int(frame_idx)
                 except (TypeError, ValueError):
                     frame_idx_int = None
-                thumb_url = frame_meta.get("media_url") or frame_meta.get("thumbnail_url")
-                skip_reason = frame_meta.get("skip")
+                thumb_url = (
+                    best_face.get("media_url")
+                    or best_face.get("thumbnail_url")
+                    or frame_meta.get("media_url")
+                    or frame_meta.get("thumbnail_url")
+                )
+                skip_reason = best_face.get("skip") or frame_meta.get("skip")
                 with row_cols[idx]:
                     caption = f"Frame {frame_idx}" if frame_idx is not None else (face_id or "frame")
                     resolved_thumb = helpers.resolve_thumb(thumb_url)
@@ -2437,7 +2460,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                     else:
                         st.caption("Crop unavailable.")
                     st.caption(caption)
-                    face_track_id = coerce_int(frame_meta.get("track_id")) or track_id
+                    face_track_id = coerce_int(best_face.get("track_id")) or coerce_int(frame_meta.get("track_id")) or track_id
                     st.caption(f":grey[Track: {face_track_id}]")
                     other_tracks = frame_meta.get("other_tracks") or []
                     if isinstance(other_tracks, list):
@@ -2452,19 +2475,21 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                             unsafe_allow_html=True,
                         )
                     # Show similarity badge if available
-                    similarity = frame_meta.get("similarity")
+                    similarity = best_face.get("similarity") if isinstance(best_face, dict) else None
+                    if similarity is None:
+                        similarity = frame_meta.get("similarity")
                     if similarity is not None:
                         similarity_badge = _render_similarity_badge(similarity)
                         st.markdown(similarity_badge, unsafe_allow_html=True)
                         # Show quality score if available
-                        quality = frame_meta.get("quality")
+                        quality = best_face.get("quality") or frame_meta.get("quality")
                         if quality and isinstance(quality, dict):
-                            quality_score = quality.get("score")
-                            if quality_score is not None:
-                                quality_pct = int(quality_score * 100)
-                                if quality_score >= 0.85:
+                            quality_score_value = quality.get("score")
+                            if quality_score_value is not None:
+                                quality_pct = int(quality_score_value * 100)
+                                if quality_score_value >= 0.85:
                                     quality_color = "#2E7D32"
-                                elif quality_score >= 0.60:
+                                elif quality_score_value >= 0.60:
                                     quality_color = "#81C784"
                                 else:
                                     quality_color = "#EF5350"

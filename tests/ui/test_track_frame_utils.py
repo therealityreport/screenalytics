@@ -53,3 +53,25 @@ def test_best_track_frame_idx_uses_track_only_faces():
     ]
     best_idx = track_frame_utils.best_track_frame_idx(frames, 889, None)
     assert best_idx == 2
+
+
+def test_track_frame_prefers_track_crop_when_other_track_in_frame():
+    track_frame_utils = _load_module()
+    frames = [
+        {
+            "frame_idx": 49504,
+            "faces": [
+                {"track_id": 1497, "face_id": "face_1497", "quality": {"score": 0.55}},
+                {"track_id": 1498, "face_id": "face_1498", "quality": {"score": 0.99}},
+            ],
+        }
+    ]
+
+    scoped, missing = track_frame_utils.scope_track_frames(frames, 1497)
+    assert not missing
+    assert len(scoped) == 1
+    frame = scoped[0]
+    assert frame.get("frame_idx") == 49504
+    assert all(face.get("track_id") == 1497 for face in frame.get("faces", []))
+    assert frame["faces"][0]["face_id"] == "face_1497"
+    assert track_frame_utils.best_track_frame_idx(scoped, 1497, None) == 49504
