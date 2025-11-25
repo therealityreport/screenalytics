@@ -128,6 +128,21 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
         raise HTTPException(status_code=500, detail=f"Grouping failed: {str(e)}")
 
 
+@router.get("/episodes/{ep_id}/clusters/group/progress")
+def group_clusters_progress(ep_id: str) -> dict:
+    """Return in-flight grouping progress for polling clients."""
+    path = grouping_service._group_progress_path(ep_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No grouping progress found")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid progress payload")
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read progress: {exc}")
+
+
 @router.get("/episodes/{ep_id}/cluster_centroids")
 def get_cluster_centroids(ep_id: str) -> dict:
     """Get cluster centroids for an episode."""

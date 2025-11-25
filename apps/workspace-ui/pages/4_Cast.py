@@ -229,12 +229,32 @@ show_options = helpers.known_shows()
 if not show_options:
     st.info("No shows available yet. Add a show via the Upload page first.")
     st.stop()
+
+# If ep_id is provided in the query string, default the Cast page to that episode's show
+ep_id_param = helpers.get_ep_id_from_query_params()
+ep_show_slug = None
+if ep_id_param:
+    episode_detail = _api_get(f"/episodes/{ep_id_param}")
+    ep_show_slug = (episode_detail.get("show_slug") or episode_detail.get("show") or "").strip().lower() if episode_detail else None
+
+# Normalize show options for lookup and set session default from ep_id when available
+option_lookup = {opt.lower(): opt for opt in show_options}
+if ep_show_slug and ep_show_slug in option_lookup:
+    st.session_state["cast_show_select"] = option_lookup[ep_show_slug]
+
+# Ensure session state value is valid
+selected_show_value = st.session_state.get("cast_show_select")
+if selected_show_value not in show_options:
+    selected_show_value = show_options[0]
+    st.session_state["cast_show_select"] = selected_show_value
+
 cols = st.columns([3, 2, 1])
 
 with cols[0]:
     show_id = st.selectbox(
         "Show",
         options=show_options,
+        index=show_options.index(selected_show_value),
         key="cast_show_select",
         help="Select a show to manage cast and seed faces",
     )
@@ -385,7 +405,16 @@ if show_add_form:
 
                         try:
                             resp = requests.post(url, files=files, timeout=120)
-                            resp.raise_for_status()
+                            try:
+                                resp.raise_for_status()
+                            except requests.HTTPError as exc:
+                                detail = ""
+                                try:
+                                    detail = resp.json().get("detail")  # type: ignore[assignment]
+                                except Exception:
+                                    detail = resp.text
+                                st.error(f"Upload failed: {detail or exc}")
+                                raise
                             result = resp.json()
                             _warn_if_simulated(result)
 
@@ -639,7 +668,16 @@ if selected_cast_id:
 
                         try:
                             resp = requests.post(url, files=files, timeout=120)
-                            resp.raise_for_status()
+                            try:
+                                resp.raise_for_status()
+                            except requests.HTTPError as exc:
+                                detail = ""
+                                try:
+                                    detail = resp.json().get("detail")  # type: ignore[assignment]
+                                except Exception:
+                                    detail = resp.text
+                                st.error(f"Upload failed: {detail or exc}")
+                                raise
                             result = resp.json()
                             _warn_if_simulated(result)
 

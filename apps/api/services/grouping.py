@@ -7,7 +7,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import numpy as np
 
@@ -83,6 +83,33 @@ class GroupingService:
         """Get path to group_log.json for an episode."""
         manifests_dir = get_path(ep_id, "detections").parent
         return manifests_dir / "group_log.json"
+
+    def _group_progress_path(self, ep_id: str) -> Path:
+        """Get path to group_progress.json for in-flight progress."""
+        manifests_dir = get_path(ep_id, "detections").parent
+        return manifests_dir / "group_progress.json"
+
+    def _write_progress(
+        self,
+        ep_id: str,
+        entries: List[Dict[str, Any]],
+        *,
+        started_at: str,
+        finished: bool = False,
+        error: str | None = None,
+    ) -> None:
+        """Persist incremental progress so UI can poll while the API runs."""
+        payload: Dict[str, Any] = {
+            "ep_id": ep_id,
+            "started_at": started_at,
+            "updated_at": _now_iso(),
+            "finished": finished,
+            "entries": entries,
+        }
+        if error:
+            payload["error"] = error
+        path = self._group_progress_path(ep_id)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def compute_cluster_centroids(self, ep_id: str, *, progress_callback=None) -> Dict[str, Any]:
         """Compute centroids for all clusters in an episode.
@@ -332,6 +359,7 @@ class GroupingService:
         max_distance: float = PEOPLE_MATCH_DISTANCE,
         momentum: float = PEOPLE_PROTO_MOMENTUM,
         auto_assign: bool = False,
+        progress_callback: Optional[Callable[[str, float, str, Optional[Dict[str, Any]]], None]] = None,
     ) -> Dict[str, Any]:
         """Match episode clusters to show-level people (optionally without assigning).
 
@@ -364,6 +392,8 @@ class GroupingService:
         assigned = []
         new_people = []
         suggestions = []
+        total_clusters = len(centroids_list)
+        processed_clusters = 0
 
         for centroid_info in centroids_list:
             cluster_id = centroid_info["cluster_id"]
@@ -421,6 +451,21 @@ class GroupingService:
                             "suggested": False,
                         }
                     )
+
+            processed_clusters += 1
+            if progress_callback and total_clusters:
+                pct = processed_clusters / max(total_clusters, 1)
+                progress_callback(
+                    "group_across_episodes",
+                    0.7 + 0.2 * pct,
+                    f"Processed {processed_clusters}/{total_clusters} clusters; assigned {len(assigned)}",
+                    {
+                        "total_clusters": total_clusters,
+                        "processed_clusters": processed_clusters,
+                        "assigned_clusters": len(assigned),
+                        "new_people": len(new_people),
+                    },
+                )
 
         # Update identities.json with person_id assignments (only if auto_assign=True)
         if auto_assign:
@@ -526,16 +571,34 @@ class GroupingService:
             raise ValueError(f"Invalid episode ID: {ep_id}")
         show_id = parsed["show"]
 
-        def _progress(step: str, pct: float, msg: str):
+        progress_entries: List[Dict[str, Any]] = []
+
+        def _progress(step: str, pct: float, msg: str, meta: Optional[Dict[str, Any]] = None):
+            entry: Dict[str, Any] = {
+                "step": step,
+                "progress": pct,
+                "message": msg,
+            }
+            if meta:
+                entry.update(meta)
+            progress_entries.append(entry)
             if progress_callback:
                 progress_callback(step, pct, msg)
             LOGGER.info(f"[{ep_id}] {step}: {msg} ({int(pct*100)}%)")
+            self._write_progress(
+                ep_id,
+                progress_entries,
+                started_at=log["started_at"],
+                finished=False,
+            )
 
         log = {
             "ep_id": ep_id,
             "started_at": _now_iso(),
             "steps": [],
         }
+        # Initialize progress file so UI polling can show immediate state
+        self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=False)
 
         # Step 0: Clear stale person_id assignments from previous runs
         _progress("clear_assignments", 0.0, "Clearing stale person assignments...")
@@ -565,12 +628,18 @@ class GroupingService:
                     "centroids_count": centroids_count,
                 }
             )
-            _progress("compute_centroids", 0.4, f"Computed {centroids_count} centroid(s)")
+            _progress(
+                "compute_centroids",
+                0.4,
+                f"Computed {centroids_count} centroid(s)",
+                {"total_clusters": centroids_count, "processed_clusters": 0},
+            )
         except Exception as e:
             log["steps"].append({"step": "compute_centroids", "status": "error", "error": str(e)})
             log["finished_at"] = _now_iso()
             self._save_group_log(ep_id, log)
             _progress("compute_centroids", 0.4, f"ERROR: {str(e)}")
+            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True, error=str(e))
             raise
 
         # Normalize centroids into a dict map for downstream assignment/merging
@@ -602,6 +671,7 @@ class GroupingService:
         except Exception as e:
             log["steps"].append({"step": "group_within_episode", "status": "error", "error": str(e)})
             _progress("group_within_episode", 0.7, f"WARNING: {str(e)}")
+            self._write_progress(ep_id, progress_log, started_at=log["started_at"], finished=False)
             # Continue even if within-episode grouping fails
 
         # Step 3: Across-episode matching to people (auto-assign + create)
@@ -609,11 +679,16 @@ class GroupingService:
             "group_across_episodes",
             0.7,
             "Assigning clusters to show-level people...",
+            {"total_clusters": len(centroids_map), "processed_clusters": 0},
         )
         assignments: List[Dict[str, Any]] = []
         new_people_count = 0
         try:
-            across_result = self.group_across_episodes(ep_id, auto_assign=True)
+            across_result = self.group_across_episodes(
+                ep_id,
+                auto_assign=True,
+                progress_callback=lambda step, pct, msg, meta=None: _progress(step, pct, msg, meta),
+            )
             assignments = across_result.get("assigned", []) if isinstance(across_result, dict) else []
             new_people_count = across_result.get("new_people_count", 0) if isinstance(across_result, dict) else 0
             _progress(
@@ -626,6 +701,7 @@ class GroupingService:
             log["finished_at"] = _now_iso()
             self._save_group_log(ep_id, log)
             _progress("group_across_episodes", 0.9, f"ERROR: {str(e)}")
+            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True, error=str(e))
             raise
 
         # Step 4: Apply within-episode merges to the assigned people
@@ -718,11 +794,24 @@ class GroupingService:
         _progress(
             "apply_within_groups",
             1.0,
+            f"Completed grouping for {len(centroids_map)} clusters",
+            {
+                "total_clusters": len(centroids_map),
+                "processed_clusters": len(centroids_map),
+                "assigned_clusters": len(final_assignments),
+                "merged_clusters": merged_clusters,
+                "new_people": new_people_count,
+            },
+        )
+        _progress(
+            "apply_within_groups",
+            1.0,
             f"Applied {len(groups)} group(s); merged {merged_clusters} cluster(s)",
         )
 
         log["finished_at"] = _now_iso()
         self._save_group_log(ep_id, log)
+        self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True)
 
         return {
             "ep_id": ep_id,

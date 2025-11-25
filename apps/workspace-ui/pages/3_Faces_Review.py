@@ -2657,20 +2657,78 @@ if st.button(
                     future = pool.submit(_thread_safe_api_post)
                     start_time = time.time()
                     last_heartbeat = 0
-                    progress_value = 0.1
+                    fallback_progress = 0.1
+                    last_progress_entry = 0
 
                     while future.running():
                         elapsed = int(time.time() - start_time)
-                        # Animate progress bar to show activity (pulse between 0.1 and 0.9)
-                        progress_value = 0.1 + (0.4 * (1 + (elapsed % 4) / 4))
-                        progress_bar.progress(min(progress_value, 0.9))
+                        # Monotonic placeholder progress up to 90% until real data arrives
+                        fallback_progress = min(fallback_progress + 0.01, 0.9)
+                        current_progress = fallback_progress
+                        new_entries = False
 
                         status_text.text(f"⏳ Auto-cluster running… {elapsed}s elapsed")
 
-                        # Log heartbeat every 5s
-                        if elapsed // 5 > last_heartbeat:
-                            last_heartbeat = elapsed // 5
-                            _add_log(f"⏳ Still processing… ({elapsed}s elapsed)")
+                        # Poll backend progress to show real-time steps
+                        try:
+                            progress_resp = requests.get(
+                                f"{api_base}/episodes/{ep_id}/clusters/group/progress",
+                                timeout=5,
+                            )
+                            if progress_resp.status_code == 200:
+                                progress_data = progress_resp.json()
+                                entries = progress_data.get("entries", []) if isinstance(progress_data, dict) else []
+                                for entry in entries[last_progress_entry:]:
+                                    new_entries = True
+                                    pct = entry.get("progress")
+                                    step = entry.get("step") or "working"
+                                    msg = entry.get("message") or ""
+                                    total_clusters = entry.get("total_clusters")
+                                    processed_clusters = entry.get("processed_clusters")
+                                    assigned_clusters = entry.get("assigned_clusters")
+                                    merged_clusters = entry.get("merged_clusters")
+                                    new_people = entry.get("new_people")
+                                    percent_complete = None
+                                    if total_clusters and processed_clusters is not None:
+                                        try:
+                                            percent_complete = int(min(max(float(processed_clusters) / float(total_clusters), 0.0), 1.0) * 100)
+                                        except Exception:
+                                            percent_complete = None
+                                    if pct is not None and percent_complete is None:
+                                        percent_complete = int(float(pct) * 100)
+                                    if pct is not None:
+                                        current_progress = max(current_progress, min(float(pct), 0.99))
+                                    elif percent_complete is not None:
+                                        current_progress = max(current_progress, min(percent_complete / 100, 0.99))
+
+                                    # Build detailed progress message
+                                    parts = []
+                                    if total_clusters and processed_clusters is not None:
+                                        parts.append(f"Processed {int(processed_clusters)}/{int(total_clusters)} clusters")
+                                    if assigned_clusters is not None:
+                                        parts.append(f"assigned {int(assigned_clusters)}")
+                                    if merged_clusters:
+                                        parts.append(f"merged {int(merged_clusters)}")
+                                    if new_people:
+                                        parts.append(f"new people {int(new_people)}")
+                                    if not parts:
+                                        parts.append(msg or step)
+                                    if percent_complete is not None:
+                                        progress_str = f"[{percent_complete:3d}%]"
+                                    else:
+                                        progress_str = "[ --%]"
+                                    elapsed_suffix = f" ({elapsed}s elapsed)" if elapsed else ""
+                                    _add_log(f"{progress_str} {step}: {'; '.join(parts)}{elapsed_suffix}")
+                                last_progress_entry = len(entries)
+                        except Exception:
+                            pass
+
+                        # Log heartbeat only if no new progress entries arrived
+                        if not new_entries and elapsed // 10 > last_heartbeat:
+                            last_heartbeat = elapsed // 10
+                            _add_log(f"⏳ Waiting for cluster progress… ({elapsed}s elapsed)")
+
+                        progress_bar.progress(current_progress)
 
                         time.sleep(0.5)
 

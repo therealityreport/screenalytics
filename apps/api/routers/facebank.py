@@ -335,6 +335,29 @@ async def upload_seeds(
     embedder = ArcFaceEmbedder(device="cpu")
     embedder.ensure_ready()
 
+    class _SimulatedDetection:
+        """Minimal detection stub when RetinaFace is unavailable."""
+
+        def __init__(self, width: int, height: int) -> None:
+            # Use a generous box covering most of the image
+            margin_w = int(max(width * 0.05, 10))
+            margin_h = int(max(height * 0.05, 10))
+            self.bbox = [margin_w, margin_h, width - margin_w, height - margin_h]
+            # Rough landmark positions (fractions of the image)
+            self.landmarks = [
+                0.35,
+                0.35,  # left eye
+                0.65,
+                0.35,  # right eye
+                0.50,
+                0.50,  # nose
+                0.40,
+                0.70,  # left mouth
+                0.60,
+                0.70,  # right mouth
+            ]
+            self.conf = 0.5
+
     _diag(
         "SEED_INIT",
         detector_ready=detector_ready,
@@ -365,7 +388,18 @@ async def upload_seeds(
                 continue
             image = np.ascontiguousarray(image_rgb[..., ::-1])
 
-            detections = detector.detect(image)
+            try:
+                detections = detector.detect(image)
+            except Exception as exc:
+                if detector_mode == "simulated":
+                    detections = []
+                    LOGGER.warning("Falling back to simulated detection for %s: %s", file.filename, exc)
+                else:
+                    raise HTTPException(status_code=500, detail=f"Detector failed: {exc}") from exc
+
+            if detector_mode == "simulated" and len(detections) == 0:
+                h, w = image.shape[:2]
+                detections = [_SimulatedDetection(w, h)]
 
             if len(detections) == 0:
                 errors.append({"file": file.filename, "error": "No face detected"})
