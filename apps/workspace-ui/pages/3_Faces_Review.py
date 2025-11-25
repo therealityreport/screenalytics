@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,13 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+from track_frame_utils import (  # noqa: E402
+    best_track_frame_idx,
+    coerce_int,
+    quality_score,
+    scope_track_frames,
+    track_faces_debug,
+)
 
 MOCKED_STREAMLIT = "unittest.mock" in type(st).__module__
 if MOCKED_STREAMLIT:
@@ -697,78 +705,6 @@ def _fetch_track_frames(
     if isinstance(payload, dict):
         return payload
     return {}
-
-
-def _coerce_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _quality_score(face_meta: Dict[str, Any]) -> float | None:
-    quality = face_meta.get("quality") if isinstance(face_meta, dict) else None
-    if isinstance(quality, dict):
-        try:
-            score = quality.get("score")
-            return float(score) if score is not None else None
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _scope_track_frames(frames: List[Dict[str, Any]], track_id: int) -> tuple[List[Dict[str, Any]], List[int]]:
-    """Filter frames down to faces that belong to the active track."""
-    scoped: List[Dict[str, Any]] = []
-    missing: List[int] = []
-    for frame in frames:
-        frame_idx = frame.get("frame_idx")
-        faces = frame.get("faces") if isinstance(frame.get("faces"), list) else []
-        candidates = [face for face in faces if isinstance(face, dict)]
-        # Include the top-level frame meta as a candidate when it already points to this track
-        top_level_tid = _coerce_int(frame.get("track_id"))
-        if top_level_tid in (None, track_id):
-            candidates.append(frame)
-
-        faces_for_track = []
-        for face in candidates:
-            tid = _coerce_int(face.get("track_id"))
-            if tid == track_id:
-                faces_for_track.append(face)
-
-        if not faces_for_track:
-            try:
-                missing.append(int(frame_idx))
-            except (TypeError, ValueError):
-                missing.append(frame_idx if frame_idx is not None else -1)
-            continue
-
-        # Prefer higher quality within the track for rendering
-        faces_for_track.sort(key=lambda f: _quality_score(f) or 0.0, reverse=True)
-        primary = {**frame, **faces_for_track[0]}
-        primary["faces"] = faces_for_track
-        primary["track_id"] = _coerce_int(primary.get("track_id")) or track_id
-        scoped.append(primary)
-    return scoped, missing
-
-
-def _best_track_frame_idx(frames: List[Dict[str, Any]], track_id: int, fallback: int | None) -> int | None:
-    best_idx = None
-    best_score = -1.0
-    for frame in frames:
-        frame_idx = frame.get("frame_idx")
-        faces = frame.get("faces") if isinstance(frame.get("faces"), list) else []
-        for face in faces:
-            tid = _coerce_int(face.get("track_id"))
-            if tid != track_id:
-                continue
-            score = _quality_score(face)
-            if score is None:
-                continue
-            if score > best_score:
-                best_score = score
-                best_idx = frame_idx
-    return best_idx if best_idx is not None else fallback
 
 
 def _render_track_media_section(ep_id: str, track_id: int, *, sample: int) -> None:
@@ -2352,8 +2288,15 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     mismatched_frames = [frame for frame in frames if frame.get("track_id") not in (None, track_id)]
     if mismatched_frames:
         frames = [frame for frame in frames if frame.get("track_id") in (None, track_id)]
-    frames, missing_faces = _scope_track_frames(frames, track_id)
-    best_frame_idx = _best_track_frame_idx(frames, track_id, frames_payload.get("best_frame_idx"))
+    frames, missing_faces = scope_track_frames(frames, track_id)
+    debug_frames = os.getenv("SCREENALYTICS_DEBUG_TRACK_FRAMES") == "1" or st.session_state.get(
+        "debug_track_frames"
+    )
+    if debug_frames:
+        st.write(f"DEBUG frames for track {track_id}")
+        for line in track_faces_debug(frames, track_id):
+            st.write(line)
+    best_frame_idx = best_track_frame_idx(frames, track_id, frames_payload.get("best_frame_idx"))
     total_sampled = int(frames_payload.get("total") or 0)
     # Preserve zero: only use total_sampled if total_frames is None
     total_frames_raw = frames_payload.get("total_frames")
@@ -2494,7 +2437,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                     else:
                         st.caption("Crop unavailable.")
                     st.caption(caption)
-                    face_track_id = _coerce_int(frame_meta.get("track_id")) or track_id
+                    face_track_id = coerce_int(frame_meta.get("track_id")) or track_id
                     st.caption(f":grey[Track: {face_track_id}]")
                     other_tracks = frame_meta.get("other_tracks") or []
                     if isinstance(other_tracks, list):

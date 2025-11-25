@@ -76,3 +76,7 @@ def test_track_frames_include_other_tracks_hint(tmp_path):
     frame_entry = payload["items"][0]
     assert frame_entry["frame_idx"] == 10
     assert frame_entry["other_tracks"] == [2]
+    # Ensure faces list is scoped to the requested track only
+    faces = frame_entry.get("faces") or []
+    assert faces, "expected faces list in track frames response"
+    assert all(face.get("track_id") == 1 for face in faces)

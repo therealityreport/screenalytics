@@ -1644,6 +1644,14 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         if _extract_quality_metrics and _compute_quality_score:
             for idx in frame_indices:
                 meta = face_rows.get(idx, {})
+                try:
+                    meta_track_id = int(meta.get("track_id", -1))
+                except (TypeError, ValueError):
+                    meta_track_id = -1
+                if meta_track_id in (None, -1):
+                    meta_track_id = track_id
+                if meta_track_id not in (track_id, -1):
+                    continue
                 if meta.get("skip"):
                     continue
                 det_score, crop_std, box_area = _extract_quality_metrics(meta)
@@ -1671,6 +1679,8 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                         frame_idx=idx,
                     )
                     meta = {}
+                elif meta_track_id in (None, -1):
+                    meta = {**meta, "track_id": track_id}
             faces_for_track = [meta] if meta else []
             item_track_id = meta_track_id if meta_track_id == track_id else track_id
             media_url = _resolve_face_media_url(ep_id, meta)
@@ -1737,6 +1747,14 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         for entry in crops:
             frame_idx = entry["frame_idx"]
             meta = face_rows.get(frame_idx, {})
+            try:
+                meta_track_id = int(meta.get("track_id", -1))
+            except (TypeError, ValueError):
+                meta_track_id = -1
+            if meta_track_id in (None, -1):
+                meta_track_id = track_id
+            if meta_track_id not in (track_id, -1):
+                continue
             if meta.get("skip"):
                 continue
             det_score, crop_std, box_area = _extract_quality_metrics(meta)
@@ -1770,6 +1788,8 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     frame_idx=frame_idx,
                 )
                 meta = {}
+            elif meta_track_id in (None, -1):
+                meta = {**meta, "track_id": track_id}
         faces_for_track = [meta] if meta else []
         item_track_id = meta_track_id if meta_track_id == track_id else track_id
         local_path = entry.get("abs_path")
