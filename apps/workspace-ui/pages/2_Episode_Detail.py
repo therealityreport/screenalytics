@@ -753,13 +753,22 @@ elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_ex
     faces_manifest_fallback = True
 
 # If detect status is missing but manifests are present, synthesize a summary so the UI still shows completion.
-if not detect_phase_status and manifest_state["manifest_ready"]:
+if not detect_phase_status and (manifest_state["manifest_ready"] or manifest_state["tracks_ready"]):
+    detections_count = _count_manifest_rows(detections_path) or 0
+    tracks_count = _count_manifest_rows(tracks_path) or 0
     detect_phase_status = {
         "status": "success",
-        "detections": _count_manifest_rows(detections_path) or 0,
-        "tracks": _count_manifest_rows(tracks_path) or 0,
+        "detections": detections_count,
+        "tracks": tracks_count,
         "finished_at": None,
     }
+    detect_status_value = "success"
+    using_manifest_fallback = True
+    if manifest_state["tracks_only_fallback"]:
+        tracks_only_fallback = True
+elif detect_status_value in {"missing", "unknown"} and (tracks_path.exists() or detections_path.exists()):
+    # If manifests exist but were not counted (e.g., empty status payload), still show a detect/track card.
+    detect_phase_status = detect_phase_status or {"status": "success"}
     detect_status_value = "success"
     using_manifest_fallback = True
 
@@ -1123,6 +1132,9 @@ detect_detector_value = _choose_value(
     helpers.tracks_detector_value(ep_id),
     fallback=helpers.DEFAULT_DETECTOR,
 )
+# Guard against unsupported detector values (legacy/internal). Force RetinaFace.
+if detect_detector_value not in {helpers.DEFAULT_DETECTOR}:
+    detect_detector_value = helpers.DEFAULT_DETECTOR
 detect_tracker_value = _choose_value(
     tracker_override,
     detect_job_defaults.get("tracker"),
