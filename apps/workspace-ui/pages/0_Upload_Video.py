@@ -13,11 +13,15 @@ WORKSPACE_DIR = PAGE_PATH.parents[1]
 if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
-# When opened via sidebar, avoid inheriting an app-injected ep_id query param.
-if "ep_id" in st.query_params and st.session_state.get("_ep_id_query_origin") == "app":
-    params = st.query_params
+# When opened via sidebar, always start in NEW EPISODE mode (no ep_id).
+params = st.query_params
+if "ep_id" in params:
     params.pop("ep_id", None)
     st.query_params = params
+# Clear any lingering episode state so the upload page does not reuse it.
+st.session_state.pop("ep_id", None)
+st.session_state.pop("_ep_id_query_origin", None)
+st.session_state.pop("upload_ep_params_cleaned", None)
 
 # Import the canonical upload page (top-level Upload_Video.py).
 # All Streamlit rendering happens inside that module.

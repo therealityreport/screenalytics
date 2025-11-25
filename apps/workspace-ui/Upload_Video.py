@@ -1254,16 +1254,14 @@ def main():
         st.session_state.pop("upload_rerun_count", None)
 
         ep_id_param = helpers.get_ep_id_from_query_params(allow_app_injected=False)
-        current_ep = st.session_state.get("ep_id") or ""
         if ep_id_param:
-            if current_ep != ep_id_param:
-                st.session_state["ep_id"] = ep_id_param
+            st.session_state["ep_id"] = ep_id_param
+            mode = "replace"
         else:
-            if not st.session_state.get("upload_ep_params_cleaned"):
-                st.session_state["ep_id"] = ""
-                st.session_state["upload_ep_params_cleaned"] = True
-
-        mode = "replace" if ep_id_param else "create"
+            # Sidebar / new episode path: always start clean.
+            st.session_state["ep_id"] = ""
+            st.session_state.pop("_ep_id_query_origin", None)
+            mode = "create"
 
         def _render_upload_summary(ep_id: str, *, created: bool, show_ref: str | None = None,
                                    season_number: int | None = None, episode_number: int | None = None) -> None:
@@ -1299,6 +1297,7 @@ def main():
             st.subheader(f"Replace video for `{ep_id_param}`")
             st.caption("Upload is locked to this episode because ep_id is present in the URL.")
         else:
+            st.caption("Mode: New episode (select show/season/episode to create)")
             upload_mode_choice = st.radio(
                 "Upload mode",
                 ["New episode", "Existing episode"],
