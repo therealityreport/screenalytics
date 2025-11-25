@@ -587,6 +587,7 @@ class GroupingService:
 
         # Step 2: Within-episode grouping
         _progress("group_within_episode", 0.4, "Grouping similar clusters within episode...")
+        within_result: Dict[str, Any] = {}
         try:
             within_result = self.group_within_episode(ep_id)
             merged = within_result.get("merged_count", 0)
@@ -652,6 +653,7 @@ class GroupingService:
             groups.append([cid])
 
         merged_clusters = 0
+        # Ensure all clusters that were grouped within the episode point at the same person
         for group in groups:
             if not group:
                 continue

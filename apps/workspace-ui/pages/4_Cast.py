@@ -348,7 +348,7 @@ if show_add_form:
                         result = _api_post(f"/shows/{show_id}/cast", payload)
                         if result:
                             st.session_state["new_cast_created"] = result["cast_id"]
-                            st.session_state["new_cast_name"] = name.strip()
+                            st.session_state["new_cast_name_stored"] = name.strip()
                             st.rerun()
 
                 if cols[1].form_submit_button("Cancel"):
@@ -358,7 +358,7 @@ if show_add_form:
         # Step 2: Upload seed images (optional)
         else:
             new_cast_id = st.session_state["new_cast_created"]
-            new_cast_name = st.session_state.get("new_cast_name", "new member")
+            new_cast_name = st.session_state.get("new_cast_name_stored", "new member")
 
             st.success(f"✓ Created cast member: **{new_cast_name}**")
             st.markdown("**Optional: Upload Seed Images**")
@@ -402,7 +402,7 @@ if show_add_form:
                             # Clean up and view the new cast member
                             st.session_state.pop("cast_show_add_form", None)
                             st.session_state.pop("new_cast_created", None)
-                            st.session_state.pop("new_cast_name", None)
+                            st.session_state.pop("new_cast_name_stored", None)
                             st.session_state["selected_cast_id"] = new_cast_id
                             st.rerun()
 
@@ -414,7 +414,7 @@ if show_add_form:
                 if cols[1].form_submit_button("Add Another"):
                     # Reset form to add another cast member
                     st.session_state.pop("new_cast_created", None)
-                    st.session_state.pop("new_cast_name", None)
+                    st.session_state.pop("new_cast_name_stored", None)
                     # Keep cast_show_add_form True to stay in add mode
                     st.rerun()
 
@@ -422,7 +422,7 @@ if show_add_form:
                     # Skip upload and view the new member
                     st.session_state.pop("cast_show_add_form", None)
                     st.session_state.pop("new_cast_created", None)
-                    st.session_state.pop("new_cast_name", None)
+                    st.session_state.pop("new_cast_name_stored", None)
                     st.session_state["selected_cast_id"] = new_cast_id
                     st.rerun()
 
@@ -430,7 +430,7 @@ if show_add_form:
                     # Cancel and return to list
                     st.session_state.pop("cast_show_add_form", None)
                     st.session_state.pop("new_cast_created", None)
-                    st.session_state.pop("new_cast_name", None)
+                    st.session_state.pop("new_cast_name_stored", None)
                     st.rerun()
 
 # Cast list with selection
