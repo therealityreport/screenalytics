@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import datetime
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+from concurrent.futures import ThreadPoolExecutor
 import math
 
 import requests
@@ -2572,7 +2575,7 @@ strategy_labels = {
 selected_label = st.selectbox(
     "Grouping strategy",
     options=list(strategy_labels.keys()),
-    key="faces_review_grouping_strategy",
+    key=f"{ep_id}::faces_review_grouping_strategy",
 )
 if selected_label not in strategy_labels:
     selected_label = list(strategy_labels.keys())[0]
@@ -2581,9 +2584,10 @@ facebank_ready = True
 if selected_strategy == "facebank":
     confirm = st.text_input(
         "Confirm show slug before regrouping",
-        value=show_slug or "",
-        key="facebank_show_confirm",
+        value="",
+        key=f"{ep_id}::facebank_show_confirm",
         help="Protect against grouping the wrong show",
+        placeholder=show_slug or "",
     ).strip()
     expected_slug = (show_slug or "").lower()
     facebank_ready = bool(expected_slug and confirm.lower() == expected_slug)
@@ -2592,133 +2596,242 @@ if selected_strategy == "facebank":
 
 button_label = "Group Clusters (facebank)" if selected_strategy == "facebank" else "Group Clusters (auto)"
 caption_text = (
-    "Auto-clusters within episode and computes similarity suggestions (no auto-assignment)"
+    "Auto-clusters within episode, assigns people, and computes cross-episode matches"
     if selected_strategy == "auto"
     else "Uses existing facebank seeds to align clusters to known cast members"
 )
+busy_flag = f"{ep_id}::group_clusters_busy"
+if st.session_state.get(busy_flag):
+    st.info("Cluster grouping already running…")
 if st.button(
     button_label,
     key="group_clusters_action",
     type="primary",
-    disabled=(selected_strategy == "facebank" and not facebank_ready),
+    disabled=(selected_strategy == "facebank" and not facebank_ready) or st.session_state.get(busy_flag, False),
 ):
     payload = {"strategy": selected_strategy}
+    st.session_state[busy_flag] = True
 
-    if selected_strategy == "auto":
-        # Show detailed progress for auto clustering
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
-        log_expander = st.expander("📋 Detailed Progress Log", expanded=False)
-        with log_expander:
-            log_placeholder = st.empty()
-
-        status_text.text("🚀 Starting auto-clustering…")
-        log_placeholder.text(f"Starting auto-cluster for {ep_id} (auto regroup + show match)…")
-        result = None
-        error = None
-
-        # Collect log messages
-        log_messages = []
-
-        try:
-            # Grouping can take >60s; allow longer timeout
-            status_text.text("Contacting API…")
-            progress_bar.progress(0.05)
-            log_messages.append(f"[5%] request: POST /episodes/{ep_id}/clusters/group (auto)")
-            with st.spinner("Running auto-cluster…"):
-                result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=300)
-        except Exception as exc:
-            error = exc
-
-        if error:
-            progress_bar.empty()
-            err_msg = f"❌ Auto-cluster failed: {error}"
-            status_text.error(err_msg)
+    try:
+        if selected_strategy == "auto":
+            # Show detailed progress for auto clustering
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            log_expander = st.expander("📋 Detailed Progress Log", expanded=True)
             with log_expander:
-                log_placeholder.text(err_msg)
-        elif result is None:
-            progress_bar.empty()
-            err_msg = "❌ Auto-cluster failed: API returned no response. Check backend logs."
-            status_text.error(err_msg)
-            log_messages.append(err_msg)
-            with log_expander:
-                log_placeholder.text("\n".join(log_messages))
-        elif result:
-            # Show progress log if available
-            progress_log = result.get("progress_log", [])
-            if progress_log:
-                for entry in progress_log:
-                    progress = entry.get("progress", 0.0)
-                    message = entry.get("message", "")
-                    step = entry.get("step", "")
-                    progress_bar.progress(progress)
-                    status_text.text(f"{step or 'working'} – {message}")
-                    log_messages.append(f"[{int(progress*100)}%] {step}: {message}")
+                log_placeholder = st.empty()
+
+            status_text.text("🚀 Starting auto-clustering…")
+            result = None
+            error = None
+
+            # Collect log messages with timestamps
+            log_messages = []
+
+            def _add_log(msg: str):
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                log_messages.append(f"[{timestamp}] {msg}")
+                log_placeholder.code("\n".join(log_messages), language="text")
+
+            _add_log(f"Starting auto-cluster for {ep_id} (auto regroup + show match)…")
+
+            try:
+                # Grouping can take >60s; allow longer timeout
+                status_text.text("⏳ Contacting API…")
+                progress_bar.progress(0.05)
+                _add_log(f"POST /episodes/{ep_id}/clusters/group (strategy=auto)")
+
+                # Capture API base before thread execution (session_state not accessible in threads)
+                api_base = st.session_state.get("api_base")
+                if not api_base:
+                    raise RuntimeError("API base URL not configured. Please reload the page.")
+
+                # Thread-safe API call function
+                def _thread_safe_api_post():
+                    url = f"{api_base}/episodes/{ep_id}/clusters/group"
+                    resp = requests.post(url, json=payload, timeout=300)
+                    resp.raise_for_status()
+                    return resp.json()
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(_thread_safe_api_post)
+                    start_time = time.time()
+                    last_heartbeat = 0
+                    progress_value = 0.1
+
+                    while future.running():
+                        elapsed = int(time.time() - start_time)
+                        # Animate progress bar to show activity (pulse between 0.1 and 0.9)
+                        progress_value = 0.1 + (0.4 * (1 + (elapsed % 4) / 4))
+                        progress_bar.progress(min(progress_value, 0.9))
+
+                        status_text.text(f"⏳ Auto-cluster running… {elapsed}s elapsed")
+
+                        # Log heartbeat every 5s
+                        if elapsed // 5 > last_heartbeat:
+                            last_heartbeat = elapsed // 5
+                            _add_log(f"⏳ Still processing… ({elapsed}s elapsed)")
+
+                        time.sleep(0.5)
+
+                    result = future.result()
+                    total_elapsed = int(time.time() - start_time)
+                    _add_log(f"✓ API returned response after {total_elapsed}s")
+            except Exception as exc:
+                error = exc
+
+            if error:
+                progress_bar.empty()
+                err_msg = f"❌ Auto-cluster failed: {error}"
+                status_text.error(err_msg)
+                _add_log(err_msg)
+            elif result is None:
+                progress_bar.empty()
+                err_msg = "❌ Auto-cluster failed: API returned no response. Check backend logs."
+                status_text.error(err_msg)
+                _add_log(err_msg)
             else:
-                log_messages.append("No progress log returned from API; auto-cluster may have completed without streaming.")
-
-            progress_bar.progress(1.0)
-
-            # Show detailed summary - check both possible locations for log
-            # API returns result -> log, but also could be at top level
-            log_data = result.get("result", {}).get("log", {}) or result.get("log", {})
-            steps = log_data.get("steps", [])
-            cleared = next(
-                (s.get("cleared_count", 0) for s in steps if s.get("step") == "clear_assignments"),
-                0,
-            )
-            centroids = next(
-                (s.get("centroids_count", 0) for s in steps if s.get("step") == "compute_centroids"),
-                0,
-            )
-            merged = next(
-                (s.get("merged_count", 0) for s in steps if s.get("step") == "group_within_episode"),
-                0,
-            )
-            suggestions = next(
-                (s.get("suggestions_count", 0) for s in steps if s.get("step") == "group_across_episodes"),
-                0,
-            )
-
-            # Add detailed steps to log
-            for step in steps:
-                step_name = step.get("step", "")
-                step_status = step.get("status", "")
-                log_messages.append(f"✓ {step_name}: {step_status}")
-                if step_name == "clear_assignments":
-                    log_messages.append(f"  → Cleared {step.get('cleared_count', 0)} stale assignments")
-                elif step_name == "compute_centroids":
-                    log_messages.append(f"  → Computed {step.get('centroids_count', 0)} centroids")
-                elif step_name == "group_within_episode":
-                    log_messages.append(f"  → Merged {step.get('merged_count', 0)} cluster groups")
-                elif step_name == "group_across_episodes":
-                    log_messages.append(f"  → Generated {step.get('suggestions_count', 0)} suggestions")
-
-            # Show log in expander
-            with log_expander:
-                if log_messages:
-                    log_placeholder.text("\n".join(log_messages))
+                error_msg = None
+                if isinstance(result, dict):
+                    error_msg = result.get("error") or result.get("detail")
+                    if isinstance(error_msg, dict):
+                        error_msg = error_msg.get("message") or str(error_msg)
+                    status_value = str(result.get("status", "")).lower()
+                    if status_value and status_value not in {"success", "ok"} and not error_msg:
+                        error_msg = f"Unexpected status: {status_value}"
+                if error_msg:
+                    progress_bar.empty()
+                    status_text.error(f"❌ Auto-cluster failed: {error_msg}")
+                    _add_log(f"❌ Auto-cluster failed: {error_msg}")
                 else:
-                    log_placeholder.text("No progress log returned from the API.")
+                    # Show progress log if available from API
+                    progress_log = result.get("progress_log", [])
+                    if progress_log:
+                        _add_log(f"Processing {len(progress_log)} progress step(s) from API…")
+                        for entry in progress_log:
+                            progress = entry.get("progress", 0.0)
+                            message = entry.get("message", "")
+                            step = entry.get("step", "")
+                            progress_bar.progress(min(progress, 1.0))
+                            status_text.text(f"{step or 'working'} – {message}")
+                            _add_log(f"[{int(progress*100):3d}%] {step}: {message}")
+                            time.sleep(0.05)  # Brief pause to show progression visually
+                    else:
+                        _add_log("⚠️ No progress_log returned from API (completed without detailed progress)")
 
-            status_text.success(
-                f"✅ Clustering complete!\n"
-                f"• Cleared {cleared} stale assignment(s)\n"
-                f"• Computed {centroids} centroid(s)\n"
-                f"• Merged {merged} cluster group(s)\n"
-                f"• Computed {suggestions} similarity suggestion(s)\n\n"
-                "Check Episode Auto-Clustered People below to review and assign."
-            )
-            progress_bar.empty()
-            st.rerun()
-    else:
-        # Original simple spinner for facebank
-        with st.spinner("Running cluster grouping..."):
-            result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=300)
-            if result:
-                matched = result.get("result", {}).get("matched_clusters", 0)
+                    progress_bar.progress(1.0)
+
+                    # Show detailed summary - check both possible locations for log
+                    # API returns result -> log, but also could be at top level
+                    log_data = result.get("result", {}).get("log", {}) or result.get("log", {})
+                    steps = log_data.get("steps", []) if isinstance(log_data, dict) else []
+                    cleared = next(
+                        (s.get("cleared_count", 0) for s in steps if s.get("step") == "clear_assignments"),
+                        0,
+                    )
+                    centroids = next(
+                        (s.get("centroids_count", 0) for s in steps if s.get("step") == "compute_centroids"),
+                        0,
+                    )
+                    merged_groups = next(
+                        (s.get("merged_count", 0) for s in steps if s.get("step") == "group_within_episode"),
+                        0,
+                    )
+                    assigned_clusters = next(
+                        (s.get("assigned_count", 0) for s in steps if s.get("step") == "group_across_episodes"),
+                        0,
+                    )
+                    new_people = next(
+                        (s.get("new_people_count", 0) for s in steps if s.get("step") == "group_across_episodes"),
+                        0,
+                    )
+                    merged_cluster_count = next(
+                        (s.get("merged_clusters", 0) for s in steps if s.get("step") == "apply_within_groups"),
+                        0,
+                    )
+                    pruned_people = next(
+                        (s.get("pruned_people", 0) for s in steps if s.get("step") == "apply_within_groups"),
+                        0,
+                    )
+
+                    assignment_entries = (
+                        result.get("assignments")
+                        or result.get("result", {}).get("assignments")
+                        or result.get("across_episodes", {}).get("assigned")
+                        or []
+                    )
+                    if isinstance(assignment_entries, dict):
+                        assignment_entries = assignment_entries.get("assigned", [])
+                    unique_people_assigned = {
+                        entry.get("person_id") for entry in assignment_entries if entry.get("person_id")
+                    }
+                    # Fallback counts when log is missing
+                    if not steps and isinstance(result, dict):
+                        centroids = centroids or len((result.get("result", {}) or {}).get("centroids", {}) or [])
+                        within = (result.get("result", {}) or {}).get("within_episode", {}) or {}
+                        merged_groups = merged_groups or within.get("merged_count", 0)
+                        assigned_clusters = assigned_clusters or len(assignment_entries or [])
+                        merged_cluster_count = merged_cluster_count or within.get("merged_count", 0)
+                        pruned_people = pruned_people or result.get("result", {}).get("across_episodes", {}).get(
+                            "pruned_people_count", 0
+                        )
+
+                    # Add detailed summary to log
+                    _add_log("=" * 50)
+                    _add_log("DETAILED SUMMARY:")
+                    for step in steps:
+                        step_name = step.get("step", "")
+                        step_status = step.get("status", "")
+                        _add_log(f"✓ {step_name}: {step_status}")
+                        if step_name == "clear_assignments":
+                            _add_log(f"  → Cleared {step.get('cleared_count', 0)} stale assignments")
+                        elif step_name == "compute_centroids":
+                            _add_log(f"  → Computed {step.get('centroids_count', 0)} centroids")
+                        elif step_name == "group_within_episode":
+                            _add_log(f"  → Merged {step.get('merged_count', 0)} cluster group(s)")
+                        elif step_name == "group_across_episodes":
+                            _add_log(
+                                f"  → Assigned {step.get('assigned_count', 0)} cluster(s); created "
+                                f"{step.get('new_people_count', 0)} new people"
+                            )
+                        elif step_name == "apply_within_groups":
+                            _add_log(
+                                f"  → Applied {step.get('groups', 0)} group(s); "
+                                f"merged {step.get('merged_clusters', 0)} cluster(s); "
+                                f"pruned {step.get('pruned_people', 0)} empty people"
+                            )
+                    _add_log("=" * 50)
+
+                    status_text.success(
+                        f"✅ Clustering complete!\n"
+                        f"• Cleared {cleared} stale assignment(s)\n"
+                        f"• Computed {centroids} centroid(s)\n"
+                        f"• Merged {merged_groups} cluster group(s)\n"
+                        f"• Assigned {assigned_clusters} cluster(s) to {len(unique_people_assigned)} people "
+                        f"(created {new_people} new)\n"
+                        f"• Merged {merged_cluster_count} cluster(s) after regrouping "
+                        f"(pruned {pruned_people} empty auto people)\n\n"
+                        "Check Episode Auto-Clustered People below to review and assign."
+                    )
+                    progress_bar.empty()
+                    st.session_state[busy_flag] = False
+                    st.rerun()
+        else:
+            # Facebank regrouping with basic progress + error handling
+            with st.spinner("Running cluster grouping..."):
+                result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=300)
+            if not result:
+                st.error("Facebank regroup failed: empty response from API.")
+            elif isinstance(result, dict) and (result.get("error") or result.get("detail")):
+                err_msg = result.get("error") or result.get("detail")
+                st.error(f"Facebank regroup failed: {err_msg}")
+            else:
+                matched = result.get("result", {}).get("matched_clusters", 0) if isinstance(result, dict) else 0
                 st.success(f"Facebank regroup complete! {matched} clusters matched to seeds.")
+                st.session_state[busy_flag] = False
                 st.rerun()
+    finally:
+        st.session_state[busy_flag] = False
 st.caption(caption_text)
 
 view_state = st.session_state.get("facebank_view", "people")
