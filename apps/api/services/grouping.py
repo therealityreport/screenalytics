@@ -501,6 +501,17 @@ class GroupingService:
         data["identities"] = identities
         identities_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    def _prune_empty_people(self, show_id: str) -> int:
+        """Delete auto-created people that no longer own any clusters."""
+        removed = 0
+        people = self.people_service.list_people(show_id)
+        for person in people:
+            if person.get("cluster_ids") or person.get("cast_id") or person.get("name"):
+                continue
+            if self.people_service.delete_person(show_id, person["person_id"]):
+                removed += 1
+        return removed
+
     def group_clusters_auto(self, ep_id: str, *, progress_callback=None) -> Dict[str, Any]:
         """Run full auto grouping: compute centroids, within-episode, across-episode.
 
@@ -510,6 +521,10 @@ class GroupingService:
 
         Returns combined result with audit log.
         """
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
 
         def _progress(step: str, pct: float, msg: str):
             if progress_callback:
@@ -558,6 +573,18 @@ class GroupingService:
             _progress("compute_centroids", 0.4, f"ERROR: {str(e)}")
             raise
 
+        # Normalize centroids into a dict map for downstream assignment/merging
+        centroids_map: Dict[str, np.ndarray] = {}
+        raw_centroids = centroids_result.get("centroids", {})
+        if isinstance(raw_centroids, dict):
+            for cid, data in raw_centroids.items():
+                if isinstance(data, dict) and data.get("centroid"):
+                    centroids_map[str(cid)] = np.array(data["centroid"], dtype=np.float32)
+        elif isinstance(raw_centroids, list):
+            for entry in raw_centroids:
+                if isinstance(entry, dict) and entry.get("cluster_id") and entry.get("centroid"):
+                    centroids_map[str(entry["cluster_id"])] = np.array(entry["centroid"], dtype=np.float32)
+
         # Step 2: Within-episode grouping
         _progress("group_within_episode", 0.4, "Grouping similar clusters within episode...")
         try:
@@ -576,34 +603,115 @@ class GroupingService:
             _progress("group_within_episode", 0.7, f"WARNING: {str(e)}")
             # Continue even if within-episode grouping fails
 
-        # Step 3: Across-episode matching to people (compute suggestions only, don't auto-assign)
+        # Step 3: Across-episode matching to people (auto-assign + create)
         _progress(
             "group_across_episodes",
             0.7,
-            "Computing similarity suggestions to cast members...",
+            "Assigning clusters to show-level people...",
         )
+        assignments: List[Dict[str, Any]] = []
+        new_people_count = 0
         try:
-            across_result = self.group_across_episodes(ep_id, auto_assign=False)
-            suggestions_count = len(across_result.get("suggestions", []))
-            log["steps"].append(
-                {
-                    "step": "group_across_episodes",
-                    "status": "success",
-                    "suggestions_count": suggestions_count,
-                    "assigned_count": len(across_result.get("assigned", [])),
-                }
-            )
+            across_result = self.group_across_episodes(ep_id, auto_assign=True)
+            assignments = across_result.get("assigned", []) if isinstance(across_result, dict) else []
+            new_people_count = across_result.get("new_people_count", 0) if isinstance(across_result, dict) else 0
             _progress(
                 "group_across_episodes",
-                1.0,
-                f"Computed {suggestions_count} suggestion(s)",
+                0.9,
+                f"Assigned {len(assignments)} cluster(s); created {new_people_count} new people",
             )
         except Exception as e:
             log["steps"].append({"step": "group_across_episodes", "status": "error", "error": str(e)})
             log["finished_at"] = _now_iso()
             self._save_group_log(ep_id, log)
-            _progress("group_across_episodes", 1.0, f"ERROR: {str(e)}")
+            _progress("group_across_episodes", 0.9, f"ERROR: {str(e)}")
             raise
+
+        # Step 4: Apply within-episode merges to the assigned people
+        # Build groupings from within_result (if any)
+        groups: List[List[str]] = []
+        if isinstance(within_result, dict):
+            for group_entry in within_result.get("groups", []) or []:
+                if not isinstance(group_entry, dict):
+                    continue
+                cluster_ids = [str(cid) for cid in group_entry.get("cluster_ids", []) if cid]
+                if len(cluster_ids) > 1:
+                    groups.append(cluster_ids)
+
+        # Ensure singletons are tracked so all clusters get assignments
+        assigned_map: Dict[str, str] = {
+            str(entry.get("cluster_id")): str(entry.get("person_id"))
+            for entry in assignments
+            if entry.get("cluster_id") and entry.get("person_id")
+        }
+        all_clusters = set(centroids_map.keys())
+        grouped_clusters = set()
+        for group in groups:
+            grouped_clusters.update(group)
+        for cid in sorted(all_clusters - grouped_clusters):
+            groups.append([cid])
+
+        merged_clusters = 0
+        for group in groups:
+            if not group:
+                continue
+            base_cluster = group[0]
+            base_person = assigned_map.get(base_cluster)
+
+            if not base_person:
+                # No assignment for the lead cluster yet - create a new person for this group
+                vectors = [centroids_map.get(cid) for cid in group if centroids_map.get(cid) is not None]
+                proto = None
+                if vectors:
+                    proto = l2_normalize(np.mean(vectors, axis=0))
+                person = self.people_service.create_person(
+                    show_id,
+                    prototype=proto.tolist() if proto is not None else [],
+                    cluster_ids=[],
+                )
+                base_person = person["person_id"]
+                new_people_count += 1
+
+            for cid in group:
+                centroid_vec = centroids_map.get(cid)
+                if assigned_map.get(cid) != base_person:
+                    merged_clusters += 1
+                self.people_service.add_cluster_to_person(
+                    show_id,
+                    base_person,
+                    f"{ep_id}:{cid}",
+                    update_prototype=True,
+                    cluster_centroid=centroid_vec,
+                )
+                assigned_map[cid] = base_person
+
+        # Update identities.json with the final assignments and clean up empty people
+        final_assignments = [{"cluster_id": cid, "person_id": pid} for cid, pid in assigned_map.items()]
+        self._update_identities_with_people(ep_id, final_assignments)
+        pruned_people = self._prune_empty_people(show_id)
+
+        log["steps"].append(
+            {
+                "step": "group_across_episodes",
+                "status": "success",
+                "assigned_count": len(final_assignments),
+                "new_people_count": new_people_count,
+            }
+        )
+        log["steps"].append(
+            {
+                "step": "apply_within_groups",
+                "status": "success",
+                "groups": len(groups),
+                "merged_clusters": merged_clusters,
+                "pruned_people": pruned_people,
+            }
+        )
+        _progress(
+            "apply_within_groups",
+            1.0,
+            f"Applied {len(groups)} group(s); merged {merged_clusters} cluster(s)",
+        )
 
         log["finished_at"] = _now_iso()
         self._save_group_log(ep_id, log)
@@ -613,6 +721,7 @@ class GroupingService:
             "centroids": centroids_result,
             "within_episode": within_result,
             "across_episodes": across_result,
+            "assignments": final_assignments,
             "log": log,
         }
 

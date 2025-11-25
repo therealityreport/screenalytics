@@ -293,9 +293,9 @@ def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, 
         return None
 
 
-def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+def _api_post(path: str, payload: Dict[str, Any] | None = None, *, timeout: float = 60.0) -> Dict[str, Any] | None:
     try:
-        return helpers.api_post(path, payload or {})
+        return helpers.api_post(path, payload or {}, timeout=timeout)
     except requests.RequestException as exc:
         base = (cfg or {}).get("api_base") if isinstance(cfg, dict) else ""
         try:
@@ -2546,7 +2546,6 @@ def _delete_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool
         st.rerun()
 
 
-helpers.init_page("Faces & Tracks")
 ep_id = helpers.get_ep_id()
 if not ep_id:
     st.warning("Select an episode from the sidebar to continue.")
@@ -2610,8 +2609,11 @@ if st.button(
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         log_expander = st.expander("📋 Detailed Progress Log", expanded=False)
+        with log_expander:
+            log_placeholder = st.empty()
 
-        status_text.text("🚀 Starting auto-clustering...")
+        status_text.text("🚀 Starting auto-clustering…")
+        log_placeholder.text(f"Starting auto-cluster for {ep_id} (auto regroup + show match)…")
         result = None
         error = None
 
@@ -2619,13 +2621,28 @@ if st.button(
         log_messages = []
 
         try:
-            result = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+            # Grouping can take >60s; allow longer timeout
+            status_text.text("Contacting API…")
+            progress_bar.progress(0.05)
+            log_messages.append(f"[5%] request: POST /episodes/{ep_id}/clusters/group (auto)")
+            with st.spinner("Running auto-cluster…"):
+                result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=300)
         except Exception as exc:
             error = exc
 
         if error:
             progress_bar.empty()
-            status_text.error(f"❌ Clustering failed: {error}")
+            err_msg = f"❌ Auto-cluster failed: {error}"
+            status_text.error(err_msg)
+            with log_expander:
+                log_placeholder.text(err_msg)
+        elif result is None:
+            progress_bar.empty()
+            err_msg = "❌ Auto-cluster failed: API returned no response. Check backend logs."
+            status_text.error(err_msg)
+            log_messages.append(err_msg)
+            with log_expander:
+                log_placeholder.text("\n".join(log_messages))
         elif result:
             # Show progress log if available
             progress_log = result.get("progress_log", [])
@@ -2635,8 +2652,10 @@ if st.button(
                     message = entry.get("message", "")
                     step = entry.get("step", "")
                     progress_bar.progress(progress)
-                    status_text.text(message)
+                    status_text.text(f"{step or 'working'} – {message}")
                     log_messages.append(f"[{int(progress*100)}%] {step}: {message}")
+            else:
+                log_messages.append("No progress log returned from API; auto-cluster may have completed without streaming.")
 
             progress_bar.progress(1.0)
 
@@ -2677,8 +2696,10 @@ if st.button(
 
             # Show log in expander
             with log_expander:
-                for msg in log_messages:
-                    st.text(msg)
+                if log_messages:
+                    log_placeholder.text("\n".join(log_messages))
+                else:
+                    log_placeholder.text("No progress log returned from the API.")
 
             status_text.success(
                 f"✅ Clustering complete!\n"
@@ -2693,7 +2714,7 @@ if st.button(
     else:
         # Original simple spinner for facebank
         with st.spinner("Running cluster grouping..."):
-            result = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+            result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=300)
             if result:
                 matched = result.get("result", {}).get("matched_clusters", 0)
                 st.success(f"Facebank regroup complete! {matched} clusters matched to seeds.")

@@ -297,14 +297,20 @@ def default_profile_for_device(device_value: str | None) -> str:
 
 def known_shows(include_session: bool = True) -> List[str]:
     """Return a sorted list of known show identifiers from episodes + S3 (plus session state)."""
-    shows: set[str] = set()
+    # Use case-insensitive dedupe so RHOSLC == rhoslc in dropdowns
+    shows: dict[str, str] = {}
 
     def _remember(show_value: Any) -> None:
         if not show_value or not isinstance(show_value, str):
             return
         cleaned = show_value.strip()
-        if cleaned:
-            shows.add(cleaned)
+        if not cleaned:
+            return
+        lowered = cleaned.lower()
+        existing = shows.get(lowered)
+        # Prefer the first seen value; if we later see a lowercase variant, adopt it
+        if existing is None or existing != existing.lower():
+            shows[lowered] = cleaned
 
     try:
         episodes_payload = api_get("/episodes")
@@ -335,7 +341,8 @@ def known_shows(include_session: bool = True) -> List[str]:
         for entry in st.session_state.get(_CUSTOM_SHOWS_SESSION_KEY, []):
             _remember(entry)
 
-    return sorted(shows, key=lambda value: value.lower())
+    # Return values sorted case-insensitively but without duplicates by case
+    return sorted(shows.values(), key=lambda value: value.lower())
 
 
 def remember_custom_show(show_id: str) -> None:

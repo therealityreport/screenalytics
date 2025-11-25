@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -25,6 +27,7 @@ CROP_JPEG_SIZE_EST_BYTES = 40_000
 AVG_FACES_PER_FRAME = 1.5
 JPEG_DEFAULT = int(os.environ.get("SCREENALYTICS_JPEG_QUALITY", "72"))
 MIN_FRAMES_BETWEEN_CROPS_DEFAULT = int(os.environ.get("SCREENALYTICS_MIN_FRAMES_BETWEEN_CROPS", "32"))
+EST_TZ = ZoneInfo("America/New_York")
 
 
 def _load_job_defaults(ep_id: str, job_type: str) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
@@ -50,7 +53,11 @@ def _format_timestamp(value: str | None) -> str | None:
         dt = datetime.fromisoformat(cleaned)
     except ValueError:
         return value
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    try:
+        est = dt.astimezone(EST_TZ)
+    except Exception:
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return est.strftime("%Y-%m-%d %H:%M:%S ET")
 
 
 def _format_runtime(runtime_sec: Any) -> str | None:
@@ -613,6 +620,7 @@ fetch_token = st.session_state.get(fetch_token_key, 0)
 status_payload = st.session_state.get(status_cache_key)
 _manifests_dir = get_path(ep_id, "detections").parent
 _runs_dir = _manifests_dir / "runs"
+_track_metrics_path = _manifests_dir / "track_metrics.json"
 current_mtimes = (
     (_runs_dir / "detect_track.json").stat().st_mtime if (_runs_dir / "detect_track.json").exists() else 0,
     (_runs_dir / "faces_embed.json").stat().st_mtime if (_runs_dir / "faces_embed.json").exists() else 0,
@@ -620,6 +628,8 @@ current_mtimes = (
     (_manifests_dir / "detections.jsonl").stat().st_mtime if (_manifests_dir / "detections.jsonl").exists() else 0,
     (_manifests_dir / "tracks.jsonl").stat().st_mtime if (_manifests_dir / "tracks.jsonl").exists() else 0,
     (_manifests_dir / "faces.jsonl").stat().st_mtime if (_manifests_dir / "faces.jsonl").exists() else 0,
+    # Track cluster metrics so status cache updates when clustering writes only metrics.
+    _track_metrics_path.stat().st_mtime if _track_metrics_path.exists() else 0,
     (_manifests_dir / "identities.json").stat().st_mtime if (_manifests_dir / "identities.json").exists() else 0,
 )
 cached_mtimes = st.session_state.get(mtimes_key)
@@ -702,6 +712,55 @@ detect_status_value, tracks_ready, using_manifest_fallback, tracks_only_fallback
     tracks_ready_flag=tracks_ready_flag,
     job_state=detect_job_state,
 )
+if cluster_status_value in {"missing", "unknown"}:
+    identities_count_manifest = None
+    cluster_metrics_block: dict[str, Any] | None = None
+    artifact_mtime = 0.0
+    if identities_path.exists():
+        try:
+            payload = json.loads(identities_path.read_text(encoding="utf-8"))
+            identities_list = payload.get("identities") if isinstance(payload, dict) else None
+            if isinstance(identities_list, list):
+                identities_count_manifest = len(identities_list)
+        except Exception:
+            pass
+        try:
+            artifact_mtime = identities_path.stat().st_mtime
+        except OSError:
+            artifact_mtime = 0.0
+    if _track_metrics_path.exists():
+        try:
+            metrics_data = json.loads(_track_metrics_path.read_text(encoding="utf-8"))
+            if isinstance(metrics_data, dict):
+                block = metrics_data.get("cluster_metrics")
+                cluster_metrics_block = block if isinstance(block, dict) else None
+        except Exception:
+            cluster_metrics_block = None
+        try:
+            artifact_mtime = max(artifact_mtime, _track_metrics_path.stat().st_mtime)
+        except OSError:
+            pass
+    if identities_count_manifest is None and isinstance(cluster_metrics_block, dict):
+        identities_count_manifest = helpers.coerce_int(
+            cluster_metrics_block.get("total_clusters_after") or cluster_metrics_block.get("total_clusters")
+        )
+    if identities_count_manifest is not None or cluster_metrics_block:
+        cluster_phase_status = dict(cluster_phase_status)
+        if isinstance(cluster_metrics_block, dict):
+            cluster_phase_status.setdefault("singleton_stats", cluster_metrics_block.get("singleton_stats"))
+            cluster_phase_status.setdefault("singleton_merge", cluster_metrics_block.get("singleton_merge"))
+            cluster_phase_status.setdefault("singleton_fraction_before", cluster_metrics_block.get("singleton_fraction_before"))
+            cluster_phase_status.setdefault("singleton_fraction_after", cluster_metrics_block.get("singleton_fraction_after"))
+            cluster_phase_status.setdefault("total_clusters_before", cluster_metrics_block.get("total_clusters_before"))
+            cluster_phase_status.setdefault("total_clusters_after", cluster_metrics_block.get("total_clusters_after"))
+        cluster_phase_status["status"] = "success"
+        cluster_phase_status["identities"] = identities_count_manifest
+        cluster_phase_status["source"] = cluster_phase_status.get("source") or "manifest_fallback"
+        if not cluster_phase_status.get("finished_at") and artifact_mtime:
+            cluster_phase_status["finished_at"] = (
+                datetime.utcfromtimestamp(artifact_mtime).replace(microsecond=0).isoformat() + "Z"
+            )
+        cluster_status_value = "success"
 jpeg_state = helpers.coerce_int(detect_phase_status.get("jpeg_quality"))
 device_state = detect_phase_status.get("device")
 requested_device_state = detect_phase_status.get("requested_device")
@@ -781,7 +840,8 @@ with header_cols[1]:
             st.session_state[_status_force_refresh_key(ep_id)] = True
             st.rerun()
 if status_refreshed_at:
-    refreshed_label = datetime.utcfromtimestamp(status_refreshed_at).strftime("%Y-%m-%d %H:%M:%S UTC")
+    refreshed_dt = datetime.fromtimestamp(status_refreshed_at, tz=timezone.utc).astimezone(EST_TZ)
+    refreshed_label = refreshed_dt.strftime("%Y-%m-%d %H:%M:%S ET")
     st.caption(f"Status refreshed at {refreshed_label}")
 else:
     st.caption("Status will refresh when a job starts or you press refresh.")
