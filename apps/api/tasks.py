@@ -11,7 +11,10 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import redis
@@ -22,6 +25,28 @@ from apps.api.celery_app import celery_app
 from apps.api.config import REDIS_URL
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _find_project_root() -> Path:
+    """Find the SCREENALYTICS project root directory.
+
+    Uses marker files (pyproject.toml, .git) to reliably locate the root,
+    regardless of how the module was imported or from what working directory.
+    """
+    # Start from this file's location
+    current = Path(__file__).resolve().parent
+
+    # Walk up looking for project markers
+    for parent in [current] + list(current.parents):
+        if (parent / "pyproject.toml").exists() or (parent / ".git").exists():
+            return parent
+
+    # Fallback to parent count (should match: apps/api/tasks.py -> SCREENALYTICS)
+    return Path(__file__).resolve().parents[2]
+
+
+# Compute once at module load time for reliability
+PROJECT_ROOT = _find_project_root()
 
 # Redis client for job locking
 _redis_client: Optional[redis.Redis] = None
@@ -386,6 +411,322 @@ def run_split_tracks_task(
         _release_lock(episode_id, "split_tracks", job_id)
 
 
+@celery_app.task(bind=True, base=GroupingTask, name="tasks.run_refresh_similarity")
+def run_refresh_similarity_task(
+    self,
+    episode_id: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Background task to refresh similarity values for an episode.
+
+    This regenerates track representatives, cluster centroids, updates
+    people prototypes, and refreshes suggestions for unassigned clusters.
+
+    Args:
+        episode_id: Episode ID
+        options: Optional dict with configuration options
+
+    Returns:
+        Result dict with detailed step-by-step progress log
+    """
+    import time as time_module
+
+    job_id = self.request.id
+    LOGGER.info(f"[{job_id}] Starting refresh_similarity for {episode_id}")
+
+    if not _acquire_lock(episode_id, "refresh_similarity", job_id):
+        return {
+            "status": "error",
+            "error": "Another refresh_similarity job is already running for this episode",
+            "episode_id": episode_id,
+        }
+
+    log_steps = []
+    start_time = time_module.time()
+
+    try:
+        # Step 1: Load identities (0-10%)
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "load_identities",
+                "progress": 0.05,
+                "message": "Loading identities...",
+                "episode_id": episode_id,
+            },
+        )
+
+        step_start = time_module.time()
+        from apps.api.routers.episodes import _load_identities
+
+        identities_payload = _load_identities(episode_id)
+        identities = identities_payload.get("identities", [])
+        track_count = sum(len(i.get("track_ids", [])) for i in identities)
+        cluster_count = len(identities)
+        assigned_count = sum(1 for i in identities if i.get("person_id"))
+        unassigned_count = cluster_count - assigned_count
+
+        log_steps.append({
+            "step": "load_identities",
+            "status": "success",
+            "progress_pct": 10,
+            "duration_ms": int((time_module.time() - step_start) * 1000),
+            "cluster_count": cluster_count,
+            "track_count": track_count,
+            "assigned_count": assigned_count,
+            "unassigned_count": unassigned_count,
+            "details": [
+                f"Loaded {cluster_count} clusters ({track_count} tracks)",
+                f"Assigned: {assigned_count}, Unassigned: {unassigned_count}",
+            ],
+        })
+
+        # Step 2: Generate track reps and centroids (10-50%)
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "generate_track_reps",
+                "progress": 0.15,
+                "message": "Generating track representatives and centroids...",
+                "episode_id": episode_id,
+            },
+        )
+
+        step_start = time_module.time()
+        track_reps_count = 0
+        centroids_count = 0
+        try:
+            from apps.api.services.track_reps import generate_track_reps_and_centroids
+
+            result = generate_track_reps_and_centroids(episode_id)
+            track_reps_count = result.get("tracks_processed", 0)
+            centroids_count = result.get("centroids_computed", 0)
+            tracks_with_reps = result.get("tracks_with_reps", 0)
+            tracks_skipped = result.get("tracks_skipped", 0)
+
+            details = [
+                f"Processed {track_reps_count} tracks",
+                f"Computed {centroids_count} cluster centroids",
+            ]
+            if tracks_with_reps:
+                details.append(f"Tracks with valid reps: {tracks_with_reps}")
+            if tracks_skipped:
+                details.append(f"Tracks skipped (no embeddings): {tracks_skipped}")
+
+            log_steps.append({
+                "step": "generate_track_reps",
+                "status": "success",
+                "progress_pct": 50,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "track_reps_count": track_reps_count,
+                "centroids_count": centroids_count,
+                "details": details,
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "generate_track_reps",
+                "status": "error",
+                "progress_pct": 50,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.error(f"[{job_id}] Track rep regeneration failed for {episode_id}: {exc}")
+
+        # Step 3: Update people prototypes (50-80%)
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "update_prototypes",
+                "progress": 0.55,
+                "message": "Updating people prototypes...",
+                "episode_id": episode_id,
+            },
+        )
+
+        step_start = time_module.time()
+        people_updated = 0
+        people_details = []
+        people = []
+        try:
+            from apps.api.services.people import PeopleService, l2_normalize
+            import numpy as np
+            from apps.api.services.track_reps import load_cluster_centroids
+            from apps.api.routers.episodes import episode_context_from_id
+
+            ep_ctx = episode_context_from_id(episode_id)
+            show_id = ep_ctx.show_slug.upper()
+            people_service = PeopleService()
+            people = people_service.list_people(show_id)
+
+            if people:
+                touched_person_ids = set()
+                for identity in identities:
+                    if identity.get("person_id"):
+                        touched_person_ids.add(identity["person_id"])
+
+                people_by_id = {p.get("person_id"): p for p in people if p.get("person_id")}
+                try:
+                    centroids_data = load_cluster_centroids(episode_id)
+                except Exception:
+                    centroids_data = {}
+
+                for person_id in touched_person_ids:
+                    person = people_by_id.get(person_id)
+                    if not person:
+                        continue
+                    person_name = person.get("name") or person.get("display_name") or person_id
+                    cluster_refs = person.get("cluster_ids") or []
+                    vectors = []
+                    for cluster_ref in cluster_refs:
+                        if not isinstance(cluster_ref, str) or ":" not in cluster_ref:
+                            continue
+                        ep_slug, cluster_id = cluster_ref.split(":", 1)
+                        if ep_slug == episode_id:
+                            centroid_data = centroids_data.get(cluster_id, {})
+                            if centroid_data and centroid_data.get("centroid"):
+                                vectors.append(np.array(centroid_data["centroid"], dtype=np.float32))
+                    if vectors:
+                        stacked = np.stack(vectors, axis=0)
+                        proto = l2_normalize(np.mean(stacked, axis=0)).tolist()
+                        people_service.update_person(show_id, person_id, prototype=proto)
+                        people_updated += 1
+                        people_details.append(f"  • {person_name}: updated from {len(vectors)} centroid(s)")
+
+            details = [f"Updated {people_updated} people prototypes"]
+            if people_details:
+                details.extend(people_details[:10])
+                if len(people_details) > 10:
+                    details.append(f"  ... and {len(people_details) - 10} more")
+
+            log_steps.append({
+                "step": "update_prototypes",
+                "status": "success",
+                "progress_pct": 80,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "people_updated": people_updated,
+                "people_total": len(touched_person_ids) if people else 0,
+                "details": details,
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "update_prototypes",
+                "status": "error",
+                "progress_pct": 80,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.warning(f"[{job_id}] People prototype update failed for {episode_id}: {exc}")
+
+        # Step 4: Refresh suggestions (80-100%)
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "refresh_suggestions",
+                "progress": 0.85,
+                "message": "Refreshing suggestions for unassigned clusters...",
+                "episode_id": episode_id,
+            },
+        )
+
+        step_start = time_module.time()
+        suggestions_count = 0
+        suggestions_details = []
+        try:
+            suggestions_result = self.grouping_service.suggest_from_assigned_clusters(episode_id)
+            suggestions_list = suggestions_result.get("suggestions", [])
+            suggestions_count = len(suggestions_list)
+
+            # Build person name lookup
+            person_names = {}
+            if people:
+                for p in people:
+                    pid = p.get("person_id")
+                    if pid:
+                        person_names[pid] = p.get("name") or p.get("display_name") or pid
+
+            details = [f"Generated {suggestions_count} suggestions for unassigned clusters"]
+            for suggestion in suggestions_list[:10]:
+                cluster_id = suggestion.get("cluster_id", "?")
+                suggested_person = suggestion.get("suggested_person_id", "?")
+                distance = suggestion.get("distance", 0)
+                person_name = person_names.get(suggested_person, suggested_person)
+                confidence = max(0, min(100, int((1 - distance) * 100)))
+                details.append(f"  • Cluster {cluster_id} → {person_name} ({confidence}% confidence)")
+                suggestions_details.append({
+                    "cluster_id": cluster_id,
+                    "suggested_person_id": suggested_person,
+                    "suggested_person_name": person_name,
+                    "distance": round(distance, 4),
+                    "confidence_pct": confidence,
+                })
+
+            if len(suggestions_list) > 10:
+                details.append(f"  ... and {len(suggestions_list) - 10} more suggestions")
+
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "success",
+                "progress_pct": 100,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "suggestions_count": suggestions_count,
+                "unassigned_clusters": unassigned_count,
+                "details": details,
+                "suggestions": suggestions_details[:20],
+            })
+        except FileNotFoundError:
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "skipped",
+                "progress_pct": 100,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "message": "No identities file found",
+                "details": ["Skipped: No identities file found"],
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "error",
+                "progress_pct": 100,
+                "duration_ms": int((time_module.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.warning(f"[{job_id}] Suggestions refresh failed for {episode_id}: {exc}")
+
+        total_duration = int((time_module.time() - start_time) * 1000)
+
+        return {
+            "status": "success",
+            "episode_id": episode_id,
+            "operation": "refresh_similarity",
+            "log": {
+                "steps": log_steps,
+                "total_duration_ms": total_duration,
+            },
+            "summary": {
+                "clusters": cluster_count,
+                "tracks": track_count,
+                "assigned_clusters": assigned_count,
+                "unassigned_clusters": unassigned_count,
+                "centroids_computed": centroids_count,
+                "people_updated": people_updated,
+                "suggestions_generated": suggestions_count,
+            },
+        }
+    except Exception as e:
+        LOGGER.exception(f"[{job_id}] refresh_similarity failed: {e}")
+        return {
+            "status": "error",
+            "episode_id": episode_id,
+            "operation": "refresh_similarity",
+            "error": str(e),
+        }
+    finally:
+        _release_lock(episode_id, "refresh_similarity", job_id)
+
+
 def get_job_status(job_id: str) -> Dict[str, Any]:
     """Get status of a Celery job.
 
@@ -449,12 +790,406 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
     }
 
 
+# =============================================================================
+# Pipeline Tasks (detect_track, faces_embed, cluster)
+# =============================================================================
+
+
+class PipelineTask(Task):
+    """Base class for ML pipeline tasks that run subprocesses."""
+
+    abstract = True
+
+    def _run_subprocess(
+        self,
+        command: list[str],
+        episode_id: str,
+        operation: str,
+        progress_file: str | None = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Run a subprocess command and track progress.
+
+        Args:
+            command: Command list to execute
+            episode_id: Episode ID for logging
+            operation: Operation name for lock management
+            progress_file: Optional path to progress JSON file
+            env: Optional environment overrides (e.g., CPU thread caps)
+
+        Returns:
+            Result dict with status, output, and any progress data
+        """
+        import subprocess
+
+        job_id = self.request.id
+
+        LOGGER.info(f"[{job_id}] Starting {operation} for {episode_id}")
+        LOGGER.info(f"[{job_id}] Command: {' '.join(command)}")
+
+        try:
+            # Run the subprocess
+            result = subprocess.run(
+                command,
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+
+            # Read progress file if available
+            progress_data = None
+            if progress_file:
+                progress_path = Path(progress_file)
+                if progress_path.exists():
+                    try:
+                        import json
+                        progress_data = json.loads(progress_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
+                LOGGER.error(f"[{job_id}] {operation} failed: {error_msg}")
+                return {
+                    "status": "error",
+                    "episode_id": episode_id,
+                    "operation": operation,
+                    "error": error_msg,
+                    "return_code": result.returncode,
+                    "progress": progress_data,
+                }
+
+            LOGGER.info(f"[{job_id}] {operation} completed successfully")
+            return {
+                "status": "success",
+                "episode_id": episode_id,
+                "operation": operation,
+                "return_code": 0,
+                "progress": progress_data,
+                "stdout": result.stdout[:2000] if result.stdout else None,
+            }
+
+        except Exception as e:
+            LOGGER.exception(f"[{job_id}] {operation} raised exception: {e}")
+            return {
+                "status": "error",
+                "episode_id": episode_id,
+                "operation": operation,
+                "error": str(e),
+            }
+
+
+@celery_app.task(bind=True, base=PipelineTask, name="tasks.run_detect_track")
+def run_detect_track_task(
+    self,
+    episode_id: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Background task to run detect/track pipeline.
+
+    Args:
+        episode_id: Episode ID
+        options: Dict with pipeline options:
+            - stride: int (default 6)
+            - device: str (default "auto")
+            - detector: str (default "retinaface")
+            - tracker: str (default "bytetrack")
+            - save_frames: bool
+            - save_crops: bool
+            - jpeg_quality: int
+            - det_thresh: float
+            - max_gap: int
+            - scene_detector: str
+            - scene_threshold: float
+            etc.
+
+    Returns:
+        Result dict with status and pipeline output
+    """
+    job_id = self.request.id
+    options = options or {}
+
+    if not _acquire_lock(episode_id, "detect_track", job_id):
+        return {
+            "status": "error",
+            "error": "Another detect_track job is already running for this episode",
+            "episode_id": episode_id,
+        }
+
+    try:
+        from py_screenalytics.artifacts import get_path
+
+        # Get video path
+        video_path = get_path(episode_id, "video")
+        if not video_path.exists():
+            return {
+                "status": "error",
+                "episode_id": episode_id,
+                "operation": "detect_track",
+                "error": f"Video not found at {video_path}",
+            }
+
+        # Progress file
+        manifests_dir = get_path(episode_id, "detections").parent
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        progress_file = manifests_dir / "progress.json"
+
+        # Build command
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "episode_run.py"),
+            "--ep-id", episode_id,
+            "--video", str(video_path),
+            "--stride", str(options.get("stride", 6)),
+            "--device", options.get("device", "auto"),
+            "--progress-file", str(progress_file),
+        ]
+
+        fps_value = options.get("fps")
+        if fps_value is not None and fps_value > 0:
+            command += ["--fps", str(fps_value)]
+        if options.get("detector"):
+            command += ["--detector", options["detector"]]
+        if options.get("tracker"):
+            command += ["--tracker", options["tracker"]]
+        if options.get("save_frames"):
+            command.append("--save-frames")
+        if options.get("save_crops"):
+            command.append("--save-crops")
+        if options.get("jpeg_quality"):
+            command += ["--jpeg-quality", str(options["jpeg_quality"])]
+        if options.get("det_thresh") is not None:
+            command += ["--det-thresh", str(options["det_thresh"])]
+        if options.get("max_gap"):
+            command += ["--max-gap", str(options["max_gap"])]
+        if options.get("scene_detector"):
+            command += ["--scene-detector", options["scene_detector"]]
+        if options.get("scene_threshold") is not None:
+            command += ["--scene-threshold", str(options["scene_threshold"])]
+        if options.get("scene_min_len") is not None:
+            command += ["--scene-min-len", str(options["scene_min_len"])]
+        if options.get("scene_warmup_dets") is not None:
+            command += ["--scene-warmup-dets", str(options["scene_warmup_dets"])]
+        if options.get("track_high_thresh") is not None:
+            command += ["--track-high-thresh", str(options["track_high_thresh"])]
+        if options.get("new_track_thresh") is not None:
+            command += ["--new-track-thresh", str(options["new_track_thresh"])]
+        if options.get("track_buffer") is not None:
+            command += ["--track-buffer", str(options["track_buffer"])]
+        if options.get("min_box_area") is not None:
+            command += ["--min-box-area", str(options["min_box_area"])]
+        # Note: --profile is not a valid argument for episode_run.py
+
+        env = os.environ.copy()
+        cpu_threads = options.get("cpu_threads")
+        if cpu_threads:
+            threads = max(int(cpu_threads), 1)
+            # Apply CPU thread caps to downstream ML libraries for laptop-friendly runs
+            env.update(
+                {
+                    "SCREANALYTICS_MAX_CPU_THREADS": str(threads),
+                    "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+                    "OMP_NUM_THREADS": str(threads),
+                    "MKL_NUM_THREADS": str(threads),
+                    "OPENBLAS_NUM_THREADS": str(threads),
+                    "VECLIB_MAXIMUM_THREADS": str(threads),
+                    "NUMEXPR_NUM_THREADS": str(threads),
+                    "ORT_INTRA_OP_NUM_THREADS": str(threads),
+                    "ORT_INTER_OP_NUM_THREADS": "1",
+                }
+            )
+
+        # Update progress
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "detect_track",
+                "progress": 0.0,
+                "message": "Starting detect/track pipeline...",
+                "episode_id": episode_id,
+            },
+        )
+
+        result = self._run_subprocess(
+            command, episode_id, "detect_track", str(progress_file), env
+        )
+
+        return result
+
+    finally:
+        _release_lock(episode_id, "detect_track", job_id)
+
+
+@celery_app.task(bind=True, base=PipelineTask, name="tasks.run_faces_embed")
+def run_faces_embed_task(
+    self,
+    episode_id: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Background task to run faces embed (harvest) pipeline.
+
+    Args:
+        episode_id: Episode ID
+        options: Dict with pipeline options:
+            - device: str (default "auto")
+            - save_frames: bool
+            - save_crops: bool
+            - jpeg_quality: int
+            - min_frames_between_crops: int
+            - thumb_size: int
+
+    Returns:
+        Result dict with status and pipeline output
+    """
+    job_id = self.request.id
+    options = options or {}
+
+    if not _acquire_lock(episode_id, "faces_embed", job_id):
+        return {
+            "status": "error",
+            "error": "Another faces_embed job is already running for this episode",
+            "episode_id": episode_id,
+        }
+
+    try:
+        from py_screenalytics.artifacts import get_path
+
+        # Progress file
+        manifests_dir = get_path(episode_id, "detections").parent
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        progress_file = manifests_dir / "progress.json"
+
+        # Build command
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "episode_run.py"),
+            "--ep-id", episode_id,
+            "--faces-embed",
+            "--device", options.get("device", "auto"),
+            "--progress-file", str(progress_file),
+        ]
+
+        if options.get("save_frames"):
+            command.append("--save-frames")
+        if options.get("save_crops"):
+            command.append("--save-crops")
+        if options.get("jpeg_quality"):
+            command += ["--jpeg-quality", str(options["jpeg_quality"])]
+        if options.get("min_frames_between_crops"):
+            command += ["--min-frames-between-crops", str(options["min_frames_between_crops"])]
+        if options.get("thumb_size"):
+            command += ["--thumb-size", str(options["thumb_size"])]
+        # Note: --profile is not a valid argument for episode_run.py
+
+        # Update progress
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "faces_embed",
+                "progress": 0.0,
+                "message": "Starting faces harvest pipeline...",
+                "episode_id": episode_id,
+            },
+        )
+
+        result = self._run_subprocess(
+            command, episode_id, "faces_embed", str(progress_file)
+        )
+
+        return result
+
+    finally:
+        _release_lock(episode_id, "faces_embed", job_id)
+
+
+@celery_app.task(bind=True, base=PipelineTask, name="tasks.run_cluster")
+def run_cluster_task(
+    self,
+    episode_id: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Background task to run clustering pipeline.
+
+    Args:
+        episode_id: Episode ID
+        options: Dict with pipeline options:
+            - device: str (default "auto")
+            - cluster_thresh: float (default 0.7)
+            - min_cluster_size: int (default 2)
+            - min_identity_sim: float
+
+    Returns:
+        Result dict with status and pipeline output
+    """
+    job_id = self.request.id
+    options = options or {}
+
+    if not _acquire_lock(episode_id, "cluster", job_id):
+        return {
+            "status": "error",
+            "error": "Another cluster job is already running for this episode",
+            "episode_id": episode_id,
+        }
+
+    try:
+        from py_screenalytics.artifacts import get_path
+
+        # Progress file
+        manifests_dir = get_path(episode_id, "detections").parent
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        progress_file = manifests_dir / "progress.json"
+
+        # Build command
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "episode_run.py"),
+            "--ep-id", episode_id,
+            "--cluster",
+            "--device", options.get("device", "auto"),
+            "--progress-file", str(progress_file),
+        ]
+
+        if options.get("cluster_thresh") is not None:
+            command += ["--cluster-thresh", str(options["cluster_thresh"])]
+        if options.get("min_cluster_size"):
+            command += ["--min-cluster-size", str(options["min_cluster_size"])]
+        if options.get("min_identity_sim") is not None:
+            command += ["--min-identity-sim", str(options["min_identity_sim"])]
+        # Note: --profile is not a valid argument for episode_run.py
+
+        # Update progress
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "step": "cluster",
+                "progress": 0.0,
+                "message": "Starting clustering pipeline...",
+                "episode_id": episode_id,
+            },
+        )
+
+        result = self._run_subprocess(
+            command, episode_id, "cluster", str(progress_file)
+        )
+
+        return result
+
+    finally:
+        _release_lock(episode_id, "cluster", job_id)
+
+
 __all__ = [
     "run_manual_assign_task",
     "run_auto_group_task",
     "run_reembed_task",
     "run_recluster_task",
     "run_split_tracks_task",
+    "run_refresh_similarity_task",
+    "run_detect_track_task",
+    "run_faces_embed_task",
+    "run_cluster_task",
     "check_active_job",
     "get_job_status",
     "cancel_job",

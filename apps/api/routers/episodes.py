@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
@@ -41,6 +41,15 @@ LOGGER = logging.getLogger(__name__)
 DIAG = os.getenv("DIAG_LOG", "0") == "1"
 
 
+def normalize_ep_id(ep_id: str) -> str:
+    """Normalize ep_id to lowercase for case-insensitive handling.
+
+    This ensures that 'RHOSLC-s06e02' and 'rhoslc-s06e02' are treated as the same episode
+    throughout the API and file system operations.
+    """
+    return ep_id.strip().lower()
+
+
 def _diag(tag: str, **kw) -> None:
     """Diagnostic logger enabled via DIAG_LOG=1."""
     if DIAG:
@@ -65,7 +74,7 @@ def _append_face_ops(ep_id: str, entries: Iterable[Dict[str, Any]]) -> None:
         return
     path = _faces_ops_path(ep_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     with path.open("a", encoding="utf-8") as handle:
         for entry in entries:
             payload = dict(entry)
@@ -425,6 +434,8 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
 
 
 def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
+    # Normalize ep_id to lowercase for case-insensitive handling
+    ep_id = normalize_ep_id(ep_id)
     record = EPISODE_STORE.get(ep_id)
     if not record:
         raise HTTPException(status_code=404, detail="Episode not found")
@@ -1605,9 +1616,11 @@ def episode_details(ep_id: str) -> EpisodeDetailResponse:
         raise HTTPException(status_code=404, detail="Episode not found")
 
     local_path = get_path(ep_id, "video")
-    v2_key = STORAGE.video_object_key_v2(record.show_ref, record.season_number, record.episode_number)
+    # Check both lowercase and uppercase show slugs for S3 v2 path (case-insensitive)
+    v2_key = STORAGE.video_object_key_v2(record.show_ref.lower(), record.season_number, record.episode_number)
+    v2_key_upper = STORAGE.video_object_key_v2(record.show_ref.upper(), record.season_number, record.episode_number)
     v1_key = STORAGE.video_object_key_v1(ep_id)
-    v2_exists = STORAGE.object_exists(v2_key)
+    v2_exists = STORAGE.object_exists(v2_key) or STORAGE.object_exists(v2_key_upper)
     v1_exists = STORAGE.object_exists(v1_key)
 
     return EpisodeDetailResponse(
@@ -1642,12 +1655,14 @@ def episode_progress(ep_id: str) -> dict:
 
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
-    detect_track_payload = _detect_track_phase_status(ep_id)
-
     tracks_path = get_path(ep_id, "tracks")
     detections_path = get_path(ep_id, "detections")
+    detect_track_payload = _detect_track_phase_status(ep_id)
+
+    detections_manifest_ready = _manifest_has_rows(detections_path)
     tracks_manifest_ready = _manifest_has_rows(tracks_path)
-    if detect_track_payload.get("status") == "success" and not tracks_manifest_ready:
+    manifest_ready = detections_manifest_ready and tracks_manifest_ready
+    if detect_track_payload.get("status") == "success" and not manifest_ready:
         detect_track_payload["status"] = "stale"
         detect_track_payload["source"] = "missing_artifact"
     detect_track_status = PhaseStatus(**detect_track_payload)
@@ -1656,12 +1671,10 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
 
     # Compute pipeline state indicators
     # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
-    scenes_ready = tracks_manifest_ready or (
-        detect_track_status.detections is not None and detect_track_status.detections > 0
-    )
+    scenes_ready = tracks_manifest_ready or detections_manifest_ready
 
-    # tracks_ready: True only when tracks manifest exists and API reports success
-    tracks_ready = tracks_manifest_ready and detect_track_status.status == "success"
+    # tracks_ready: True only when both detections+tracks exist and API reports success
+    tracks_ready = manifest_ready and detect_track_status.status == "success"
 
     # faces_harvested: True if faces.jsonl exists and has content
     faces_harvested = faces_status.faces is not None and faces_status.faces > 0
@@ -2034,6 +2047,78 @@ def refresh_similarity_values(ep_id: str) -> dict:
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to refresh similarity values: {str(e)}")
+
+
+# Lazy Celery availability check
+_celery_available_cache = None
+
+
+def _check_celery_available() -> bool:
+    """Check if Celery/Redis are available for async jobs."""
+    global _celery_available_cache
+    if _celery_available_cache is None:
+        try:
+            import redis
+            from apps.api.config import REDIS_URL
+            r = redis.from_url(REDIS_URL, socket_timeout=1)
+            r.ping()
+            _celery_available_cache = True
+        except Exception as e:
+            LOGGER.warning(f"Celery/Redis not available: {e}")
+            _celery_available_cache = False
+    return _celery_available_cache
+
+
+@router.post("/episodes/{ep_id}/refresh_similarity_async", status_code=202, tags=["episodes"])
+def refresh_similarity_async(ep_id: str) -> dict:
+    """Enqueue similarity refresh as background job (non-blocking).
+
+    Returns immediately with HTTP 202 Accepted and a job_id.
+    Poll /celery_jobs/{job_id} to check status.
+
+    If Celery/Redis are unavailable, falls back to synchronous execution.
+    """
+    # Check if Celery is available
+    if not _check_celery_available():
+        LOGGER.info(f"[{ep_id}] Celery unavailable, falling back to sync refresh_similarity")
+        # Fall back to synchronous execution (with reduced timeout risk by returning early)
+        try:
+            # Just return a message that async is not available
+            return {
+                "status": "error",
+                "ep_id": ep_id,
+                "async": False,
+                "message": "Background jobs unavailable (Celery/Redis not running). Please start background services.",
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        from apps.api.tasks import run_refresh_similarity_task, check_active_job
+
+        # Check for active job
+        active = check_active_job(ep_id, "refresh_similarity")
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Refresh job already in progress: {active}",
+            )
+
+        # Enqueue the task
+        task = run_refresh_similarity_task.delay(episode_id=ep_id)
+
+        return {
+            "job_id": task.id,
+            "status": "queued",
+            "ep_id": ep_id,
+            "async": True,
+            "message": "Refresh similarity job queued. Poll /celery_jobs/{job_id} for status.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to enqueue refresh_similarity: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
 
 
 @router.get(
