@@ -8,12 +8,16 @@ PYTHON="$ROOT/.venv/bin/python"
 API_LOG="$ROOT/api_server.log"
 CELERY_LOG="$ROOT/celery_worker.log"
 
+# Initialize PIDs to empty (prevents unbound variable errors on early exit)
+API_PID=""
+CELERY_PID=""
+
 # Cleanup function to kill all background processes on exit
 cleanup() {
     echo ""
     echo "[dev_auto] Shutting down services..."
-    kill "$API_PID" 2>/dev/null || true
-    kill "$CELERY_PID" 2>/dev/null || true
+    [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
+    [ -n "$CELERY_PID" ] && kill "$CELERY_PID" 2>/dev/null || true
     echo "[dev_auto] Done."
 }
 trap cleanup EXIT
