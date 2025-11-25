@@ -437,7 +437,10 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     )
     st.session_state.setdefault("bucket", bucket)
 
-    query_ep_id = st.query_params.get("ep_id", "")
+    query_params = st.query_params
+    query_ep_id = query_params.get("ep_id", "")
+    if query_ep_id and not st.session_state.get("_ep_id_query_origin"):
+        st.session_state["_ep_id_query_origin"] = "external"
     stored_ep_id = st.session_state.get("ep_id")
     if stored_ep_id is None:
         st.session_state["ep_id"] = query_ep_id
@@ -447,6 +450,7 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
         params = st.query_params
         params["ep_id"] = stored_ep_id
         st.query_params = params
+        st.session_state.setdefault("_ep_id_query_origin", "app")
 
     if "device_default_label" not in st.session_state:
         st.session_state["device_default_label"] = _guess_device_label()
@@ -478,9 +482,12 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     }
 
 
-def set_ep_id(ep_id: str, rerun: bool = True, update_query_params: bool = True) -> None:
+def set_ep_id(ep_id: str, rerun: bool = True, update_query_params: bool = True, origin: str | None = None) -> None:
     if not ep_id:
         return
+    resolved_origin = origin or st.session_state.get("_ep_id_query_origin")
+    if update_query_params and not resolved_origin:
+        resolved_origin = "app"
     current = st.session_state.get("ep_id")
     if current == ep_id:
         if update_query_params:
@@ -488,6 +495,10 @@ def set_ep_id(ep_id: str, rerun: bool = True, update_query_params: bool = True) 
             if params.get("ep_id") != ep_id:
                 params["ep_id"] = ep_id
                 st.query_params = params
+            if resolved_origin:
+                st.session_state["_ep_id_query_origin"] = resolved_origin
+        elif resolved_origin:
+            st.session_state["_ep_id_query_origin"] = resolved_origin
         return
     st.session_state["ep_id"] = ep_id
     if update_query_params:
@@ -495,12 +506,29 @@ def set_ep_id(ep_id: str, rerun: bool = True, update_query_params: bool = True) 
         if params.get("ep_id") != ep_id:
             params["ep_id"] = ep_id
             st.query_params = params
+        if resolved_origin:
+            st.session_state["_ep_id_query_origin"] = resolved_origin
+    elif resolved_origin:
+        st.session_state["_ep_id_query_origin"] = resolved_origin
     if rerun:
         st.rerun()
 
 
 def get_ep_id() -> str:
     return st.session_state.get("ep_id", "")
+
+
+def get_ep_id_from_query_params(*, allow_app_injected: bool = True) -> str:
+    """Return ep_id from query params, optionally ignoring app-injected values."""
+    if "ep_id" not in st.query_params:
+        return ""
+    ep_value = st.query_params.get("ep_id") or ""
+    if not ep_value:
+        return ""
+    origin = st.session_state.get("_ep_id_query_origin")
+    if not allow_app_injected and origin == "app":
+        return ""
+    return str(ep_value)
 
 
 def render_sidebar_episode_selector() -> str | None:

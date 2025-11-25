@@ -869,6 +869,7 @@ def handle_episode_upload(
     include_air_date: bool,
     air_date_value: date,
     uploaded_file,
+    existing_ep_id: str | None = None,
 ) -> Dict[str, Any]:
     """Handle the heavy upload workflow inside a spinner-safe function."""
     # Preflight validation: check file size
@@ -894,24 +895,30 @@ def handle_episode_upload(
         )
         return {"status": "error", "reason": "too_large"}
 
-    air_date_payload = air_date_value.isoformat() if include_air_date else None
-    payload = {
-        "show_slug_or_id": show_ref.strip(),
-        "season_number": int(season_number),
-        "episode_number": int(episode_number),
-        "title": title or None,
-        "air_date": air_date_payload,
-    }
+    created_new_episode = False
+    if existing_ep_id:
+        ep_id = existing_ep_id
+        st.info(f"Replacing video for existing episode `{ep_id}`")
+    else:
+        air_date_payload = air_date_value.isoformat() if include_air_date else None
+        payload = {
+            "show_slug_or_id": show_ref.strip(),
+            "season_number": int(season_number),
+            "episode_number": int(episode_number),
+            "title": title or None,
+            "air_date": air_date_payload,
+        }
 
-    try:
-        create_resp = helpers.api_post("/episodes", payload)
-    except requests.RequestException as exc:
-        endpoint = f"{cfg['api_base']}/episodes"
-        st.error(f"Episode create failed: {helpers.describe_error(endpoint, exc)}")
-        return {"status": "error", "reason": "create_failed"}
+        try:
+            create_resp = helpers.api_post("/episodes", payload)
+        except requests.RequestException as exc:
+            endpoint = f"{cfg['api_base']}/episodes"
+            st.error(f"Episode create failed: {helpers.describe_error(endpoint, exc)}")
+            return {"status": "error", "reason": "create_failed"}
 
-    ep_id = create_resp["ep_id"]
-    st.info(f"Episode `{ep_id}` created. Requesting upload target…")
+        ep_id = create_resp["ep_id"]
+        created_new_episode = True
+        st.info(f"Episode `{ep_id}` created. Requesting upload target…")
 
     presign_path = f"/episodes/{ep_id}/assets"
     try:
@@ -924,7 +931,8 @@ def handle_episode_upload(
     # Validate presign response structure
     if not isinstance(presign_resp, dict):
         st.error(f"Invalid presign response: expected dict, got {type(presign_resp).__name__}")
-        _rollback_episode_creation(ep_id)
+        if created_new_episode:
+            _rollback_episode_creation(ep_id)
         return {"status": "error", "reason": "invalid_presign", "ep_id": ep_id}
 
     # Extract upload method and targets from presign response
@@ -939,13 +947,15 @@ def handle_episode_upload(
     if upload_method == "PUT":
         if not upload_url:
             st.error("Presign response method='PUT' but missing 'upload_url'")
-            _rollback_episode_creation(ep_id, bucket, key)
+            if created_new_episode:
+                _rollback_episode_creation(ep_id, bucket, key)
             return {"status": "error", "reason": "missing_upload_url", "ep_id": ep_id}
         st.info(f"Target: Presigned PUT to {upload_url[:50]}...")
     elif upload_method == "FILE":
         if not local_video_path:
             st.error("Presign response method='FILE' but missing 'local_video_path'")
-            _rollback_episode_creation(ep_id, bucket, key)
+            if created_new_episode:
+                _rollback_episode_creation(ep_id, bucket, key)
             return {"status": "error", "reason": "missing_local_path", "ep_id": ep_id}
         st.info(f"Target: Local file {local_video_path}")
     elif bucket and key:
@@ -953,7 +963,8 @@ def handle_episode_upload(
         st.info(f"Target: s3://{bucket}/{key} (direct boto3)")
     else:
         st.error("Invalid presign response: no valid upload method detected")
-        _rollback_episode_creation(ep_id, bucket, key)
+        if created_new_episode:
+            _rollback_episode_creation(ep_id, bucket, key)
         return {"status": "error", "reason": "no_upload_method", "ep_id": ep_id}
 
     # Credential validation only applies to direct boto3 uploads; presigned/local paths must not block on AWS creds.
@@ -993,7 +1004,8 @@ def handle_episode_upload(
             presigned_seek_error = seek_exc
         if presigned_seek_error:
             st.error(f"Failed to reset file pointer: {presigned_seek_error}")
-            _rollback_episode_creation(ep_id, bucket, key)
+            if created_new_episode:
+                _rollback_episode_creation(ep_id, bucket, key)
             return {"status": "error", "reason": "seek_failed", "ep_id": ep_id}
 
         try:
@@ -1024,7 +1036,8 @@ def handle_episode_upload(
         cloud_result["error_message"] = "Presign provided a local-only path (no cloud upload attempted)."
         if not local_result["succeeded"]:
             st.error(f"Failed to write local copy: {local_result['error_message']}")
-            _rollback_episode_creation(ep_id, bucket, key)
+            if created_new_episode:
+                _rollback_episode_creation(ep_id, bucket, key)
             return {"status": "error", "reason": "local_write_failed", "ep_id": ep_id}
         else:
             st.success("✅ Video saved to local storage")
@@ -1041,7 +1054,8 @@ def handle_episode_upload(
             boto3_seek_error = seek_exc
         if boto3_seek_error:
             st.error(f"Failed to reset file pointer: {boto3_seek_error}")
-            _rollback_episode_creation(ep_id, bucket, key)
+            if created_new_episode:
+                _rollback_episode_creation(ep_id, bucket, key)
             return {"status": "error", "reason": "seek_failed", "ep_id": ep_id}
 
         upload_resp = _upload_file(bucket, key, uploaded_file)
@@ -1107,7 +1121,8 @@ def handle_episode_upload(
             )
     else:
         st.error("Upload failed. Cleaning up partial state.")
-        _rollback_episode_creation(ep_id, cloud_result.get("bucket"), cloud_result.get("key"))
+        if created_new_episode:
+            _rollback_episode_creation(ep_id, cloud_result.get("bucket"), cloud_result.get("key"))
         return {"status": outcome_state, "ep_id": ep_id, "cloud_ok": cloud_ok, "local_ok": local_ok}
 
     cloud_label = cloud_result.get("status_label")
@@ -1156,8 +1171,6 @@ def handle_episode_upload(
 def main():
     """Main application entry point with top-level error handling."""
     try:
-        if DEBUG_UPLOAD:
-            st.write("DEBUG: layout start")
         global cfg
         try:
             cfg = helpers.init_page("Screenalytics Upload")
@@ -1166,6 +1179,8 @@ def main():
             st.exception(init_exc)
             logging.exception("init_page failed in Upload_Video")
             st.stop()
+        if DEBUG_UPLOAD:
+            st.write("DEBUG: layout start")
         st.title("Upload & Run")
         st.caption("Upload page initialized.")
         if DEBUG_UPLOAD:
@@ -1181,14 +1196,6 @@ def main():
         if "tracker" in st.session_state:
             del st.session_state["tracker"]
         st.cache_data.clear()
-        # Remove ep_id from state/query params on upload page to avoid stale episode IDs causing reruns.
-        if not st.session_state.get("upload_ep_params_cleaned"):
-            st.session_state["ep_id"] = ""
-            if "ep_id" in st.query_params:
-                params = st.query_params
-                params.pop("ep_id", None)
-                st.query_params = params
-            st.session_state["upload_ep_params_cleaned"] = True
 
         flash_message = st.session_state.pop("upload_flash", None)
         if flash_message:
@@ -1246,101 +1253,250 @@ def main():
         # Auto-refresh disabled for stability; manually refresh if needed.
         st.session_state.pop("upload_rerun_count", None)
 
+        ep_id_param = helpers.get_ep_id_from_query_params(allow_app_injected=False)
+        current_ep = st.session_state.get("ep_id") or ""
+        if ep_id_param:
+            if current_ep != ep_id_param:
+                st.session_state["ep_id"] = ep_id_param
+        else:
+            if not st.session_state.get("upload_ep_params_cleaned"):
+                st.session_state["ep_id"] = ""
+                st.session_state["upload_ep_params_cleaned"] = True
 
-        new_show_name = ""
-        add_show_clicked = False
-        show_choice = None
+        mode = "replace" if ep_id_param else "create"
 
-        with st.form("episode-upload"):
-            st.subheader("Upload new episode")
-            show_options = helpers.known_shows()
-            select_options = list(show_options) if show_options else []
-            if ADD_SHOW_OPTION not in select_options:
-                select_options.append(ADD_SHOW_OPTION)
-            show_choice = st.selectbox(
-                "Show",
-                options=select_options or [ADD_SHOW_OPTION],
-                key="upload_show_choice",
-                help="Select an existing show or add a new one",
-            )
-            if show_choice == ADD_SHOW_OPTION:
-                st.caption("Add a new show slug/ID to track episodes for.")
-                new_show_name = st.text_input(
-                    "New show slug or ID",
-                    key="upload_new_show_input",
-                    placeholder="rhoslc",
-                    help="This becomes the show slug used for new episodes",
+        def _render_upload_summary(ep_id: str, *, created: bool, show_ref: str | None = None,
+                                   season_number: int | None = None, episode_number: int | None = None) -> None:
+            if not ep_id:
+                return
+            if created:
+                season_label = f"{int(season_number):02d}" if season_number is not None else "??"
+                episode_label = f"{int(episode_number):02d}" if episode_number is not None else "??"
+                show_label = (show_ref or "unknown").strip() or "unknown"
+                st.success(
+                    f"Created episode `{ep_id}` (Show {show_label} · Season {season_label} Episode {episode_label}) "
+                    "and uploaded video."
                 )
-                add_show_clicked = st.form_submit_button("Add show")
             else:
-                st.session_state.pop("upload_new_show_input", None)
-            season_number = st.number_input("Season", min_value=0, max_value=999, value=1, step=1)
-            episode_number = st.number_input("Episode #", min_value=0, max_value=999, value=1, step=1)
-            title = st.text_input("Title", placeholder="Don't Ice Me Bro", help="Optional episode title")
-            include_air_date = st.checkbox("Set air date", value=False)
-            air_date_value = st.date_input(
-                "Air date",
-                value=date.today(),
-                disabled=not include_air_date,
-                help="Optional premiere date",
+                st.success(f"Replaced video for `{ep_id}`.")
+            st.button(
+                "Open Episode Detail",
+                key=f"open_detail_after_upload_{ep_id}",
+                on_click=lambda ep=ep_id: _navigate_to_detail_with_ep(ep),
             )
-            uploaded_file = st.file_uploader(
-                "Episode video",
-                type=["mp4"],
-                accept_multiple_files=False,
-                help="Maximum file size: 10 GB. Supports full-length episode uploads.",
+
+        upload_mode_choice: str
+        if mode == "replace":
+            st.radio(
+                "Upload mode",
+                ["New episode", "Existing episode"],
+                index=1,
+                key="upload_mode_choice_locked",
+                disabled=True,
+                help="ep_id provided in URL; uploads will replace this episode.",
             )
-            st.caption("Video will be uploaded to S3. After upload, open Episode Detail to run detect/track.")
-            submit = st.form_submit_button("Upload episode", type="primary")
-    
-        if add_show_clicked:
-            pending_show = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
-            if not pending_show:
-                st.error("Enter a new show slug/ID before adding.")
-            else:
-                helpers.remember_custom_show(pending_show)
-                st.session_state["upload_show_choice"] = pending_show
-                st.session_state["upload_new_show_input"] = ""
-                st.success(f"Added show `{pending_show}` to the dropdown.")
-                st.rerun()
-        
-        if submit:
-            show_ref = show_choice or ""
-            if show_ref == ADD_SHOW_OPTION:
-                show_ref = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
-                if show_ref:
-                    helpers.remember_custom_show(show_ref)
-                    st.session_state["upload_show_choice"] = show_ref
-        
-            if not show_ref.strip():
-                st.error("Show is required.")
-            elif uploaded_file is None:
-                st.warning("Attach an .mp4 before submitting.")
-            else:
-                if DEBUG_UPLOAD:
-                    st.write("DEBUG: starting handle_episode_upload")
-                with st.spinner("Uploading video to S3 and local mirror..."):
+            upload_mode_choice = "Existing episode"
+            st.subheader(f"Replace video for `{ep_id_param}`")
+            st.caption("Upload is locked to this episode because ep_id is present in the URL.")
+        else:
+            upload_mode_choice = st.radio(
+                "Upload mode",
+                ["New episode", "Existing episode"],
+                index=0,
+                key="upload_mode_choice",
+            )
+
+        is_new_episode_mode = upload_mode_choice == "New episode" and mode != "replace"
+
+        if is_new_episode_mode:
+            new_show_name = ""
+            add_show_clicked = False
+            show_choice = None
+
+            with st.form("episode-upload"):
+                st.subheader("Upload new episode")
+                show_options = helpers.known_shows()
+                select_options = list(show_options) if show_options else []
+                if ADD_SHOW_OPTION not in select_options:
+                    select_options.append(ADD_SHOW_OPTION)
+                show_choice = st.selectbox(
+                    "Show",
+                    options=select_options or [ADD_SHOW_OPTION],
+                    key="upload_show_choice",
+                    help="Select an existing show or add a new one",
+                )
+                if show_choice == ADD_SHOW_OPTION:
+                    st.caption("Add a new show slug/ID to track episodes for.")
+                    new_show_name = st.text_input(
+                        "New show slug or ID",
+                        key="upload_new_show_input",
+                        placeholder="rhoslc",
+                        help="This becomes the show slug used for new episodes",
+                    )
+                    add_show_clicked = st.form_submit_button("Add show")
+                else:
+                    st.session_state.pop("upload_new_show_input", None)
+                season_number = st.number_input("Season", min_value=0, max_value=999, value=1, step=1)
+                episode_number = st.number_input("Episode #", min_value=0, max_value=999, value=1, step=1)
+                title = st.text_input("Title", placeholder="Don't Ice Me Bro", help="Optional episode title")
+                include_air_date = st.checkbox("Set air date", value=False)
+                air_date_value = st.date_input(
+                    "Air date",
+                    value=date.today(),
+                    disabled=not include_air_date,
+                    help="Optional premiere date",
+                )
+                uploaded_file = st.file_uploader(
+                    "Episode video",
+                    type=["mp4"],
+                    accept_multiple_files=False,
+                    help="Maximum file size: 10 GB. Supports full-length episode uploads.",
+                )
+                st.caption("Video will be uploaded to S3. After upload, open Episode Detail to run detect/track.")
+                submit = st.form_submit_button("Create episode & upload", type="primary")
+
+            if add_show_clicked:
+                pending_show = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
+                if not pending_show:
+                    st.error("Enter a new show slug/ID before adding.")
+                else:
+                    helpers.remember_custom_show(pending_show)
+                    st.session_state["upload_show_choice"] = pending_show
+                    st.session_state["upload_new_show_input"] = ""
+                    st.success(f"Added show `{pending_show}` to the dropdown.")
+                    st.rerun()
+
+            if submit:
+                show_ref = show_choice or ""
+                if show_ref == ADD_SHOW_OPTION:
+                    show_ref = (st.session_state.get("upload_new_show_input") or new_show_name or "").strip()
+                    if show_ref:
+                        helpers.remember_custom_show(show_ref)
+                        st.session_state["upload_show_choice"] = show_ref
+
+                if not show_ref.strip():
+                    st.warning("Please pick a show before uploading.")
+                elif uploaded_file is None:
+                    st.warning("Attach an .mp4 before submitting.")
+                else:
+                    if DEBUG_UPLOAD:
+                        st.write("DEBUG: starting handle_episode_upload (new episode)")
+                    with st.spinner("Creating episode and uploading video..."):
+                        try:
+                            outcome = handle_episode_upload(
+                                show_ref=show_ref,
+                                season_number=int(season_number),
+                                episode_number=int(episode_number),
+                                title=title,
+                                include_air_date=include_air_date,
+                                air_date_value=air_date_value,
+                                uploaded_file=uploaded_file,
+                                existing_ep_id=None,
+                            )
+                            if DEBUG_UPLOAD:
+                                st.write(f"DEBUG: handle_episode_upload returned {outcome}")
+                        except Exception as exc:  # final safety net to avoid blank UI
+                            if DEBUG_UPLOAD:
+                                st.write("DEBUG: handle_episode_upload raised")
+                            st.error("Unexpected error during upload. See details below.")
+                            st.exception(exc)
+                        else:
+                            if outcome and outcome.get("status") == "cloud_and_local_ok":
+                                _render_upload_summary(
+                                    outcome.get("ep_id", ""),
+                                    created=True,
+                                    show_ref=show_ref,
+                                    season_number=int(season_number),
+                                    episode_number=int(episode_number),
+                                )
+        else:
+            existing_episode_error = None
+            existing_ep_options: list[Dict[str, Any]] = []
+            manual_existing_ep_id = ""
+            selected_existing_ep_id = ep_id_param or ""
+            episode_choice_label = "Upload to existing episode"
+            if mode == "replace":
+                episode_choice_label = f"Replace video for `{ep_id_param}`"
+
+            def _format_existing_label(ep_id_val: str) -> str:
+                parsed = helpers.parse_ep_id(ep_id_val)
+                if parsed:
+                    return f"{parsed['show'].upper()} · s{parsed['season']:02d}e{parsed['episode']:02d} ({ep_id_val})"
+                return ep_id_val
+
+            with st.form("existing-episode-upload"):
+                st.subheader(episode_choice_label)
+                if mode != "replace":
                     try:
-                        outcome = handle_episode_upload(
-                            show_ref=show_ref,
-                            season_number=int(season_number),
-                            episode_number=int(episode_number),
-                            title=title,
-                            include_air_date=include_air_date,
-                            air_date_value=air_date_value,
-                            uploaded_file=uploaded_file,
-                        )
-                        if DEBUG_UPLOAD:
-                            st.write(f"DEBUG: handle_episode_upload returned {outcome}")
-                    except Exception as exc:  # final safety net to avoid blank UI
-                        if DEBUG_UPLOAD:
-                            st.write("DEBUG: handle_episode_upload raised")
-                        st.error("Unexpected error during upload. See details below.")
-                        st.exception(exc)
-        
+                        episodes_payload = helpers.api_get("/episodes")
+                        existing_ep_options = episodes_payload.get("episodes", [])
+                    except requests.RequestException as exc:
+                        existing_episode_error = helpers.describe_error(f"{cfg['api_base']}/episodes", exc)
+                        existing_ep_options = []
+
+                    ep_ids = [ep["ep_id"] for ep in existing_ep_options if ep.get("ep_id")]
+                    selected_existing_ep_id = st.selectbox(
+                        "Episode to replace",
+                        ep_ids or [""],
+                        format_func=lambda eid: _format_existing_label(eid) if eid else "Select an episode",
+                        key="upload_existing_ep_select",
+                    )
+                    manual_existing_ep_id = st.text_input(
+                        "Or enter episode ID",
+                        key="upload_existing_ep_manual",
+                        placeholder="rhoslc-s06e02",
+                    )
+                uploaded_file = st.file_uploader(
+                    "Episode video",
+                    type=["mp4"],
+                    accept_multiple_files=False,
+                    help="Select the replacement .mp4",
+                )
+                submit = st.form_submit_button("Upload replacement", type="primary")
+
+            chosen_ep_id = (
+                ep_id_param
+                or (manual_existing_ep_id or "").strip()
+                or (selected_existing_ep_id or "").strip()
+            )
+
+            if existing_episode_error:
+                st.warning(f"Could not load tracked episodes for selection: {existing_episode_error}")
+
+            if submit:
+                if not chosen_ep_id:
+                    st.warning("Select an episode to replace before uploading.")
+                elif uploaded_file is None:
+                    st.warning("Attach an .mp4 before submitting.")
+                else:
+                    if DEBUG_UPLOAD:
+                        st.write("DEBUG: starting handle_episode_upload (existing episode)")
+                    with st.spinner("Uploading video to S3 and local mirror..."):
+                        try:
+                            outcome = handle_episode_upload(
+                                show_ref="",
+                                season_number=0,
+                                episode_number=0,
+                                title=None,
+                                include_air_date=False,
+                                air_date_value=date.today(),
+                                uploaded_file=uploaded_file,
+                                existing_ep_id=chosen_ep_id,
+                            )
+                            if DEBUG_UPLOAD:
+                                st.write(f"DEBUG: handle_episode_upload returned {outcome}")
+                        except Exception as exc:  # final safety net to avoid blank UI
+                            if DEBUG_UPLOAD:
+                                st.write("DEBUG: handle_episode_upload raised")
+                            st.error("Unexpected error during upload. See details below.")
+                            st.exception(exc)
+                        else:
+                            if outcome and outcome.get("status") == "cloud_and_local_ok":
+                                _render_upload_summary(outcome.get("ep_id", chosen_ep_id), created=False)
+
         st.button(
             "Open Episode Detail",
-            on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
+            on_click=lambda: _navigate_to_detail_with_ep(st.session_state.get("ep_id", "")),
         )
         
         s3_loaded = True
@@ -1548,5 +1704,5 @@ def main():
         logging.exception("Unexpected error in Upload page main()")
  
  
-# Always run main; in Streamlit multipage __name__ is not "__main__".
-main()
+if __name__ == "__main__":
+    main()

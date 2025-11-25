@@ -147,6 +147,14 @@ def _screentime_job_key(ep_id: str) -> str:
     return f"{ep_id}::screentime_job"
 
 
+def _navigate_to_upload(ep_id: str) -> None:
+    helpers.set_ep_id(ep_id, rerun=False, origin="replace")
+    params = st.query_params
+    params["ep_id"] = ep_id
+    st.query_params = params
+    helpers.try_switch_page("pages/0_Upload_Video.py")
+
+
 def _trigger_safe_detect_rerun(ep_id: str, message: str) -> None:
     st.session_state["episode_detail_detector_override"] = helpers.DEFAULT_DETECTOR
     st.session_state["episode_detail_tracker_override"] = helpers.DEFAULT_TRACKER
@@ -561,6 +569,16 @@ if canonical_ep_id != ep_id:
     helpers.set_ep_id(canonical_ep_id)
     st.rerun()
 ep_id = canonical_ep_id
+action_cols = st.columns([1, 2, 2])
+with action_cols[0]:
+    st.button(
+        "Upload / Replace video",
+        key="episode_detail_upload",
+        type="primary",
+        use_container_width=True,
+        on_click=lambda ep=ep_id: _navigate_to_upload(ep),
+        help="Open Upload page locked to this episode for replacement.",
+    )
 running_job_key = f"{ep_id}::pipeline_job_running"
 if running_job_key not in st.session_state:
     st.session_state[running_job_key] = False
@@ -683,6 +701,10 @@ detect_status_value, tracks_ready, using_manifest_fallback, tracks_only_fallback
     tracks_ready_flag=tracks_ready_flag,
     job_state=detect_job_state,
 )
+jpeg_state = helpers.coerce_int(detect_phase_status.get("jpeg_quality"))
+device_state = detect_phase_status.get("device")
+requested_device_state = detect_phase_status.get("requested_device")
+resolved_device_state = detect_phase_status.get("resolved_device")
 screentime_status_value = "missing"
 screentime_error = None
 screentime_started_at = None
@@ -795,17 +817,13 @@ with col1:
     save_crops_state = detect_phase_status.get("save_crops")
     if save_crops_state is not None:
         detect_params.append(f"save_crops={'on' if save_crops_state else 'off'}")
-        jpeg_state = helpers.coerce_int(detect_phase_status.get("jpeg_quality"))
-        if jpeg_state:
-            detect_params.append(f"jpeg={jpeg_state}")
-        device_state = detect_phase_status.get("device")
-        requested_device_state = detect_phase_status.get("requested_device")
-        resolved_device_state = detect_phase_status.get("resolved_device")
-        detect_runtime = _format_runtime(detect_phase_status.get("runtime_sec"))
-        if requested_device_state and requested_device_state != device_state:
-            detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
-        if device_state:
-            detect_params.append(f"device={helpers.device_label_from_value(device_state)}")
+    if jpeg_state:
+        detect_params.append(f"jpeg={jpeg_state}")
+    detect_runtime = _format_runtime(detect_phase_status.get("runtime_sec"))
+    if requested_device_state and requested_device_state != device_state:
+        detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
+    if device_state:
+        detect_params.append(f"device={helpers.device_label_from_value(device_state)}")
         if detect_status_value == "success":
             runtime_label = detect_runtime or "n/a"
             st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
@@ -892,9 +910,9 @@ with col2:
     thumb_size_state = helpers.coerce_int(faces_phase_status.get("thumb_size"))
     if thumb_size_state:
         faces_params.append(f"thumb={thumb_size_state}px")
-    jpeg_state = helpers.coerce_int(faces_phase_status.get("jpeg_quality"))
-    if jpeg_state:
-        faces_params.append(f"jpeg={jpeg_state}")
+    faces_jpeg_state = helpers.coerce_int(faces_phase_status.get("jpeg_quality"))
+    if faces_jpeg_state:
+        faces_params.append(f"jpeg={faces_jpeg_state}")
     if faces_ready_state:
         runtime_label = faces_runtime or "n/a"
         st.success(f"✅ **Faces Harvest**: Complete (Runtime: {runtime_label})")
