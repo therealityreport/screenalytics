@@ -50,6 +50,7 @@ app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
 app.include_router(metadata.router)
+app.include_router(celery_jobs.router, tags=["celery_jobs"])
 
 
 @app.on_event("startup")

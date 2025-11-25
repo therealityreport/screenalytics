@@ -6,7 +6,6 @@ import os
 import re
 import sys
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
@@ -25,7 +24,6 @@ from tools import episode_run
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.jobs import JobService
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -38,7 +36,6 @@ from apps.api.services.storage import (
 router = APIRouter()
 EPISODE_STORE = EpisodeStore()
 STORAGE = StorageService()
-JOB_SERVICE = JobService()
 LOGGER = logging.getLogger(__name__)
 
 DIAG = os.getenv("DIAG_LOG", "0") == "1"
@@ -84,10 +81,6 @@ def _runs_dir(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "runs"
 
 
-def _progress_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "progress.json"
-
-
 def _tracks_path(ep_id: str) -> Path:
     return get_path(ep_id, "tracks")
 
@@ -100,117 +93,37 @@ def _crops_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "crops"
 
 
-# Thread-local storage to track local file fallbacks during request processing
-import threading
-_local_file_tracker = threading.local()
-
-
-def _track_local_fallback(file_path: str) -> None:
-    """Track when a local file is used as fallback instead of S3."""
-    if not hasattr(_local_file_tracker, "files"):
-        _local_file_tracker.files = set()
-    _local_file_tracker.files.add(file_path)
-
-
-def _get_local_fallbacks() -> List[str]:
-    """Get list of local files used as fallbacks in current request."""
-    if not hasattr(_local_file_tracker, "files"):
-        return []
-    return sorted(_local_file_tracker.files)
-
-
-def _clear_local_fallbacks() -> None:
-    """Clear tracked local fallbacks (call at start of request)."""
-    if hasattr(_local_file_tracker, "files"):
-        _local_file_tracker.files.clear()
-
-
 def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    """Resolve crop URL, preferring S3 with local fallback tracking.
-
-    Priority:
-    1. Use provided s3_key if available
-    2. Construct S3 key from rel_path if s3_key not provided
-    3. Fall back to local file ONLY if S3 fails, and track it for the banner
-
-    Returns S3 presigned URL when possible, local path as last resort (with tracking).
-    """
-    constructed_s3_key = s3_key
-
-    # If no S3 key provided, try to construct one from rel_path
-    if not constructed_s3_key and rel_path:
-        try:
-            ep_ctx = episode_context_from_id(ep_id)
-            prefixes = v2_artifact_prefixes(ep_ctx)
-            crops_prefix = prefixes.get("crops")
-            if crops_prefix:
-                # rel_path format: crops/track_XXXX/frame_XXXXXX.jpg or track_XXXX/frame_XXXXXX.jpg
-                crop_rel = rel_path
-                if crop_rel.startswith("crops/"):
-                    crop_rel = crop_rel[6:]  # Remove "crops/"
-                constructed_s3_key = f"{crops_prefix}{crop_rel}"
-        except (ValueError, KeyError) as exc:
-            LOGGER.debug(f"Could not construct S3 key for {ep_id}/{rel_path}: {exc}")
-
-    # Try S3 first - it's the authoritative source
-    if constructed_s3_key:
-        url = STORAGE.presign_get(constructed_s3_key)
+    if s3_key:
+        url = STORAGE.presign_get(s3_key)
         if url:
             return url
-        LOGGER.debug(f"S3 presign failed for {constructed_s3_key}, checking local fallback")
-
-    # Local fallback - track it for the banner and use if available
-    if rel_path:
-        normalized = rel_path.strip()
-        if normalized:
-            frames_root = get_path(ep_id, "frames_root")
-            local = frames_root / normalized
-            if local.exists():
-                _track_local_fallback(str(local))
-                return str(local)
-
-            rel_parts = Path(normalized)
-            if rel_parts.parts and rel_parts.parts[0] == "crops":
-                rel_parts = Path(*rel_parts.parts[1:])
-            fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-            legacy = fallback_root / ep_id / "tracks" / rel_parts
-            if legacy.exists():
-                _track_local_fallback(str(legacy))
-                return str(legacy)
-
+    if not rel_path:
+        return None
+    normalized = rel_path.strip()
+    if not normalized:
+        return None
+    frames_root = get_path(ep_id, "frames_root")
+    local = frames_root / normalized
+    if local.exists():
+        return str(local)
+    rel_parts = Path(normalized)
+    if rel_parts.parts and rel_parts.parts[0] == "crops":
+        rel_parts = Path(*rel_parts.parts[1:])
+    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+    legacy = fallback_root / ep_id / "tracks" / rel_parts
+    if legacy.exists():
+        return str(legacy)
     return None
 
 
 def _resolve_face_media_url(ep_id: str, row: Dict[str, Any] | None) -> str | None:
-    """Resolve the best media URL for a face, prioritizing crops over thumbs.
-
-    IMPORTANT: Crops are the authoritative source for face images. Thumbs may
-    have been generated from different sources and could show the wrong face
-    when multiple tracks share the same frame. Always prefer crops.
-    """
     if not row:
         return None
-    # Prioritize crop files - they are track-specific and authoritative
-    crop = _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
-    if crop:
-        return crop
-    # Fall back to thumb only if crop is unavailable
-    return _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
-
-
-def _resolve_track_media_url(ep_id: str, track_row: Dict[str, Any] | None) -> str | None:
-    """Resolve the best media URL for a track, prioritizing crops over thumbs.
-
-    IMPORTANT: Crops are authoritative. best_crop_rel_path should be used first.
-    """
-    if not track_row:
-        return None
-    # Prioritize best crop - authoritative source for track preview
-    crop = _resolve_crop_url(ep_id, track_row.get("best_crop_rel_path"), track_row.get("best_crop_s3_key"))
-    if crop:
-        return crop
-    # Fall back to thumb only if crop is unavailable
-    return _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
+    thumb = _resolve_thumb_url(ep_id, row.get("thumb_rel_path"), row.get("thumb_s3_key"))
+    if thumb:
+        return thumb
+    return _resolve_crop_url(ep_id, row.get("crop_rel_path"), row.get("crop_s3_key"))
 
 
 def _remove_face_assets(ep_id: str, rows: Iterable[Dict[str, Any]]) -> None:
@@ -278,46 +191,6 @@ def _safe_float(value) -> float | None:
         return None
 
 
-def _parse_iso8601(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    candidate = value
-    if candidate.endswith("Z"):
-        candidate = candidate[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(candidate)
-    except (TypeError, ValueError):
-        return None
-
-
-def _runtime_from_times(started_at: str | None, finished_at: str | None) -> float | None:
-    start_dt = _parse_iso8601(started_at)
-    end_dt = _parse_iso8601(finished_at)
-    if not start_dt or not end_dt:
-        return None
-    delta = end_dt - start_dt
-    if delta.total_seconds() < 0:
-        return None
-    return round(delta.total_seconds(), 3)
-
-
-def _safe_mtime(path: Path) -> float:
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _load_progress_payload(ep_id: str) -> tuple[Dict[str, Any] | None, float]:
-    progress_path = _progress_path(ep_id)
-    try:
-        payload = json.loads(progress_path.read_text(encoding="utf-8"))
-        mtime = progress_path.stat().st_mtime
-    except (OSError, json.JSONDecodeError):
-        return None, 0.0
-    return payload if isinstance(payload, dict) else None, mtime
-
-
 def _count_nonempty_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -374,8 +247,6 @@ def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
 
 def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, Any]:
     status_value = str(marker.get("status") or "unknown").lower()
-    started_at = marker.get("started_at")
-    finished_at = marker.get("finished_at")
     return {
         "phase": phase,
         "status": status_value,
@@ -403,194 +274,47 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
         "cluster_thresh": _safe_float(marker.get("cluster_thresh")),
         "min_cluster_size": _safe_int(marker.get("min_cluster_size")),
         "min_identity_sim": _safe_float(marker.get("min_identity_sim")),
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "runtime_sec": _runtime_from_times(started_at, finished_at),
+        "started_at": marker.get("started_at"),
+        "finished_at": marker.get("finished_at"),
         "version": marker.get("version"),
         "source": "marker",
     }
 
 
 def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
-    marker_path = _runs_dir(ep_id) / "faces_embed.json"
-    marker_mtime = _safe_mtime(marker_path)
     marker = _load_run_marker(ep_id, "faces_embed")
-    progress_payload, progress_mtime = _load_progress_payload(ep_id)
-    progress_phase = ""
-    progress_step = ""
-    if isinstance(progress_payload, dict):
-        progress_phase = str(progress_payload.get("phase") or "").lower()
-        progress_step = str(progress_payload.get("step") or "").lower()
-    progress_summary = progress_payload.get("summary") if isinstance(progress_payload, dict) else None
-    progress_stage = ""
-    if isinstance(progress_summary, dict):
-        progress_stage = str(progress_summary.get("stage") or "").lower()
-    progress_is_faces = (
-        progress_phase.startswith("faces")
-        or progress_step == "faces_embed"
-        or progress_stage == "faces_embed"
-    )
-    if not progress_is_faces:
-        progress_payload = None
-        progress_summary = None
-        progress_mtime = 0.0
-
+    if marker:
+        return _phase_status_from_marker("faces_embed", marker)
     faces_path = _faces_path(ep_id)
     faces_count = _count_nonempty_lines(faces_path)
-    faces_manifest_exists = faces_path.exists()
-    latest_source_mtime = max(progress_mtime, _safe_mtime(faces_path))
-    marker_faces_match = marker and _safe_int(marker.get("faces")) == faces_count
-    if marker and marker_mtime >= latest_source_mtime and marker_faces_match:
-        return _phase_status_from_marker("faces_embed", marker)
-
-    status_value = "success" if faces_manifest_exists else "missing"
-    if faces_count > 0:
-        status_value = "success"
-    requested_device = None
-    resolved_device = None
-    save_frames = None
-    save_crops = None
-    jpeg_quality = None
-    thumb_size = None
-    updated_at_value = None
-
-    if isinstance(progress_payload, dict):
-        requested_device = progress_payload.get("device_requested") or progress_payload.get("device")
-        resolved_device = (
-            progress_payload.get("resolved_device")
-            or progress_payload.get("device_resolved")
-            or progress_payload.get("device")
-            or requested_device
-        )
-        updated_at_value = progress_payload.get("updated_at")
-    if isinstance(progress_summary, dict):
-        requested_device = progress_summary.get("requested_device") or requested_device
-        resolved_device = progress_summary.get("resolved_device") or resolved_device
-        faces_from_summary = _safe_int(progress_summary.get("faces"))
-        if faces_from_summary is not None:
-            faces_count = faces_from_summary
-            status_value = "success" if faces_count > 0 else "missing"
-        if progress_summary.get("save_frames") is not None:
-            save_frames = bool(progress_summary.get("save_frames"))
-        if progress_summary.get("save_crops") is not None:
-            save_crops = bool(progress_summary.get("save_crops"))
-        jpeg_quality = _safe_int(progress_summary.get("jpeg_quality")) or jpeg_quality
-        thumb_size = _safe_int(progress_summary.get("thumb_size")) or thumb_size
-
-    if marker:
-        requested_device = requested_device or marker.get("requested_device")
-        resolved_device = resolved_device or marker.get("resolved_device")
-        profile_value = profile_value or marker.get("profile")
-        cpu_threads_value = cpu_threads_value or _safe_int(marker.get("cpu_threads"))
-        if save_frames_value is None:
-            save_frames_value = marker.get("save_frames")
-        if save_crops_value is None:
-            save_crops_value = marker.get("save_crops")
-        if save_frames is None:
-            save_frames = marker.get("save_frames")
-        if save_crops is None:
-            save_crops = marker.get("save_crops")
-        jpeg_quality = jpeg_quality or _safe_int(marker.get("jpeg_quality"))
-        thumb_size = thumb_size or _safe_int(marker.get("thumb_size"))
-
-    source = "progress" if progress_payload else ("output" if faces_manifest_exists else "absent")
-    manifest_fallback = bool(source == "output" and not progress_payload and not marker)
-    status_payload = {
+    status_value = "success" if faces_count > 0 else "missing"
+    source = "output" if faces_path.exists() else "absent"
+    return {
         "phase": "faces_embed",
         "status": status_value,
         "faces": faces_count,
         "identities": None,
-        "device": resolved_device,
-        "requested_device": requested_device,
-        "resolved_device": resolved_device,
-        "save_frames": save_frames,
-        "save_crops": save_crops,
-        "jpeg_quality": jpeg_quality,
-        "thumb_size": thumb_size,
-        "started_at": marker.get("started_at") if marker else None,
-        "finished_at": updated_at_value
-        or (datetime.utcfromtimestamp(progress_mtime).replace(microsecond=0).isoformat() + "Z" if progress_mtime else None)
-        or (marker.get("finished_at") if marker else None),
-        "version": marker.get("version") if marker else episode_run.APP_VERSION,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "save_frames": None,
+        "save_crops": None,
+        "jpeg_quality": None,
+        "thumb_size": None,
+        "started_at": None,
+        "finished_at": None,
+        "version": None,
         "source": source,
-        "faces_manifest_fallback": manifest_fallback,
     }
-    status_payload["runtime_sec"] = _runtime_from_times(status_payload.get("started_at"), status_payload.get("finished_at"))
-
-    if latest_source_mtime > marker_mtime:
-        try:
-            marker_payload = dict(status_payload)
-            marker_payload["phase"] = "faces_embed"
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
-        except OSError as exc:  # pragma: no cover - best effort
-            LOGGER.warning("Failed to refresh faces marker for %s: %s", ep_id, exc)
-
-    return status_payload
 
 
 def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
-    marker_path = _runs_dir(ep_id) / "cluster.json"
-    marker_mtime = _safe_mtime(marker_path)
     marker = _load_run_marker(ep_id, "cluster")
-    progress_payload, progress_mtime = _load_progress_payload(ep_id)
-    progress_phase = ""
-    progress_step = ""
-    if isinstance(progress_payload, dict):
-        progress_phase = str(progress_payload.get("phase") or "").lower()
-        progress_step = str(progress_payload.get("step") or "").lower()
-    progress_summary = progress_payload.get("summary") if isinstance(progress_payload, dict) else None
-    progress_stage = ""
-    if isinstance(progress_summary, dict):
-        progress_stage = str(progress_summary.get("stage") or "").lower()
-    progress_is_cluster = (
-        progress_phase.startswith("cluster")
-        or progress_step == "cluster"
-        or progress_stage == "cluster"
-    )
-    if not progress_is_cluster:
-        progress_payload = None
-        progress_summary = None
-        progress_mtime = 0.0
-
-    # Track the latest cluster job to surface running state
-    cluster_job: Dict[str, Any] | None = None
-    try:
-        jobs = JOB_SERVICE.list_jobs(ep_id=ep_id, job_type="cluster", limit=1)
-        if jobs:
-            cluster_job = jobs[0]
-    except Exception:
-        cluster_job = None
-    job_state = str((cluster_job or {}).get("state") or "").lower()
-    job_running = job_state in {"running", "queued"}
-    job_started_at = (cluster_job or {}).get("started_at")
-    job_finished_at = (cluster_job or {}).get("ended_at")
-    job_requested_block = (cluster_job or {}).get("requested") if isinstance((cluster_job or {}).get("requested"), dict) else {}
-
+    if marker:
+        return _phase_status_from_marker("cluster", marker)
     identities_path = _identities_path(ep_id)
     faces_total = 0
     identities_count = 0
-    singleton_merge_block = None
-    singleton_stats_block = None
-    singleton_fraction_before = None
-    singleton_fraction_after = None
-    total_clusters_before = None
-    total_clusters_after = None
-    singleton_merge_enabled = None
-    singleton_merge_threshold = None
-    singleton_merge_neighbor_top_k = None
-    singleton_merge_merge_count = None
-    singleton_merge_similarity_thresh = None
-    metrics_path = _manifests_dir(ep_id) / "track_metrics.json"
-    metrics_mtime = _safe_mtime(metrics_path)
-    cluster_metrics_block = None
-    if metrics_path.exists():
-        try:
-            metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            metrics_payload = {}
-        if isinstance(metrics_payload, dict) and isinstance(metrics_payload.get("cluster_metrics"), dict):
-            cluster_metrics_block = metrics_payload.get("cluster_metrics")
     if identities_path.exists():
         try:
             payload = json.loads(identities_path.read_text(encoding="utf-8"))
@@ -602,257 +326,24 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         stats_block = payload.get("stats") if isinstance(payload, dict) else None
         if isinstance(stats_block, dict):
             faces_total = _safe_int(stats_block.get("faces")) or 0
-            if isinstance(stats_block.get("singleton_stats"), dict):
-                singleton_stats_block = stats_block.get("singleton_stats")
-                before_block = singleton_stats_block.get("before") if isinstance(singleton_stats_block, dict) else None
-                after_block = singleton_stats_block.get("after") if isinstance(singleton_stats_block, dict) else None
-                if isinstance(before_block, dict):
-                    singleton_fraction_before = _safe_float(before_block.get("singleton_fraction")) or singleton_fraction_before
-                    total_clusters_before = _safe_int(before_block.get("cluster_count")) or total_clusters_before
-                if isinstance(after_block, dict):
-                    singleton_fraction_after = _safe_float(after_block.get("singleton_fraction")) or singleton_fraction_after
-                    total_clusters_after = _safe_int(after_block.get("cluster_count")) or total_clusters_after
-                    singleton_merge_merge_count = _safe_int(after_block.get("merge_count")) or singleton_merge_merge_count
-                singleton_merge_enabled = singleton_merge_enabled if singleton_merge_enabled is not None else bool(
-                    singleton_stats_block.get("enabled")
-                )
-                singleton_merge_threshold = singleton_merge_threshold or _safe_float(
-                    singleton_stats_block.get("threshold")
-                )
-            singleton_merge_block = stats_block.get("singleton_merge") if isinstance(stats_block, dict) else None
-        if isinstance(singleton_merge_block, dict):
-            singleton_fraction_before = _safe_float(singleton_merge_block.get("singleton_fraction_before"))
-            singleton_fraction_after = _safe_float(singleton_merge_block.get("singleton_fraction_after"))
-            total_clusters_before = _safe_int(singleton_merge_block.get("total_clusters_before"))
-            total_clusters_after = _safe_int(singleton_merge_block.get("total_clusters_after"))
-            singleton_merge_enabled = singleton_merge_enabled if singleton_merge_enabled is not None else bool(
-                singleton_merge_block.get("enabled")
-            )
-            singleton_merge_similarity_thresh = singleton_merge_block.get("similarity_thresh") or singleton_merge_block.get(
-                "secondary_cluster_thresh"
-            )
-            singleton_merge_neighbor_top_k = singleton_merge_neighbor_top_k or _safe_int(
-                singleton_merge_block.get("neighbor_top_k") or singleton_merge_block.get("max_pairs_per_track")
-            )
-
-    if isinstance(cluster_metrics_block, dict):
-        identities_from_metrics = _safe_int(
-            cluster_metrics_block.get("total_clusters_after") or cluster_metrics_block.get("total_clusters")
-        )
-        if identities_count == 0 and identities_from_metrics is not None:
-            identities_count = identities_from_metrics
-        if singleton_merge_block is None and isinstance(cluster_metrics_block.get("singleton_merge"), dict):
-            singleton_merge_block = cluster_metrics_block.get("singleton_merge")
-        if isinstance(cluster_metrics_block.get("singleton_stats"), dict) and singleton_stats_block is None:
-            singleton_stats_block = cluster_metrics_block.get("singleton_stats")
-        singleton_fraction_before = singleton_fraction_before or _safe_float(
-            cluster_metrics_block.get("singleton_fraction_before")
-        )
-        singleton_fraction_after = singleton_fraction_after or _safe_float(
-            cluster_metrics_block.get("singleton_fraction_after")
-        )
-        total_clusters_before = total_clusters_before or _safe_int(cluster_metrics_block.get("total_clusters_before"))
-        total_clusters_after = total_clusters_after or _safe_int(cluster_metrics_block.get("total_clusters_after"))
-        singleton_merge_similarity_thresh = singleton_merge_similarity_thresh or cluster_metrics_block.get(
-            "similarity_thresh"
-        )
-        singleton_merge_neighbor_top_k = singleton_merge_neighbor_top_k or _safe_int(
-            cluster_metrics_block.get("neighbor_top_k") or cluster_metrics_block.get("max_pairs_per_track")
-        )
-
-    latest_source_mtime = max(progress_mtime, _safe_mtime(identities_path), metrics_mtime)
-    marker_identities_match = bool(
-        marker and identities_count is not None and _safe_int(marker.get("identities")) == identities_count
-    )
-    if marker and marker_mtime >= latest_source_mtime and marker_identities_match:
-        return _phase_status_from_marker("cluster", marker)
-
-    status_value = "running" if job_running else "missing"
-    requested_device = None
-    resolved_device = None
-    cluster_thresh = None
-    min_cluster_size = None
-    min_identity_sim = None
-    updated_at_value = None
-
-    if isinstance(progress_payload, dict):
-        requested_device = progress_payload.get("device_requested") or progress_payload.get("device")
-        resolved_device = (
-            progress_payload.get("resolved_device")
-            or progress_payload.get("device_resolved")
-            or progress_payload.get("device")
-            or requested_device
-        )
-        updated_at_value = progress_payload.get("updated_at")
-    if isinstance(progress_summary, dict):
-        requested_device = progress_summary.get("requested_device") or requested_device
-        resolved_device = progress_summary.get("resolved_device") or resolved_device
-        faces_from_summary = _safe_int(progress_summary.get("faces"))
-        identities_from_summary = _safe_int(progress_summary.get("identities") or progress_summary.get("identities_count"))
-        if faces_from_summary is not None:
-            faces_total = faces_from_summary
-        if identities_from_summary is not None:
-            identities_count = identities_from_summary
-        cluster_thresh = _safe_float(progress_summary.get("cluster_thresh")) or cluster_thresh
-        min_cluster_size = _safe_int(progress_summary.get("min_cluster_size")) or min_cluster_size
-        min_identity_sim = _safe_float(progress_summary.get("min_identity_sim")) or min_identity_sim
-        stats_block = progress_summary.get("stats")
-        if isinstance(stats_block, dict):
-            if singleton_stats_block is None and isinstance(stats_block.get("singleton_stats"), dict):
-                singleton_stats_block = stats_block.get("singleton_stats")
-            if singleton_merge_block is None:
-                singleton_merge_block = stats_block.get("singleton_merge")
-        if isinstance(singleton_stats_block, dict):
-            before_block = singleton_stats_block.get("before") if isinstance(singleton_stats_block, dict) else None
-            after_block = singleton_stats_block.get("after") if isinstance(singleton_stats_block, dict) else None
-            if isinstance(before_block, dict):
-                singleton_fraction_before = singleton_fraction_before or _safe_float(before_block.get("singleton_fraction"))
-                total_clusters_before = total_clusters_before or _safe_int(before_block.get("cluster_count"))
-            if isinstance(after_block, dict):
-                singleton_fraction_after = singleton_fraction_after or _safe_float(after_block.get("singleton_fraction"))
-                total_clusters_after = total_clusters_after or _safe_int(after_block.get("cluster_count"))
-                singleton_merge_merge_count = singleton_merge_merge_count or _safe_int(after_block.get("merge_count"))
-            singleton_merge_enabled = singleton_merge_enabled if singleton_merge_enabled is not None else bool(
-                singleton_stats_block.get("enabled")
-            )
-            singleton_merge_threshold = singleton_merge_threshold or _safe_float(singleton_stats_block.get("threshold"))
-        if isinstance(singleton_merge_block, dict):
-            singleton_fraction_before = singleton_fraction_before or _safe_float(
-                singleton_merge_block.get("singleton_fraction_before")
-            )
-            singleton_fraction_after = singleton_fraction_after or _safe_float(
-                singleton_merge_block.get("singleton_fraction_after")
-            )
-            total_clusters_before = total_clusters_before or _safe_int(
-                singleton_merge_block.get("total_clusters_before")
-            )
-            total_clusters_after = total_clusters_after or _safe_int(singleton_merge_block.get("total_clusters_after"))
-            singleton_merge_enabled = singleton_merge_enabled if singleton_merge_enabled is not None else bool(
-                singleton_merge_block.get("enabled")
-            )
-            singleton_merge_similarity_thresh = singleton_merge_similarity_thresh or singleton_merge_block.get(
-                "similarity_thresh"
-            ) or singleton_merge_block.get("secondary_cluster_thresh")
-            singleton_merge_neighbor_top_k = singleton_merge_neighbor_top_k or _safe_int(
-                singleton_merge_block.get("neighbor_top_k") or singleton_merge_block.get("max_pairs_per_track")
-            )
-
-    if marker:
-        requested_device = requested_device or marker.get("requested_device")
-        resolved_device = resolved_device or marker.get("resolved_device")
-        cluster_thresh = cluster_thresh or _safe_float(marker.get("cluster_thresh"))
-        min_cluster_size = min_cluster_size or _safe_int(marker.get("min_cluster_size"))
-        min_identity_sim = min_identity_sim or _safe_float(marker.get("min_identity_sim"))
-        if singleton_fraction_before is None:
-            singleton_fraction_before = _safe_float(marker.get("singleton_fraction_before"))
-        if singleton_fraction_after is None:
-            singleton_fraction_after = _safe_float(marker.get("singleton_fraction_after"))
-        if total_clusters_before is None:
-            total_clusters_before = _safe_int(marker.get("total_clusters_before"))
-        if total_clusters_after is None:
-            total_clusters_after = _safe_int(marker.get("total_clusters_after"))
-        if singleton_stats_block is None and isinstance(marker.get("singleton_stats"), dict):
-            singleton_stats_block = marker.get("singleton_stats")
-        if isinstance(singleton_stats_block, dict):
-            before_block = singleton_stats_block.get("before")
-            after_block = singleton_stats_block.get("after")
-            if isinstance(before_block, dict):
-                singleton_fraction_before = singleton_fraction_before or _safe_float(before_block.get("singleton_fraction"))
-                total_clusters_before = total_clusters_before or _safe_int(before_block.get("cluster_count"))
-            if isinstance(after_block, dict):
-                singleton_fraction_after = singleton_fraction_after or _safe_float(after_block.get("singleton_fraction"))
-                total_clusters_after = total_clusters_after or _safe_int(after_block.get("cluster_count"))
-                singleton_merge_merge_count = singleton_merge_merge_count or _safe_int(after_block.get("merge_count"))
-            singleton_merge_enabled = singleton_merge_enabled if singleton_merge_enabled is not None else bool(
-                singleton_stats_block.get("enabled")
-            )
-            singleton_merge_threshold = singleton_merge_threshold or _safe_float(singleton_stats_block.get("threshold"))
-        if singleton_merge_block is None:
-            merge_block = marker.get("singleton_merge")
-            if isinstance(merge_block, dict):
-                singleton_merge_block = merge_block
-        if isinstance(singleton_merge_block, dict):
-            singleton_merge_enabled = singleton_merge_enabled if singleton_merge_enabled is not None else bool(
-                singleton_merge_block.get("enabled")
-            )
-            singleton_merge_similarity_thresh = singleton_merge_similarity_thresh or singleton_merge_block.get(
-                "similarity_thresh"
-            ) or singleton_merge_block.get("secondary_cluster_thresh")
-            singleton_merge_neighbor_top_k = singleton_merge_neighbor_top_k or _safe_int(
-                singleton_merge_block.get("neighbor_top_k") or singleton_merge_block.get("max_pairs_per_track")
-            )
-
-    if singleton_merge_enabled and singleton_merge_threshold is None:
-        singleton_merge_threshold = 0.5
-
-    has_success_marker = marker and str(marker.get("status") or "").lower() == "success"
-    if not job_running:
-        completed = has_success_marker or progress_payload or cluster_metrics_block is not None or identities_path.exists()
-        if identities_count > 0 or completed:
-            status_value = "success"
-    source = "progress" if progress_payload else ("output" if identities_path.exists() else "absent")
-    if job_running and source == "absent":
-        source = "job"
-    started_at_value = marker.get("started_at") if marker else job_started_at
-    finished_at_value = None if job_running else updated_at_value
-    if not finished_at_value and not job_running and progress_mtime:
-        finished_at_value = datetime.utcfromtimestamp(progress_mtime).replace(microsecond=0).isoformat() + "Z"
-    if not finished_at_value and marker:
-        finished_at_value = marker.get("finished_at")
-    if not finished_at_value and not job_running:
-        finished_at_value = job_finished_at
-    if not finished_at_value and not job_running:
-        artifact_mtime = max(_safe_mtime(identities_path), metrics_mtime)
-        if artifact_mtime:
-            finished_at_value = datetime.utcfromtimestamp(artifact_mtime).replace(microsecond=0).isoformat() + "Z"
-    status_payload = {
+    status_value = "success" if identities_count > 0 else "missing"
+    source = "output" if identities_path.exists() else "absent"
+    return {
         "phase": "cluster",
         "status": status_value,
         "faces": faces_total,
         "identities": identities_count,
-        "device": resolved_device,
-        "requested_device": requested_device,
-        "resolved_device": resolved_device,
-        "cluster_thresh": cluster_thresh,
-        "min_cluster_size": min_cluster_size,
-        "min_identity_sim": min_identity_sim,
-        "singleton_fraction_before": singleton_fraction_before,
-        "singleton_fraction_after": singleton_fraction_after,
-        "total_clusters_before": total_clusters_before,
-        "total_clusters_after": total_clusters_after,
-        "singleton_merge": singleton_merge_block,
-        "singleton_stats": singleton_stats_block,
-        "singleton_merge_enabled": singleton_merge_enabled,
-        "singleton_merge_threshold": singleton_merge_threshold,
-        "singleton_merge_neighbor_top_k": singleton_merge_neighbor_top_k,
-        "singleton_merge_merge_count": singleton_merge_merge_count,
-        "singleton_merge_similarity_thresh": singleton_merge_similarity_thresh,
-        "started_at": started_at_value,
-        "finished_at": finished_at_value,
-        "version": marker.get("version") if marker else episode_run.APP_VERSION,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "cluster_thresh": None,
+        "min_cluster_size": None,
+        "min_identity_sim": None,
+        "started_at": None,
+        "finished_at": None,
+        "version": None,
         "source": source,
     }
-    if requested_device is None and isinstance(job_requested_block, dict):
-        requested_device = job_requested_block.get("device") or job_requested_block.get("requested_device")
-    if resolved_device is None and isinstance(job_requested_block, dict):
-        resolved_device = job_requested_block.get("resolved_device") or resolved_device
-    status_payload["requested_device"] = requested_device
-    status_payload["resolved_device"] = resolved_device
-    status_payload["runtime_sec"] = _runtime_from_times(status_payload.get("started_at"), status_payload.get("finished_at"))
-
-    if status_payload["source"] != "progress" and marker and marker_identities_match:
-        status_payload["source"] = "marker"
-
-    if latest_source_mtime > marker_mtime and not job_running:
-        try:
-            marker_payload = dict(status_payload)
-            marker_payload["phase"] = "cluster"
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
-        except OSError as exc:  # pragma: no cover - best effort
-            LOGGER.warning("Failed to refresh cluster marker for %s: %s", ep_id, exc)
-
-    return status_payload
 
 
 def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
@@ -861,54 +352,16 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     IMPORTANT: Returns the FACE detector (e.g., retinaface), NOT the scene detector.
     Scene detection (pyscenedetect) is a preliminary step, not the main detect/track operation.
     """
-    marker_path = _runs_dir(ep_id) / "detect_track.json"
-    marker_mtime = _safe_mtime(marker_path)
     marker = _load_run_marker(ep_id, "detect_track")
-    progress_payload, progress_mtime = _load_progress_payload(ep_id)
-    progress_phase = ""
-    progress_step = ""
-    if isinstance(progress_payload, dict):
-        raw_phase = progress_payload.get("phase") or ""
-        progress_phase = str(raw_phase).lower()
-        progress_step = str(progress_payload.get("step") or "").lower()
-    progress_summary = progress_payload.get("summary") if isinstance(progress_payload, dict) else None
-    progress_stage = ""
-    if isinstance(progress_summary, dict):
-        progress_stage = str(progress_summary.get("stage") or "").lower()
-    progress_is_detect = progress_phase.startswith("detect") or progress_phase.startswith("scene") or progress_step == "detect_track" or progress_stage == "detect_track"
-    if not progress_is_detect:
-        progress_payload = None
-        progress_summary = None
-        progress_tracker_cfg = None
-        progress_mtime = 0.0
-    else:
-        progress_tracker_cfg = None
-        if isinstance(progress_payload, dict):
-            stats_block = progress_payload.get("detect_track_stats")
-            if isinstance(stats_block, dict):
-                progress_tracker_cfg = stats_block.get("tracker_config")
-        if isinstance(progress_summary, dict) and not progress_tracker_cfg:
-            cfg_block = progress_summary.get("tracker_config")
-            progress_tracker_cfg = cfg_block if isinstance(cfg_block, dict) else None
+    if marker:
+        return _phase_status_from_marker("detect_track", marker)
+    from py_screenalytics.artifacts import get_path
 
     tracks_path = get_path(ep_id, "tracks")
     detections_path = get_path(ep_id, "detections")
 
     detections_count = _count_nonempty_lines(detections_path)
     tracks_count = _count_nonempty_lines(tracks_path)
-
-    latest_source_mtime = max(
-        progress_mtime,
-        _safe_mtime(tracks_path),
-        _safe_mtime(detections_path),
-    )
-    marker_counts_match = (
-        marker
-        and _safe_int(marker.get("detections")) == detections_count
-        and _safe_int(marker.get("tracks")) == tracks_count
-    )
-    if marker and marker_mtime >= latest_source_mtime and marker_counts_match:
-        return _phase_status_from_marker("detect_track", marker)
 
     # Infer detector/tracker from tracks.jsonl if available
     # Only accept FACE detectors (retinaface, yolov8face, etc.), NOT scene detectors
@@ -932,146 +385,43 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         track_id_value = track_row.get("track_id")
         tracks_manifest_valid = detector is not None and tracker is not None and track_id_value is not None
 
-    requested_device = None
-    resolved_device = None
-    stride_value = None
-    scene_detector_value = None
-    scene_threshold_value = None
-    scene_min_len_value = None
-    scene_warmup_value = None
-    det_thresh_value = None
-    tracker_high_value = None
-    tracker_new_value = None
-    profile_value = None
-    save_frames_value = None
-    save_crops_value = None
-    cpu_threads_value = None
-    updated_at_value = None
-
-    if isinstance(progress_payload, dict):
-        requested_device = progress_payload.get("device_requested") or progress_payload.get("device")
-        resolved_device = (
-            progress_payload.get("resolved_device")
-            or progress_payload.get("device_resolved")
-            or progress_payload.get("device")
-            or requested_device
-        )
-        stride_value = _safe_int(progress_payload.get("stride"))
-        scene_detector_value = progress_payload.get("scene_mode_resolved") or progress_payload.get(
-            "scene_mode_requested"
-        )
-        profile_value = progress_payload.get("profile") or profile_value
-        if progress_payload.get("save_frames") is not None:
-            save_frames_value = bool(progress_payload.get("save_frames"))
-        if progress_payload.get("save_crops") is not None:
-            save_crops_value = bool(progress_payload.get("save_crops"))
-        cpu_threads_value = _safe_int(progress_payload.get("cpu_threads")) or cpu_threads_value
-        updated_at_value = progress_payload.get("updated_at")
-
-    if isinstance(progress_summary, dict):
-        requested_device = progress_summary.get("requested_device") or requested_device
-        resolved_device = progress_summary.get("resolved_device") or resolved_device
-        detector = progress_summary.get("detector") or detector
-        tracker = progress_summary.get("tracker") or tracker
-        stride_value = _safe_int(progress_summary.get("stride")) or stride_value
-        det_thresh_value = _safe_float(progress_summary.get("det_thresh")) or det_thresh_value
-        scene_detector_value = progress_summary.get("scene_detector") or scene_detector_value
-        scene_threshold_value = _safe_float(progress_summary.get("scene_threshold")) or scene_threshold_value
-        scene_min_len_value = _safe_int(progress_summary.get("scene_min_len")) or scene_min_len_value
-        scene_warmup_value = _safe_int(progress_summary.get("scene_warmup_dets")) or scene_warmup_value
-        tracker_config = progress_summary.get("tracker_config")
-        if isinstance(tracker_config, dict):
-            tracker_high_value = _safe_float(tracker_config.get("track_high_thresh"))
-            tracker_new_value = _safe_float(tracker_config.get("new_track_thresh"))
-        profile_value = progress_summary.get("profile") or profile_value
-        if progress_summary.get("save_frames") is not None:
-            save_frames_value = bool(progress_summary.get("save_frames"))
-        if progress_summary.get("save_crops") is not None:
-            save_crops_value = bool(progress_summary.get("save_crops"))
-        cpu_threads_value = _safe_int(progress_summary.get("cpu_threads")) or cpu_threads_value
-
-    if isinstance(progress_tracker_cfg, dict) and not tracker_high_value:
-        tracker_high_value = _safe_float(progress_tracker_cfg.get("track_high_thresh"))
-        tracker_new_value = _safe_float(progress_tracker_cfg.get("new_track_thresh"))
-
-    if marker:
-        requested_device = requested_device or marker.get("requested_device")
-        resolved_device = resolved_device or marker.get("resolved_device")
-        profile_value = profile_value or marker.get("profile")
-        cpu_threads_value = cpu_threads_value or _safe_int(marker.get("cpu_threads"))
-        if save_frames_value is None:
-            save_frames_value = marker.get("save_frames")
-        if save_crops_value is None:
-            save_crops_value = marker.get("save_crops")
-
-    tracks_present = tracks_count > 0
-    detections_present = detections_count > 0
-    tracks_only_fallback = tracks_present and not detections_present
     # Determine status
-    if tracks_present and not tracks_manifest_valid:
+    if tracks_count > 0 and not tracks_manifest_valid:
         status_value = "invalid"
-    elif tracks_present and detections_present:
+    elif tracks_count > 0:
         status_value = "success"
-    elif tracks_only_fallback:
-        status_value = "partial"
-    elif detections_present:
-        status_value = "partial"
+    elif detections_count > 0:
+        status_value = "partial"  # Has detections but no tracks
     else:
         status_value = "missing"
 
     source = "output" if tracks_path.exists() or detections_path.exists() else "absent"
 
-    metadata_missing = bool(
-        source == "output"
-        and not progress_payload
-        and not progress_summary
-        and not marker
-    )
-    status_payload = {
+    return {
         "phase": "detect_track",
         "status": status_value,
         "detections": detections_count,
         "tracks": tracks_count,
         "detector": detector,
         "tracker": tracker,
-        "device": resolved_device,
-        "requested_device": requested_device,
-        "resolved_device": resolved_device,
-        "stride": stride_value,
-        "det_thresh": det_thresh_value,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "stride": None,
+        "det_thresh": None,
         "max_gap": None,
-        "scene_threshold": scene_threshold_value,
-        "scene_min_len": scene_min_len_value,
-        "scene_warmup_dets": scene_warmup_value,
-        "track_high_thresh": tracker_high_value,
-        "new_track_thresh": tracker_new_value,
-        "profile": profile_value,
-        "save_frames": save_frames_value,
-        "save_crops": save_crops_value,
-        "cpu_threads": cpu_threads_value,
+        "scene_threshold": None,
+        "scene_min_len": None,
+        "scene_warmup_dets": None,
+        "track_high_thresh": None,
+        "new_track_thresh": None,
         "faces": None,
         "identities": None,
-        "started_at": marker.get("started_at") if marker else None,
-        "finished_at": updated_at_value
-        or (datetime.utcfromtimestamp(progress_mtime).replace(microsecond=0).isoformat() + "Z" if progress_mtime else None)
-        or (marker.get("finished_at") if marker else None),
-        "version": marker.get("version") if marker else episode_run.APP_VERSION,
-        "source": "progress" if progress_payload else source,
-        "tracks_only_fallback": tracks_only_fallback,
-        "metadata_missing": metadata_missing,
+        "started_at": None,
+        "finished_at": None,
+        "version": None,
+        "source": source,
     }
-    status_payload["runtime_sec"] = _runtime_from_times(status_payload.get("started_at"), status_payload.get("finished_at"))
-
-    if latest_source_mtime > marker_mtime:
-        try:
-            marker_payload = dict(status_payload)
-            marker_payload["phase"] = "detect_track"
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
-        except OSError as exc:  # pragma: no cover - best effort
-            LOGGER.warning("Failed to refresh detect/track marker for %s: %s", ep_id, exc)
-
-    return status_payload
 
 
 def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
@@ -1450,47 +800,15 @@ def _refresh_similarity_indexes(
 
 
 def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    """Resolve thumb URL, preferring S3 with local fallback tracking.
-
-    Priority:
-    1. Use provided s3_key if available
-    2. Construct S3 key from rel_path if s3_key not provided
-    3. Fall back to local file ONLY if S3 fails, and track it for the banner
-    """
-    constructed_s3_key = s3_key
-
-    # If no S3 key provided, try to construct one from rel_path
-    if not constructed_s3_key and rel_path:
-        try:
-            ep_ctx = episode_context_from_id(ep_id)
-            prefixes = v2_artifact_prefixes(ep_ctx)
-            thumbs_prefix = prefixes.get("thumbs")
-            if thumbs_prefix:
-                # rel_path format: track_XXXX/thumb_XXXXXX.jpg
-                constructed_s3_key = f"{thumbs_prefix}{rel_path}"
-        except (ValueError, KeyError) as exc:
-            LOGGER.debug(f"Could not construct S3 key for thumb {ep_id}/{rel_path}: {exc}")
-
-    # Try S3 first
-    if constructed_s3_key:
-        url = STORAGE.presign_get(constructed_s3_key)
+    if s3_key:
+        url = STORAGE.presign_get(s3_key)
         if url:
             return url
-        LOGGER.debug(f"S3 presign failed for thumb {constructed_s3_key}, checking local fallback")
-
-    # If rel_path looks like a crop, try the crop resolver
-    if rel_path and (rel_path.startswith("crops/") or "crops/" in rel_path):
-        crop_url = _resolve_crop_url(ep_id, rel_path, s3_key)
-        if crop_url:
-            return crop_url
-
-    # Local fallback - track it for the banner and use if available
-    if rel_path:
-        local = _thumbs_root(ep_id) / rel_path
-        if local.exists():
-            _track_local_fallback(str(local))
-            return str(local)
-
+    if not rel_path:
+        return None
+    local = _thumbs_root(ep_id) / rel_path
+    if local.exists():
+        return str(local)
     return None
 
 
@@ -1682,61 +1000,6 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     sample = max(1, sample)
     page = max(1, page)
     page_size = max(1, min(page_size, TRACK_LIST_MAX_LIMIT))
-    frame_tracks: Dict[int, Set[int]] = defaultdict(set)
-    for face in _load_faces(ep_id, include_skipped=True):
-        try:
-            tid = int(face.get("track_id", -1))
-            frame_idx_val = int(face.get("frame_idx", -1))
-        except (TypeError, ValueError):
-            continue
-        if tid < 0 or frame_idx_val < 0:
-            continue
-        frame_tracks[frame_idx_val].add(tid)
-
-    def _other_tracks(frame_idx: int) -> List[int]:
-        tracks = frame_tracks.get(frame_idx, set())
-        if not tracks:
-            return []
-        return sorted(tid for tid in tracks if tid != track_id)
-
-    def _scoped_faces(faces: List[Dict[str, Any]], frame_idx: int, source: str) -> List[Dict[str, Any]]:
-        scoped: List[Dict[str, Any]] = []
-        dropped: List[int] = []
-        for face in faces:
-            if not isinstance(face, dict):
-                continue
-            tid = _safe_int(face.get("track_id"))
-            if tid in (None, track_id):
-                normalized = dict(face)
-                normalized["track_id"] = track_id if tid is None else tid
-
-                # CRITICAL: Add explicit media URLs for THIS specific face
-                # This prevents UI from falling back to frame-level URLs that might point to other tracks
-                face_media_url = _resolve_face_media_url(ep_id, normalized)
-                face_thumb_url = _resolve_thumb_url(
-                    ep_id,
-                    normalized.get("thumb_rel_path"),
-                    normalized.get("thumb_s3_key")
-                )
-                normalized["media_url"] = face_media_url or face_thumb_url
-                normalized["thumbnail_url"] = face_media_url or face_thumb_url
-
-                scoped.append(normalized)
-            else:
-                dropped.append(tid)
-        if dropped:
-            LOGGER.warning(
-                "Dropped mismatched faces from track frame listing",
-                extra={
-                    "ep_id": ep_id,
-                    "track_id": track_id,
-                    "frame_idx": frame_idx,
-                    "dropped_track_ids": sorted({tid for tid in dropped if tid is not None}),
-                    "source": source,
-                },
-            )
-        return scoped
-
     face_rows = _track_face_rows(ep_id, track_id)
     crops = _discover_crop_entries(ep_id, track_id)
     ctx, prefixes = _require_episode_context(ep_id)
@@ -1782,14 +1045,6 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         if _extract_quality_metrics and _compute_quality_score:
             for idx in frame_indices:
                 meta = face_rows.get(idx, {})
-                try:
-                    meta_track_id = int(meta.get("track_id", -1))
-                except (TypeError, ValueError):
-                    meta_track_id = -1
-                if meta_track_id in (None, -1):
-                    meta_track_id = track_id
-                if meta_track_id not in (track_id, -1):
-                    continue
                 if meta.get("skip"):
                     continue
                 det_score, crop_std, box_area = _extract_quality_metrics(meta)
@@ -1802,25 +1057,6 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         items: List[Dict[str, Any]] = []
         for idx in page_indices:
             meta = face_rows.get(idx, {})
-            meta_track_id = None
-            if meta:
-                try:
-                    meta_track_id = int(meta.get("track_id", -1))
-                except (TypeError, ValueError):
-                    meta_track_id = -1
-                if meta_track_id not in (track_id, -1):
-                    _diag(
-                        "TRACK_FRAME_META_MISMATCH",
-                        ep_id=ep_id,
-                        requested_track_id=track_id,
-                        meta_track_id=meta_track_id,
-                        frame_idx=idx,
-                    )
-                    meta = {}
-                elif meta_track_id in (None, -1):
-                    meta = {**meta, "track_id": track_id}
-            faces_for_track = _scoped_faces([meta] if meta else [], idx, "manifest")
-            item_track_id = meta_track_id if meta_track_id == track_id else track_id
             media_url = _resolve_face_media_url(ep_id, meta)
             fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
             url = media_url or fallback
@@ -1850,7 +1086,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
 
             items.append(
                 {
-                    "track_id": item_track_id,
+                    "track_id": track_id,
                     "frame_idx": idx,
                     "ts": meta.get("ts"),
                     "media_url": url,
@@ -1863,8 +1099,6 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     "face_id": meta.get("face_id"),
                     "similarity": similarity,
                     "quality": quality,
-                    "faces": faces_for_track,
-                    "other_tracks": _other_tracks(idx),
                 }
             )
         return {
@@ -1885,14 +1119,6 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         for entry in crops:
             frame_idx = entry["frame_idx"]
             meta = face_rows.get(frame_idx, {})
-            try:
-                meta_track_id = int(meta.get("track_id", -1))
-            except (TypeError, ValueError):
-                meta_track_id = -1
-            if meta_track_id in (None, -1):
-                meta_track_id = track_id
-            if meta_track_id not in (track_id, -1):
-                continue
             if meta.get("skip"):
                 continue
             det_score, crop_std, box_area = _extract_quality_metrics(meta)
@@ -1911,33 +1137,14 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     for entry in page_entries:
         frame_idx = entry["frame_idx"]
         meta = face_rows.get(frame_idx, {})
-        meta_track_id = None
-        if meta:
-            try:
-                meta_track_id = int(meta.get("track_id", -1))
-            except (TypeError, ValueError):
-                meta_track_id = -1
-            if meta_track_id not in (track_id, -1):
-                _diag(
-                    "TRACK_FRAME_META_MISMATCH",
-                    ep_id=ep_id,
-                    requested_track_id=track_id,
-                    meta_track_id=meta_track_id,
-                    frame_idx=frame_idx,
-                )
-                meta = {}
-            elif meta_track_id in (None, -1):
-                meta = {**meta, "track_id": track_id}
-        faces_for_track = _scoped_faces([meta] if meta else [], frame_idx, "manifest")
-        item_track_id = meta_track_id if meta_track_id == track_id else track_id
-        # S3-ONLY: Construct S3 key from rel_path, do NOT use local files
+        local_path = entry.get("abs_path")
+        local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
         rel_path = entry.get("rel_path")
         s3_key = None
         if crops_prefix and rel_path:
             suffix = rel_path.split("crops/", 1)[-1]
             s3_key = f"{crops_prefix}{suffix}"
-        # Only use S3 URLs - local_path is tracked for banner but NOT used
-        media_url = _resolve_crop_url(ep_id, rel_path, s3_key)
+        media_url = local_url or _resolve_crop_url(ep_id, rel_path, s3_key if not local_url else None)
         fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
         url = media_url or fallback
 
@@ -1966,7 +1173,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
 
         items.append(
             {
-                "track_id": item_track_id,
+                "track_id": track_id,
                 "frame_idx": frame_idx,
                 "ts": meta.get("ts") if meta else entry.get("ts"),
                 "media_url": url,
@@ -1979,8 +1186,6 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 "face_id": meta.get("face_id"),
                 "similarity": similarity,
                 "quality": quality,
-                "faces": faces_for_track,
-                "other_tracks": _other_tracks(frame_idx),
             }
         )
     return {
@@ -2069,14 +1274,6 @@ class IdentityRenameRequest(BaseModel):
 class IdentityNameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     show: str | None = Field(None, description="Optional show slug override")
-    cast_id: str | None = Field(None, description="Optional cast_id for linking person to cast member")
-
-
-class BulkTrackAssignRequest(BaseModel):
-    track_ids: List[int] = Field(..., min_length=1, description="List of track IDs to assign")
-    name: str = Field(..., min_length=1, max_length=200, description="Name to assign")
-    show: str | None = Field(None, description="Optional show slug override")
-    cast_id: str | None = Field(None, description="Optional cast_id for linking to cast member")
 
 
 class IdentityMergeRequest(BaseModel):
@@ -2096,10 +1293,6 @@ class FrameDeleteRequest(BaseModel):
     track_id: int
     frame_idx: int
     delete_assets: bool = False
-
-
-class FullFrameOverlayRequest(BaseModel):
-    highlight_track_id: int | None = Field(None, description="Track ID to highlight in a different color")
 
 
 class DeleteAllIn(BaseModel):
@@ -2216,12 +1409,8 @@ class PhaseStatus(BaseModel):
     min_identity_sim: float | None = None
     started_at: str | None = None
     finished_at: str | None = None
-    runtime_sec: float | None = None
     version: str | None = None
     source: str | None = None
-    faces_manifest_fallback: bool | None = None
-    tracks_only_fallback: bool | None = None
-    metadata_missing: bool | None = None
 
 
 class EpisodeStatusResponse(BaseModel):
@@ -2309,9 +1498,6 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
             continue
         if q and q.lower() not in ep_id.lower():
             continue
-        key_version = obj.get("key_version")
-        if key_version not in {"v1", "v2"}:
-            continue
         items.append(
             S3VideoItem(
                 bucket=obj.get("bucket", STORAGE.bucket),
@@ -2324,7 +1510,7 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
                 last_modified=(str(obj.get("last_modified")) if obj.get("last_modified") else None),
                 etag=obj.get("etag"),
                 exists_in_store=EPISODE_STORE.exists(ep_id),
-                key_version=key_version,
+                key_version=obj.get("key_version"),
             )
         )
         if len(items) >= limit:
@@ -2465,30 +1651,8 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         detect_track_payload["status"] = "stale"
         detect_track_payload["source"] = "missing_artifact"
     detect_track_status = PhaseStatus(**detect_track_payload)
-    faces_payload = _faces_phase_status(ep_id)
-    cluster_payload = _cluster_phase_status(ep_id)
-
-    # Check for stale downstream artifacts based on timestamps
-    # If detect/track finished after faces_embed, faces are stale (referencing old track IDs)
-    if (
-        detect_track_status.finished_at
-        and faces_payload.get("finished_at")
-        and detect_track_status.finished_at > faces_payload["finished_at"]
-    ):
-        faces_payload["status"] = "stale"
-        faces_payload["source"] = "outdated_after_redetect"
-
-    # If detect/track finished after cluster, clusters are stale
-    if (
-        detect_track_status.finished_at
-        and cluster_payload.get("finished_at")
-        and detect_track_status.finished_at > cluster_payload["finished_at"]
-    ):
-        cluster_payload["status"] = "stale"
-        cluster_payload["source"] = "outdated_after_redetect"
-
-    faces_status = PhaseStatus(**faces_payload)
-    cluster_status = PhaseStatus(**cluster_payload)
+    faces_status = PhaseStatus(**_faces_phase_status(ep_id))
+    cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
 
     # Compute pipeline state indicators
     # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
@@ -2499,10 +1663,8 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     # tracks_ready: True only when tracks manifest exists and API reports success
     tracks_ready = tracks_manifest_ready and detect_track_status.status == "success"
 
-    # faces_harvested: True if faces.jsonl exists and has content AND not stale
-    faces_harvested = (
-        faces_status.faces is not None and faces_status.faces > 0 and faces_status.status != "stale"
-    )
+    # faces_harvested: True if faces.jsonl exists and has content
+    faces_harvested = faces_status.faces is not None and faces_status.faces > 0
 
     coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
 
@@ -2623,17 +1785,252 @@ def hydrate_episode_video(ep_id: str) -> EpisodeMirrorResponse:
 def refresh_similarity_values(ep_id: str) -> dict:
     """Recompute all similarity scores for the episode.
 
-    This regenerates track representatives, cluster centroids, and updates
-    all similarity scores at the track and frame level.
+    This regenerates track representatives, cluster centroids, updates
+    all similarity scores, and refreshes suggestions for unassigned clusters.
+
+    Returns detailed step-by-step progress log with stats.
     """
+    import time
+
+    log_steps = []
+    start_time = time.time()
+
     try:
-        # Refresh all track reps and centroids for all identities
-        _refresh_similarity_indexes(ep_id, identity_ids=None, track_ids=None)
+        # Step 1: Load identities to count tracks and clusters (0-10%)
+        step_start = time.time()
+        identities_payload = _load_identities(ep_id)
+        identities = identities_payload.get("identities", [])
+        track_count = sum(len(i.get("track_ids", [])) for i in identities)
+        cluster_count = len(identities)
+
+        # Count assigned vs unassigned clusters
+        assigned_count = sum(1 for i in identities if i.get("person_id"))
+        unassigned_count = cluster_count - assigned_count
+
+        log_steps.append({
+            "step": "load_identities",
+            "status": "success",
+            "progress_pct": 10,
+            "duration_ms": int((time.time() - step_start) * 1000),
+            "cluster_count": cluster_count,
+            "track_count": track_count,
+            "assigned_count": assigned_count,
+            "unassigned_count": unassigned_count,
+            "details": [
+                f"Loaded {cluster_count} clusters ({track_count} tracks)",
+                f"Assigned: {assigned_count}, Unassigned: {unassigned_count}",
+            ],
+        })
+
+        # Step 2: Generate track reps and centroids (10-50%)
+        step_start = time.time()
+        track_reps_count = 0
+        centroids_count = 0
+        try:
+            from apps.api.services.track_reps import (
+                generate_track_reps_and_centroids,
+            )
+            result = generate_track_reps_and_centroids(ep_id)
+            track_reps_count = result.get("tracks_processed", 0)
+            centroids_count = result.get("centroids_computed", 0)
+            tracks_with_reps = result.get("tracks_with_reps", 0)
+            tracks_skipped = result.get("tracks_skipped", 0)
+
+            details = [
+                f"Processed {track_reps_count} tracks",
+                f"Computed {centroids_count} cluster centroids",
+            ]
+            if tracks_with_reps:
+                details.append(f"Tracks with valid reps: {tracks_with_reps}")
+            if tracks_skipped:
+                details.append(f"Tracks skipped (no embeddings): {tracks_skipped}")
+
+            log_steps.append({
+                "step": "generate_track_reps",
+                "status": "success",
+                "progress_pct": 50,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "track_reps_count": track_reps_count,
+                "centroids_count": centroids_count,
+                "details": details,
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "generate_track_reps",
+                "status": "error",
+                "progress_pct": 50,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.error("Track rep regeneration failed for %s: %s", ep_id, exc)
+
+        # Step 3: Update people prototypes (50-80%)
+        step_start = time.time()
+        people_updated = 0
+        people_details = []
+        try:
+            from apps.api.services.people import PeopleService, l2_normalize
+            import numpy as np
+            from apps.api.services.track_reps import load_cluster_centroids
+
+            ep_ctx = episode_context_from_id(ep_id)
+            show_id = ep_ctx.show_slug.upper()
+            people_service = PeopleService()
+            people = people_service.list_people(show_id)
+
+            if people:
+                # Find all person_ids that have clusters in this episode
+                touched_person_ids = set()
+                for identity in identities:
+                    if identity.get("person_id"):
+                        touched_person_ids.add(identity["person_id"])
+
+                # Update prototypes
+                people_by_id = {p.get("person_id"): p for p in people if p.get("person_id")}
+                try:
+                    centroids_data = load_cluster_centroids(ep_id)
+                except Exception:
+                    centroids_data = {}
+
+                for person_id in touched_person_ids:
+                    person = people_by_id.get(person_id)
+                    if not person:
+                        continue
+                    person_name = person.get("name") or person.get("display_name") or person_id
+                    cluster_refs = person.get("cluster_ids") or []
+                    vectors = []
+                    ep_clusters = 0
+                    for cluster_ref in cluster_refs:
+                        if not isinstance(cluster_ref, str) or ":" not in cluster_ref:
+                            continue
+                        ep_slug, cluster_id = cluster_ref.split(":", 1)
+                        if ep_slug == ep_id:
+                            ep_clusters += 1
+                            centroid_data = centroids_data.get(cluster_id, {})
+                            if centroid_data and centroid_data.get("centroid"):
+                                vectors.append(np.array(centroid_data["centroid"], dtype=np.float32))
+                    if vectors:
+                        stacked = np.stack(vectors, axis=0)
+                        proto = l2_normalize(np.mean(stacked, axis=0)).tolist()
+                        people_service.update_person(show_id, person_id, prototype=proto)
+                        people_updated += 1
+                        people_details.append(f"  • {person_name}: updated from {len(vectors)} centroid(s)")
+
+            details = [f"Updated {people_updated} people prototypes"]
+            if people_details:
+                details.extend(people_details[:10])  # Limit to first 10 for brevity
+                if len(people_details) > 10:
+                    details.append(f"  ... and {len(people_details) - 10} more")
+
+            log_steps.append({
+                "step": "update_prototypes",
+                "status": "success",
+                "progress_pct": 80,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "people_updated": people_updated,
+                "people_total": len(touched_person_ids) if people else 0,
+                "details": details,
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "update_prototypes",
+                "status": "error",
+                "progress_pct": 80,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.warning("People prototype update failed for %s: %s", ep_id, exc)
+
+        # Step 4: Refresh suggestions for unassigned clusters (80-100%)
+        step_start = time.time()
+        suggestions_count = 0
+        suggestions_details = []
+        suggestions_list = []
+        try:
+            from apps.api.services.grouping import GroupingService
+            grouping_service = GroupingService()
+            suggestions_result = grouping_service.suggest_from_assigned_clusters(ep_id)
+            suggestions_list = suggestions_result.get("suggestions", [])
+            suggestions_count = len(suggestions_list)
+
+            # Build lookup for person names
+            person_names = {}
+            if people:
+                for p in people:
+                    pid = p.get("person_id")
+                    if pid:
+                        person_names[pid] = p.get("name") or p.get("display_name") or pid
+
+            details = [f"Generated {suggestions_count} suggestions for unassigned clusters"]
+            for suggestion in suggestions_list[:10]:  # Show first 10 suggestions
+                cluster_id = suggestion.get("cluster_id", "?")
+                suggested_person = suggestion.get("suggested_person_id", "?")
+                distance = suggestion.get("distance", 0)
+                person_name = person_names.get(suggested_person, suggested_person)
+                confidence = max(0, min(100, int((1 - distance) * 100)))
+                details.append(f"  • Cluster {cluster_id} → {person_name} ({confidence}% confidence)")
+                suggestions_details.append({
+                    "cluster_id": cluster_id,
+                    "suggested_person_id": suggested_person,
+                    "suggested_person_name": person_name,
+                    "distance": round(distance, 4),
+                    "confidence_pct": confidence,
+                })
+
+            if len(suggestions_list) > 10:
+                details.append(f"  ... and {len(suggestions_list) - 10} more suggestions")
+
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "success",
+                "progress_pct": 100,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "suggestions_count": suggestions_count,
+                "unassigned_clusters": unassigned_count,
+                "details": details,
+                "suggestions": suggestions_details[:20],  # Include first 20 in response
+            })
+        except FileNotFoundError:
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "skipped",
+                "progress_pct": 100,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "message": "No identities file found",
+                "details": ["Skipped: No identities file found"],
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "error",
+                "progress_pct": 100,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.warning("Suggestions refresh failed for %s: %s", ep_id, exc)
+
+        total_duration = int((time.time() - start_time) * 1000)
 
         return {
             "status": "success",
             "ep_id": ep_id,
             "message": "Similarity values refreshed successfully",
+            "log": {
+                "steps": log_steps,
+                "total_duration_ms": total_duration,
+            },
+            "summary": {
+                "clusters": cluster_count,
+                "tracks": track_count,
+                "assigned_clusters": assigned_count,
+                "unassigned_clusters": unassigned_count,
+                "centroids_computed": centroids_count,
+                "people_updated": people_updated,
+                "suggestions_generated": suggestions_count,
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to refresh similarity values: {str(e)}")
@@ -2743,7 +2140,6 @@ def list_cluster_tracks(
     ep_id: str,
     limit_per_cluster: int | None = Query(None, ge=1, description="Optional max tracks per cluster"),
 ) -> dict:
-    _clear_local_fallbacks()  # Reset tracker for this request
     try:
         payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster)
     except ValueError as exc:
@@ -2760,145 +2156,12 @@ def list_cluster_tracks(
             if media_url:
                 track["rep_media_url"] = media_url
                 track["rep_thumb_url"] = media_url
-    # Include local fallback info for UI banner
-    local_fallbacks = _get_local_fallbacks()
-    if local_fallbacks:
-        payload["_local_fallbacks"] = local_fallbacks
     return payload
-
-
-@router.get("/episodes/{ep_id}/tracks")
-def list_tracks_batch(
-    ep_id: str,
-    ids: str | None = Query(None, description="Comma-separated track IDs"),
-    fields: str | None = Query(None, description="Comma-separated field names to include"),
-) -> dict:
-    """Batch fetch track metadata to avoid N+1 queries."""
-    if not ids:
-        raise HTTPException(status_code=400, detail="'ids' query parameter is required")
-
-    # Parse track IDs
-    try:
-        track_ids = [int(tid.strip()) for tid in ids.split(",") if tid.strip()]
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid track ID format: {exc}") from exc
-
-    if not track_ids:
-        return {"tracks": []}
-
-    # Parse requested fields
-    requested_fields = set()
-    if fields:
-        requested_fields = {f.strip() for f in fields.split(",") if f.strip()}
-    else:
-        # Default fields
-        requested_fields = {"id", "track_id", "faces_count", "thumbnail_url", "media_url"}
-
-    # Load faces and tracks data
-    all_faces = _load_faces(ep_id, include_skipped=False)
-    track_rows_list = _load_tracks(ep_id)
-    track_rows = {int(row.get("track_id", -1)): row for row in track_rows_list}
-
-    # Group faces by track_id
-    faces_by_track: dict[int, list] = {}
-    for face in all_faces:
-        tid = int(face.get("track_id", -1))
-        if tid in track_ids:
-            faces_by_track.setdefault(tid, []).append(face)
-
-    # Build track objects
-    tracks = []
-    for track_id in track_ids:
-        track_faces = faces_by_track.get(track_id, [])
-        track_row = track_rows.get(track_id)
-
-        # Build track object with requested fields
-        track_obj: dict = {}
-
-        if "id" in requested_fields or "track_id" in requested_fields:
-            track_obj["track_id"] = track_id
-            track_obj["id"] = track_id
-
-        if "faces_count" in requested_fields:
-            track_obj["faces_count"] = len(track_faces)
-
-        if "thumbnail_url" in requested_fields or "media_url" in requested_fields:
-            preview_url = _resolve_face_media_url(ep_id, track_faces[0] if track_faces else None)
-            if not preview_url:
-                preview_url = _resolve_track_media_url(ep_id, track_row)
-            if "thumbnail_url" in requested_fields:
-                track_obj["thumbnail_url"] = preview_url
-            if "media_url" in requested_fields:
-                track_obj["media_url"] = preview_url
-
-        if "frames" in requested_fields:
-            frames = []
-            for row in track_faces:
-                media_url = _resolve_face_media_url(ep_id, row)
-                frames.append(
-                    {
-                        "face_id": row.get("face_id"),
-                        "frame_idx": row.get("frame_idx"),
-                        "ts": row.get("ts"),
-                        "thumbnail_url": media_url,
-                        "media_url": media_url,
-                        "skip": row.get("skip"),
-                        "crop_rel_path": row.get("crop_rel_path"),
-                        "crop_s3_key": row.get("crop_s3_key"),
-                        "similarity": row.get("similarity"),
-                    }
-                )
-            track_obj["frames"] = frames
-
-        tracks.append(track_obj)
-
-    return {"tracks": tracks}
-
-
-def _get_faces_for_track_frames(
-    ep_id: str, needed: set[tuple[int, int]]
-) -> Dict[tuple[int, int], Dict[str, Any]]:
-    """Efficiently get face metadata for specific (track_id, frame_idx) pairs.
-
-    Streams through faces.jsonl once and collects only the faces we need.
-    Much faster than loading all faces when we only need a few.
-    """
-    if not needed:
-        return {}
-    path = _faces_path(ep_id)
-    if not path.exists():
-        return {}
-    result: Dict[tuple[int, int], Dict[str, Any]] = {}
-    remaining = set(needed)
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not remaining:
-                break  # Found all we need
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict) or obj.get("skip"):
-                continue
-            try:
-                tid = int(obj.get("track_id", -1))
-                fidx = int(obj.get("frame_idx", -1))
-            except (TypeError, ValueError):
-                continue
-            key = (tid, fidx)
-            if key in remaining:
-                result[key] = obj
-                remaining.discard(key)
-    return result
 
 
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
 def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
     """Get representative frames with similarity scores for all tracks in a cluster."""
-    _clear_local_fallbacks()  # Reset tracker for this request
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
@@ -2906,74 +2169,19 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
             load_cluster_centroids,
         )
 
-        # Get S3 prefixes for fallback URL construction
-        ep_ctx = episode_context_from_id(ep_id)
-        prefixes = v2_artifact_prefixes(ep_ctx)
-
         track_reps = load_track_reps(ep_id)
         cluster_centroids = load_cluster_centroids(ep_id)
 
         result = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
 
-        # Collect all (track_id, frame_idx) pairs we need to look up
-        needed_faces: set[tuple[int, int]] = set()
+        # Resolve crop URLs
         for track in result.get("tracks", []):
-            track_id_str = track.get("track_id", "")
-            rep_frame = track.get("rep_frame")
-            if rep_frame is None:
-                continue
-            try:
-                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
-                    track_id_int = int(track_id_str.replace("track_", ""))
-                else:
-                    track_id_int = int(track_id_str)
-                needed_faces.add((track_id_int, rep_frame))
-            except (TypeError, ValueError):
-                continue
-
-        # Efficiently load only the faces we need (single file scan)
-        face_lookup = _get_faces_for_track_frames(ep_id, needed_faces)
-
-        # Resolve crop URLs using face metadata for track-specific accuracy
-        for track in result.get("tracks", []):
-            track_id_str = track.get("track_id", "")
-            rep_frame = track.get("rep_frame")
             crop_key = track.get("crop_key")
+            if crop_key:
+                # Use existing _resolve_crop_url helper
+                url = _resolve_crop_url(ep_id, crop_key, None)
+                track["crop_url"] = url
 
-            # Parse track_id from string format (e.g., "track_1150")
-            try:
-                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
-                    track_id_int = int(track_id_str.replace("track_", ""))
-                else:
-                    track_id_int = int(track_id_str)
-            except (TypeError, ValueError):
-                track_id_int = None
-
-            # Try to get URL from face metadata first (most accurate for track-specific crops)
-            url = None
-            if track_id_int is not None and rep_frame is not None:
-                face_meta = face_lookup.get((track_id_int, rep_frame))
-                if face_meta:
-                    # Use face-metadata-backed URL which is track-specific
-                    url = _resolve_face_media_url(ep_id, face_meta)
-
-            # Fall back to crop_key if face metadata lookup fails
-            if not url and crop_key:
-                # Construct S3 key from crop_key using episode context
-                crop_s3_key = None
-                if prefixes.get("crops"):
-                    crop_rel = crop_key
-                    if crop_rel.startswith("crops/"):
-                        crop_rel = crop_rel[6:]  # Remove "crops/"
-                    crop_s3_key = f"{prefixes['crops']}{crop_rel}"
-                url = _resolve_crop_url(ep_id, crop_key, crop_s3_key)
-
-            track["crop_url"] = url
-
-        # Include local fallback info for UI banner
-        local_fallbacks = _get_local_fallbacks()
-        if local_fallbacks:
-            result["_local_fallbacks"] = local_fallbacks
         return result
     except Exception as exc:
         LOGGER.error(f"Failed to load track reps for cluster {cluster_id}: {exc}")
@@ -2983,7 +2191,6 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
 @router.get("/episodes/{ep_id}/people/{person_id}/clusters_summary")
 def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
     """Get clusters summary with track representatives for a person in an episode."""
-    _clear_local_fallbacks()  # Reset tracker for this request
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
@@ -2991,9 +2198,8 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             load_cluster_centroids,
         )
 
-        # Parse episode to get show and S3 prefixes
+        # Parse episode to get show
         ep_ctx = episode_context_from_id(ep_id)
-        prefixes = v2_artifact_prefixes(ep_ctx)
         show_slug = ep_ctx.show_slug.upper()
 
         # Load people data
@@ -3031,86 +2237,47 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
 
         # Load identities for face counts
         identities_data = _load_identities(ep_id)
+        LOGGER.info(
+            f"identities_data type: {type(identities_data)}, keys: {list(identities_data.keys()) if isinstance(identities_data, dict) else 'not a dict'}"
+        )
         identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
-        identity_index = {
-            ident["identity_id"]: ident
-            for ident in identities_list
-            if isinstance(ident, dict) and "identity_id" in ident
-        }
-
-        # First pass: collect all cluster data and find ONLY first track's face per cluster
-        # UI only displays first track as cluster thumbnail, so we only need those
-        clusters_data_list = []
-        needed_faces: set[tuple[int, int]] = set()
-
-        for cluster_id in episode_clusters:
-            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
-            clusters_data_list.append((cluster_id, cluster_data))
-
-            # Only need first track's face for cluster thumbnail
-            tracks_list = cluster_data.get("tracks", []) if isinstance(cluster_data, dict) else []
-            if tracks_list and isinstance(tracks_list[0], dict):
-                first_track = tracks_list[0]
-                track_id_str = first_track.get("track_id", "")
-                rep_frame = first_track.get("rep_frame")
-                if rep_frame is not None:
-                    try:
-                        if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
-                            track_id_int = int(track_id_str.replace("track_", ""))
-                        else:
-                            track_id_int = int(track_id_str)
-                        needed_faces.add((track_id_int, rep_frame))
-                    except (TypeError, ValueError):
-                        pass
-
-        # Efficiently load only first track's face per cluster (single file scan)
-        face_lookup = _get_faces_for_track_frames(ep_id, needed_faces)
+        LOGGER.info(
+            f"identities_list type: {type(identities_list)}, length: {len(identities_list) if isinstance(identities_list, list) else 'not a list'}"
+        )
+        identity_index = {}
+        for ident in identities_list:
+            if isinstance(ident, dict) and "identity_id" in ident:
+                identity_index[ident["identity_id"]] = ident
+            else:
+                LOGGER.warning(f"Skipping malformed identity: {type(ident)}")
 
         clusters_output = []
         total_tracks = 0
 
-        # Second pass: resolve URLs (only first track uses face lookup, rest use crop_key)
-        for cluster_id, cluster_data in clusters_data_list:
+        for cluster_id in episode_clusters:
+            LOGGER.info(f"Processing cluster {cluster_id}")
+            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+            LOGGER.info(
+                f"cluster_data type: {type(cluster_data)}, keys: {list(cluster_data.keys()) if isinstance(cluster_data, dict) else 'not a dict'}"
+            )
+
+            # Resolve crop URLs
             tracks_list = cluster_data.get("tracks", []) if isinstance(cluster_data, dict) else []
-            for idx, track in enumerate(tracks_list):
+            for track in tracks_list:
                 if isinstance(track, dict):
-                    track_id_str = track.get("track_id", "")
-                    rep_frame = track.get("rep_frame")
                     crop_key = track.get("crop_key")
-
-                    url = None
-                    # Only use face metadata lookup for first track (visible thumbnail)
-                    if idx == 0 and rep_frame is not None:
-                        try:
-                            if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
-                                track_id_int = int(track_id_str.replace("track_", ""))
-                            else:
-                                track_id_int = int(track_id_str)
-                            face_meta = face_lookup.get((track_id_int, rep_frame))
-                            if face_meta:
-                                url = _resolve_face_media_url(ep_id, face_meta)
-                        except (TypeError, ValueError):
-                            pass
-
-                    # Fall back to crop_key (fast path for non-visible tracks)
-                    if not url and crop_key:
-                        # Construct S3 key from crop_key using episode context
-                        # crop_key format: crops/track_XXXX/frame_XXXXXX.jpg
-                        # S3 key format: artifacts/crops/{show}/{season}/{episode}/tracks/track_XXXX/frame_XXXXXX.jpg
-                        crop_s3_key = None
-                        if prefixes.get("crops"):
-                            # Remove leading "crops/" from crop_key and append to S3 prefix
-                            crop_rel = crop_key
-                            if crop_rel.startswith("crops/"):
-                                crop_rel = crop_rel[6:]  # Remove "crops/"
-                            crop_s3_key = f"{prefixes['crops']}{crop_rel}"
-                        url = _resolve_crop_url(ep_id, crop_key, crop_s3_key)
-
-                    track["crop_url"] = url
+                    if crop_key:
+                        url = _resolve_crop_url(ep_id, crop_key, None)
+                        track["crop_url"] = url
 
             # Get face count from identities
             identity = identity_index.get(cluster_id, {})
-            faces_count = identity.get("size") or 0 if isinstance(identity, dict) else 0
+            LOGGER.info(f"identity for {cluster_id}: type={type(identity)}")
+            if isinstance(identity, dict):
+                faces_count = identity.get("size") or 0
+            else:
+                LOGGER.error(f"identity is not a dict for cluster {cluster_id}: {type(identity)}")
+                faces_count = 0
 
             clusters_output.append(
                 {
@@ -3124,19 +2291,12 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             )
             total_tracks += len(cluster_data.get("tracks", []))
 
-        # Include local fallback info for UI banner
-        result = {
+        return {
             "person_id": person_id,
             "clusters": clusters_output,
             "total_clusters": len(clusters_output),
             "total_tracks": total_tracks,
         }
-        local_fallbacks = _get_local_fallbacks()
-        if local_fallbacks:
-            result["_local_fallbacks"] = local_fallbacks
-        return result
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions (like 404) as-is without wrapping
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -3194,7 +2354,7 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
         face_row = first_faces.get(tid)
         media_url = _resolve_face_media_url(ep_id, face_row)
         if not media_url:
-            media_url = _resolve_track_media_url(ep_id, track_row)
+            media_url = _resolve_thumb_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
         tracks_payload.append(
             {
                 "track_id": tid,
@@ -3251,36 +2411,17 @@ def track_detail(ep_id: str, track_id: int) -> dict:
                 "similarity": row.get("similarity"),  # Include frame similarity score
             }
         )
-
-    # Fallback: if no faces in faces.jsonl, discover crops from disk
-    if not frames:
-        crop_entries = _discover_crop_entries(ep_id, track_id)
-        for entry in crop_entries:
-            rel_path = entry.get("rel_path")
-            media_url = _resolve_crop_url(ep_id, rel_path, None) if rel_path else None
-            frames.append(
-                {
-                    "face_id": None,
-                    "frame_idx": entry.get("frame_idx"),
-                    "ts": entry.get("ts"),
-                    "thumbnail_url": media_url,
-                    "media_url": media_url,
-                    "skip": False,
-                    "crop_rel_path": rel_path,
-                    "crop_s3_key": None,
-                    "similarity": None,
-                }
-            )
-
     track_row = next(
         (row for row in _load_tracks(ep_id) if int(row.get("track_id", -1)) == track_id),
         None,
     )
     preview_url = _resolve_face_media_url(ep_id, faces[0] if faces else None)
-    if not preview_url and frames:
-        preview_url = frames[0].get("media_url")
     if not preview_url:
-        preview_url = _resolve_track_media_url(ep_id, track_row)
+        preview_url = _resolve_thumb_url(
+            ep_id,
+            (track_row or {}).get("thumb_rel_path"),
+            (track_row or {}).get("thumb_s3_key"),
+        )
     return {
         "track_id": track_id,
         "faces_count": len(frames),
@@ -3359,156 +2500,6 @@ def track_integrity(ep_id: str, track_id: int) -> Dict[str, Any]:
         "faces_manifest": faces_count,
         "crops_files": crops,
         "ok": crops >= faces_count > 0,
-    }
-
-
-@router.post("/episodes/{ep_id}/frames/{frame_idx}/overlay")
-def create_frame_overlay(
-    ep_id: str,
-    frame_idx: int,
-    body: FullFrameOverlayRequest = Body(default=FullFrameOverlayRequest()),
-) -> Dict[str, Any]:
-    """Generate a full-frame image with bounding boxes around all detected faces.
-
-    Creates an overlay image showing all face detections for a specific frame,
-    with bounding boxes color-coded by track ID. Optionally highlights a specific
-    track in a different color.
-
-    The overlay is saved to S3 at: artifacts/ff_overlays/{ep_id}/frame_{frame_idx}.jpg
-    """
-    import cv2
-    import numpy as np
-
-    ctx, prefixes = _require_episode_context(ep_id)
-    highlight_track = body.highlight_track_id
-
-    # Load all detections for this frame
-    det_path = _manifests_dir(ep_id) / "detections.jsonl"
-    if not det_path.exists():
-        raise HTTPException(status_code=404, detail="Detections not found")
-
-    frame_detections: List[Dict[str, Any]] = []
-    with det_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                det = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if det.get("frame_idx") == frame_idx:
-                frame_detections.append(det)
-
-    if not frame_detections:
-        raise HTTPException(status_code=404, detail=f"No detections found for frame {frame_idx}")
-
-    # Load the full frame image from S3 or local
-    frames_prefix = prefixes.get("frames", "")
-    frame_filename = f"frame_{frame_idx:06d}.jpg"
-    frame_s3_key = f"{frames_prefix}{frame_filename}" if frames_prefix else None
-
-    frame_image = None
-    frames_root = get_path(ep_id, "frames_root") / "frames"
-
-    # Try S3 first
-    if frame_s3_key and STORAGE.s3_enabled():
-        try:
-            import io
-            frame_bytes = STORAGE.download_bytes(frame_s3_key)
-            if frame_bytes:
-                nparr = np.frombuffer(frame_bytes, np.uint8)
-                frame_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        except Exception as exc:
-            LOGGER.debug(f"Failed to load frame from S3 {frame_s3_key}: {exc}")
-
-    # Fall back to local
-    if frame_image is None:
-        local_frame = frames_root / frame_filename
-        if local_frame.exists():
-            frame_image = cv2.imread(str(local_frame))
-
-    if frame_image is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Frame image not found: {frame_filename} (S3: {frame_s3_key})",
-        )
-
-    # Generate distinct colors for each track (using HSV for better visibility)
-    track_ids = sorted({det.get("track_id") for det in frame_detections if det.get("track_id") is not None})
-    track_colors: Dict[int, tuple] = {}
-    for i, tid in enumerate(track_ids):
-        if tid == highlight_track:
-            # Highlighted track gets bright cyan
-            track_colors[tid] = (255, 255, 0)  # BGR cyan
-        else:
-            # Other tracks get colors from HSV wheel
-            hue = int((i * 180 / max(len(track_ids), 1)) % 180)
-            hsv_color = np.array([[[hue, 255, 200]]], dtype=np.uint8)
-            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
-            track_colors[tid] = tuple(int(c) for c in bgr_color)
-
-    # Draw bounding boxes
-    for det in frame_detections:
-        bbox = det.get("bbox_xyxy")
-        track_id = det.get("track_id")
-        if not bbox or track_id is None:
-            continue
-
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        color = track_colors.get(track_id, (0, 255, 0))
-        thickness = 4 if track_id == highlight_track else 2
-
-        cv2.rectangle(frame_image, (x1, y1), (x2, y2), color, thickness)
-
-        # Draw track ID label
-        label = f"T{track_id}"
-        font_scale = 0.8 if track_id == highlight_track else 0.6
-        (text_width, text_height), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2
-        )
-        cv2.rectangle(
-            frame_image,
-            (x1, y1 - text_height - 10),
-            (x1 + text_width + 4, y1),
-            color,
-            -1,
-        )
-        cv2.putText(
-            frame_image,
-            label,
-            (x1 + 2, y1 - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (255, 255, 255),
-            2,
-        )
-
-    # Encode and upload to S3
-    _, encoded = cv2.imencode(".jpg", frame_image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    overlay_bytes = encoded.tobytes()
-
-    # S3 path: artifacts/ff_overlays/{show}/{season}/{episode}/frame_{idx}.jpg
-    overlay_s3_key = f"artifacts/ff_overlays/{ctx.show}/s{ctx.season:02d}/e{ctx.episode:02d}/frame_{frame_idx:06d}.jpg"
-
-    if not STORAGE.s3_enabled():
-        raise HTTPException(status_code=500, detail="S3 storage not enabled")
-
-    if not STORAGE.upload_bytes(overlay_bytes, overlay_s3_key, content_type="image/jpeg"):
-        raise HTTPException(status_code=500, detail="Failed to upload overlay to S3")
-
-    # Generate presigned URL
-    overlay_url = STORAGE.presign_get(overlay_s3_key)
-    if not overlay_url:
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
-
-    return {
-        "frame_idx": frame_idx,
-        "detections": len(frame_detections),
-        "tracks": track_ids,
-        "highlighted_track": highlight_track,
-        "s3_key": overlay_s3_key,
-        "url": overlay_url,
     }
 
 
@@ -3654,7 +2645,7 @@ def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -
 @router.post("/episodes/{ep_id}/identities/{identity_id}/name")
 def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest) -> dict:
     try:
-        return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show, body.cast_id)
+        return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3662,47 +2653,9 @@ def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest
 @router.post("/episodes/{ep_id}/tracks/{track_id}/name")
 def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> dict:
     try:
-        return identity_service.assign_track_name(ep_id, track_id, body.name, body.show, body.cast_id)
+        return identity_service.assign_track_name(ep_id, track_id, body.name, body.show)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/episodes/{ep_id}/tracks/bulk_assign")
-def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
-    """Assign multiple tracks to a cast member in a single operation.
-
-    All tracks will be moved to new identities with the specified name/cast_id.
-    Uses parallel processing for improved performance with large batches.
-    """
-
-    def assign_single_track(track_id: int) -> dict:
-        """Assign a single track - used by ThreadPoolExecutor."""
-        try:
-            result = identity_service.assign_track_name(ep_id, track_id, body.name, body.show, body.cast_id)
-            return {"track_id": track_id, "success": True, **result}
-        except ValueError as exc:
-            return {"track_id": track_id, "success": False, "error": str(exc)}
-
-    results = []
-    errors = []
-
-    # Use ThreadPoolExecutor for parallel processing (max 4 workers to avoid overwhelming the system)
-    max_workers = min(4, len(body.track_ids)) if body.track_ids else 1
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(assign_single_track, tid): tid for tid in body.track_ids}
-        for future in as_completed(futures):
-            result = future.result()
-            if result.get("success"):
-                results.append(result)
-            else:
-                errors.append(result)
-
-    return {
-        "assigned": len(results),
-        "failed": len(errors),
-        "results": results,
-        "errors": errors,
-    }
 
 
 @router.post("/episodes/{ep_id}/identities/merge")
@@ -3734,19 +2687,16 @@ def move_track(ep_id: str, track_id: int, body: TrackMoveRequest) -> dict:
     for identity in identities:
         if body.target_identity_id and identity.get("identity_id") == body.target_identity_id:
             target_identity = identity
-        # Coerce track_ids to int for consistent comparison
-        identity_track_ids = {int(tid) for tid in (identity.get("track_ids", []) or [])}
-        if track_id in identity_track_ids:
+        if track_id in identity.get("track_ids", []):
             source_identity = identity
     if body.target_identity_id and target_identity is None:
         raise HTTPException(status_code=404, detail="Target identity not found")
-    if source_identity:
-        source_track_ids = {int(tid) for tid in source_identity.get("track_ids", [])}
-        source_identity["track_ids"] = sorted(tid for tid in source_track_ids if tid != track_id)
+    if source_identity and track_id in source_identity.get("track_ids", []):
+        source_identity["track_ids"] = [tid for tid in source_identity["track_ids"] if tid != track_id]
     if target_identity is not None:
-        target_track_ids = {int(tid) for tid in target_identity.get("track_ids", [])}
-        target_track_ids.add(track_id)
-        target_identity["track_ids"] = sorted(target_track_ids)
+        if track_id not in target_identity.get("track_ids", []):
+            target_identity.setdefault("track_ids", []).append(track_id)
+            target_identity["track_ids"] = sorted(target_identity["track_ids"])
     _update_identity_stats(ep_id, payload)
     path = _write_identities(ep_id, payload)
     _sync_manifests(ep_id, path)
@@ -3954,13 +2904,9 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
         seeds_path,
     )
 
-    # Refresh similarity indexes for this episode/identity
-    # Note: Cross-episode refresh (for other episodes of the same show) requires
-    # a separate batch job or manual trigger via /refresh_similarity endpoint
-    try:
-        _refresh_similarity_indexes(ep_id, identity_ids=[identity_id])
-    except Exception as exc:
-        LOGGER.warning(f"Failed to refresh similarity indexes after facebank export: {exc}")
+    # TODO: Emit refresh job for similarity recomputation across episodes
+    # This would trigger re-indexing of embeddings in pgvector/FAISS
+    # For now, similarity refresh must be triggered manually
 
     return {
         "status": "success",
@@ -3969,6 +2915,6 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
         "ep_id": ep_id,
         "seeds_exported": len(seeds),
         "seeds_path": str(seeds_path),
-        "refresh_required": False,  # Local refresh done; cross-episode may still need manual trigger
-        "message": f"Exported {len(seeds)} high-quality seeds to facebank. Local similarity refreshed.",
+        "refresh_required": True,
+        "message": f"Exported {len(seeds)} high-quality seeds to facebank. Similarity refresh recommended.",
     }

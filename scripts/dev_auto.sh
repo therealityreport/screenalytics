@@ -11,6 +11,7 @@ CELERY_LOG="$ROOT/celery_worker.log"
 # Initialize PIDs to empty (prevents unbound variable errors on early exit)
 API_PID=""
 CELERY_PID=""
+STREAMLIT_PID=""
 
 # Cleanup function to kill all background processes on exit
 cleanup() {
@@ -18,6 +19,7 @@ cleanup() {
     echo "[dev_auto] Shutting down services..."
     [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
     [ -n "$CELERY_PID" ] && kill "$CELERY_PID" 2>/dev/null || true
+    [ -n "$STREAMLIT_PID" ] && kill "$STREAMLIT_PID" 2>/dev/null || true
     echo "[dev_auto] Done."
 }
 trap cleanup EXIT
@@ -94,9 +96,15 @@ elif command -v xdg-open >/dev/null 2>&1; then
 fi
 
 # ============================================================================
-# Streamlit UI (foreground - blocking)
+# Streamlit UI (background)
 # ============================================================================
 echo "[dev_auto] Starting Streamlit UI (auto-rerun)..."
+"$PYTHON" -m streamlit run apps/workspace-ui/streamlit_app.py \
+    --server.port 8505 \
+    --server.address 127.0.0.1 &
+STREAMLIT_PID=$!
+echo "[dev_auto] Streamlit started (PID: $STREAMLIT_PID)"
+
 echo ""
 echo "=============================================="
 echo "  SCREENALYTICS Dev Environment"
@@ -110,6 +118,19 @@ echo "  Press Ctrl+C to stop all services"
 echo "=============================================="
 echo ""
 
-"$PYTHON" -m streamlit run apps/workspace-ui/streamlit_app.py \
-    --server.port 8505 \
-    --server.address 127.0.0.1 || true
+# Wait for Ctrl+C - don't exit if a single service crashes
+while true; do
+    sleep 5
+    # Optional: check if services are still running and report
+    if [ -n "$API_PID" ] && ! kill -0 "$API_PID" 2>/dev/null; then
+        echo "[dev_auto] WARNING: API died. Check $API_LOG"
+        API_PID=""
+    fi
+    if [ -n "$STREAMLIT_PID" ] && ! kill -0 "$STREAMLIT_PID" 2>/dev/null; then
+        echo "[dev_auto] WARNING: Streamlit died. Restarting..."
+        "$PYTHON" -m streamlit run apps/workspace-ui/streamlit_app.py \
+            --server.port 8505 \
+            --server.address 127.0.0.1 &
+        STREAMLIT_PID=$!
+    fi
+done

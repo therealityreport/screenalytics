@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -71,110 +70,6 @@ def _load_tracking_config_yaml() -> dict[str, Any]:
     return {}
 
 
-def _load_performance_profile(profile_name: str | None = None) -> dict[str, Any]:
-    """
-    D6: Load performance profile configuration.
-
-    Args:
-        profile_name: Profile to load ("low_power", "balanced", "high_accuracy")
-                     If None, uses SCREENALYTICS_PERF_PROFILE env var or "balanced"
-
-    Returns:
-        Dictionary of profile settings
-    """
-    if profile_name is None:
-        profile_name = os.environ.get("SCREENALYTICS_PERF_PROFILE", "balanced")
-
-    profile_name = profile_name.lower().strip()
-    if profile_name == "fast_cpu":
-        profile_name = "low_power"
-
-    config_path = REPO_ROOT / "config" / "pipeline" / "performance_profiles.yaml"
-    if not config_path.exists():
-        LOGGER.debug("Performance profiles YAML not found at %s", config_path)
-        return {}
-
-    try:
-        import yaml
-
-        with open(config_path, "r") as f:
-            all_profiles = yaml.safe_load(f)
-
-        if not all_profiles or profile_name not in all_profiles:
-            LOGGER.warning("Profile '%s' not found, using defaults", profile_name)
-            return {}
-
-        profile = all_profiles[profile_name]
-        LOGGER.info("Loaded performance profile '%s': %s", profile_name, profile.get("description", ""))
-        return profile
-    except Exception as exc:
-        LOGGER.warning("Failed to load performance profile: %s", exc)
-        return {}
-
-
-def _load_quality_gating_config() -> dict[str, Any]:
-    """
-    Load quality gating configuration from faces_embed_sampling.yaml.
-
-    Returns:
-        Dictionary of quality gating settings
-    """
-    config = _load_faces_embed_config()
-    quality = config.get("quality_gating") if isinstance(config, dict) else None
-    return quality if isinstance(quality, dict) else {}
-
-
-def _load_faces_embed_config() -> dict[str, Any]:
-    """
-    Load faces_embed sampling configuration (quality gates + limits).
-    """
-    config_path = REPO_ROOT / "config" / "pipeline" / "faces_embed_sampling.yaml"
-    if not config_path.exists():
-        LOGGER.debug("Quality gating config YAML not found at %s, using defaults", config_path)
-        return {}
-
-    try:
-        import yaml
-
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-
-        if config:
-            LOGGER.info("Loaded faces_embed config from %s", config_path)
-            return config
-    except Exception as exc:
-        LOGGER.warning("Failed to load faces_embed config YAML: %s", exc)
-
-    return {}
-
-
-def _load_clustering_config() -> dict[str, Any]:
-    """
-    Load clustering configuration from clustering.yaml.
-
-    Returns:
-        Dictionary of clustering settings
-    """
-    config_path = REPO_ROOT / "config" / "pipeline" / "clustering.yaml"
-    if not config_path.exists():
-        LOGGER.debug("Clustering config YAML not found at %s, using defaults", config_path)
-        return {}
-
-    try:
-        import yaml
-
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-
-        if config:
-            LOGGER.info("Loaded clustering config from %s", config_path)
-            return config
-    except Exception as exc:
-        LOGGER.warning("Failed to load clustering config YAML: %s", exc)
-
-    return {}
-
-
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
@@ -194,13 +89,6 @@ MIN_FACE_AREA = 20.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
 RETINAFACE_SCORE_THRESHOLD = 0.65
 RETINAFACE_NMS = 0.45
-
-FACE_SAMPLES_PER_TRACK_DEFAULT = 16
-FACE_MIN_SAMPLES_PER_TRACK_DEFAULT = 4
-FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT = 4
-FACE_MAX_PER_EPISODE_DEFAULT = 10000
-DEFAULT_JPEG_QUALITY = int(os.environ.get("SCREENALYTICS_JPEG_QUALITY", "72"))
-MIN_FRAMES_BETWEEN_CROPS_DEFAULT = int(os.environ.get("SCREENALYTICS_MIN_FRAMES_BETWEEN_CROPS", "32"))
 
 RUN_MARKERS_SUBDIR = "runs"
 
@@ -305,42 +193,35 @@ RETINAFACE_HELP = (
 )
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 # Strict tracking defaults (matching config/pipeline/tracking.yaml)
-# T7: Softer appearance thresholds (reduced from 0.75/0.82 to 0.65/0.75)
-GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.65"))
-GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.75"))
-GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "3")), 1)  # Increased from 2 to 3
+GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.75"))
+GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.82"))
+GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1)
 GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.50"))  # Increased to prevent spatial jumps
 GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
-PROTO_UPDATE_MIN_SIM = float(os.environ.get("TRACK_GATE_PROTO_UPDATE_MIN_SIM", "0.5"))
 GATE_EMB_EVERY_DEFAULT = max(
-    int(os.environ.get("TRACK_GATE_EMB_EVERY", "24")), 0
-)  # Reduced from 10 to 24 for better thermal/CPU performance
-# Track processing throttling - process only every Nth track per frame to reduce CPU
-TRACK_PROCESS_SKIP = max(int(os.environ.get("SCREANALYTICS_TRACK_PROCESS_SKIP", "6")), 1)
-TRACK_CROP_SKIP = max(int(os.environ.get("SCREANALYTICS_TRACK_CROP_SKIP", "8")), 1)
-# ByteTrack spatial matching - relaxed defaults for better continuity
+    int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0
+)  # Reduced from 5 to 10 for better thermal performance
+# ByteTrack spatial matching - strict defaults
 TRACK_BUFFER_BASE_DEFAULT = max(
-    _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 90)),
+    _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
     1,
 )
-BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.72)
+BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.85)
 TRACK_HIGH_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_TRACK_HIGH_THRESH",
     _env_float("BYTE_TRACK_HIGH_THRESH", 0.45),
 )
 TRACK_NEW_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_NEW_TRACK_THRESH",
-    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.55),
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
 )
-TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "2.0"))
+TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
-# Load clustering config early to use for DEFAULT_CLUSTER_SIMILARITY
-_CLUSTERING_CONFIG_EARLY = _load_clustering_config()
 DEFAULT_CLUSTER_SIMILARITY = float(
-    os.environ.get("SCREENALYTICS_CLUSTER_SIM", _CLUSTERING_CONFIG_EARLY.get("cluster_thresh", 0.58))
-)
+    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75")
+)  # Increased to prevent multiple people in same cluster
 
 # Load and apply YAML config overrides if available (only if env vars not set)
 _YAML_CONFIG = _load_tracking_config_yaml()
@@ -360,28 +241,10 @@ if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTIC
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
         LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
-
-MIN_IDENTITY_SIMILARITY = float(
-    os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", _CLUSTERING_CONFIG_EARLY.get("min_identity_sim", 0.50))
-)
-
-# Load quality gating config from YAML
-_QUALITY_GATING_CONFIG = _load_quality_gating_config()
-
-# Face quality gating thresholds (config-driven, env var overrides)
-FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", _QUALITY_GATING_CONFIG.get("min_confidence", 0.60)))
-FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", _QUALITY_GATING_CONFIG.get("min_blur_score", 35.0)))
-FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", _QUALITY_GATING_CONFIG.get("min_std", 1.0)))
-_FACE_EMBED_MIN_QUALITY_RAW = float(os.environ.get("FACES_MIN_QUALITY", _QUALITY_GATING_CONFIG.get("min_quality_score", 3.0)))
-# Config uses 0-10 scale; our quality score is 0-1. Normalize and clamp to keep gating meaningful.
-FACE_EMBED_MIN_QUALITY = max(0.0, min(1.0, _FACE_EMBED_MIN_QUALITY_RAW / 10.0 if _FACE_EMBED_MIN_QUALITY_RAW > 1.0 else _FACE_EMBED_MIN_QUALITY_RAW))
-FACE_EMBED_MAX_YAW = float(os.environ.get("FACES_MAX_YAW", _QUALITY_GATING_CONFIG.get("max_yaw_angle", 45.0)))
-FACE_EMBED_MAX_PITCH = float(os.environ.get("FACES_MAX_PITCH", _QUALITY_GATING_CONFIG.get("max_pitch_angle", 30.0)))
-FACE_EMBED_ALLOWED_EXPRESSIONS = os.environ.get(
-    "FACES_ALLOWED_EXPRESSIONS",
-    ",".join(_QUALITY_GATING_CONFIG.get("allowed_expressions", ["neutral", "smile", "happy", "unknown"])),
-).split(",") if os.environ.get("FACES_ALLOWED_EXPRESSIONS") else _QUALITY_GATING_CONFIG.get("allowed_expressions", ["neutral", "smile", "happy", "unknown"])
-
+MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
+FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
+FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
+FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
 BYTE_TRACK_BUFFER_DEFAULT = TRACK_BUFFER_BASE_DEFAULT
 BYTE_TRACK_HIGH_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
 BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = TRACK_NEW_THRESH_DEFAULT
@@ -409,14 +272,13 @@ def _set_track_sample_limit(value: int | None) -> None:
     TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(value)
 
 
-TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(os.environ.get("SCREANALYTICS_TRACK_SAMPLE_LIMIT", "8"))
+TRACK_SAMPLE_LIMIT = _resolve_track_sample_limit(os.environ.get("SCREENALYTICS_TRACK_SAMPLE_LIMIT"))
 
 
 # Seed-based detection boosting configuration
 SEED_BOOST_ENABLED = _env_flag("SEED_BOOST_ENABLED", False)
 SEED_BOOST_SCORE_DELTA = float(os.environ.get("SEED_BOOST_SCORE_DELTA", "0.15"))
 SEED_BOOST_MIN_SIM = float(os.environ.get("SEED_BOOST_MIN_SIM", "0.42"))
-SEED_REJECTION_MIN_SIM = float(os.environ.get("SEED_REJECTION_MIN_SIM", "0.42"))
 
 SCENE_DETECTOR_CHOICES = ("pyscenedetect", "internal", "off")
 _RAW_SCENE_DETECTOR = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
@@ -432,69 +294,6 @@ def _normalize_device_label(device: str | None) -> str:
     if normalized in {"0", "cuda", "gpu"}:
         return "cuda"
     return normalized
-
-
-def _resolve_device(requested: str | None, logger: logging.Logger | None = None) -> str:
-    """
-    Resolve the requested device to a concrete execution target.
-
-    CoreML requests fall back to MPS when available; otherwise CPU.
-    """
-
-    normalized = (requested or "auto").strip().lower()
-    log = logger or LOGGER
-    if normalized in {"coreml", "mps", "metal", "apple"}:
-        try:
-            import torch  # type: ignore
-
-            mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
-            if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)):
-                if mps_backend.is_available():
-                    return "mps"
-            log.info("Requested device '%s' but MPS is unavailable; falling back to CPU", normalized)
-        except Exception as exc:  # pragma: no cover - torch optional
-            log.info("Requested device '%s' but torch MPS probe failed; falling back to CPU (%s)", normalized, exc)
-        return "cpu"
-    if normalized == "auto":
-        return pick_device("auto")
-    return _normalize_device_label(normalized)
-
-
-# Public alias for reuse in API/job services
-resolve_device = _resolve_device
-
-
-def _default_profile_for_device(requested: str | None, resolved: str | None = None) -> str | None:
-    normalized = (resolved or requested or "").strip().lower()
-    if normalized in {"mps", "coreml", "metal", "apple"} and platform.system().lower() == "darwin":
-        return "low_power"
-    return None
-
-
-def _apply_profile_cpu_threads(cpu_threads: int | None) -> None:
-    if cpu_threads is None:
-        return
-    for var in (
-        "SCREANALYTICS_MAX_CPU_THREADS",
-        "SCREENALYTICS_MAX_CPU_THREADS",
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "OPENCV_NUM_THREADS",
-        "ORT_INTRA_OP_NUM_THREADS",
-    ):
-        os.environ[var] = str(cpu_threads)
-    os.environ["ORT_INTER_OP_NUM_THREADS"] = "1"
-    try:
-        import torch  # type: ignore
-
-        torch.set_num_threads(cpu_threads)
-        torch.set_num_interop_threads(max(1, cpu_threads // 2))
-    except Exception:
-        # Torch optional; best-effort alignment with thread caps.
-        pass
 
 
 def _filter_providers(requested: list[str], available: list[str], allow_cpu_fallback: bool = True) -> list[str]:
@@ -624,15 +423,6 @@ def _init_retinaface(
     except ImportError as exc:  # pragma: no cover - runtime guard
         raise RuntimeError("insightface is required for RetinaFace detection") from exc
 
-    try:
-        import onnxruntime as ort  # type: ignore
-
-        # Suppress noisy VerifyOutputSizes warnings that spam stderr on MPS/CoreML
-        if hasattr(ort, "set_default_logger_severity"):
-            ort.set_default_logger_severity(3)
-    except Exception:
-        LOGGER.debug("Unable to lower ONNX Runtime log level; proceeding with defaults")
-
     providers, resolved = _onnx_providers_for(device, allow_cpu_fallback=allow_cpu_fallback)
     model = get_model(model_name)
     if model is None:
@@ -663,183 +453,6 @@ def _init_retinaface(
     return model, resolved
 
 
-def _insightface_model_dir(model_name: str) -> Path:
-    root = Path(os.environ.get("INSIGHTFACE_HOME", str(Path.home() / ".insightface"))).expanduser()
-    return root / "models" / model_name
-
-
-def _embedding_is_valid(embedding: Optional[np.ndarray], expected_dim: int = 512) -> bool:
-    """
-    Check if an embedding vector is valid and meets quality standards.
-
-    Validates that the embedding is:
-    - A non-None numpy array
-    - 1-dimensional with the expected dimension (default 512 for ArcFace)
-    - Contains only finite values (no NaN or inf)
-    - Has reasonable L2 norm (0.9-1.1 for normalized embeddings)
-
-    Args:
-        embedding: Numpy array embedding vector or None
-        expected_dim: Expected embedding dimension (default 512)
-
-    Returns:
-        True if embedding passes all validation checks, False otherwise
-    """
-    if embedding is None:
-        return False
-
-    if not isinstance(embedding, np.ndarray):
-        LOGGER.debug("Embedding validation failed: not a numpy array (type=%s)", type(embedding))
-        return False
-
-    # Check shape - must be 1D vector of expected dimension
-    if embedding.ndim != 1:
-        LOGGER.debug("Embedding validation failed: wrong ndim=%d (expected 1)", embedding.ndim)
-        return False
-
-    if embedding.shape[0] != expected_dim:
-        LOGGER.debug("Embedding validation failed: wrong dimension=%d (expected %d)", embedding.shape[0], expected_dim)
-        return False
-
-    # Check for NaN or inf values
-    if not np.isfinite(embedding).all():
-        LOGGER.debug("Embedding validation failed: contains NaN or inf values")
-        return False
-
-    # Check L2 norm - should be close to 1.0 for normalized embeddings
-    # Allow some tolerance for numerical precision
-    norm = np.linalg.norm(embedding)
-    if not (0.9 <= norm <= 1.1):
-        LOGGER.debug("Embedding validation failed: L2 norm=%.3f outside acceptable range [0.9, 1.1]", norm)
-        return False
-
-    return True
-
-
-def _analyze_pose_expression(landmarks: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """
-    Analyze facial landmarks to extract pose (yaw, pitch) and expression.
-
-    **CURRENT STATUS:** Pose and expression extraction is not implemented.
-    This function returns (None, None, None) to skip pose/expression quality gating.
-
-    **IMPACT ON QUALITY:**
-    - Pose gating is currently DISABLED (no filtering by head rotation)
-    - Expression gating is currently DISABLED (no filtering by facial expression)
-    - Config thresholds (max_yaw_angle=45°, max_pitch_angle=30°) are defined but not enforced
-    - This may reduce clustering quality by allowing extreme poses and occlusions
-    - Embeddings from profile views or unusual expressions will be included in clustering
-
-    **CONFIGURATION:**
-    Quality gating thresholds are defined in config/pipeline/faces_embed_sampling.yaml:
-    - max_yaw_angle: 45.0 (degrees) - Maximum head rotation left/right
-    - max_pitch_angle: 30.0 (degrees) - Maximum head tilt up/down
-    - allowed_expressions: [neutral, smile, happy, unknown]
-
-    These thresholds are loaded but not currently enforced because this function
-    returns None values.
-
-    **TODO - IMPLEMENTATION OPTIONS:**
-    
-    Option A: Geometric pose estimation from landmarks
-    - Extract 5-point landmarks (eyes, nose, mouth corners)
-    - Estimate yaw/pitch using geometric relationships
-    - Fast but less accurate for extreme poses
-    
-    Option B: Pose regression model
-    - Use dedicated head pose estimation model (e.g., FSA-Net, WHENet)
-    - More accurate across wide pose range
-    - Adds model loading overhead
-    
-    Option C: Explicit configuration flag
-    - Add enable_pose_gating config flag
-    - Make pose gating opt-in rather than silently disabled
-    - Document current limitation in pipeline docs
-
-    Args:
-        landmarks: Facial landmark points from face detection (currently unused)
-
-    Returns:
-        Tuple of (yaw, pitch, expression):
-        - yaw: Head rotation in degrees (None = not implemented)
-        - pitch: Head tilt in degrees (None = not implemented)
-        - expression: Facial expression label (None = not implemented)
-    """
-    # POSE GATING CURRENTLY DISABLED - returns None to skip quality checks
-    return (None, None, None)
-
-
-
-def _parse_track_id(track_id: Any) -> int:
-    """
-    Parse track_id from various formats (int, str like 'track-00000', etc).
-    
-    Args:
-        track_id: Track ID in any format (int, str, etc.)
-    
-    Returns:
-        Integer track ID
-    
-    Raises:
-        ValueError: If track_id cannot be parsed
-    """
-    if isinstance(track_id, int):
-        return track_id
-    
-    if isinstance(track_id, str):
-        # Handle "track-XXXXX" format
-        if track_id.startswith("track-"):
-            try:
-                return int(track_id.split("-")[1])
-            except (IndexError, ValueError) as exc:
-                raise ValueError(f"Invalid track ID format: {track_id}") from exc
-        # Handle plain numeric string
-        try:
-            return int(track_id)
-        except ValueError as exc:
-            raise ValueError(f"Invalid track ID: {track_id}") from exc
-    
-    # Try direct int conversion as fallback
-    try:
-        return int(track_id)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Cannot parse track_id: {track_id} (type={type(track_id)})") from exc
-
-
-def _compute_file_sha256(path: Path) -> str:
-    sha = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            sha.update(chunk)
-    return sha.hexdigest()
-
-
-def _verify_model_checksum(model_name: str) -> None:
-    """Ensure the InsightFace model file matches the recorded checksum."""
-    model_dir = _insightface_model_dir(model_name)
-    onnx_files = sorted(model_dir.glob("*.onnx"))
-    if not onnx_files:
-        LOGGER.warning("No ONNX weights found for %s in %s", model_name, model_dir)
-        return
-    for onnx_path in onnx_files:
-        checksum_path = onnx_path.with_suffix(onnx_path.suffix + ".sha256")
-        if not checksum_path.exists():
-            raise RuntimeError(
-                f"Checksum missing for {onnx_path}. Re-run scripts/fetch_models.py to refresh weights."
-            )
-        expected = checksum_path.read_text(encoding="utf-8").strip()
-        actual = _compute_file_sha256(onnx_path)
-        if not expected:
-            raise RuntimeError(
-                f"Checksum file {checksum_path} is empty. Re-run scripts/fetch_models.py to refresh weights."
-            )
-        if actual != expected:
-            raise RuntimeError(
-                f"ArcFace model checksum mismatch for {onnx_path}. "
-                "The file appears corrupted. Re-run scripts/fetch_models.py."
-            )
-
-
 def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = True):
     try:
         from insightface.model_zoo import get_model  # type: ignore
@@ -852,7 +465,6 @@ def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = True)
         raise RuntimeError(
             f"ArcFace weights '{model_name}' not found. Install insightface models or run scripts/fetch_models.py."
         )
-    _verify_model_checksum(model_name)
     ctx_id = 0 if resolved == "cuda" else -1
     model.prepare(ctx_id=ctx_id, providers=providers)
     return model, resolved
@@ -861,22 +473,12 @@ def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = True)
 def ensure_retinaface_ready(device: str, det_thresh: float | None = None) -> tuple[bool, Optional[str], Optional[str]]:
     """Lightweight readiness probe for API/CLI preflight checks."""
 
-    requested_device = device
-    resolved_device = _resolve_device(device, LOGGER)
-    # D3: Explicit CoreML check on Apple Silicon - allow CPU fallback when CoreML is unavailable
-    if APPLE_SILICON_HOST and resolved_device in {"coreml", "mps"} and not COREML_PROVIDER_AVAILABLE:
-        LOGGER.info(
-            "CoreMLExecutionProvider unavailable; falling back to CPU for device='%s' on Apple Silicon",
-            requested_device,
-        )
-        resolved_device = "cpu"
-
     try:
         from insightface.app import FaceAnalysis  # type: ignore
     except ImportError as exc:  # pragma: no cover - dependency guard
         return False, f"insightface import failed: {exc}", None
 
-    providers, resolved = _onnx_providers_for(resolved_device)
+    providers, resolved = _onnx_providers_for(device)
     ctx_id = 0 if resolved == "cuda" else -1
     profile = os.environ.get("RETINAFACE_PROFILE", "buffalo_l")
     detector = None
@@ -964,224 +566,6 @@ def _normalize_scene_detector_choice(scene_detector: str | None) -> str:
     return SCENE_DETECTOR_DEFAULT
 
 
-def _detect_letterbox(image: np.ndarray, threshold: int = 20) -> tuple[int, int, int, int]:
-    """
-    D9: Detect and return crop coordinates to remove letterbox black bars.
-
-    Args:
-        image: Input image (BGR)
-        threshold: Pixel intensity threshold for detecting black bars
-
-    Returns:
-        (top, bottom, left, right): Number of pixels to crop from each edge
-    """
-    try:
-        if len(image.shape) != 3:
-            return 0, 0, 0, 0
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        height, width = gray.shape
-
-        # Detect top letterbox
-        top = 0
-        for y in range(height // 3):  # Check only top third
-            if np.mean(gray[y, :]) > threshold:
-                break
-            top = y + 1
-
-        # Detect bottom letterbox
-        bottom = 0
-        for y in range(height - 1, height * 2 // 3, -1):  # Check only bottom third
-            if np.mean(gray[y, :]) > threshold:
-                break
-            bottom = height - y
-
-        # Detect left pillarbox
-        left = 0
-        for x in range(width // 3):  # Check only left third
-            if np.mean(gray[:, x]) > threshold:
-                break
-            left = x + 1
-
-        # Detect right pillarbox
-        right = 0
-        for x in range(width - 1, width * 2 // 3, -1):  # Check only right third
-            if np.mean(gray[:, x]) > threshold:
-                break
-            right = width - x
-
-        # Only return non-zero crops if they're significant (> 5% of dimension)
-        min_crop_h = height * 0.05
-        min_crop_w = width * 0.05
-
-        top = top if top > min_crop_h else 0
-        bottom = bottom if bottom > min_crop_h else 0
-        left = left if left > min_crop_w else 0
-        right = right if right > min_crop_w else 0
-
-        return int(top), int(bottom), int(left), int(right)
-    except Exception:
-        return 0, 0, 0, 0
-
-
-def _crop_letterbox(image: np.ndarray, crop_coords: tuple[int, int, int, int]) -> np.ndarray:
-    """
-    D9: Apply letterbox crop to image.
-
-    Args:
-        image: Input image
-        crop_coords: (top, bottom, left, right) pixels to crop
-
-    Returns:
-        Cropped image
-    """
-    top, bottom, left, right = crop_coords
-    if top == 0 and bottom == 0 and left == 0 and right == 0:
-        return image
-
-    height, width = image.shape[:2]
-    y1 = top
-    y2 = height - bottom
-    x1 = left
-    x2 = width - right
-
-    if y2 <= y1 or x2 <= x1:
-        return image
-
-    return image[y1:y2, x1:x2]
-
-
-def _analyze_image_brightness_contrast(image: np.ndarray) -> tuple[float, float]:
-    """
-    Analyze image brightness and contrast.
-
-    Returns:
-        (brightness, contrast): brightness in [0, 1], contrast in [0, 1]
-    """
-    try:
-        # Convert to grayscale if needed
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-
-        # Compute brightness (normalized mean intensity)
-        brightness = np.mean(gray) / 255.0
-
-        # Compute contrast (normalized standard deviation)
-        contrast = np.std(gray) / 128.0  # Normalize by half of 255
-        contrast = min(contrast, 1.0)
-
-        return brightness, contrast
-    except Exception:
-        # Default to neutral values if analysis fails
-        return 0.5, 0.5
-
-
-def _adaptive_confidence_threshold(
-    image: np.ndarray,
-    base_threshold: float,
-    min_threshold: float = 0.6,
-    max_threshold: float = 0.9,
-    enable_adaptive: bool = True,
-) -> float:
-    """
-    Compute adaptive confidence threshold based on image characteristics.
-
-    For low-light scenes (brightness < 0.3), lowers threshold.
-    For high-contrast scenes (contrast > 0.7), lowers threshold slightly.
-
-    Args:
-        image: Input image
-        base_threshold: Default confidence threshold
-        min_threshold: Minimum allowed threshold
-        max_threshold: Maximum allowed threshold
-        enable_adaptive: If False, returns base_threshold
-
-    Returns:
-        Adjusted confidence threshold
-    """
-    if not enable_adaptive:
-        return base_threshold
-
-    try:
-        brightness, contrast = _analyze_image_brightness_contrast(image)
-
-        adjusted = base_threshold
-
-        # Lower threshold for low-light scenes
-        if brightness < 0.3:
-            # Very dark: reduce threshold significantly
-            adjusted = base_threshold - 0.15
-        elif brightness < 0.4:
-            # Somewhat dark: reduce threshold moderately
-            adjusted = base_threshold - 0.10
-
-        # Lower threshold for high-contrast scenes (harder to detect)
-        if contrast > 0.7:
-            adjusted = adjusted - 0.05
-
-        # Clamp to bounds
-        adjusted = max(min_threshold, min(max_threshold, adjusted))
-
-        return adjusted
-    except Exception:
-        return base_threshold
-
-
-def _estimate_face_yaw(landmarks: np.ndarray) -> float | None:
-    """
-    D10: Estimate yaw angle (head rotation) from 5-point facial landmarks.
-
-    The 5-point landmarks are: left eye, right eye, nose, left mouth, right mouth.
-    Landmarks are in format: [x1, y1, x2, y2, x3, y3, x4, y4, x5, y5]
-
-    Args:
-        landmarks: Flat array of 10 values (5 points × 2 coordinates)
-
-    Returns:
-        Estimated yaw angle in degrees, or None if estimation fails.
-        Positive = face turned right, Negative = face turned left
-    """
-    try:
-        if landmarks is None or len(landmarks) < 10:
-            return None
-
-        # Parse landmarks (InsightFace format: left_eye, right_eye, nose, left_mouth, right_mouth)
-        left_eye = np.array([landmarks[0], landmarks[1]])
-        right_eye = np.array([landmarks[2], landmarks[3]])
-        nose = np.array([landmarks[4], landmarks[5]])
-
-        # Compute eye center
-        eye_center = (left_eye + right_eye) / 2.0
-
-        # Compute horizontal distance from nose to eye center
-        eye_to_nose = nose[0] - eye_center[0]
-
-        # Compute eye distance (inter-ocular distance)
-        eye_distance = np.linalg.norm(right_eye - left_eye)
-
-        if eye_distance < 1e-6:
-            return None
-
-        # Normalized horizontal offset
-        # For frontal faces, nose is centered between eyes (ratio ≈ 0)
-        # For profile faces, nose shifts significantly (ratio → ±0.5)
-        ratio = eye_to_nose / eye_distance
-
-        # Empirical mapping: ratio to yaw angle
-        # ratio = 0 → yaw = 0 (frontal)
-        # ratio = ±0.5 → yaw = ±90 (full profile)
-        yaw_deg = ratio * 180.0  # Simple linear approximation
-
-        # Clamp to reasonable range
-        yaw_deg = max(-90.0, min(90.0, yaw_deg))
-
-        return yaw_deg
-    except Exception:
-        return None
-
-
 def _valid_face_box(bbox: np.ndarray, score: float, *, min_score: float, min_area: float) -> bool:
     # Validate bbox has valid numeric coordinates
     try:
@@ -1222,62 +606,6 @@ def _nms_detections(
     return keep
 
 
-def _soft_nms_detections(
-    detections: list[tuple[np.ndarray, float, np.ndarray | None]],
-    iou_thresh: float = 0.5,
-    sigma: float = 0.5,
-    score_thresh: float = 0.001,
-) -> list[tuple[np.ndarray, float, np.ndarray | None]]:
-    """
-    D7: Soft-NMS implementation for handling overlapping faces.
-
-    Instead of eliminating overlapping detections, Soft-NMS decays their scores
-    using a Gaussian function. This helps detect overlapping faces (e.g., hugging,
-    dense crowds) that would be suppressed by hard NMS.
-
-    Args:
-        detections: List of (bbox, score, landmarks) tuples
-        iou_thresh: IoU threshold above which scores are decayed
-        sigma: Gaussian decay parameter (lower = more aggressive)
-        score_thresh: Minimum score to keep a detection
-
-    Returns:
-        Filtered list of detections with decayed scores
-    """
-    if not detections:
-        return []
-
-    # Create mutable list of detections with indices
-    dets = [(i, bbox, score, kps) for i, (bbox, score, kps) in enumerate(detections)]
-    keep: list[tuple[np.ndarray, float, np.ndarray | None]] = []
-
-    while dets:
-        # Find detection with highest score
-        max_idx = max(range(len(dets)), key=lambda i: dets[i][2])
-        idx, bbox, score, kps = dets.pop(max_idx)
-
-        # Keep this detection
-        keep.append((bbox, score, kps))
-
-        # Decay scores of remaining detections based on IoU
-        new_dets: list[tuple[int, np.ndarray, float, np.ndarray | None]] = []
-        for i, other_bbox, other_score, other_kps in dets:
-            iou = _bbox_iou(bbox.tolist(), other_bbox.tolist())
-
-            # Gaussian decay: score *= exp(-(iou^2 / sigma))
-            if iou > iou_thresh:
-                decay = np.exp(-(iou * iou) / sigma)
-                other_score = other_score * decay
-
-            # Only keep if score is above threshold
-            if other_score >= score_thresh:
-                new_dets.append((i, other_bbox, other_score, other_kps))
-
-        dets = new_dets
-
-    return keep
-
-
 @dataclass
 class TrackAccumulator:
     track_id: int
@@ -1288,7 +616,6 @@ class TrackAccumulator:
     last_frame_idx: int = -1
     frame_count: int = 0
     samples: List[dict] = field(default_factory=list)
-    gate_embedding: List[float] | None = None  # G3: Store gate embedding
 
     def add(
         self,
@@ -1332,9 +659,6 @@ class TrackAccumulator:
             row["last_frame_idx"] = int(self.last_frame_idx)
         if self.samples:
             row["bboxes_sampled"] = self.samples
-        # G3: Include gate embedding if available
-        if self.gate_embedding:
-            row["gate_embedding"] = self.gate_embedding
         return row
 
 
@@ -1374,7 +698,6 @@ class GateTrackState:
     proto: np.ndarray | None = None
     last_box: np.ndarray | None = None
     low_sim_streak: int = 0
-    frames_since_embed: int = 0  # Counter for throttling embeddings
 
 
 TrackEmbeddingSample = Tuple[float, np.ndarray]
@@ -1414,8 +737,6 @@ class AppearanceGate:
         self.config = config
         self._states: dict[int, GateTrackState] = {}
         self.stats: Counter[str] = Counter()
-        # Throttle embeddings: extract every N frames per track
-        self.embed_throttle_interval = 30
 
     def reset_all(self) -> None:
         self._states.clear()
@@ -1425,42 +746,6 @@ class AppearanceGate:
             if tracker_id not in active_ids:
                 self._states.pop(tracker_id, None)
 
-    def should_extract_embedding(
-        self,
-        tracker_id: int,
-        crop: np.ndarray | None,
-        frame_idx: int,
-    ) -> tuple[bool, np.ndarray | None]:
-        """Decide whether to extract an embedding based on crop deltas + frame gap."""
-        if crop is None or crop.size == 0:
-            return False, None
-        state = self._states.setdefault(tracker_id, GateTrackState())
-        signature = _compute_crop_signature(crop)
-        if signature is None:
-            return False, None
-        changed = _signature_changed(state.last_crop_signature, signature, self.embed_change_threshold)
-        if state.last_embed_frame_idx >= 0:
-            frame_gap = frame_idx - state.last_embed_frame_idx
-            if frame_gap < self.embed_throttle_interval and not changed:
-                return False, None
-        if state.last_crop_signature is not None and not changed:
-            # Crop hasn't changed materially; skip redundant embedding
-            return False, None
-        return True, signature
-
-    def note_embedding_extracted(
-        self,
-        tracker_id: int,
-        frame_idx: int,
-        signature: np.ndarray | None,
-        success: bool,
-    ) -> None:
-        """Record the crop fingerprint for the last successful embedding."""
-        state = self._states.setdefault(tracker_id, GateTrackState())
-        if success and signature is not None:
-            state.last_embed_frame_idx = frame_idx
-            state.last_crop_signature = signature
-
     def process(
         self,
         tracker_id: int,
@@ -1469,11 +754,8 @@ class AppearanceGate:
         frame_idx: int,
     ) -> tuple[bool, str | None, float | None, float]:
         state = self._states.setdefault(tracker_id, GateTrackState())
-        # Increment frame counter for throttling
-        state.frames_since_embed += 1
         bbox_arr = bbox.astype(np.float32, copy=True)
-        embedding_vec = embedding if _embedding_is_valid(embedding) else None
-        similarity = _cosine_similarity(embedding_vec, state.proto)
+        similarity = _cosine_similarity(embedding, state.proto)
         iou = 1.0
         if state.last_box is not None:
             iou = float(_bbox_iou(state.last_box.tolist(), bbox_arr.tolist()))
@@ -1506,27 +788,17 @@ class AppearanceGate:
                 reason or "unknown",
             )
             state.low_sim_streak = 0
-            state.proto = _l2_normalize(embedding_vec.copy()) if embedding_vec is not None else None
-            if embedding_vec is not None:
-                state.frames_since_embed = 0  # Reset counter when embedding used
+            state.proto = _l2_normalize(embedding.copy()) if embedding is not None else None
         else:
             if similarity is not None:
                 self.stats["sim_sum"] += similarity
                 self.stats["sim_count"] += 1
-            if embedding_vec is not None:
+            if embedding is not None and not low_similarity:
                 if state.proto is None:
-                    state.proto = _l2_normalize(embedding_vec.copy())
-                    if _embedding_is_valid(state.proto):
-                        state.frames_since_embed = 0
-                    else:
-                        state.proto = None
-                elif similarity is not None and similarity >= PROTO_UPDATE_MIN_SIM and not low_similarity:
-                    mixed = self.config.proto_momentum * state.proto + (1.0 - self.config.proto_momentum) * embedding_vec
+                    state.proto = _l2_normalize(embedding.copy())
+                else:
+                    mixed = self.config.proto_momentum * state.proto + (1.0 - self.config.proto_momentum) * embedding
                     state.proto = _l2_normalize(mixed)
-                    if _embedding_is_valid(state.proto):
-                        state.frames_since_embed = 0  # Reset counter when embedding used
-                    else:
-                        state.proto = None
         state.last_box = bbox_arr
         return split, reason, similarity, iou
 
@@ -1572,99 +844,16 @@ def _load_show_seeds(show_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-class SeedMatcher:
-    """Approximate nearest neighbour search over seed embeddings."""
-
-    def __init__(self, seeds: List[Dict[str, Any]], rejection_sim: float = SEED_REJECTION_MIN_SIM):
-        self._seeds = seeds or []
-        self._rejection_sim = rejection_sim
-        self._ids: list[str] = []
-        self._embeddings: np.ndarray | None = None
-        self._index = None
-        self._build_index()
-
-    def _build_index(self) -> None:
-        if not self._seeds:
-            return
-        vectors: list[np.ndarray] = []
-        ids: list[str] = []
-        for seed in self._seeds:
-            embedding = seed.get("embedding")
-            cast_id = seed.get("cast_id") or seed.get("fb_id")
-            if embedding is None or cast_id is None:
-                continue
-            normed = _l2_normalize(np.asarray(embedding, dtype=np.float32))
-            if not _embedding_is_valid(normed):
-                continue
-            vectors.append(normed)
-            ids.append(str(cast_id))
-        if not vectors:
-            return
-        self._embeddings = np.vstack(vectors)
-        self._ids = ids
-        try:
-            import faiss  # type: ignore
-
-            index = faiss.IndexFlatIP(self._embeddings.shape[1])
-            index.add(self._embeddings.astype(np.float32))
-            self._index = index
-        except Exception as exc:  # pragma: no cover - faiss optional
-            LOGGER.warning("FAISS unavailable for seed matching (%s); using brute-force fallback.", exc)
-            self._index = None
-
-    @property
-    def ready(self) -> bool:
-        return self._embeddings is not None and self._embeddings.size > 0
-
-    def query(self, embedding: np.ndarray | None) -> Optional[Tuple[str, float]]:
-        if not self.ready or not _embedding_is_valid(embedding):
-            return None
-        vec = _l2_normalize(np.asarray(embedding, dtype=np.float32))
-        if not _embedding_is_valid(vec):
-            return None
-        if self._index is not None:
-            try:
-                sims, idxs = self._index.search(vec[np.newaxis, :], 1)
-            except Exception as exc:  # pragma: no cover - faiss runtime guard
-                LOGGER.warning("FAISS search failed (%s); falling back to brute-force.", exc)
-                sims = None
-                idxs = None
-            else:
-                score = float(sims[0][0])
-                best_idx = int(idxs[0][0])
-                if score >= self._rejection_sim:
-                    return self._ids[best_idx], score
-                return None
-        assert self._embeddings is not None
-        sims = np.dot(self._embeddings, vec)
-        best_idx = int(np.argmax(sims))
-        score = float(sims[best_idx])
-        if score >= self._rejection_sim:
-            return self._ids[best_idx], score
-        return None
-
-
 def _find_best_seed_match(
     embedding: np.ndarray,
     seeds: List[Dict[str, Any]],
     min_sim: float = SEED_BOOST_MIN_SIM,
-    matcher: SeedMatcher | None = None,
 ) -> Optional[Tuple[str, float]]:
     """Find the best matching seed for an embedding.
 
     Returns (cast_id, similarity) if match found above threshold, else None.
     """
     if not seeds or embedding is None:
-        return None
-
-    threshold = max(min_sim, SEED_REJECTION_MIN_SIM)
-    if matcher and matcher.ready:
-        match = matcher.query(embedding)
-        if match is None:
-            return None
-        cast_id, score = match
-        if score >= threshold:
-            return cast_id, score
         return None
 
     best_sim = -1.0
@@ -1682,7 +871,7 @@ def _find_best_seed_match(
             best_sim = sim
             best_cast_id = seed.get("cast_id")
 
-    if best_sim >= threshold and best_cast_id:
+    if best_sim >= min_sim and best_cast_id:
         return (best_cast_id, best_sim)
 
     return None
@@ -1752,7 +941,6 @@ class ByteTrackRuntimeConfig:
     track_low_thresh: float = 0.1
     track_buffer_base: int = TRACK_BUFFER_BASE_DEFAULT
     min_box_area: float = BYTE_TRACK_MIN_BOX_AREA_DEFAULT
-    fuse_score: bool = False
 
     def __post_init__(self) -> None:
         self.track_high_thresh = min(max(float(self.track_high_thresh), 0.0), 1.0)
@@ -1760,33 +948,11 @@ class ByteTrackRuntimeConfig:
         self.match_thresh = min(max(float(self.match_thresh), 0.0), 1.0)
         self.track_buffer_base = max(int(self.track_buffer_base), 1)
         self.min_box_area = max(float(self.min_box_area), 0.0)
-        self.fuse_score = bool(self.fuse_score)
 
-    def scaled_buffer(self, stride: int, fps: float | None = None, max_buffer: int = 300) -> int:
-        """Compute effective track buffer scaled by stride and capped by time-based limit.
-
-        Args:
-            stride: Frame stride for detection
-            fps: Optional FPS to compute time-based floor (defaults to 30 if unknown)
-            max_buffer: T10: Maximum buffer size to prevent runaway memory (default 300)
-
-        Returns:
-            Effective buffer in frames (minimum 1, at least max_gap_frames, capped at max_buffer)
-        """
+    def scaled_buffer(self, stride: int) -> int:
         stride_value = max(int(stride), 1)
-        # Scale buffer proportionally to stride for better track continuity
-        scale = max(1.0, float(stride_value))
+        scale = max(1.0, float(stride_value) / 3.0)
         effective = max(int(round(self.track_buffer_base * scale)), self.track_buffer_base)
-
-        # Ensure buffer is at least as large as max_gap based on seconds
-        if TRACK_MAX_GAP_SEC > 0:
-            assumed_fps = fps if fps and fps > 0 else 30.0
-            max_gap_frames = int(round(assumed_fps * TRACK_MAX_GAP_SEC))
-            effective = max(effective, max_gap_frames)
-
-        # T10: Cap the effective buffer to prevent excessive memory usage
-        effective = min(effective, max_buffer)
-
         return max(effective, 1)
 
     def summary(self, stride: int) -> Dict[str, Any]:
@@ -1798,7 +964,6 @@ class ByteTrackRuntimeConfig:
             "track_buffer_base": self.track_buffer_base,
             "min_box_area": round(self.min_box_area, 3),
             "stride": max(int(stride), 1),
-            "fuse_score": bool(self.fuse_score),
         }
 
 
@@ -1814,7 +979,7 @@ class ByteTrackAdapter:
         self.frame_rate = max(frame_rate, 1)
         self.stride = max(stride, 1)
         self.config = config or ByteTrackRuntimeConfig()
-        self._effective_buffer = self.config.scaled_buffer(self.stride, fps=self.frame_rate)
+        self._effective_buffer = self.config.scaled_buffer(self.stride)
         self._config_snapshot = self.config.summary(self.stride)
         self._tracker = self._build_tracker()
 
@@ -1831,7 +996,6 @@ class ByteTrackAdapter:
             track_buffer=self._effective_buffer,
             match_thresh=self.config.match_thresh,
             min_box_area=self.config.min_box_area,
-            fuse_score=self.config.fuse_score,
         )
         return BYTETracker(cfg, frame_rate=self.frame_rate)
 
@@ -1950,14 +1114,6 @@ class RetinaFaceDetectorBackend:
         score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
         *,
         coreml_input_size: tuple[int, int] | None = None,
-        adaptive_confidence: bool = False,
-        min_confidence: float = 0.6,
-        max_confidence: float = 0.9,
-        min_size: int | None = None,
-        nms_mode: str = "hard",
-        soft_nms_sigma: float = 0.5,
-        max_yaw_angle: float = 45.0,
-        check_pose_quality: bool = True,
     ) -> None:
         self.device = device
         self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
@@ -1965,18 +1121,6 @@ class RetinaFaceDetectorBackend:
         self._model = None
         self._resolved_device: Optional[str] = None
         self._coreml_input_size = coreml_input_size
-        # D1: Adaptive confidence threshold support
-        self.adaptive_confidence = adaptive_confidence
-        self.min_confidence = min_confidence
-        self.max_confidence = max_confidence
-        # D2: Configurable minimum face size
-        self.min_size = min_size if min_size is not None else 90
-        # D7: Soft-NMS support
-        self.nms_mode = nms_mode.lower() if nms_mode else "hard"
-        self.soft_nms_sigma = soft_nms_sigma
-        # D10: Pose quality check
-        self.max_yaw_angle = max_yaw_angle
-        self.check_pose_quality = check_pose_quality
 
     def _lazy_model(self):
         if self._model is not None:
@@ -2009,20 +1153,6 @@ class RetinaFaceDetectorBackend:
 
     def detect(self, image) -> list[DetectionSample]:
         model = self._lazy_model()
-        # D1: Compute adaptive confidence threshold if enabled
-        effective_threshold = self.score_thresh
-        if self.adaptive_confidence:
-            effective_threshold = _adaptive_confidence_threshold(
-                image,
-                base_threshold=self.score_thresh,
-                min_threshold=self.min_confidence,
-                max_threshold=self.max_confidence,
-                enable_adaptive=True,
-            )
-
-        # D2: Compute minimum face area based on min_size
-        min_face_area = float(self.min_size * self.min_size)
-
         # Threshold + input size configured during model.prepare. Some InsightFace
         # RetinaFace builds still require an explicit input_size, so pass it when
         # available.
@@ -2036,44 +1166,24 @@ class RetinaFaceDetectorBackend:
         pending: list[tuple[np.ndarray, float, np.ndarray | None]] = []
         for idx in range(len(bboxes)):
             raw = bboxes[idx]
-            score = float(raw[4]) if raw.shape[0] >= 5 else float(effective_threshold)
+            score = float(raw[4]) if raw.shape[0] >= 5 else float(self.score_thresh)
             bbox = raw[:4].astype(np.float32)
-            if not _valid_face_box(bbox, score, min_score=effective_threshold, min_area=min_face_area):
+            if not _valid_face_box(bbox, score, min_score=self.score_thresh, min_area=self.min_area):
                 continue
             kps = None
             if landmarks is not None and idx < len(landmarks):
                 kps = landmarks[idx].astype(np.float32).reshape(-1)
             pending.append((bbox, score, kps))
-        # D7: Use Soft-NMS or Hard-NMS based on configuration
-        if pending:
-            if self.nms_mode == "soft":
-                filtered = _soft_nms_detections(
-                    pending,
-                    iou_thresh=RETINAFACE_NMS,
-                    sigma=self.soft_nms_sigma,
-                    score_thresh=effective_threshold * 0.5,  # Lower threshold for soft-NMS
-                )
-            else:
-                filtered = _nms_detections(pending, RETINAFACE_NMS)
-        else:
-            filtered = []
+        filtered = _nms_detections(pending, RETINAFACE_NMS) if pending else []
         samples: list[DetectionSample] = []
         for bbox, score, kps in filtered:
-            # D10: Check pose quality and discard landmarks for extreme profiles
-            final_kps = kps
-            if self.check_pose_quality and kps is not None:
-                yaw = _estimate_face_yaw(kps)
-                if yaw is not None and abs(yaw) > self.max_yaw_angle:
-                    # Extreme profile: discard landmarks, use bbox crop only
-                    final_kps = None
-
             samples.append(
                 DetectionSample(
                     bbox=bbox.astype(np.float32),
                     conf=score,
                     class_idx=0,
                     class_label=FACE_CLASS_LABEL,
-                    landmarks=final_kps.copy() if isinstance(final_kps, np.ndarray) else None,
+                    landmarks=kps.copy() if isinstance(kps, np.ndarray) else None,
                 )
             )
         return samples
@@ -2084,28 +1194,8 @@ def _build_face_detector(
     device: str,
     score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
     coreml_input_size: tuple[int, int] | None = None,
-    adaptive_confidence: bool = False,
-    min_confidence: float = 0.6,
-    max_confidence: float = 0.9,
-    min_size: int | None = None,
-    nms_mode: str = "hard",
-    soft_nms_sigma: float = 0.5,
-    max_yaw_angle: float = 45.0,
-    check_pose_quality: bool = True,
 ):
-    return RetinaFaceDetectorBackend(
-        device,
-        score_thresh=score_thresh,
-        coreml_input_size=coreml_input_size,
-        adaptive_confidence=adaptive_confidence,
-        min_confidence=min_confidence,
-        max_confidence=max_confidence,
-        min_size=min_size,
-        nms_mode=nms_mode,
-        soft_nms_sigma=soft_nms_sigma,
-        max_yaw_angle=max_yaw_angle,
-        check_pose_quality=check_pose_quality,
-    )
+    return RetinaFaceDetectorBackend(device, score_thresh=score_thresh, coreml_input_size=coreml_input_size)
 
 
 def _build_tracker_adapter(
@@ -2252,27 +1342,6 @@ def _safe_bbox_or_none(
         return None, f"bbox_validation_error_{e}"
 
 
-def _fallback_bbox_from_frame(frame) -> np.ndarray | None:
-    """
-    Synthetic detector for test videos: bounding box around non-zero pixels.
-
-    Only invoked when RUN_ML_TESTS=1 and primary detection produces no faces.
-    """
-    try:
-        import cv2  # type: ignore
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        nz = cv2.findNonZero(gray)
-        if nz is None:
-            return None
-        x, y, w, h = cv2.boundingRect(nz)
-        if w <= 0 or h <= 0:
-            return None
-        return np.array([x, y, x + w, y + h], dtype=np.float32)
-    except Exception:
-        return None
-
-
 def _prepare_face_crop(
     image,
     bbox: list[float],
@@ -2300,8 +1369,6 @@ def _prepare_face_crop(
     import numpy as _np
 
     normalized_mode = (detector_mode or "retinaface").lower()
-    if normalized_mode == "simulated":
-        return _letterbox_square(image, size=112), None
     # For simulated detector, use the bbox it computed (centered on brightest pixels)
     # instead of letterboxing the full image. This preserves the useful crop.
     # Fall through to bbox-based cropping logic below.
@@ -2389,18 +1456,6 @@ def _estimate_blur_score(image) -> float:
     return float(variance)
 
 
-def _estimate_crop_quality_score(image) -> float:
-    """Estimate a simple quality score for a face crop based on blur and contrast."""
-    try:
-        blur = _estimate_blur_score(image)
-        std = float(np.std(image))
-        norm_blur = min(max(blur / 1000.0, 0.0), 1.0)
-        norm_std = min(max(std / 64.0, 0.0), 1.0)
-        return max(min((norm_blur + norm_std) / 2.0, 1.0), 0.0)
-    except Exception:
-        return 0.0
-
-
 def _make_skip_face_row(
     ep_id: str,
     track_id: int,
@@ -2437,22 +1492,10 @@ def _make_skip_face_row(
     return row
 
 
-def _resolved_max_gap(configured_gap: int, analyzed_fps: float | None, max_gap_sec: float | None = None) -> int:
-    """Resolve effective max gap in frames, capped by seconds-based limit.
-
-    Args:
-        configured_gap: User-configured gap in frames
-        analyzed_fps: Detected video FPS (None if unknown)
-        max_gap_sec: Optional seconds-based cap (defaults to TRACK_MAX_GAP_SEC)
-
-    Returns:
-        Effective max gap in frames (minimum 1)
-    """
+def _resolved_max_gap(configured_gap: int, analyzed_fps: float | None) -> int:
     configured = max(1, int(configured_gap))
-    sec_cap = max_gap_sec if max_gap_sec is not None else TRACK_MAX_GAP_SEC
-
-    if analyzed_fps and analyzed_fps > 0 and sec_cap > 0:
-        cadence_cap = int(round(analyzed_fps * sec_cap))
+    if analyzed_fps and analyzed_fps > 0 and TRACK_MAX_GAP_SEC > 0:
+        cadence_cap = int(max(1, round(analyzed_fps * TRACK_MAX_GAP_SEC)))
         return max(1, min(configured, cadence_cap))
     return configured
 
@@ -2467,13 +1510,11 @@ class TrackRecorder:
         self._mapping: dict[int, dict[str, int]] = {}
         self._active_exports: set[int] = set()
         self._accumulators: dict[int, TrackAccumulator] = {}
-        self._last_recorded: dict[int, dict] = {}  # B4: Track last recorded state
         self.metrics = {
             "tracks_born": 0,
             "tracks_lost": 0,
             "id_switches": 0,
             "forced_splits": 0,
-            "updates_skipped": 0,  # B4: Track redundant updates skipped
         }
 
     def _spawn_export_id(self) -> int:
@@ -2499,22 +1540,9 @@ class TrackRecorder:
         landmarks: list[float] | None = None,
         confidence: float | None = None,
         force_new_track: bool = False,
-        skip_if_unchanged: bool = False,  # B4: Skip if bbox hasn't changed
-        gate_embedding: np.ndarray | None = None,  # G3: Accept gate embedding
     ) -> int:
         if isinstance(bbox, np.ndarray):
             bbox_values = bbox.tolist()
-
-        # B4: Skip update if bbox hasn't changed significantly
-        if skip_if_unchanged and tracker_track_id in self._last_recorded:
-            last = self._last_recorded[tracker_track_id]
-            frame_gap = frame_idx - last["frame_idx"]
-            if frame_gap < 5:  # Only check recent frames
-                bbox_similar = np.allclose(bbox_values, last["bbox"], rtol=0.05)
-                if bbox_similar:
-                    self.metrics["updates_skipped"] += 1
-                    return last["export_id"]
-
         else:
             bbox_values = bbox
         export_id: int
@@ -2556,19 +1584,6 @@ class TrackRecorder:
             track = TrackAccumulator(track_id=export_id, class_id=class_label, first_ts=ts, last_ts=ts)
             self._accumulators[export_id] = track
         track.add(ts, frame_idx, bbox_values, confidence=confidence, landmarks=landmarks)
-
-        # G3: Store gate embedding if provided
-        if gate_embedding is not None:
-            track.gate_embedding = gate_embedding.tolist()
-
-
-        # B4: Update last recorded state
-        self._last_recorded[tracker_track_id] = {
-            "frame_idx": frame_idx,
-            "bbox": bbox_values,
-            "export_id": export_id,
-        }
-
         return export_id
 
     def finalize(self) -> None:
@@ -2586,7 +1601,6 @@ class TrackRecorder:
             self._complete_track(mapping["export_id"])
             forced += 1
         self._mapping.clear()
-        self._last_recorded.clear()  # B4: Clear cached state on scene cuts
         if forced:
             self.metrics["forced_splits"] += forced
 
@@ -2677,7 +1691,7 @@ def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8, copy=False)
 
 
-def save_jpeg(path: str | Path, image, *, quality: int = DEFAULT_JPEG_QUALITY, color: str = "bgr") -> None:
+def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr") -> None:
     """Normalize + persist an image to JPEG, ensuring non-blank uint8 BGR data."""
     import cv2  # type: ignore
 
@@ -2696,7 +1710,7 @@ def save_jpeg(path: str | Path, image, *, quality: int = DEFAULT_JPEG_QUALITY, c
     else:
         raise ValueError(f"Unsupported image shape for JPEG write: {arr.shape}")
     arr = np.ascontiguousarray(arr)
-    jpeg_quality = max(1, min(int(quality or DEFAULT_JPEG_QUALITY), 100))
+    jpeg_quality = max(1, min(int(quality or 85), 100))
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ok = cv2.imwrite(str(out_path), arr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
@@ -2705,10 +1719,10 @@ def save_jpeg(path: str | Path, image, *, quality: int = DEFAULT_JPEG_QUALITY, c
 
 
 class ThumbWriter:
-    def __init__(self, ep_id: str, size: int = 256, jpeg_quality: int = DEFAULT_JPEG_QUALITY) -> None:
+    def __init__(self, ep_id: str, size: int = 256, jpeg_quality: int = 85) -> None:
         self.ep_id = ep_id
         self.size = size
-        self.jpeg_quality = max(1, min(int(jpeg_quality or DEFAULT_JPEG_QUALITY), 100))
+        self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self._stat_samples = 0
@@ -2855,7 +1869,6 @@ class ProgressEmitter:
         self._detector: str | None = None
         self._tracker: str | None = None
         self._resolved_device: str | None = None
-        self._static_extra: Dict[str, Any] = {}
         self._closed = False
 
     def _now(self) -> str:
@@ -2892,7 +1905,7 @@ class ProgressEmitter:
         is_scene_phase = phase.startswith("scene_detect")
         detector_value = None if is_scene_phase else (detector or self._detector)
         tracker_value = None if is_scene_phase else (tracker or self._tracker)
-        resolved_device_value = resolved_device or self._resolved_device
+        resolved_device_value = None if is_scene_phase else (resolved_device or self._resolved_device)
 
         payload: Dict[str, object] = {
             "progress_version": self.VERSION,
@@ -2917,19 +1930,9 @@ class ProgressEmitter:
             payload["summary"] = summary
         if error:
             payload["error"] = error
-        if self._static_extra:
-            payload.update(self._static_extra)
         if extra:
             payload.update(extra)
         return payload
-
-    def set_static_fields(self, fields: Dict[str, Any]) -> None:
-        """Persist metadata across all emitted progress payloads."""
-
-        for key, value in (fields or {}).items():
-            if value is None:
-                continue
-            self._static_extra[key] = value
 
     def _write_payload(self, payload: Dict[str, object]) -> None:
         line = json.dumps(payload, sort_keys=True)
@@ -3155,28 +2158,17 @@ class FrameExporter:
         save_crops: bool,
         jpeg_quality: int,
         debug_logger: JsonlLogger | NullLogger | None = None,
-        storage: StorageService | None = None,
-        s3_prefixes: Dict[str, str] | None = None,
-        direct_to_s3: bool | None = None,
     ) -> None:
         self.ep_id = ep_id
         self.save_frames = save_frames
         self.save_crops = save_crops
-        self.jpeg_quality = max(1, min(int(jpeg_quality or DEFAULT_JPEG_QUALITY), 100))
+        self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.root_dir = get_path(ep_id, "frames_root")
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
-        self.storage = storage if storage and storage.s3_enabled() and storage.write_enabled else None
-        self.s3_prefixes = s3_prefixes or {}
-        self.frames_prefix = (self.s3_prefixes.get("frames") or "").rstrip("/")
-        self.crops_prefix = (self.s3_prefixes.get("crops") or "").rstrip("/")
-        use_storage_for_media = self.storage is not None and (self.frames_prefix or self.crops_prefix)
-        self.direct_to_s3 = bool(direct_to_s3) if direct_to_s3 is not None else use_storage_for_media
-        self._write_local_frames = self.save_frames and not self.direct_to_s3
-        self._write_local_crops = self.save_crops and not self.direct_to_s3
-        if self._write_local_frames:
+        if self.save_frames:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
-        if self._write_local_crops:
+        if self.save_crops:
             self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.frames_written = 0
         self.crops_written = 0
@@ -3189,14 +2181,6 @@ class FrameExporter:
         self._fail_fast_min_attempts = 50  # Require at least 50 attempts before checking
         self._fail_fast_reasons = {"near_uniform_gray", "tiny_file"}
         self.debug_logger = debug_logger
-        # Throttle crop exports: save every N frames only
-        self.crop_export_interval = 8
-        # Quality filters for face harvesting
-        self.min_confidence = 0.75
-        self.min_face_size = 50  # pixels
-        self._quality_filtered_count = 0
-
-        # Exports run synchronously to keep writes deterministic and avoid missing worker hooks.
 
     def _log_image_stats(self, kind: str, path: Path, image) -> None:
         if self._stat_samples >= self._stat_limit:
@@ -3224,25 +2208,13 @@ class FrameExporter:
         if not (self.save_frames or self.save_crops):
             return
         if self.save_frames:
-            frame_component = self.frame_component(frame_idx)
-            if self.direct_to_s3 and self.storage and self.frames_prefix:
-                data, err = self._encode_jpeg_bytes(image)
-                if data is None:
-                    LOGGER.warning("Skipping frame %s: %s", frame_idx, err or "encode_failed")
-                else:
-                    key = self._s3_key(self.frames_prefix, frame_component)
-                    if self.storage.upload_bytes(data, key, content_type="image/jpeg"):
-                        self.frames_written += 1
-                    else:
-                        LOGGER.warning("Failed to upload frame %s to %s", frame_idx, key)
-            else:
-                frame_path = self.frames_dir / frame_component
-                try:
-                    self._log_image_stats("frame", frame_path, image)
-                    save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
-                    self.frames_written += 1
-                except Exception as exc:  # pragma: no cover - best effort
-                    LOGGER.warning("Failed to save frame %s: %s", frame_path, exc)
+            frame_path = self.frames_dir / f"frame_{frame_idx:06d}.jpg"
+            try:
+                self._log_image_stats("frame", frame_path, image)
+                save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
+                self.frames_written += 1
+            except Exception as exc:  # pragma: no cover - best effort
+                LOGGER.warning("Failed to save frame %s: %s", frame_path, exc)
         if self.save_crops and crops:
             for track_id, bbox in crops:
                 if track_id is None:
@@ -3265,16 +2237,6 @@ class FrameExporter:
                 if saved:
                     self.crops_written += 1
                     self._record_crop_index(track_id, frame_idx, ts)
-
-    def frame_component(self, frame_idx: int) -> str:
-        return f"frame_{frame_idx:06d}.jpg"
-
-    def frame_rel_path(self, frame_idx: int) -> str:
-        return f"frames/{self.frame_component(frame_idx)}"
-
-    def _s3_key(self, prefix: str, component: str) -> str:
-        prefix_clean = prefix.rstrip("/")
-        return f"{prefix_clean}/{component}" if prefix_clean else component
 
     def crop_component(self, track_id: int, frame_idx: int) -> str:
         return f"track_{track_id:04d}/frame_{frame_idx:06d}.jpg"
@@ -3302,21 +2264,10 @@ class FrameExporter:
         for track_id, entries in self._track_indexes.items():
             if not entries:
                 continue
-            ordered = sorted(entries.values(), key=lambda item: item["frame_idx"])
-            if self.direct_to_s3 and self.storage and self.crops_prefix:
-                key = self._s3_key(self.crops_prefix, f"track_{track_id:04d}/index.json")
-                try:
-                    payload = json.dumps(ordered, indent=2).encode("utf-8")
-                except Exception as exc:  # pragma: no cover - best effort
-                    LOGGER.warning("Failed to serialize crop index for track %s: %s", track_id, exc)
-                    continue
-                if not self.storage.upload_bytes(payload, key, content_type="application/json"):
-                    LOGGER.warning("Failed to upload crop index for track %s to %s", track_id, key)
-                continue
-
             track_dir = self.crops_dir / f"track_{track_id:04d}"
             if not track_dir.exists():
                 continue
+            ordered = sorted(entries.values(), key=lambda item: item["frame_idx"])
             index_path = track_dir / "index.json"
             try:
                 index_path.write_text(json.dumps(ordered, indent=2), encoding="utf-8")
@@ -3374,17 +2325,8 @@ class FrameExporter:
                 self._emit_debug(debug_payload)
             return False
 
-        if self.direct_to_s3 and self.storage and self.crops_prefix:
-            encoded, encode_err = self._encode_jpeg_bytes(crop)
-            ok = False
-            reason = encode_err
-            if encoded is not None:
-                key = self._s3_key(self.crops_prefix, self.crop_component(track_id, frame_idx))
-                ok = self.storage.upload_bytes(encoded, key, content_type="image/jpeg")
-                reason = None if ok else "upload_failed"
-        else:
-            ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
-            reason = save_err if not ok else None
+        ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
+        reason = save_err if not ok else None
         self._register_crop_attempt(reason)
 
         if debug_payload is not None:
@@ -3397,39 +2339,16 @@ class FrameExporter:
                     "max": mx,
                     "mean": mean,
                     "save_ok": bool(ok),
-                    "save_err": reason,
+                    "save_err": save_err,
                     "file_size": (crop_path.stat().st_size if ok and crop_path.exists() else None),
                     "ms": int((time.time() - start) * 1000),
                 }
             )
             self._emit_debug(debug_payload)
 
-        if not ok and reason:
-            LOGGER.warning("Failed to save crop %s: %s", crop_path, reason)
+        if not ok and save_err:
+            LOGGER.warning("Failed to save crop %s: %s", crop_path, save_err)
         return bool(ok)
-
-    def _encode_jpeg_bytes(self, image) -> tuple[bytes | None, str | None]:
-        import cv2  # type: ignore
-
-        arr = np.asarray(image)
-        if arr.size == 0:
-            return None, "empty_image"
-        arr = _normalize_to_uint8(arr)
-        if arr.ndim == 2:
-            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-        if arr.ndim != 3 or arr.shape[2] < 3:
-            return None, "invalid_image_shape"
-        variance = float(np.std(arr)) if arr.size else 0.0
-        range_val = float(np.nanmax(arr)) - float(np.nanmin(arr)) if arr.size else 0.0
-        ok, buf = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
-        if not ok or buf is None:
-            return None, "imencode_failed"
-        data = buf.tobytes()
-        if len(data) < 1024:
-            return None, "tiny_file"
-        if variance <= 0.05 and range_val <= 1.0:
-            return None, "near_uniform_gray"
-        return data, None
 
     def _emit_debug(self, payload: Dict[str, Any]) -> None:
         if not self.debug_logger:
@@ -3439,17 +2358,6 @@ class FrameExporter:
         except Exception:  # pragma: no cover - best effort diagnostics
             # Debug logging must never break frame processing.
             pass
-
-    def summary(self) -> Dict[str, Any]:
-        """Return export summary including quality filtering stats."""
-        return {
-            "frames_written": self.frames_written,
-            "crops_written": self.crops_written,
-            "quality_filtered": self._quality_filtered_count,
-            "crop_export_interval": self.crop_export_interval,
-            "min_confidence": self.min_confidence,
-            "min_face_size": self.min_face_size,
-        }
 
 
 class FrameDecoder:
@@ -3600,7 +2508,7 @@ def _episode_ctx(ep_id: str) -> EpisodeContext | None:
 def _storage_context(
     ep_id: str,
 ) -> tuple[StorageService | None, EpisodeContext | None, Dict[str, str] | None]:
-    storage_backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
+    storage_backend = os.environ.get("STORAGE_BACKEND", "local").lower()
     storage: StorageService | None = None
     if storage_backend in {"s3", "minio"}:
         try:
@@ -3608,27 +2516,9 @@ def _storage_context(
         except Exception as exc:  # pragma: no cover - best effort init
             LOGGER.warning("Storage init failed (%s); disabling uploads", exc)
             storage = None
-    elif storage_backend != "local":
-        LOGGER.warning("Unsupported STORAGE_BACKEND '%s'; falling back to local-only exports", storage_backend)
     ep_ctx = _episode_ctx(ep_id)
     prefixes = artifact_prefixes(ep_ctx) if ep_ctx else None
     return storage, ep_ctx, prefixes
-
-
-def _warn_if_exports_disabled(
-    save_frames: bool,
-    save_crops: bool,
-    storage: StorageService | None,
-) -> None:
-    if not (save_frames or save_crops):
-        return
-    if storage and storage.s3_enabled() and storage.write_enabled:
-        return
-    backend = os.environ.get("STORAGE_BACKEND", "s3")
-    LOGGER.warning(
-        "Frame/crop export requested but STORAGE_BACKEND=%s is not s3-enabled; artifacts will stay local",
-        backend,
-    )
 
 
 def _sync_artifacts_to_s3(
@@ -3637,8 +2527,6 @@ def _sync_artifacts_to_s3(
     ep_ctx: EpisodeContext | None,
     exporter: FrameExporter | None,
     thumb_dir: Path | None = None,
-    *,
-    include_track_thumbs: bool = True,
 ) -> Dict[str, int]:
     """Sync artifacts to S3 storage.
 
@@ -3656,13 +2544,6 @@ def _sync_artifacts_to_s3(
         "thumbs_tracks": 0,
         "thumbs_identities": 0,
     }
-    if storage is None and ep_ctx is not None:
-        # Best-effort late binding in case initialization failed earlier
-        try:
-            storage = StorageService()
-        except Exception as exc:  # pragma: no cover - network/env specific
-            LOGGER.warning("Unable to init storage for S3 sync: %s", exc)
-            storage = None
     if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
         return stats
     prefixes = artifact_prefixes(ep_ctx)
@@ -3674,24 +2555,17 @@ def _sync_artifacts_to_s3(
     # Only upload frames/crops if they were actually produced in this run
     # The elif branches that uploaded stale artifacts have been removed to prevent
     # publishing old frames/crops from prior runs when exports are disabled
-    if exporter and exporter.direct_to_s3:
-        if exporter.save_frames:
-            stats["frames"] = exporter.frames_written
-        if exporter.save_crops:
-            stats["crops"] = exporter.crops_written
-    else:
-        if exporter and exporter.save_frames and exporter.frames_dir.exists():
-            stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
-        if exporter and exporter.save_crops and exporter.crops_dir.exists():
-            stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
+    if exporter and exporter.save_frames and exporter.frames_dir.exists():
+        stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
+    if exporter and exporter.save_crops and exporter.crops_dir.exists():
+        stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
     if thumb_dir is not None and thumb_dir.exists():
         identities_dir = thumb_dir / "identities"
-        if include_track_thumbs:
-            stats["thumbs_tracks"] = storage.upload_dir(
-                thumb_dir,
-                prefixes.get("thumbs_tracks", ""),
-                skip_subdirs=("identities",),
-            )
+        stats["thumbs_tracks"] = storage.upload_dir(
+            thumb_dir,
+            prefixes.get("thumbs_tracks", ""),
+            skip_subdirs=("identities",),
+        )
         if identities_dir.exists():
             stats["thumbs_identities"] = storage.upload_dir(
                 identities_dir,
@@ -3731,21 +2605,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
     parser.add_argument(
-        "--profile",
-        choices=["fast_cpu", "low_power", "balanced", "high_accuracy"],
-        default=None,
-        help=(
-            "Performance profile (fast_cpu/low_power/balanced/high_accuracy). "
-            "Automatically adjusts stride, FPS limit, and min_size for target hardware. "
-            "Defaults to device-aware choice (low_power on Apple MPS/CoreML, balanced otherwise). "
-            "Override specific settings with CLI flags."
-        ),
-    )
-    parser.add_argument(
         "--stride",
         type=int,
-        default=6,
-        help="Frame stride for detection (default: 6, was 1)",
+        default=1,
+        help="Frame stride for detection (default: 1 = every frame)",
     )
     parser.add_argument(
         "--fps",
@@ -3850,12 +2713,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Frames of forced detection after each cut",
     )
     parser.add_argument(
-        "--scene-cut-cooldown",
-        type=int,
-        default=24,
-        help="Minimum frames between scene cut resets (default: 24, prevents reset thrashing)",
-    )
-    parser.add_argument(
         "--det-thresh",
         type=float,
         default=RETINAFACE_SCORE_THRESHOLD,
@@ -3868,52 +2725,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Maximum frame gap before splitting a track",
     )
     parser.add_argument(
-        "--max-gap-sec",
-        type=float,
-        default=None,
-        help="Maximum time gap in seconds before splitting a track (overrides frame-based if FPS known, default: 2.0s)",
-    )
-    parser.add_argument(
-        "--min-track-length",
-        type=int,
-        default=3,
-        help="Minimum number of frames a track must span to be exported (default: 3)",
-    )
-    parser.add_argument(
         "--track-sample-limit",
         type=int,
-        default=6,
-        help="Max samples stored per track (default: 6, was None/unbounded)",
+        default=None,
+        help="Optional max samples stored per track (0→all detections, default)",
     )
     parser.add_argument(
         "--max-samples-per-track",
         type=int,
-        default=FACE_SAMPLES_PER_TRACK_DEFAULT,
+        default=16,
         help="Maximum samples per track for embedding/export (default: 16)",
     )
     parser.add_argument(
         "--min-samples-per-track",
         type=int,
-        default=FACE_MIN_SAMPLES_PER_TRACK_DEFAULT,
+        default=4,
         help="Minimum samples per track if track is long enough (default: 4)",
     )
     parser.add_argument(
         "--sample-every-n-frames",
         type=int,
-        default=FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT,
+        default=4,
         help="Sample interval for per-track sampling (default: 4)",
-    )
-    parser.add_argument(
-        "--min-frames-between-crops",
-        type=int,
-        default=MIN_FRAMES_BETWEEN_CROPS_DEFAULT,
-        help="Minimum frame gap between successive crops for the same track",
-    )
-    parser.add_argument(
-        "--max-faces-per-episode",
-        type=int,
-        default=FACE_MAX_PER_EPISODE_DEFAULT,
-        help="Hard cap on total faces embedded/exported per episode",
     )
     parser.add_argument("--thumb-size", type=int, default=256, help="Square thumbnail size for faces")
     parser.add_argument(
@@ -3934,7 +2767,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--jpeg-quality",
         type=int,
-        default=DEFAULT_JPEG_QUALITY,
+        default=85,
         help="JPEG quality for frame exports (1-100)",
     )
     parser.add_argument("--faces-embed", action="store_true", help="Run faces embedding stage only")
@@ -3956,6 +2789,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=float,
         default=MIN_IDENTITY_SIMILARITY,
         help="Minimum cosine similarity for a track to remain in an identity cluster (outliers are split out)",
+    )
+    parser.add_argument(
+        "--preserve-assigned",
+        action="store_true",
+        help="Preserve clusters that are assigned to cast members (don't recluster their tracks)",
     )
     gate_group = parser.add_argument_group("Appearance gate")
     gate_group.add_argument(
@@ -3999,42 +2837,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-
-    requested_device = getattr(args, "device", None)
-    try:
-        resolved_for_profile = _resolve_device(requested_device, LOGGER)
-    except Exception:
-        resolved_for_profile = requested_device
-
-    profile_name = getattr(args, "profile", None) or os.environ.get("SCREENALYTICS_PERF_PROFILE")
-    if not profile_name:
-        default_profile = _default_profile_for_device(requested_device, resolved_for_profile)
-        if default_profile:
-            profile_name = default_profile
-            args.profile = default_profile
-            LOGGER.info(
-                "[PROFILE] Defaulting to %s profile for device=%s", default_profile, resolved_for_profile or requested_device
-            )
-
-    # Apply performance profile settings (if not overridden by CLI flags)
-    profile = _load_performance_profile(profile_name) if profile_name else {}
-    if profile:
-        # Apply profile defaults only if not explicitly set via CLI
-        if not hasattr(args, "stride") or args.stride == 6:  # 6 is default
-            args.stride = profile.get("frame_stride", args.stride)
-            LOGGER.info("[PROFILE] Applied frame_stride=%d from %s profile", args.stride, profile_name)
-
-        if not hasattr(args, "fps") or args.fps is None:
-            detection_fps_limit = profile.get("detection_fps_limit") or profile.get("max_fps")
-            if detection_fps_limit:
-                args.fps = float(detection_fps_limit)
-                LOGGER.info("[PROFILE] Applied fps=%.1f from %s profile", args.fps, profile_name)
-
-        cpu_threads_hint = profile.get("cpu_threads")
-        _apply_profile_cpu_threads(cpu_threads_hint)
-
-        LOGGER.info("[PROFILE] Loaded %s profile: %s", profile_name, profile.get("description", ""))
-
     coreml_size_arg = getattr(args, "coreml_det_size", None)
     if coreml_size_arg:
         args.coreml_det_size = _parse_retinaface_det_size(coreml_size_arg)
@@ -4215,43 +3017,6 @@ def _detect_scene_cuts_histogram(
     return cuts
 
 
-def _opencv_can_open(video_path: str | Path) -> bool:
-    """Best-effort check if OpenCV can open the video (FFmpeg availability, readable frames)."""
-
-    try:
-        import cv2  # type: ignore
-    except Exception:
-        return False
-
-    try:
-        cap = cv2.VideoCapture(str(video_path))
-    except Exception:
-        return False
-    try:
-        if not hasattr(cap, "isOpened") or not cap.isOpened():
-            return False
-        frame_count = int(cap.get(getattr(cv2, "CAP_PROP_FRAME_COUNT", 0)) or 0)
-        if frame_count <= 0:
-            return False
-        return True
-    finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-
-
-def _opencv_has_ffmpeg() -> bool:
-    try:
-        import cv2  # type: ignore
-    except Exception:
-        return False
-    try:
-        return "FFmpeg" in cv2.getBuildInformation()
-    except Exception:
-        return False
-
-
 def detect_scene_cuts_pyscenedetect(
     video_path: str | Path,
     *,
@@ -4268,21 +3033,13 @@ def detect_scene_cuts_pyscenedetect(
             "PySceneDetect is required for scene detection. Install it via `pip install scenedetect>=0.6.4`."
         ) from exc
 
-    if not _opencv_has_ffmpeg():
-        LOGGER.warning("PySceneDetect/OpenCV build lacks FFmpeg; falling back to histogram-based detector.")
-        return _detect_scene_cuts_histogram(video_path, thr=0.15, min_len=min_len)
-    if not _opencv_can_open(video_path):
-        raise RuntimeError("OpenCV backend cannot open video; FFmpeg missing or video unsupported.")
-
     video = open_video(str(video_path))
     manager = SceneManager()
     detector = ContentDetector(threshold=float(threshold), min_scene_len=max(int(min_len), 1))
     manager.add_detector(detector)
-    LOGGER.info("[PySceneDetect] Starting scene detection (threshold=%.1f, min_len=%d)", threshold, min_len)
     try:
-        manager.detect_scenes(video, show_progress=True)
+        manager.detect_scenes(video, show_progress=False)
         scenes = manager.get_scene_list()
-        LOGGER.info("[PySceneDetect] Detected %d scene cuts", len(scenes))
     finally:
         close_handle = getattr(video, "close", None)
         if callable(close_handle):  # pragma: no cover - depends on backend
@@ -4305,42 +3062,16 @@ def detect_scene_cuts(
 ) -> list[int]:
     """Run the configured scene-cut detector and emit consistent progress events."""
 
-    requested_detector = detector.strip().lower() if detector else SCENE_DETECTOR_DEFAULT
     detector_choice = _normalize_scene_detector_choice(detector)
-    resolved_detector = detector_choice
     threshold_value = max(float(thr), 0.0)
     if detector_choice == "internal":
         threshold_value = max(min(threshold_value, 2.0), 0.0)
-
-    decode_backend = "opencv"
-    preflight_resolved = resolved_detector
-    if detector_choice == "pyscenedetect":
-        try:
-            if not _opencv_has_ffmpeg() or not _opencv_can_open(video_path):
-                preflight_resolved = "internal"
-        except Exception:
-            preflight_resolved = "internal"
-        if preflight_resolved != resolved_detector:
-            resolved_detector = preflight_resolved
-            detector_choice = preflight_resolved
-
     summary_start = {
-        "detector_requested": requested_detector,
-        "detector_resolved": resolved_detector,
-        "scene_mode_requested": requested_detector,
-        "scene_mode_resolved": resolved_detector,
-        "decode_backend": decode_backend,
+        "detector": detector_choice,
         "threshold": round(float(threshold_value), 3),
         "min_len": max(int(min_len), 1),
     }
     if progress:
-        progress.set_static_fields(
-            {
-                "scene_mode_requested": requested_detector,
-                "scene_mode_resolved": resolved_detector,
-                "decode_backend": decode_backend,
-            }
-        )
         progress.emit(
             0,
             phase="scene_detect:cut",
@@ -4352,33 +3083,11 @@ def detect_scene_cuts(
     if detector_choice == "off":
         cuts: list[int] = []
     elif detector_choice == "pyscenedetect":
-        try:
-            cuts = detect_scene_cuts_pyscenedetect(
-                video_path,
-                threshold=threshold_value,
-                min_len=min_len,
-            )
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            LOGGER.warning(
-                "PySceneDetect scene detection failed (%s). Falling back to internal histogram detector.",
-                exc,
-            )
-            detector_choice = "internal"
-            resolved_detector = "internal"
-            threshold_value = max(min(threshold_value, 2.0), 0.0)
-            if progress:
-                progress.set_static_fields(
-                    {
-                        "scene_mode_resolved": resolved_detector,
-                        "decode_backend": decode_backend,
-                    }
-                )
-            cuts = _detect_scene_cuts_histogram(
-                video_path,
-                thr=threshold_value,
-                min_len=min_len,
-                progress=progress,
-            )
+        cuts = detect_scene_cuts_pyscenedetect(
+            video_path,
+            threshold=threshold_value,
+            min_len=min_len,
+        )
     else:
         cuts = _detect_scene_cuts_histogram(
             video_path,
@@ -4389,18 +3098,9 @@ def detect_scene_cuts(
 
     if progress:
         total_frames = progress.target_frames or (cuts[-1] if cuts else 0)
-        summary_done = {
-            "count": len(cuts),
-            "detector": detector_choice,
-            "detector_requested": requested_detector,
-            "detector_resolved": resolved_detector,
-            "scene_mode_requested": requested_detector,
-            "scene_mode_resolved": resolved_detector,
-            "decode_backend": decode_backend,
-        }
+        summary_done = {"count": len(cuts), "detector": detector_choice}
         if cuts:
             summary_done["first_cut"] = cuts[0]
-            summary_done["indices"] = cuts
         progress.emit(
             total_frames,
             phase="scene_detect:cut",
@@ -4494,12 +3194,6 @@ def _run_full_pipeline(
     )
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
-    if progress:
-        progress.set_static_fields(
-            {
-                "detector_device": detector_device,
-            }
-        )
     tracker_label = tracker_choice
     if progress:
         start_frames, video_meta = _progress_value(-1, include_current=True)
@@ -4509,7 +3203,7 @@ def _run_full_pipeline(
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
-            resolved_device=device,
+            resolved_device=detector_device,
             force=True,
             extra=video_meta,
         )
@@ -4564,16 +3258,12 @@ def _run_full_pipeline(
     cut_ix = 0
     next_cut = scene_cuts[cut_ix] if scene_cuts else None
     frames_since_cut = 10**9
-    last_cut_reset = -999  # F1: Track last reset to prevent thrashing
-    scene_cut_cooldown = max(int(getattr(args, "scene_cut_cooldown", 0)), 0)
-    max_gap_sec_arg = getattr(args, "max_gap_sec", None)
-    max_gap_frames = _resolved_max_gap(args.max_gap, analyzed_fps, max_gap_sec=max_gap_sec_arg)
+    max_gap_frames = _resolved_max_gap(args.max_gap, analyzed_fps)
     if max_gap_frames != max(1, int(args.max_gap)):
         LOGGER.info(
-            "Track max_gap capped to %s frames (configured=%s max_gap_sec=%.2f analyzed_fps=%.2f)",
+            "Track max_gap capped to %s frames (configured=%s analyzed_fps=%.2f)",
             max_gap_frames,
             args.max_gap,
-            max_gap_sec_arg or TRACK_MAX_GAP_SEC,
             analyzed_fps or 0.0,
         )
     recorder = TrackRecorder(max_gap=max_gap_frames, remap_ids=True)
@@ -4627,39 +3317,12 @@ def _run_full_pipeline(
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video {video_dest}")
 
-    # Write to temporary files to avoid data loss if detect/track fails
-    det_path_tmp = det_path.with_suffix('.jsonl.tmp')
     try:
-        with det_path_tmp.open("w", encoding="utf-8") as det_handle:
+        with det_path.open("w", encoding="utf-8") as det_handle:
             while True:
-                # D1: Use grab() to skip frame decode for frames we won't analyze
-                # This avoids decoding ~83% of frames when stride=6
-                ok = cap.grab()
+                ok, frame = cap.read()
                 if not ok:
                     break
-
-                # Determine if we need to actually decode this frame
-                force_detect = frames_since_cut < scene_warmup
-                should_sample = frame_idx % frame_stride == 0
-                at_scene_cut = next_cut is not None and frame_idx >= next_cut
-
-                # Skip decode if we won't process this frame
-                if not (should_sample or force_detect or at_scene_cut):
-                    frame_idx += 1
-                    frames_since_cut += 1
-                    continue
-
-                # Retrieve (decode) only frames we'll actually process
-                frame_ok, frame = cap.retrieve()
-                if not frame_ok:
-                    LOGGER.warning(
-                        "Failed to retrieve frame %d for %s after successful grab",
-                        frame_idx,
-                        args.ep_id,
-                    )
-                    frame_idx += 1
-                    frames_since_cut += 1
-                    continue
 
                 # Guard against empty/None frames before detection
                 if frame is None or frame.size == 0:
@@ -4673,39 +3336,13 @@ def _run_full_pipeline(
                     continue
 
                 if next_cut is not None and frame_idx >= next_cut:
-                    # F1: Only reset if we're past cooldown period
-                    if frame_idx - last_cut_reset >= scene_cut_cooldown:
-                        reset_tracker = getattr(tracker_adapter, "reset", None)
-                        if callable(reset_tracker):
-                            reset_tracker()
-                        if appearance_gate:
-                            appearance_gate.reset_all()
-                        recorder.on_cut(frame_idx)
-                        frames_since_cut = 0
-                        last_cut_reset = frame_idx  # F1: Record reset time
-                        if progress:
-                            emit_frames, video_meta = _progress_value(frame_idx, include_current=False)
-                            progress.emit(
-                                emit_frames,
-                                phase="track",
-                                device=device,
-                                detector=detector_choice,
-                                tracker=tracker_label,
-                                resolved_device=device,
-                                summary={"event": "reset_on_cut", "frame": frame_idx},
-                                force=True,
-                                extra=video_meta,
-                            )
-                    else:
-                        # F1: Cut detected but within cooldown - skip reset
-                        LOGGER.debug(
-                            "Skipping scene cut reset at frame %d (last reset at %d, cooldown=%d)",
-                            frame_idx,
-                            last_cut_reset,
-                            scene_cut_cooldown,
-                        )
-                
-                    # Always advance to next cut (even if we skipped reset)
+                    reset_tracker = getattr(tracker_adapter, "reset", None)
+                    if callable(reset_tracker):
+                        reset_tracker()
+                    if appearance_gate:
+                        appearance_gate.reset_all()
+                    recorder.on_cut(frame_idx)
+                    frames_since_cut = 0
                     cut_ix += 1
                     next_cut = scene_cuts[cut_ix] if cut_ix < len(scene_cuts) else None
                     if progress:
@@ -4716,11 +3353,17 @@ def _run_full_pipeline(
                             device=device,
                             detector=detector_choice,
                             tracker=tracker_label,
-                            resolved_device=device,
+                            resolved_device=detector_device,
                             summary={"event": "reset_on_cut", "frame": frame_idx},
                             force=True,
                             extra=video_meta,
                         )
+                force_detect = frames_since_cut < scene_warmup
+                should_sample = frame_idx % frame_stride == 0
+                if not (should_sample or force_detect):
+                    frame_idx += 1
+                    frames_since_cut += 1
+                    continue
 
                 frames_sampled += 1
                 detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
@@ -4739,7 +3382,7 @@ def _run_full_pipeline(
                 try:
                     # DEBUG: Trace execution at frame start
                     if frames_sampled < 5:
-                        LOGGER.debug(
+                        LOGGER.error(
                             "[DEBUG] Frame %d START: entering detect/track/crop block",
                             frame_idx,
                         )
@@ -4750,7 +3393,7 @@ def _run_full_pipeline(
                         detections = detector_backend.detect(frame)
                         # DEBUG: Show detection count
                         if frames_sampled < 5:
-                            LOGGER.debug(
+                            LOGGER.error(
                                 "[DEBUG] Frame %d: detector returned %d detections",
                                 frame_idx,
                                 len(detections),
@@ -4768,7 +3411,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Show face detection count
                     if frames_sampled < 5:
-                        LOGGER.debug(
+                        LOGGER.error(
                             "[DEBUG] Frame %d: filtered to %d face detections",
                             frame_idx,
                             len(face_detections),
@@ -4808,7 +3451,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Show validation results
                     if frames_sampled < 5:
-                        LOGGER.debug(
+                        LOGGER.error(
                             "[DEBUG] Frame %d: after detection bbox validation: %d valid, %d invalid",
                             frame_idx,
                             len(validated_detections),
@@ -4818,24 +3461,6 @@ def _run_full_pipeline(
                     # Quarantine: Capture validated detections for diagnostics
                     quarantine_detections = [(det.bbox, float(det.conf)) for det in validated_detections[:10]]
                     quarantine_stage = "tracking"
-
-                    # Synthetic fallback for test videos: generate a detection if RetinaFace found none.
-                    if (
-                        not validated_detections
-                        and os.environ.get("RUN_ML_TESTS") == "1"
-                    ):
-                        synth_bbox = _fallback_bbox_from_frame(frame)
-                        if synth_bbox is not None:
-                            det_sample = DetectionSample(
-                                bbox=synth_bbox,
-                                conf=0.99,
-                                class_idx=0,
-                                class_label=FACE_CLASS_LABEL,
-                            )
-                            _record_detection_conf(det_sample.conf)
-                            validated_detections.append(det_sample)
-                            quarantine_detections = [(det_sample.bbox, float(det_sample.conf))]
-                            quarantine_stage = "synthetic_detect"
 
                     # Wrap tracker update in specific try/except to catch NoneType multiply errors
                     try:
@@ -4863,7 +3488,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Show tracker output
                     if frames_sampled < 5:
-                        LOGGER.debug(
+                        LOGGER.error(
                             "[DEBUG] Frame %d: tracker returned %d raw tracked objects",
                             frame_idx,
                             len(raw_tracked_objects),
@@ -4900,7 +3525,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Log tracked object validation results
                     if frames_sampled < 5:
-                        LOGGER.debug(
+                        LOGGER.error(
                             "[DEBUG] Frame %d: after tracked object bbox validation: %d valid, %d invalid",
                             frame_idx,
                             len(tracked_objects),
@@ -4923,8 +3548,7 @@ def _run_full_pipeline(
                     if last_diag_stats and "skipped_none_multiply" in last_diag_stats:
                         diag_stats["skipped_none_multiply"] = last_diag_stats["skipped_none_multiply"]
                     last_diag_stats = diag_stats
-                    # Rate-limit progress events: only emit every 30 frames to reduce overhead
-                    if progress and frames_sampled % 30 == 0:
+                    if progress:
                         detect_extra = dict(detect_meta)
                         detect_extra["detect_track_stats"] = diag_stats
                         progress.emit(
@@ -4933,7 +3557,7 @@ def _run_full_pipeline(
                             device=device,
                             detector=detector_choice,
                             tracker=tracker_label,
-                            resolved_device=device,
+                            resolved_device=detector_device,
                             extra=detect_extra,
                         )
 
@@ -4986,7 +3610,7 @@ def _run_full_pipeline(
                         if should_embed_gate and gate_embedder and tracked_objects:
                             # DEBUG: Show gate embedding processing
                             if frames_sampled < 5:
-                                LOGGER.debug(
+                                LOGGER.error(
                                     "[DEBUG] Frame %d: processing gate embeddings for %d tracks",
                                     frame_idx,
                                     len(tracked_objects),
@@ -4994,8 +3618,6 @@ def _run_full_pipeline(
 
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
-                            embed_signatures: list[np.ndarray | None] = []
-                            embed_frame_idxs: list[int] = []
                             for obj in tracked_objects:
                                 # Validate bbox before cropping to prevent NoneType multiply errors
                                 validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
@@ -5029,80 +3651,17 @@ def _run_full_pipeline(
                                             crop_err,
                                         )
                                     continue
-
-                                yaw, pitch, expression = _analyze_pose_expression(landmarks_list)
-                                if yaw is not None and abs(yaw) > FACE_EMBED_MAX_YAW:
-                                    LOGGER.debug(
-                                        "Gate embedding skipped for track %s frame %d: yaw %.2f exceeds %.2f",
-                                        obj.track_id,
-                                        frame_idx,
-                                        yaw,
-                                        FACE_EMBED_MAX_YAW,
-                                    )
-                                    continue
-                                if pitch is not None and abs(pitch) > FACE_EMBED_MAX_PITCH:
-                                    LOGGER.debug(
-                                        "Gate embedding skipped for track %s frame %d: pitch %.2f exceeds %.2f",
-                                        obj.track_id,
-                                        frame_idx,
-                                        pitch,
-                                        FACE_EMBED_MAX_PITCH,
-                                    )
-                                    continue
-                                if expression not in FACE_EMBED_ALLOWED_EXPRESSIONS and expression != "unknown":
-                                    LOGGER.debug(
-                                        "Gate embedding skipped for track %s frame %d: disallowed expression=%s",
-                                        obj.track_id,
-                                        frame_idx,
-                                        expression,
-                                    )
-                                    continue
-
-                                quality_score = _estimate_crop_quality_score(crop)
-                                if quality_score < FACE_EMBED_MIN_QUALITY:
-                                    LOGGER.debug(
-                                        "Gate embedding skipped for track %s frame %d: low quality %.2f (< %.2f)",
-                                        obj.track_id,
-                                        frame_idx,
-                                        quality_score,
-                                        FACE_EMBED_MIN_QUALITY,
-                                    )
-                                    continue
-
-                                should_embed, signature = appearance_gate.should_extract_embedding(
-                                    obj.track_id,
-                                    crop,
-                                    frame_idx,
-                                )
-                                if not should_embed:
-                                    continue
-
                                 aligned = _resize_for_arcface(crop)
                                 embed_inputs.append(aligned)
                                 embed_track_ids.append(obj.track_id)
-                                embed_signatures.append(signature)
-                                embed_frame_idxs.append(frame_idx)
                             if embed_inputs:
                                 encoded = gate_embedder.encode(embed_inputs)
                                 for idx, tid in enumerate(embed_track_ids):
                                     embedding_vec = encoded[idx]
-                                    signature = embed_signatures[idx]
-                                    embed_frame_val = embed_frame_idxs[idx]
-                                    success = False
                                     # Validate embedding contains finite values before storing
                                     try:
                                         if embedding_vec is not None and np.all(np.isfinite(embedding_vec)):
-                                            normed = np.asarray(embedding_vec, dtype=np.float32)
-                                            if _embedding_is_valid(normed):
-                                                gate_embeddings[tid] = normed
-                                                success = True
-                                            else:
-                                                gate_embeddings[tid] = None
-                                                LOGGER.warning(
-                                                    "Gate embedding for track %s at frame %d is zero-norm; discarding",
-                                                    tid,
-                                                    frame_idx,
-                                                )
+                                            gate_embeddings[tid] = embedding_vec
                                         else:
                                             gate_embeddings[tid] = None
                                             if embedding_vec is not None:
@@ -5118,13 +3677,6 @@ def _run_full_pipeline(
                                             "Gate embedding for track %s at frame %d is not a valid numeric array, discarding",
                                             tid,
                                             frame_idx,
-                                        )
-                                    finally:
-                                        appearance_gate.note_embedding_extracted(
-                                            tid,
-                                            embed_frame_val,
-                                            signature,
-                                            success=success,
                                         )
                         for obj in tracked_objects:
                             gate_embeddings.setdefault(obj.track_id, None)
@@ -5142,26 +3694,8 @@ def _run_full_pipeline(
                         continue
 
                     active_ids: set[int] = set()
-                    for obj_idx, obj in enumerate(tracked_objects):
+                    for obj in tracked_objects:
                         active_ids.add(obj.track_id)
-
-                        # B2: Skip heavy processing for most tracks to reduce CPU ~80%
-                        # Still record track continuity but skip appearance gate, JSON writes, crops
-                        if obj_idx % TRACK_PROCESS_SKIP != 0:
-                            # Lightweight continuity update only
-                            recorder.record(
-                                tracker_track_id=obj.track_id,
-                                frame_idx=frame_idx,
-                                ts=ts,
-                                bbox=obj.bbox,
-                                class_label=FACE_CLASS_LABEL,
-                                landmarks=None,
-                                confidence=float(obj.conf) if obj.conf is not None else None,
-                                force_new_track=False,
-                            )
-                            continue
-
-                        # Full processing for sampled tracks
                         class_value = FACE_CLASS_LABEL
                         landmarks = None
                         if obj.landmarks is not None:
@@ -5208,24 +3742,7 @@ def _run_full_pipeline(
                             row["landmarks"] = [round(float(val), 4) for val in landmarks]
                         det_handle.write(json.dumps(row) + "\n")
                         det_count += 1
-
-                        # B3: Crop sampling - only save crops for subset of tracks
-                        if frame_exporter and frame_exporter.save_crops and obj_idx % TRACK_CROP_SKIP == 0:
-                            # Apply quality filters for face harvesting
-                            # 1. Frame interval: only save every N frames
-                            if frame_idx % frame_exporter.crop_export_interval != 0:
-                                continue
-                            # 2. Confidence threshold
-                            if conf_value < frame_exporter.min_confidence:
-                                frame_exporter._quality_filtered_count += 1
-                                continue
-                            # 3. Face size: check bbox dimensions
-                            x1, y1, x2, y2 = bbox_list
-                            face_width = abs(x2 - x1)
-                            face_height = abs(y2 - y1)
-                            if face_width < frame_exporter.min_face_size or face_height < frame_exporter.min_face_size:
-                                frame_exporter._quality_filtered_count += 1
-                                continue
+                        if frame_exporter and frame_exporter.save_crops:
                             crop_records.append((export_id, bbox_list))
 
                     if appearance_gate:
@@ -5236,7 +3753,7 @@ def _run_full_pipeline(
 
                     # DEBUG: Frame processing completed successfully
                     if frames_sampled < 5:
-                        LOGGER.debug(
+                        LOGGER.error(
                             "[DEBUG] Frame %d END: completed all detect/track/crop processing successfully",
                             frame_idx,
                         )
@@ -5339,7 +3856,7 @@ def _run_full_pipeline(
                                 device=device,
                                 detector=detector_choice,
                                 tracker=tracker_label,
-                                resolved_device=device,
+                                resolved_device=detector_device,
                                 summary={
                                     "event": "none_multiply_skip",
                                     "frame": frame_idx,
@@ -5377,7 +3894,7 @@ def _run_full_pipeline(
                         device=device,
                         detector=detector_choice,
                         tracker=tracker_label,
-                        resolved_device=device,
+                        resolved_device=detector_device,
                         summary={
                             "tracks_born": recorder.metrics["tracks_born"],
                             "tracks_lost": recorder.metrics["tracks_lost"],
@@ -5413,7 +3930,7 @@ def _run_full_pipeline(
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
-            resolved_device=device,
+            resolved_device=detector_device,
             force=True,
             extra=detect_done_meta,
         )
@@ -5421,22 +3938,7 @@ def _run_full_pipeline(
     recorder.finalize()
     if frame_exporter:
         frame_exporter.write_indexes()
-
-    # Get all tracks and filter by minimum length
-    all_track_rows = recorder.rows()
-    min_track_length = getattr(args, "min_track_length", 3)
-    track_rows = [row for row in all_track_rows if row.get("frame_count", 0) >= min_track_length]
-
-    if min_track_length > 1 and len(all_track_rows) > len(track_rows):
-        filtered_count = len(all_track_rows) - len(track_rows)
-        LOGGER.info(
-            "Filtered %d micro-tracks (<%d frames) from %d total tracks; %d tracks remain",
-            filtered_count,
-            min_track_length,
-            len(all_track_rows),
-            len(track_rows),
-        )
-
+    track_rows = recorder.rows()
     final_diag_stats = last_diag_stats or _diagnostic_stats(0, 0)
 
     # CRITICAL: Validate that tracking produced results when detections exist
@@ -5464,84 +3966,13 @@ def _run_full_pipeline(
         row["detector"] = detector_choice
         row["tracker"] = tracker_label
     _write_jsonl(track_path, track_rows)
-    # Atomically move detections temp file into place (only after tracks also succeeded)
-    det_path_tmp.replace(det_path)
-
-    # Calculate derived metrics
-    tracks_born = recorder.metrics["tracks_born"]
-    tracks_lost = recorder.metrics["tracks_lost"]
-    id_switches = recorder.metrics["id_switches"]
-    forced_splits = recorder.metrics.get("forced_splits", 0)
-
-    # Episode duration in minutes (from frames sampled and FPS)
-    duration_min = 0.0
-    frames_for_duration = frames_goal if frames_goal and frames_goal > 0 else frames_sampled
-    if analyzed_fps and analyzed_fps > 0 and frames_for_duration > 0:
-        duration_min = (frames_for_duration / analyzed_fps) / 60.0
-
-    # Tracks per minute
-    tracks_per_minute = 0.0
-    if duration_min > 0:
-        tracks_per_minute = tracks_born / duration_min
-
-    # Short track fraction (tracks filtered out due to min_track_length)
-    short_track_fraction = 0.0
-    if len(all_track_rows) > 0:
-        short_track_count = len(all_track_rows) - len(track_rows)
-        short_track_fraction = short_track_count / len(all_track_rows)
-
-    # ID switch rate
-    id_switch_rate = 0.0
-    if tracks_born > 0:
-        id_switch_rate = id_switches / tracks_born
-
-    # Guardrails: Emit warnings when metrics exceed thresholds
-    # (based on docs/ops/troubleshooting_faces_pipeline.md and ACCEPTANCE_MATRIX.md)
-    if tracks_per_minute > 50:
-        LOGGER.warning(
-            "[GUARDRAIL] High track count detected: %.1f tracks/min (threshold: 50). "
-            "This may indicate track explosion. Consider increasing track_thresh to 0.75-0.85 "
-            "or new_track_thresh to 0.85-0.90. See docs/ops/troubleshooting_faces_pipeline.md",
-            tracks_per_minute,
-        )
-
-    if short_track_fraction > 0.3:
-        LOGGER.warning(
-            "[GUARDRAIL] High short track fraction: %.2f (threshold: 0.30). "
-            "%.1f%% of tracks are ghost tracks (<%d frames). "
-            "Consider increasing min_box_area to 400 or new_track_thresh to 0.85-0.90. "
-            "See docs/ops/troubleshooting_faces_pipeline.md",
-            short_track_fraction,
-            short_track_fraction * 100,
-            min_track_length,
-        )
-
-    if id_switch_rate > 0.1:
-        LOGGER.warning(
-            "[GUARDRAIL] High ID switch rate: %.3f (threshold: 0.10). "
-            "Tracker is unstable with %.1f%% of tracks experiencing ID switches. "
-            "Consider increasing match_thresh to 0.85-0.90, track_buffer to 120-180, "
-            "or decreasing TRACK_GATE_APPEAR_HARD to 0.60. "
-            "See docs/ops/troubleshooting_faces_pipeline.md",
-            id_switch_rate,
-            id_switch_rate * 100,
-        )
-
     metrics = {
-        "total_detections": det_count,
-        "total_tracks": len(track_rows),
-        "tracks_born": tracks_born,
-        "tracks_lost": tracks_lost,
-        "id_switches": id_switches,
-        "forced_splits": forced_splits,
+        "tracks_born": recorder.metrics["tracks_born"],
+        "tracks_lost": recorder.metrics["tracks_lost"],
+        "id_switches": recorder.metrics["id_switches"],
+        "forced_splits": recorder.metrics.get("forced_splits", 0),
         "longest_tracks": recorder.top_long_tracks(),
         "max_gap_frames": recorder.max_gap,
-        # Derived metrics
-        "duration_minutes": round(duration_min, 2),
-        "tracks_per_minute": round(tracks_per_minute, 2),
-        "short_track_count": len(all_track_rows) - len(track_rows),
-        "short_track_fraction": round(short_track_fraction, 3),
-        "id_switch_rate": round(id_switch_rate, 3),
     }
     if tracker_config_summary:
         metrics["tracker_config"] = tracker_config_summary
@@ -5561,7 +3992,7 @@ def _run_full_pipeline(
             device=device,
             detector=detector_choice,
             tracker=tracker_label,
-            resolved_device=device,
+            resolved_device=detector_device,
             summary=metrics,
             force=True,
             extra=track_done_meta,
@@ -5582,18 +4013,10 @@ def _run_full_pipeline(
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
-    """Write rows to JSONL file atomically.
-
-    Writes to a temporary file first, then renames to the target path on success.
-    This prevents data loss if the write operation fails.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix('.jsonl.tmp')
-    with tmp_path.open("w", encoding="utf-8") as handle:
+    with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
-    # Atomic rename: only replace the target file if write succeeded
-    tmp_path.replace(path)
 
 
 def _run_detect_track_stage(
@@ -5627,42 +4050,9 @@ def _run_detect_track_stage(
             frame_count=frame_count,
         )
 
-    requested_device = getattr(args, "device", None)
-    resolved_device = _resolve_device(requested_device, LOGGER)
-    args.device = resolved_device
-
-    detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
-    tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
-    args.detector = detector_choice
-    args.tracker = tracker_choice
-
-    scene_mode_requested = getattr(args, "scene_detector", SCENE_DETECTOR_DEFAULT)
-    scene_mode_resolved = scene_mode_requested
-    decode_backend = "opencv"
-    if scene_mode_requested == "pyscenedetect":
-        try:
-            if not _opencv_has_ffmpeg() or not _opencv_can_open(video_dest):
-                scene_mode_resolved = "internal"
-        except Exception:
-            scene_mode_resolved = "internal"
-
-    manifests_dir = get_path(args.ep_id, "detections").parent
-    progress_file_path = Path(args.progress_file).expanduser() if args.progress_file else manifests_dir / "progress.json"
-
-    profile_value = getattr(args, "profile", None)
-    cpu_threads_raw = (
-        os.environ.get("SCREANALYTICS_MAX_CPU_THREADS")
-        or os.environ.get("SCREENALYTICS_MAX_CPU_THREADS")
-        or os.environ.get("OMP_NUM_THREADS")
-    )
-    try:
-        cpu_threads_value = int(cpu_threads_raw) if cpu_threads_raw else None
-    except (TypeError, ValueError):
-        cpu_threads_value = None
-
     progress = ProgressEmitter(
         args.ep_id,
-        progress_file_path,
+        args.progress_file,
         frames_total=frames_total,
         secs_total=duration_sec,
         stride=args.stride,
@@ -5670,59 +4060,17 @@ def _run_detect_track_stage(
         fps_requested=target_fps,
     )
 
-    progress.set_static_fields(
-        {
-            "device_requested": requested_device,
-            "device_resolved": resolved_device,
-            "scene_mode_requested": scene_mode_requested,
-            "scene_mode_resolved": scene_mode_resolved,
-            "decode_backend": decode_backend,
-            "detector_requested": detector_choice,
-            "detector_resolved": detector_choice,
-            "tracker_requested": tracker_choice,
-            "tracker_resolved": tracker_choice,
-            "profile": profile_value,
-            "cpu_threads": cpu_threads_value,
-            "save_frames": bool(args.save_frames),
-            "save_crops": bool(args.save_crops),
-        }
-    )
-    init_summary = {
-        "device_requested": requested_device,
-        "device_resolved": resolved_device,
-        "scene_mode_requested": scene_mode_requested,
-        "scene_mode_resolved": scene_mode_resolved,
-        "decode_backend": decode_backend,
-        "detector": detector_choice,
-        "detector_requested": detector_choice,
-        "detector_resolved": detector_choice,
-        "tracker": tracker_choice,
-        "tracker_requested": tracker_choice,
-        "tracker_resolved": tracker_choice,
-        "frames_total": frames_total,
-        "profile": profile_value,
-        "stride": args.stride,
-        "save_frames": bool(args.save_frames),
-        "save_crops": bool(args.save_crops),
-        "cpu_threads": cpu_threads_value,
-    }
     # Emit initial progress before model initialization to ensure progress.json
     # exists even if the job fails early (e.g., model load error, video access issue)
     progress.emit(
         frames_done=0,
         phase="init",
-        device=resolved_device,
-        detector=detector_choice,
-        tracker=tracker_choice,
-        resolved_device=resolved_device,
-        summary=init_summary,
         force=True,
     )
 
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
-    _warn_if_exports_disabled(save_frames, save_crops, storage)
-    jpeg_quality = max(1, min(int(args.jpeg_quality or DEFAULT_JPEG_QUALITY), 100))
+    jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
     frame_exporter = (
@@ -5732,8 +4080,6 @@ def _run_detect_track_stage(
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
             debug_logger=None,
-            storage=storage,
-            s3_prefixes=s3_prefixes,
         )
         if (save_frames or save_crops)
         else None
@@ -5787,7 +4133,7 @@ def _run_detect_track_stage(
             device=pipeline_device,
             detector=detector_choice,
             tracker=tracker_choice,
-            resolved_device=resolved_device,
+            resolved_device=detector_device,
         )
         track_ratio = round(track_count / det_count, 3) if det_count > 0 else 0.0
         summary: Dict[str, Any] = {
@@ -5805,16 +4151,9 @@ def _run_detect_track_stage(
             "frames_total": progress.target_frames,
             "frames_exported": frame_exporter.frames_written if frame_exporter else 0,
             "crops_exported": frame_exporter.crops_written if frame_exporter else 0,
-            "profile": profile_value,
-            "stride": args.stride,
-            "fps": target_fps,
-            "save_frames": save_frames,
-            "save_crops": save_crops,
-            "cpu_threads": cpu_threads_value,
             "device": pipeline_device,
-            "requested_device": requested_device,
-            "resolved_device": resolved_device,
-            "detector_device": detector_device,
+            "requested_device": args.device,
+            "resolved_device": detector_device,
             "analyzed_fps": analyzed_fps,
             "detector": detector_choice,
             "tracker": tracker_choice,
@@ -5825,20 +4164,15 @@ def _run_detect_track_stage(
                     "tracks": str(get_path(args.ep_id, "tracks")),
                     "manifests_dir": str(manifests_dir),
                     "frames_dir": (
-                        str(frame_exporter.frames_dir)
-                        if frame_exporter and frame_exporter.save_frames and not frame_exporter.direct_to_s3
-                        else None
+                        str(frame_exporter.frames_dir) if frame_exporter and frame_exporter.save_frames else None
                     ),
                     "crops_dir": (
-                        str(frame_exporter.crops_dir)
-                        if frame_exporter and frame_exporter.save_crops and not frame_exporter.direct_to_s3
-                        else None
+                        str(frame_exporter.crops_dir) if frame_exporter and frame_exporter.save_crops else None
                     ),
                 },
                 "s3_prefixes": s3_prefixes,
                 "s3_uploads": s3_stats,
             },
-            "direct_s3": bool(frame_exporter.direct_to_s3) if frame_exporter else False,
         }
         if detect_track_stats:
             summary["detect_track_stats"] = detect_track_stats
@@ -5846,38 +4180,11 @@ def _run_detect_track_stage(
             summary["tracker_config"] = tracker_config_summary
         scene_summary = scene_summary or {"count": 0}
         metrics_path = manifests_dir / "track_metrics.json"
-
-        # Include crop statistics from frame exporter
-        crop_stats = _crop_diag_meta(frame_exporter)
-        if crop_stats:
-            # Calculate crop quality metrics
-            total_crops = crop_stats.get("crop_attempts", 0)
-            crop_errors = crop_stats.get("crop_errors", {})
-
-            # Count blank/gray crops (near_uniform_gray + tiny_file)
-            blank_crops = crop_errors.get("near_uniform_gray", 0) + crop_errors.get("tiny_file", 0)
-            blank_fraction = round(blank_crops / max(total_crops, 1), 4) if total_crops > 0 else 0.0
-
-            crop_stats["blank_crops"] = blank_crops
-            crop_stats["blank_fraction"] = blank_fraction
-
-            # Warn if blank fraction exceeds 10%
-            if blank_fraction > 0.10 and total_crops > 0:
-                LOGGER.warning(
-                    "High blank crop rate for %s: %d/%d (%.1f%%) crops were blank or near-uniform. "
-                    "Consider reviewing quality gating thresholds or source video quality.",
-                    args.ep_id,
-                    blank_crops,
-                    total_crops,
-                    blank_fraction * 100,
-                )
-
         metrics_payload = {
             "ep_id": args.ep_id,
             "generated_at": _utcnow_iso(),
             "metrics": track_metrics,
             "scene_cuts": scene_summary,
-            "crop_stats": crop_stats if crop_stats else None,
         }
         try:
             metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
@@ -5911,7 +4218,7 @@ def _run_detect_track_stage(
             device=pipeline_device,
             detector=detector_choice,
             tracker=tracker_choice,
-            resolved_device=resolved_device,
+            resolved_device=detector_device,
             step="detect_track",
             extra=completion_extra or None,
         )
@@ -5930,7 +4237,7 @@ def _run_detect_track_stage(
                 "detector": detector_choice,
                 "tracker": tracker_choice,
                 "stride": args.stride,
-                "det_thresh": args.det_thresh,
+                "det_thresh": det_thresh,
                 "max_gap": getattr(args, "max_gap", None),
                 "scene_detector": args.scene_detector,
                 "scene_threshold": args.scene_threshold,
@@ -5943,9 +4250,8 @@ def _run_detect_track_stage(
                 "save_crops": save_crops,
                 "jpeg_quality": jpeg_quality,
                 "device": pipeline_device,
-                "requested_device": requested_device,
-                "resolved_device": resolved_device,
-                "detector_device": detector_device,
+                "requested_device": args.device,
+                "resolved_device": detector_device,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
@@ -5958,88 +4264,6 @@ def _run_detect_track_stage(
         progress.close()
 
 
-def _resolve_face_sampling_params(args: argparse.Namespace) -> Dict[str, int | None]:
-    config = _load_faces_embed_config()
-    limits_cfg = config.get("limits") if isinstance(config, dict) else {}
-    default_limits = limits_cfg.get("default") if isinstance(limits_cfg, dict) else {}
-    profile_name = getattr(args, "profile", None) or os.environ.get("SCREENALYTICS_PERF_PROFILE")
-    profile = profile_name.lower().strip() if isinstance(profile_name, str) and profile_name else None
-    profile_limits = {}
-    if profile and isinstance(limits_cfg, dict):
-        raw_profiles = limits_cfg.get("profiles")
-        if isinstance(raw_profiles, dict):
-            profile_limits = raw_profiles.get(profile, {}) or {}
-
-    def _as_int(value: Any) -> int | None:
-        try:
-            if value is None:
-                return None
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _pick(
-        arg_value: Any,
-        *,
-        key: str,
-        parser_default: int,
-        fallback: int,
-    ) -> int:
-        profile_val = _as_int(profile_limits.get(key)) if profile_limits else None
-        default_val = _as_int(default_limits.get(key)) if default_limits else None
-        arg_numeric = _as_int(arg_value)
-        if arg_numeric is not None and arg_numeric != parser_default:
-            return arg_numeric
-        if profile_val is not None:
-            return profile_val
-        if default_val is not None:
-            return default_val
-        if arg_numeric is not None:
-            return arg_numeric
-        return fallback
-
-    max_per_track = _pick(
-        getattr(args, "max_samples_per_track", None),
-        key="max_samples_per_track",
-        parser_default=FACE_SAMPLES_PER_TRACK_DEFAULT,
-        fallback=FACE_SAMPLES_PER_TRACK_DEFAULT,
-    )
-    min_per_track = _pick(
-        getattr(args, "min_samples_per_track", None),
-        key="min_samples_per_track",
-        parser_default=FACE_MIN_SAMPLES_PER_TRACK_DEFAULT,
-        fallback=FACE_MIN_SAMPLES_PER_TRACK_DEFAULT,
-    )
-    sample_every = _pick(
-        getattr(args, "sample_every_n_frames", None),
-        key="sample_every_n_frames",
-        parser_default=FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT,
-        fallback=FACE_SAMPLE_EVERY_N_FRAMES_DEFAULT,
-    )
-    min_frames_between = _pick(
-        getattr(args, "min_frames_between_crops", None),
-        key="min_frames_between_crops",
-        parser_default=MIN_FRAMES_BETWEEN_CROPS_DEFAULT,
-        fallback=MIN_FRAMES_BETWEEN_CROPS_DEFAULT,
-    )
-    max_faces_total_val = _pick(
-        getattr(args, "max_faces_per_episode", None),
-        key="max_faces_per_episode",
-        parser_default=FACE_MAX_PER_EPISODE_DEFAULT,
-        fallback=FACE_MAX_PER_EPISODE_DEFAULT,
-    )
-    max_faces_total = max_faces_total_val if max_faces_total_val and max_faces_total_val > 0 else None
-    if min_per_track > max_per_track:
-        min_per_track = max_per_track
-    return {
-        "max_samples_per_track": max(1, int(max_per_track)),
-        "min_samples_per_track": max(1, int(min_per_track)),
-        "sample_every_n_frames": max(1, int(sample_every)),
-        "min_frames_between_crops": max(1, int(min_frames_between)),
-        "max_faces_per_episode": max_faces_total,
-    }
-
-
 def _run_faces_embed_stage(
     args: argparse.Namespace,
     storage: StorageService | None,
@@ -6049,102 +4273,17 @@ def _run_faces_embed_stage(
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
-    sampling_params = _resolve_face_sampling_params(args)
     # Sort samples by frame to enable batch embedding per frame
     # Apply per-track sampling to limit embedding/export volume
     samples = _load_track_samples(
         track_path,
         sort_by_frame=True,
-        max_samples_per_track=sampling_params["max_samples_per_track"],
-        min_samples_per_track=sampling_params["min_samples_per_track"],
-        sample_every_n_frames=sampling_params["sample_every_n_frames"],
-        min_frames_between_crops=sampling_params["min_frames_between_crops"],
-        max_faces_total=sampling_params.get("max_faces_per_episode"),
+        max_samples_per_track=getattr(args, "max_samples_per_track", 16),
+        min_samples_per_track=getattr(args, "min_samples_per_track", 4),
+        sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
     )
-    manifests_dir = get_path(args.ep_id, "detections").parent
-    faces_path = manifests_dir / "faces.jsonl"
-    embeds_dir = manifests_dir.parent / "embeds" / args.ep_id
     if not samples:
-        # Gracefully succeed with empty artifacts when no tracks/faces are available.
-        LOGGER.warning("No track samples available for faces embedding; writing empty artifacts.")
-        faces_path.parent.mkdir(parents=True, exist_ok=True)
-        faces_path.write_text("", encoding="utf-8")
-        embeds_dir.mkdir(parents=True, exist_ok=True)
-        faces_npy_path = embeds_dir / "faces.npy"
-        np.save(faces_npy_path, np.zeros((0, 512), dtype=np.float32))
-        faces_npy_manifest = manifests_dir / "faces.npy"
-        try:
-            shutil.copy(faces_npy_path, faces_npy_manifest)
-        except Exception:
-            np.save(faces_npy_manifest, np.zeros((0, 512), dtype=np.float32))
-        progress = ProgressEmitter(
-            args.ep_id,
-            args.progress_file,
-            frames_total=0,
-            secs_total=None,
-            stride=1,
-            fps_detected=None,
-            fps_requested=None,
-        )
-        embed_device = pick_device(getattr(args, "embed_device", None) or args.device)
-        detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
-        tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
-        summary: Dict[str, Any] = {
-            "stage": "faces_embed",
-            "faces": 0,
-            "faces_total": 0,
-            "tracks": 0,
-            "ep_id": args.ep_id,
-            "device": embed_device,
-            "detector": detector_choice,
-            "tracker": tracker_choice,
-            "artifacts": {
-                "local": {
-                    "faces": str(faces_path),
-                    "faces_embeddings": str(faces_npy_path),
-                    "manifests_dir": str(manifests_dir),
-                }
-            },
-        }
-        phase_meta = _non_video_phase_meta()
-        progress.emit(
-            0,
-            phase="faces_embed",
-            device=embed_device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
-            summary=summary,
-            force=True,
-            extra=phase_meta,
-        )
-        progress.complete(
-            summary,
-            device=embed_device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
-            extra=phase_meta,
-            step="faces_embed",
-        )
-        _write_run_marker(
-            args.ep_id,
-            "faces_embed",
-            {
-                "phase": "faces_embed",
-                "status": "success",
-                "version": APP_VERSION,
-                "faces": 0,
-                "faces_total": 0,
-                "device": embed_device,
-                "detector": detector_choice,
-                "tracker": tracker_choice,
-                "started_at": _utcnow_iso(),
-                "finished_at": _utcnow_iso(),
-            },
-        )
-        progress.close()
-        return summary
+        raise RuntimeError("No track samples available for faces embedding")
 
     faces_total = len(samples)
     progress = ProgressEmitter(
@@ -6160,8 +4299,7 @@ def _run_faces_embed_stage(
     device = pick_device(requested_embed_device)
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
-    _warn_if_exports_disabled(save_frames, save_crops, storage)
-    jpeg_quality = max(1, min(int(args.jpeg_quality or DEFAULT_JPEG_QUALITY), 100))
+    jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
     frames_root = get_path(args.ep_id, "frames_root")
     debug_logger_obj: JsonlLogger | NullLogger | None = None
     if save_crops and debug_thumbs_enabled():
@@ -6173,18 +4311,15 @@ def _run_faces_embed_stage(
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
             debug_logger=debug_logger_obj,
-            storage=storage,
-            s3_prefixes=s3_prefixes,
         )
         if (save_frames or save_crops)
         else None
     )
-    thumb_root = frames_root / "thumbs"
-    thumb_size_val = int(getattr(args, "thumb_size", 256))
 
     def _phase_meta(step: str | None = None) -> Dict[str, Any]:
         return _non_video_phase_meta(step, crop_diag_source=exporter)
 
+    thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
     # Respect --coreml-only flag to prevent CPU fallback and enforce <300% CPU budget
@@ -6194,15 +4329,16 @@ def _run_faces_embed_stage(
     embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
 
+    manifests_dir = get_path(args.ep_id, "detections").parent
+    faces_path = manifests_dir / "faces.jsonl"
     video_path = get_path(args.ep_id, "video")
     frame_decoder: FrameDecoder | None = None
     track_embeddings: Dict[int, List[TrackEmbeddingSample]] = defaultdict(list)
-    track_best_crop: Dict[int, tuple[float, str, str | None, Path | None]] = {}
+    track_best_thumb: Dict[int, tuple[float, str, str | None]] = {}
     embeddings_array: List[np.ndarray] = []
 
     # Load seeds for seed-based face matching
     show_seeds = []
-    seed_matcher: SeedMatcher | None = None
     seed_match_stats = {"enabled": SEED_BOOST_ENABLED, "matches": 0, "total": 0}
     if SEED_BOOST_ENABLED:
         show_id = _parse_ep_id_for_show(args.ep_id)
@@ -6210,7 +4346,6 @@ def _run_faces_embed_stage(
             show_seeds = _load_show_seeds(show_id)
             if show_seeds:
                 LOGGER.info("Loaded %d seed embeddings for show %s", len(show_seeds), show_id)
-                seed_matcher = SeedMatcher(show_seeds)
 
     faces_done = 0
     started_at = _utcnow_iso()
@@ -6307,7 +4442,6 @@ def _run_faces_embed_stage(
                 crop_s3_key = None
                 thumb_rel_path = None
                 thumb_s3_key = None
-                crop_local_path: Path | None = None
                 raw_conf = sample.get("conf")
                 if raw_conf is None:
                     raw_conf = sample.get("confidence")
@@ -6323,9 +4457,6 @@ def _run_faces_embed_stage(
                     exporter.export(frame_idx, image, [(track_id, bbox)], ts=ts_val)
                     if exporter.save_crops:
                         crop_rel_path = exporter.crop_rel_path(track_id, frame_idx)
-                        abs_crop = exporter.crop_abs_path(track_id, frame_idx)
-                        if abs_crop.exists():
-                            crop_local_path = abs_crop
                         if s3_prefixes and s3_prefixes.get("crops"):
                             crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
 
@@ -6370,83 +4501,6 @@ def _run_faces_embed_stage(
                     faces_done = min(faces_total, faces_done + 1)
                     continue
 
-                pose_yaw, pose_pitch, expression = _analyze_pose_expression(landmarks)
-                if pose_yaw is not None and abs(pose_yaw) > FACE_EMBED_MAX_YAW:
-                    rows.append(
-                        _make_skip_face_row(
-                            args.ep_id,
-                            track_id,
-                            frame_idx,
-                            ts_val,
-                            bbox,
-                            detector_choice,
-                            f"pose_yaw:{pose_yaw:.1f}",
-                            crop_rel_path=crop_rel_path,
-                            crop_s3_key=crop_s3_key,
-                            thumb_rel_path=thumb_rel_path,
-                            thumb_s3_key=thumb_s3_key,
-                        )
-                    )
-                    faces_done = min(faces_total, faces_done + 1)
-                    continue
-                if pose_pitch is not None and abs(pose_pitch) > FACE_EMBED_MAX_PITCH:
-                    rows.append(
-                        _make_skip_face_row(
-                            args.ep_id,
-                            track_id,
-                            frame_idx,
-                            ts_val,
-                            bbox,
-                            detector_choice,
-                            f"pose_pitch:{pose_pitch:.1f}",
-                            crop_rel_path=crop_rel_path,
-                            crop_s3_key=crop_s3_key,
-                            thumb_rel_path=thumb_rel_path,
-                            thumb_s3_key=thumb_s3_key,
-                        )
-                    )
-                    faces_done = min(faces_total, faces_done + 1)
-                    continue
-                if expression is not None and expression not in FACE_EMBED_ALLOWED_EXPRESSIONS and expression != "unknown":
-                    rows.append(
-                        _make_skip_face_row(
-                            args.ep_id,
-                            track_id,
-                            frame_idx,
-                            ts_val,
-                            bbox,
-                            detector_choice,
-                            f"expression:{expression}",
-                            crop_rel_path=crop_rel_path,
-                            crop_s3_key=crop_s3_key,
-                            thumb_rel_path=thumb_rel_path,
-                            thumb_s3_key=thumb_s3_key,
-                        )
-                    )
-                    faces_done = min(faces_total, faces_done + 1)
-                    continue
-
-                quality_score = _estimate_crop_quality_score(crop)
-                if quality_score < FACE_EMBED_MIN_QUALITY:
-                    rows.append(
-                        _make_skip_face_row(
-                            args.ep_id,
-                            track_id,
-                            frame_idx,
-                            ts_val,
-                            bbox,
-                            detector_choice,
-                            f"low_quality:{quality_score:.2f}",
-                            crop_rel_path=crop_rel_path,
-                            crop_s3_key=crop_s3_key,
-                            thumb_rel_path=thumb_rel_path,
-                            thumb_s3_key=thumb_s3_key,
-                        )
-                    )
-                    faces_done = min(faces_total, faces_done + 1)
-                    continue
-
-                quality = min(1.0, max(quality, quality_score / 10.0))
                 crop_std = float(np.std(crop))
                 blur_score = _estimate_blur_score(crop)
                 skip_reason: str | None = None
@@ -6480,6 +4534,18 @@ def _run_faces_embed_stage(
                     faces_done = min(faces_total, faces_done + 1)
                     continue
 
+                # Quality checks passed - create thumbnail for this valid face
+                if image is not None:
+                    thumb_rel_path, _ = thumb_writer.write(
+                        image,
+                        validated_bbox,
+                        track_id,
+                        frame_idx,
+                        prepared_crop=crop,
+                    )
+                    if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
+                        thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
+
                 # Add to batch for embedding
                 batch_crops.append(crop)
                 batch_metadata.append({
@@ -6491,7 +4557,6 @@ def _run_faces_embed_stage(
                     "crop_s3_key": crop_s3_key,
                     "thumb_rel_path": thumb_rel_path,
                     "thumb_s3_key": thumb_s3_key,
-                    "crop_local_path": crop_local_path,
                     "conf": conf,
                     "quality": quality,
                     "track_id": track_id,
@@ -6508,8 +4573,9 @@ def _run_faces_embed_stage(
                     ts_val = meta["ts_val"]
                     bbox = meta["bbox"]
                     
-                    # Check for invalid embeddings (NaN/Inf/zero)
-                    if not _embedding_is_valid(embedding_vec):
+                    # Check for zero-norm embedding (invalid)
+                    embedding_norm = float(np.linalg.norm(embedding_vec))
+                    if embedding_norm < 1e-6:
                         rows.append(
                             _make_skip_face_row(
                                 args.ep_id,
@@ -6518,7 +4584,7 @@ def _run_faces_embed_stage(
                                 ts_val,
                                 bbox,
                                 detector_choice,
-                                "invalid_embedding",
+                                "zero_norm_embedding",
                                 crop_rel_path=meta["crop_rel_path"],
                                 crop_s3_key=meta["crop_s3_key"],
                                 thumb_rel_path=meta["thumb_rel_path"],
@@ -6536,40 +4602,16 @@ def _run_faces_embed_stage(
                     seed_similarity = None
                     if show_seeds and SEED_BOOST_ENABLED:
                         seed_match_stats["total"] += 1
-                        match_result = _find_best_seed_match(
-                            embedding_vec,
-                            show_seeds,
-                            min_sim=SEED_BOOST_MIN_SIM,
-                            matcher=seed_matcher,
-                        )
+                        match_result = _find_best_seed_match(embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM)
                         if match_result:
                             seed_cast_id, seed_similarity = match_result
                             seed_match_stats["matches"] += 1
                     
-                    if meta.get("crop_rel_path"):
-                        prev_crop = track_best_crop.get(track_id)
-                        is_better = prev_crop is None or meta["quality"] > prev_crop[0]
-                        if is_better:
-                            cached_path = meta.get("crop_local_path") if meta.get("crop_local_path") else None
-                            if (cached_path is None or not cached_path.exists()) and meta.get("crop_rel_path"):
-                                candidate_path = get_path(args.ep_id, "frames_root") / str(meta["crop_rel_path"])
-                                try:
-                                    candidate_path.parent.mkdir(parents=True, exist_ok=True)
-                                    safe_imwrite(candidate_path, crop, jpeg_quality)
-                                    cached_path = candidate_path
-                                except Exception as exc:
-                                    LOGGER.debug(
-                                        "Failed to cache best crop locally for track %s frame %s: %s",
-                                        track_id,
-                                        frame_idx,
-                                        exc,
-                                    )
-                            track_best_crop[track_id] = (
-                                float(meta["quality"]),
-                                str(meta["crop_rel_path"]),
-                                meta["crop_s3_key"],
-                                cached_path,
-                            )
+                    # Track best thumbnail
+                    if meta["thumb_rel_path"]:
+                        prev = track_best_thumb.get(track_id)
+                        if not prev or meta["quality"] > prev[0]:
+                            track_best_thumb[track_id] = (meta["quality"], meta["thumb_rel_path"], meta["thumb_s3_key"])
 
                     face_row = {
                         "ep_id": args.ep_id,
@@ -6589,6 +4631,10 @@ def _run_faces_embed_stage(
                         face_row["crop_rel_path"] = meta["crop_rel_path"]
                     if meta["crop_s3_key"]:
                         face_row["crop_s3_key"] = meta["crop_s3_key"]
+                    if meta["thumb_rel_path"]:
+                        face_row["thumb_rel_path"] = meta["thumb_rel_path"]
+                    if meta["thumb_s3_key"]:
+                        face_row["thumb_s3_key"] = meta["thumb_s3_key"]
                     if meta["landmarks"]:
                         face_row["landmarks"] = [round(float(val), 4) for val in meta["landmarks"]]
                     if seed_cast_id:
@@ -6654,13 +4700,8 @@ def _run_faces_embed_stage(
             np.save(embed_path, np.vstack(embeddings_array))
         else:
             np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
-        manifest_faces_npy = manifests_dir / "faces.npy"
-        try:
-            shutil.copy(embed_path, manifest_faces_npy)
-        except Exception:
-            np.save(manifest_faces_npy, np.zeros((0, 512), dtype=np.float32))
 
-        _update_track_embeddings(track_path, track_embeddings, {}, embedding_model_name, track_best_crop)
+        _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
         if exporter:
             exporter.write_indexes()
 
@@ -6683,27 +4724,14 @@ def _run_faces_embed_stage(
                     "faces": str(faces_path),
                     "tracks": str(track_path),
                     "manifests_dir": str(manifests_dir),
-                    "frames_dir": (
-                        str(exporter.frames_dir)
-                        if exporter and exporter.save_frames and not exporter.direct_to_s3
-                        else None
-                    ),
-                    "crops_dir": (
-                        str(exporter.crops_dir)
-                        if exporter and exporter.save_crops and not exporter.direct_to_s3
-                        else None
-                    ),
-                    "thumbs_dir": str(thumb_root),
+                    "frames_dir": (str(exporter.frames_dir) if exporter and exporter.save_frames else None),
+                    "crops_dir": (str(exporter.crops_dir) if exporter and exporter.save_crops else None),
+                    "thumbs_dir": str(thumb_writer.root_dir),
                     "faces_embeddings": str(embed_path),
                 },
                 "s3_prefixes": s3_prefixes,
             },
-            "stats": {
-                "faces": len(rows),
-                "embedding_model": embedding_model_name,
-                "sampling": sampling_params,
-            },
-            "direct_s3": bool(exporter.direct_to_s3) if exporter else False,
+            "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
         }
 
         # Emit completion BEFORE S3 sync (which might hang or take long)
@@ -6729,14 +4757,7 @@ def _run_faces_embed_stage(
         )
 
         # Now do S3 sync after completion is signaled
-        s3_stats = _sync_artifacts_to_s3(
-            args.ep_id,
-            storage,
-            ep_ctx,
-            exporter,
-            None,
-            include_track_thumbs=False,
-        )
+        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
         summary["artifacts"]["s3_uploads"] = s3_stats
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
@@ -6751,13 +4772,8 @@ def _run_faces_embed_stage(
                 "save_frames": save_frames,
                 "save_crops": save_crops,
                 "jpeg_quality": jpeg_quality,
-                "thumb_size": thumb_size_val,
+                "thumb_size": thumb_writer.size,
                 "device": device,
-                "max_faces_per_episode": sampling_params.get("max_faces_per_episode"),
-                "max_samples_per_track": sampling_params["max_samples_per_track"],
-                "min_samples_per_track": sampling_params["min_samples_per_track"],
-                "sample_every_n_frames": sampling_params["sample_every_n_frames"],
-                "min_frames_between_crops": sampling_params["min_frames_between_crops"],
                 "requested_device": requested_embed_device,
                 "resolved_device": embed_device,
                 "started_at": started_at,
@@ -6804,7 +4820,7 @@ def _select_track_prototype(
     weights: list[float] = []
     for score, vec in capped:
         normed = _l2_normalize(vec)
-        if not _embedding_is_valid(normed):
+        if normed is None:
             continue
         vectors.append(normed)
         weights.append(max(float(score), 1e-3))
@@ -6819,7 +4835,7 @@ def _select_track_prototype(
         weight_arr = weight_arr / weight_sum
     proto = np.sum(stack * weight_arr[:, None], axis=0)
     proto = _l2_normalize(proto)
-    if not _embedding_is_valid(proto):
+    if proto is None:
         return None, stack.shape[0], None
     sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
     sims = np.clip(sims, -1.0, 1.0)
@@ -6833,8 +4849,6 @@ def _select_track_prototype(
             weight_arr = weight_arr / max(float(weight_arr.sum()), 1e-6)
             proto = np.sum(stack * weight_arr[:, None], axis=0)
             proto = _l2_normalize(proto)
-            if not _embedding_is_valid(proto):
-                return None, stack.shape[0], None
             sims = np.array([float(np.dot(vec, proto)) for vec in stack], dtype=np.float32)
             sims = np.clip(sims, -1.0, 1.0)
     spread = _max_pairwise_cosine_distance(stack)
@@ -6846,19 +4860,13 @@ def _update_track_embeddings(
     track_embeddings: Dict[int, List[TrackEmbeddingSample]],
     track_best_thumb: Dict[int, tuple[float, str, str | None]],
     embedding_model: str,
-    track_best_crop: Dict[int, tuple[float, str, str | None, Path | None]] | None = None,
 ) -> None:
     if not track_path.exists():
         return
     rows = list(_iter_jsonl(track_path))
     updated: List[dict] = []
-
-    # Collect track embeddings for writing to tracks.npy
-    track_embeds_array: List[np.ndarray] = []
-    track_ids_array: List[int] = []
-
     for row in rows:
-        track_id = _parse_track_id(row.get("track_id", -1))
+        track_id = int(row.get("track_id", -1))
         samples = track_embeddings.get(track_id) or []
         if samples:
             proto_vec, sample_count, spread = _select_track_prototype(samples)
@@ -6869,51 +4877,15 @@ def _update_track_embeddings(
                 row["face_embedding_samples"] = sample_count
                 if spread is not None:
                     row["face_embedding_spread"] = round(float(spread), 4)
-
-                # Collect for tracks.npy
-                track_embeds_array.append(proto_vec)
-                track_ids_array.append(track_id)
-        thumb_info = track_best_thumb.get(track_id) if track_best_thumb else None
+        thumb_info = track_best_thumb.get(track_id)
         if thumb_info:
             _, rel_path, s3_key = thumb_info
             row["thumb_rel_path"] = rel_path
             if s3_key:
                 row["thumb_s3_key"] = s3_key
-        crop_info = track_best_crop.get(track_id) if track_best_crop else None
-        if crop_info:
-            _, rel_path, s3_key, _ = crop_info
-            row["best_crop_rel_path"] = rel_path
-            if s3_key:
-                row["best_crop_s3_key"] = s3_key
-            row.setdefault("thumb_rel_path", rel_path)
-            if s3_key:
-                row.setdefault("thumb_s3_key", s3_key)
         updated.append(row)
     if updated:
         _write_jsonl(track_path, updated)
-
-    # Write track embeddings to tracks.npy (for clustering)
-    # This provides a consolidated array of track-level embeddings
-    if track_embeds_array:
-        ep_id = track_path.parent.parent.name  # Extract ep_id from path
-        embeds_dir = track_path.parents[2] / "embeds" / ep_id
-        embeds_dir.mkdir(parents=True, exist_ok=True)
-        tracks_npy_path = embeds_dir / "tracks.npy"
-        track_ids_path = embeds_dir / "track_ids.json"
-
-        np.save(tracks_npy_path, np.vstack(track_embeds_array))
-
-        # Write track_ids.json mapping (index → track_id)
-        import json
-        with open(track_ids_path, 'w') as f:
-            json.dump(track_ids_array, f)
-
-        LOGGER.info(
-            "Wrote %d track embeddings to %s (shape: %s)",
-            len(track_embeds_array),
-            tracks_npy_path,
-            np.vstack(track_embeds_array).shape
-        )
 
 
 def _run_cluster_stage(
@@ -6928,137 +4900,16 @@ def _run_cluster_stage(
         raise FileNotFoundError("faces.jsonl not found; run faces embedding first")
     faces_rows = list(_iter_jsonl(faces_path))
     if not faces_rows:
-        LOGGER.warning("faces.jsonl is empty; skipping clustering and writing empty identities.")
-        faces_total = 0
-        progress = ProgressEmitter(
-            args.ep_id,
-            args.progress_file,
-            frames_total=faces_total,
-            secs_total=None,
-            stride=1,
-            fps_detected=None,
-            fps_requested=None,
-        )
-        detector_choice = _infer_detector_from_tracks(get_path(args.ep_id, "tracks")) or DEFAULT_DETECTOR
-        tracker_choice = _infer_tracker_from_tracks(get_path(args.ep_id, "tracks")) or DEFAULT_TRACKER
-        device = pick_device(args.device)
-        phase_meta = _non_video_phase_meta()
-        progress.emit(
-            0,
-            phase="cluster",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            summary={"identities": 0, "faces": 0},
-            force=True,
-            extra=phase_meta,
-        )
-        identities_path = manifests_dir / "identities.json"
-        identities_path.write_text(json.dumps({"identities": []}, indent=2), encoding="utf-8")
-        cluster_metrics = {
-            "total_clusters": 0,
-            "singleton_fraction": 0.0,
-            "largest_cluster_fraction": 0.0,
-            "singleton_count": 0,
-            "largest_cluster_size": 0,
-        }
-        summary = {
-            "stage": "cluster",
-            "ep_id": args.ep_id,
-            "identities": 0,
-            "faces": 0,
-            "tracks": 0,
-            "cluster_metrics": cluster_metrics,
-            "artifacts": {
-                "local": {
-                    "identities": str(identities_path),
-                    "faces": str(faces_path),
-                    "manifests_dir": str(manifests_dir),
-                }
-            },
-        }
-        track_metrics_path = manifests_dir / "track_metrics.json"
-        try:
-            payload = (
-                json.loads(track_metrics_path.read_text(encoding="utf-8"))
-                if track_metrics_path.exists()
-                else {"metrics": {}}
-            )
-            payload["cluster_metrics"] = cluster_metrics
-            track_metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except Exception as exc:
-            LOGGER.warning("Failed to write cluster metrics for empty faces: %s", exc)
-        progress.complete(
-            summary,
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            extra=phase_meta,
-            step="cluster",
-        )
-        _write_run_marker(
-            args.ep_id,
-            "cluster",
-            {
-                "phase": "cluster",
-                "status": "success",
-                "version": APP_VERSION,
-                "identities": 0,
-                "faces": 0,
-                "tracks": 0,
-                "cluster_thresh": args.cluster_thresh,
-                "min_cluster_size": args.min_cluster_size,
-                "min_identity_sim": args.min_identity_sim,
-                "device": device,
-                "detector": detector_choice,
-                "tracker": tracker_choice,
-                "started_at": _utcnow_iso(),
-                "finished_at": _utcnow_iso(),
-            },
-        )
-        progress.close()
-        return summary
+        raise RuntimeError("faces.jsonl is empty; cannot cluster")
     faces_total = len(faces_rows)
     faces_per_track: Dict[int, int] = defaultdict(int)
-    face_embeds_path = manifests_dir / "faces.npy"
-    face_embeds_array: np.ndarray | None = None
-    if face_embeds_path.exists():
-        try:
-            face_embeds_array = np.load(face_embeds_path)
-        except Exception:
-            face_embeds_array = None
-    embeddings_by_track: Dict[int, List[np.ndarray]] = defaultdict(list)
-    for idx, face_row in enumerate(faces_rows):
+    for face_row in faces_rows:
         track_id_val = face_row.get("track_id")
         try:
-            track_key = _parse_track_id(track_id_val)
-        except Exception:
+            track_key = int(track_id_val)
+        except (TypeError, ValueError):
             continue
-        emb_val = face_row.get("embedding")
-        if emb_val is None and face_embeds_array is not None and idx < len(face_embeds_array):
-            emb_val = face_embeds_array[idx]
-            face_row["embedding"] = emb_val.tolist() if hasattr(emb_val, "tolist") else emb_val
         faces_per_track[track_key] += 1
-        if emb_val is None:
-            continue
-        try:
-            emb_arr = np.asarray(emb_val, dtype=np.float32)
-        except Exception:
-            continue
-        if emb_arr.size == 0:
-            continue
-        embeddings_by_track[track_key].append(emb_arr)
-    averaged_embeddings: Dict[int, np.ndarray] = {}
-    for tid, embeds in embeddings_by_track.items():
-        try:
-            stacked = np.stack(embeds, axis=0)
-            proto = stacked.mean(axis=0)
-            normed = _l2_normalize(proto)
-            averaged_embeddings[tid] = normed if normed is not None else proto
-        except Exception:
-            continue
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
@@ -7070,12 +4921,9 @@ def _run_cluster_stage(
     for row in track_rows:
         track_id_val = row.get("track_id")
         try:
-            track_id = _parse_track_id(track_id_val)
+            track_id = int(track_id_val)
         except (TypeError, ValueError):
             continue
-        if "face_embedding" not in row and track_id in averaged_embeddings:
-            row["face_embedding"] = averaged_embeddings[track_id].tolist()
-            row.setdefault("face_embedding_spread", 0.0)
         spread_val = row.get("face_embedding_spread")
         if spread_val is None:
             continue
@@ -7091,6 +4939,69 @@ def _run_cluster_stage(
             len(flagged_tracks),
             distance_threshold,
         )
+
+    # =========================================================================
+    # PRESERVE CAST-ASSIGNED CLUSTERS
+    # Load existing identities and protect clusters linked to cast members
+    # =========================================================================
+    preserved_identities: List[dict] = []
+    preserved_track_ids: Set[int] = set()
+    max_preserved_id: int = 0
+
+    identities_path = manifests_dir / "identities.json"
+    if identities_path.exists():
+        try:
+            existing_data = json.loads(identities_path.read_text(encoding="utf-8"))
+            existing_identities = existing_data.get("identities", [])
+
+            # Load people service to check cast assignments
+            try:
+                from apps.api.services.people import PeopleService
+                people_service = PeopleService()
+
+                # Parse show_slug from ep_id (e.g., "rhobh-s05e14" -> "RHOBH")
+                import re
+                ep_match = re.match(r"^(?P<show>.+)-s\d{2}e\d{2}$", args.ep_id, re.IGNORECASE)
+                show_slug = ep_match.group("show").upper() if ep_match else None
+
+                if show_slug:
+                    for identity in existing_identities:
+                        person_id = identity.get("person_id")
+                        if not person_id:
+                            continue
+
+                        # Check if this person is linked to a cast member
+                        person = people_service.get_person(show_slug, person_id)
+                        if person and person.get("cast_id"):
+                            # This cluster is assigned to a cast member - preserve it!
+                            preserved_identities.append(identity)
+                            for tid in identity.get("track_ids", []):
+                                try:
+                                    preserved_track_ids.add(int(tid))
+                                except (TypeError, ValueError):
+                                    pass
+
+                            # Track max identity ID for renumbering new clusters
+                            identity_id = identity.get("identity_id", "")
+                            if identity_id.startswith("id_"):
+                                try:
+                                    id_num = int(identity_id[3:])
+                                    max_preserved_id = max(max_preserved_id, id_num)
+                                except ValueError:
+                                    pass
+
+                    if preserved_identities:
+                        LOGGER.info(
+                            "Preserving %d clusters (%d tracks) assigned to cast members",
+                            len(preserved_identities),
+                            len(preserved_track_ids),
+                        )
+            except ImportError:
+                LOGGER.warning("PeopleService not available; skipping cast preservation check")
+            except Exception as exc:
+                LOGGER.warning("Failed to check cast assignments: %s; proceeding without preservation", exc)
+        except (json.JSONDecodeError, OSError) as exc:
+            LOGGER.warning("Failed to load existing identities.json: %s", exc)
 
     progress = ProgressEmitter(
         args.ep_id,
@@ -7113,7 +5024,6 @@ def _run_cluster_stage(
         force=True,
         extra=phase_meta,
     )
-    LOGGER.info("[PHASE] cluster: start ep_id=%s device=%s", args.ep_id, device)
 
     started_at = _utcnow_iso()
     try:
@@ -7124,8 +5034,11 @@ def _run_cluster_stage(
         tracks_with_embeddings: Set[int] = set()
 
         for row in track_rows:
-            track_id = _parse_track_id(row.get("track_id", -1))
+            track_id = int(row.get("track_id", -1))
             track_index[track_id] = row
+            # Skip preserved tracks (assigned to cast members) - they stay in their existing cluster
+            if track_id in preserved_track_ids:
+                continue
             if track_id in flagged_tracks:
                 forced_singletons.append([track_id])
                 continue
@@ -7138,6 +5051,9 @@ def _run_cluster_stage(
         # Add tracks with no accepted embeddings as forced singletons
         # This ensures tracks whose faces were all skipped still appear in identities.json
         for track_id, row in track_index.items():
+            # Skip preserved tracks
+            if track_id in preserved_track_ids:
+                continue
             if track_id not in tracks_with_embeddings and track_id not in flagged_tracks:
                 # Track has no embedding and wasn't already flagged
                 faces_count = faces_per_track.get(track_id, 0)
@@ -7149,7 +5065,8 @@ def _run_cluster_stage(
                         faces_count,
                     )
 
-        if not embedding_rows and not forced_singletons:
+        # Allow empty clustering if we have preserved identities
+        if not embedding_rows and not forced_singletons and not preserved_identities:
             raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
         track_groups: Dict[int, List[int]] = defaultdict(list)
@@ -7182,9 +5099,9 @@ def _run_cluster_stage(
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
         thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
-        thumb_size_val = int(getattr(args, "thumb_size", 256))
         faces_done = 0
-        identity_counter = 1
+        # Start identity counter after max preserved ID to avoid collisions
+        identity_counter = max_preserved_id + 1
         candidate_groups: List[List[int]] = list(track_groups.values())
         candidate_groups.extend(forced_singletons)
 
@@ -7194,37 +5111,7 @@ def _run_cluster_stage(
 
         # Build outlier lookup for manifest metadata
         outlier_map: Dict[int, str] = {tid: reason for tid, reason in outlier_tracks}
-        best_face_scores: Dict[int, tuple[int, int, float, int]] = {}
-        best_face_by_track: Dict[int, Dict[str, Any]] = {}
-        for row in faces_rows:
-            try:
-                tid = _parse_track_id(row.get("track_id", -1))
-                frame_idx = int(row.get("frame_idx", 10**9))
-            except (TypeError, ValueError):
-                continue
-            skip_flag = 1 if row.get("skip") else 0
-            has_media = 0 if (row.get("crop_rel_path") or row.get("thumb_rel_path") or row.get("crop_s3_key") or row.get("thumb_s3_key")) else 1
-            quality_value = row.get("quality")
-            if quality_value is None:
-                quality_value = row.get("conf") or row.get("confidence")
-            try:
-                quality_score = float(quality_value) if quality_value is not None else 0.0
-            except (TypeError, ValueError):
-                quality_score = 0.0
-            candidate_score = (skip_flag, has_media, -quality_score, frame_idx)
-            best_score = best_face_scores.get(tid)
-            if best_score is None or candidate_score < best_score:
-                best_face_scores[tid] = candidate_score
-                best_face_by_track[tid] = row
-        # Optional singleton merge (second-stage) when singleton fraction is high
-        merged_groups, singleton_merge_summary = _apply_singleton_merge(
-            candidate_groups,
-            track_embeddings,
-            primary_cluster_thresh=args.cluster_thresh,
-            min_cluster_size=min_cluster,
-        )
-
-        for tids in merged_groups:
+        for tids in candidate_groups:
             buckets = [tids]
             if len(tids) < min_cluster:
                 buckets = [[tid] for tid in tids]
@@ -7239,14 +5126,10 @@ def _run_cluster_stage(
                     key=lambda tid: track_index.get(tid, {}).get("faces_count", 0),
                 )
                 rep_rel, rep_s3 = _materialize_identity_thumb(
-                    args.ep_id,
                     thumb_root,
                     track_index.get(rep_track_id),
                     identity_id,
                     s3_prefixes,
-                    best_face=best_face_by_track.get(rep_track_id),
-                    thumb_size=thumb_size_val,
-                    storage=storage,
                 )
 
                 # Check if any tracks in this identity are outliers
@@ -7317,106 +5200,15 @@ def _run_cluster_stage(
             force=True,
         )
 
+        # Merge preserved identities (cast-assigned) with newly clustered identities
+        # Preserved identities come first to maintain their original IDs
+        all_identities = preserved_identities + identity_payload
+        preserved_faces = sum(
+            identity.get("size", 0) for identity in preserved_identities
+        )
+
         identities_path = manifests_dir / "identities.json"
-        low_cohesion_count = sum(1 for identity in identity_payload if identity.get("low_cohesion"))
-
-        # Compute cluster metrics
-        total_clusters = len(identity_payload)
-        total_tracks = sum(len(identity.get("track_ids", [])) for identity in identity_payload)
-
-        # Singleton fraction (identities with only 1 track)
-        singleton_count = sum(1 for identity in identity_payload if len(identity.get("track_ids", [])) == 1)
-        singleton_fraction = singleton_count / total_clusters if total_clusters > 0 else 0.0
-        # Align merge summary with final counts
-        singleton_merge_summary.update(
-            {
-                "singleton_count_after": singleton_count,
-                "singleton_fraction_after": round(singleton_fraction, 3),
-                "total_clusters_after": total_clusters,
-            }
-        )
-
-        # Largest cluster fraction (largest identity's track count / total tracks)
-        largest_cluster_size = max((len(identity.get("track_ids", [])) for identity in identity_payload), default=0)
-        largest_cluster_fraction = largest_cluster_size / total_tracks if total_tracks > 0 else 0.0
-        cluster_thresholds = _CLUSTERING_CONFIG_EARLY.get("metrics_thresholds", {})
-        singleton_threshold = cluster_thresholds.get("max_singleton_fraction", 0.50)
-        try:
-            singleton_threshold = float(singleton_threshold)
-        except (TypeError, ValueError):
-            singleton_threshold = 0.50
-        cluster_thresholds = {**cluster_thresholds, "max_singleton_fraction": singleton_threshold}
-        singleton_stats = {
-            "enabled": bool(singleton_merge_summary.get("enabled")),
-            "threshold": singleton_threshold,
-            "before": {
-                "singleton_fraction": singleton_merge_summary.get("singleton_fraction_before"),
-                "cluster_count": singleton_merge_summary.get("total_clusters_before"),
-                "singleton_count": singleton_merge_summary.get("singleton_count_before"),
-            },
-            "after": {
-                "singleton_fraction": round(singleton_fraction, 3),
-                "cluster_count": total_clusters,
-                "singleton_count": singleton_count,
-                "merge_count": singleton_merge_summary.get("num_singleton_merges"),
-            },
-        }
-        cluster_metrics = {
-            "singleton_count": singleton_count,
-            "singleton_fraction": round(singleton_fraction, 3),
-            "largest_cluster_size": largest_cluster_size,
-            "largest_cluster_fraction": round(largest_cluster_fraction, 3),
-            "total_clusters": total_clusters,
-            "singleton_merge": singleton_merge_summary,
-            "singleton_fraction_before": singleton_merge_summary.get("singleton_fraction_before"),
-            "singleton_fraction_after": singleton_merge_summary.get("singleton_fraction_after"),
-            "total_clusters_before": singleton_merge_summary.get("total_clusters_before"),
-            "total_clusters_after": singleton_merge_summary.get("total_clusters_after"),
-            "singleton_stats": singleton_stats,
-        }
-
-        # Guardrails: Emit warnings when cluster metrics exceed thresholds
-        # (based on docs/ops/troubleshooting_faces_pipeline.md and ACCEPTANCE_MATRIX.md)
-        _emit_singleton_guardrail(
-            singleton_stats,
-            cluster_thresholds=cluster_thresholds,
-            merge_summary=singleton_merge_summary,
-            cluster_thresh=args.cluster_thresh,
-        )
-
-        if largest_cluster_fraction > cluster_thresholds.get("max_largest_cluster_fraction", 0.60):
-            LOGGER.warning(
-                "[GUARDRAIL] Over-merged largest cluster: %.2f (threshold: %.2f). "
-                "One identity contains %.1f%% of all tracks (possibly multiple people). "
-                "Consider increasing cluster_thresh to %.2f-%.2f. "
-                "See docs/ops/troubleshooting_faces_pipeline.md",
-                largest_cluster_fraction,
-                cluster_thresholds.get("max_largest_cluster_fraction", 0.60),
-                largest_cluster_fraction * 100,
-                args.cluster_thresh + 0.05,
-                args.cluster_thresh + 0.10,
-            )
-
-        if total_clusters < cluster_thresholds.get("min_cluster_count", 3):
-            LOGGER.warning(
-                "[GUARDRAIL] Very few identities detected: %d (threshold: %d). "
-                "This may indicate under-segmentation. "
-                "Consider decreasing cluster_thresh or reviewing embedding quality. "
-                "See docs/ops/troubleshooting_faces_pipeline.md",
-                total_clusters,
-                cluster_thresholds.get("min_cluster_count", 3),
-            )
-
-        if total_clusters > cluster_thresholds.get("max_cluster_count", 50):
-            LOGGER.warning(
-                "[GUARDRAIL] Very many identities detected: %d (threshold: %d). "
-                "This may indicate over-segmentation. "
-                "Consider increasing cluster_thresh or reviewing track quality. "
-                "See docs/ops/troubleshooting_faces_pipeline.md",
-                total_clusters,
-                cluster_thresholds.get("max_cluster_count", 50),
-            )
-
+        low_cohesion_count = sum(1 for identity in all_identities if identity.get("low_cohesion"))
         payload = {
             "ep_id": args.ep_id,
             "pipeline_ver": PIPELINE_VERSION,
@@ -7427,50 +5219,42 @@ def _run_cluster_stage(
             },
             "stats": {
                 "faces": faces_total,
-                "clusters": total_clusters,
-                "total_tracks": total_tracks,
+                "clusters": len(all_identities),
                 "mixed_tracks": len(flagged_tracks),
                 "outlier_tracks": len(outlier_tracks),
                 "low_cohesion_identities": low_cohesion_count,
-                # Cluster metrics
-                "singleton_count": cluster_metrics["singleton_count"],
-                "singleton_fraction": cluster_metrics["singleton_fraction"],
-                "largest_cluster_size": cluster_metrics["largest_cluster_size"],
-                "largest_cluster_fraction": cluster_metrics["largest_cluster_fraction"],
-                "singleton_merge": singleton_merge_summary,
-                "singleton_stats": singleton_stats,
+                "preserved_clusters": len(preserved_identities),
+                "preserved_tracks": len(preserved_track_ids),
             },
-            "identities": identity_payload,
+            "identities": all_identities,
         }
         identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        LOGGER.info(
-            "[PHASE] cluster: done ep_id=%s clusters=%d singleton_before=%s singleton_after=%s",
-            args.ep_id,
-            total_clusters,
-            singleton_merge_summary.get("singleton_fraction_before"),
-            singleton_merge_summary.get("singleton_fraction_after"),
-        )
 
-        # Update track_metrics.json with cluster metrics
-        metrics_path = manifests_dir / "track_metrics.json"
-        if metrics_path.exists():
-            try:
-                metrics_data = json.loads(metrics_path.read_text(encoding="utf-8"))
-                # Add cluster metrics to existing metrics
-                metrics_data["cluster_metrics"] = {
-                    **cluster_metrics,
-                    "total_tracks": total_tracks,
-                    "outlier_tracks": len(outlier_tracks),
-                    "low_cohesion_identities": low_cohesion_count,
-                    "singleton_merge": singleton_merge_summary,
-                    "singleton_stats": singleton_stats,
-                }
-                metrics_path.write_text(json.dumps(metrics_data, indent=2), encoding="utf-8")
-                LOGGER.info("Updated track_metrics.json with cluster metrics")
-            except Exception as exc:
-                LOGGER.warning("Failed to update track_metrics.json with cluster metrics: %s", exc)
+        if preserved_identities:
+            LOGGER.info(
+                "Cluster stage complete: %d preserved clusters, %d new clusters",
+                len(preserved_identities),
+                len(identity_payload),
+            )
 
-        # Build summary for completion (before any teardown operations)
+        # Generate track representatives and cluster centroids
+        try:
+            from apps.api.services.track_reps import generate_track_reps_and_centroids
+
+            LOGGER.info(
+                "Generating track representatives and cluster centroids for %s",
+                args.ep_id,
+            )
+            track_reps_summary = generate_track_reps_and_centroids(args.ep_id)
+            LOGGER.info(
+                "Generated %d track reps and %d cluster centroids",
+                track_reps_summary.get("track_reps_count", 0),
+                track_reps_summary.get("cluster_centroids_count", 0),
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to generate track representatives: %s", exc)
+
+        # Build preliminary summary for completion events (before S3 sync)
         finished_at = _utcnow_iso()
         summary: Dict[str, Any] = {
             "stage": "cluster",
@@ -7491,12 +5275,35 @@ def _run_cluster_stage(
                 "s3_prefixes": s3_prefixes,
             },
             "stats": payload["stats"],
-            "finished_at": finished_at,
         }
 
-        # Write run marker BEFORE signaling completion
-        # This ensures the marker file exists when the UI polls for status after completion
-        LOGGER.info("[JOB] cluster: writing run marker ep_id=%s", args.ep_id)
+        # Emit completion BEFORE S3 sync (which might hang or take long)
+        progress.emit(
+            faces_total,
+            phase="cluster",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            summary=summary,
+            force=True,
+            extra=_non_video_phase_meta("done"),
+        )
+        progress.complete(
+            summary,
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            step="cluster",
+            extra=phase_meta,
+        )
+
+        # Now do S3 sync after completion is signaled
+        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
+        summary["artifacts"]["s3_uploads"] = s3_stats
+        # Brief delay to ensure final progress event is written and readable
+        time.sleep(0.2)
         _write_run_marker(
             args.ep_id,
             "cluster",
@@ -7509,12 +5316,6 @@ def _run_cluster_stage(
                 "cluster_thresh": args.cluster_thresh,
                 "min_cluster_size": args.min_cluster_size,
                 "min_identity_sim": args.min_identity_sim,
-                "singleton_fraction_before": singleton_merge_summary.get("singleton_fraction_before"),
-                "singleton_fraction_after": singleton_merge_summary.get("singleton_fraction_after"),
-                "total_clusters_before": singleton_merge_summary.get("total_clusters_before"),
-                "total_clusters_after": singleton_merge_summary.get("total_clusters_after"),
-                "singleton_merge": singleton_merge_summary,
-                "singleton_stats": singleton_stats,
                 "device": device,
                 "requested_device": args.device,
                 "resolved_device": device,
@@ -7522,56 +5323,6 @@ def _run_cluster_stage(
                 "finished_at": finished_at,
             },
         )
-
-        # Signal completion immediately after clustering (before teardown)
-        # This allows the job to complete from the client's perspective while teardown happens
-        LOGGER.info("[JOB] cluster: signaling completion ep_id=%s", args.ep_id)
-        progress.complete(
-            summary,
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            step="cluster",
-            extra=phase_meta,
-        )
-
-        # Now perform teardown operations (these don't block job completion)
-        # These operations happen after completion signal to avoid blocking the job
-
-        # Generate track representatives and cluster centroids
-        LOGGER.info("[PHASE] teardown: generating track representatives for %s", args.ep_id)
-        track_rep_start = time.time()
-        try:
-            from apps.api.services.track_reps import generate_track_reps_and_centroids
-
-            track_reps_summary = generate_track_reps_and_centroids(args.ep_id)
-            LOGGER.info(
-                "[PHASE] teardown: track representatives done in %.2fs (track_reps=%d, centroids=%d)",
-                time.time() - track_rep_start,
-                track_reps_summary.get("track_reps_count", 0),
-                track_reps_summary.get("cluster_centroids_count", 0),
-            )
-        except Exception as exc:
-            LOGGER.warning("[PHASE] teardown: failed to generate track representatives (continuing): %s", exc)
-
-        # Sync artifacts to S3 (optional, doesn't block completion)
-        LOGGER.info("[PHASE] teardown: syncing artifacts to S3 for %s", args.ep_id)
-        s3_start = time.time()
-        try:
-            s3_stats = _sync_artifacts_to_s3(
-                args.ep_id,
-                storage,
-                ep_ctx,
-                exporter=None,
-                thumb_dir=thumb_root,
-                include_track_thumbs=False,
-            )
-            LOGGER.info("[PHASE] teardown: S3 sync done in %.2fs", time.time() - s3_start)
-            summary["artifacts"]["s3_uploads"] = s3_stats
-        except Exception as exc:
-            LOGGER.warning("[PHASE] teardown: S3 sync failed (continuing): %s", exc)
-        LOGGER.info("[JOB] cluster: complete ep_id=%s", args.ep_id)
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -7654,8 +5405,6 @@ def _load_track_samples(
     max_samples_per_track: int | None = None,
     min_samples_per_track: int | None = None,
     sample_every_n_frames: int | None = None,
-    min_frames_between_crops: int | None = None,
-    max_faces_total: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Load track samples from tracks.jsonl with optional per-track sampling.
 
@@ -7665,8 +5414,6 @@ def _load_track_samples(
         max_samples_per_track: Maximum samples per track (None = no limit)
         min_samples_per_track: Minimum samples per track if track is long enough
         sample_every_n_frames: Fallback interval for uniform sampling
-        min_frames_between_crops: Minimum frame gap between samples for the same track
-        max_faces_total: Optional cap on total samples across all tracks
 
     Returns:
         List of sample dicts with track_id, frame_idx, bbox_xyxy, etc.
@@ -7678,15 +5425,12 @@ def _load_track_samples(
         min_samples_per_track = 4
     if sample_every_n_frames is None:
         sample_every_n_frames = 4
-    if min_frames_between_crops is None:
-        min_frames_between_crops = MIN_FRAMES_BETWEEN_CROPS_DEFAULT
-    spacing = max(1, int(min_frames_between_crops))
 
     # Group samples by track_id first
     tracks_samples: Dict[int, List[Dict[str, Any]]] = {}
 
     for row in _iter_jsonl(track_path):
-        track_id = _parse_track_id(row.get("track_id", -1))
+        track_id = int(row.get("track_id", -1))
         bbox_samples = row.get("bboxes_sampled") or []
         if not bbox_samples:
             fallback = {
@@ -7716,17 +5460,6 @@ def _load_track_samples(
 
         # Sort by frame_idx within this track
         track_samples_list.sort(key=lambda s: s["frame_idx"])
-        if spacing > 1 and track_samples_list:
-            filtered: List[Dict[str, Any]] = []
-            last_frame = None
-            for sample in track_samples_list:
-                frame_idx = sample["frame_idx"]
-                if last_frame is None or frame_idx - last_frame >= spacing:
-                    filtered.append(sample)
-                    last_frame = frame_idx
-            # Always keep at least one sample to allow downstream gating
-            if filtered:
-                track_samples_list = filtered
         tracks_samples[track_id] = track_samples_list
 
     # Apply per-track sampling
@@ -7740,76 +5473,10 @@ def _load_track_samples(
         )
         samples.extend(sampled)
 
-    if max_faces_total is not None and max_faces_total > 0 and len(samples) > max_faces_total:
-        samples = _downsample_episode_samples(samples, max_faces_total)
-
     if sort_by_frame:
         samples.sort(key=lambda s: s["frame_idx"])
 
     return samples
-
-
-def _uniform_indices(count: int, target: int) -> List[int]:
-    if target <= 0:
-        return []
-    if count <= target:
-        return list(range(count))
-    if target == 1:
-        return [count // 2]
-    step = (count - 1) / float(target - 1)
-    raw = [int(round(i * step)) for i in range(target)]
-    indices: List[int] = []
-    seen: set[int] = set()
-    for idx in raw:
-        fixed = min(max(idx, 0), count - 1)
-        if fixed not in seen:
-            seen.add(fixed)
-            indices.append(fixed)
-    # Fill gaps if rounding collapsed indices
-    while len(indices) < target and indices[-1] < count - 1:
-        candidate = indices[-1] + 1
-        if candidate not in seen:
-            indices.append(candidate)
-            seen.add(candidate)
-        else:
-            break
-    return indices[:target]
-
-
-def _downsample_episode_samples(samples: List[Dict[str, Any]], max_total: int) -> List[Dict[str, Any]]:
-    if max_total <= 0 or len(samples) <= max_total:
-        return samples
-    by_track: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for sample in samples:
-        track_id = _parse_track_id(sample.get("track_id", -1))
-        by_track[track_id].append(sample)
-    for track_samples in by_track.values():
-        track_samples.sort(key=lambda s: s["frame_idx"])
-
-    kept: List[Dict[str, Any]] = []
-    remaining: List[Dict[str, Any]] = []
-    for track_samples in by_track.values():
-        if not track_samples:
-            continue
-        # Always keep at least one sample per track
-        kept.append(track_samples[0])
-        remaining.extend(track_samples[1:])
-
-    if len(kept) >= max_total:
-        return sorted(kept[:max_total], key=lambda s: s["frame_idx"])
-
-    budget = max_total - len(kept)
-    if remaining:
-        remaining.sort(key=lambda s: s["frame_idx"])
-        chosen: List[Dict[str, Any]]
-        if len(remaining) > budget:
-            indices = _uniform_indices(len(remaining), budget)
-            chosen = [remaining[idx] for idx in indices if 0 <= idx < len(remaining)]
-        else:
-            chosen = remaining
-        kept.extend(chosen[:budget])
-
-    return sorted(kept[:max_total], key=lambda s: s["frame_idx"])
 
 
 def _infer_detector_from_tracks(track_path: Path) -> str | None:
@@ -7866,291 +5533,19 @@ def _cluster_distance_threshold(similarity: float) -> float:
     return max(distance, 0.01)
 
 
-def _singleton_merge_config() -> dict[str, Any]:
-    cfg = _CLUSTERING_CONFIG_EARLY.get("singleton_merge") or {}
-    return cfg if isinstance(cfg, dict) else {}
-
-
-def _apply_singleton_merge(
-    candidate_groups: List[List[int]],
-    track_embeddings: Dict[int, np.ndarray],
-    *,
-    primary_cluster_thresh: float,
-    min_cluster_size: int,
-) -> tuple[List[List[int]], Dict[str, Any]]:
-    """
-    Optional second-stage merge for singleton identities using a looser threshold.
-
-    Returns:
-        (final_groups, summary) where final_groups are updated identity groups and
-        summary contains before/after singleton metrics and thresholds.
-    """
-
-    cfg = _singleton_merge_config()
-    enabled = bool(cfg.get("enabled", True))
-    trigger_frac = float(cfg.get("trigger_singleton_frac", 0.60))
-    # Prefer new naming; fall back to legacy fields for compatibility
-    sec_thresh = cfg.get("similarity_thresh")
-    if sec_thresh is None:
-        sec_thresh = cfg.get("secondary_cluster_thresh")
-    if sec_thresh is None:
-        delta = float(cfg.get("fallback_delta", cfg.get("secondary_cluster_delta", 0.05)))
-        sec_thresh = max(0.0, min(1.0, primary_cluster_thresh - delta))
-    try:
-        sec_thresh = float(sec_thresh)
-    except (TypeError, ValueError):
-        sec_thresh = primary_cluster_thresh
-    neighbor_top_k = max(1, int(cfg.get("neighbor_top_k", cfg.get("max_pairs_per_track", 20))))
-    min_tracks_merged = max(2, int(cfg.get("min_tracks_per_merged_cluster", 2)))
-    max_iters = max(1, int(cfg.get("max_singleton_merge_iters", 1)))
-
-    def _normalize(v: np.ndarray) -> np.ndarray:
-        norm = np.linalg.norm(v) + 1e-12
-        return v / norm
-
-    # Expand groups based on min_cluster_size first
-    expanded_groups: List[List[int]] = []
-    for group in candidate_groups:
-        if len(group) < min_cluster_size:
-            expanded_groups.extend([[tid] for tid in group])
-        else:
-            expanded_groups.append(list(group))
-
-    total_clusters_before = len(expanded_groups)
-    singleton_clusters = [g for g in expanded_groups if len(g) == 1]
-    singleton_count_before = len(singleton_clusters)
-    singleton_fraction_before = (
-        singleton_count_before / total_clusters_before if total_clusters_before > 0 else 0.0
-    )
-
-    summary = {
-        "enabled": enabled,
-        "trigger_singleton_frac": trigger_frac,
-        "primary_cluster_thresh": primary_cluster_thresh,
-        "similarity_thresh": round(sec_thresh, 3),
-        "secondary_cluster_thresh": round(sec_thresh, 3),  # legacy alias
-        "singleton_count_before": singleton_count_before,
-        "singleton_fraction_before": round(singleton_fraction_before, 3),
-        "singleton_count_after": singleton_count_before,
-        "singleton_fraction_after": round(singleton_fraction_before, 3),
-        "total_clusters_before": total_clusters_before,
-        "total_clusters_after": total_clusters_before,
-        "num_singleton_merges": 0,
-        "applied": False,
-        "neighbor_top_k": neighbor_top_k,
-        "min_tracks_per_merged_cluster": min_tracks_merged,
-        "max_singleton_merge_iters": max_iters,
-    }
-
-    if not enabled or singleton_fraction_before < trigger_frac:
-        return expanded_groups, summary
-
-    # Build embedding matrix for singleton tracks with embeddings
-    singleton_tracks: List[int] = []
-    emb_list: List[np.ndarray] = []
-    for cluster in singleton_clusters:
-        tid = cluster[0]
-        emb = track_embeddings.get(tid)
-        if emb is None:
-            continue
-        singleton_tracks.append(tid)
-        emb_list.append(_normalize(np.asarray(emb, dtype=np.float32)))
-
-    if len(singleton_tracks) < 2:
-        return expanded_groups, summary
-
-    emb_mat = np.stack(emb_list, axis=0)
-    sims = emb_mat @ emb_mat.T
-    np.fill_diagonal(sims, -np.inf)
-
-    # Collect top-K candidate pairs per singleton
-    pairs: set[tuple[int, int]] = set()
-    sims_lookup: Dict[tuple[int, int], float] = {}
-    for i in range(len(singleton_tracks)):
-        row = sims[i]
-        order = np.argsort(row)[::-1]
-        picked = 0
-        for j_idx in order:
-            if picked >= neighbor_top_k:
-                break
-            sim_val = float(row[j_idx])
-            if sim_val < sec_thresh:
-                break
-            a = singleton_tracks[i]
-            b = singleton_tracks[j_idx]
-            if a == b:
-                continue
-            key = (a, b) if a < b else (b, a)
-            if key in pairs:
-                continue
-            pairs.add(key)
-            sims_lookup[key] = sim_val
-            picked += 1
-
-    if not pairs:
-        return expanded_groups, summary
-
-    sorted_pairs = sorted(pairs, key=lambda item: sims_lookup[item], reverse=True)
-
-    parent: Dict[int, int] = {tid: tid for tid in singleton_tracks}
-    size: Dict[int, int] = {tid: 1 for tid in singleton_tracks}
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    merges = 0
-    for _ in range(max_iters):
-        merged_this_iter = 0
-        for a, b in sorted_pairs:
-            sim_val = sims_lookup.get((a, b)) or sims_lookup.get((b, a)) or 0.0
-            if sim_val < sec_thresh:
-                break
-            ra = find(a)
-            rb = find(b)
-            if ra == rb:
-                continue
-            new_size = size[ra] + size[rb]
-            if new_size < min_tracks_merged:
-                continue
-            if size[rb] > size[ra]:
-                ra, rb = rb, ra
-            parent[rb] = ra
-            size[ra] = new_size
-            merges += 1
-            merged_this_iter += 1
-        if merged_this_iter == 0:
-            break
-
-    components: Dict[int, List[int]] = defaultdict(list)
-    for tid in singleton_tracks:
-        components[find(tid)].append(tid)
-
-    merged_components = [sorted(vals) for vals in components.values() if len(vals) >= min_tracks_merged]
-    merged_ids = {tid for comp in merged_components for tid in comp}
-    leftover_singletons = [tid for tid in singleton_tracks if tid not in merged_ids]
-
-    final_groups: List[List[int]] = [group for group in expanded_groups if len(group) > 1]
-    final_groups.extend(merged_components)
-    final_groups.extend([[tid] for tid in leftover_singletons])
-
-    total_clusters_after = len(final_groups)
-    singleton_count_after = sum(1 for g in final_groups if len(g) == 1)
-    singleton_fraction_after = singleton_count_after / total_clusters_after if total_clusters_after > 0 else 0.0
-
-    summary.update(
-        {
-            "singleton_count_after": singleton_count_after,
-            "singleton_fraction_after": round(singleton_fraction_after, 3),
-            "total_clusters_after": total_clusters_after,
-            "num_singleton_merges": merges,
-            "merge_count": merges,
-            "applied": merges > 0,
-        }
-    )
-    return final_groups, summary
-
-
-def _emit_singleton_guardrail(
-    singleton_stats: Dict[str, Any],
-    *,
-    cluster_thresholds: Dict[str, Any],
-    merge_summary: Dict[str, Any],
-    cluster_thresh: float,
-) -> None:
-    """Log guardrail messages for singleton fractions, honoring singleton-merge results."""
-
-    threshold = float(cluster_thresholds.get("max_singleton_fraction", 0.50))
-    before_block = singleton_stats.get("before") or {}
-    after_block = singleton_stats.get("after") or {}
-    before = before_block.get("singleton_fraction")
-    after = after_block.get("singleton_fraction")
-    enabled = bool(singleton_stats.get("enabled"))
-
-    def _clamp(val: float) -> float:
-        return max(0.0, min(val, 1.0))
-
-    if enabled:
-        if after is None:
-            return
-        after_val = float(after)
-        before_val = float(before) if before is not None else after_val
-        if after_val <= threshold:
-            if before_val > after_val:
-                LOGGER.info(
-                    "Singleton merge improved singleton_fraction from %.2f to %.2f (threshold %.2f).",
-                    before_val,
-                    after_val,
-                    threshold,
-                )
-            return
-        sim_thresh = merge_summary.get("similarity_thresh") or merge_summary.get("secondary_cluster_thresh") or 0.0
-        neighbor_top_k = merge_summary.get("neighbor_top_k") or merge_summary.get("max_pairs_per_track")
-        LOGGER.warning(
-            "[GUARDRAIL] High singleton fraction after singleton merge: %.2f (before: %.2f, threshold: %.2f, "
-            "merge_sim_thresh=%.2f, top_k=%s). "
-            "Consider tightening cluster_thresh to %.2f-%.2f, raising faces_embed.min_quality, or tuning "
-            "singleton_merge.similarity_thresh. "
-            "See docs/ops/troubleshooting_faces_pipeline.md#high-singleton-fraction-with-singleton-merge",
-            _clamp(after_val),
-            _clamp(before_val),
-            threshold,
-            float(sim_thresh),
-            neighbor_top_k if neighbor_top_k is not None else "?",
-            max(0.0, cluster_thresh + 0.03),
-            max(0.0, cluster_thresh + 0.07),
-        )
-        return
-
-    if before is None:
-        return
-    before_val = float(before)
-    if before_val <= threshold:
-        return
-    LOGGER.warning(
-        "[GUARDRAIL] High singleton fraction: %.2f (threshold: %.2f). "
-        "%.1f%% of identities are singletons (single-track clusters). "
-        "Consider decreasing cluster_thresh to %.2f-%.2f or increasing min_quality in faces_embed. "
-        "See docs/ops/troubleshooting_faces_pipeline.md#high-singleton-fraction",
-        _clamp(before_val),
-        threshold,
-        _clamp(before_val) * 100,
-        max(0.0, cluster_thresh - 0.05),
-        max(0.0, cluster_thresh - 0.08),
-    )
-
-
 def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
     if matrix.shape[0] == 1:
         return np.array([0], dtype=int)
-    # Lightweight connected-component clustering based on cosine similarity threshold.
-    # Avoids heavyweight sklearn dependency while keeping deterministic results for small sets.
-    sim_threshold = 1.0 - _cluster_distance_threshold(threshold)
-    sim_threshold = max(0.0, min(float(sim_threshold), 0.999))
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12
-    normed = matrix / norms
-    sim_matrix = normed @ normed.T
+    from sklearn.cluster import AgglomerativeClustering
 
-    n = sim_matrix.shape[0]
-    labels = np.full(n, -1, dtype=int)
-    cluster_id = 0
-    for idx in range(n):
-        if labels[idx] != -1:
-            continue
-        # Depth-first search to collect all nodes connected above similarity threshold
-        stack = [idx]
-        labels[idx] = cluster_id
-        while stack:
-            cur = stack.pop()
-            neighbors = np.where(sim_matrix[cur] >= sim_threshold)[0]
-            for nb in neighbors:
-                if labels[nb] == -1:
-                    labels[nb] = cluster_id
-                    stack.append(nb)
-        cluster_id += 1
-    return labels
+    distance_threshold = _cluster_distance_threshold(threshold)
+    model = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=distance_threshold,
+    )
+    return model.fit_predict(matrix)
 
 
 # NOTE: Duplicate _cosine_similarity removed - using single definition at line ~590
@@ -8215,85 +5610,23 @@ def _remove_low_similarity_outliers(
 
 
 def _materialize_identity_thumb(
-    ep_id: str,
     thumb_root: Path,
     track_row: dict | None,
     identity_id: str,
     s3_prefixes: Dict[str, str] | None,
-    *,
-    best_face: Dict[str, Any] | None = None,
-    thumb_size: int = 256,
-    storage: StorageService | None = None,
 ) -> tuple[str | None, str | None]:
-    """Create an identity thumbnail from the best available crop.
-
-    Prefers track-level crops (canonical) and falls back to legacy track thumbs.
-    """
-
-    try:
-        import cv2  # type: ignore
-        import numpy as np
-    except ImportError:
+    if not track_row:
         return None, None
-
-    if thumb_size <= 0:
-        thumb_size = 256
-
-    def _load_image(rel_path: str | None, s3_key: str | None) -> np.ndarray | None:
-        if rel_path:
-            frames_root = get_path(ep_id, "frames_root")
-            local_path = frames_root / rel_path
-            if local_path.exists():
-                img = cv2.imread(str(local_path))
-                if img is not None:
-                    return img
-        if s3_key and storage:
-            data = storage.download_bytes(s3_key)
-            if data:
-                arr = np.frombuffer(data, dtype=np.uint8)
-                try:
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                except Exception:
-                    img = None
-                if img is not None:
-                    return img
-        return None
-
-    candidates: List[tuple[str | None, str | None]] = []
-    if track_row:
-        candidates.append((track_row.get("best_crop_rel_path"), track_row.get("best_crop_s3_key")))
-        candidates.append((track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key")))
-    if best_face:
-        candidates.append((best_face.get("crop_rel_path"), best_face.get("crop_s3_key")))
-        candidates.append((best_face.get("thumb_rel_path"), best_face.get("thumb_s3_key")))
-
-    image = None
-    for rel_path, s3_key in candidates:
-        image = _load_image(rel_path, s3_key)
-        if image is not None:
-            break
-
-    if image is None:
+    rel = track_row.get("thumb_rel_path")
+    if not rel:
         return None, None
-
-    h, w = image.shape[:2]
-    scale = min(thumb_size / max(w, 1), thumb_size / max(h, 1))
-    new_w = max(int(w * scale), 1)
-    new_h = max(int(h * scale), 1)
-    resized = cv2.resize(image, (new_w, new_h))
-    canvas = np.zeros((thumb_size, thumb_size, 3), dtype=np.uint8)
-    top = (thumb_size - new_h) // 2
-    left = (thumb_size - new_w) // 2
-    canvas[top : top + new_h, left : left + new_w] = resized
-
+    source = thumb_root / rel
+    if not source.exists():
+        return None, None
     dest_rel = Path("identities") / identity_id / "rep.jpg"
     dest = thumb_root / dest_rel
     dest.parent.mkdir(parents=True, exist_ok=True)
-    ok, err = safe_imwrite(dest, canvas, DEFAULT_JPEG_QUALITY)
-    if not ok:
-        LOGGER.warning("Failed to write identity thumb for %s: %s", identity_id, err)
-        return None, None
-
+    shutil.copy(source, dest)
     s3_key = None
     if s3_prefixes and s3_prefixes.get("thumbs_identities"):
         s3_key = f"{s3_prefixes['thumbs_identities']}{identity_id}/rep.jpg"

@@ -18,77 +18,22 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-import types
-
-try:
-    import streamlit as st
-    import streamlit.components.v1 as components
-    from streamlit.runtime.scriptrunner.script_run_context import (
-        add_script_run_ctx,
-        get_script_run_ctx,
-    )
-    from streamlit.runtime.scriptrunner.script_requests import RerunData
-except Exception:
-    class _ContextStub:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    class _StubSidebar:
-        def __getattr__(self, name):  # noqa: ANN001
-            def _noop(*args, **kwargs):
-                return None
-
-            return _noop
-
-    class _StubStreamlit:
-        def __init__(self) -> None:
-            self.session_state: dict = {}
-            self.query_params: dict = {}
-            self.sidebar = _StubSidebar()
-
-        def __getattr__(self, name):  # noqa: ANN001
-            def _noop(*args, **kwargs):
-                return None
-
-            return _noop
-
-        def expander(self, *args, **kwargs):
-            return _ContextStub()
-
-        def columns(self, n=1):
-            count = max(int(n), 0)
-            return tuple(_ContextStub() for _ in range(count))
-
-    class _ComponentsStub:
-        def __getattr__(self, name):  # noqa: ANN001
-            def _noop(*args, **kwargs):
-                return None
-
-            return _noop
-
-    st = _StubStreamlit()  # type: ignore[assignment]
-    components = _ComponentsStub()
-
-    def add_script_run_ctx(*args, **kwargs):  # type: ignore[override]
-        return None
-
-    def get_script_run_ctx(*args, **kwargs):  # type: ignore[override]
-        return None
-
-    class RerunData:  # type: ignore[override]
-        pass
+import streamlit as st
+import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner.script_run_context import (
+    add_script_run_ctx,
+    get_script_run_ctx,
+)
+from streamlit.runtime.scriptrunner.script_requests import RerunData
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DEFAULT_STRIDE = 6
+DEFAULT_STRIDE = 4
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
-DEFAULT_DEVICE = "coreml"
-DEFAULT_DEVICE_LABEL = "CoreML"
-DEFAULT_DET_THRESH = 0.65
+DEFAULT_DEVICE = "auto"
+DEFAULT_DEVICE_LABEL = "Auto"
+DEFAULT_DET_THRESH = 0.5
 DEFAULT_MAX_GAP = 60
 DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
@@ -176,8 +121,8 @@ TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
 TRACKER_VALUE_MAP = {label: value for label, value in TRACKER_OPTIONS}
 TRACKER_LABEL_MAP = {value: label for label, value in TRACKER_OPTIONS}
 SUPPORTED_PIPELINE_COMBOS = {
-    "harvest": {(DEFAULT_DETECTOR, DEFAULT_TRACKER), (DEFAULT_DETECTOR, "strongsort")},
-    "cluster": {(DEFAULT_DETECTOR, DEFAULT_TRACKER), (DEFAULT_DETECTOR, "strongsort")},
+    "harvest": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
+    "cluster": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
 }
 SCENE_DETECTOR_OPTIONS = [
     ("PySceneDetect (recommended)", "pyscenedetect"),
@@ -189,16 +134,6 @@ SCENE_DETECTOR_VALUE_MAP = {label: value for label, value in SCENE_DETECTOR_OPTI
 SCENE_DETECTOR_LABEL_MAP = {value: label for label, value in SCENE_DETECTOR_OPTIONS}
 _SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
 SCENE_DETECTOR_DEFAULT = _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
-PERF_PROFILE_PATH = Path(__file__).resolve().parents[2] / "config" / "pipeline" / "performance_profiles.yaml"
-PROFILE_OPTIONS = [
-    ("Low Power (recommended on laptops)", "low_power"),
-    ("Balanced", "balanced"),
-    ("High Accuracy (GPU)", "high_accuracy"),
-]
-PROFILE_LABELS = [label for label, _ in PROFILE_OPTIONS]
-PROFILE_VALUE_MAP = {label: value for label, value in PROFILE_OPTIONS}
-PROFILE_VALUE_TO_LABEL = {value: label for label, value in PROFILE_OPTIONS}
-PROFILE_VALUE_TO_LABEL["fast_cpu"] = PROFILE_VALUE_TO_LABEL.get("low_power", "Low Power")
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
 
@@ -219,96 +154,16 @@ def _env_flag(name: str, default: bool) -> bool:
     return default
 
 
-def _profile_alias(name: str | None) -> str | None:
-    if not name:
-        return None
-    normalized = name.strip().lower()
-    if normalized == "fast_cpu":
-        return "low_power"
-    return normalized
-
-
-@lru_cache(maxsize=1)
-def performance_profiles() -> Dict[str, Any]:
-    if not PERF_PROFILE_PATH.exists():
-        return {}
-    try:
-        import yaml  # type: ignore
-    except ImportError:
-        LOGGER.warning("pyyaml not installed; skipping performance profile load")
-        return {}
-    try:
-        with PERF_PROFILE_PATH.open("r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:  # pragma: no cover - file/io specific
-        LOGGER.warning("Failed to load performance profiles: %s", exc)
-        return {}
-
-
-def profile_defaults(profile_value: str | None) -> Dict[str, Any]:
-    profile_key = _profile_alias(profile_value)
-    if not profile_key:
-        return {}
-    profiles = performance_profiles()
-    profile_cfg = profiles.get(profile_key, {}) if isinstance(profiles, dict) else {}
-    if not isinstance(profile_cfg, dict):
-        return {}
-    return {
-        "stride": profile_cfg.get("frame_stride"),
-        "fps": profile_cfg.get("detection_fps_limit") or profile_cfg.get("max_fps"),
-        "save_frames": profile_cfg.get("save_frames"),
-        "save_crops": profile_cfg.get("save_crops"),
-        "cpu_threads": profile_cfg.get("cpu_threads"),
-    }
-
-
-def profile_label_index(profile_value: str | None) -> int:
-    normalized = _profile_alias(profile_value) or "balanced"
-    label = PROFILE_VALUE_TO_LABEL.get(normalized, PROFILE_LABELS[1])
-    try:
-        return PROFILE_LABELS.index(label)
-    except ValueError:
-        return 0
-
-
-def profile_label_from_value(profile_value: str | None) -> str:
-    normalized = _profile_alias(profile_value)
-    if normalized and normalized in PROFILE_VALUE_TO_LABEL:
-        return PROFILE_VALUE_TO_LABEL[normalized]
-    return PROFILE_LABELS[1]
-
-
-def profile_value_from_state(value: str | None) -> str | None:
-    """Interpret a profile value stored in session (label or key)."""
-    if not value:
-        return None
-    if value in PROFILE_VALUE_TO_LABEL:
-        return _profile_alias(value)
-    return PROFILE_VALUE_MAP.get(value) or _profile_alias(value)
-
-
-def default_profile_for_device(device_value: str | None) -> str:
-    # Default to balanced everywhere; users can opt into low_power/high_accuracy explicitly.
-    return "balanced"
-
-
 def known_shows(include_session: bool = True) -> List[str]:
     """Return a sorted list of known show identifiers from episodes + S3 (plus session state)."""
-    # Use case-insensitive dedupe so RHOSLC == rhoslc in dropdowns
-    shows: dict[str, str] = {}
+    shows: set[str] = set()
 
     def _remember(show_value: Any) -> None:
         if not show_value or not isinstance(show_value, str):
             return
         cleaned = show_value.strip()
-        if not cleaned:
-            return
-        lowered = cleaned.lower()
-        existing = shows.get(lowered)
-        # Prefer the first seen value; if we later see a lowercase variant, adopt it
-        if existing is None or existing != existing.lower():
-            shows[lowered] = cleaned
+        if cleaned:
+            shows.add(cleaned)
 
     try:
         episodes_payload = api_get("/episodes")
@@ -339,8 +194,7 @@ def known_shows(include_session: bool = True) -> List[str]:
         for entry in st.session_state.get(_CUSTOM_SHOWS_SESSION_KEY, []):
             _remember(entry)
 
-    # Return values sorted case-insensitively but without duplicates by case
-    return sorted(shows.values(), key=lambda value: value.lower())
+    return sorted(shows, key=lambda value: value.lower())
 
 
 def remember_custom_show(show_id: str) -> None:
@@ -417,97 +271,6 @@ def describe_error(url: str, exc: requests.RequestException) -> str:
     return f"{url} → {detail}"
 
 
-# ============================================================================
-# Unified Error Display Component
-# ============================================================================
-
-def show_error(
-    message: str,
-    *,
-    context: str | None = None,
-    severity: str = "error",
-    show_timestamp: bool = False,
-    details: str | None = None,
-) -> None:
-    """Display a consistent error message in the UI.
-
-    Args:
-        message: The main error message
-        context: Optional context (e.g., "while loading cast data")
-        severity: One of "error", "warning", "info"
-        show_timestamp: Whether to include a timestamp
-        details: Optional technical details (shown in expandable section)
-    """
-    # Build the message
-    parts = []
-    if show_timestamp:
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        parts.append(f"[{timestamp}]")
-    if context:
-        parts.append(f"{context}:")
-    parts.append(message)
-    full_message = " ".join(parts)
-
-    # Display with appropriate severity
-    if severity == "warning":
-        st.warning(full_message)
-    elif severity == "info":
-        st.info(full_message)
-    else:
-        st.error(full_message)
-
-    # Show technical details if provided
-    if details:
-        with st.expander("Technical details", expanded=False):
-            st.code(details, language="text")
-
-
-def show_api_error(
-    exc: Exception,
-    *,
-    context: str | None = None,
-    url: str | None = None,
-) -> None:
-    """Display an API error with consistent formatting.
-
-    Args:
-        exc: The exception that occurred
-        context: Optional context (e.g., "loading cast members")
-        url: Optional URL that was being accessed
-    """
-    if isinstance(exc, requests.HTTPError) and hasattr(exc, "response"):
-        resp = exc.response
-        status = resp.status_code if resp else "unknown"
-        if status >= 500:
-            message = f"Server error ({status}). Please try again later."
-        elif status == 404:
-            message = "Resource not found."
-        elif status == 422:
-            message = "Invalid request data."
-        elif status >= 400:
-            message = f"Request failed ({status})."
-        else:
-            message = str(exc)
-    elif isinstance(exc, requests.Timeout):
-        message = "Request timed out. Please try again."
-    elif isinstance(exc, requests.ConnectionError):
-        message = "Could not connect to server. Check your network connection."
-    elif isinstance(exc, requests.RequestException):
-        message = f"Network error: {exc}"
-    else:
-        message = str(exc)
-
-    details = None
-    if url:
-        details = f"URL: {url}\n"
-    if hasattr(exc, "__traceback__"):
-        import traceback
-        details = (details or "") + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-
-    show_error(message, context=context, details=details)
-
-
 def _api_base() -> str:
     base = st.session_state.get("api_base")
     if not base:
@@ -515,28 +278,18 @@ def _api_base() -> str:
     return base
 
 
-_PAGE_CONFIG_KEY = "_page_config_set"
-
-
 def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
-    if not st.session_state.get(_PAGE_CONFIG_KEY):
-        st.set_page_config(page_title=title, layout="wide")
-        st.session_state[_PAGE_CONFIG_KEY] = True
+    st.set_page_config(page_title=title, layout="wide")
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
     st.session_state.setdefault("api_base", api_base)
-    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
+    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "local").lower()
     st.session_state.setdefault("backend", backend)
     bucket = st.session_state.get("bucket") or (
-        _env("AWS_S3_BUCKET")
-        or _env("SCREENALYTICS_OBJECT_STORE_BUCKET")
-        or ("local" if backend == "local" else "screenalytics")
+        _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "")
     )
     st.session_state.setdefault("bucket", bucket)
 
-    query_params = st.query_params
-    query_ep_id = query_params.get("ep_id", "")
-    if query_ep_id and not st.session_state.get("_ep_id_query_origin"):
-        st.session_state["_ep_id_query_origin"] = "external"
+    query_ep_id = st.query_params.get("ep_id", "")
     stored_ep_id = st.session_state.get("ep_id")
     if stored_ep_id is None:
         st.session_state["ep_id"] = query_ep_id
@@ -546,7 +299,6 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
         params = st.query_params
         params["ep_id"] = stored_ep_id
         st.query_params = params
-        st.session_state.setdefault("_ep_id_query_origin", "app")
 
     if "device_default_label" not in st.session_state:
         st.session_state["device_default_label"] = _guess_device_label()
@@ -559,17 +311,9 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
     try:
-        resp = requests.get(health_url, timeout=15)
+        resp = requests.get(health_url, timeout=5)
         resp.raise_for_status()
         sidebar.success("/healthz OK")
-    except requests.Timeout:
-        sidebar.warning("Health check timed out; retrying…")
-        try:
-            retry = requests.get(health_url, timeout=30)
-            retry.raise_for_status()
-            sidebar.success("/healthz OK (after retry)")
-        except requests.RequestException as exc_retry:
-            sidebar.error(describe_error(health_url, exc_retry))
     except requests.RequestException as exc:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
@@ -586,53 +330,25 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     }
 
 
-def set_ep_id(ep_id: str, rerun: bool = True, update_query_params: bool = True, origin: str | None = None) -> None:
+def set_ep_id(ep_id: str, rerun: bool = True) -> None:
     if not ep_id:
         return
-    resolved_origin = origin or st.session_state.get("_ep_id_query_origin")
-    if update_query_params and not resolved_origin:
-        resolved_origin = "app"
     current = st.session_state.get("ep_id")
     if current == ep_id:
-        if update_query_params:
-            params = st.query_params
-            if params.get("ep_id") != ep_id:
-                params["ep_id"] = ep_id
-                st.query_params = params
-            if resolved_origin:
-                st.session_state["_ep_id_query_origin"] = resolved_origin
-        elif resolved_origin:
-            st.session_state["_ep_id_query_origin"] = resolved_origin
+        params = st.query_params
+        params["ep_id"] = ep_id
+        st.query_params = params
         return
     st.session_state["ep_id"] = ep_id
-    if update_query_params:
-        params = st.query_params
-        if params.get("ep_id") != ep_id:
-            params["ep_id"] = ep_id
-            st.query_params = params
-        if resolved_origin:
-            st.session_state["_ep_id_query_origin"] = resolved_origin
-    elif resolved_origin:
-        st.session_state["_ep_id_query_origin"] = resolved_origin
+    params = st.query_params
+    params["ep_id"] = ep_id
+    st.query_params = params
     if rerun:
         st.rerun()
 
 
 def get_ep_id() -> str:
     return st.session_state.get("ep_id", "")
-
-
-def get_ep_id_from_query_params(*, allow_app_injected: bool = True) -> str:
-    """Return ep_id from query params, optionally ignoring app-injected values."""
-    if "ep_id" not in st.query_params:
-        return ""
-    ep_value = st.query_params.get("ep_id") or ""
-    if not ep_value:
-        return ""
-    origin = st.session_state.get("_ep_id_query_origin")
-    if not allow_app_injected and origin == "app":
-        return ""
-    return str(ep_value)
 
 
 def render_sidebar_episode_selector() -> str | None:
@@ -707,10 +423,6 @@ def render_sidebar_episode_selector() -> str | None:
     if selected_ep_id != current_ep_id:
         set_ep_id(selected_ep_id, rerun=False)
 
-    # Explicit load button to apply selection and rerun the app
-    if st.sidebar.button("Load Episode", key="load_episode_button"):
-        set_ep_id(selected_ep_id, rerun=True, origin="sidebar_button")
-
     # Cache clear button
     st.sidebar.divider()
     if st.sidebar.button("🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"):
@@ -757,7 +469,7 @@ def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[st
     timeout = kwargs.pop("timeout", 60)
     resp = requests.post(f"{base}{path}", json=json or {}, timeout=timeout, **kwargs)
     resp.raise_for_status()
-    return resp.json() if resp.content else {}
+    return resp.json()
 
 
 def api_delete(path: str, **kwargs) -> Dict[str, Any]:
@@ -767,7 +479,167 @@ def api_delete(path: str, **kwargs) -> Dict[str, Any]:
     timeout = kwargs.pop("timeout", 60)
     resp = requests.delete(f"{base}{path}", timeout=timeout, **kwargs)
     resp.raise_for_status()
-    return resp.json() if resp.content else {}
+    return resp.json()
+
+
+# ============================================================================
+# Async Job Helpers (Celery/Redis background jobs)
+# ============================================================================
+
+ASYNC_JOB_KEY = "_async_job"
+
+
+def submit_async_job(
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+    episode_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Submit an async job to the API and store in session state.
+
+    Args:
+        endpoint: API endpoint (e.g., /episodes/{ep_id}/clusters/group_async)
+        payload: Request payload
+        operation: Operation name for display (e.g., "Auto Group")
+        episode_id: Episode ID
+
+    Returns:
+        Response dict if submitted, None if failed or sync fallback occurred
+    """
+    base = st.session_state.get("api_base")
+    if not base:
+        st.error("API not initialized")
+        return None
+
+    # Check if a job is already running
+    existing = st.session_state.get(ASYNC_JOB_KEY)
+    if existing:
+        st.warning(f"⏳ A job is already running: {existing.get('operation')} ({existing.get('job_id', '')[:8]}...)")
+        return None
+
+    try:
+        resp = requests.post(f"{base}{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("async", False) and data.get("job_id"):
+            # Store job in session state for polling
+            st.session_state[ASYNC_JOB_KEY] = {
+                "job_id": data["job_id"],
+                "operation": operation,
+                "episode_id": episode_id,
+                "created_at": time.time(),
+            }
+            st.info(f"⏳ {operation} started... (job {data['job_id'][:8]}...)")
+            return data
+        else:
+            # Synchronous fallback - return result directly
+            return data
+    except requests.RequestException as e:
+        st.error(f"Failed to submit {operation}: {describe_error(f'{base}{endpoint}', e)}")
+        return None
+
+
+def get_active_async_job() -> Optional[Dict[str, Any]]:
+    """Get the currently active async job, if any."""
+    return st.session_state.get(ASYNC_JOB_KEY)
+
+
+def clear_async_job() -> None:
+    """Clear the active async job from session state."""
+    if ASYNC_JOB_KEY in st.session_state:
+        del st.session_state[ASYNC_JOB_KEY]
+
+
+def poll_async_job() -> Optional[Dict[str, Any]]:
+    """Poll the active async job status.
+
+    Returns:
+        Job status dict with 'state', 'result', 'progress', etc., or None if no job/error
+    """
+    job = st.session_state.get(ASYNC_JOB_KEY)
+    if not job:
+        return None
+
+    base = st.session_state.get("api_base")
+    if not base:
+        return None
+
+    try:
+        resp = requests.get(f"{base}/celery_jobs/{job['job_id']}", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def render_async_job_status() -> bool:
+    """Render active job status banner if a job is running.
+
+    Returns:
+        True if job is still running (caller should schedule refresh),
+        False if no job or job is complete
+    """
+    job = st.session_state.get(ASYNC_JOB_KEY)
+    if not job:
+        return False
+
+    status = poll_async_job()
+    if not status:
+        st.warning(f"Unable to check job status: {job['job_id'][:8]}...")
+        return False
+
+    state = status.get("state", "unknown")
+    operation = job.get("operation", "Operation")
+    job_id_short = job["job_id"][:8]
+
+    if state in ("queued", "in_progress"):
+        # Show progress
+        progress = status.get("progress", {})
+        step = progress.get("step", "")
+        message = progress.get("message", "Working...")
+
+        if progress and step:
+            st.info(f"⏳ **{operation}** in progress ({job_id_short}...)\n\n**{step}**: {message}")
+        else:
+            st.info(f"⏳ **{operation}** in progress ({job_id_short}...)")
+        return True
+
+    elif state == "success":
+        result = status.get("result", {})
+        # Format success message based on operation type
+        if "auto" in operation.lower() or "group" in operation.lower():
+            assigned = result.get("assignments_count", result.get("succeeded", 0))
+            new_people = result.get("new_people_count", 0)
+            facebank = result.get("facebank_assigned", 0)
+            msg = f"✅ **{operation}** complete! {assigned} clusters processed"
+            if new_people:
+                msg += f", {new_people} new people"
+            if facebank:
+                msg += f", {facebank} facebank matches"
+            st.success(msg)
+        elif "assign" in operation.lower():
+            succeeded = result.get("succeeded", 0)
+            failed = result.get("failed", 0)
+            st.success(f"✅ **{operation}** complete! {succeeded} succeeded, {failed} failed")
+        else:
+            st.success(f"✅ **{operation}** complete!")
+        clear_async_job()
+        return False
+
+    elif state == "failed":
+        error = status.get("error", status.get("result", "Unknown error"))
+        st.error(f"❌ **{operation}** failed: {error}")
+        clear_async_job()
+        return False
+
+    elif state == "cancelled":
+        st.warning(f"🚫 **{operation}** was cancelled")
+        clear_async_job()
+        return False
+
+    return False
 
 
 def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
@@ -828,27 +700,6 @@ def get_episode_status(ep_id: str) -> Dict[str, Any] | None:
     return _episode_status_payload(ep_id)
 
 
-def get_track_images(ep_id: str, track_id: int) -> List[str]:
-    """Return canonical track images (crops preferred, legacy thumbs fallback)."""
-
-    try:
-        payload = api_get(f"/episodes/{ep_id}/tracks/{int(track_id)}")
-    except requests.RequestException:
-        return []
-    frames = payload.get("frames") or []
-    urls: List[str] = []
-    for frame in frames:
-        candidate = frame.get("media_url") or frame.get("thumbnail_url")
-        resolved = ensure_media_url(candidate)
-        if resolved:
-            urls.append(resolved)
-    if not urls:
-        resolved = ensure_media_url(payload.get("media_url") or payload.get("thumbnail_url"))
-        if resolved:
-            urls.append(resolved)
-    return urls
-
-
 def link_local(path: Path | str) -> str:
     return f"`{path}`"
 
@@ -889,22 +740,16 @@ def ensure_media_url(path_or_url: str | Path | None) -> str | None:
     value = str(path_or_url)
     parsed = urlparse(value)
     scheme = parsed.scheme.lower()
-
-    # Accept HTTP/HTTPS URLs and data URLs
     if scheme in {"http", "https", "data"}:
         return value
-
-    # Check for local file paths and convert to data URL
     candidate_paths: List[Path] = []
     if scheme == "file":
         candidate_paths.append(Path(parsed.path))
     else:
         candidate_paths.append(Path(value))
-
     first = candidate_paths[0]
     if not first.is_absolute():
         candidate_paths.append((DATA_ROOT / first).expanduser())
-
     for candidate in candidate_paths:
         try:
             resolved = candidate.expanduser().resolve()
@@ -914,8 +759,6 @@ def ensure_media_url(path_or_url: str | Path | None) -> str | None:
             cached = _data_url_cache(str(resolved))
             if cached:
                 return cached
-
-    # Return original value (might be an S3 key for later resolution)
     return value
 
 
@@ -1043,41 +886,21 @@ def default_detect_track_payload(
     device: str | None = None,
     det_thresh: float | None = None,
 ) -> Dict[str, Any]:
-    device_value = (device or DEFAULT_DEVICE).lower()
-    profile_value = default_profile_for_device(device_value)
-    profile_cfg = profile_defaults(profile_value)
-    stride_default = profile_cfg.get("stride") if profile_cfg else None
-    save_frames_default = profile_cfg.get("save_frames") if profile_cfg else None
-    save_crops_default = profile_cfg.get("save_crops") if profile_cfg else None
-    cpu_threads_default = profile_cfg.get("cpu_threads") if profile_cfg else None
-    fps_default = profile_cfg.get("fps") if profile_cfg else None
-
     payload: Dict[str, Any] = {
         "ep_id": ep_id,
-        "stride": int(stride if stride is not None else (stride_default or DEFAULT_STRIDE)),
-        "device": device_value,
-        "profile": profile_value,
+        "stride": int(stride if stride is not None else DEFAULT_STRIDE),
+        "device": (device or DEFAULT_DEVICE).lower(),
         "detector": DEFAULT_DETECTOR,
         "tracker": DEFAULT_TRACKER,
         "det_thresh": float(det_thresh if det_thresh is not None else DEFAULT_DET_THRESH),
-        "save_frames": bool(save_frames_default if save_frames_default is not None else True),
-        "save_crops": bool(save_crops_default if save_crops_default is not None else True),
+        "save_frames": True,
+        "save_crops": True,
         "jpeg_quality": 85,
         "scene_detector": SCENE_DETECTOR_DEFAULT,
         "scene_threshold": SCENE_THRESHOLD_DEFAULT,
         "scene_min_len": SCENE_MIN_LEN_DEFAULT,
         "scene_warmup_dets": SCENE_WARMUP_DETS_DEFAULT,
     }
-    if cpu_threads_default is not None:
-        try:
-            payload["cpu_threads"] = int(cpu_threads_default)
-        except (TypeError, ValueError):
-            pass
-    if fps_default is not None:
-        try:
-            payload["fps"] = float(fps_default)
-        except (TypeError, ValueError):
-            pass
     return payload
 
 
@@ -1266,15 +1089,8 @@ def tracks_tracker_label(ep_id: str) -> str:
 def try_switch_page(page_path: str) -> None:
     try:
         st.switch_page(page_path)
-        return
     except Exception:
-        # Try common fallback: prepend pages/ if missing
-        alt = f"pages/{page_path}" if not page_path.startswith("pages/") else page_path.replace("pages/", "", 1)
-        try:
-            st.switch_page(alt)
-            return
-        except Exception:
-            st.info("Use the sidebar navigation to open the target page.")
+        st.info("Use the sidebar navigation to open the target page.")
 
 
 def format_mmss(seconds: float | int | None) -> str:
@@ -1463,10 +1279,8 @@ def _fetch_async_job_error(ep_id: str, phase: str) -> str | None:
             timeout=5,
         )
         resp.raise_for_status()
-        raw_payload = resp.json()
-        jobs_block = raw_payload.get("jobs") if isinstance(raw_payload, dict) else raw_payload
-        jobs = jobs_block if isinstance(jobs_block, list) else None
-        if not jobs:
+        jobs = resp.json()
+        if not isinstance(jobs, list) or not jobs:
             return None
         # Get most recent job (jobs are typically sorted by creation time)
         job = jobs[0]
@@ -1575,39 +1389,34 @@ def attempt_sse_run(
         return summary, None, False
 
     final_summary: Dict[str, Any] | None = None
-    events_seen = False
-    progress_events_seen = False
     try:
         for event_name, event_payload in iter_sse_events(response):
             if not isinstance(event_payload, dict):
                 continue
             update_cb(event_payload)
-            events_seen = True
-            phase = str(event_payload.get("phase", "")).lower()
-            if event_name != "log" and phase != "log":
-                progress_events_seen = True
             summary_candidate = event_payload.get("summary")
             if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
                 final_summary = summary_candidate
+            phase = str(event_payload.get("phase", "")).lower()
             if event_name == "error" or phase == "error":
-                return None, event_payload.get("error") or "Job failed", progress_events_seen
+                return None, event_payload.get("error") or "Job failed", True
             if event_name == "done" or _is_phase_done(event_payload):
                 if final_summary:
-                    return final_summary, None, progress_events_seen
+                    return final_summary, None, True
                 if isinstance(summary_candidate, dict) and _is_complete_summary(summary_candidate):
-                    return summary_candidate, None, progress_events_seen
-                return None, None, progress_events_seen
+                    return summary_candidate, None, True
+                return None, None, True
     finally:
         response.close()
     if final_summary:
-        return final_summary, None, progress_events_seen
+        return final_summary, None, True
     ep_id_value = payload.get("ep_id")
     if isinstance(ep_id_value, str):
         phase_hint = _phase_from_endpoint(endpoint_path) or "detect_track"
         status_summary = _summary_from_status(ep_id_value, phase_hint)
         if status_summary:
-            return status_summary, None, progress_events_seen
-    return None, None, progress_events_seen
+            return status_summary, None, True
+    return None, None, True
 
 
 def fallback_poll_progress(
@@ -1618,58 +1427,27 @@ def fallback_poll_progress(
     status_placeholder,
     job_started: bool,
     async_endpoint: str,
-    force_async_start: bool = False,
-    log_fn=None,
 ) -> tuple[Dict[str, Any] | None, str | None]:
-    job_id: str | None = None
-
-    def _read_stderr_tail(path: str | None, max_lines: int = 20) -> str | None:
-        if not path:
-            return None
+    if not job_started:
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                lines = handle.readlines()
-        except OSError:
-            return None
-        if not lines:
-            return None
-        return "".join(lines[-max_lines:]).strip()
-
-    should_start_async = force_async_start or not job_started
-    if should_start_async:
-        try:
-            resp = requests.post(f"{_api_base()}{async_endpoint}", json=payload, timeout=30)
-            resp.raise_for_status()
-            try:
-                body = resp.json()
-                if isinstance(body, dict):
-                    job_id = body.get("job_id")
-                    if log_fn and job_id:
-                        log_fn(f"Async job id: {job_id} (via {async_endpoint})")
-            except ValueError:
-                job_id = None
+            requests.post(f"{_api_base()}{async_endpoint}", json=payload, timeout=30).raise_for_status()
         except requests.RequestException as exc:
             return None, describe_error(f"{_api_base()}{async_endpoint}", exc)
-        if not job_id:
-            return None, f"Async endpoint {async_endpoint} did not return a job_id"
 
     progress_url = f"{_api_base()}/episodes/{ep_id}/progress"
-    job_progress_url = f"{_api_base()}/jobs/{job_id}/progress" if job_id else None
-    job_detail_url = f"{_api_base()}/jobs/{job_id}" if job_id else None
     phase_hint = _phase_from_endpoint(async_endpoint) or "detect_track"
     last_progress: Dict[str, Any] | None = None
     poll_attempts = 0
     max_poll_attempts = 60  # 30 seconds (60 attempts * 0.5s sleep)
     while True:
         try:
-            if job_progress_url:
-                resp = requests.get(job_progress_url, timeout=5)
-            else:
-                resp = requests.get(progress_url, timeout=5)
+            resp = requests.get(progress_url, timeout=5)
             if resp.status_code == 404:
                 poll_attempts += 1
                 if poll_attempts > max_poll_attempts:
-                    job_error = _fetch_async_job_error(ep_id, phase_hint) if not job_progress_url else None
+                    # Timeout: progress file never appeared, job likely failed during init
+                    # Fetch job record to surface actual error
+                    job_error = _fetch_async_job_error(ep_id, phase_hint)
                     return (
                         None,
                         job_error
@@ -1680,57 +1458,18 @@ def fallback_poll_progress(
                 continue
             resp.raise_for_status()
         except requests.RequestException as exc:
-            return None, describe_error(job_progress_url or progress_url, exc)
+            return None, describe_error(progress_url, exc)
         payload_body = resp.json()
-        progress = payload_body.get("progress") if isinstance(payload_body, dict) else None
-        if progress is None and isinstance(payload_body, dict):
-            progress = payload_body
-        if isinstance(progress, dict) and progress:
-            update_cb(progress)
-            last_progress = progress
-            phase = str(progress.get("phase", "")).lower()
-            if phase == "error":
-                return None, progress.get("error") or "Job failed"
-            if _is_phase_done(progress):
-                summary_block = progress.get("summary")
-                if isinstance(summary_block, dict):
-                    return summary_block, None
-        state = str(payload_body.get("state", "")).lower() if isinstance(payload_body, dict) else ""
-        if job_progress_url and state in {"succeeded", "failed", "canceled"}:
-            if state != "succeeded":
-                error_msg = payload_body.get("error") or f"Job {state}"
-                if job_detail_url:
-                    try:
-                        job_detail = requests.get(job_detail_url, timeout=5).json()
-                    except Exception:
-                        job_detail = None
-                    if isinstance(job_detail, dict):
-                        stderr_tail = _read_stderr_tail(job_detail.get("stderr_log"))
-                        if stderr_tail:
-                            error_msg = f"{error_msg}\n\nstderr tail:\n{stderr_tail}"
-                return None, error_msg
-            summary_payload: Dict[str, Any] | None = None
-            if isinstance(payload_body.get("track_metrics"), dict):
-                summary_payload = {"track_metrics": payload_body["track_metrics"]}
-            if not summary_payload and isinstance(progress, dict):
-                summary_candidate = progress.get("summary") if isinstance(progress.get("summary"), dict) else progress
-                if _is_complete_summary(summary_candidate):
-                    summary_payload = summary_candidate
-            if not summary_payload and job_detail_url:
-                try:
-                    job_detail = requests.get(job_detail_url, timeout=5).json()
-                    if isinstance(job_detail, dict):
-                        detail_summary = job_detail.get("summary") if isinstance(job_detail.get("summary"), dict) else None
-                        if detail_summary:
-                            summary_payload = detail_summary
-                        elif isinstance(job_detail.get("track_metrics"), dict):
-                            summary_payload = {"track_metrics": job_detail["track_metrics"]}
-                        elif isinstance(progress, dict):
-                            summary_payload = progress
-                except Exception:
-                    summary_payload = summary_payload or None
-            return summary_payload or progress or payload_body, None
-        if not job_progress_url and isinstance(progress, dict) and _is_phase_done(progress):
+        progress = payload_body.get("progress") or payload_body
+        if not isinstance(progress, dict):
+            time.sleep(0.5)
+            continue
+        update_cb(progress)
+        last_progress = progress
+        phase = str(progress.get("phase", "")).lower()
+        if phase == "error":
+            return None, progress.get("error") or "Job failed"
+        if _is_phase_done(progress):
             summary_block = progress.get("summary")
             if isinstance(summary_block, dict):
                 return summary_block, None
@@ -1832,7 +1571,7 @@ def identity_card(title: str, subtitle: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_container_width=True)
+            st.image(image_url, use_column_width=True)
         st.markdown(f"**{title}**")
         if subtitle:
             st.caption(subtitle)
@@ -1845,7 +1584,7 @@ def track_card(title: str, caption: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_container_width=True)
+            st.image(image_url, use_column_width=True)
         st.markdown(f"**{title}**")
         st.caption(caption)
         if extra:
@@ -1857,7 +1596,7 @@ def frame_card(title: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_container_width=True)
+            st.image(image_url, use_column_width=True)
         st.caption(title)
         if extra:
             extra()
@@ -2004,10 +1743,9 @@ def run_job_with_progress(
                 status_placeholder=status_placeholder,
                 job_started=False,
                 async_endpoint=target_endpoint,
-                log_fn=_append_log,
             )
         else:
-            summary, error_message, progress_seen = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
+            summary, error_message, job_started = attempt_sse_run(endpoint_path, payload, update_cb=_cb)
             if not events_seen:
                 if error_message:
                     _append_log(f"Request failed before any realtime updates ({_mode_context()}): {error_message}")
@@ -2020,19 +1758,17 @@ def run_job_with_progress(
                     )
             if async_endpoint and (summary is None or error_message):
                 _append_log(f"Falling back to async endpoint {async_endpoint} for {endpoint_path} ({_mode_context()})…")
-                force_async_start = bool(error_message) or not progress_seen
                 fallback_summary, fallback_error = fallback_poll_progress(
                     ep_id,
                     payload,
                     update_cb=_cb,
                     status_placeholder=status_placeholder,
-                    job_started=progress_seen,
+                    job_started=job_started,
                     async_endpoint=async_endpoint,
-                    force_async_start=force_async_start,
-                    log_fn=_append_log,
                 )
-                summary = fallback_summary if fallback_summary is not None else summary
-                error_message = fallback_error or error_message
+                if fallback_summary is not None or fallback_error is None:
+                    summary = fallback_summary
+                    error_message = fallback_error
                 if fallback_error:
                     _append_log(
                         f"Async endpoint {async_endpoint} reported an error ({_mode_context()}): {fallback_error}"
@@ -2046,24 +1782,16 @@ def run_job_with_progress(
             status_summary = _summary_from_status(ep_id, phase_hint)
             if status_summary:
                 summary = status_summary
-        if summary is None and not error_message:
-            error_message = f"No progress or summary returned from {endpoint_path}; check API logs."
         return summary, error_message
     finally:
         st.session_state.pop(dedupe_key, None)
         st.session_state.pop(run_id_key, None)
 
 
-def track_row_html(
-    track_id: int,
-    items: List[Dict[str, Any]],
-    thumb_height: int = 200,
-    thumb_width: int | None = None,
-) -> str:
+def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
     if not items:
-        return f'<div class="track-rail track-rail-{track_id} empty">' "<span>No frames available for this track yet.</span>" "</div>"
+        return '<div class="track-grid empty">' "<span>No frames available for this track yet.</span>" "</div>"
     thumbs: List[str] = []
-    width_px = thumb_width if thumb_width is not None else thumb_height
     for item in items:
         url = item.get("url")
         if not url:
@@ -2073,13 +1801,13 @@ def track_row_html(
         src = html.escape(str(url))
         thumbs.append(f'<img class="thumb" loading="lazy" src="{src}" alt="{alt_text}" />')
     if not thumbs:
-        return f'<div class="track-rail track-rail-{track_id} empty">' "<span>No frames available for this track yet.</span>" "</div>"
+        return '<div class="track-grid empty">' "<span>No frames available for this track yet.</span>" "</div>"
     thumbs_html = "".join(thumbs)
     return f"""
     <style>
       .track-grid {{
         display: grid;
-        grid-template-columns: repeat(5, {width_px}px);
+        grid-template-columns: repeat(5, {thumb_width}px);
         gap: 12px;
         margin: 16px 0;
         padding: 12px;
@@ -2095,8 +1823,8 @@ def track_row_html(
         color: #666;
       }}
       .track-grid .thumb {{
-        width: {width_px}px;
-        height: {thumb_height}px;
+        width: {thumb_width}px;
+        aspect-ratio: 4 / 5;
         object-fit: fill;
         border-radius: 6px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.1);
@@ -2108,14 +1836,14 @@ def track_row_html(
         cursor: pointer;
       }}
     </style>
-    <div class="track-rail track-rail-{track_id}"><div class="track-grid">{thumbs_html}</div></div>
+    <div class="track-grid">{thumbs_html}</div>
     """
 
 
 def render_track_row(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> None:
-    thumb_height = int(thumb_width * 5 / 4)
-    html_block = track_row_html(track_id, items, thumb_height=thumb_height, thumb_width=thumb_width)
-    # Calculate height: rows of thumbs (height) + gaps + padding
+    html_block = track_row_html(track_id, items, thumb_width=thumb_width)
+    # Calculate height: rows of thumbs (200px * 5/4 for 4:5 aspect) + gaps + padding
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio means height = width * 5/4
     num_rows = (len(items) + 4) // 5  # Round up to get number of rows
     row_height = max(num_rows * thumb_height + (num_rows - 1) * 12 + 50, 150)  # thumbs + gaps + padding
     components.html(html_block, height=row_height, scrolling=False)
@@ -2205,16 +1933,10 @@ def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | Non
     params = {"key": src, "ttl": ttl}
     inferred_mime = _infer_mime(src)
     response = requests.get(f"{api_base}/files/presign", params=params, timeout=3)
-    raise_status = getattr(response, "raise_for_status", None)
-    if callable(raise_status):
-        raise_status()
-    try:
-        data = response.json()
-    except (ValueError, TypeError) as exc:
-        _diag("UI_RESOLVE_FAIL", src=src, reason="json_parse_error", error=str(exc))
-        return None
-    presigned_url = data.get("url") if isinstance(data, dict) else None
-    resolved_mime = (data.get("content_type") if isinstance(data, dict) else None) or inferred_mime
+    response.raise_for_status()
+    data = response.json()
+    presigned_url = data.get("url")
+    resolved_mime = data.get("content_type") or inferred_mime
     if not presigned_url:
         return None
     if presigned_url.startswith("https://"):
@@ -2229,9 +1951,6 @@ def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | Non
 def _thumb_worker_runner(src: str, api_base: str, ttl: int) -> None:
     ctx = get_script_run_ctx()
     if ctx is None:
-        # Context lost - store error result to prevent stuck "pending" state
-        _store_thumb_result(src, None, error="context_lost")
-        _diag("UI_RESOLVE_FAIL", src=src, reason="context_lost", error="script context unavailable")
         return
     error: str | None = None
     url: str | None = None
@@ -2277,11 +1996,6 @@ def _start_thumb_worker(src: str, api_base: str, ttl: int = 3600) -> None:
 
 
 def _resolve_thumb_async(src: str, api_base: str) -> str | None:
-    """Queue async thumbnail fetch and return cached URL if ready, else None.
-
-    Returns:
-        Presigned URL if cached and ready, None if pending or error (placeholder should be shown).
-    """
     cache = _thumb_async_cache()
     entry = cache.get(src)
     if entry:
@@ -2289,15 +2003,10 @@ def _resolve_thumb_async(src: str, api_base: str) -> str | None:
         if status == "ready":
             return entry.get("url")
         if status == "error":
-            _diag("UI_THUMB_ASYNC", src=src, status="error_retry", error=entry.get("error"))
             cache.pop(src, None)
             entry = None
-        elif status == "pending":
-            # Already queued, waiting for worker to complete
-            return None
     if not entry:
         cache[src] = {"status": "pending", "url": None, "error": None, "updated": time.time()}
-        _diag("UI_THUMB_ASYNC", src=src, status="queued")
     _start_thumb_worker(src, api_base)
     return None
 
@@ -2308,22 +2017,29 @@ def resolve_thumb(src: str | None) -> str | None:
     Resolution order:
     1. Already a data URL → return as-is
     2. HTTPS URL (S3 presigned) → return as-is (CORS-safe)
-    3. Local file path exists → convert to data URL (fallback tracked by API)
-    4. S3 key (artifacts/**) → presign via API asynchronously
-    5. None → return None for placeholder
+    3. HTTP localhost API URL → fetch and convert to data URL
+    4. Local file path exists → convert to data URL
+    5. S3 key (artifacts/**) → presign via API asynchronously
+    6. None → return None for placeholder
     """
     if not src:
         return None
 
-    # Accept existing data URLs
     if isinstance(src, str) and src.startswith("data:"):
         return src
-
-    # Accept HTTPS URLs (S3 presigned)
     if isinstance(src, str) and src.startswith("https://"):
         return src
 
-    # Local file paths - convert to base64 (API tracks these for banner)
+    if isinstance(src, str) and src.startswith("http://localhost:"):
+        try:
+            response = requests.get(src, timeout=2)
+            if response.ok and response.content:
+                encoded = base64.b64encode(response.content).decode("ascii")
+                content_type = response.headers.get("content-type") or _infer_mime(src) or "image/jpeg"
+                return f"data:{content_type};base64,{encoded}"
+        except Exception as exc:
+            _diag("UI_RESOLVE_FAIL", src=src, reason="localhost_fetch_error", error=str(exc))
+
     try:
         path = Path(src)
         if path.exists() and path.is_file():
@@ -2333,16 +2049,12 @@ def resolve_thumb(src: str | None) -> str | None:
     except (OSError, ValueError) as exc:
         _diag("UI_RESOLVE_FAIL", src=src, reason="local_file_error", error=str(exc))
 
-    # Try to resolve as S3 key
     if isinstance(src, str) and (
         src.startswith("artifacts/")
         or src.startswith("raw/")
         or ("/" in src and not src.startswith("/") and not src.startswith("http"))
     ):
         api_base = st.session_state.get("api_base") or _api_base()
-        presigned = _blocking_thumb_fetch(src, api_base)
-        if presigned:
-            return presigned
         return _resolve_thumb_async(src, api_base)
 
     _diag("UI_RESOLVE_FAIL", src=src, reason="all_methods_failed")
@@ -2394,8 +2106,6 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
         img = placeholder
 
     escaped_alt = html.escape(alt)
-    # Escape src attribute to prevent XSS (handles quotes, ampersands, angle brackets)
-    escaped_img = html.escape(img, quote=True)
     if hide_if_missing:
         onerror_handler = "this.closest('.thumb').classList.add('thumb-hidden');"
     else:
@@ -2407,16 +2117,6 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
 
     return (
         f'<div class="{wrapper_class}">'
-        f'<img src="{escaped_img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
+        f'<img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
         "</div>"
     )
-
-
-def track_skeleton_html(num_frames: int = 12) -> str:
-    """Generate skeleton HTML for track detail loading state.
-
-    Shows animated placeholder frames while track data is being loaded.
-    Uses the existing thumb-skeleton CSS class for consistent styling.
-    """
-    frames = "".join(['<div class="thumb thumb-skeleton"></div>' for _ in range(num_frames)])
-    return f'<div class="thumb-strip">{frames}</div>'
