@@ -1497,189 +1497,190 @@ def main():
             "Open Episode Detail",
             on_click=lambda: _navigate_to_detail_with_ep(st.session_state.get("ep_id", "")),
         )
-        
-        s3_loaded = True
-        st.subheader("Existing Episode (browse S3)")
-        try:
-            s3_payload = helpers.api_get("/episodes/s3_videos")
-            s3_items = s3_payload.get("items", [])
+
+        if upload_mode_choice != "New episode" or mode == "replace":
             s3_loaded = True
-        except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/s3_videos", exc))
-            s3_items = []
-            s3_loaded = False
-        
-        if s3_items:
-            s3_search = st.text_input("Filter S3 videos", "").strip().lower()
-        
-            # Expand filter to search ep_id, show, season, episode, and S3 key
-            def _matches_filter(item: Dict[str, Any], search_term: str) -> bool:
-                if not search_term:
-                    return True
-                meta = _s3_item_metadata(item)
-                search_fields = [
-                    str(item.get("ep_id", "")),
-                    str(meta.get("show", "")),
-                    str(meta.get("season", "")),
-                    str(meta.get("episode", "")),
-                    str(item.get("key", "")),
-                ]
-                return any(search_term in field.lower() for field in search_fields)
-        
-            filtered_items = [item for item in s3_items if _matches_filter(item, s3_search)]
-        
-            # Reset selectbox selection when filter changes to avoid stale index
-            prev_filter = st.session_state.get("s3_prev_filter", "")
-            if s3_search != prev_filter:
-                st.session_state["s3_prev_filter"] = s3_search
-                if "s3_video_select" in st.session_state:
-                    del st.session_state["s3_video_select"]
-        
-            if filtered_items:
-                # Sort by show (alphabetically), then season (descending), then episode (descending)
-                def _sort_key(item: Dict[str, Any]) -> tuple:
+            st.subheader("Existing Episode (browse S3)")
+            try:
+                s3_payload = helpers.api_get("/episodes/s3_videos")
+                s3_items = s3_payload.get("items", [])
+                s3_loaded = True
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/s3_videos", exc))
+                s3_items = []
+                s3_loaded = False
+
+            if s3_items:
+                s3_search = st.text_input("Filter S3 videos", "").strip().lower()
+
+                # Expand filter to search ep_id, show, season, episode, and S3 key
+                def _matches_filter(item: Dict[str, Any], search_term: str) -> bool:
+                    if not search_term:
+                        return True
                     meta = _s3_item_metadata(item)
-                    show = meta.get("show") or ""
-                    season = meta.get("season")
-                    episode = meta.get("episode")
-                    # Use negative values for descending sort, fallback to 0 if None
-                    season_val = -int(season) if season is not None else 0
-                    episode_val = -int(episode) if episode is not None else 0
-                    return (show.lower(), season_val, episode_val)
-        
-                sorted_items = sorted(filtered_items, key=_sort_key)
-        
-                def _format_item(item: Dict[str, Any]) -> str:
-                    size = item.get("size")
-                    size_mb = f"{(size or 0) / (1024**2):.1f} MB" if size else "size ?"
-                    last_mod_raw = item.get("last_modified")
-                    # Format timestamp: extract date portion (YYYY-MM-DD) from ISO timestamp
-                    if last_mod_raw and len(last_mod_raw) >= 10:
-                        last_mod = last_mod_raw[:10]  # Take first 10 chars: YYYY-MM-DD
-                    else:
-                        last_mod = last_mod_raw or "unknown"
-                    return f"{item['ep_id']} · {size_mb} · {last_mod}"
-        
-                selected_index = st.selectbox(
-                    "S3 videos",
-                    list(range(len(sorted_items))),
-                    format_func=lambda idx: _format_item(sorted_items[idx]),
-                    key="s3_video_select",
-                )
-                selected_item = sorted_items[selected_index]
-                selected_meta = _s3_item_metadata(selected_item)
-                ep_id_from_s3 = selected_meta.get("ep_id") or selected_item.get("ep_id")
-                show_label = selected_meta.get("show")
-                season_label = selected_meta.get("season")
-                episode_label = selected_meta.get("episode")
-                st.write(f"S3 key: `{selected_item['key']}`")
-                if show_label and season_label is not None and episode_label is not None:
-                    st.caption(f"{show_label} · s{int(season_label):02d}e{int(episode_label):02d}")
-                tracked = bool(selected_item.get("exists_in_store"))
-                st.write(f"Tracked in store: {tracked}")
-                if ep_id_from_s3:
-                    helpers.set_ep_id(ep_id_from_s3, rerun=False)
-        
-                prefixes = helpers.episode_artifact_prefixes(ep_id_from_s3) if ep_id_from_s3 else None
-                if prefixes:
-                    st.caption(
-                        "S3 artifacts → "
-                        f"Frames {helpers.s3_uri(prefixes['frames'], cfg.get('bucket'))} | "
-                        f"Crops {helpers.s3_uri(prefixes['crops'], cfg.get('bucket'))} | "
-                        f"Manifests {helpers.s3_uri(prefixes['manifests'], cfg.get('bucket'))}"
-                    )
-        
-                detail_data = None
-                if ep_id_from_s3 and tracked:
-                    try:
-                        detail_data = helpers.api_get(f"/episodes/{ep_id_from_s3}")
-                    except requests.RequestException as exc:
-                        st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id_from_s3}", exc))
-                if detail_data:
-                    s3_info = detail_data.get("s3", {})
-                    st.write(f"V2 key: `{s3_info.get('v2_key')}` (exists={s3_info.get('v2_exists')})")
-                    st.write(f"V1 key: `{s3_info.get('v1_key')}` (exists={s3_info.get('v1_exists')})")
-                    if not s3_info.get("v2_exists") and s3_info.get("v1_exists"):
-                        st.warning("Found legacy v1 object; mirror will fall back to v1 but new uploads use the v2 path.")
-        
-                if not tracked:
-                    st.warning("Episode not in local store yet.")
-                    if st.button("Create episode in store", key=f"create_episode_{ep_id_from_s3}"):
-                        if not (ep_id_from_s3 and show_label and season_label is not None and episode_label is not None):
-                            st.error("Unable to parse S3 key into show/season/episode (v2 keys required).")
+                    search_fields = [
+                        str(item.get("ep_id", "")),
+                        str(meta.get("show", "")),
+                        str(meta.get("season", "")),
+                        str(meta.get("episode", "")),
+                        str(item.get("key", "")),
+                    ]
+                    return any(search_term in field.lower() for field in search_fields)
+
+                filtered_items = [item for item in s3_items if _matches_filter(item, s3_search)]
+
+                # Reset selectbox selection when filter changes to avoid stale index
+                prev_filter = st.session_state.get("s3_prev_filter", "")
+                if s3_search != prev_filter:
+                    st.session_state["s3_prev_filter"] = s3_search
+                    if "s3_video_select" in st.session_state:
+                        del st.session_state["s3_video_select"]
+
+                if filtered_items:
+                    # Sort by show (alphabetically), then season (descending), then episode (descending)
+                    def _sort_key(item: Dict[str, Any]) -> tuple:
+                        meta = _s3_item_metadata(item)
+                        show = meta.get("show") or ""
+                        season = meta.get("season")
+                        episode = meta.get("episode")
+                        # Use negative values for descending sort, fallback to 0 if None
+                        season_val = -int(season) if season is not None else 0
+                        episode_val = -int(episode) if episode is not None else 0
+                        return (show.lower(), season_val, episode_val)
+
+                    sorted_items = sorted(filtered_items, key=_sort_key)
+
+                    def _format_item(item: Dict[str, Any]) -> str:
+                        size = item.get("size")
+                        size_mb = f"{(size or 0) / (1024**2):.1f} MB" if size else "size ?"
+                        last_mod_raw = item.get("last_modified")
+                        # Format timestamp: extract date portion (YYYY-MM-DD) from ISO timestamp
+                        if last_mod_raw and len(last_mod_raw) >= 10:
+                            last_mod = last_mod_raw[:10]  # Take first 10 chars: YYYY-MM-DD
                         else:
-                            payload = {
-                                "ep_id": ep_id_from_s3,
-                                "show_slug": str(show_label),
-                                "season": int(season_label),
-                                "episode": int(episode_label),
-                            }
-                            try:
-                                upsert_resp = helpers.api_post("/episodes/upsert_by_id", payload)
-                            except requests.RequestException as exc:
-                                st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/upsert_by_id", exc))
-                            else:
-                                st.success(f"Episode `{upsert_resp['ep_id']}` tracked (created={upsert_resp['created']}).")
-                                helpers.set_ep_id(upsert_resp["ep_id"])
-                                st.rerun()
-                elif ep_id_from_s3:
-                    action_cols = st.columns([1, 1, 1])
-                    with action_cols[0]:
-                        st.button(
-                            "Open Episode Detail",
-                            key=f"open_detail_{ep_id_from_s3}",
-                            use_container_width=True,
-                            on_click=lambda ep=ep_id_from_s3: _navigate_to_detail_with_ep(ep),
-                        )
-                    with action_cols[1]:
-                        if st.button(
-                            "Mirror from S3",
-                            key=f"mirror_{ep_id_from_s3}",
-                            use_container_width=True,
-                        ):
-                            with st.spinner(f"Mirroring video from S3 for {ep_id_from_s3}..."):
-                                try:
-                                    mirror_resp = helpers.api_post(f"/episodes/{ep_id_from_s3}/mirror")
-                                except requests.RequestException as exc:
-                                    st.error(
-                                        helpers.describe_error(
-                                            f"{cfg['api_base']}/episodes/{ep_id_from_s3}/mirror",
-                                            exc,
-                                        )
-                                    )
-                                else:
-                                    st.success(
-                                        f"Mirrored to {helpers.link_local(mirror_resp['local_video_path'])} "
-                                        f"({helpers.human_size(mirror_resp.get('bytes'))})"
-                                    )
-                    with action_cols[2]:
-                        if st.button(
-                            "Queue detect/track (defaults)",
-                            key=f"queue_detect_track_{ep_id_from_s3}",
-                            use_container_width=True,
-                        ):
-                            with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
-                                result = _launch_default_detect_track(
-                                    ep_id_from_s3,
-                                    label=f"S3 detect/track · {ep_id_from_s3}",
-                                )
-                            if result and result.get("job"):
-                                st.rerun()
-        
-                    artifacts = {
-                        "video": get_path(ep_id_from_s3, "video"),
-                        "detections": get_path(ep_id_from_s3, "detections"),
-                        "tracks": get_path(ep_id_from_s3, "tracks"),
-                    }
-                    st.caption(
-                        f"Video → {helpers.link_local(artifacts['video'])} | "
-                        f"Detections → {helpers.link_local(artifacts['detections'])} | "
-                        f"Tracks → {helpers.link_local(artifacts['tracks'])}"
+                            last_mod = last_mod_raw or "unknown"
+                        return f"{item['ep_id']} · {size_mb} · {last_mod}"
+
+                    selected_index = st.selectbox(
+                        "S3 videos",
+                        list(range(len(sorted_items))),
+                        format_func=lambda idx: _format_item(sorted_items[idx]),
+                        key="s3_video_select",
                     )
-            elif s3_loaded:
-                st.warning("No S3 videos match that filter.")
-        else:
-            st.info("No S3 videos found (or API error).")
+                    selected_item = sorted_items[selected_index]
+                    selected_meta = _s3_item_metadata(selected_item)
+                    ep_id_from_s3 = selected_meta.get("ep_id") or selected_item.get("ep_id")
+                    show_label = selected_meta.get("show")
+                    season_label = selected_meta.get("season")
+                    episode_label = selected_meta.get("episode")
+                    st.write(f"S3 key: `{selected_item['key']}`")
+                    if show_label and season_label is not None and episode_label is not None:
+                        st.caption(f"{show_label} · s{int(season_label):02d}e{int(episode_label):02d}")
+                    tracked = bool(selected_item.get("exists_in_store"))
+                    st.write(f"Tracked in store: {tracked}")
+                    if ep_id_from_s3:
+                        helpers.set_ep_id(ep_id_from_s3, rerun=False)
+
+                    prefixes = helpers.episode_artifact_prefixes(ep_id_from_s3) if ep_id_from_s3 else None
+                    if prefixes:
+                        st.caption(
+                            "S3 artifacts → "
+                            f"Frames {helpers.s3_uri(prefixes['frames'], cfg.get('bucket'))} | "
+                            f"Crops {helpers.s3_uri(prefixes['crops'], cfg.get('bucket'))} | "
+                            f"Manifests {helpers.s3_uri(prefixes['manifests'], cfg.get('bucket'))}"
+                        )
+
+                    detail_data = None
+                    if ep_id_from_s3 and tracked:
+                        try:
+                            detail_data = helpers.api_get(f"/episodes/{ep_id_from_s3}")
+                        except requests.RequestException as exc:
+                            st.warning(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id_from_s3}", exc))
+                    if detail_data:
+                        s3_info = detail_data.get("s3", {})
+                        st.write(f"V2 key: `{s3_info.get('v2_key')}` (exists={s3_info.get('v2_exists')})")
+                        st.write(f"V1 key: `{s3_info.get('v1_key')}` (exists={s3_info.get('v1_exists')})")
+                        if not s3_info.get("v2_exists") and s3_info.get("v1_exists"):
+                            st.warning("Found legacy v1 object; mirror will fall back to v1 but new uploads use the v2 path.")
+
+                    if not tracked:
+                        st.warning("Episode not in local store yet.")
+                        if st.button("Create episode in store", key=f"create_episode_{ep_id_from_s3}"):
+                            if not (ep_id_from_s3 and show_label and season_label is not None and episode_label is not None):
+                                st.error("Unable to parse S3 key into show/season/episode (v2 keys required).")
+                            else:
+                                payload = {
+                                    "ep_id": ep_id_from_s3,
+                                    "show_slug": str(show_label),
+                                    "season": int(season_label),
+                                    "episode": int(episode_label),
+                                }
+                                try:
+                                    upsert_resp = helpers.api_post("/episodes/upsert_by_id", payload)
+                                except requests.RequestException as exc:
+                                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/upsert_by_id", exc))
+                                else:
+                                    st.success(f"Episode `{upsert_resp['ep_id']}` tracked (created={upsert_resp['created']}).")
+                                    helpers.set_ep_id(upsert_resp["ep_id"])
+                                    st.rerun()
+                    elif ep_id_from_s3:
+                        action_cols = st.columns([1, 1, 1])
+                        with action_cols[0]:
+                            st.button(
+                                "Open Episode Detail",
+                                key=f"open_detail_{ep_id_from_s3}",
+                                use_container_width=True,
+                                on_click=lambda ep=ep_id_from_s3: _navigate_to_detail_with_ep(ep),
+                            )
+                        with action_cols[1]:
+                            if st.button(
+                                "Mirror from S3",
+                                key=f"mirror_{ep_id_from_s3}",
+                                use_container_width=True,
+                            ):
+                                with st.spinner(f"Mirroring video from S3 for {ep_id_from_s3}..."):
+                                    try:
+                                        mirror_resp = helpers.api_post(f"/episodes/{ep_id_from_s3}/mirror")
+                                    except requests.RequestException as exc:
+                                        st.error(
+                                            helpers.describe_error(
+                                                f"{cfg['api_base']}/episodes/{ep_id_from_s3}/mirror",
+                                                exc,
+                                            )
+                                        )
+                                    else:
+                                        st.success(
+                                            f"Mirrored to {helpers.link_local(mirror_resp['local_video_path'])} "
+                                            f"({helpers.human_size(mirror_resp.get('bytes'))})"
+                                        )
+                        with action_cols[2]:
+                            if st.button(
+                                "Queue detect/track (defaults)",
+                                key=f"queue_detect_track_{ep_id_from_s3}",
+                                use_container_width=True,
+                            ):
+                                with st.spinner("Queueing detect/track (RetinaFace + ByteTrack)…"):
+                                    result = _launch_default_detect_track(
+                                        ep_id_from_s3,
+                                        label=f"S3 detect/track · {ep_id_from_s3}",
+                                    )
+                                if result and result.get("job"):
+                                    st.rerun()
+
+                        artifacts = {
+                            "video": get_path(ep_id_from_s3, "video"),
+                            "detections": get_path(ep_id_from_s3, "detections"),
+                            "tracks": get_path(ep_id_from_s3, "tracks"),
+                        }
+                        st.caption(
+                            f"Video → {helpers.link_local(artifacts['video'])} | "
+                            f"Detections → {helpers.link_local(artifacts['detections'])} | "
+                            f"Tracks → {helpers.link_local(artifacts['tracks'])}"
+                        )
+                elif s3_loaded:
+                    st.warning("No S3 videos match that filter.")
+            else:
+                st.info("No S3 videos found (or API error).")
 
         # Auto-refresh if jobs running with lightweight backoff (capped at 0.5s to avoid UI freeze)
         if jobs_running:
