@@ -1283,19 +1283,22 @@ def _render_unassigned_cluster_card(
                     )
 
                 if submit_quick_assign:
-                    # Use the suggested person_id directly
-                    payload = {
-                        "strategy": "manual",
-                        "cluster_ids": [cluster_id],
-                        "target_person_id": suggested_person_id,
-                        "cast_id": suggested_cast_id,  # May be None, that's ok
-                    }
-                    resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                    if resp and resp.get("status") == "success":
-                        st.success(f"Assigned cluster to {suggested_cast_name}!")
-                        st.rerun()
+                    # Use async batch assign for single cluster
+                    if suggested_cast_id:
+                        payload = {"assignments": [{"cluster_id": cluster_id, "target_cast_id": suggested_cast_id}]}
+                        response = helpers.submit_async_job(
+                            endpoint=f"/episodes/{ep_id}/clusters/batch_assign_async",
+                            payload=payload,
+                            operation=f"Assign to {suggested_cast_name}",
+                            episode_id=ep_id,
+                        )
+                        if response and response.get("async"):
+                            st.rerun()
+                        elif response:
+                            st.success(f"Assigned cluster to {suggested_cast_name}!")
+                            st.rerun()
                     else:
-                        st.error("Failed to assign cluster. Check logs.")
+                        st.error("No cast_id for suggested assignment")
 
         st.markdown("**Assign this cluster to:**")
 
@@ -1327,34 +1330,19 @@ def _render_unassigned_cluster_card(
                     submit_assign = st.form_submit_button("Assign Cluster")
 
                     if submit_assign:
-                        with st.spinner("Assigning cluster..."):
-                            # First, find or get the person_id for this cast member
-                            people_resp = _safe_api_get(f"/shows/{show_id}/people")
-                            people = people_resp.get("people", []) if people_resp else []
-                            target_person = next(
-                                (p for p in people if p.get("cast_id") == selected_cast_id),
-                                None,
-                            )
-
-                            if target_person:
-                                target_person_id = target_person.get("person_id")
-                            else:
-                                # Person doesn't exist yet - the API will create one
-                                target_person_id = None
-
-                            # Call manual grouping API
-                            payload = {
-                                "strategy": "manual",
-                                "cluster_ids": [cluster_id],
-                                "target_person_id": target_person_id,
-                                "cast_id": selected_cast_id,  # Include cast_id for linking
-                            }
-                            resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                            if resp and resp.get("status") == "success":
-                                st.success(f"Assigned cluster to {cast_options[selected_cast_id]}!")
-                                st.rerun()
-                            else:
-                                st.error("Failed to assign cluster. Check logs.")
+                        # Use async batch assign
+                        payload = {"assignments": [{"cluster_id": cluster_id, "target_cast_id": selected_cast_id}]}
+                        response = helpers.submit_async_job(
+                            endpoint=f"/episodes/{ep_id}/clusters/batch_assign_async",
+                            payload=payload,
+                            operation=f"Assign to {cast_options[selected_cast_id]}",
+                            episode_id=ep_id,
+                        )
+                        if response and response.get("async"):
+                            st.rerun()
+                        elif response:
+                            st.success(f"Assigned cluster to {cast_options[selected_cast_id]}!")
+                            st.rerun()
             else:
                 st.warning("No cast members available. Import cast first.")
 
@@ -1597,44 +1585,37 @@ def _bulk_assign_clusters(
     target_cast_id: str,
     cluster_ids: List[str],
 ) -> bool:
-    """Assign all clusters from source person to a cast member."""
-    try:
-        # Find or create a person record for this cast_id via API
-        people_resp = _safe_api_get(f"/shows/{show_id}/people")
-        people = people_resp.get("people", []) if people_resp else []
-        target_person = next((p for p in people if p.get("cast_id") == target_cast_id), None)
-
-        if not target_person:
-            # Fetch cast member details to get the name
-            cast_resp = _safe_api_get(f"/shows/{show_id}/cast")
-            cast_members = cast_resp.get("cast", []) if cast_resp else []
-            cast_member = next((cm for cm in cast_members if cm.get("cast_id") == target_cast_id), None)
-
-            if not cast_member:
-                st.error(f"Cast member {target_cast_id} not found")
-                return False
-
-            # Create a new person record linked to this cast member via API
-            create_payload = {
-                "name": cast_member.get("name"),
-                "cast_id": target_cast_id,
-                "aliases": cast_member.get("aliases", []),
-            }
-            target_person = _api_post(f"/shows/{show_id}/people", create_payload)
-            if not target_person:
-                st.error("Failed to create person record")
-                return False
-
-        # Merge source person into target person via API
-        merge_payload = {
-            "source_person_id": source_person_id,
-            "target_person_id": target_person["person_id"],
-        }
-        result = _api_post(f"/shows/{show_id}/people/merge", merge_payload)
-        return result is not None
-    except Exception as exc:
-        st.error(f"Failed to assign clusters: {exc}")
+    """Assign all clusters from source person to a cast member (async)."""
+    if not cluster_ids:
+        st.warning("No clusters to assign")
         return False
+
+    # Build batch assignment payload
+    assignments = [{"cluster_id": cid, "target_cast_id": target_cast_id} for cid in cluster_ids]
+    payload = {"assignments": assignments}
+
+    # Submit async job
+    response = helpers.submit_async_job(
+        endpoint=f"/episodes/{ep_id}/clusters/batch_assign_async",
+        payload=payload,
+        operation=f"Assign {len(cluster_ids)} clusters",
+        episode_id=ep_id,
+    )
+
+    if response:
+        if response.get("async"):
+            # Job submitted - will refresh via job status polling
+            return True
+        else:
+            # Sync fallback completed
+            succeeded = response.get("succeeded", 0)
+            failed = response.get("failed", 0)
+            if failed == 0:
+                return True
+            else:
+                st.warning(f"Assigned {succeeded} clusters, {failed} failed")
+                return succeeded > 0
+    return False
 
 
 def _bulk_assign_to_new_person(
@@ -1644,47 +1625,30 @@ def _bulk_assign_to_new_person(
     new_name: str,
     cluster_ids: List[str],
 ) -> bool:
-    """Create a new person and assign all clusters to them."""
-    try:
-        # Check if person with this name exists via API
-        people_resp = _safe_api_get(f"/shows/{show_id}/people")
-        people = people_resp.get("people", []) if people_resp else []
+    """Create a new person and assign all clusters to them.
 
-        # Simple name matching (case-insensitive)
-        existing = next((p for p in people if p.get("name", "").lower() == new_name.lower()), None)
+    Uses manual grouping strategy which handles person creation automatically.
+    """
+    if not cluster_ids:
+        st.warning("No clusters to assign")
+        return False
 
-        if existing:
-            # Merge into existing person
-            merge_payload = {
-                "source_person_id": source_person_id,
-                "target_person_id": existing["person_id"],
-            }
-            result = _api_post(f"/shows/{show_id}/people/merge", merge_payload)
-            return result is not None
+    # Use manual grouping strategy - it creates persons automatically
+    payload = {
+        "strategy": "manual",
+        "cluster_ids": cluster_ids,
+        "name": new_name,
+    }
 
-        # Get source person data
-        source = _safe_api_get(f"/shows/{show_id}/people/{source_person_id}")
-        if not source:
-            st.error(f"Source person {source_person_id} not found")
-            return False
+    # Use sync call for manual strategy (async only supports auto)
+    # but show a spinner since it can take a while
+    with st.spinner(f"Creating '{new_name}' and assigning {len(cluster_ids)} clusters..."):
+        result = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
 
-        # Create new person via API
-        create_payload = {
-            "name": new_name,
-            "cluster_ids": source.get("cluster_ids", []),
-            "aliases": [],
-        }
-        new_person = _api_post(f"/shows/{show_id}/people", create_payload)
-        if not new_person:
-            st.error("Failed to create new person")
-            return False
-
-        # Delete old person via API
-        delete_result = _api_delete(f"/shows/{show_id}/people/{source_person_id}")
-
+    if result and result.get("status") == "success":
         return True
-    except Exception as exc:
-        st.error(f"Failed to create person: {exc}")
+    else:
+        st.error("Failed to create person and assign clusters")
         return False
 
 
