@@ -45,9 +45,13 @@ class CastService:
 
     @staticmethod
     def _normalize_show_id(show_id: str) -> str:
+        """Normalize show_id to uppercase for consistent directory structure.
+
+        Matches PeopleService.normalize_show_id for consistent storage paths.
+        """
         if not isinstance(show_id, str):
             raise ValueError("show_id must be a string")
-        cleaned = show_id.strip()
+        cleaned = show_id.strip().upper()
         if not cleaned:
             raise ValueError("show_id cannot be empty")
         return cleaned
@@ -68,13 +72,14 @@ class CastService:
 
     def _load_cast(self, show_id: str) -> Dict[str, Any]:
         """Load cast.json or create empty structure."""
+        normalized_show_id = self._normalize_show_id(show_id)
         path = self._cast_file_path(show_id)
         if not path.exists():
-            return {"show_id": show_id, "cast": []}
+            return {"show_id": normalized_show_id, "cast": []}
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return {"show_id": show_id, "cast": []}
+            return {"show_id": normalized_show_id, "cast": []}
 
     def _save_cast(self, show_id: str, data: Dict[str, Any]) -> None:
         """Save cast.json."""
@@ -137,8 +142,6 @@ class CastService:
                 payload["show_title"] = payload.get("full_name") or normalized
             if full_name is not None:
                 payload["full_name"] = full_name or None
-            elif created:
-                payload["full_name"] = title
             if imdb_series_id is not None:
                 payload["imdb_series_id"] = imdb_series_id or None
 
@@ -295,8 +298,12 @@ class CastService:
         data = self._load_cast(show_id)
         cast_members = data.get("cast", [])
 
-        # Build name lookup (case-insensitive)
-        name_to_member = {m["name"].lower(): m for m in cast_members}
+        # Build name lookup (case-insensitive), skip members with None/empty names
+        name_to_member = {
+            m["name"].lower(): m
+            for m in cast_members
+            if m.get("name") and isinstance(m["name"], str)
+        }
 
         created = []
         updated = []
@@ -313,6 +320,8 @@ class CastService:
             aliases = entry.get("aliases", [])
             seasons = entry.get("seasons", [])
             social = entry.get("social", {})
+            full_name = entry.get("full_name")
+            imdb_id = entry.get("imdb_id")
 
             # Normalize aliases and seasons
             if isinstance(aliases, str):
@@ -330,6 +339,10 @@ class CastService:
                 existing["aliases"] = aliases
                 existing["seasons"] = seasons
                 existing["social"] = social
+                if full_name is not None:
+                    existing["full_name"] = full_name
+                if imdb_id is not None:
+                    existing["imdb_id"] = imdb_id
                 existing["updated_at"] = _now_iso()
                 updated.append({"name": name, "cast_id": existing["cast_id"]})
             else:
@@ -339,6 +352,8 @@ class CastService:
                     "cast_id": cast_id,
                     "show_id": show_id,
                     "name": name,
+                    "full_name": full_name,
+                    "imdb_id": imdb_id,
                     "role": role,
                     "status": status,
                     "aliases": aliases,

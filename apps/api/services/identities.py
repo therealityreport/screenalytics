@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Generator, Iterable, List, Sequence
 
 from py_screenalytics.artifacts import get_path
 
@@ -19,6 +21,26 @@ from apps.shared.storage import s3_write_json, use_s3
 
 STORAGE = StorageService()
 LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def _episode_lock(ep_id: str) -> Generator[None, None, None]:
+    """Acquire an exclusive lock for episode-level file operations.
+
+    Uses fcntl advisory locking to prevent concurrent modifications
+    to faces, tracks, and identities files for the same episode.
+    """
+    lock_path = _manifests_dir(ep_id) / ".episode.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = None
+    try:
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
 
 
 def _manifests_dir(ep_id: str) -> Path:
@@ -428,10 +450,11 @@ def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, An
     target = next((item for item in identities if item.get("identity_id") == target_id), None)
     if not source or not target:
         raise ValueError("identity_not_found")
-    merged = set(target.get("track_ids", []) or [])
-    for tid in source.get("track_ids", []) or []:
-        merged.add(int(tid))
-    target["track_ids"] = sorted({int(val) for val in merged})
+    # Consistently coerce all track_ids to int to avoid type confusion
+    target_tids = {int(tid) for tid in (target.get("track_ids", []) or [])}
+    source_tids = {int(tid) for tid in (source.get("track_ids", []) or [])}
+    merged = target_tids | source_tids
+    target["track_ids"] = sorted(merged)
     payload["identities"] = [item for item in identities if item.get("identity_id") != source_id]
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
@@ -445,20 +468,24 @@ def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dic
     source_identity = None
     target_identity = None
     for identity in identities:
-        track_ids = identity.get("track_ids", []) or []
+        # Coerce track_ids to int for consistent comparison (handles string/int mismatch)
+        track_ids = {int(tid) for tid in (identity.get("track_ids", []) or [])}
         if track_id in track_ids:
             source_identity = identity
         if target_identity_id and identity.get("identity_id") == target_identity_id:
             target_identity = identity
     if target_identity_id and target_identity is None:
         raise ValueError("target_not_found")
-    if source_identity and track_id in source_identity.get("track_ids", []):
-        source_identity["track_ids"] = [tid for tid in source_identity["track_ids"] if tid != track_id]
+    # Remove from source identity (coerce to int for comparison)
+    if source_identity:
+        source_track_ids = {int(tid) for tid in source_identity.get("track_ids", [])}
+        source_identity["track_ids"] = sorted(tid for tid in source_track_ids if tid != track_id)
     if target_identity is not None:
         target_identity.setdefault("track_ids", [])
-        if track_id not in target_identity["track_ids"]:
-            target_identity["track_ids"].append(track_id)
-            target_identity["track_ids"] = sorted(target_identity["track_ids"])
+        # Coerce existing track_ids to int and add new track
+        target_track_ids = {int(tid) for tid in target_identity["track_ids"]}
+        target_track_ids.add(track_id)
+        target_identity["track_ids"] = sorted(target_track_ids)
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
     sync_manifests(ep_id, identities_path)
@@ -476,7 +503,10 @@ def drop_track(ep_id: str, track_id: int) -> Dict[str, Any]:
     tracks_path = write_tracks(ep_id, kept_tracks)
     identities = load_identities(ep_id)
     for identity in identities.get("identities", []):
-        identity["track_ids"] = [tid for tid in identity.get("track_ids", []) if tid != track_id]
+        # Coerce to int for consistent comparison
+        identity["track_ids"] = sorted(
+            int(tid) for tid in identity.get("track_ids", []) if int(tid) != track_id
+        )
     update_identity_stats(ep_id, identities)
     identities_path = write_identities(ep_id, identities)
     sync_manifests(ep_id, tracks_path, identities_path)
@@ -525,6 +555,7 @@ def _persist_identity_name(
     identity_id: str,
     trimmed_name: str,
     show: str | None,
+    cast_id: str | None = None,
 ) -> Dict[str, Any]:
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
@@ -556,10 +587,23 @@ def _persist_identity_name(
             # Build cluster_id with episode prefix
             cluster_id_with_prefix = f"{ep_id}:{identity_id}"
 
-            # Use alias-aware lookup to find existing person
-            existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
+            existing_person = None
+
+            # PRIORITY 1: If cast_id provided, look for person with that cast_id first
+            if cast_id:
+                existing_person = next(
+                    (p for p in people_service.list_people(show_slug) if p.get("cast_id") == cast_id),
+                    None,
+                )
+                if existing_person:
+                    LOGGER.info(f"Found existing person by cast_id {cast_id}: {existing_person['person_id']}")
+
+            # PRIORITY 2: If no cast_id match, use alias-aware lookup by name
             if not existing_person:
-                # Fallback to case-insensitive primary-name match
+                existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
+
+            # PRIORITY 3: Fallback to case-insensitive primary-name match
+            if not existing_person:
                 existing_person = next(
                     (
                         person
@@ -590,15 +634,21 @@ def _persist_identity_name(
                 if people_service.normalize_name(trimmed_name) != people_service.normalize_name(primary_name):
                     people_service.add_alias_to_person(show_slug, person_id, trimmed_name)
                     LOGGER.info(f"Added alias '{trimmed_name}' to person {person_id}")
+
+                # Ensure cast_id is set if provided
+                if cast_id and existing_person.get("cast_id") != cast_id:
+                    people_service.update_person(show_slug, person_id, cast_id=cast_id)
+                    LOGGER.info(f"Updated person {person_id} with cast_id {cast_id}")
             else:
-                # Create new person
+                # Create new person with cast_id
                 person = people_service.create_person(
                     show_slug,
                     name=trimmed_name,
                     cluster_ids=[cluster_id_with_prefix],
                     aliases=[],
+                    cast_id=cast_id,  # Include cast_id when creating person
                 )
-                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id}")
+                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id} and cast_id {cast_id}")
 
         except Exception as exc:
             # Don't fail the naming operation if People service fails
@@ -607,7 +657,7 @@ def _persist_identity_name(
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
 
 
-def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None) -> Dict[str, Any]:
+def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
     payload = load_identities(ep_id)
     entries = _identity_rows(payload)
     target = next(
@@ -620,10 +670,10 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
     if not trimmed:
         raise ValueError("name_required")
     target["name"] = trimmed
-    return _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
+    return _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
 
 
-def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None) -> Dict[str, Any]:
+def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
     trimmed = (name or "").strip()
     if not trimmed:
         raise ValueError("name_required")
@@ -658,7 +708,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
 
     if len(track_ids_for_identity) <= 1:
         target_identity["name"] = trimmed
-        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
+        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
         result["track_id"] = track_id_int
         result["split"] = False
         return result
@@ -675,7 +725,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
     }
     payload.setdefault("identities", []).append(new_identity)
 
-    result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show)
+    result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
     result["track_id"] = track_id_int
     result["split"] = True
     result["source_identity_id"] = identity_id
@@ -698,6 +748,21 @@ def move_frames(
     except ValueError as exc:
         raise ValueError("invalid_ep_id") from exc
 
+    # Acquire episode lock to prevent concurrent modifications
+    with _episode_lock(ep_id):
+        return _move_frames_locked(ep_id, from_track_id, face_ids, target_identity_id, new_identity_name, show_id, ctx)
+
+
+def _move_frames_locked(
+    ep_id: str,
+    from_track_id: int,
+    face_ids: Sequence[str],
+    target_identity_id: str | None,
+    new_identity_name: str | None,
+    show_id: str | None,
+    ctx: Any,
+) -> Dict[str, Any]:
+    """Internal implementation of move_frames, called while holding episode lock."""
     faces = load_faces(ep_id)
     face_map = {str(row.get("face_id")): row for row in faces}
     selected: List[Dict[str, Any]] = []
@@ -718,8 +783,9 @@ def move_frames(
 
     identities_payload = load_identities(ep_id)
     identities = _identity_rows(identities_payload)
+    # Coerce track_ids to int for consistent comparison (handles string/int mismatch)
     source_identity = next(
-        (entry for entry in identities if from_track_id in (entry.get("track_ids") or [])),
+        (entry for entry in identities if from_track_id in {int(tid) for tid in (entry.get("track_ids") or [])}),
         None,
     )
 

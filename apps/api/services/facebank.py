@@ -89,15 +89,25 @@ class FacebankService:
         self.facebank_dir = self.data_root / "facebank"
         self.facebank_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _normalize_show_id(show_id: str) -> str:
+        """Normalize show_id to uppercase for consistent directory structure.
+
+        Matches PeopleService and CastService normalize methods.
+        """
+        return show_id.strip().upper() if show_id else ""
+
     def _facebank_path(self, show_id: str, cast_id: str) -> Path:
         """Get path to facebank.json for a cast member."""
-        cast_dir = self.facebank_dir / show_id / cast_id
+        normalized_show = self._normalize_show_id(show_id)
+        cast_dir = self.facebank_dir / normalized_show / cast_id
         cast_dir.mkdir(parents=True, exist_ok=True)
         return cast_dir / "facebank.json"
 
     def _seeds_dir(self, show_id: str, cast_id: str) -> Path:
         """Get directory for seed images."""
-        seeds_dir = self.facebank_dir / show_id / cast_id / "seeds"
+        normalized_show = self._normalize_show_id(show_id)
+        seeds_dir = self.facebank_dir / normalized_show / cast_id / "seeds"
         seeds_dir.mkdir(parents=True, exist_ok=True)
         return seeds_dir
 

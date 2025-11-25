@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -19,6 +21,7 @@ from apps.api.services.storage import StorageService
 router = APIRouter()
 people_service = PeopleService()
 storage_service = StorageService()
+LOGGER = logging.getLogger(__name__)
 
 
 class PersonResponse(BaseModel):
@@ -39,11 +42,13 @@ class PersonUpdateRequest(BaseModel):
     rep_crop: Optional[str] = None
     rep_crop_s3_key: Optional[str] = None
     aliases: Optional[List[str]] = None
+    cast_id: Optional[str] = None
 
 
 class PersonCreateRequest(BaseModel):
     name: Optional[str] = None
     aliases: Optional[List[str]] = None
+    cast_id: Optional[str] = None
 
 
 class PersonMergeRequest(BaseModel):
@@ -92,7 +97,21 @@ def get_person(show_id: str, person_id: str) -> PersonResponse:
 @router.post("/shows/{show_id}/people")
 def create_person(show_id: str, body: PersonCreateRequest) -> PersonResponse:
     """Create a new person."""
-    person = people_service.create_person(show_id, name=body.name)
+    LOGGER.info(
+        "Creating person",
+        extra={
+            "show_id": show_id,
+            "name": body.name,
+            "cast_id": body.cast_id,
+            "aliases": body.aliases or [],
+        },
+    )
+    person = people_service.create_person(
+        show_id,
+        name=body.name,
+        cast_id=body.cast_id,
+        aliases=body.aliases,
+    )
     return PersonResponse(**_hydrate_rep_crop(person))
 
 
@@ -105,6 +124,8 @@ def update_person(show_id: str, person_id: str, body: PersonUpdateRequest) -> Pe
         name=body.name,
         rep_crop=body.rep_crop,
         rep_crop_s3_key=body.rep_crop_s3_key,
+        cast_id=body.cast_id,
+        aliases=body.aliases,
     )
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")

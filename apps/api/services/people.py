@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
+LOGGER = logging.getLogger(__name__)
 DEFAULT_DATA_ROOT = Path("data").expanduser()
+
+# Sentinel value to explicitly clear a field (distinguishes from "don't update")
+CLEAR_FIELD = object()
 
 
 def _now_iso() -> str:
@@ -53,13 +58,14 @@ class PeopleService:
 
     def _load_people(self, show_id: str) -> Dict[str, Any]:
         """Load people.json or create empty structure."""
+        normalized_show_id = self.normalize_show_id(show_id)
         path = self._people_path(show_id)
         if not path.exists():
-            return {"show_id": show_id, "people": []}
+            return {"show_id": normalized_show_id, "people": []}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            return {"show_id": show_id, "people": []}
+            return {"show_id": normalized_show_id, "people": []}
         people = data.get("people")
         if isinstance(people, list):
             for person in people:
@@ -134,34 +140,71 @@ class PeopleService:
         cluster_ids: Optional[List[str]] = None,
         rep_crop: Optional[str] = None,
         rep_crop_s3_key: Optional[str] = None,
-        cast_id: Optional[str] = None,
+        cast_id: Union[Optional[str], object] = None,
         aliases: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Update an existing person."""
+        """Update an existing person.
+
+        To clear cast_id, pass cast_id=CLEAR_FIELD instead of cast_id=None.
+        None means "don't update this field".
+        """
+
         data = self._load_people(show_id)
         people = data.get("people", [])
 
         for person in people:
             if person["person_id"] == person_id:
+                # Log what we're updating
+                updates = []
                 if name is not None:
                     person["name"] = name
+                    updates.append("name")
                 if prototype is not None:
                     person["prototype"] = prototype
+                    updates.append("prototype")
                 if cluster_ids is not None:
+                    old_cluster_count = len(person.get("cluster_ids", []))
+                    new_cluster_count = len(cluster_ids)
                     person["cluster_ids"] = cluster_ids
+                    updates.append(f"cluster_ids ({old_cluster_count} -> {new_cluster_count})")
                 if rep_crop is not None:
                     person["rep_crop"] = rep_crop
+                    updates.append("rep_crop")
                 if rep_crop_s3_key is not None:
                     person["rep_crop_s3_key"] = rep_crop_s3_key
-                if cast_id is not None:
+                    updates.append("rep_crop_s3_key")
+                # Handle cast_id: CLEAR_FIELD removes it, non-None string sets it
+                if cast_id is CLEAR_FIELD:
+                    person.pop("cast_id", None)
+                    updates.append("cast_id (cleared)")
+                elif cast_id is not None:
                     person["cast_id"] = cast_id
+                    updates.append("cast_id")
                 if aliases is not None:
                     person["aliases"] = aliases
+                    updates.append("aliases")
+
+                LOGGER.info(f"update_person {person_id}: updating {', '.join(updates)}")
 
                 data["people"] = people
                 self._save_people(show_id, data)
+
+                # Verify the save worked by reloading
+                verify_data = self._load_people(show_id)
+                verify_person = next((p for p in verify_data.get("people", []) if p["person_id"] == person_id), None)
+                if verify_person and cluster_ids is not None:
+                    verify_cluster_count = len(verify_person.get("cluster_ids", []))
+                    if verify_cluster_count != new_cluster_count:
+                        LOGGER.error(
+                            f"update_person {person_id}: SAVE VERIFICATION FAILED! "
+                            f"Saved {new_cluster_count} clusters but reload shows {verify_cluster_count}"
+                        )
+                    else:
+                        LOGGER.info(f"update_person {person_id}: save verified ({verify_cluster_count} clusters)")
+
                 return person
 
+        LOGGER.error(f"update_person: person {person_id} not found in {show_id}")
         return None
 
     def remove_cluster_from_all_people(
@@ -206,16 +249,20 @@ class PeopleService:
         the cluster from all other people before adding it to the target person.
         The operation is idempotent - running it multiple times yields the same result.
         """
-        # First, remove cluster from all people to ensure single ownership
-        removed_from = self.remove_cluster_from_all_people(show_id, cluster_id)
-        if removed_from:
-            import logging
-
-            LOGGER = logging.getLogger(__name__)
-            LOGGER.info(f"Removed cluster {cluster_id} from people {removed_from} before reassigning to {person_id}")
-
+        # Validate target person exists BEFORE modifying any state
         person = self.get_person(show_id, person_id)
         if not person:
+            return None
+
+        # Remove cluster from all people to ensure single ownership
+        removed_from = self.remove_cluster_from_all_people(show_id, cluster_id)
+        if removed_from:
+            LOGGER.info(f"Removed cluster {cluster_id} from people {removed_from} before reassigning to {person_id}")
+
+        # Re-fetch person in case it was modified during removal (e.g., cluster was on this person)
+        person = self.get_person(show_id, person_id)
+        if not person:
+            LOGGER.warning(f"Person {person_id} disappeared after cluster removal - possible concurrent deletion")
             return None
 
         cluster_ids = person.get("cluster_ids", [])
@@ -316,15 +363,14 @@ class PeopleService:
 
         people = self.list_people(show_id)
 
-        # First pass: try to match by cast_id if provided
-        if cast_id:
-            for person in people:
-                if person.get("cast_id") == cast_id:
-                    return person
-
-        # Second pass: match by name or aliases
+        # Single pass: collect matches and check cast_id simultaneously
+        cast_id_match = None
         matches = []
         for person in people:
+            # Check cast_id match first (highest priority)
+            if cast_id and person.get("cast_id") == cast_id:
+                cast_id_match = person
+
             # Ensure backwards compatibility: add aliases field if missing
             if "aliases" not in person:
                 person["aliases"] = []
@@ -341,6 +387,10 @@ class PeopleService:
                 if self.normalize_name(alias) == normalized:
                     matches.append(person)
                     break
+
+        # Return cast_id match first if found
+        if cast_id_match:
+            return cast_id_match
 
         if not matches:
             return None
@@ -394,6 +444,10 @@ class PeopleService:
         target = self.get_person(show_id, target_person_id)
 
         if not source or not target:
+            LOGGER.error(
+                f"merge_people failed: source or target not found "
+                f"(source={source_person_id}, target={target_person_id})"
+            )
             return None
 
         # Merge cluster_ids
@@ -420,17 +474,59 @@ class PeopleService:
                 target_aliases.append(alias)
                 existing_normalized.add(normalized)
 
+        # Log what we're about to merge
+        target_clusters_before = len(target.get("cluster_ids") or [])
+        source_clusters_count = len(source_clusters)
+        merged_clusters_sorted = sorted(target_clusters)
+        expected_cluster_count = len(merged_clusters_sorted)
+
+        LOGGER.info(
+            f"merge_people: {source_person_id} -> {target_person_id} | "
+            f"target_clusters_before={target_clusters_before}, "
+            f"source_clusters={source_clusters_count}, "
+            f"expected_after={expected_cluster_count}"
+        )
+
         # Update target with merged data
         updated = self.update_person(
             show_id,
             target_person_id,
-            cluster_ids=sorted(target_clusters),
+            cluster_ids=merged_clusters_sorted,
             aliases=target_aliases,
         )
 
-        # Delete source person
+        if not updated:
+            LOGGER.error(
+                f"merge_people: update_person FAILED for target {target_person_id}! "
+                f"NOT deleting source {source_person_id} to prevent data loss."
+            )
+            return None
+
+        # CRITICAL: Verify the update actually worked before deleting source
+        actual_cluster_count = len(updated.get("cluster_ids") or [])
+        LOGGER.info(
+            f"merge_people: update_person returned person with {actual_cluster_count} clusters "
+            f"(expected {expected_cluster_count})"
+        )
+
+        if actual_cluster_count != expected_cluster_count:
+            LOGGER.error(
+                f"merge_people: CLUSTER LOSS DETECTED! "
+                f"Expected {expected_cluster_count} clusters after merge, "
+                f"but updated person has {actual_cluster_count} clusters. "
+                f"Missing {expected_cluster_count - actual_cluster_count} clusters. "
+                f"NOT deleting source {source_person_id} to prevent data loss."
+            )
+            return None
+
+        # Verification passed - safe to delete source
+        LOGGER.info(f"merge_people: verification passed, deleting source {source_person_id}")
         self.delete_person(show_id, source_person_id)
 
+        LOGGER.info(
+            f"merge_people: SUCCESS! Merged {source_clusters_count} clusters from "
+            f"{source_person_id} into {target_person_id}"
+        )
         return updated
 
     def remove_episode_clusters(self, show_id: str, ep_id: str) -> Dict[str, Any]:
@@ -486,4 +582,4 @@ class PeopleService:
         }
 
 
-__all__ = ["PeopleService", "l2_normalize", "cosine_distance"]
+__all__ = ["PeopleService", "l2_normalize", "cosine_distance", "CLEAR_FIELD"]

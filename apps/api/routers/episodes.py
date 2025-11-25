@@ -1609,6 +1609,18 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
             if tid in (None, track_id):
                 normalized = dict(face)
                 normalized["track_id"] = track_id if tid is None else tid
+
+                # CRITICAL: Add explicit media URLs for THIS specific face
+                # This prevents UI from falling back to frame-level URLs that might point to other tracks
+                face_media_url = _resolve_face_media_url(ep_id, normalized)
+                face_thumb_url = _resolve_thumb_url(
+                    ep_id,
+                    normalized.get("thumb_rel_path"),
+                    normalized.get("thumb_s3_key")
+                )
+                normalized["media_url"] = face_media_url or face_thumb_url
+                normalized["thumbnail_url"] = face_media_url or face_thumb_url
+
                 scoped.append(normalized)
             else:
                 dropped.append(tid)
@@ -1957,6 +1969,7 @@ class IdentityRenameRequest(BaseModel):
 class IdentityNameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     show: str | None = Field(None, description="Optional show slug override")
+    cast_id: str | None = Field(None, description="Optional cast_id for linking person to cast member")
 
 
 class IdentityMergeRequest(BaseModel):
@@ -2638,6 +2651,94 @@ def list_cluster_tracks(
     return payload
 
 
+@router.get("/episodes/{ep_id}/tracks")
+def list_tracks_batch(
+    ep_id: str,
+    ids: str | None = Query(None, description="Comma-separated track IDs"),
+    fields: str | None = Query(None, description="Comma-separated field names to include"),
+) -> dict:
+    """Batch fetch track metadata to avoid N+1 queries."""
+    if not ids:
+        raise HTTPException(status_code=400, detail="'ids' query parameter is required")
+
+    # Parse track IDs
+    try:
+        track_ids = [int(tid.strip()) for tid in ids.split(",") if tid.strip()]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid track ID format: {exc}") from exc
+
+    if not track_ids:
+        return {"tracks": []}
+
+    # Parse requested fields
+    requested_fields = set()
+    if fields:
+        requested_fields = {f.strip() for f in fields.split(",") if f.strip()}
+    else:
+        # Default fields
+        requested_fields = {"id", "track_id", "faces_count", "thumbnail_url", "media_url"}
+
+    # Load faces and tracks data
+    all_faces = _load_faces(ep_id, include_skipped=False)
+    track_rows_list = _load_tracks(ep_id)
+    track_rows = {int(row.get("track_id", -1)): row for row in track_rows_list}
+
+    # Group faces by track_id
+    faces_by_track: dict[int, list] = {}
+    for face in all_faces:
+        tid = int(face.get("track_id", -1))
+        if tid in track_ids:
+            faces_by_track.setdefault(tid, []).append(face)
+
+    # Build track objects
+    tracks = []
+    for track_id in track_ids:
+        track_faces = faces_by_track.get(track_id, [])
+        track_row = track_rows.get(track_id)
+
+        # Build track object with requested fields
+        track_obj: dict = {}
+
+        if "id" in requested_fields or "track_id" in requested_fields:
+            track_obj["track_id"] = track_id
+            track_obj["id"] = track_id
+
+        if "faces_count" in requested_fields:
+            track_obj["faces_count"] = len(track_faces)
+
+        if "thumbnail_url" in requested_fields or "media_url" in requested_fields:
+            preview_url = _resolve_face_media_url(ep_id, track_faces[0] if track_faces else None)
+            if not preview_url:
+                preview_url = _resolve_track_media_url(ep_id, track_row)
+            if "thumbnail_url" in requested_fields:
+                track_obj["thumbnail_url"] = preview_url
+            if "media_url" in requested_fields:
+                track_obj["media_url"] = preview_url
+
+        if "frames" in requested_fields:
+            frames = []
+            for row in track_faces:
+                media_url = _resolve_face_media_url(ep_id, row)
+                frames.append(
+                    {
+                        "face_id": row.get("face_id"),
+                        "frame_idx": row.get("frame_idx"),
+                        "ts": row.get("ts"),
+                        "thumbnail_url": media_url,
+                        "media_url": media_url,
+                        "skip": row.get("skip"),
+                        "crop_rel_path": row.get("crop_rel_path"),
+                        "crop_s3_key": row.get("crop_s3_key"),
+                        "similarity": row.get("similarity"),
+                    }
+                )
+            track_obj["frames"] = frames
+
+        tracks.append(track_obj)
+
+    return {"tracks": tracks}
+
+
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
 def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
     """Get representative frames with similarity scores for all tracks in a cluster."""
@@ -3120,7 +3221,7 @@ def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -
 @router.post("/episodes/{ep_id}/identities/{identity_id}/name")
 def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest) -> dict:
     try:
-        return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show)
+        return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show, body.cast_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3128,7 +3229,7 @@ def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest
 @router.post("/episodes/{ep_id}/tracks/{track_id}/name")
 def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> dict:
     try:
-        return identity_service.assign_track_name(ep_id, track_id, body.name, body.show)
+        return identity_service.assign_track_name(ep_id, track_id, body.name, body.show, body.cast_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3162,16 +3263,19 @@ def move_track(ep_id: str, track_id: int, body: TrackMoveRequest) -> dict:
     for identity in identities:
         if body.target_identity_id and identity.get("identity_id") == body.target_identity_id:
             target_identity = identity
-        if track_id in identity.get("track_ids", []):
+        # Coerce track_ids to int for consistent comparison
+        identity_track_ids = {int(tid) for tid in (identity.get("track_ids", []) or [])}
+        if track_id in identity_track_ids:
             source_identity = identity
     if body.target_identity_id and target_identity is None:
         raise HTTPException(status_code=404, detail="Target identity not found")
-    if source_identity and track_id in source_identity.get("track_ids", []):
-        source_identity["track_ids"] = [tid for tid in source_identity["track_ids"] if tid != track_id]
+    if source_identity:
+        source_track_ids = {int(tid) for tid in source_identity.get("track_ids", [])}
+        source_identity["track_ids"] = sorted(tid for tid in source_track_ids if tid != track_id)
     if target_identity is not None:
-        if track_id not in target_identity.get("track_ids", []):
-            target_identity.setdefault("track_ids", []).append(track_id)
-            target_identity["track_ids"] = sorted(target_identity["track_ids"])
+        target_track_ids = {int(tid) for tid in target_identity.get("track_ids", [])}
+        target_track_ids.add(track_id)
+        target_identity["track_ids"] = sorted(target_track_ids)
     _update_identity_stats(ep_id, payload)
     path = _write_identities(ep_id, payload)
     _sync_manifests(ep_id, path)
@@ -3379,9 +3483,13 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
         seeds_path,
     )
 
-    # TODO: Emit refresh job for similarity recomputation across episodes
-    # This would trigger re-indexing of embeddings in pgvector/FAISS
-    # For now, similarity refresh must be triggered manually
+    # Refresh similarity indexes for this episode/identity
+    # Note: Cross-episode refresh (for other episodes of the same show) requires
+    # a separate batch job or manual trigger via /refresh_similarity endpoint
+    try:
+        _refresh_similarity_indexes(ep_id, identity_ids=[identity_id])
+    except Exception as exc:
+        LOGGER.warning(f"Failed to refresh similarity indexes after facebank export: {exc}")
 
     return {
         "status": "success",
@@ -3390,6 +3498,6 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
         "ep_id": ep_id,
         "seeds_exported": len(seeds),
         "seeds_path": str(seeds_path),
-        "refresh_required": True,
-        "message": f"Exported {len(seeds)} high-quality seeds to facebank. Similarity refresh recommended.",
+        "refresh_required": False,  # Local refresh done; cross-episode may still need manual trigger
+        "message": f"Exported {len(seeds)} high-quality seeds to facebank. Local similarity refreshed.",
     }

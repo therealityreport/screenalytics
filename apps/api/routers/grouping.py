@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Iterable, List, Literal, Optional
@@ -26,6 +27,8 @@ class GroupClustersRequest(BaseModel):
     target_person_id: Optional[str] = Field(None, description="Target person ID for manual grouping")
     cast_id: Optional[str] = Field(None, description="Cast ID to link to the person (for new or existing)")
     name: Optional[str] = Field(None, description="Name for new person (when target_person_id is None)")
+    protect_manual: bool = Field(True, description="If True, don't merge manually assigned clusters to different people")
+    facebank_first: bool = Field(True, description="If True, try facebank matching before people prototypes (more accurate)")
 
 
 def _trigger_similarity_refresh(ep_id: str, cluster_ids: Iterable[str] | None) -> None:
@@ -58,7 +61,12 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                     }
                 )
 
-            result = grouping_service.group_clusters_auto(ep_id, progress_callback=progress_callback)
+            result = grouping_service.group_clusters_auto(
+                ep_id,
+                progress_callback=progress_callback,
+                protect_manual=body.protect_manual,
+                facebank_first=body.facebank_first,
+            )
             affected_clusters = set()
             within = (
                 (result.get("within_episode") or {}).get("groups")
@@ -238,6 +246,395 @@ def get_cluster_suggestions_from_assigned(ep_id: str) -> dict:
             status_code=500,
             detail=f"Failed to compute suggestions from assigned: {str(e)}",
         )
+
+
+@router.get("/episodes/{ep_id}/clusters/{cluster_id}/suggest_cast")
+def suggest_cast_for_cluster(ep_id: str, cluster_id: str, min_similarity: float = 0.40, top_k: int = 5) -> dict:
+    """Get cast member suggestions for a specific cluster (Enhancement #6).
+
+    Compares the cluster's centroid against all cast member facebank seeds.
+    Returns top-k cast member suggestions with confidence levels.
+
+    This endpoint is designed for on-demand "Suggest for Me" button clicks.
+    """
+    try:
+        from apps.api.services.facebank import cosine_similarity
+        import numpy as np
+
+        # Parse episode ID
+        import re
+        pattern = r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$"
+        match = re.match(pattern, ep_id, re.IGNORECASE)
+        if not match:
+            raise HTTPException(status_code=400, detail=f"Invalid episode ID: {ep_id}")
+        show_id = match.group("show").upper()
+
+        # Load cluster centroid
+        try:
+            centroids_data = grouping_service.load_cluster_centroids(ep_id)
+            centroids = centroids_data.get("centroids", {})
+            cluster_data = centroids.get(cluster_id)
+            if not cluster_data or not cluster_data.get("centroid"):
+                return {
+                    "status": "success",
+                    "cluster_id": cluster_id,
+                    "suggestions": [],
+                    "message": f"No centroid found for cluster {cluster_id}",
+                }
+            centroid_vec = np.array(cluster_data["centroid"], dtype=np.float32)
+        except FileNotFoundError:
+            return {
+                "status": "success",
+                "cluster_id": cluster_id,
+                "suggestions": [],
+                "message": "No centroids file found. Run clustering first.",
+            }
+
+        # Get all seeds for the show
+        from apps.api.services.facebank import FacebankService
+        from apps.api.services.cast import CastService
+        facebank_service = FacebankService()
+        cast_service = CastService()
+
+        seeds = facebank_service.get_all_seeds_for_show(show_id)
+        if not seeds:
+            return {
+                "status": "success",
+                "cluster_id": cluster_id,
+                "suggestions": [],
+                "message": f"No facebank seeds available for show {show_id}",
+            }
+
+        # Get cast member names
+        cast_members = cast_service.list_cast(show_id)
+        cast_lookup = {member["cast_id"]: member for member in cast_members if member.get("cast_id")}
+
+        # Group seeds by cast_id
+        seeds_by_cast = {}
+        for seed in seeds:
+            cast_id = seed.get("cast_id")
+            if cast_id and seed.get("embedding"):
+                seeds_by_cast.setdefault(cast_id, []).append(seed)
+
+        # Find best similarity per cast member
+        cast_matches = []
+        for cast_id, cast_seeds in seeds_by_cast.items():
+            best_sim = -1.0
+            best_seed_id = None
+
+            for seed in cast_seeds:
+                seed_emb = np.array(seed["embedding"], dtype=np.float32)
+                sim = cosine_similarity(centroid_vec, seed_emb)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_seed_id = seed.get("fb_id")
+
+            if best_sim >= min_similarity:
+                cast_meta = cast_lookup.get(cast_id, {})
+                cast_name = cast_meta.get("name", cast_id)
+
+                # Determine confidence level
+                if best_sim >= 0.80:
+                    confidence = "high"
+                elif best_sim >= 0.65:
+                    confidence = "medium"
+                else:
+                    confidence = "low"
+
+                cast_matches.append({
+                    "cast_id": cast_id,
+                    "name": cast_name,
+                    "similarity": round(float(best_sim), 3),
+                    "confidence": confidence,
+                    "best_seed_id": best_seed_id,
+                })
+
+        # Sort by similarity (descending) and take top_k
+        cast_matches.sort(key=lambda x: x["similarity"], reverse=True)
+        top_matches = cast_matches[:top_k]
+
+        return {
+            "status": "success",
+            "cluster_id": cluster_id,
+            "suggestions": top_matches,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to compute suggestions for cluster: {str(e)}",
+        )
+
+
+@router.get("/episodes/{ep_id}/cast_suggestions")
+def get_cast_suggestions(ep_id: str, min_similarity: float = 0.50, top_k: int = 3) -> dict:
+    """Get cast member suggestions for unassigned clusters based on facebank similarity.
+
+    Compares each unassigned cluster's centroid against all cast member facebank seeds.
+    Returns top-k cast member suggestions per cluster with confidence levels.
+
+    Query params:
+        min_similarity: Minimum similarity threshold (default 0.50)
+        top_k: Number of suggestions per cluster (default 3)
+    """
+    try:
+        result = grouping_service.suggest_cast_for_unassigned_clusters(
+            ep_id,
+            min_similarity=min_similarity,
+            top_k=top_k,
+        )
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "suggestions": result.get("suggestions", []),
+            "message": result.get("message"),
+        }
+    except FileNotFoundError as e:
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "suggestions": [],
+            "message": str(e),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to compute cast suggestions: {str(e)}",
+        )
+
+
+@router.post("/episodes/{ep_id}/auto_link_cast")
+def auto_link_cast(ep_id: str, min_confidence: float = 0.85) -> dict:
+    """Auto-assign unassigned clusters to cast members with high confidence (Enhancement #8).
+
+    Only assigns when facebank similarity is >= min_confidence.
+    Called during Refresh Values to auto-link obvious matches.
+    """
+    try:
+        result = grouping_service.auto_link_high_confidence_matches(
+            ep_id,
+            min_confidence=min_confidence,
+        )
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "auto_assigned": result.get("auto_assigned", 0),
+            "assignments": result.get("assignments", []),
+        }
+    except FileNotFoundError as e:
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "auto_assigned": 0,
+            "assignments": [],
+            "message": str(e),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Auto-link failed: {str(e)}",
+        )
+
+
+@router.get("/episodes/{ep_id}/cleanup_preview")
+def cleanup_preview(ep_id: str) -> dict:
+    """Get a preview of what would change if cleanup were run (Enhancement #3).
+
+    Analyzes current state and estimates impact without making changes.
+    Returns counts of affected clusters, manual assignments that could be impacted, etc.
+    """
+    try:
+        from apps.api.services.identities import load_identities
+
+        # Load current state
+        identities_data = load_identities(ep_id)
+        identities = identities_data.get("identities", [])
+
+        # Count current clusters
+        total_clusters = len(identities)
+
+        # Load manual assignments
+        manual_assignments = grouping_service._load_manual_assignments(ep_id)
+        manual_cluster_ids = [
+            cid for cid, data in manual_assignments.items()
+            if data.get("assigned_by") == "user"
+        ]
+
+        # Load centroids if available
+        centroids_count = 0
+        try:
+            centroids_data = grouping_service.load_cluster_centroids(ep_id)
+            centroids_count = len(centroids_data.get("centroids", {}))
+        except FileNotFoundError:
+            pass
+
+        # Estimate potential merges (clusters that could be merged based on similarity)
+        potential_merges = 0
+        if centroids_count > 1:
+            try:
+                within_result = grouping_service.group_within_episode(
+                    ep_id,
+                    protect_manual=False,  # Check without protection to see full impact
+                )
+                potential_merges = within_result.get("merged_count", 0)
+            except Exception:
+                pass
+
+        # Count unassigned vs assigned clusters
+        assigned_clusters = sum(1 for i in identities if i.get("person_id"))
+        unassigned_clusters = total_clusters - assigned_clusters
+
+        preview = {
+            "total_clusters": total_clusters,
+            "assigned_clusters": assigned_clusters,
+            "unassigned_clusters": unassigned_clusters,
+            "manual_assignments_count": len(manual_cluster_ids),
+            "manual_cluster_ids": manual_cluster_ids[:10],  # First 10 for preview
+            "potential_merges": potential_merges,
+            "warning_level": "low",
+            "warnings": [],
+        }
+
+        # Add warnings based on potential impact
+        if potential_merges > 0 and len(manual_cluster_ids) > 0:
+            preview["warning_level"] = "high"
+            preview["warnings"].append(
+                f"⚠️ {potential_merges} cluster group(s) could be merged, "
+                f"potentially affecting {len(manual_cluster_ids)} manual assignment(s)."
+            )
+        elif potential_merges > 0:
+            preview["warning_level"] = "medium"
+            preview["warnings"].append(
+                f"⚡ {potential_merges} cluster group(s) could be merged."
+            )
+
+        if unassigned_clusters > 0:
+            preview["warnings"].append(
+                f"ℹ️ {unassigned_clusters} unassigned cluster(s) may be grouped."
+            )
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "preview": preview,
+        }
+    except FileNotFoundError as e:
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "preview": {
+                "total_clusters": 0,
+                "warning_level": "low",
+                "warnings": [f"No data found: {e}"],
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preview failed: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/backup")
+def create_backup(ep_id: str) -> dict:
+    """Create backup before cleanup (Enhancement #7).
+
+    Backs up identities.json, people.json, cluster_centroids.json.
+    """
+    try:
+        result = grouping_service.backup_before_cleanup(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "backup_id": result.get("backup_id"),
+            "files_backed_up": len(result.get("files", [])),
+            "timestamp": result.get("timestamp"),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/restore/{backup_id}")
+def restore_backup(ep_id: str, backup_id: str) -> dict:
+    """Restore from a backup (Enhancement #7)."""
+    try:
+        result = grouping_service.restore_from_backup(ep_id, backup_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "backup_id": backup_id,
+            "files_restored": result.get("restored", 0),
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
+
+
+@router.get("/episodes/{ep_id}/backups")
+def list_backups(ep_id: str) -> dict:
+    """List available backups for an episode (Enhancement #7)."""
+    try:
+        backups = grouping_service.list_backups(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "backups": backups,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list backups: {str(e)}")
+
+
+@router.get("/episodes/{ep_id}/consistency_check")
+def cross_episode_consistency(ep_id: str) -> dict:
+    """Check for cross-episode inconsistencies (Enhancement #9).
+
+    Finds clusters that might be the same person but are assigned differently.
+    """
+    try:
+        import re
+        pattern = r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$"
+        match = re.match(pattern, ep_id, re.IGNORECASE)
+        if not match:
+            raise HTTPException(status_code=400, detail=f"Invalid episode ID: {ep_id}")
+        show_id = match.group("show").upper()
+
+        people = grouping_service.people_service.list_people(show_id)
+        if not people:
+            return {"status": "success", "inconsistencies": []}
+
+        # Find cast members with multiple people records
+        people_by_cast: dict = {}
+        for person in people:
+            cast_id = person.get("cast_id")
+            if cast_id:
+                people_by_cast.setdefault(cast_id, []).append(person)
+
+        inconsistencies = []
+        for cast_id, cast_people in people_by_cast.items():
+            if len(cast_people) > 1:
+                inconsistencies.append({
+                    "cast_id": cast_id,
+                    "people_count": len(cast_people),
+                    "person_ids": [p.get("person_id") for p in cast_people],
+                    "suggestion": "Consider merging - same cast member, multiple person records",
+                })
+
+        return {
+            "status": "success",
+            "inconsistencies": inconsistencies,
+            "total_people": len(people),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Consistency check failed: {str(e)}")
 
 
 @router.post("/episodes/{ep_id}/save_assignments")

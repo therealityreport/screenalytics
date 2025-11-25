@@ -24,7 +24,7 @@ def _ensure_streamlit_shims() -> None:
         streamlit_mod.set_page_config = lambda *args, **kwargs: None
         streamlit_mod.title = lambda *args, **kwargs: None
         streamlit_mod.caption = lambda *args, **kwargs: None
-        streamlit_mod.experimental_get_query_params = lambda: {}
+        streamlit_mod.query_params = {}
         streamlit_mod.experimental_set_query_params = lambda **kwargs: None
         streamlit_mod.sidebar = types.SimpleNamespace(
             header=lambda *args, **kwargs: None,

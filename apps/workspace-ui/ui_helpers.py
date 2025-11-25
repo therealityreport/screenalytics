@@ -289,9 +289,7 @@ def profile_value_from_state(value: str | None) -> str | None:
 
 
 def default_profile_for_device(device_value: str | None) -> str:
-    normalized = (device_value or "").strip().lower()
-    if normalized in {"mps", "coreml", "metal", "apple"} and is_apple_silicon():
-        return "low_power"
+    # Default to balanced everywhere; users can opt into low_power/high_accuracy explicitly.
     return "balanced"
 
 
@@ -610,6 +608,10 @@ def render_sidebar_episode_selector() -> str | None:
     if selected_ep_id != current_ep_id:
         set_ep_id(selected_ep_id, rerun=False)
 
+    # Explicit load button to apply selection and rerun the app
+    if st.sidebar.button("Load Episode", key="load_episode_button"):
+        set_ep_id(selected_ep_id, rerun=True, origin="sidebar_button")
+
     # Cache clear button
     st.sidebar.divider()
     if st.sidebar.button("🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"):
@@ -656,7 +658,7 @@ def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[st
     timeout = kwargs.pop("timeout", 60)
     resp = requests.post(f"{base}{path}", json=json or {}, timeout=timeout, **kwargs)
     resp.raise_for_status()
-    return resp.json()
+    return resp.json() if resp.content else {}
 
 
 def api_delete(path: str, **kwargs) -> Dict[str, Any]:
@@ -666,7 +668,7 @@ def api_delete(path: str, **kwargs) -> Dict[str, Any]:
     timeout = kwargs.pop("timeout", 60)
     resp = requests.delete(f"{base}{path}", timeout=timeout, **kwargs)
     resp.raise_for_status()
-    return resp.json()
+    return resp.json() if resp.content else {}
 
 
 def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
@@ -1723,7 +1725,7 @@ def identity_card(title: str, subtitle: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.markdown(f"**{title}**")
         if subtitle:
             st.caption(subtitle)
@@ -1736,7 +1738,7 @@ def track_card(title: str, caption: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.markdown(f"**{title}**")
         st.caption(caption)
         if extra:
@@ -1748,7 +1750,7 @@ def frame_card(title: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.caption(title)
         if extra:
             extra()
@@ -2099,9 +2101,13 @@ def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | Non
     raise_status = getattr(response, "raise_for_status", None)
     if callable(raise_status):
         raise_status()
-    data = response.json()
-    presigned_url = data.get("url")
-    resolved_mime = data.get("content_type") or inferred_mime
+    try:
+        data = response.json()
+    except (ValueError, TypeError) as exc:
+        _diag("UI_RESOLVE_FAIL", src=src, reason="json_parse_error", error=str(exc))
+        return None
+    presigned_url = data.get("url") if isinstance(data, dict) else None
+    resolved_mime = (data.get("content_type") if isinstance(data, dict) else None) or inferred_mime
     if not presigned_url:
         return None
     if presigned_url.startswith("https://"):
@@ -2116,6 +2122,9 @@ def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | Non
 def _thumb_worker_runner(src: str, api_base: str, ttl: int) -> None:
     ctx = get_script_run_ctx()
     if ctx is None:
+        # Context lost - store error result to prevent stuck "pending" state
+        _store_thumb_result(src, None, error="context_lost")
+        _diag("UI_RESOLVE_FAIL", src=src, reason="context_lost", error="script context unavailable")
         return
     error: str | None = None
     url: str | None = None
@@ -2161,6 +2170,11 @@ def _start_thumb_worker(src: str, api_base: str, ttl: int = 3600) -> None:
 
 
 def _resolve_thumb_async(src: str, api_base: str) -> str | None:
+    """Queue async thumbnail fetch and return cached URL if ready, else None.
+
+    Returns:
+        Presigned URL if cached and ready, None if pending or error (placeholder should be shown).
+    """
     cache = _thumb_async_cache()
     entry = cache.get(src)
     if entry:
@@ -2168,10 +2182,15 @@ def _resolve_thumb_async(src: str, api_base: str) -> str | None:
         if status == "ready":
             return entry.get("url")
         if status == "error":
+            _diag("UI_THUMB_ASYNC", src=src, status="error_retry", error=entry.get("error"))
             cache.pop(src, None)
             entry = None
+        elif status == "pending":
+            # Already queued, waiting for worker to complete
+            return None
     if not entry:
         cache[src] = {"status": "pending", "url": None, "error": None, "updated": time.time()}
+        _diag("UI_THUMB_ASYNC", src=src, status="queued")
     _start_thumb_worker(src, api_base)
     return None
 

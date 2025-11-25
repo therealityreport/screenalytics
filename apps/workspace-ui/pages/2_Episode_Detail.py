@@ -806,11 +806,15 @@ faces_manifest_count = None
 faces_ready_state = False
 faces_manifest_fallback = bool(faces_phase_status.get("faces_manifest_fallback"))
 faces_manifest_exists = faces_path.exists()
+if faces_manifest_exists:
+    faces_manifest_count = _count_manifest_rows(faces_path) or 0
 if faces_status_value == "success":
     faces_ready_state = True
 elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_exists:
     faces_ready_state = True
     faces_manifest_fallback = True
+if faces_count_value is None and faces_manifest_count is not None:
+    faces_count_value = faces_manifest_count
 
 # If detect status is missing but manifests are present, synthesize a summary so the UI still shows completion.
 if not detect_phase_status and manifest_state["manifest_ready"]:
@@ -1996,14 +2000,26 @@ with col_cluster:
         step=0.01,
         help="Higher thresholds require tighter ArcFace similarity between faces to form a cluster.",
     )
+    # Provide threshold guidance based on selected value
+    if cluster_thresh_value >= 0.80:
+        st.caption("🔴 **Very strict**: May over-split same person into multiple clusters.")
+    elif cluster_thresh_value >= 0.70:
+        st.caption("🟡 **Strict**: Good for distinguishing similar-looking people.")
+    elif cluster_thresh_value >= 0.55:
+        st.caption("🟢 **Balanced**: Recommended for most content.")
+    else:
+        st.caption("🟠 **Lenient**: May merge different people into same cluster.")
+
     min_cluster_size_value = st.number_input(
         "Minimum tracks per identity",
         min_value=1,
         max_value=50,
         value=int(min_cluster_size_default),
         step=1,
-        help="Clusters smaller than this are discarded as noise.",
+        help="Clusters smaller than this are discarded as noise. Recommended: 2+ for cleaner results.",
     )
+    if min_cluster_size_value == 1:
+        st.caption("⚠️ Single-track clusters may contain noise/false detections.")
     if not local_video_exists:
         st.info("Local mirror missing; artifacts will be mirrored automatically when clustering starts.")
     elif not tracks_ready:

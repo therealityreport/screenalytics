@@ -672,13 +672,74 @@ def build_cluster_track_reps(
         cluster_centroids = load_cluster_centroids(ep_id)
 
     cluster_data = cluster_centroids.get(cluster_id)
+
+    # If cluster not in centroids (e.g., newly created via manual assignment),
+    # fall back to loading track_ids directly from identities.json
     if not cluster_data:
+        from apps.api.services.identities import load_identities
+
+        identities_data = load_identities(ep_id)
+        identities = identities_data.get("identities", [])
+        identity = next(
+            (ident for ident in identities if ident.get("identity_id") == cluster_id),
+            None,
+        )
+        if not identity:
+            return {
+                "cluster_id": cluster_id,
+                "cluster_centroid": None,
+                "cohesion": None,
+                "tracks": [],
+                "total_tracks": 0,
+            }
+
+        # Get track_ids from identity and normalize to track_XXXX format
+        raw_track_ids = identity.get("track_ids", [])
+        track_ids = []
+        for tid in raw_track_ids:
+            if isinstance(tid, int):
+                track_ids.append(f"track_{tid:04d}")
+            elif isinstance(tid, str):
+                if tid.startswith("track_"):
+                    track_ids.append(tid)
+                else:
+                    try:
+                        track_ids.append(f"track_{int(tid):04d}")
+                    except (TypeError, ValueError):
+                        continue
+
+        # Build tracks output without centroid similarity (no centroid available)
+        tracks_output: List[Dict[str, Any]] = []
+        for track_id in track_ids:
+            rep = track_reps.get(track_id)
+            if not rep:
+                tracks_output.append(
+                    {
+                        "track_id": track_id,
+                        "rep_frame": None,
+                        "crop_key": None,
+                        "similarity": None,
+                        "quality": None,
+                    }
+                )
+                continue
+
+            tracks_output.append(
+                {
+                    "track_id": track_id,
+                    "rep_frame": rep.get("rep_frame"),
+                    "crop_key": rep.get("crop_key"),
+                    "similarity": None,  # No centroid to compare against
+                    "quality": rep.get("quality"),
+                }
+            )
+
         return {
             "cluster_id": cluster_id,
             "cluster_centroid": None,
             "cohesion": None,
-            "tracks": [],
-            "total_tracks": 0,
+            "tracks": tracks_output,
+            "total_tracks": len(tracks_output),
         }
 
     cluster_centroid_vec = np.array(cluster_data["centroid"], dtype=np.float32)

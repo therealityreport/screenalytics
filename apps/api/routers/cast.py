@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+LOGGER = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -16,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from apps.api.services.cast import CastService
 from apps.api.services.facebank import FacebankService
+from apps.api.services.people import PeopleService
 from apps.api.services.storage import StorageService
 
 router = APIRouter()
@@ -33,6 +37,11 @@ def _facebank_service() -> FacebankService:
 
 def _storage_service() -> StorageService:
     return StorageService()
+
+
+def _people_service() -> PeopleService:
+    data_root = os.environ.get("SCREENALYTICS_DATA_ROOT")
+    return PeopleService(data_root=data_root) if data_root else PeopleService()
 
 
 class ShowEntry(BaseModel):
@@ -198,6 +207,29 @@ def create_cast_member(show_id: str, body: CastMemberCreateRequest) -> CastMembe
         social=body.social,
         imdb_id=body.imdb_id,
     )
+
+    # Ensure a People record exists and carries this cast_id for UI/assignment flows
+    try:
+        people_service = _people_service()
+        existing = people_service.find_person_by_name_or_alias(show_id, body.name, cast_id=member["cast_id"])
+        if existing:
+            # Persist cast_id (idempotent) and merge aliases when provided
+            merged_aliases = existing.get("aliases") or []
+            if body.aliases:
+                for alias in body.aliases:
+                    if alias and alias not in merged_aliases:
+                        merged_aliases.append(alias)
+            people_service.update_person(
+                show_id,
+                existing["person_id"],
+                cast_id=member["cast_id"],
+                aliases=merged_aliases,
+            )
+        else:
+            people_service.create_person(show_id, name=body.name, aliases=body.aliases, cast_id=member["cast_id"])
+    except Exception as exc:
+        # Do not fail cast creation if people sync encounters an edge case
+        LOGGER.warning("Failed to sync cast member %s to people: %s", body.name, exc)
     return CastMemberResponse(**member)
 
 
@@ -218,6 +250,27 @@ def update_cast_member(show_id: str, cast_id: str, body: CastMemberUpdateRequest
     )
     if not member:
         raise HTTPException(status_code=404, detail=f"Cast member {cast_id} not found")
+
+    # Sync updates to People service to maintain consistency
+    try:
+        people_service = _people_service()
+        existing = next(
+            (p for p in people_service.list_people(show_id) if p.get("cast_id") == cast_id),
+            None,
+        )
+        if existing:
+            # Update the person with new name and aliases
+            update_fields = {}
+            if body.name is not None:
+                update_fields["name"] = body.name
+            if body.aliases is not None:
+                update_fields["aliases"] = body.aliases
+            if update_fields:
+                people_service.update_person(show_id, existing["person_id"], **update_fields)
+    except Exception as exc:
+        # Do not fail cast update if people sync encounters an edge case
+        LOGGER.warning("Failed to sync cast member %s update to people: %s", cast_id, exc)
+
     return CastMemberResponse(**member)
 
 
@@ -227,6 +280,22 @@ def delete_cast_member(show_id: str, cast_id: str) -> dict:
     success = _cast_service().delete_cast_member(show_id, cast_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Cast member {cast_id} not found")
+
+    # Clear cast_id from any linked People record (don't delete the person, just unlink)
+    try:
+        from apps.api.services.people import CLEAR_FIELD
+
+        people_service = _people_service()
+        existing = next(
+            (p for p in people_service.list_people(show_id) if p.get("cast_id") == cast_id),
+            None,
+        )
+        if existing:
+            people_service.update_person(show_id, existing["person_id"], cast_id=CLEAR_FIELD)
+            LOGGER.info("Unlinked person %s from deleted cast member %s", existing["person_id"], cast_id)
+    except Exception as exc:
+        LOGGER.warning("Failed to unlink person from deleted cast member %s: %s", cast_id, exc)
+
     return {"status": "deleted", "cast_id": cast_id}
 
 
