@@ -77,7 +77,7 @@ def _create_webp_image(size=(112, 112)):
     return stream
 
 
-def _mock_face_pipeline(monkeypatch, *, simulated: bool = False, bbox: list[float] | None = None):
+def _mock_face_pipeline(monkeypatch, *, simulated: bool = False, bbox: list[float] | list[list[float]] | None = None):
     """Replace detector/embedder with deterministic fakes."""
 
     simulated_flag = simulated
@@ -94,23 +94,33 @@ def _mock_face_pipeline(monkeypatch, *, simulated: bool = False, bbox: list[floa
 
         def __call__(self, image):
             h, w = image.shape[:2]
-            # Support either relative (0-1) or absolute bbox input
-            if max(bbox_rel) <= 1.0:
-                x1, y1, x2, y2 = (
-                    bbox_rel[0] * w,
-                    bbox_rel[1] * h,
-                    bbox_rel[2] * w,
-                    bbox_rel[3] * h,
+            boxes = bbox_rel if (isinstance(bbox_rel, (list, tuple)) and bbox_rel and isinstance(bbox_rel[0], (list, tuple))) else [bbox_rel]
+            detections: list[types.SimpleNamespace] = []
+            for idx, box in enumerate(boxes):
+                # Support either relative (0-1) or absolute bbox input
+                if max(box) <= 1.0:
+                    x1, y1, x2, y2 = box[0] * w, box[1] * h, box[2] * w, box[3] * h
+                else:
+                    x1, y1, x2, y2 = box
+                detections.append(
+                    types.SimpleNamespace(
+                        bbox=[x1, y1, x2, y2],
+                        landmarks=[
+                            0.2 * w,
+                            0.2 * h,
+                            0.4 * w,
+                            0.2 * h,
+                            0.3 * w,
+                            0.3 * h,
+                            0.25 * w,
+                            0.45 * h,
+                            0.4 * w,
+                            0.45 * h,
+                        ],
+                        conf=0.99 - idx * 0.05,
+                    )
                 )
-            else:
-                x1, y1, x2, y2 = bbox_rel
-            return [
-                types.SimpleNamespace(
-                    bbox=[x1, y1, x2, y2],
-                    landmarks=[0.2 * w, 0.2 * h, 0.4 * w, 0.2 * h, 0.3 * w, 0.3 * h, 0.25 * w, 0.45 * h, 0.4 * w, 0.45 * h],
-                    conf=0.99,
-                )
-            ]
+            return detections
 
         def detect(self, image):
             return self(image)
@@ -554,6 +564,66 @@ def test_upload_seed_rejects_small_face_when_detector_real(tmp_path, monkeypatch
     assert "Face too small" in resp.json()["detail"]
 
 
+def test_upload_seed_uses_largest_face(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    from apps.api.routers import facebank as facebank_router
+    from apps.api.services.facebank import FacebankService
+
+    client = TestClient(app)
+    show_id = "rhobh"
+    cast_id = _create_cast_member(facebank_router, show_id, "Kyle", data_root)
+
+    facebank_router.facebank_service = FacebankService(data_root)
+    facebank_router.job_service = _DummyJobService()
+
+    _mock_face_pipeline(
+        monkeypatch,
+        bbox=[
+            [0.05, 0.05, 0.15, 0.15],  # tiny background face
+            [0.1, 0.1, 0.8, 0.8],  # primary face
+        ],
+    )
+
+    files = [("files", ("seed.jpg", _create_test_image(), "image/jpeg"))]
+    resp = client.post(f"/cast/{cast_id}/seeds/upload?show_id={show_id}", files=files)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["uploaded"] == 1
+    facebank = client.get(f"/cast/{cast_id}/facebank?show_id={show_id}").json()
+    quality = facebank["seeds"][0]["quality"]
+    assert quality["bbox_ratio"] > 0.4
+    assert quality["bbox"][0] < quality["bbox"][2]
+    assert quality["bbox"][1] < quality["bbox"][3]
+
+
+def test_upload_seed_allows_small_fraction_when_pixels_high(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    from apps.api.routers import facebank as facebank_router
+    from apps.api.services.facebank import FacebankService
+
+    client = TestClient(app)
+    show_id = "rhobh"
+    cast_id = _create_cast_member(facebank_router, show_id, "Garcelle", data_root)
+
+    facebank_router.facebank_service = FacebankService(data_root)
+    facebank_router.job_service = _DummyJobService()
+
+    _mock_face_pipeline(monkeypatch, bbox=[0.1, 0.1, 0.24, 0.24])
+
+    files = [("files", ("seed_large.jpg", _create_test_image(size=(2000, 2000)), "image/jpeg"))]
+    resp = client.post(f"/cast/{cast_id}/seeds/upload?show_id={show_id}", files=files)
+    assert resp.status_code == 200
+    facebank = client.get(f"/cast/{cast_id}/facebank?show_id={show_id}").json()
+    quality = facebank["seeds"][0]["quality"]
+    # Ratio below default threshold but absolute pixels should be sufficient to pass
+    assert quality["bbox_ratio"] < 0.05
+    assert quality["bbox"][2] - quality["bbox"][0] > 100
 def test_upload_seed_applies_exif_transpose(tmp_path, monkeypatch):
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))

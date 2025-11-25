@@ -1582,6 +1582,23 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     sample = max(1, sample)
     page = max(1, page)
     page_size = max(1, min(page_size, TRACK_LIST_MAX_LIMIT))
+    frame_tracks: Dict[int, Set[int]] = defaultdict(set)
+    for face in _load_faces(ep_id, include_skipped=True):
+        try:
+            tid = int(face.get("track_id", -1))
+            frame_idx_val = int(face.get("frame_idx", -1))
+        except (TypeError, ValueError):
+            continue
+        if tid < 0 or frame_idx_val < 0:
+            continue
+        frame_tracks[frame_idx_val].add(tid)
+
+    def _other_tracks(frame_idx: int) -> List[int]:
+        tracks = frame_tracks.get(frame_idx, set())
+        if not tracks:
+            return []
+        return sorted(tid for tid in tracks if tid != track_id)
+
     face_rows = _track_face_rows(ep_id, track_id)
     crops = _discover_crop_entries(ep_id, track_id)
     ctx, prefixes = _require_episode_context(ep_id)
@@ -1639,6 +1656,23 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
         items: List[Dict[str, Any]] = []
         for idx in page_indices:
             meta = face_rows.get(idx, {})
+            meta_track_id = None
+            if meta:
+                try:
+                    meta_track_id = int(meta.get("track_id", -1))
+                except (TypeError, ValueError):
+                    meta_track_id = -1
+                if meta_track_id not in (track_id, -1):
+                    _diag(
+                        "TRACK_FRAME_META_MISMATCH",
+                        ep_id=ep_id,
+                        requested_track_id=track_id,
+                        meta_track_id=meta_track_id,
+                        frame_idx=idx,
+                    )
+                    meta = {}
+            faces_for_track = [meta] if meta else []
+            item_track_id = meta_track_id if meta_track_id == track_id else track_id
             media_url = _resolve_face_media_url(ep_id, meta)
             fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
             url = media_url or fallback
@@ -1668,7 +1702,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
 
             items.append(
                 {
-                    "track_id": track_id,
+                    "track_id": item_track_id,
                     "frame_idx": idx,
                     "ts": meta.get("ts"),
                     "media_url": url,
@@ -1681,6 +1715,8 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                     "face_id": meta.get("face_id"),
                     "similarity": similarity,
                     "quality": quality,
+                    "faces": faces_for_track,
+                    "other_tracks": _other_tracks(idx),
                 }
             )
         return {
@@ -1719,6 +1755,23 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     for entry in page_entries:
         frame_idx = entry["frame_idx"]
         meta = face_rows.get(frame_idx, {})
+        meta_track_id = None
+        if meta:
+            try:
+                meta_track_id = int(meta.get("track_id", -1))
+            except (TypeError, ValueError):
+                meta_track_id = -1
+            if meta_track_id not in (track_id, -1):
+                _diag(
+                    "TRACK_FRAME_META_MISMATCH",
+                    ep_id=ep_id,
+                    requested_track_id=track_id,
+                    meta_track_id=meta_track_id,
+                    frame_idx=frame_idx,
+                )
+                meta = {}
+        faces_for_track = [meta] if meta else []
+        item_track_id = meta_track_id if meta_track_id == track_id else track_id
         local_path = entry.get("abs_path")
         local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
         rel_path = entry.get("rel_path")
@@ -1755,7 +1808,7 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
 
         items.append(
             {
-                "track_id": track_id,
+                "track_id": item_track_id,
                 "frame_idx": frame_idx,
                 "ts": meta.get("ts") if meta else entry.get("ts"),
                 "media_url": url,
@@ -1768,6 +1821,8 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 "face_id": meta.get("face_id"),
                 "similarity": similarity,
                 "quality": quality,
+                "faces": faces_for_track,
+                "other_tracks": _other_tracks(frame_idx),
             }
         )
     return {

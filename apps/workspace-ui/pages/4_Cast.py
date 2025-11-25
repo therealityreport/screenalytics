@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -176,6 +177,24 @@ def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, A
     except requests.RequestException as exc:
         st.error(helpers.describe_error(f"{base}{path}", exc))
         return None
+
+
+def _format_seed_upload_error(resp: requests.Response, exc: requests.HTTPError) -> str:
+    detail: str | Dict[str, Any] | List[Any] | None = None
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            detail = payload.get("detail") or payload.get("message") or payload.get("error") or None
+            if detail is None and payload:
+                detail = json.dumps(payload)
+        else:
+            detail = payload
+    except Exception:
+        detail = resp.text or None
+    if isinstance(detail, (dict, list)):
+        detail = json.dumps(detail)
+    message = detail or helpers.describe_error(resp.url or "upload", exc)
+    return f"Upload failed: {message}"
 
 
 def _warn_if_simulated(payload: Dict[str, Any] | None) -> None:
@@ -405,38 +424,39 @@ if show_add_form:
 
                         try:
                             resp = requests.post(url, files=files, timeout=120)
+                            handled_error = False
                             try:
                                 resp.raise_for_status()
                             except requests.HTTPError as exc:
-                                detail = ""
-                                try:
-                                    detail = resp.json().get("detail")  # type: ignore[assignment]
-                                except Exception:
-                                    detail = resp.text
-                                st.error(f"Upload failed: {detail or exc}")
-                                raise
-                            result = resp.json()
-                            _warn_if_simulated(result)
+                                if resp.status_code == 422:
+                                    st.error(_format_seed_upload_error(resp, exc))
+                                    handled_error = True
+                                else:
+                                    raise
 
-                            uploaded_count = result.get("uploaded", 0)
-                            failed_count = result.get("failed", 0)
+                            if not handled_error:
+                                result = resp.json()
+                                _warn_if_simulated(result)
 
-                            if uploaded_count > 0:
-                                st.success(f"Uploaded {uploaded_count} seed(s)")
-                            if failed_count > 0:
-                                st.warning(f"{failed_count} file(s) failed")
-                                for error in result.get("errors", []):
-                                    st.error(f"{error['file']}: {error['error']}")
+                                uploaded_count = result.get("uploaded", 0)
+                                failed_count = result.get("failed", 0)
 
-                            # Clean up and view the new cast member
-                            st.session_state.pop("cast_show_add_form", None)
-                            st.session_state.pop("new_cast_created", None)
-                            st.session_state.pop("new_cast_name_stored", None)
-                            st.session_state["selected_cast_id"] = new_cast_id
-                            st.rerun()
+                                if uploaded_count > 0:
+                                    st.success(f"Uploaded {uploaded_count} seed(s)")
+                                if failed_count > 0:
+                                    st.warning(f"{failed_count} file(s) failed")
+                                    for error in result.get("errors", []):
+                                        st.error(f"{error['file']}: {error['error']}")
+
+                                # Clean up and view the new cast member
+                                st.session_state.pop("cast_show_add_form", None)
+                                st.session_state.pop("new_cast_created", None)
+                                st.session_state.pop("new_cast_name_stored", None)
+                                st.session_state["selected_cast_id"] = new_cast_id
+                                st.rerun()
 
                         except requests.RequestException as exc:
-                            st.error(f"Upload failed: {exc}")
+                            st.error(helpers.describe_error(url, exc))
                     else:
                         st.warning("No files selected")
 
@@ -668,34 +688,35 @@ if selected_cast_id:
 
                         try:
                             resp = requests.post(url, files=files, timeout=120)
+                            handled_error = False
                             try:
                                 resp.raise_for_status()
                             except requests.HTTPError as exc:
-                                detail = ""
-                                try:
-                                    detail = resp.json().get("detail")  # type: ignore[assignment]
-                                except Exception:
-                                    detail = resp.text
-                                st.error(f"Upload failed: {detail or exc}")
-                                raise
-                            result = resp.json()
-                            _warn_if_simulated(result)
+                                if resp.status_code == 422:
+                                    st.error(_format_seed_upload_error(resp, exc))
+                                    handled_error = True
+                                else:
+                                    raise
 
-                            uploaded_count = result.get("uploaded", 0)
-                            failed_count = result.get("failed", 0)
+                            if not handled_error:
+                                result = resp.json()
+                                _warn_if_simulated(result)
 
-                            if uploaded_count > 0:
-                                st.success(f"Uploaded {uploaded_count} seed(s)")
-                            if failed_count > 0:
-                                st.warning(f"{failed_count} file(s) failed")
-                                for error in result.get("errors", []):
-                                    st.error(f"{error['file']}: {error['error']}")
+                                uploaded_count = result.get("uploaded", 0)
+                                failed_count = result.get("failed", 0)
 
-                            st.session_state.pop("cast_show_upload_form", None)
-                            st.rerun()
+                                if uploaded_count > 0:
+                                    st.success(f"Uploaded {uploaded_count} seed(s)")
+                                if failed_count > 0:
+                                    st.warning(f"{failed_count} file(s) failed")
+                                    for error in result.get("errors", []):
+                                        st.error(f"{error['file']}: {error['error']}")
+
+                                st.session_state.pop("cast_show_upload_form", None)
+                                st.rerun()
 
                         except requests.RequestException as exc:
-                            st.error(f"Upload failed: {exc}")
+                            st.error(helpers.describe_error(url, exc))
 
                 if cols[1].form_submit_button("Cancel"):
                     st.session_state.pop("cast_show_upload_form", None)

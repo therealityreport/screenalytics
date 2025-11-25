@@ -699,6 +699,78 @@ def _fetch_track_frames(
     return {}
 
 
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _quality_score(face_meta: Dict[str, Any]) -> float | None:
+    quality = face_meta.get("quality") if isinstance(face_meta, dict) else None
+    if isinstance(quality, dict):
+        try:
+            score = quality.get("score")
+            return float(score) if score is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _scope_track_frames(frames: List[Dict[str, Any]], track_id: int) -> tuple[List[Dict[str, Any]], List[int]]:
+    """Filter frames down to faces that belong to the active track."""
+    scoped: List[Dict[str, Any]] = []
+    missing: List[int] = []
+    for frame in frames:
+        frame_idx = frame.get("frame_idx")
+        faces = frame.get("faces") if isinstance(frame.get("faces"), list) else []
+        candidates = [face for face in faces if isinstance(face, dict)]
+        # Include the top-level frame meta as a candidate when it already points to this track
+        top_level_tid = _coerce_int(frame.get("track_id"))
+        if top_level_tid in (None, track_id):
+            candidates.append(frame)
+
+        faces_for_track = []
+        for face in candidates:
+            tid = _coerce_int(face.get("track_id"))
+            if tid == track_id:
+                faces_for_track.append(face)
+
+        if not faces_for_track:
+            try:
+                missing.append(int(frame_idx))
+            except (TypeError, ValueError):
+                missing.append(frame_idx if frame_idx is not None else -1)
+            continue
+
+        # Prefer higher quality within the track for rendering
+        faces_for_track.sort(key=lambda f: _quality_score(f) or 0.0, reverse=True)
+        primary = {**frame, **faces_for_track[0]}
+        primary["faces"] = faces_for_track
+        primary["track_id"] = _coerce_int(primary.get("track_id")) or track_id
+        scoped.append(primary)
+    return scoped, missing
+
+
+def _best_track_frame_idx(frames: List[Dict[str, Any]], track_id: int, fallback: int | None) -> int | None:
+    best_idx = None
+    best_score = -1.0
+    for frame in frames:
+        frame_idx = frame.get("frame_idx")
+        faces = frame.get("faces") if isinstance(frame.get("faces"), list) else []
+        for face in faces:
+            tid = _coerce_int(face.get("track_id"))
+            if tid != track_id:
+                continue
+            score = _quality_score(face)
+            if score is None:
+                continue
+            if score > best_score:
+                best_score = score
+                best_idx = frame_idx
+    return best_idx if best_idx is not None else fallback
+
+
 def _render_track_media_section(ep_id: str, track_id: int, *, sample: int) -> None:
     """Show cached crops with lazy pagination for the active track."""
     state = _track_media_state(ep_id, track_id)
@@ -726,6 +798,14 @@ def _render_track_media_section(ep_id: str, track_id: int, *, sample: int) -> No
     items = state.get("items", [])
     cursor = state.get("cursor")
     batch_limit = int(state.get("batch_limit", TRACK_MEDIA_BATCH_LIMIT))
+    # Defensive filter: ignore crops that somehow belong to another track
+    if items:
+        scoped_items = [item for item in items if item.get("track_id") in (None, track_id)]
+        dropped = len(items) - len(scoped_items)
+        if dropped:
+            st.warning(f"Ignoring {dropped} crop(s) not matching track {track_id}.")
+        items = scoped_items
+        state["items"] = items
 
     st.markdown("#### Track crops preview")
     header_cols = st.columns([3, 1])
@@ -2269,7 +2349,11 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     page = current_page
     frames_payload = _fetch_track_frames(ep_id, track_id, sample=sample, page=page, page_size=page_size)
     frames = frames_payload.get("items", [])
-    best_frame_idx = frames_payload.get("best_frame_idx")
+    mismatched_frames = [frame for frame in frames if frame.get("track_id") not in (None, track_id)]
+    if mismatched_frames:
+        frames = [frame for frame in frames if frame.get("track_id") in (None, track_id)]
+    frames, missing_faces = _scope_track_frames(frames, track_id)
+    best_frame_idx = _best_track_frame_idx(frames, track_id, frames_payload.get("best_frame_idx"))
     total_sampled = int(frames_payload.get("total") or 0)
     # Preserve zero: only use total_sampled if total_frames is None
     total_frames_raw = frames_payload.get("total_frames")
@@ -2328,6 +2412,13 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     if total_frames:
         summary += f" · Faces tracked: {total_frames}"
     nav_cols[2].caption(summary)
+    if mismatched_frames:
+        st.warning(f"Dropped {len(mismatched_frames)} frame(s) that were tagged to a different track.")
+    if missing_faces:
+        missing_labels = ", ".join(str(idx) for idx in sorted({m for m in missing_faces if m is not None}))
+        st.warning(
+            f"No faces found for track {track_id} in frame(s): {missing_labels}. Dropped mismatched faces."
+        )
     _render_track_media_section(ep_id, track_id, sample=sample)
     if current_identity:
         assign_container = st.container(border=True)
@@ -2403,6 +2494,13 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                     else:
                         st.caption("Crop unavailable.")
                     st.caption(caption)
+                    face_track_id = _coerce_int(frame_meta.get("track_id")) or track_id
+                    st.caption(f":grey[Track: {face_track_id}]")
+                    other_tracks = frame_meta.get("other_tracks") or []
+                    if isinstance(other_tracks, list):
+                        scoped_tracks = [str(t) for t in other_tracks if t is not None]
+                        if scoped_tracks:
+                            st.caption(f":grey[Other track(s) in this frame: {', '.join(scoped_tracks)}]")
                     # Show best-quality frame badge
                     if frame_idx == best_frame_idx:
                         st.markdown(
