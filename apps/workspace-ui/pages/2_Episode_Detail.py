@@ -257,7 +257,7 @@ def _cached_episode_status(ep_id: str, cache_key: float, marker_mtimes: tuple) -
     Args:
         ep_id: Episode ID
         cache_key: Fetch token for manual cache busting
-        marker_mtimes: Tuple of (detect_track_mtime, faces_mtime, cluster_mtime) to auto-invalidate cache
+        marker_mtimes: Tuple of artifact mtimes to auto-invalidate cache (runs + manifests)
     """
     return helpers.get_episode_status(ep_id)
 
@@ -627,7 +627,8 @@ should_refresh_status = force_refresh or _job_active(ep_id) or status_payload is
 if should_refresh_status:
     fetch_token += 1
     st.session_state[fetch_token_key] = fetch_token
-    status_payload = _cached_episode_status(ep_id, fetch_token, current_mtimes[:3])
+    # Include manifests in the cache key so status refreshes when identities/faces/tracks change.
+    status_payload = _cached_episode_status(ep_id, fetch_token, current_mtimes)
     st.session_state[status_cache_key] = status_payload
     st.session_state[status_ts_key] = time.time()
     st.session_state[mtimes_key] = current_mtimes
@@ -753,22 +754,13 @@ elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_ex
     faces_manifest_fallback = True
 
 # If detect status is missing but manifests are present, synthesize a summary so the UI still shows completion.
-if not detect_phase_status and (manifest_state["manifest_ready"] or manifest_state["tracks_ready"]):
-    detections_count = _count_manifest_rows(detections_path) or 0
-    tracks_count = _count_manifest_rows(tracks_path) or 0
+if not detect_phase_status and manifest_state["manifest_ready"]:
     detect_phase_status = {
         "status": "success",
-        "detections": detections_count,
-        "tracks": tracks_count,
+        "detections": _count_manifest_rows(detections_path) or 0,
+        "tracks": _count_manifest_rows(tracks_path) or 0,
         "finished_at": None,
     }
-    detect_status_value = "success"
-    using_manifest_fallback = True
-    if manifest_state["tracks_only_fallback"]:
-        tracks_only_fallback = True
-elif detect_status_value in {"missing", "unknown"} and (tracks_path.exists() or detections_path.exists()):
-    # If manifests exist but were not counted (e.g., empty status payload), still show a detect/track card.
-    detect_phase_status = detect_phase_status or {"status": "success"}
     detect_status_value = "success"
     using_manifest_fallback = True
 
@@ -831,52 +823,55 @@ with col1:
     detect_runtime = _format_runtime(detect_phase_status.get("runtime_sec"))
     if requested_device_state and requested_device_state != device_state:
         detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
-    if device_state:
-        detect_params.append(f"device={helpers.device_label_from_value(device_state)}")
-        if detect_status_value == "success":
-            runtime_label = detect_runtime or "n/a"
-            st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
-            det = detect_phase_status.get("detector") or "--"
-            trk = detect_phase_status.get("tracker") or "--"
-            st.caption(f"{det} + {trk}")
-            detections = detect_phase_status.get("detections")
-            tracks = detect_phase_status.get("tracks")
-            st.caption(f"{(detections or 0):,} detections, {(tracks or 0):,} tracks")
-            ratio_value = helpers.coerce_float(
-                detect_phase_status.get("track_to_detection_ratio") or detect_phase_status.get("track_ratio")
-            )
-            if ratio_value is not None:
-                st.caption(f"Tracks / detections: {ratio_value:.2f}")
-                if ratio_value < 0.1:
-                    st.caption(
-                        "⚠️ Track-to-detection ratio < 0.10. Consider lowering ByteTrack thresholds or rerunning detect/track."
-                    )
-            # Show manifest-fallback caption when status was inferred from manifests
-            if using_manifest_fallback or detect_phase_status.get("metadata_missing"):
-                st.warning(
-                    "⚠️ Detect/Track details inferred from manifests (metadata missing). "
-                    "Detector/tracker and runtime may be inaccurate; rerun detect/track for fresh metadata."
+    device_label = helpers.device_label_from_value(
+        resolved_device_state or device_state or requested_device_state or helpers.DEFAULT_DEVICE
+    )
+    if device_label:
+        detect_params.append(f"device={device_label}")
+    if detect_status_value == "success":
+        runtime_label = detect_runtime or "n/a"
+        st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
+        det = detect_phase_status.get("detector") or "--"
+        trk = detect_phase_status.get("tracker") or "--"
+        st.caption(f"{det} + {trk}")
+        detections = detect_phase_status.get("detections")
+        tracks = detect_phase_status.get("tracks")
+        st.caption(f"{(detections or 0):,} detections, {(tracks or 0):,} tracks")
+        ratio_value = helpers.coerce_float(
+            detect_phase_status.get("track_to_detection_ratio") or detect_phase_status.get("track_ratio")
+        )
+        if ratio_value is not None:
+            st.caption(f"Tracks / detections: {ratio_value:.2f}")
+            if ratio_value < 0.1:
+                st.caption(
+                    "⚠️ Track-to-detection ratio < 0.10. Consider lowering ByteTrack thresholds or rerunning detect/track."
                 )
-            if tracks_only_fallback:
-                st.warning("⚠️ Tracks exist but detections are missing. Rerun detect/track to regenerate detections.")
-        elif detect_status_value == "running":
-            st.info("⏳ **Detect/Track**: Running")
-            if detect_job_record and detect_job_record.get("started_at"):
-                st.caption(f"Started at {detect_job_record['started_at']}")
-            st.caption("Live progress appears in the log panel below.")
-        elif detect_status_value == "stale":
-            st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
-            st.caption("Rerun Detect/Track Faces to rebuild detections/tracks for this episode.")
-        elif detect_status_value == "partial":
-            st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
-            st.caption("Rerun detect/track to rebuild tracks.")
-        elif detect_status_value == "missing":
-            st.info("⏳ **Detect/Track**: Not started")
-            st.caption("Run detect/track first.")
-        else:
-            st.error(f"⚠️ **Detect/Track**: {detect_status_value.title()}")
-            if detect_phase_status.get("error"):
-                st.caption(detect_phase_status["error"])
+        # Show manifest-fallback caption when status was inferred from manifests
+        if using_manifest_fallback or detect_phase_status.get("metadata_missing"):
+            st.warning(
+                "⚠️ Detect/Track details inferred from manifests (metadata missing). "
+                "Detector/tracker and runtime may be inaccurate; rerun detect/track for fresh metadata."
+            )
+        if tracks_only_fallback:
+            st.warning("⚠️ Tracks exist but detections are missing. Rerun detect/track to regenerate detections.")
+    elif detect_status_value == "running":
+        st.info("⏳ **Detect/Track**: Running")
+        if detect_job_record and detect_job_record.get("started_at"):
+            st.caption(f"Started at {detect_job_record['started_at']}")
+        st.caption("Live progress appears in the log panel below.")
+    elif detect_status_value == "stale":
+        st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
+        st.caption("Rerun Detect/Track Faces to rebuild detections/tracks for this episode.")
+    elif detect_status_value == "partial":
+        st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
+        st.caption("Rerun detect/track to rebuild tracks.")
+    elif detect_status_value == "missing":
+        st.info("⏳ **Detect/Track**: Not started")
+        st.caption("Run detect/track first.")
+    else:
+        st.error(f"⚠️ **Detect/Track**: {detect_status_value.title()}")
+        if detect_phase_status.get("error"):
+            st.caption(detect_phase_status["error"])
     if detect_params:
         st.caption("Params: " + ", ".join(detect_params))
     if tracks_only_fallback:
@@ -1132,9 +1127,6 @@ detect_detector_value = _choose_value(
     helpers.tracks_detector_value(ep_id),
     fallback=helpers.DEFAULT_DETECTOR,
 )
-# Guard against unsupported detector values (legacy/internal). Force RetinaFace.
-if detect_detector_value not in {helpers.DEFAULT_DETECTOR}:
-    detect_detector_value = helpers.DEFAULT_DETECTOR
 detect_tracker_value = _choose_value(
     tracker_override,
     detect_job_defaults.get("tracker"),
