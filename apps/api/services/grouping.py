@@ -1557,6 +1557,143 @@ class GroupingService:
             "ep_id": ep_id,
         }
 
+    def batch_assign_clusters(
+        self,
+        ep_id: str,
+        assignments: List[Any],  # List of BatchAssignmentItem from router
+    ) -> Dict[str, Any]:
+        """Batch assign multiple clusters to cast members in a single operation.
+
+        Optimized for bulk assignments - loads data once and processes all
+        assignments together, significantly reducing latency.
+
+        Args:
+            ep_id: Episode ID
+            assignments: List of {cluster_id, target_cast_id} assignment items
+
+        Returns:
+            Dict with succeeded, failed counts and results list
+        """
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
+
+        # Load all required data once
+        centroids_data = self.load_cluster_centroids(ep_id)
+        centroids_map_full = _normalize_centroids_to_map(centroids_data.get("centroids", {}), validate=True)
+        centroids_map = {cid: data["centroid"] for cid, data in centroids_map_full.items()}
+
+        # Load people and cast data once
+        people = self.people_service.get_all_people(show_id)
+        people_by_cast_id = {p.get("cast_id"): p for p in people if p.get("cast_id")}
+
+        # Load cast data for names
+        cast_service = CastService()
+        cast_list = cast_service.get_cast(show_id)
+        cast_by_id = {c.get("cast_id"): c for c in cast_list}
+
+        results = []
+        succeeded = 0
+        failed = 0
+
+        # Group assignments by target_cast_id for efficiency
+        by_cast_id: Dict[str, List[str]] = {}
+        for assignment in assignments:
+            cast_id = assignment.target_cast_id
+            cluster_id = assignment.cluster_id
+            if cast_id not in by_cast_id:
+                by_cast_id[cast_id] = []
+            by_cast_id[cast_id].append(cluster_id)
+
+        # Process each cast_id group
+        for cast_id, cluster_ids in by_cast_id.items():
+            try:
+                target_person = people_by_cast_id.get(cast_id)
+
+                if not target_person:
+                    # Create new person for this cast member
+                    cast_member = cast_by_id.get(cast_id)
+                    if not cast_member:
+                        for cid in cluster_ids:
+                            results.append({
+                                "cluster_id": cid,
+                                "cast_id": cast_id,
+                                "success": False,
+                                "error": f"Cast member {cast_id} not found",
+                            })
+                            failed += len(cluster_ids)
+                        continue
+
+                    # Compute prototype from clusters
+                    centroids_to_merge = [centroids_map[cid] for cid in cluster_ids if cid in centroids_map]
+                    if not centroids_to_merge:
+                        for cid in cluster_ids:
+                            results.append({
+                                "cluster_id": cid,
+                                "cast_id": cast_id,
+                                "success": False,
+                                "error": "No valid cluster centroids found",
+                            })
+                            failed += len(cluster_ids)
+                        continue
+
+                    proto = l2_normalize(np.mean(centroids_to_merge, axis=0))
+                    target_person = self.people_service.create_person(
+                        show_id,
+                        prototype=proto.tolist(),
+                        cluster_ids=[f"{ep_id}:{cid}" for cid in cluster_ids],
+                        cast_id=cast_id,
+                        name=cast_member.get("name"),
+                    )
+                    people_by_cast_id[cast_id] = target_person
+                else:
+                    # Add clusters to existing person
+                    for cluster_id in cluster_ids:
+                        full_cluster_id = f"{ep_id}:{cluster_id}"
+                        centroid = centroids_map.get(cluster_id)
+                        self.people_service.add_cluster_to_person(
+                            show_id,
+                            target_person["person_id"],
+                            full_cluster_id,
+                            update_prototype=True,
+                            cluster_centroid=centroid,
+                        )
+
+                target_person_id = target_person["person_id"]
+
+                # Update identities.json for these clusters
+                identity_assignments = [{"cluster_id": cid, "person_id": target_person_id} for cid in cluster_ids]
+                self._update_identities_with_people(ep_id, identity_assignments)
+
+                # Mark as manually assigned
+                for cluster_id in cluster_ids:
+                    self.mark_assignment_manual(ep_id, cluster_id, cast_id=cast_id)
+                    results.append({
+                        "cluster_id": cluster_id,
+                        "cast_id": cast_id,
+                        "person_id": target_person_id,
+                        "success": True,
+                    })
+                    succeeded += 1
+
+            except Exception as exc:
+                LOGGER.error(f"Batch assign failed for cast {cast_id}: {exc}")
+                for cid in cluster_ids:
+                    results.append({
+                        "cluster_id": cid,
+                        "cast_id": cast_id,
+                        "success": False,
+                        "error": str(exc),
+                    })
+                    failed += 1
+
+        return {
+            "results": results,
+            "succeeded": succeeded,
+            "failed": failed,
+        }
+
     def group_using_facebank(
         self,
         ep_id: str,
@@ -1823,16 +1960,25 @@ class GroupingService:
             if cast_id and seed.get("embedding"):
                 seeds_by_cast.setdefault(cast_id, []).append(seed)
 
-        # Find unassigned clusters
-        unassigned_clusters = []
+        # Load people to check which have cast_id assigned
+        people = self.people_service.list_people(show_id)
+        people_with_cast = {p.get("person_id") for p in people if p.get("cast_id")}
+
+        # Find clusters needing suggestions:
+        # 1. No person_id (completely unassigned)
+        # 2. Has person_id but that person has no cast_id (auto-detected people)
+        clusters_needing_suggestions = []
         for identity in identities:
             cluster_id = identity.get("identity_id")
             person_id = identity.get("person_id")
-            if not person_id and cluster_id in centroids_map:
-                unassigned_clusters.append(cluster_id)
+            if cluster_id not in centroids_map:
+                continue
+            # Include if no person, OR person has no cast_id
+            if not person_id or person_id not in people_with_cast:
+                clusters_needing_suggestions.append(cluster_id)
 
         suggestions = []
-        for cluster_id in unassigned_clusters:
+        for cluster_id in clusters_needing_suggestions:
             centroid_data = centroids_map.get(cluster_id)
             if not centroid_data:
                 continue
@@ -1881,7 +2027,7 @@ class GroupingService:
                 "cast_suggestions": top_matches,
             })
 
-        LOGGER.info(f"[{ep_id}] Generated cast suggestions for {len(suggestions)} unassigned clusters")
+        LOGGER.info(f"[{ep_id}] Generated cast suggestions for {len(suggestions)} clusters needing assignment")
         return {"suggestions": suggestions}
 
     def auto_link_high_confidence_matches(

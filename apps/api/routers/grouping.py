@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Iterable, List, Literal, Optional
@@ -17,8 +18,30 @@ if str(PROJECT_ROOT) not in sys.path:
 from apps.api.services.grouping import GroupingService
 from apps.api.routers.episodes import _refresh_similarity_indexes
 
+LOGGER = logging.getLogger(__name__)
 router = APIRouter()
 grouping_service = GroupingService()
+
+# Lazy imports for Celery (only when needed)
+_celery_available = None
+
+
+def _check_celery_available() -> bool:
+    """Check if Celery/Redis are available for async jobs."""
+    global _celery_available
+    if _celery_available is None:
+        try:
+            from apps.api.tasks import check_active_job
+            import redis
+            from apps.api.config import REDIS_URL
+            # Try to ping Redis
+            r = redis.from_url(REDIS_URL, socket_timeout=1)
+            r.ping()
+            _celery_available = True
+        except Exception as e:
+            LOGGER.warning(f"Celery/Redis not available: {e}")
+            _celery_available = False
+    return _celery_available
 
 
 class GroupClustersRequest(BaseModel):
@@ -29,6 +52,17 @@ class GroupClustersRequest(BaseModel):
     name: Optional[str] = Field(None, description="Name for new person (when target_person_id is None)")
     protect_manual: bool = Field(True, description="If True, don't merge manually assigned clusters to different people")
     facebank_first: bool = Field(True, description="If True, try facebank matching before people prototypes (more accurate)")
+
+
+class BatchAssignmentItem(BaseModel):
+    """Single assignment in a batch."""
+    cluster_id: str = Field(..., description="Cluster ID to assign")
+    target_cast_id: str = Field(..., description="Cast ID to assign the cluster to")
+
+
+class BatchAssignRequest(BaseModel):
+    """Batch assignment request for multiple clusters to multiple cast members."""
+    assignments: List[BatchAssignmentItem] = Field(..., description="List of cluster-to-cast assignments")
 
 
 def _trigger_similarity_refresh(ep_id: str, cluster_ids: Iterable[str] | None) -> None:
@@ -146,6 +180,193 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Grouping failed: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/clusters/batch_assign")
+def batch_assign_clusters(ep_id: str, body: BatchAssignRequest) -> dict:
+    """Batch assign multiple clusters to cast members in a single operation.
+
+    This endpoint is optimized for bulk assignments - it loads data once and
+    processes all assignments together, significantly reducing latency compared
+    to multiple individual calls.
+
+    Request body:
+        assignments: List of {cluster_id, target_cast_id} pairs
+
+    Returns:
+        - status: "success" or "partial" (if some failed)
+        - results: List of assignment results
+        - succeeded: Count of successful assignments
+        - failed: Count of failed assignments
+    """
+    if not body.assignments:
+        raise HTTPException(status_code=400, detail="No assignments provided")
+
+    try:
+        result = grouping_service.batch_assign_clusters(ep_id, body.assignments)
+        status = "success" if result.get("failed", 0) == 0 else "partial"
+        return {
+            "status": status,
+            "ep_id": ep_id,
+            **result,
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch assignment failed: {str(e)}")
+
+
+# ============================================================================
+# ASYNC ENDPOINTS - Return HTTP 202 with job_id for background processing
+# ============================================================================
+
+
+@router.post("/episodes/{ep_id}/clusters/batch_assign_async", status_code=202)
+def batch_assign_clusters_async(ep_id: str, body: BatchAssignRequest) -> dict:
+    """Enqueue batch cluster assignment as background job (non-blocking).
+
+    Returns immediately with HTTP 202 Accepted and a job_id.
+    Poll /celery_jobs/{job_id} to check status.
+
+    If Celery/Redis are unavailable, falls back to synchronous execution.
+    """
+    if not body.assignments:
+        raise HTTPException(status_code=400, detail="No assignments provided")
+
+    # Check if Celery is available
+    if not _check_celery_available():
+        LOGGER.info(f"[{ep_id}] Celery unavailable, falling back to sync batch_assign")
+        # Fall back to synchronous execution
+        try:
+            result = grouping_service.batch_assign_clusters(ep_id, body.assignments)
+            status = "success" if result.get("failed", 0) == 0 else "partial"
+            return {
+                "status": status,
+                "ep_id": ep_id,
+                "async": False,
+                "message": "Executed synchronously (Celery unavailable)",
+                **result,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        from apps.api.tasks import run_manual_assign_task, check_active_job
+
+        # Check for active job
+        active = check_active_job(ep_id, "manual_assign")
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job already in progress: {active}",
+            )
+
+        # Convert assignments to dict format for Celery
+        payload = {
+            "assignments": [
+                {"cluster_id": a.cluster_id, "target_cast_id": a.target_cast_id}
+                for a in body.assignments
+            ]
+        }
+
+        # Enqueue the task
+        task = run_manual_assign_task.delay(
+            episode_id=ep_id,
+            payload=payload,
+        )
+
+        return {
+            "job_id": task.id,
+            "status": "queued",
+            "ep_id": ep_id,
+            "async": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to enqueue batch_assign: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/clusters/group_async", status_code=202)
+def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
+    """Enqueue auto-grouping as background job (non-blocking).
+
+    Only supports strategy="auto". For manual/facebank, use the synchronous endpoint.
+
+    Returns immediately with HTTP 202 Accepted and a job_id.
+    Poll /celery_jobs/{job_id} to check status.
+
+    If Celery/Redis are unavailable, falls back to synchronous execution.
+    """
+    if body.strategy != "auto":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Async only supports strategy='auto', got '{body.strategy}'. "
+            "Use /clusters/group for manual/facebank.",
+        )
+
+    # Check if Celery is available
+    if not _check_celery_available():
+        LOGGER.info(f"[{ep_id}] Celery unavailable, falling back to sync group_clusters")
+        # Fall back to synchronous execution
+        try:
+            progress_log = []
+
+            def progress_callback(step: str, progress: float, message: str):
+                progress_log.append({"step": step, "progress": progress, "message": message})
+
+            result = grouping_service.group_clusters_auto(
+                ep_id,
+                progress_callback=progress_callback,
+                protect_manual=body.protect_manual,
+                facebank_first=body.facebank_first,
+            )
+            return {
+                "status": "success",
+                "strategy": "auto",
+                "ep_id": ep_id,
+                "async": False,
+                "message": "Executed synchronously (Celery unavailable)",
+                "result": result,
+                "progress_log": progress_log,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        from apps.api.tasks import run_auto_group_task, check_active_job
+
+        # Check for active job
+        active = check_active_job(ep_id, "auto_group")
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job already in progress: {active}",
+            )
+
+        # Enqueue the task
+        task = run_auto_group_task.delay(
+            episode_id=ep_id,
+            options={
+                "protect_manual": body.protect_manual,
+                "facebank_first": body.facebank_first,
+            },
+        )
+
+        return {
+            "job_id": task.id,
+            "status": "queued",
+            "ep_id": ep_id,
+            "async": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to enqueue group_clusters: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
 
 
 @router.get("/episodes/{ep_id}/clusters/group/progress")

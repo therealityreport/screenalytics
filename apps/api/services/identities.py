@@ -68,40 +68,87 @@ def _crops_root(ep_id: str) -> Path:
 
 
 def _crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    """Resolve a crop URL, prioritizing S3, then local files."""
-    if s3_key:
-        url = STORAGE.presign_get(str(s3_key))
+    """Resolve a crop URL, preferring S3 with local fallback.
+
+    Priority:
+    1. Use provided s3_key if available
+    2. Construct S3 key from rel_path if s3_key not provided
+    3. Fall back to local file if S3 fails
+    """
+    constructed_s3_key = s3_key
+
+    # If no S3 key provided, try to construct one from rel_path
+    if not constructed_s3_key and rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = artifact_prefixes(ep_ctx)
+            crops_prefix = prefixes.get("crops")
+            if crops_prefix:
+                crop_rel = rel_path
+                if crop_rel.startswith("crops/"):
+                    crop_rel = crop_rel[6:]
+                constructed_s3_key = f"{crops_prefix}{crop_rel}"
+        except (ValueError, KeyError):
+            pass
+
+    # Try S3 first
+    if constructed_s3_key:
+        url = STORAGE.presign_get(str(constructed_s3_key))
         if url:
             return url
-    if not rel_path:
-        return None
-    frames_root = get_path(ep_id, "frames_root")
-    # Handle paths with or without "crops/" prefix
-    if rel_path.startswith("crops/"):
-        local = frames_root / rel_path
-    else:
-        local = _crops_root(ep_id) / rel_path
-    if local.exists():
-        return str(local)
+
+    # Local fallback
+    if rel_path:
+        frames_root = get_path(ep_id, "frames_root")
+        if rel_path.startswith("crops/"):
+            local = frames_root / rel_path
+        else:
+            local = _crops_root(ep_id) / rel_path
+        if local.exists():
+            return str(local)
+
     return None
 
 
 def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    """Resolve a thumbnail URL. Can handle both thumb and crop paths."""
-    if s3_key:
-        url = STORAGE.presign_get(str(s3_key))
+    """Resolve a thumbnail URL, preferring S3 with local fallback.
+
+    Priority:
+    1. Use provided s3_key if available
+    2. Construct S3 key from rel_path if s3_key not provided
+    3. Fall back to local file if S3 fails
+    """
+    constructed_s3_key = s3_key
+
+    # If no S3 key provided, try to construct one from rel_path
+    if not constructed_s3_key and rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = artifact_prefixes(ep_ctx)
+            thumbs_prefix = prefixes.get("thumbs")
+            if thumbs_prefix:
+                constructed_s3_key = f"{thumbs_prefix}{rel_path}"
+        except (ValueError, KeyError):
+            pass
+
+    # Try S3 first
+    if constructed_s3_key:
+        url = STORAGE.presign_get(str(constructed_s3_key))
         if url:
             return url
+
+    # Local fallback - try crop path first if it looks like a crop
     if rel_path and (rel_path.startswith("crops/") or "crops/" in rel_path):
         frames_root = get_path(ep_id, "frames_root")
         crop_path = frames_root / rel_path
         if crop_path.exists():
             return str(crop_path)
-    if not rel_path:
-        return None
-    local = _thumbs_root(ep_id) / rel_path
-    if local.exists():
-        return str(local)
+
+    if rel_path:
+        local = _thumbs_root(ep_id) / rel_path
+        if local.exists():
+            return str(local)
+
     return None
 
 

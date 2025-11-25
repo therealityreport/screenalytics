@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.routers import (
     cast,
+    celery_jobs,
     episodes,
     facebank,
     files,

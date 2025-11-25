@@ -241,3 +241,201 @@ def get_bool(key: str, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.lower() in ("true", "1", "yes")
     return bool(value)
+
+
+# ============================================================================
+# Celery Job State Management (Phase 2)
+# ============================================================================
+
+import time
+from typing import Dict, Optional, Callable
+import requests
+
+# Job state session keys
+ACTIVE_JOB_KEY = "celery_active_job"
+
+
+def get_active_job() -> Optional[Dict[str, Any]]:
+    """Get the currently active background job from session state.
+
+    Returns:
+        Dict with job_id, operation, episode_id, created_at, or None if no active job
+    """
+    return get(ACTIVE_JOB_KEY)
+
+
+def set_active_job(job_id: str, operation: str, episode_id: str) -> None:
+    """Store an active job in session state.
+
+    Args:
+        job_id: Celery task ID
+        operation: Operation type (manual_assign, auto_group, etc.)
+        episode_id: Episode ID the job is running for
+    """
+    set(ACTIVE_JOB_KEY, {
+        "job_id": job_id,
+        "operation": operation,
+        "episode_id": episode_id,
+        "created_at": time.time(),
+    })
+
+
+def clear_active_job() -> None:
+    """Clear the active job from session state."""
+    delete(ACTIVE_JOB_KEY)
+
+
+def poll_job_status(api_base: str, job_id: str) -> Optional[Dict[str, Any]]:
+    """Poll job status from the Celery jobs API.
+
+    Args:
+        api_base: API base URL (e.g., http://localhost:8000)
+        job_id: Celery task ID
+
+    Returns:
+        Dict with job_id, state, result, etc., or None if request failed
+    """
+    try:
+        resp = requests.get(f"{api_base}/celery_jobs/{job_id}", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def render_job_status(api_base: str) -> bool:
+    """Render active job status in Streamlit UI if one exists.
+
+    This should be called at the top of the page after loading episode data.
+
+    Args:
+        api_base: API base URL
+
+    Returns:
+        True if a job is still running (page should auto-refresh),
+        False if no job or job is complete
+    """
+    if st is None:
+        return False
+
+    job = get_active_job()
+    if not job:
+        return False
+
+    status = poll_job_status(api_base, job["job_id"])
+    if not status:
+        st.warning(f"Unable to check job status: {job['job_id']}")
+        return False
+
+    state = status.get("state", "unknown")
+    operation = job.get("operation", "operation")
+    job_id_short = job["job_id"][:8]
+
+    if state in ("queued", "in_progress"):
+        # Show progress info
+        progress = status.get("progress", {})
+        step = progress.get("step", "")
+        message = progress.get("message", "Working...")
+
+        if progress:
+            st.info(f"⏳ {operation} in progress ({job_id_short}...)\n\n**{step}**: {message}")
+        else:
+            st.info(f"⏳ {operation} in progress ({job_id_short}...)")
+
+        # Signal that page should auto-refresh
+        return True
+
+    elif state == "success":
+        result = status.get("result", {})
+        succeeded = result.get("succeeded", 0)
+        failed = result.get("failed", 0)
+
+        if operation == "manual_assign":
+            st.success(f"✅ Assignment complete! {succeeded} succeeded, {failed} failed")
+        elif operation == "auto_group":
+            assigned = result.get("assignments_count", 0)
+            new_people = result.get("new_people_count", 0)
+            st.success(f"✅ Auto-grouping complete! {assigned} clusters assigned, {new_people} new people created")
+        else:
+            st.success(f"✅ {operation} complete!")
+
+        # Clear job and trigger cache invalidation
+        clear_active_job()
+        return False
+
+    elif state == "failed":
+        error = status.get("error", status.get("result", "Unknown error"))
+        st.error(f"❌ {operation} failed: {error}")
+        clear_active_job()
+        return False
+
+    elif state == "cancelled":
+        st.warning(f"🚫 {operation} was cancelled")
+        clear_active_job()
+        return False
+
+    return False
+
+
+def submit_async_job(
+    api_base: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+    episode_id: str,
+) -> Optional[str]:
+    """Submit an async job to the API and store in session state.
+
+    Args:
+        api_base: API base URL
+        endpoint: API endpoint (e.g., /episodes/{ep_id}/clusters/batch_assign_async)
+        payload: Request payload
+        operation: Operation name for display
+        episode_id: Episode ID
+
+    Returns:
+        Job ID if submitted successfully, None otherwise
+    """
+    if st is None:
+        return None
+
+    # Check if a job is already running
+    existing = get_active_job()
+    if existing:
+        st.warning(f"A job is already running: {existing.get('operation')} ({existing.get('job_id', '')[:8]}...)")
+        return None
+
+    try:
+        resp = requests.post(
+            f"{api_base}{endpoint}",
+            json=payload,
+            timeout=10,
+        )
+        if resp.status_code in (200, 202):
+            data = resp.json()
+            job_id = data.get("job_id")
+            if job_id and data.get("async", True):
+                # Store job in session state
+                set_active_job(job_id, operation, episode_id)
+                return job_id
+            elif not data.get("async"):
+                # Synchronous fallback - no job to track
+                return None
+        else:
+            error = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+            st.error(f"Failed to submit job: {error}")
+            return None
+    except Exception as e:
+        st.error(f"Failed to submit job: {e}")
+        return None
+
+
+# Convenience function for auto-refresh polling
+def should_auto_refresh() -> bool:
+    """Check if page should auto-refresh due to running job.
+
+    Call this after render_job_status() to determine if st.rerun() should be scheduled.
+    """
+    job = get_active_job()
+    return job is not None

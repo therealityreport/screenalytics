@@ -16,8 +16,29 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+from similarity_badges import SimilarityType, render_similarity_badge  # noqa: E402
 
 cfg = helpers.init_page("Cast")
+
+# Cast View header
+st.markdown(
+    """
+    <div style="
+        background: linear-gradient(135deg, rgba(156, 39, 176, 0.25), rgba(33, 150, 243, 0.25));
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        border-radius: 8px;
+        padding: 12px 20px;
+        margin-bottom: 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    ">
+        <span style="font-size: 24px; font-weight: 600; color: #000;">🎭 Cast View</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Cast Management")
 st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
 
@@ -671,7 +692,8 @@ if selected_cast_id:
         stat_cols[0].metric("Seed Images", stats.get("total_seeds", 0))
         stat_cols[1].metric("Exemplars", stats.get("total_exemplars", 0))
         if avg_similarity is not None:
-            stat_cols[2].metric("Avg Similarity", f"{int(round(avg_similarity * 100))}%")
+            avg_badge = render_similarity_badge(avg_similarity, SimilarityType.CAST)
+            stat_cols[2].markdown(f"**Avg Similarity** {avg_badge}", unsafe_allow_html=True)
         else:
             stat_cols[2].metric("Avg Similarity", "n/a")
         updated_label = stats.get("updated_at", "never") or "never"
@@ -709,8 +731,8 @@ if selected_cast_id:
                                 _mark_featured_seed(show_id, selected_cast_id, fb_id)
                         sim_info = per_seed_similarity.get(fb_id) if isinstance(per_seed_similarity, dict) else None
                         if isinstance(sim_info, dict) and sim_info.get("mean") is not None:
-                            sim_pct = int(round(sim_info["mean"] * 100))
-                            st.caption(f"{sim_pct}% avg similarity")
+                            sim_badge = render_similarity_badge(sim_info["mean"], SimilarityType.CAST)
+                            st.markdown(sim_badge, unsafe_allow_html=True)
 
                         confirm_key = f"confirm_delete_seed_{fb_id}"
                         is_confirming = st.session_state.get(confirm_key, False)

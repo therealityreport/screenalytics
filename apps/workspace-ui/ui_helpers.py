@@ -559,9 +559,17 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
     try:
-        resp = requests.get(health_url, timeout=5)
+        resp = requests.get(health_url, timeout=15)
         resp.raise_for_status()
         sidebar.success("/healthz OK")
+    except requests.Timeout:
+        sidebar.warning("Health check timed out; retrying…")
+        try:
+            retry = requests.get(health_url, timeout=30)
+            retry.raise_for_status()
+            sidebar.success("/healthz OK (after retry)")
+        except requests.RequestException as exc_retry:
+            sidebar.error(describe_error(health_url, exc_retry))
     except requests.RequestException as exc:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
@@ -881,16 +889,22 @@ def ensure_media_url(path_or_url: str | Path | None) -> str | None:
     value = str(path_or_url)
     parsed = urlparse(value)
     scheme = parsed.scheme.lower()
+
+    # Accept HTTP/HTTPS URLs and data URLs
     if scheme in {"http", "https", "data"}:
         return value
+
+    # Check for local file paths and convert to data URL
     candidate_paths: List[Path] = []
     if scheme == "file":
         candidate_paths.append(Path(parsed.path))
     else:
         candidate_paths.append(Path(value))
+
     first = candidate_paths[0]
     if not first.is_absolute():
         candidate_paths.append((DATA_ROOT / first).expanduser())
+
     for candidate in candidate_paths:
         try:
             resolved = candidate.expanduser().resolve()
@@ -900,6 +914,8 @@ def ensure_media_url(path_or_url: str | Path | None) -> str | None:
             cached = _data_url_cache(str(resolved))
             if cached:
                 return cached
+
+    # Return original value (might be an S3 key for later resolution)
     return value
 
 
@@ -2292,29 +2308,22 @@ def resolve_thumb(src: str | None) -> str | None:
     Resolution order:
     1. Already a data URL → return as-is
     2. HTTPS URL (S3 presigned) → return as-is (CORS-safe)
-    3. HTTP localhost API URL → fetch and convert to data URL
-    4. Local file path exists → convert to data URL
-    5. S3 key (artifacts/**) → presign via API asynchronously
-    6. None → return None for placeholder
+    3. Local file path exists → convert to data URL (fallback tracked by API)
+    4. S3 key (artifacts/**) → presign via API asynchronously
+    5. None → return None for placeholder
     """
     if not src:
         return None
 
+    # Accept existing data URLs
     if isinstance(src, str) and src.startswith("data:"):
         return src
+
+    # Accept HTTPS URLs (S3 presigned)
     if isinstance(src, str) and src.startswith("https://"):
         return src
 
-    if isinstance(src, str) and src.startswith("http://localhost:"):
-        try:
-            response = requests.get(src, timeout=2)
-            if response.ok and response.content:
-                encoded = base64.b64encode(response.content).decode("ascii")
-                content_type = response.headers.get("content-type") or _infer_mime(src) or "image/jpeg"
-                return f"data:{content_type};base64,{encoded}"
-        except Exception as exc:
-            _diag("UI_RESOLVE_FAIL", src=src, reason="localhost_fetch_error", error=str(exc))
-
+    # Local file paths - convert to base64 (API tracks these for banner)
     try:
         path = Path(src)
         if path.exists() and path.is_file():
@@ -2324,6 +2333,7 @@ def resolve_thumb(src: str | None) -> str | None:
     except (OSError, ValueError) as exc:
         _diag("UI_RESOLVE_FAIL", src=src, reason="local_file_error", error=str(exc))
 
+    # Try to resolve as S3 key
     if isinstance(src, str) and (
         src.startswith("artifacts/")
         or src.startswith("raw/")
@@ -2384,6 +2394,8 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
         img = placeholder
 
     escaped_alt = html.escape(alt)
+    # Escape src attribute to prevent XSS (handles quotes, ampersands, angle brackets)
+    escaped_img = html.escape(img, quote=True)
     if hide_if_missing:
         onerror_handler = "this.closest('.thumb').classList.add('thumb-hidden');"
     else:
@@ -2395,6 +2407,16 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
 
     return (
         f'<div class="{wrapper_class}">'
-        f'<img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
+        f'<img src="{escaped_img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
         "</div>"
     )
+
+
+def track_skeleton_html(num_frames: int = 12) -> str:
+    """Generate skeleton HTML for track detail loading state.
+
+    Shows animated placeholder frames while track data is being loaded.
+    Uses the existing thumb-skeleton CSS class for consistent styling.
+    """
+    frames = "".join(['<div class="thumb thumb-skeleton"></div>' for _ in range(num_frames)])
+    return f'<div class="thumb-strip">{frames}</div>'

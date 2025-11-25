@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
@@ -99,27 +100,84 @@ def _crops_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "crops"
 
 
+# Thread-local storage to track local file fallbacks during request processing
+import threading
+_local_file_tracker = threading.local()
+
+
+def _track_local_fallback(file_path: str) -> None:
+    """Track when a local file is used as fallback instead of S3."""
+    if not hasattr(_local_file_tracker, "files"):
+        _local_file_tracker.files = set()
+    _local_file_tracker.files.add(file_path)
+
+
+def _get_local_fallbacks() -> List[str]:
+    """Get list of local files used as fallbacks in current request."""
+    if not hasattr(_local_file_tracker, "files"):
+        return []
+    return sorted(_local_file_tracker.files)
+
+
+def _clear_local_fallbacks() -> None:
+    """Clear tracked local fallbacks (call at start of request)."""
+    if hasattr(_local_file_tracker, "files"):
+        _local_file_tracker.files.clear()
+
+
 def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    if s3_key:
-        url = STORAGE.presign_get(s3_key)
+    """Resolve crop URL, preferring S3 with local fallback tracking.
+
+    Priority:
+    1. Use provided s3_key if available
+    2. Construct S3 key from rel_path if s3_key not provided
+    3. Fall back to local file ONLY if S3 fails, and track it for the banner
+
+    Returns S3 presigned URL when possible, local path as last resort (with tracking).
+    """
+    constructed_s3_key = s3_key
+
+    # If no S3 key provided, try to construct one from rel_path
+    if not constructed_s3_key and rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = v2_artifact_prefixes(ep_ctx)
+            crops_prefix = prefixes.get("crops")
+            if crops_prefix:
+                # rel_path format: crops/track_XXXX/frame_XXXXXX.jpg or track_XXXX/frame_XXXXXX.jpg
+                crop_rel = rel_path
+                if crop_rel.startswith("crops/"):
+                    crop_rel = crop_rel[6:]  # Remove "crops/"
+                constructed_s3_key = f"{crops_prefix}{crop_rel}"
+        except (ValueError, KeyError) as exc:
+            LOGGER.debug(f"Could not construct S3 key for {ep_id}/{rel_path}: {exc}")
+
+    # Try S3 first - it's the authoritative source
+    if constructed_s3_key:
+        url = STORAGE.presign_get(constructed_s3_key)
         if url:
             return url
-    if not rel_path:
-        return None
-    normalized = rel_path.strip()
-    if not normalized:
-        return None
-    frames_root = get_path(ep_id, "frames_root")
-    local = frames_root / normalized
-    if local.exists():
-        return str(local)
-    rel_parts = Path(normalized)
-    if rel_parts.parts and rel_parts.parts[0] == "crops":
-        rel_parts = Path(*rel_parts.parts[1:])
-    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-    legacy = fallback_root / ep_id / "tracks" / rel_parts
-    if legacy.exists():
-        return str(legacy)
+        LOGGER.debug(f"S3 presign failed for {constructed_s3_key}, checking local fallback")
+
+    # Local fallback - track it for the banner and use if available
+    if rel_path:
+        normalized = rel_path.strip()
+        if normalized:
+            frames_root = get_path(ep_id, "frames_root")
+            local = frames_root / normalized
+            if local.exists():
+                _track_local_fallback(str(local))
+                return str(local)
+
+            rel_parts = Path(normalized)
+            if rel_parts.parts and rel_parts.parts[0] == "crops":
+                rel_parts = Path(*rel_parts.parts[1:])
+            fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
+            legacy = fallback_root / ep_id / "tracks" / rel_parts
+            if legacy.exists():
+                _track_local_fallback(str(legacy))
+                return str(legacy)
+
     return None
 
 
@@ -1392,19 +1450,47 @@ def _refresh_similarity_indexes(
 
 
 def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    if s3_key:
-        url = STORAGE.presign_get(s3_key)
+    """Resolve thumb URL, preferring S3 with local fallback tracking.
+
+    Priority:
+    1. Use provided s3_key if available
+    2. Construct S3 key from rel_path if s3_key not provided
+    3. Fall back to local file ONLY if S3 fails, and track it for the banner
+    """
+    constructed_s3_key = s3_key
+
+    # If no S3 key provided, try to construct one from rel_path
+    if not constructed_s3_key and rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = v2_artifact_prefixes(ep_ctx)
+            thumbs_prefix = prefixes.get("thumbs")
+            if thumbs_prefix:
+                # rel_path format: track_XXXX/thumb_XXXXXX.jpg
+                constructed_s3_key = f"{thumbs_prefix}{rel_path}"
+        except (ValueError, KeyError) as exc:
+            LOGGER.debug(f"Could not construct S3 key for thumb {ep_id}/{rel_path}: {exc}")
+
+    # Try S3 first
+    if constructed_s3_key:
+        url = STORAGE.presign_get(constructed_s3_key)
         if url:
             return url
+        LOGGER.debug(f"S3 presign failed for thumb {constructed_s3_key}, checking local fallback")
+
+    # If rel_path looks like a crop, try the crop resolver
     if rel_path and (rel_path.startswith("crops/") or "crops/" in rel_path):
         crop_url = _resolve_crop_url(ep_id, rel_path, s3_key)
         if crop_url:
             return crop_url
-    if not rel_path:
-        return None
-    local = _thumbs_root(ep_id) / rel_path
-    if local.exists():
-        return str(local)
+
+    # Local fallback - track it for the banner and use if available
+    if rel_path:
+        local = _thumbs_root(ep_id) / rel_path
+        if local.exists():
+            _track_local_fallback(str(local))
+            return str(local)
+
     return None
 
 
@@ -1844,14 +1930,14 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
                 meta = {**meta, "track_id": track_id}
         faces_for_track = _scoped_faces([meta] if meta else [], frame_idx, "manifest")
         item_track_id = meta_track_id if meta_track_id == track_id else track_id
-        local_path = entry.get("abs_path")
-        local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
+        # S3-ONLY: Construct S3 key from rel_path, do NOT use local files
         rel_path = entry.get("rel_path")
         s3_key = None
         if crops_prefix and rel_path:
             suffix = rel_path.split("crops/", 1)[-1]
             s3_key = f"{crops_prefix}{suffix}"
-        media_url = local_url or _resolve_crop_url(ep_id, rel_path, s3_key if not local_url else None)
+        # Only use S3 URLs - local_path is tracked for banner but NOT used
+        media_url = _resolve_crop_url(ep_id, rel_path, s3_key)
         fallback = _resolve_thumb_url(ep_id, meta.get("thumb_rel_path"), meta.get("thumb_s3_key"))
         url = media_url or fallback
 
@@ -2010,6 +2096,10 @@ class FrameDeleteRequest(BaseModel):
     track_id: int
     frame_idx: int
     delete_assets: bool = False
+
+
+class FullFrameOverlayRequest(BaseModel):
+    highlight_track_id: int | None = Field(None, description="Track ID to highlight in a different color")
 
 
 class DeleteAllIn(BaseModel):
@@ -2653,6 +2743,7 @@ def list_cluster_tracks(
     ep_id: str,
     limit_per_cluster: int | None = Query(None, ge=1, description="Optional max tracks per cluster"),
 ) -> dict:
+    _clear_local_fallbacks()  # Reset tracker for this request
     try:
         payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster)
     except ValueError as exc:
@@ -2669,6 +2760,10 @@ def list_cluster_tracks(
             if media_url:
                 track["rep_media_url"] = media_url
                 track["rep_thumb_url"] = media_url
+    # Include local fallback info for UI banner
+    local_fallbacks = _get_local_fallbacks()
+    if local_fallbacks:
+        payload["_local_fallbacks"] = local_fallbacks
     return payload
 
 
@@ -2803,12 +2898,17 @@ def _get_faces_for_track_frames(
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
 def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
     """Get representative frames with similarity scores for all tracks in a cluster."""
+    _clear_local_fallbacks()  # Reset tracker for this request
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
             load_track_reps,
             load_cluster_centroids,
         )
+
+        # Get S3 prefixes for fallback URL construction
+        ep_ctx = episode_context_from_id(ep_id)
+        prefixes = v2_artifact_prefixes(ep_ctx)
 
         track_reps = load_track_reps(ep_id)
         cluster_centroids = load_cluster_centroids(ep_id)
@@ -2859,10 +2959,21 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
 
             # Fall back to crop_key if face metadata lookup fails
             if not url and crop_key:
-                url = _resolve_crop_url(ep_id, crop_key, None)
+                # Construct S3 key from crop_key using episode context
+                crop_s3_key = None
+                if prefixes.get("crops"):
+                    crop_rel = crop_key
+                    if crop_rel.startswith("crops/"):
+                        crop_rel = crop_rel[6:]  # Remove "crops/"
+                    crop_s3_key = f"{prefixes['crops']}{crop_rel}"
+                url = _resolve_crop_url(ep_id, crop_key, crop_s3_key)
 
             track["crop_url"] = url
 
+        # Include local fallback info for UI banner
+        local_fallbacks = _get_local_fallbacks()
+        if local_fallbacks:
+            result["_local_fallbacks"] = local_fallbacks
         return result
     except Exception as exc:
         LOGGER.error(f"Failed to load track reps for cluster {cluster_id}: {exc}")
@@ -2872,6 +2983,7 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
 @router.get("/episodes/{ep_id}/people/{person_id}/clusters_summary")
 def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
     """Get clusters summary with track representatives for a person in an episode."""
+    _clear_local_fallbacks()  # Reset tracker for this request
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
@@ -2879,8 +2991,9 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             load_cluster_centroids,
         )
 
-        # Parse episode to get show
+        # Parse episode to get show and S3 prefixes
         ep_ctx = episode_context_from_id(ep_id)
+        prefixes = v2_artifact_prefixes(ep_ctx)
         show_slug = ep_ctx.show_slug.upper()
 
         # Load people data
@@ -2981,7 +3094,17 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
 
                     # Fall back to crop_key (fast path for non-visible tracks)
                     if not url and crop_key:
-                        url = _resolve_crop_url(ep_id, crop_key, None)
+                        # Construct S3 key from crop_key using episode context
+                        # crop_key format: crops/track_XXXX/frame_XXXXXX.jpg
+                        # S3 key format: artifacts/crops/{show}/{season}/{episode}/tracks/track_XXXX/frame_XXXXXX.jpg
+                        crop_s3_key = None
+                        if prefixes.get("crops"):
+                            # Remove leading "crops/" from crop_key and append to S3 prefix
+                            crop_rel = crop_key
+                            if crop_rel.startswith("crops/"):
+                                crop_rel = crop_rel[6:]  # Remove "crops/"
+                            crop_s3_key = f"{prefixes['crops']}{crop_rel}"
+                        url = _resolve_crop_url(ep_id, crop_key, crop_s3_key)
 
                     track["crop_url"] = url
 
@@ -3001,12 +3124,17 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             )
             total_tracks += len(cluster_data.get("tracks", []))
 
-        return {
+        # Include local fallback info for UI banner
+        result = {
             "person_id": person_id,
             "clusters": clusters_output,
             "total_clusters": len(clusters_output),
             "total_tracks": total_tracks,
         }
+        local_fallbacks = _get_local_fallbacks()
+        if local_fallbacks:
+            result["_local_fallbacks"] = local_fallbacks
+        return result
     except HTTPException:
         raise  # Re-raise HTTP exceptions (like 404) as-is without wrapping
     except ValueError as exc:
@@ -3234,6 +3362,156 @@ def track_integrity(ep_id: str, track_id: int) -> Dict[str, Any]:
     }
 
 
+@router.post("/episodes/{ep_id}/frames/{frame_idx}/overlay")
+def create_frame_overlay(
+    ep_id: str,
+    frame_idx: int,
+    body: FullFrameOverlayRequest = Body(default=FullFrameOverlayRequest()),
+) -> Dict[str, Any]:
+    """Generate a full-frame image with bounding boxes around all detected faces.
+
+    Creates an overlay image showing all face detections for a specific frame,
+    with bounding boxes color-coded by track ID. Optionally highlights a specific
+    track in a different color.
+
+    The overlay is saved to S3 at: artifacts/ff_overlays/{ep_id}/frame_{frame_idx}.jpg
+    """
+    import cv2
+    import numpy as np
+
+    ctx, prefixes = _require_episode_context(ep_id)
+    highlight_track = body.highlight_track_id
+
+    # Load all detections for this frame
+    det_path = _manifests_dir(ep_id) / "detections.jsonl"
+    if not det_path.exists():
+        raise HTTPException(status_code=404, detail="Detections not found")
+
+    frame_detections: List[Dict[str, Any]] = []
+    with det_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                det = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if det.get("frame_idx") == frame_idx:
+                frame_detections.append(det)
+
+    if not frame_detections:
+        raise HTTPException(status_code=404, detail=f"No detections found for frame {frame_idx}")
+
+    # Load the full frame image from S3 or local
+    frames_prefix = prefixes.get("frames", "")
+    frame_filename = f"frame_{frame_idx:06d}.jpg"
+    frame_s3_key = f"{frames_prefix}{frame_filename}" if frames_prefix else None
+
+    frame_image = None
+    frames_root = get_path(ep_id, "frames_root") / "frames"
+
+    # Try S3 first
+    if frame_s3_key and STORAGE.s3_enabled():
+        try:
+            import io
+            frame_bytes = STORAGE.download_bytes(frame_s3_key)
+            if frame_bytes:
+                nparr = np.frombuffer(frame_bytes, np.uint8)
+                frame_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        except Exception as exc:
+            LOGGER.debug(f"Failed to load frame from S3 {frame_s3_key}: {exc}")
+
+    # Fall back to local
+    if frame_image is None:
+        local_frame = frames_root / frame_filename
+        if local_frame.exists():
+            frame_image = cv2.imread(str(local_frame))
+
+    if frame_image is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Frame image not found: {frame_filename} (S3: {frame_s3_key})",
+        )
+
+    # Generate distinct colors for each track (using HSV for better visibility)
+    track_ids = sorted({det.get("track_id") for det in frame_detections if det.get("track_id") is not None})
+    track_colors: Dict[int, tuple] = {}
+    for i, tid in enumerate(track_ids):
+        if tid == highlight_track:
+            # Highlighted track gets bright cyan
+            track_colors[tid] = (255, 255, 0)  # BGR cyan
+        else:
+            # Other tracks get colors from HSV wheel
+            hue = int((i * 180 / max(len(track_ids), 1)) % 180)
+            hsv_color = np.array([[[hue, 255, 200]]], dtype=np.uint8)
+            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+            track_colors[tid] = tuple(int(c) for c in bgr_color)
+
+    # Draw bounding boxes
+    for det in frame_detections:
+        bbox = det.get("bbox_xyxy")
+        track_id = det.get("track_id")
+        if not bbox or track_id is None:
+            continue
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        color = track_colors.get(track_id, (0, 255, 0))
+        thickness = 4 if track_id == highlight_track else 2
+
+        cv2.rectangle(frame_image, (x1, y1), (x2, y2), color, thickness)
+
+        # Draw track ID label
+        label = f"T{track_id}"
+        font_scale = 0.8 if track_id == highlight_track else 0.6
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2
+        )
+        cv2.rectangle(
+            frame_image,
+            (x1, y1 - text_height - 10),
+            (x1 + text_width + 4, y1),
+            color,
+            -1,
+        )
+        cv2.putText(
+            frame_image,
+            label,
+            (x1 + 2, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            2,
+        )
+
+    # Encode and upload to S3
+    _, encoded = cv2.imencode(".jpg", frame_image, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    overlay_bytes = encoded.tobytes()
+
+    # S3 path: artifacts/ff_overlays/{show}/{season}/{episode}/frame_{idx}.jpg
+    overlay_s3_key = f"artifacts/ff_overlays/{ctx.show}/s{ctx.season:02d}/e{ctx.episode:02d}/frame_{frame_idx:06d}.jpg"
+
+    if not STORAGE.s3_enabled():
+        raise HTTPException(status_code=500, detail="S3 storage not enabled")
+
+    if not STORAGE.upload_bytes(overlay_bytes, overlay_s3_key, content_type="image/jpeg"):
+        raise HTTPException(status_code=500, detail="Failed to upload overlay to S3")
+
+    # Generate presigned URL
+    overlay_url = STORAGE.presign_get(overlay_s3_key)
+    if not overlay_url:
+        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+
+    return {
+        "frame_idx": frame_idx,
+        "detections": len(frame_detections),
+        "tracks": track_ids,
+        "highlighted_track": highlight_track,
+        "s3_key": overlay_s3_key,
+        "url": overlay_url,
+    }
+
+
 @router.post("/episodes/{ep_id}/tracks/{track_id}/frames/move")
 def move_track_frames(ep_id: str, track_id: int, body: TrackFrameMoveRequest) -> dict:
     frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
@@ -3394,15 +3672,31 @@ def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
     """Assign multiple tracks to a cast member in a single operation.
 
     All tracks will be moved to new identities with the specified name/cast_id.
+    Uses parallel processing for improved performance with large batches.
     """
-    results = []
-    errors = []
-    for track_id in body.track_ids:
+
+    def assign_single_track(track_id: int) -> dict:
+        """Assign a single track - used by ThreadPoolExecutor."""
         try:
             result = identity_service.assign_track_name(ep_id, track_id, body.name, body.show, body.cast_id)
-            results.append({"track_id": track_id, "success": True, **result})
+            return {"track_id": track_id, "success": True, **result}
         except ValueError as exc:
-            errors.append({"track_id": track_id, "success": False, "error": str(exc)})
+            return {"track_id": track_id, "success": False, "error": str(exc)}
+
+    results = []
+    errors = []
+
+    # Use ThreadPoolExecutor for parallel processing (max 4 workers to avoid overwhelming the system)
+    max_workers = min(4, len(body.track_ids)) if body.track_ids else 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(assign_single_track, tid): tid for tid in body.track_ids}
+        for future in as_completed(futures):
+            result = future.result()
+            if result.get("success"):
+                results.append(result)
+            else:
+                errors.append(result)
+
     return {
         "assigned": len(results),
         "failed": len(errors),

@@ -1,65 +1,48 @@
 """Similarity Scores Color Key Component for Faces Review Page.
 
-Insert this code block in apps/workspace-ui/pages/3_Faces_Review.py
-after line 21 (after st.caption with backend info).
+Uses centralized color definitions from similarity_badges.py for consistency.
 """
 
 import streamlit as st
+
+from similarity_badges import (
+    SimilarityType,
+    SIMILARITY_COLORS,
+    get_similarity_key_data,
+)
 
 
 def render_similarity_scores_key():
     """Render collapsible similarity scores guide with color-coded legend for Faces Review."""
     with st.expander("📊 Similarity Scores Guide", expanded=False):
-        st.markdown(
-            """
-        <style>
-        .sim-key {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin: 8px 0;
-        }
-        .sim-item {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 8px 12px;
-            border-radius: 6px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        .sim-color {
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            flex-shrink: 0;
-        }
-        .sim-label {
-            font-size: 13px;
-            font-weight: 500;
-        }
-        .sim-desc {
-            font-size: 11px;
-            opacity: 0.7;
-            margin-top: 2px;
-        }
-        .sim-threshold {
-            font-size: 10px;
-            opacity: 0.6;
-            font-family: monospace;
-        }
-        </style>
+        # Get color data from centralized module
+        key_data = get_similarity_key_data()
 
-        <div class="sim-key">
+        # Build HTML for each score type
+        items_html = ""
+        for item in key_data:
+            emoji_map = {
+                SimilarityType.IDENTITY: "🔵",
+                SimilarityType.CAST: "🟣",
+                SimilarityType.TRACK: "🟠",
+                SimilarityType.FRAME: "🟠",
+                SimilarityType.CAST_TRACK: "🔷",
+                SimilarityType.CLUSTER: "🟢",
+            }
+            emoji = emoji_map.get(item["type"], "⚪")
+            items_html += f"""
             <div class="sim-item">
-                <div class="sim-color" style="background: #2196F3;"></div>
+                <div class="sim-color" style="background: {item['color']};"></div>
                 <div>
-                    <div class="sim-label">🔵 Identity Similarity</div>
-                    <div class="sim-desc">Frame → Track centroid</div>
-                    <div class="sim-threshold">ID: XX% badge on frames</div>
+                    <div class="sim-label">{emoji} {item['label']}</div>
+                    <div class="sim-desc">{item['description']}</div>
+                    <div class="sim-threshold">{item['thresholds']}</div>
                 </div>
             </div>
+            """
 
+        # Add Quality Score (separate from similarity)
+        items_html += """
             <div class="sim-item">
                 <div class="sim-color" style="background: #4CAF50;"></div>
                 <div>
@@ -68,33 +51,50 @@ def render_similarity_scores_key():
                     <div class="sim-threshold">Q: XX% badge on frames</div>
                 </div>
             </div>
+        """
 
-            <div class="sim-item">
-                <div class="sim-color" style="background: #9C27B0;"></div>
-                <div>
-                    <div class="sim-label">🟣 Cast Similarity</div>
-                    <div class="sim-desc">Cluster → Cast member</div>
-                    <div class="sim-threshold">≥0.68 to auto-assign</div>
-                </div>
-            </div>
+        st.markdown(
+            f"""
+        <style>
+        .sim-key {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin: 8px 0;
+        }}
+        .sim-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .sim-color {{
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }}
+        .sim-label {{
+            font-size: 13px;
+            font-weight: 500;
+        }}
+        .sim-desc {{
+            font-size: 11px;
+            opacity: 0.7;
+            margin-top: 2px;
+        }}
+        .sim-threshold {{
+            font-size: 10px;
+            opacity: 0.6;
+            font-family: monospace;
+        }}
+        </style>
 
-            <div class="sim-item">
-                <div class="sim-color" style="background: #FF9800;"></div>
-                <div>
-                    <div class="sim-label">🟠 Track Similarity</div>
-                    <div class="sim-desc">Appearance gate (logs)</div>
-                    <div class="sim-threshold">≥0.75 hard, ≥0.82 soft</div>
-                </div>
-            </div>
-
-            <div class="sim-item">
-                <div class="sim-color" style="background: #4CAF50;"></div>
-                <div>
-                    <div class="sim-label">🟢 Cluster Similarity</div>
-                    <div class="sim-desc">Face grouping (DBSCAN)</div>
-                    <div class="sim-threshold">≥0.35 for same cluster</div>
-                </div>
-            </div>
+        <div class="sim-key">
+            {items_html}
         </div>
         """,
             unsafe_allow_html=True,
@@ -121,21 +121,3 @@ def render_similarity_scores_key():
         📚 **Full guide:** See `docs/similarity-scores-guide.md` for complete documentation.
         """
         )
-
-
-# INTEGRATION INSTRUCTIONS:
-#
-# In apps/workspace-ui/pages/3_Faces_Review.py, add this after line 21:
-#
-# st.title("Faces & Tracks Review")
-# st.caption(f"Backend: {cfg['backend']} · Bucket: {cfg.get('bucket') or 'n/a'}")
-#
-# # NEW: Add similarity scores key
-# from similarity_key_component import render_similarity_scores_key
-# render_similarity_scores_key()
-#
-# # Inject thumbnail CSS
-# helpers.inject_thumb_css()
-# ...
-#
-# OR copy the function content directly (already done in 3_Faces_Review.py)
