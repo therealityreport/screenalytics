@@ -506,9 +506,10 @@ def _ensure_local_artifacts(ep_id: str, details: Dict[str, Any]) -> bool:
         st.error("Episode is not mirrored in S3; mirror/upload the video before running this job.")
         return False
     mirror_path = f"/episodes/{ep_id}/mirror"
-    with st.spinner("Mirroring artifacts from S3…"):
+    with st.spinner("Mirroring video from S3 (this may take several minutes for large files)…"):
         try:
-            resp = helpers.api_post(mirror_path)
+            # Use longer timeout for S3 downloads (10 minutes)
+            resp = helpers.api_post(mirror_path, timeout=600)
         except requests.RequestException as exc:
             st.error(helpers.describe_error(f"{cfg['api_base']}{mirror_path}", exc))
             return False
@@ -547,16 +548,29 @@ def _launch_detect_job(
     if detect_flag_key:
         st.session_state[detect_flag_key] = True
     try:
-        with st.spinner(f"Running detect/track ({mode_label} on {device_label})…"):
-            summary, error_message = helpers.run_job_with_progress(
-                ep_id,
-                "/jobs/detect_track",
-                job_payload,
-                requested_device=device_value,
-                async_endpoint="/jobs/detect_track_async",
-                requested_detector=detector_value,
-                requested_tracker=tracker_value,
-            )
+        # Use Celery for async execution via Redis queue
+        use_celery = os.environ.get("USE_CELERY_JOBS", "1") == "1"
+        if use_celery:
+            with st.spinner(f"Running detect/track via Celery ({mode_label} on {device_label})…"):
+                summary, error_message = helpers.run_celery_job_with_progress(
+                    ep_id,
+                    "detect_track",
+                    job_payload,
+                    requested_device=device_value,
+                    requested_detector=detector_value,
+                    requested_tracker=tracker_value,
+                )
+        else:
+            with st.spinner(f"Running detect/track ({mode_label} on {device_label})…"):
+                summary, error_message = helpers.run_job_with_progress(
+                    ep_id,
+                    "/jobs/detect_track",
+                    job_payload,
+                    requested_device=device_value,
+                    async_endpoint="/jobs/detect_track_async",
+                    requested_detector=detector_value,
+                    requested_tracker=tracker_value,
+                )
     finally:
         if running_state_key:
             st.session_state[running_state_key] = False
@@ -576,16 +590,6 @@ if canonical_ep_id != ep_id:
     helpers.set_ep_id(canonical_ep_id)
     st.rerun()
 ep_id = canonical_ep_id
-action_cols = st.columns([1, 2, 2])
-with action_cols[0]:
-    st.button(
-        "Upload / Replace video",
-        key="episode_detail_upload",
-        type="primary",
-        use_container_width=True,
-        on_click=lambda ep=ep_id: _navigate_to_upload(ep),
-        help="Open Upload page locked to this episode for replacement.",
-    )
 running_job_key = f"{ep_id}::pipeline_job_running"
 if running_job_key not in st.session_state:
     st.session_state[running_job_key] = False
@@ -680,23 +684,111 @@ else:
     st.session_state.pop(video_meta_key, None)
 
 
-st.subheader(f"Episode `{ep_id}`")
-st.write(f"Show `{details['show_slug']}` · Season {details['season_number']} Episode {details['episode_number']}")
-st.write(f"S3 v2 → `{details['s3']['v2_key']}` (exists={details['s3']['v2_exists']})")
-st.write(f"S3 v1 → `{details['s3']['v1_key']}` (exists={details['s3']['v1_exists']})")
-if not details["s3"]["v2_exists"] and details["s3"]["v1_exists"]:
-    st.warning("Legacy v1 object detected; mirroring will use it until the v2 path is populated.")
-st.write(f"Local → {helpers.link_local(details['local']['path'])} (exists={details['local']['exists']})")
-if prefixes:
-    st.caption(
-        "S3 artifacts → "
-        f"Frames {helpers.s3_uri(prefixes['frames'], bucket_name)} | "
-        f"Crops {helpers.s3_uri(prefixes['crops'], bucket_name)} | "
-        f"Manifests {helpers.s3_uri(prefixes['manifests'], bucket_name)}"
-    )
-if tracks_path.exists():
-    st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
-    st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
+# =============================================================================
+# Current Jobs Panel (Celery + subprocess background jobs)
+# =============================================================================
+with st.expander("⚙️ Current Jobs", expanded=False):
+    try:
+        all_jobs: list[dict] = []
+
+        # Fetch Celery jobs
+        celery_response = helpers.api_get("/celery_jobs")
+        celery_jobs = celery_response.get("jobs", []) if celery_response else []
+        for job in celery_jobs:
+            all_jobs.append({
+                "job_id": job.get("job_id", "unknown"),
+                "name": job.get("name", "Celery Task"),
+                "state": job.get("state", "unknown"),
+                "worker": job.get("worker", ""),
+                "ep_id": job.get("ep_id"),
+                "source": "celery",
+            })
+
+        # Fetch subprocess-based jobs (filtered to current episode if set)
+        jobs_response = helpers.api_get(f"/jobs?ep_id={ep_id}&limit=20")
+        subprocess_jobs = jobs_response.get("jobs", []) if jobs_response else []
+        for job in subprocess_jobs:
+            # Only show running/queued jobs, not completed ones
+            state = job.get("state", "unknown")
+            if state in ("running", "queued", "in_progress"):
+                all_jobs.append({
+                    "job_id": job.get("job_id", "unknown"),
+                    "name": job.get("job_type", "Pipeline Job"),
+                    "state": state,
+                    "worker": "",
+                    "ep_id": job.get("ep_id"),
+                    "source": "subprocess",
+                })
+
+        if not all_jobs:
+            st.info("No background jobs currently running.")
+        else:
+            st.caption(f"Found {len(all_jobs)} active job(s) for this episode")
+            for job in all_jobs:
+                job_id = job.get("job_id", "unknown")
+                job_name = job.get("name", "unknown")
+                job_state = job.get("state", "unknown")
+                worker = job.get("worker", "")
+                source = job.get("source", "unknown")
+
+                # State badge
+                if job_state in ("in_progress", "running"):
+                    badge = "🔄"
+                elif job_state == "queued":
+                    badge = "⏳"
+                elif job_state == "scheduled":
+                    badge = "📅"
+                else:
+                    badge = "❓"
+
+                # Display job card with cancel button
+                col1, col2, col3 = st.columns([2.5, 1, 0.5])
+                with col1:
+                    st.markdown(f"**{badge} {job_name}**")
+                    short_id = f"{job_id[:12]}..." if len(job_id) > 12 else job_id
+                    st.caption(f"ID: `{short_id}` ({source})")
+                with col2:
+                    st.caption(f"State: {job_state}")
+                    if worker:
+                        st.caption(f"Worker: {worker.split('@')[-1]}")
+                with col3:
+                    # Cancel button
+                    cancel_key = f"cancel_{job_id}"
+                    if st.button("❌", key=cancel_key, help="Cancel this job"):
+                        try:
+                            if source == "celery":
+                                cancel_resp = helpers.api_post(f"/celery_jobs/{job_id}/cancel")
+                            else:
+                                cancel_resp = helpers.api_post(f"/jobs/{job_id}/cancel")
+                            if cancel_resp:
+                                st.success(f"Cancelled job {job_id[:8]}...")
+                                st.rerun()
+                            else:
+                                st.error("Failed to cancel job")
+                        except Exception as cancel_err:
+                            st.error(f"Cancel failed: {cancel_err}")
+                st.divider()
+    except Exception as e:
+        st.warning(f"Could not fetch job status: {e}")
+
+
+with st.expander(f"Episode {ep_id}", expanded=False):
+    st.write(f"Show `{details['show_slug']}` · Season {details['season_number']} Episode {details['episode_number']}")
+    st.write(f"S3 v2 → `{details['s3']['v2_key']}` (exists={details['s3']['v2_exists']})")
+    st.write(f"S3 v1 → `{details['s3']['v1_key']}` (exists={details['s3']['v1_exists']})")
+    if not details["s3"]["v2_exists"] and details["s3"]["v1_exists"]:
+        st.warning("Legacy v1 object detected; mirroring will use it until the v2 path is populated.")
+    st.write(f"Local → {helpers.link_local(details['local']['path'])} (exists={details['local']['exists']})")
+    if prefixes:
+        st.caption(
+            "S3 artifacts → "
+            f"Frames {helpers.s3_uri(prefixes['frames'], bucket_name)} | "
+            f"Crops {helpers.s3_uri(prefixes['crops'], bucket_name)} | "
+            f"Manifests {helpers.s3_uri(prefixes['manifests'], bucket_name)}"
+        )
+    if tracks_path.exists():
+        st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
+        st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
 
 manifest_state = _detect_track_manifests_ready(detections_path, tracks_path)
 
@@ -775,7 +867,7 @@ if cluster_status_value in {"missing", "unknown"}:
         # Fallback to artifact mtime for finished_at if marker didn't have it
         if not cluster_phase_status.get("finished_at") and artifact_mtime:
             cluster_phase_status["finished_at"] = (
-                datetime.utcfromtimestamp(artifact_mtime).replace(microsecond=0).isoformat() + "Z"
+                datetime.fromtimestamp(artifact_mtime, tz=timezone.utc).replace(microsecond=0).isoformat() + "Z"
             )
         # Compute runtime_sec if timestamps are available
         if not cluster_phase_status.get("runtime_sec"):
@@ -809,7 +901,7 @@ if screentime_status_value == "missing" and screentime_json_path.exists():
     screentime_status_value = "success"
     if screentime_finished_at is None:
         screentime_finished_at = (
-            datetime.utcfromtimestamp(screentime_json_path.stat().st_mtime).replace(microsecond=0).isoformat() + "Z"
+            datetime.fromtimestamp(screentime_json_path.stat().st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat() + "Z"
         )
 screentime_runtime = _format_runtime(_runtime_from_iso(screentime_started_at, screentime_finished_at))
 status_running = (
@@ -853,12 +945,7 @@ if not detect_phase_status and manifest_state["manifest_ready"]:
     using_manifest_fallback = True
 
 # Add pipeline state indicators (even if status API is temporarily unavailable)
-st.divider()
-
-header_cols = st.columns([3, 1])
-with header_cols[0]:
-    st.subheader("Pipeline Status")
-with header_cols[1]:
+with st.expander("Pipeline Status", expanded=False):
     if st.button("Refresh status", key="episode_status_refresh", use_container_width=True):
         now = time.time()
         last_click = float(st.session_state.get(_refresh_click_key(ep_id), 0.0))
@@ -868,341 +955,340 @@ with header_cols[1]:
             st.session_state[_refresh_click_key(ep_id)] = now
             st.session_state[_status_force_refresh_key(ep_id)] = True
             st.rerun()
-if status_refreshed_at:
-    refreshed_dt = datetime.fromtimestamp(status_refreshed_at, tz=timezone.utc).astimezone(EST_TZ)
-    refreshed_label = refreshed_dt.strftime("%Y-%m-%d %H:%M:%S ET")
-    st.caption(f"Status refreshed at {refreshed_label}")
-else:
-    st.caption("Status will refresh when a job starts or you press refresh.")
-coreml_available = status_payload.get("coreml_available") if status_payload else None
-if coreml_available is False and helpers.is_apple_silicon():
-    st.warning(
-        "⚠️ CoreML acceleration isn't available on this host. Install `onnxruntime-coreml` to avoid CPU-only runs."
-    )
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    detect_params: list[str] = []
-    stride_state = helpers.coerce_int(detect_phase_status.get("stride"))
-    if stride_state:
-        detect_params.append(f"stride={stride_state}")
-    det_thresh_state = helpers.coerce_float(detect_phase_status.get("det_thresh"))
-    if det_thresh_state is not None:
-        detect_params.append(f"det_thresh={det_thresh_state:.2f}")
-    max_gap_state = helpers.coerce_int(detect_phase_status.get("max_gap"))
-    if max_gap_state is not None:
-        detect_params.append(f"max_gap={max_gap_state}")
-    scene_thresh_state = helpers.coerce_float(detect_phase_status.get("scene_threshold"))
-    if scene_thresh_state is not None:
-        detect_params.append(f"scene={scene_thresh_state:.2f}")
-    track_high_state = helpers.coerce_float(detect_phase_status.get("track_high_thresh"))
-    if track_high_state is not None:
-        detect_params.append(f"track_high={track_high_state:.2f}")
-    new_track_state = helpers.coerce_float(detect_phase_status.get("new_track_thresh"))
-    if new_track_state is not None:
-        detect_params.append(f"new_track={new_track_state:.2f}")
-    save_frames_state = detect_phase_status.get("save_frames")
-    if save_frames_state is not None:
-        detect_params.append(f"save_frames={'on' if save_frames_state else 'off'}")
-    save_crops_state = detect_phase_status.get("save_crops")
-    if save_crops_state is not None:
-        detect_params.append(f"save_crops={'on' if save_crops_state else 'off'}")
-    if jpeg_state:
-        detect_params.append(f"jpeg={jpeg_state}")
-    detect_runtime = _format_runtime(detect_phase_status.get("runtime_sec"))
-    if requested_device_state and requested_device_state != device_state:
-        detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
-    device_label = helpers.device_label_from_value(
-        resolved_device_state or device_state or requested_device_state or helpers.DEFAULT_DEVICE
-    )
-    if device_label:
-        detect_params.append(f"device={device_label}")
-    if detect_status_value == "success":
-        runtime_label = detect_runtime or "n/a"
-        st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
-        det = detect_phase_status.get("detector") or "--"
-        trk = detect_phase_status.get("tracker") or "--"
-        st.caption(f"{det} + {trk}")
-        detections = detect_phase_status.get("detections")
-        tracks = detect_phase_status.get("tracks")
-        st.caption(f"{(detections or 0):,} detections, {(tracks or 0):,} tracks")
-        ratio_value = helpers.coerce_float(
-            detect_phase_status.get("track_to_detection_ratio") or detect_phase_status.get("track_ratio")
-        )
-        if ratio_value is not None:
-            st.caption(f"Tracks / detections: {ratio_value:.2f}")
-            if ratio_value < 0.1:
-                st.caption(
-                    "⚠️ Track-to-detection ratio < 0.10. Consider lowering ByteTrack thresholds or rerunning detect/track."
-                )
-        # Show manifest-fallback caption when status was inferred from manifests
-        if using_manifest_fallback or detect_phase_status.get("metadata_missing"):
-            st.warning(
-                "⚠️ Detect/Track details inferred from manifests (metadata missing). "
-                "Detector/tracker and runtime may be inaccurate; rerun detect/track for fresh metadata."
-            )
-        if tracks_only_fallback:
-            st.warning("⚠️ Tracks exist but detections are missing. Rerun detect/track to regenerate detections.")
-    elif detect_status_value == "running":
-        st.info("⏳ **Detect/Track**: Running")
-        if detect_job_record and detect_job_record.get("started_at"):
-            st.caption(f"Started at {detect_job_record['started_at']}")
-        st.caption("Live progress appears in the log panel below.")
-    elif detect_status_value == "stale":
-        st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
-        st.caption("Rerun Detect/Track Faces to rebuild detections/tracks for this episode.")
-    elif detect_status_value == "partial":
-        st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
-        st.caption("Rerun detect/track to rebuild tracks.")
-    elif detect_status_value == "missing":
-        st.info("⏳ **Detect/Track**: Not started")
-        st.caption("Run detect/track first.")
+    if status_refreshed_at:
+        refreshed_dt = datetime.fromtimestamp(status_refreshed_at, tz=timezone.utc).astimezone(EST_TZ)
+        refreshed_label = refreshed_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+        st.caption(f"Status refreshed at {refreshed_label}")
     else:
-        st.error(f"⚠️ **Detect/Track**: {detect_status_value.title()}")
-        if detect_phase_status.get("error"):
-            st.caption(detect_phase_status["error"])
-    if detect_params:
-        st.caption("Params: " + ", ".join(detect_params))
-    if tracks_only_fallback:
+        st.caption("Status will refresh when a job starts or you press refresh.")
+    coreml_available = status_payload.get("coreml_available") if status_payload else None
+    if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
-            "⚠️ Tracks manifest is present but detections are missing. Rerun Detect/Track to regenerate detections "
-            "before continuing."
+            "⚠️ CoreML acceleration isn't available on this host. Install `onnxruntime-coreml` to avoid CPU-only runs."
         )
-    if jpeg_state:
-        st.caption(f"JPEG quality: {jpeg_state}")
-    _render_device_summary(requested_device_state, resolved_device_state or device_state)
-    finished = _format_timestamp(detect_phase_status.get("finished_at"))
-    if finished:
-        st.caption(f"Last run: {finished}")
-    if detect_status_value != "success" and detect_runtime:
-        st.caption(f"Runtime: {detect_runtime}")
-    elif detect_status_value == "success" and detect_runtime is None:
-        st.caption("Runtime: n/a")
+    col1, col2, col3, col4 = st.columns(4)
 
-with col2:
-    faces_params: list[str] = []
-    faces_device_state = faces_phase_status.get("device")
-    faces_device_request = faces_phase_status.get("requested_device")
-    faces_resolved_state = faces_phase_status.get("resolved_device")
-    faces_runtime = _format_runtime(faces_phase_status.get("runtime_sec"))
-    faces_job_state = str((faces_job_record or {}).get("state") or "").lower()
-    faces_error_msg = faces_phase_status.get("error") or (faces_job_record or {}).get("error")
-    if faces_device_request and faces_device_request != faces_device_state:
-        faces_params.append(f"requested={helpers.device_label_from_value(faces_device_request)}")
-    if faces_device_state:
-        faces_params.append(f"device={helpers.device_label_from_value(faces_device_state)}")
-    save_frames_state = faces_phase_status.get("save_frames")
-    if save_frames_state is not None:
-        faces_params.append(f"save_frames={'on' if save_frames_state else 'off'}")
-    save_crops_state = faces_phase_status.get("save_crops")
-    if save_crops_state is not None:
-        faces_params.append(f"save_crops={'on' if save_crops_state else 'off'}")
-    spacing_state = helpers.coerce_int(faces_phase_status.get("min_frames_between_crops"))
-    if spacing_state:
-        faces_params.append(f"spacing={spacing_state}")
-    thumb_size_state = helpers.coerce_int(faces_phase_status.get("thumb_size"))
-    if thumb_size_state:
-        faces_params.append(f"thumb={thumb_size_state}px")
-    faces_jpeg_state = helpers.coerce_int(faces_phase_status.get("jpeg_quality"))
-    if faces_jpeg_state:
-        faces_params.append(f"jpeg={faces_jpeg_state}")
-    if faces_ready_state:
-        runtime_label = faces_runtime or "n/a"
-        st.success(f"✅ **Faces Harvest**: Complete (Runtime: {runtime_label})")
-        face_count_label = helpers.format_count(faces_count_value) or "0"
-        st.caption(f"Faces: {face_count_label} (harvest completed)")
-        if faces_manifest_fallback:
-            st.caption("ℹ️ Using manifest fallback; status may be stale.")
-    elif faces_status_value == "success":
-        st.warning("⚠️ **Faces Harvest**: Manifest unavailable locally")
-        st.caption("Faces completed on the backend, but faces.jsonl has not been mirrored locally yet.")
-    elif faces_job_state == "failed":
-        st.error("⚠️ **Faces Harvest**: Failed")
-        if faces_error_msg:
-            st.caption(faces_error_msg)
-    elif faces_status_value not in {"missing", "unknown"}:
-        st.warning(f"⚠️ **Faces Harvest**: {faces_status_value.title()}")
-        if faces_error_msg:
-            st.caption(faces_error_msg)
-    elif tracks_ready:
-        st.info("⏳ **Faces Harvest**: Ready to run")
-        st.caption("Click 'Run Faces Harvest' below.")
-    else:
-        st.info("⏳ **Faces Harvest**: Waiting for tracks")
-        st.caption("Complete detect/track first.")
-    if faces_params:
-        st.caption("Params: " + ", ".join(faces_params))
-    _render_device_summary(faces_device_request, faces_resolved_state or faces_device_state)
-    finished = _format_timestamp(faces_phase_status.get("finished_at"))
-    if finished:
-        st.caption(f"Last run: {finished}")
-    if not faces_ready_state:
-        if faces_runtime:
-            st.caption(f"Runtime: {faces_runtime}")
-        elif faces_status_value == "success":
+    with col1:
+        detect_params: list[str] = []
+        stride_state = helpers.coerce_int(detect_phase_status.get("stride"))
+        if stride_state:
+            detect_params.append(f"stride={stride_state}")
+        det_thresh_state = helpers.coerce_float(detect_phase_status.get("det_thresh"))
+        if det_thresh_state is not None:
+            detect_params.append(f"det_thresh={det_thresh_state:.2f}")
+        max_gap_state = helpers.coerce_int(detect_phase_status.get("max_gap"))
+        if max_gap_state is not None:
+            detect_params.append(f"max_gap={max_gap_state}")
+        scene_thresh_state = helpers.coerce_float(detect_phase_status.get("scene_threshold"))
+        if scene_thresh_state is not None:
+            detect_params.append(f"scene={scene_thresh_state:.2f}")
+        track_high_state = helpers.coerce_float(detect_phase_status.get("track_high_thresh"))
+        if track_high_state is not None:
+            detect_params.append(f"track_high={track_high_state:.2f}")
+        new_track_state = helpers.coerce_float(detect_phase_status.get("new_track_thresh"))
+        if new_track_state is not None:
+            detect_params.append(f"new_track={new_track_state:.2f}")
+        save_frames_state = detect_phase_status.get("save_frames")
+        if save_frames_state is not None:
+            detect_params.append(f"save_frames={'on' if save_frames_state else 'off'}")
+        save_crops_state = detect_phase_status.get("save_crops")
+        if save_crops_state is not None:
+            detect_params.append(f"save_crops={'on' if save_crops_state else 'off'}")
+        if jpeg_state:
+            detect_params.append(f"jpeg={jpeg_state}")
+        detect_runtime = _format_runtime(detect_phase_status.get("runtime_sec"))
+        if requested_device_state and requested_device_state != device_state:
+            detect_params.append(f"requested={helpers.device_label_from_value(requested_device_state)}")
+        device_label = helpers.device_label_from_value(
+            resolved_device_state or device_state or requested_device_state or helpers.DEFAULT_DEVICE
+        )
+        if device_label:
+            detect_params.append(f"device={device_label}")
+        if detect_status_value == "success":
+            runtime_label = detect_runtime or "n/a"
+            st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
+            det = detect_phase_status.get("detector") or "--"
+            trk = detect_phase_status.get("tracker") or "--"
+            st.caption(f"{det} + {trk}")
+            detections = detect_phase_status.get("detections")
+            tracks = detect_phase_status.get("tracks")
+            st.caption(f"{(detections or 0):,} detections, {(tracks or 0):,} tracks")
+            ratio_value = helpers.coerce_float(
+                detect_phase_status.get("track_to_detection_ratio") or detect_phase_status.get("track_ratio")
+            )
+            if ratio_value is not None:
+                st.caption(f"Tracks / detections: {ratio_value:.2f}")
+                if ratio_value < 0.1:
+                    st.caption(
+                        "⚠️ Track-to-detection ratio < 0.10. Consider lowering ByteTrack thresholds or rerunning detect/track."
+                    )
+            # Show manifest-fallback caption when status was inferred from manifests
+            if using_manifest_fallback or detect_phase_status.get("metadata_missing"):
+                st.warning(
+                    "⚠️ Detect/Track details inferred from manifests (metadata missing). "
+                    "Detector/tracker and runtime may be inaccurate; rerun detect/track for fresh metadata."
+                )
+            if tracks_only_fallback:
+                st.warning("⚠️ Tracks exist but detections are missing. Rerun detect/track to regenerate detections.")
+        elif detect_status_value == "running":
+            st.info("⏳ **Detect/Track**: Running")
+            if detect_job_record and detect_job_record.get("started_at"):
+                st.caption(f"Started at {detect_job_record['started_at']}")
+            st.caption("Live progress appears in the log panel below.")
+        elif detect_status_value == "stale":
+            st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
+            st.caption("Rerun Detect/Track Faces to rebuild detections/tracks for this episode.")
+        elif detect_status_value == "partial":
+            st.warning("⚠️ **Detect/Track**: Detections present but tracks missing")
+            st.caption("Rerun detect/track to rebuild tracks.")
+        elif detect_status_value == "missing":
+            st.info("⏳ **Detect/Track**: Not started")
+            st.caption("Run detect/track first.")
+        else:
+            st.error(f"⚠️ **Detect/Track**: {detect_status_value.title()}")
+            if detect_phase_status.get("error"):
+                st.caption(detect_phase_status["error"])
+        if detect_params:
+            st.caption("Params: " + ", ".join(detect_params))
+        if tracks_only_fallback:
+            st.warning(
+                "⚠️ Tracks manifest is present but detections are missing. Rerun Detect/Track to regenerate detections "
+                "before continuing."
+            )
+        if jpeg_state:
+            st.caption(f"JPEG quality: {jpeg_state}")
+        _render_device_summary(requested_device_state, resolved_device_state or device_state)
+        finished = _format_timestamp(detect_phase_status.get("finished_at"))
+        if finished:
+            st.caption(f"Last run: {finished}")
+        if detect_status_value != "success" and detect_runtime:
+            st.caption(f"Runtime: {detect_runtime}")
+        elif detect_status_value == "success" and detect_runtime is None:
             st.caption("Runtime: n/a")
 
-with col3:
-    cluster_params: list[str] = []
-    cluster_device_state = cluster_phase_status.get("device")
-    cluster_device_request = cluster_phase_status.get("requested_device")
-    cluster_resolved_state = cluster_phase_status.get("resolved_device")
-    cluster_runtime = _format_runtime(cluster_phase_status.get("runtime_sec"))
-    cluster_job_state = str((cluster_job_record or {}).get("state") or "").lower()
-    cluster_error_msg = cluster_phase_status.get("error") or (cluster_job_record or {}).get("error")
-    if cluster_device_request and cluster_device_request != cluster_device_state:
-        cluster_params.append(f"requested={helpers.device_label_from_value(cluster_device_request)}")
-    if cluster_device_state:
-        cluster_params.append(f"device={helpers.device_label_from_value(cluster_device_state)}")
-    cluster_thresh_state = helpers.coerce_float(cluster_phase_status.get("cluster_thresh"))
-    if cluster_thresh_state is not None:
-        cluster_params.append(f"thresh={cluster_thresh_state:.2f}")
-    min_cluster_state = helpers.coerce_int(cluster_phase_status.get("min_cluster_size"))
-    if min_cluster_state is not None:
-        cluster_params.append(f"min_cluster={min_cluster_state}")
-    identities_label = helpers.format_count(identities_count_value) or "0"
-    if cluster_status_value == "success":
-        runtime_label = cluster_runtime or "n/a"
-        st.success(f"✅ **Cluster**: Complete (Runtime: {runtime_label})")
-        st.caption(f"Identities: {identities_label}")
-    elif cluster_status_value == "running":
-        st.info("⏳ **Cluster**: Running")
-        started = _format_timestamp(cluster_phase_status.get("started_at"))
-        if started:
-            st.caption(f"Started at {started}")
-        st.caption("Live progress appears in the log panel below.")
-    elif cluster_job_state == "failed":
-        st.error("⚠️ **Cluster**: Failed")
-        if cluster_error_msg:
-            st.caption(cluster_error_msg)
-    elif cluster_status_value not in {"missing", "unknown"}:
-        st.warning(f"⚠️ **Cluster**: {cluster_status_value.title()}")
-        if cluster_error_msg:
-            st.caption(cluster_error_msg)
-    elif faces_ready_state:
-        if (faces_count_value or 0) == 0:
-            st.info("ℹ️ **Cluster**: No faces to cluster")
-            st.caption("Faces harvest finished with 0 faces → expect 0 identities.")
+    with col2:
+        faces_params: list[str] = []
+        faces_device_state = faces_phase_status.get("device")
+        faces_device_request = faces_phase_status.get("requested_device")
+        faces_resolved_state = faces_phase_status.get("resolved_device")
+        faces_runtime = _format_runtime(faces_phase_status.get("runtime_sec"))
+        faces_job_state = str((faces_job_record or {}).get("state") or "").lower()
+        faces_error_msg = faces_phase_status.get("error") or (faces_job_record or {}).get("error")
+        if faces_device_request and faces_device_request != faces_device_state:
+            faces_params.append(f"requested={helpers.device_label_from_value(faces_device_request)}")
+        if faces_device_state:
+            faces_params.append(f"device={helpers.device_label_from_value(faces_device_state)}")
+        save_frames_state = faces_phase_status.get("save_frames")
+        if save_frames_state is not None:
+            faces_params.append(f"save_frames={'on' if save_frames_state else 'off'}")
+        save_crops_state = faces_phase_status.get("save_crops")
+        if save_crops_state is not None:
+            faces_params.append(f"save_crops={'on' if save_crops_state else 'off'}")
+        spacing_state = helpers.coerce_int(faces_phase_status.get("min_frames_between_crops"))
+        if spacing_state:
+            faces_params.append(f"spacing={spacing_state}")
+        thumb_size_state = helpers.coerce_int(faces_phase_status.get("thumb_size"))
+        if thumb_size_state:
+            faces_params.append(f"thumb={thumb_size_state}px")
+        faces_jpeg_state = helpers.coerce_int(faces_phase_status.get("jpeg_quality"))
+        if faces_jpeg_state:
+            faces_params.append(f"jpeg={faces_jpeg_state}")
+        if faces_ready_state:
+            runtime_label = faces_runtime or "n/a"
+            st.success(f"✅ **Faces Harvest**: Complete (Runtime: {runtime_label})")
+            face_count_label = helpers.format_count(faces_count_value) or "0"
+            st.caption(f"Faces: {face_count_label} (harvest completed)")
+            if faces_manifest_fallback:
+                st.caption("ℹ️ Using manifest fallback; status may be stale.")
+        elif faces_status_value == "success":
+            st.warning("⚠️ **Faces Harvest**: Manifest unavailable locally")
+            st.caption("Faces completed on the backend, but faces.jsonl has not been mirrored locally yet.")
+        elif faces_job_state == "failed":
+            st.error("⚠️ **Faces Harvest**: Failed")
+            if faces_error_msg:
+                st.caption(faces_error_msg)
+        elif faces_status_value not in {"missing", "unknown"}:
+            st.warning(f"⚠️ **Faces Harvest**: {faces_status_value.title()}")
+            if faces_error_msg:
+                st.caption(faces_error_msg)
+        elif tracks_ready:
+            st.info("⏳ **Faces Harvest**: Ready to run")
+            st.caption("Click 'Run Faces Harvest' below.")
         else:
-            st.info("⏳ **Cluster**: Ready to run")
-            st.caption("Click 'Run Cluster' below.")
-    else:
-        st.info("⏳ **Cluster**: Waiting for faces")
-        st.caption("Complete faces harvest first.")
-    if cluster_params:
-        st.caption("Params: " + ", ".join(cluster_params))
-    merge_block = cluster_phase_status.get("singleton_merge") or {}
-    singleton_stats = cluster_phase_status.get("singleton_stats") or merge_block.get("singleton_stats") or {}
-    if not isinstance(singleton_stats, dict):
-        singleton_stats = {}
-    before_block = singleton_stats.get("before") or {}
-    after_block = singleton_stats.get("after") or {}
-    if not isinstance(before_block, dict):
-        before_block = {}
-    if not isinstance(after_block, dict):
-        after_block = {}
-    before_frac = helpers.coerce_float(before_block.get("singleton_fraction"))
-    if before_frac is None:
-        before_frac = helpers.coerce_float(cluster_phase_status.get("singleton_fraction_before"))
-    after_frac = helpers.coerce_float(after_block.get("singleton_fraction"))
-    if after_frac is None:
-        after_frac = helpers.coerce_float(cluster_phase_status.get("singleton_fraction_after"))
-    threshold = helpers.coerce_float(singleton_stats.get("threshold"))
-    if threshold is None:
-        threshold = helpers.coerce_float(cluster_phase_status.get("singleton_merge_threshold"))
-    clusters_before = helpers.coerce_int(before_block.get("cluster_count"))
-    if clusters_before is None:
-        clusters_before = helpers.coerce_int(cluster_phase_status.get("total_clusters_before"))
-    clusters_after = helpers.coerce_int(after_block.get("cluster_count"))
-    if clusters_after is None:
-        clusters_after = helpers.coerce_int(cluster_phase_status.get("total_clusters_after"))
-    merge_count = helpers.coerce_int(after_block.get("merge_count"))
-    if merge_count is None:
-        merge_count = helpers.coerce_int(merge_block.get("num_singleton_merges"))
-    sim_thresh = merge_block.get("similarity_thresh") or merge_block.get("secondary_cluster_thresh")
-    neighbor_top_k = merge_block.get("neighbor_top_k") or merge_block.get("max_pairs_per_track")
-    merge_enabled = merge_block.get("enabled") if merge_block else False
-    primary_frac = after_frac if after_frac is not None else before_frac
-    has_metrics = any(val is not None for val in [before_frac, after_frac, clusters_before, clusters_after, merge_count])
-    use_after_merge_label = bool(merge_enabled and after_frac is not None)
-    if has_metrics:
-        lines: list[str] = []
-        if before_frac is not None and after_frac is not None:
-            thresh_label = f"{threshold:.2f}" if threshold is not None else "?"
-            lines.append(f"Singletons: {before_frac:.2f} → {after_frac:.2f} (threshold {thresh_label})")
-        elif before_frac is not None:
-            thresh_label = f" (threshold {threshold:.2f})" if threshold is not None else ""
-            lines.append(f"Singletons: {before_frac:.2f}{thresh_label}")
-        elif after_frac is not None:
-            thresh_label = f" (threshold {threshold:.2f})" if threshold is not None else ""
-            lines.append(f"Singletons (post-merge): {after_frac:.2f}{thresh_label}")
-        if clusters_before is not None and clusters_after is not None:
-            before_clusters = helpers.format_count(clusters_before) or str(clusters_before)
-            after_clusters = helpers.format_count(clusters_after) or str(clusters_after)
-            lines.append(f"Clusters: {before_clusters} → {after_clusters}")
-        elif clusters_after is not None:
-            after_clusters = helpers.format_count(clusters_after) or str(clusters_after)
-            lines.append(f"Clusters: {after_clusters}")
-        elif clusters_before is not None:
-            before_clusters = helpers.format_count(clusters_before) or str(clusters_before)
-            lines.append(f"Clusters: {before_clusters}")
-        if merge_enabled and merge_count is not None:
-            sim_label = f"{sim_thresh:.2f}" if isinstance(sim_thresh, (int, float)) else sim_thresh or "?"
-            neighbor_label = neighbor_top_k if neighbor_top_k is not None else "?"
-            lines.append(f"Merge: {merge_count} pairs (sim ≥ {sim_label}, top_k={neighbor_label})")
-        for entry in lines:
-            st.caption(entry)
-        if threshold is not None and primary_frac is not None:
-            high_label = "🚧 High singleton fraction after merge" if use_after_merge_label else "🚧 High singleton fraction"
-            ok_label = (
-                "✅ Singletons reduced below threshold after merge"
-                if use_after_merge_label
-                else "✅ Singleton fraction below threshold"
-            )
-            if primary_frac > threshold:
-                st.warning(high_label)
-            elif merge_enabled:
-                st.success(ok_label)
-    else:
+            st.info("⏳ **Faces Harvest**: Waiting for tracks")
+            st.caption("Complete detect/track first.")
+        if faces_params:
+            st.caption("Params: " + ", ".join(faces_params))
+        _render_device_summary(faces_device_request, faces_resolved_state or faces_device_state)
+        finished = _format_timestamp(faces_phase_status.get("finished_at"))
+        if finished:
+            st.caption(f"Last run: {finished}")
+        if not faces_ready_state:
+            if faces_runtime:
+                st.caption(f"Runtime: {faces_runtime}")
+            elif faces_status_value == "success":
+                st.caption("Runtime: n/a")
+
+    with col3:
+        cluster_params: list[str] = []
+        cluster_device_state = cluster_phase_status.get("device")
+        cluster_device_request = cluster_phase_status.get("requested_device")
+        cluster_resolved_state = cluster_phase_status.get("resolved_device")
+        cluster_runtime = _format_runtime(cluster_phase_status.get("runtime_sec"))
+        cluster_job_state = str((cluster_job_record or {}).get("state") or "").lower()
+        cluster_error_msg = cluster_phase_status.get("error") or (cluster_job_record or {}).get("error")
+        if cluster_device_request and cluster_device_request != cluster_device_state:
+            cluster_params.append(f"requested={helpers.device_label_from_value(cluster_device_request)}")
+        if cluster_device_state:
+            cluster_params.append(f"device={helpers.device_label_from_value(cluster_device_state)}")
+        cluster_thresh_state = helpers.coerce_float(cluster_phase_status.get("cluster_thresh"))
+        if cluster_thresh_state is not None:
+            cluster_params.append(f"thresh={cluster_thresh_state:.2f}")
+        min_cluster_state = helpers.coerce_int(cluster_phase_status.get("min_cluster_size"))
+        if min_cluster_state is not None:
+            cluster_params.append(f"min_cluster={min_cluster_state}")
+        identities_label = helpers.format_count(identities_count_value) or "0"
         if cluster_status_value == "success":
-            st.caption("Singleton metrics unavailable for this run.")
+            runtime_label = cluster_runtime or "n/a"
+            st.success(f"✅ **Cluster**: Complete (Runtime: {runtime_label})")
+            st.caption(f"Identities: {identities_label}")
+        elif cluster_status_value == "running":
+            st.info("⏳ **Cluster**: Running")
+            started = _format_timestamp(cluster_phase_status.get("started_at"))
+            if started:
+                st.caption(f"Started at {started}")
+            st.caption("Live progress appears in the log panel below.")
+        elif cluster_job_state == "failed":
+            st.error("⚠️ **Cluster**: Failed")
+            if cluster_error_msg:
+                st.caption(cluster_error_msg)
+        elif cluster_status_value not in {"missing", "unknown"}:
+            st.warning(f"⚠️ **Cluster**: {cluster_status_value.title()}")
+            if cluster_error_msg:
+                st.caption(cluster_error_msg)
+        elif faces_ready_state:
+            if (faces_count_value or 0) == 0:
+                st.info("ℹ️ **Cluster**: No faces to cluster")
+                st.caption("Faces harvest finished with 0 faces → expect 0 identities.")
+            else:
+                st.info("⏳ **Cluster**: Ready to run")
+                st.caption("Click 'Run Cluster' below.")
         else:
-            st.caption("Singleton metrics not available until clustering completes.")
-    _render_device_summary(cluster_device_request, cluster_resolved_state or cluster_device_state)
-    finished = _format_timestamp(cluster_phase_status.get("finished_at"))
-    if finished:
-        st.caption(f"Last run: {finished}")
-    if cluster_status_value != "success" and cluster_runtime:
-        st.caption(f"Runtime: {cluster_runtime}")
-    elif cluster_status_value == "success" and cluster_runtime is None:
-        st.caption("Runtime: n/a")
+            st.info("⏳ **Cluster**: Waiting for faces")
+            st.caption("Complete faces harvest first.")
+        if cluster_params:
+            st.caption("Params: " + ", ".join(cluster_params))
+        merge_block = cluster_phase_status.get("singleton_merge") or {}
+        singleton_stats = cluster_phase_status.get("singleton_stats") or merge_block.get("singleton_stats") or {}
+        if not isinstance(singleton_stats, dict):
+            singleton_stats = {}
+        before_block = singleton_stats.get("before") or {}
+        after_block = singleton_stats.get("after") or {}
+        if not isinstance(before_block, dict):
+            before_block = {}
+        if not isinstance(after_block, dict):
+            after_block = {}
+        before_frac = helpers.coerce_float(before_block.get("singleton_fraction"))
+        if before_frac is None:
+            before_frac = helpers.coerce_float(cluster_phase_status.get("singleton_fraction_before"))
+        after_frac = helpers.coerce_float(after_block.get("singleton_fraction"))
+        if after_frac is None:
+            after_frac = helpers.coerce_float(cluster_phase_status.get("singleton_fraction_after"))
+        threshold = helpers.coerce_float(singleton_stats.get("threshold"))
+        if threshold is None:
+            threshold = helpers.coerce_float(cluster_phase_status.get("singleton_merge_threshold"))
+        clusters_before = helpers.coerce_int(before_block.get("cluster_count"))
+        if clusters_before is None:
+            clusters_before = helpers.coerce_int(cluster_phase_status.get("total_clusters_before"))
+        clusters_after = helpers.coerce_int(after_block.get("cluster_count"))
+        if clusters_after is None:
+            clusters_after = helpers.coerce_int(cluster_phase_status.get("total_clusters_after"))
+        merge_count = helpers.coerce_int(after_block.get("merge_count"))
+        if merge_count is None:
+            merge_count = helpers.coerce_int(merge_block.get("num_singleton_merges"))
+        sim_thresh = merge_block.get("similarity_thresh") or merge_block.get("secondary_cluster_thresh")
+        neighbor_top_k = merge_block.get("neighbor_top_k") or merge_block.get("max_pairs_per_track")
+        merge_enabled = merge_block.get("enabled") if merge_block else False
+        primary_frac = after_frac if after_frac is not None else before_frac
+        has_metrics = any(val is not None for val in [before_frac, after_frac, clusters_before, clusters_after, merge_count])
+        use_after_merge_label = bool(merge_enabled and after_frac is not None)
+        if has_metrics:
+            lines: list[str] = []
+            if before_frac is not None and after_frac is not None:
+                thresh_label = f"{threshold:.2f}" if threshold is not None else "?"
+                lines.append(f"Singletons: {before_frac:.2f} → {after_frac:.2f} (threshold {thresh_label})")
+            elif before_frac is not None:
+                thresh_label = f" (threshold {threshold:.2f})" if threshold is not None else ""
+                lines.append(f"Singletons: {before_frac:.2f}{thresh_label}")
+            elif after_frac is not None:
+                thresh_label = f" (threshold {threshold:.2f})" if threshold is not None else ""
+                lines.append(f"Singletons (post-merge): {after_frac:.2f}{thresh_label}")
+            if clusters_before is not None and clusters_after is not None:
+                before_clusters = helpers.format_count(clusters_before) or str(clusters_before)
+                after_clusters = helpers.format_count(clusters_after) or str(clusters_after)
+                lines.append(f"Clusters: {before_clusters} → {after_clusters}")
+            elif clusters_after is not None:
+                after_clusters = helpers.format_count(clusters_after) or str(clusters_after)
+                lines.append(f"Clusters: {after_clusters}")
+            elif clusters_before is not None:
+                before_clusters = helpers.format_count(clusters_before) or str(clusters_before)
+                lines.append(f"Clusters: {before_clusters}")
+            if merge_enabled and merge_count is not None:
+                sim_label = f"{sim_thresh:.2f}" if isinstance(sim_thresh, (int, float)) else sim_thresh or "?"
+                neighbor_label = neighbor_top_k if neighbor_top_k is not None else "?"
+                lines.append(f"Merge: {merge_count} pairs (sim ≥ {sim_label}, top_k={neighbor_label})")
+            for entry in lines:
+                st.caption(entry)
+            if threshold is not None and primary_frac is not None:
+                high_label = "🚧 High singleton fraction after merge" if use_after_merge_label else "🚧 High singleton fraction"
+                ok_label = (
+                    "✅ Singletons reduced below threshold after merge"
+                    if use_after_merge_label
+                    else "✅ Singleton fraction below threshold"
+                )
+                if primary_frac > threshold:
+                    st.warning(high_label)
+                elif merge_enabled:
+                    st.success(ok_label)
+        else:
+            if cluster_status_value == "success":
+                st.caption("Singleton metrics unavailable for this run.")
+            else:
+                st.caption("Singleton metrics not available until clustering completes.")
+        _render_device_summary(cluster_device_request, cluster_resolved_state or cluster_device_state)
+        finished = _format_timestamp(cluster_phase_status.get("finished_at"))
+        if finished:
+            st.caption(f"Last run: {finished}")
+        if cluster_status_value != "success" and cluster_runtime:
+            st.caption(f"Runtime: {cluster_runtime}")
+        elif cluster_status_value == "success" and cluster_runtime is None:
+            st.caption("Runtime: n/a")
 
-with col4:
-    screentime_started_label = _format_timestamp(screentime_started_at)
-    screentime_finished_label = _format_timestamp(screentime_finished_at)
-    if screentime_status_value == "success":
-        runtime_label = screentime_runtime or "n/a"
-        st.success(f"✅ **Screentime**: Complete (Runtime: {runtime_label})")
-        st.caption(f"JSON: {helpers.link_local(screentime_json_path)}")
-    elif screentime_status_value == "running":
-        st.info("⏳ **Screentime**: Running")
-        if screentime_started_label:
-            st.caption(f"Started at {screentime_started_label}")
-    elif screentime_status_value == "error":
-        st.error("⚠️ **Screentime**: Failed")
-        if screentime_error:
-            st.caption(screentime_error)
-    else:
-        st.info("⏳ **Screentime**: Ready")
-        st.caption("Click 'Compute screentime' below.")
-    if screentime_finished_label and screentime_status_value == "success":
-        st.caption(f"Last run: {screentime_finished_label}")
-    if screentime_status_value != "success" and screentime_runtime:
-        st.caption(f"Runtime: {screentime_runtime}")
-    elif screentime_status_value == "success" and screentime_runtime is None:
-        st.caption("Runtime: n/a")
+    with col4:
+        screentime_started_label = _format_timestamp(screentime_started_at)
+        screentime_finished_label = _format_timestamp(screentime_finished_at)
+        if screentime_status_value == "success":
+            runtime_label = screentime_runtime or "n/a"
+            st.success(f"✅ **Screentime**: Complete (Runtime: {runtime_label})")
+            st.caption(f"JSON: {helpers.link_local(screentime_json_path)}")
+        elif screentime_status_value == "running":
+            st.info("⏳ **Screentime**: Running")
+            if screentime_started_label:
+                st.caption(f"Started at {screentime_started_label}")
+        elif screentime_status_value == "error":
+            st.error("⚠️ **Screentime**: Failed")
+            if screentime_error:
+                st.caption(screentime_error)
+        else:
+            st.info("⏳ **Screentime**: Ready")
+            st.caption("Click 'Compute screentime' below.")
+        if screentime_finished_label and screentime_status_value == "success":
+            st.caption(f"Last run: {screentime_finished_label}")
+        if screentime_status_value != "success" and screentime_runtime:
+            st.caption(f"Runtime: {screentime_runtime}")
+        elif screentime_status_value == "success" and screentime_runtime is None:
+            st.caption("Runtime: n/a")
 
-st.divider()
 
 detector_override = st.session_state.pop("episode_detail_detector_override", None)
 tracker_override = st.session_state.pop("episode_detail_tracker_override", None)
@@ -1288,25 +1374,8 @@ if min_cluster_size_default is None:
 if min_cluster_size_default is None:
     min_cluster_size_default = 2
 
-col_hydrate, col_detect = st.columns(2)
-with col_hydrate:
-    detect_inflight = bool(st.session_state.get(detect_running_key))
-    mirror_disabled = detect_inflight or job_running
-    mirror_help = "Detect/Track automatically mirrors before running." if detect_inflight else None
-    if st.button("Mirror from S3", use_container_width=True, disabled=mirror_disabled, help=mirror_help):
-        mirror_path = f"/episodes/{ep_id}/mirror"
-        try:
-            resp = helpers.api_post(mirror_path)
-        except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}{mirror_path}", exc))
-        else:
-            st.session_state["episode_detail_flash"] = (
-                f"Mirrored → {helpers.link_local(resp['local_video_path'])} | size {helpers.human_size(resp.get('bytes'))}"
-            )
-            st.rerun()
-    if detect_inflight:
-        st.caption("Detect/Track is mirroring required artifacts automatically…")
-with col_detect:
+detect_inflight = bool(st.session_state.get(detect_running_key))
+with st.container():
     st.markdown("### Detect/Track Faces")
     session_prefix = f"episode_detail_detect::{ep_id}"
 
@@ -1315,11 +1384,22 @@ with col_detect:
         profile_default_value = helpers.default_profile_for_device(detect_device_default_value)
     profile_key = _detect_setting_key(ep_id, "profile")
     profile_seed_value = helpers.profile_value_from_state(st.session_state.get(profile_key, profile_default_value))
+    # Sanitize the selectbox session state to use label format (Streamlit stores widget value directly)
+    profile_widget_key = f"{session_prefix}::profile"
+    if profile_widget_key in st.session_state:
+        stored_value = st.session_state[profile_widget_key]
+        if stored_value not in helpers.PROFILE_LABELS:
+            # Convert internal value to label format
+            sanitized = helpers.PROFILE_LABEL_MAP.get(str(stored_value).lower())
+            if sanitized:
+                st.session_state[profile_widget_key] = sanitized
+            else:
+                del st.session_state[profile_widget_key]  # Remove invalid value
     profile_label = st.selectbox(
         "Performance profile",
         helpers.PROFILE_LABELS,
         index=helpers.profile_label_index(profile_seed_value),
-        key=f"{session_prefix}::profile",
+        key=profile_widget_key,
         help="Low Power is recommended on Apple laptops (higher stride, capped FPS, fewer exports).",
     )
     profile_value = helpers.PROFILE_VALUE_MAP.get(profile_label, profile_seed_value)
@@ -1648,6 +1728,7 @@ with col_detect:
     def _process_detect_result(summary: Dict[str, Any] | None, error_message: str | None) -> None:
         if error_message:
             if error_message == "mirror_failed":
+                st.error("Failed to mirror video from S3. Check that the video exists in S3 and you have network connectivity.")
                 return
             if "RetinaFace weights missing or could not initialize" in error_message:
                 st.error(error_message)
@@ -1722,7 +1803,12 @@ with col_detect:
         _process_detect_result(summary, error_message)
 
     if not local_video_exists:
-        st.info("Local mirror missing; Detect/Track will mirror automatically before starting.")
+        s3_meta = details.get("s3") or {}
+        s3_exists = s3_meta.get("v2_exists") or s3_meta.get("v1_exists")
+        if s3_exists:
+            st.info("Local mirror missing; Detect/Track will mirror automatically from S3 before starting.")
+        else:
+            st.warning("Video not found locally or in S3. Upload the video first via the Upload page.")
 
     # Display total frames from video metadata
     total_frames = None
@@ -1868,7 +1954,12 @@ with col_faces:
 
     # Improved messaging for when Harvest Faces is disabled
     if not local_video_exists:
-        st.info("Local mirror missing; video will be mirrored from S3 automatically when Faces Harvest starts.")
+        s3_meta = details.get("s3") or {}
+        s3_exists = s3_meta.get("v2_exists") or s3_meta.get("v1_exists")
+        if s3_exists:
+            st.info("Local mirror missing; video will be mirrored from S3 automatically when Faces Harvest starts.")
+        else:
+            st.warning("Video not found locally or in S3. Upload the video first.")
     elif faces_status_value == "stale":
         st.warning(
             "**Harvest Faces is outdated**: Detect/Track was rerun after the last faces harvest.\n\n"
@@ -1973,16 +2064,29 @@ with col_faces:
             st.session_state[running_job_key] = True
             _set_job_active(ep_id, True)
             try:
-                with st.spinner("Running faces harvest…"):
-                    summary, error_message = helpers.run_job_with_progress(
-                        ep_id,
-                        "/jobs/faces_embed",
-                        payload,
-                        requested_device=faces_device_value,
-                        async_endpoint="/jobs/faces_embed_async",
-                        requested_detector=helpers.tracks_detector_value(ep_id),
-                        requested_tracker=helpers.tracks_tracker_value(ep_id),
-                    )
+                # Use Celery for async execution via Redis queue
+                use_celery = os.environ.get("USE_CELERY_JOBS", "1") == "1"
+                if use_celery:
+                    with st.spinner("Running faces harvest via Celery…"):
+                        summary, error_message = helpers.run_celery_job_with_progress(
+                            ep_id,
+                            "faces_embed",
+                            payload,
+                            requested_device=faces_device_value,
+                            requested_detector=helpers.tracks_detector_value(ep_id),
+                            requested_tracker=helpers.tracks_tracker_value(ep_id),
+                        )
+                else:
+                    with st.spinner("Running faces harvest…"):
+                        summary, error_message = helpers.run_job_with_progress(
+                            ep_id,
+                            "/jobs/faces_embed",
+                            payload,
+                            requested_device=faces_device_value,
+                            async_endpoint="/jobs/faces_embed_async",
+                            requested_detector=helpers.tracks_detector_value(ep_id),
+                            requested_tracker=helpers.tracks_tracker_value(ep_id),
+                        )
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
@@ -1995,13 +2099,13 @@ with col_faces:
                 normalized = helpers.normalize_summary(ep_id, summary)
                 faces_count = normalized.get("faces")
                 crops_exported = normalized.get("crops_exported")
-                details = []
+                flash_parts = []
                 if isinstance(faces_count, int):
-                    details.append(f"faces: {faces_count:,}")
+                    flash_parts.append(f"faces: {faces_count:,}")
                 if crops_exported:
-                    details.append(f"crops exported: {crops_exported:,}")
-                details.append(f"thumb size: {int(faces_thumb_size)}px")
-                flash_msg = "Faces harvest complete" + (" · " + ", ".join(details) if details else "")
+                    flash_parts.append(f"crops exported: {crops_exported:,}")
+                flash_parts.append(f"thumb size: {int(faces_thumb_size)}px")
+                flash_msg = "Faces harvest complete" + (" · " + ", ".join(flash_parts) if flash_parts else "")
                 st.session_state["episode_detail_flash"] = flash_msg
                 # Force status refresh after job completion to pick up new faces status
                 st.session_state[_status_force_refresh_key(ep_id)] = True
@@ -2046,7 +2150,12 @@ with col_cluster:
     if min_cluster_size_value == 1:
         st.caption("⚠️ Single-track clusters may contain noise/false detections.")
     if not local_video_exists:
-        st.info("Local mirror missing; artifacts will be mirrored automatically when clustering starts.")
+        s3_meta = details.get("s3") or {}
+        s3_exists = s3_meta.get("v2_exists") or s3_meta.get("v1_exists")
+        if s3_exists:
+            st.info("Local mirror missing; artifacts will be mirrored automatically when clustering starts.")
+        else:
+            st.warning("Video not found locally or in S3. Upload the video first.")
     elif not tracks_ready:
         st.caption("Run detect/track first; clustering requires fresh tracks and faces.")
         if st.button(
@@ -2113,6 +2222,8 @@ with col_cluster:
             disabled=job_running,
         ):
             _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
+    elif cluster_status_value == "running":
+        st.info("Clustering is currently running. Wait for it to complete before starting another run.")
 
     cluster_disabled = (
         (not faces_ready)
@@ -2122,6 +2233,7 @@ with col_cluster:
         or zero_faces_success
         or (not combo_supported_cluster)
         or faces_status_value == "stale"
+        or cluster_status_value == "running"
     )
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True
@@ -2148,16 +2260,29 @@ with col_cluster:
             st.session_state[running_job_key] = True
             _set_job_active(ep_id, True)
             try:
-                with st.spinner("Clustering faces…"):
-                    summary, error_message = helpers.run_job_with_progress(
-                        ep_id,
-                        "/jobs/cluster",
-                        payload,
-                        requested_device=cluster_device_value,
-                        async_endpoint="/jobs/cluster_async",
-                        requested_detector=helpers.tracks_detector_value(ep_id),
-                        requested_tracker=helpers.tracks_tracker_value(ep_id),
-                    )
+                # Use Celery for async execution via Redis queue
+                use_celery = os.environ.get("USE_CELERY_JOBS", "1") == "1"
+                if use_celery:
+                    with st.spinner("Clustering faces via Celery…"):
+                        summary, error_message = helpers.run_celery_job_with_progress(
+                            ep_id,
+                            "cluster",
+                            payload,
+                            requested_device=cluster_device_value,
+                            requested_detector=helpers.tracks_detector_value(ep_id),
+                            requested_tracker=helpers.tracks_tracker_value(ep_id),
+                        )
+                else:
+                    with st.spinner("Clustering faces…"):
+                        summary, error_message = helpers.run_job_with_progress(
+                            ep_id,
+                            "/jobs/cluster",
+                            payload,
+                            requested_device=cluster_device_value,
+                            async_endpoint="/jobs/cluster_async",
+                            requested_detector=helpers.tracks_detector_value(ep_id),
+                            requested_tracker=helpers.tracks_tracker_value(ep_id),
+                        )
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
@@ -2170,13 +2295,13 @@ with col_cluster:
                 normalized = helpers.normalize_summary(ep_id, summary)
                 identities_count = normalized.get("identities")
                 faces_count = normalized.get("faces")
-                details = []
+                cluster_flash_parts = []
                 if isinstance(identities_count, int):
-                    details.append(f"identities: {identities_count:,}")
+                    cluster_flash_parts.append(f"identities: {identities_count:,}")
                 if isinstance(faces_count, int):
-                    details.append(f"faces: {faces_count:,}")
+                    cluster_flash_parts.append(f"faces: {faces_count:,}")
                 flash_msg = f"Clustered (thresh {cluster_thresh_value:.2f}, min {int(min_cluster_size_value)})" + (
-                    " · " + ", ".join(details) if details else ""
+                    " · " + ", ".join(cluster_flash_parts) if cluster_flash_parts else ""
                 )
                 st.session_state["episode_detail_flash"] = flash_msg
                 # Force status refresh after job completion to pick up new cluster status
@@ -2184,9 +2309,17 @@ with col_cluster:
                 st.rerun()
 with col_screen:
     st.markdown("### Screentime")
-    screentime_disabled = False
+    screentime_disabled = (
+        job_running
+        or screentime_status_value == "running"
+        or cluster_status_value != "success"
+    )
     if not local_video_exists:
         st.info("Local mirror missing; video will be mirrored automatically when screentime starts.")
+    elif screentime_status_value == "running":
+        st.info("Screentime analysis is currently running.")
+    elif cluster_status_value != "success":
+        st.caption("Complete clustering before computing screentime.")
     if st.button("Compute screentime", use_container_width=True, disabled=screentime_disabled):
         can_run_screen = True
         if not local_video_exists:

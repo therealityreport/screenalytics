@@ -808,7 +808,10 @@ class PipelineTask(Task):
         progress_file: str | None = None,
         env: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Run a subprocess command and track progress.
+        """Run a subprocess command and track progress with real-time updates.
+
+        Uses Popen for non-blocking execution and polls the progress file
+        to provide real-time progress updates to the Celery task state.
 
         Args:
             command: Command list to execute
@@ -821,6 +824,7 @@ class PipelineTask(Task):
             Result dict with status, output, and any progress data
         """
         import subprocess
+        import json
 
         job_id = self.request.id
 
@@ -828,36 +832,85 @@ class PipelineTask(Task):
         LOGGER.info(f"[{job_id}] Command: {' '.join(command)}")
 
         try:
-            # Run the subprocess
-            result = subprocess.run(
+            # Use Popen for non-blocking execution with real-time progress
+            proc = subprocess.Popen(
                 command,
                 cwd=str(PROJECT_ROOT),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=env,
             )
 
-            # Read progress file if available
-            progress_data = None
-            if progress_file:
-                progress_path = Path(progress_file)
-                if progress_path.exists():
-                    try:
-                        import json
-                        progress_data = json.loads(progress_path.read_text(encoding="utf-8"))
-                    except (json.JSONDecodeError, OSError):
-                        pass
+            progress_path = Path(progress_file) if progress_file else None
+            poll_interval = 2.0  # seconds
+            last_progress = 0.0
+            last_phase = ""
+            stderr_lines = []
 
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
+            # Poll until process completes
+            while proc.poll() is None:
+                time.sleep(poll_interval)
+
+                # Read progress file if available and update Celery state
+                if progress_path and progress_path.exists():
+                    try:
+                        progress_text = progress_path.read_text(encoding="utf-8")
+                        progress_data = json.loads(progress_text)
+                        frames_done = progress_data.get("frames_done", 0)
+                        frames_total = progress_data.get("frames_total", 1)
+                        phase = progress_data.get("phase", "running")
+                        secs_done = progress_data.get("secs_done", 0)
+
+                        # Calculate progress percentage (cap at 99% until complete)
+                        progress_pct = min(frames_done / max(frames_total, 1), 0.99)
+
+                        # Update Celery state if progress changed
+                        if progress_pct > last_progress or phase != last_phase:
+                            last_progress = progress_pct
+                            last_phase = phase
+                            self.update_state(
+                                state="PROGRESS",
+                                meta={
+                                    "step": operation,
+                                    "progress": progress_pct,
+                                    "message": f"{phase}: {frames_done:,}/{frames_total:,} frames",
+                                    "episode_id": episode_id,
+                                    "frames_done": frames_done,
+                                    "frames_total": frames_total,
+                                    "phase": phase,
+                                    "secs_done": secs_done,
+                                },
+                            )
+                            LOGGER.debug(
+                                f"[{job_id}] Progress update: {phase} {frames_done}/{frames_total} "
+                                f"({progress_pct*100:.1f}%)"
+                            )
+                    except (json.JSONDecodeError, OSError) as e:
+                        LOGGER.debug(f"[{job_id}] Could not read progress file: {e}")
+
+            # Process complete - get final output
+            stdout, stderr = proc.communicate()
+            if stderr:
+                stderr_lines.append(stderr)
+
+            # Read final progress
+            progress_data = None
+            if progress_path and progress_path.exists():
+                try:
+                    progress_data = json.loads(progress_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            if proc.returncode != 0:
+                error_msg = stderr.strip() if stderr else f"Exit code {proc.returncode}"
                 LOGGER.error(f"[{job_id}] {operation} failed: {error_msg}")
                 return {
                     "status": "error",
                     "episode_id": episode_id,
                     "operation": operation,
                     "error": error_msg,
-                    "return_code": result.returncode,
+                    "return_code": proc.returncode,
                     "progress": progress_data,
                 }
 
@@ -868,7 +921,7 @@ class PipelineTask(Task):
                 "operation": operation,
                 "return_code": 0,
                 "progress": progress_data,
-                "stdout": result.stdout[:2000] if result.stdout else None,
+                "stdout": stdout[:2000] if stdout else None,
             }
 
         except Exception as e:
@@ -985,11 +1038,12 @@ def run_detect_track_task(
         env = os.environ.copy()
         cpu_threads = options.get("cpu_threads")
         if cpu_threads:
-            threads = max(int(cpu_threads), 1)
+            # Cap threads between 1 and available CPU count to prevent overheating
+            max_allowed = os.cpu_count() or 8
+            threads = max(1, min(int(cpu_threads), max_allowed))
             # Apply CPU thread caps to downstream ML libraries for laptop-friendly runs
             env.update(
                 {
-                    "SCREANALYTICS_MAX_CPU_THREADS": str(threads),
                     "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
                     "OMP_NUM_THREADS": str(threads),
                     "MKL_NUM_THREADS": str(threads),

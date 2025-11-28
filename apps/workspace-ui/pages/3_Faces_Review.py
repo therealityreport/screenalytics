@@ -615,80 +615,88 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
         if st.button(
             "🔄 Refresh Values",
             key="facebank_refresh_similarity_button",
-            help="Recompute all similarity scores and refresh suggestions",
+            help="Recompute all similarity scores and refresh suggestions (background job)",
         ):
-            # Show detailed progress UI with live updates
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-            log_container = st.container()
-
-            status_text.text("🚀 [0%] Starting similarity refresh...")
-
+            # Start async job
+            should_rerun = False
             try:
-                progress_bar.progress(0.05)
-                status_text.text("📊 [5%] Calling API to refresh similarity values...")
+                # Use async endpoint to queue background job
+                refresh_resp = _api_post(f"/episodes/{ep_id}/refresh_similarity_async", {})
 
-                # Trigger similarity index refresh for all identities
-                refresh_resp = _api_post(f"/episodes/{ep_id}/refresh_similarity", {})
+                if refresh_resp and refresh_resp.get("status") == "queued":
+                    job_id = refresh_resp.get("job_id")
+                    st.success(f"✅ Refresh job queued! Job ID: `{job_id[:12]}...`")
+                    st.info("Check **Current Jobs** panel above to monitor progress. Page will refresh when done.")
+                    # Store job ID for tracking
+                    st.session_state["refresh_similarity_job_id"] = job_id
+                    should_rerun = True
+                elif refresh_resp and refresh_resp.get("async") is False:
+                    # Celery not available
+                    st.error(f"❌ {refresh_resp.get('message', 'Background jobs unavailable')}")
+                    st.warning("Please ensure Redis and Celery worker are running.")
+                else:
+                    error_detail = refresh_resp.get("detail", "Unknown error") if refresh_resp else "No response"
+                    st.error(f"❌ Failed to queue refresh job: {error_detail}")
+            except Exception as exc:
+                st.error(f"❌ Failed to queue refresh job: {exc}")
+            # Call st.rerun() outside try-except to avoid catching RerunException
+            if should_rerun:
+                st.rerun()
 
-                if refresh_resp and refresh_resp.get("status") == "success":
-                    # Extract log data
-                    log_data = refresh_resp.get("log", {})
-                    steps = log_data.get("steps", [])
-                    summary = refresh_resp.get("summary", {})
-                    total_duration = log_data.get("total_duration_ms", 0)
+    # Check for active refresh_similarity job and show progress
+    refresh_job_id = st.session_state.get("refresh_similarity_job_id")
+    should_rerun_after_success = False
+    if refresh_job_id:
+        try:
+            job_status = helpers.api_get(f"/celery_jobs/{refresh_job_id}")
+            if job_status:
+                state = job_status.get("state", "unknown")
 
-                    # Build detailed log messages with percentage markers
+                if state == "in_progress":
+                    progress_info = job_status.get("progress", {})
+                    progress_pct = progress_info.get("progress", 0) * 100
+                    message = progress_info.get("message", "Processing...")
+                    step = progress_info.get("step", "")
+
+                    st.info(f"🔄 **Refresh in progress** [{progress_pct:.0f}%]: {message}")
+                    st.progress(progress_info.get("progress", 0))
+
+                elif state == "success":
+                    result = job_status.get("result", {})
+                    summary = result.get("summary", {})
+                    log_data = result.get("log", {})
+
+                    # Build detailed log
                     log_lines = []
                     log_lines.append("=" * 60)
                     log_lines.append("SIMILARITY REFRESH - DETAILED LOG")
                     log_lines.append("=" * 60)
 
-                    # Process each step with its percentage and details
-                    for step in steps:
+                    for step in log_data.get("steps", []):
                         step_name = step.get("step", "")
                         step_status = step.get("status", "")
                         duration = step.get("duration_ms", 0)
                         progress_pct = step.get("progress_pct", 0)
                         details = step.get("details", [])
 
-                        # Update progress bar for each step
-                        progress_bar.progress(progress_pct / 100.0)
-
-                        # Status icon
-                        if step_status == "success":
-                            status_icon = "✓"
-                        elif step_status == "skipped":
-                            status_icon = "⊘"
-                        else:
-                            status_icon = "✗"
-
-                        # Step header with progress percentage
+                        status_icon = "✓" if step_status == "success" else ("⊘" if step_status == "skipped" else "✗")
                         step_display_name = step_name.replace("_", " ").title()
+
                         log_lines.append("")
                         log_lines.append(f"[{progress_pct}%] {status_icon} {step_display_name}")
                         log_lines.append(f"    Status: {step_status} | Duration: {duration}ms")
 
-                        # Add all detail lines
                         for detail in details:
                             log_lines.append(f"    {detail}")
 
-                        # Show any errors
                         if step.get("error"):
                             log_lines.append(f"    ⚠️ ERROR: {step.get('error')}")
 
-                        # Update status text with current step
-                        status_text.text(f"📊 [{progress_pct}%] {step_display_name}...")
-
-                    # Final progress
-                    progress_bar.progress(1.0)
-
-                    # Summary section
                     log_lines.append("")
                     log_lines.append("=" * 60)
                     log_lines.append("SUMMARY")
                     log_lines.append("=" * 60)
-                    log_lines.append(f"  Total Duration: {total_duration}ms")
+                    log_lines.append(f"  Total Duration: {log_data.get('total_duration_ms', 0)}ms")
                     log_lines.append(f"  Clusters: {summary.get('clusters', 0)} ({summary.get('assigned_clusters', 0)} assigned, {summary.get('unassigned_clusters', 0)} unassigned)")
                     log_lines.append(f"  Tracks: {summary.get('tracks', 0)}")
                     log_lines.append(f"  Centroids Computed: {summary.get('centroids_computed', 0)}")
@@ -696,46 +704,36 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                     log_lines.append(f"  Suggestions Generated: {summary.get('suggestions_generated', 0)}")
                     log_lines.append("=" * 60)
 
-                    # Show detailed log in an expanded container
-                    with log_container:
-                        with st.expander("📋 Detailed Progress Log", expanded=True):
-                            st.code("\n".join(log_lines), language=None)
+                    with st.expander("📋 Refresh Complete - Detailed Log", expanded=True):
+                        st.code("\n".join(log_lines), language=None)
 
-                    # Show summary success message
-                    clusters = summary.get("clusters", 0)
-                    tracks = summary.get("tracks", 0)
-                    assigned = summary.get("assigned_clusters", 0)
-                    unassigned = summary.get("unassigned_clusters", 0)
-                    centroids = summary.get("centroids_computed", 0)
-                    people_updated = summary.get("people_updated", 0)
-                    suggestions = summary.get("suggestions_generated", 0)
-
-                    progress_bar.empty()
-                    status_text.success(
-                        f"✅ Similarity refresh complete!\n\n"
-                        f"**Clusters:** {clusters} total ({assigned} assigned, {unassigned} unassigned)\n"
-                        f"**Tracks:** {tracks}\n"
-                        f"**Centroids:** {centroids} computed\n"
-                        f"**People Updated:** {people_updated} prototype(s)\n"
-                        f"**Suggestions:** {suggestions} generated for unassigned clusters\n\n"
-                        f"⏱️ Total time: {total_duration}ms"
+                    st.success(
+                        f"✅ **Similarity refresh complete!**\n\n"
+                        f"• **Clusters:** {summary.get('clusters', 0)} ({summary.get('assigned_clusters', 0)} assigned, {summary.get('unassigned_clusters', 0)} unassigned)\n"
+                        f"• **Centroids:** {summary.get('centroids_computed', 0)} computed\n"
+                        f"• **People Updated:** {summary.get('people_updated', 0)}\n"
+                        f"• **Suggestions:** {summary.get('suggestions_generated', 0)} generated\n"
+                        f"• **Duration:** {log_data.get('total_duration_ms', 0)}ms"
                     )
-                    st.rerun()
-                else:
-                    progress_bar.empty()
-                    error_detail = refresh_resp.get("detail", "Unknown error") if refresh_resp else "No response"
-                    status_text.error(f"❌ Failed to refresh similarity values: {error_detail}")
-                    with log_container:
-                        with st.expander("📋 Error Log", expanded=True):
-                            st.code(f"Error: {error_detail}", language=None)
 
-            except Exception as exc:
-                progress_bar.empty()
-                status_text.error(f"❌ Refresh failed: {exc}")
-                with log_container:
-                    with st.expander("📋 Exception Log", expanded=True):
-                        import traceback
-                        st.code(f"Exception: {exc}\n\n{traceback.format_exc()}", language=None)
+                    # Clear job from session and flag for rerun
+                    del st.session_state["refresh_similarity_job_id"]
+                    should_rerun_after_success = True
+
+                elif state == "failed":
+                    error = job_status.get("error", "Unknown error")
+                    st.error(f"❌ Refresh job failed: {error}")
+                    del st.session_state["refresh_similarity_job_id"]
+
+                elif state == "queued":
+                    st.info(f"⏳ Refresh job queued, waiting for worker... (Job: `{refresh_job_id[:12]}...`)")
+
+        except Exception as exc:
+            st.warning(f"Could not check job status: {exc}")
+    # Call st.rerun() outside try-except to avoid catching RerunException
+    if should_rerun_after_success:
+        st.rerun()
+
     return detail
 
 

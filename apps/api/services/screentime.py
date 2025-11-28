@@ -8,7 +8,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -253,7 +253,7 @@ class ScreenTimeAnalyzer:
         # Convert to output format
         return {
             "episode_id": ep_id,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "diagnostics": diagnostics,
             "metrics": [
                 {

@@ -487,8 +487,8 @@ def _build_detect_track_command(
         "--progress-file",
         str(progress_path),
     ]
-    if profile_value:
-        command += ["--profile", profile_value]
+    # Note: profile_value is used internally for stride/fps defaults,
+    # but episode_run.py doesn't accept --profile as a command line argument
     if fps_value is not None and fps_value > 0:
         command += ["--fps", str(fps_value)]
     if save_frames_value:
@@ -531,8 +531,7 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         "--progress-file",
         str(progress_path),
     ]
-    if req.profile:
-        command += ["--profile", req.profile]
+    # Note: profile is used internally for defaults, but episode_run.py doesn't accept --profile
     if req.save_frames:
         command.append("--save-frames")
     if req.save_crops:
@@ -562,8 +561,7 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
         "--progress-file",
         str(progress_path),
     ]
-    if req.profile:
-        command += ["--profile", req.profile]
+    # Note: profile is used internally for defaults, but episode_run.py doesn't accept --profile
     command += ["--cluster-thresh", str(req.cluster_thresh)]
     command += ["--min-cluster-size", str(req.min_cluster_size)]
     command += ["--min-identity-sim", str(req.min_identity_sim)]
@@ -1088,8 +1086,8 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             new_track_thresh=req.new_track_thresh,
             track_buffer=req.track_buffer,
             min_box_area=req.min_box_area,
-            profile=effective["profile"],
-            cpu_threads=effective["cpu_threads"],
+            # Note: profile and cpu_threads are used internally for stride/fps defaults
+            # but not passed to the job service (it uses the resolved values above)
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1110,17 +1108,14 @@ async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) ->
     # Ensure the local mirror exists so asynchronous jobs don't fail later
     _validate_episode_ready(req.ep_id)
     try:
-            job = JOB_SERVICE.start_faces_embed_job(
-                ep_id=req.ep_id,
-                device=req.device or "auto",
-                save_frames=req.save_frames,
-                save_crops=req.save_crops,
-                jpeg_quality=req.jpeg_quality,
-                min_frames_between_crops=req.min_frames_between_crops,
-                thumb_size=req.thumb_size,
-                profile=req.profile,
-                cpu_threads=req.cpu_threads,
-            )
+        job = JOB_SERVICE.start_faces_embed_job(
+            ep_id=req.ep_id,
+            device=req.device or "auto",
+            save_frames=req.save_frames,
+            save_crops=req.save_crops,
+            jpeg_quality=req.jpeg_quality,
+            thumb_size=req.thumb_size,
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -1143,7 +1138,6 @@ async def enqueue_cluster_async(req: ClusterRequest, request: Request) -> dict:
             cluster_thresh=req.cluster_thresh,
             min_cluster_size=req.min_cluster_size,
             min_identity_sim=req.min_identity_sim,
-            profile=req.profile,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

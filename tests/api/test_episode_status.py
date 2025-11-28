@@ -70,3 +70,36 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     assert inferred["cluster"]["status"] == "success"
     assert inferred["cluster"].get("source") == "output"
     assert inferred["cluster"].get("runtime_sec") is None
+
+
+def test_detect_track_tracks_only_marks_stale(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    ep_id = "stale-tracks-only"
+
+    manifests_dir = get_path(ep_id, "detections").parent
+    tracks_path = manifests_dir / "tracks.jsonl"
+    tracks_path.parent.mkdir(parents=True, exist_ok=True)
+    tracks_path.write_text(
+        json.dumps(
+            {
+                "ep_id": ep_id,
+                "track_id": 1,
+                "detector": "retinaface",
+                "tracker": "bytetrack",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    client = TestClient(app)
+    status_resp = client.get(f"/episodes/{ep_id}/status")
+    assert status_resp.status_code == 200
+    payload = status_resp.json()
+
+    detect_status = payload.get("detect_track", {})
+    assert detect_status.get("status") == "stale"
+    assert payload.get("tracks_ready") is False
+    # Scenes are considered ready when tracks manifest exists even if detections are missing
+    assert payload.get("scenes_ready") is True

@@ -420,12 +420,16 @@ class StorageService:
             return info
         keys_to_try: List[tuple[str, str]] = []
         if show_ref is not None and season_number is not None and episode_number is not None:
-            keys_to_try.append(
-                (
-                    "v2",
-                    self.video_object_key_v2(show_ref, season_number, episode_number),
-                )
-            )
+            # Try both lowercase and uppercase show_ref for case-insensitive S3 matching
+            v2_key_original = self.video_object_key_v2(show_ref, season_number, episode_number)
+            v2_key_lower = self.video_object_key_v2(show_ref.lower(), season_number, episode_number)
+            v2_key_upper = self.video_object_key_v2(show_ref.upper(), season_number, episode_number)
+            # Add original case first, then try alternatives if different
+            keys_to_try.append(("v2", v2_key_original))
+            if v2_key_lower != v2_key_original:
+                keys_to_try.append(("v2", v2_key_lower))
+            if v2_key_upper != v2_key_original and v2_key_upper != v2_key_lower:
+                keys_to_try.append(("v2", v2_key_upper))
         keys_to_try.append(("v1", self.video_object_key_v1(ep_id)))
 
         for version, key in keys_to_try:

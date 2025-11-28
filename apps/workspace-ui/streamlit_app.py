@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import streamlit as st
 
+# IMPORTANT: st.set_page_config() must be called FIRST, before any other st.* calls
+# This is the single location for page config across the entire multi-page app
+st.set_page_config(page_title="Screenalytics Workspace", layout="wide")
+
 import ui_helpers as helpers
 
 cfg = helpers.init_page("Screenalytics Workspace")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,7 +26,7 @@ REP_HIGH_SIM_THRESHOLD = float(
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def l2_normalize(vector: np.ndarray) -> np.ndarray:
@@ -401,14 +401,28 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     return result
 
 
-def compute_all_track_reps(ep_id: str) -> List[Dict[str, Any]]:
-    """Compute track representatives for all tracks in an episode."""
+def compute_all_track_reps(ep_id: str, return_stats: bool = False) -> List[Dict[str, Any]] | Dict[str, Any]:
+    """Compute track representatives for all tracks in an episode.
+
+    Args:
+        ep_id: Episode ID
+        return_stats: If True, return dict with reps and statistics
+
+    Returns:
+        If return_stats is False: List of track rep dicts
+        If return_stats is True: Dict with 'reps', 'tracks_processed', 'tracks_with_reps', 'tracks_skipped'
+    """
     tracks_path = _tracks_path(ep_id)
     if not tracks_path.exists():
         LOGGER.warning(f"No tracks file found for {ep_id}")
+        if return_stats:
+            return {"reps": [], "tracks_processed": 0, "tracks_with_reps": 0, "tracks_skipped": 0}
         return []
 
     track_reps: List[Dict[str, Any]] = []
+    tracks_processed = 0
+    tracks_skipped = 0
+
     with tracks_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -423,10 +437,20 @@ def compute_all_track_reps(ep_id: str) -> List[Dict[str, Any]]:
             if track_id is None:
                 continue
 
+            tracks_processed += 1
             rep = compute_track_representative(ep_id, track_id)
             if rep:
                 track_reps.append(rep)
+            else:
+                tracks_skipped += 1
 
+    if return_stats:
+        return {
+            "reps": track_reps,
+            "tracks_processed": tracks_processed,
+            "tracks_with_reps": len(track_reps),
+            "tracks_skipped": tracks_skipped,
+        }
     return track_reps
 
 
@@ -789,10 +813,15 @@ def build_cluster_track_reps(
 def generate_track_reps_and_centroids(ep_id: str) -> Dict[str, Any]:
     """Complete pipeline: compute track reps and cluster centroids.
 
-    Returns: Summary with paths and counts
+    Returns: Summary with paths and counts matching expected keys:
+        - tracks_processed: Total tracks attempted
+        - tracks_with_reps: Tracks with valid representatives
+        - tracks_skipped: Tracks skipped (no embeddings)
+        - centroids_computed: Number of cluster centroids computed
     """
     LOGGER.info(f"Generating track representatives for {ep_id}")
-    track_reps_list = compute_all_track_reps(ep_id)
+    track_reps_result = compute_all_track_reps(ep_id, return_stats=True)
+    track_reps_list = track_reps_result["reps"]
     track_reps_map = {rep["track_id"]: rep for rep in track_reps_list}
 
     track_reps_path = write_track_reps(ep_id, track_reps_list)
@@ -803,8 +832,12 @@ def generate_track_reps_and_centroids(ep_id: str) -> Dict[str, Any]:
     centroids_path = write_cluster_centroids(ep_id, centroids)
 
     return {
-        "track_reps_count": len(track_reps_list),
+        # Keys expected by run_refresh_similarity_task
+        "tracks_processed": track_reps_result["tracks_processed"],
+        "tracks_with_reps": track_reps_result["tracks_with_reps"],
+        "tracks_skipped": track_reps_result["tracks_skipped"],
+        "centroids_computed": len(centroids),
+        # Additional paths for debugging/logging
         "track_reps_path": str(track_reps_path),
-        "cluster_centroids_count": len(centroids),
         "cluster_centroids_path": str(centroids_path),
     }

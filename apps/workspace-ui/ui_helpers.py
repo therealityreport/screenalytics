@@ -28,12 +28,12 @@ from streamlit.runtime.scriptrunner.script_requests import RerunData
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DEFAULT_STRIDE = 4
+DEFAULT_STRIDE = 6  # Every 6th frame - balances accuracy vs false positives
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
 DEFAULT_DEVICE = "auto"
 DEFAULT_DEVICE_LABEL = "Auto"
-DEFAULT_DET_THRESH = 0.5
+DEFAULT_DET_THRESH = 0.65  # Raised from 0.5 to reduce false positive face detections
 DEFAULT_MAX_GAP = 60
 DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
@@ -70,18 +70,18 @@ def _env_int(name: str, default: int) -> int:
 
 TRACK_HIGH_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_TRACK_HIGH_THRESH",
-    _env_float("BYTE_TRACK_HIGH_THRESH", 0.45),
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.55),  # Raised from 0.45 - stricter track continuation
 )
 TRACK_NEW_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_NEW_TRACK_THRESH",
-    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.75),  # Raised from 0.60 - much stricter new track creation
 )
 TRACK_BUFFER_BASE_DEFAULT = max(
     _env_int("SCREENALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 30)),
     1,
 )
 MIN_BOX_AREA_DEFAULT = max(
-    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 100.0)),  # Raised from 20 - filter tiny false detections
     0.0,
 )
 
@@ -120,6 +120,44 @@ TRACKER_OPTIONS = [
 TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
 TRACKER_VALUE_MAP = {label: value for label, value in TRACKER_OPTIONS}
 TRACKER_LABEL_MAP = {value: label for label, value in TRACKER_OPTIONS}
+
+# Performance profile settings
+# Higher strides = fewer frames = fewer false detections
+PROFILE_LABELS = ["Low Power", "Balanced", "Performance"]
+PROFILE_VALUE_MAP = {"Low Power": "low_power", "Balanced": "balanced", "Performance": "performance"}
+PROFILE_LABEL_MAP = {v: k for k, v in PROFILE_VALUE_MAP.items()}
+PROFILE_DEFAULTS = {
+    "low_power": {
+        "stride": 12,  # Every 12th frame - fast, fewer false positives
+        "fps": 15.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 2,
+    },
+    "balanced": {
+        "stride": 6,  # Every 6th frame - good balance
+        "fps": 24.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 4,
+    },
+    "performance": {
+        "stride": 4,  # Every 4th frame - thorough
+        "fps": 30.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 8,
+    },
+}
+# Default profile per device type
+DEVICE_DEFAULT_PROFILE = {
+    "coreml": "low_power",  # CoreML: use higher stride to reduce false detections
+    "mps": "low_power",
+    "cpu": "low_power",
+    "cuda": "balanced",  # CUDA can handle more frames
+    "auto": "balanced",
+}
+
 SUPPORTED_PIPELINE_COMBOS = {
     "harvest": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
     "cluster": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
@@ -279,7 +317,16 @@ def _api_base() -> str:
 
 
 def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
-    st.set_page_config(page_title=title, layout="wide")
+    # Set page config with wide layout - use try/except to handle multi-page navigation
+    # where set_page_config may have already been called
+    try:
+        st.set_page_config(page_title=title, layout="wide")
+    except st.errors.StreamlitAPIException:
+        pass  # Already configured, ignore
+
+    # Clear render flags at the start of each page run to allow widgets to be rendered fresh
+    st.session_state.pop("_episode_selector_rendered", None)
+
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
     st.session_state.setdefault("api_base", api_base)
     backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "local").lower()
@@ -360,7 +407,15 @@ def render_sidebar_episode_selector() -> str | None:
     - Defaults to most recently uploaded episode when no ep_id is set
     - Persists selection in st.session_state across page changes
     - Falls back to newest episode if previously selected ep_id no longer exists
+    - Only renders the widget once per page run to avoid duplicate key errors
     """
+    # Guard: only render the selector widget once per page run
+    # This prevents DuplicateWidgetID errors if init_page() is called multiple times
+    _rendered_key = "_episode_selector_rendered"
+    if st.session_state.get(_rendered_key):
+        return st.session_state.get("ep_id")
+    st.session_state[_rendered_key] = True
+
     try:
         episodes_payload = api_get("/episodes")
     except requests.RequestException:
@@ -671,7 +726,7 @@ def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
     try:
         cast_rows = api_get(f"/metadata/shows/{show_slug}/cast")
     except requests.HTTPError as exc:
-        if exc.response.status_code != 404:
+        if exc.response is not None and exc.response.status_code != 404:
             raise
 
     return {
@@ -857,6 +912,56 @@ def remember_tracker(value: str | None) -> None:
     key = (value or "").lower() if value else ""
     if key in TRACKER_LABEL_MAP:
         st.session_state["tracker_choice"] = key
+
+
+# ─── Profile helper functions ───────────────────────────────────────────────
+
+
+def default_profile_for_device(device: str | None) -> str:
+    """Return the default performance profile for a given device type."""
+    if not device:
+        return "balanced"
+    normalized = str(device).strip().lower()
+    return DEVICE_DEFAULT_PROFILE.get(normalized, "balanced")
+
+
+def profile_value_from_state(state_value: str | None) -> str:
+    """Normalize profile value from session state."""
+    if not state_value:
+        return "balanced"
+    normalized = str(state_value).strip().lower()
+    # Handle both value format ("low_power") and label format ("Low Power")
+    if normalized in PROFILE_DEFAULTS:
+        return normalized
+    # Try to map from label
+    return PROFILE_VALUE_MAP.get(state_value, "balanced")
+
+
+def profile_label_index(value: str | None) -> int:
+    """Get the index of a profile value in PROFILE_LABELS."""
+    if not value:
+        return 1  # Default to "Balanced"
+    normalized = str(value).strip().lower()
+    label = PROFILE_LABEL_MAP.get(normalized)
+    if label and label in PROFILE_LABELS:
+        return PROFILE_LABELS.index(label)
+    return 1  # Default to "Balanced"
+
+
+def profile_defaults(profile_value: str | None) -> dict:
+    """Get default settings for a performance profile."""
+    if not profile_value:
+        return PROFILE_DEFAULTS.get("balanced", {})
+    normalized = str(profile_value).strip().lower()
+    return PROFILE_DEFAULTS.get(normalized, PROFILE_DEFAULTS.get("balanced", {}))
+
+
+def profile_label_from_value(value: str | None) -> str:
+    """Convert profile value to display label."""
+    if not value:
+        return "Balanced"
+    normalized = str(value).strip().lower()
+    return PROFILE_LABEL_MAP.get(normalized, "Balanced")
 
 
 def scene_detector_label_index(value: str | None = None) -> int:
@@ -1786,6 +1891,235 @@ def run_job_with_progress(
     finally:
         st.session_state.pop(dedupe_key, None)
         st.session_state.pop(run_id_key, None)
+
+
+# =============================================================================
+# Celery Job Polling (for async pipeline jobs via Redis queue)
+# =============================================================================
+
+
+def run_celery_job_with_progress(
+    ep_id: str,
+    operation: str,
+    payload: Dict[str, Any],
+    *,
+    requested_device: str = "auto",
+    requested_detector: str | None = None,
+    requested_tracker: str | None = None,
+):
+    """Run a job via Celery and poll for completion.
+
+    Uses the /celery_jobs/* endpoints for true async execution via Redis.
+
+    Args:
+        ep_id: Episode ID
+        operation: One of "detect_track", "faces_embed", "cluster"
+        payload: Request payload for the job
+        requested_device: Device string for context display
+        requested_detector: Detector string for context display
+        requested_tracker: Tracker string for context display
+
+    Returns:
+        Tuple of (summary_dict, error_message)
+    """
+    progress_bar = st.progress(0.0)
+    status_placeholder = st.empty()
+    detail_placeholder = st.empty()
+    log_expander = st.expander("Detailed log", expanded=False)
+    with log_expander:
+        log_placeholder = st.empty()
+    log_lines: List[str] = []
+    max_log_lines = 25
+
+    def _mode_context() -> str:
+        parts: List[str] = []
+        if requested_detector:
+            parts.append(f"detector={requested_detector}")
+        if requested_tracker:
+            parts.append(f"tracker={requested_tracker}")
+        if requested_device:
+            parts.append(f"device={requested_device}")
+        return ", ".join(parts) if parts else f"device={requested_device}"
+
+    def _append_log(entry: str) -> None:
+        log_lines.append(entry)
+        if len(log_lines) > max_log_lines:
+            del log_lines[0 : len(log_lines) - max_log_lines]
+        log_placeholder.code("\n\n".join(log_lines), language="text")
+
+    # Map operation to endpoint
+    endpoint_map = {
+        "detect_track": "/celery_jobs/detect_track",
+        "faces_embed": "/celery_jobs/faces_embed",
+        "cluster": "/celery_jobs/cluster",
+    }
+    endpoint = endpoint_map.get(operation)
+    if not endpoint:
+        return None, f"Unknown operation: {operation}"
+
+    _append_log(f"Starting {operation} via Celery ({_mode_context()})...")
+
+    # Start the Celery job
+    try:
+        resp = requests.post(f"{_api_base()}{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        start_result = resp.json()
+    except requests.RequestException as exc:
+        error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+        _append_log(f"Failed to start job: {error_msg}")
+        return None, error_msg
+
+    job_id = start_result.get("job_id")
+    if not job_id:
+        _append_log("Error: No job_id returned from Celery endpoint")
+        return None, "No job_id returned"
+
+    if start_result.get("state") == "already_running":
+        _append_log(f"Job {job_id} is already running for this episode")
+        status_placeholder.info(f"⏳ {operation} job is already running...")
+        # Fall through to poll for completion
+
+    _append_log(f"Job {job_id} queued. Polling for progress...")
+    status_placeholder.info(f"⏳ {operation} job queued via Celery...")
+
+    # Poll for completion
+    poll_url = f"{_api_base()}/celery_jobs/{job_id}"
+    poll_interval = 2.0  # seconds
+    max_poll_time = 3600  # 1 hour max
+    elapsed = 0.0
+    queued_since: float | None = None
+
+    while elapsed < max_poll_time:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        try:
+            poll_resp = requests.get(poll_url, timeout=10)
+            poll_resp.raise_for_status()
+            status_data = poll_resp.json()
+        except requests.RequestException as exc:
+            _append_log(f"Poll error: {exc}")
+            continue
+
+        state = status_data.get("state", "unknown")
+        raw_state = status_data.get("raw_state", "")
+        progress_info = status_data.get("progress") or {}
+
+        if state == "success":
+            progress_bar.progress(1.0)
+            result = status_data.get("result", {})
+            result_status = result.get("status", "success")
+            _append_log(f"Job completed: {result_status}")
+            detail_placeholder.caption(f"Completed in {elapsed:.1f}s")
+
+            # Check if the subprocess actually succeeded
+            if result_status == "error":
+                error_msg = result.get("error", "Subprocess failed")
+                status_placeholder.error(f"❌ {operation} failed: {error_msg}")
+                _append_log(f"Subprocess error: {error_msg}")
+                # Include any stdout/stderr for debugging
+                stdout = result.get("stdout")
+                if stdout:
+                    _append_log(f"Output: {stdout[:500]}")
+                return result.get("progress"), error_msg
+
+            status_placeholder.success(f"✅ {operation} completed successfully")
+
+            # Read progress file for detailed results
+            progress_data = result.get("progress")
+            if progress_data:
+                _append_log(f"Progress data: {progress_data.get('phase', 'done')}")
+                return progress_data, None
+
+            return result, None
+
+        elif state == "failed":
+            progress_bar.progress(1.0)
+            error = status_data.get("error", "Unknown error")
+            status_placeholder.error(f"❌ {operation} failed: {error}")
+            _append_log(f"Job failed: {error}")
+            return None, error
+
+        elif state == "cancelled":
+            progress_bar.progress(1.0)
+            status_placeholder.warning(f"⚠️ {operation} was cancelled")
+            _append_log("Job was cancelled")
+            return None, "Job cancelled"
+
+        elif state == "in_progress":
+            # Update progress display
+            progress_pct = progress_info.get("progress", 0.0)
+            message = progress_info.get("message", f"Running {operation}...")
+            step = progress_info.get("step", operation)
+
+            progress_bar.progress(min(progress_pct, 1.0))
+            status_placeholder.info(f"⏳ {step}: {message}")
+            _append_log(f"Progress: {progress_pct*100:.1f}% - {message}")
+
+        else:
+            # queued, retrying, or unknown
+            status_placeholder.info(f"⏳ {operation}: {state} ({raw_state})")
+            default_msg = (
+                progress_info.get("message")
+                or status_data.get("message")
+                or f"Starting {operation} pipeline..."
+            )
+            # Mirror legacy log style to keep user feedback consistent while waiting for the worker
+            _append_log(f"Progress: 0.0% - {default_msg}")
+            # Detect stuck queued jobs (common when Celery worker or Redis is down)
+            if state in {"queued", "unknown"}:
+                queued_since = queued_since or time.time()
+                if time.time() - queued_since > 60:
+                    error_msg = (
+                        f"{operation} has been queued for over 60s without starting. "
+                        "Check that the Celery worker and Redis are running."
+                    )
+                    status_placeholder.error(f"⚠️ {error_msg}")
+                    _append_log(error_msg)
+                    return None, error_msg
+
+    # Timeout
+    _append_log(f"Job timed out after {max_poll_time}s")
+    return None, f"Job timed out after {max_poll_time}s"
+
+
+def start_celery_job_async(
+    operation: str,
+    payload: Dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Start a Celery job without waiting for completion.
+
+    Returns (job_id, error_message).
+    """
+    endpoint_map = {
+        "detect_track": "/celery_jobs/detect_track",
+        "faces_embed": "/celery_jobs/faces_embed",
+        "cluster": "/celery_jobs/cluster",
+    }
+    endpoint = endpoint_map.get(operation)
+    if not endpoint:
+        return None, f"Unknown operation: {operation}"
+
+    try:
+        resp = requests.post(f"{_api_base()}{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        return result.get("job_id"), None
+    except requests.RequestException as exc:
+        return None, describe_error(f"{_api_base()}{endpoint}", exc)
+
+
+def check_celery_job_status(job_id: str) -> Dict[str, Any] | None:
+    """Check the status of a Celery job.
+
+    Returns status dict or None if error.
+    """
+    try:
+        resp = requests.get(f"{_api_base()}/celery_jobs/{job_id}", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException:
+        return None
 
 
 def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:

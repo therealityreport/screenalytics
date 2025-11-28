@@ -23,8 +23,8 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    task_time_limit=1800,      # 30 min hard cap
-    task_soft_time_limit=1200, # 20 min soft limit
+    task_time_limit=7200,       # 2 hours hard cap (long videos can take 30+ min)
+    task_soft_time_limit=6000,  # 100 min soft limit
     task_track_started=True,   # Track STARTED state
     result_expires=3600,       # Results expire after 1 hour
 )

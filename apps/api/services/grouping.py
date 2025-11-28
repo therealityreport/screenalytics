@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 
@@ -57,7 +57,7 @@ DEFAULT_DATA_ROOT = Path("data").expanduser()
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _parse_ep_id(ep_id: str) -> Optional[Dict[str, Any]]:
@@ -253,7 +253,7 @@ class GroupingService:
             raise ValueError(f"Invalid episode ID: {ep_id}")
         show_id = parsed["show"]
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_id = f"cleanup_{timestamp}"
 
         # Create backup directory

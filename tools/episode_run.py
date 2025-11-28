@@ -4237,7 +4237,7 @@ def _run_detect_track_stage(
                 "detector": detector_choice,
                 "tracker": tracker_choice,
                 "stride": args.stride,
-                "det_thresh": det_thresh,
+                "det_thresh": args.det_thresh,
                 "max_gap": getattr(args, "max_gap", None),
                 "scene_detector": args.scene_detector,
                 "scene_threshold": args.scene_threshold,
