@@ -412,6 +412,44 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
     status_text.empty()
 
 
+def _upload_presigned(upload_url: str, file_obj, headers: dict, content_type: str = "video/mp4") -> None:
+    """Upload file using presigned URL with requests.put (no boto3 required).
+
+    Args:
+        upload_url: Presigned S3 PUT URL
+        file_obj: File-like object supporting read()
+        headers: Headers to include in the PUT request
+        content_type: MIME type for the uploaded file (default: video/mp4)
+    """
+    # Get file size for progress tracking
+    file_obj.seek(0, 2)  # Seek to end
+    file_size = file_obj.tell()
+    file_obj.seek(0)  # Reset to beginning
+
+    # Create progress bar and status
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text(f"Uploading: 0 MB / {file_size / (1024**2):.1f} MB (0%)")
+
+    # Read file data
+    data = file_obj.read()
+
+    # Merge content-type into headers
+    request_headers = dict(headers)
+    request_headers["Content-Type"] = content_type
+
+    # Upload using requests.put with presigned URL
+    response = requests.put(upload_url, data=data, headers=request_headers)
+    response.raise_for_status()
+
+    # Complete the progress bar
+    progress_bar.progress(1.0)
+    status_text.text(f"Upload complete: {file_size / (1024**2):.1f} MB")
+    time.sleep(0.5)  # Brief pause to show completion
+    progress_bar.empty()
+    status_text.empty()
+
+
 def _mirror_local(ep_id: str, file_obj, local_path: str, chunk_size: int = 8 * 1024 * 1024) -> Path | None:
     """Mirror file to local disk using streaming to avoid memory buffering.
 
@@ -597,24 +635,37 @@ if submit:
         st.error(f"Presign failed: {helpers.describe_error(endpoint, exc)}")
         st.stop()
 
+    # Honor the presign contract: check method to determine upload strategy
+    upload_method = presign_resp.get("method", "FILE")
+    upload_url = presign_resp.get("upload_url")
+    upload_headers = presign_resp.get("headers", {})
     bucket = presign_resp.get("bucket")
     key = presign_resp.get("key") or presign_resp.get("object_key")
-    st.info(f"Uploading to s3://{bucket}/{key}" if bucket else f"Writing to {presign_resp['local_video_path']}")
-    if bucket and key:
+
+    if upload_method == "PUT" and upload_url:
+        # S3 presigned URL upload - use requests.put (no boto3 credentials needed)
+        st.info(f"Uploading to s3://{bucket}/{key} via presigned URL...")
         try:
-            _upload_file(bucket, key, uploaded_file)
+            _upload_presigned(upload_url, uploaded_file, upload_headers)
         except Exception as exc:
             st.error(f"Upload failed: {type(exc).__name__}: {exc}")
             _rollback_episode_creation(ep_id)
             st.stop()
         # Seek back to beginning for local mirror after S3 upload
         uploaded_file.seek(0)
+    elif upload_method == "FILE":
+        # Local-only mode - skip remote upload entirely
+        st.info(f"Writing to local storage: {presign_resp['local_video_path']}")
+    else:
+        # Unexpected method - warn but continue with local mirror
+        st.warning(f"Unknown upload method '{upload_method}', falling back to local-only")
 
     try:
         _mirror_local(ep_id, uploaded_file, presign_resp["local_video_path"])
     except OSError as exc:
         st.error(f"Failed to write local copy: {exc}")
-        st.warning("Video uploaded to S3 successfully, but local mirror failed. Check disk space and permissions.")
+        if upload_method == "PUT":
+            st.warning("Video uploaded to S3 successfully, but local mirror failed. Check disk space and permissions.")
         _rollback_episode_creation(ep_id)
         st.stop()
 
@@ -626,7 +677,10 @@ if submit:
     artifacts = {
         "video": get_path(ep_id, "video"),
     }
-    flash_lines = [f"Episode `{ep_id}` uploaded to S3 successfully."]
+    if upload_method == "PUT":
+        flash_lines = [f"Episode `{ep_id}` uploaded to S3 successfully."]
+    else:
+        flash_lines = [f"Episode `{ep_id}` saved locally."]
     flash_lines.append(f"Video -> {helpers.link_local(artifacts['video'])}")
     flash_lines.append("Go to Episode Detail to run detect/track processing.")
 
