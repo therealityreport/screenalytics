@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from apps.api.routers import (
+    archive,
     cast,
     episodes,
     facebank,
@@ -50,6 +51,7 @@ app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
 app.include_router(metadata.router)
+app.include_router(archive.router, tags=["archive"])
 
 # Celery is optional in local dev; guard the import so /healthz stays alive even if
 # celery[redis] is not installed. Expose a 503 stub so callers see a clear error.

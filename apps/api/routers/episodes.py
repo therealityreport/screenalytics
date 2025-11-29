@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Set
 
+import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -23,6 +24,7 @@ from tools import episode_run
 
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
+from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services.storage import (
     StorageService,
@@ -1457,6 +1459,13 @@ class IdentityNameRequest(BaseModel):
     show: str | None = Field(None, description="Optional show slug override")
 
 
+class BulkTrackAssignRequest(BaseModel):
+    track_ids: List[int] = Field(..., min_length=1, description="List of track IDs to assign")
+    name: str = Field(..., min_length=1, max_length=200, description="Name to assign")
+    show: str | None = Field(None, description="Optional show slug override")
+    cast_id: str | None = Field(None, description="Optional cast_id to link assignment")
+
+
 class IdentityMergeRequest(BaseModel):
     source_id: str
     target_id: str
@@ -2516,6 +2525,39 @@ def refresh_similarity_async(ep_id: str, body: RefreshSimilarityRequest = Body(d
         raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
 
 
+@router.post("/episodes/{ep_id}/recover_noise_tracks", tags=["episodes"])
+def recover_noise_tracks(ep_id: str) -> dict:
+    """Recover single-frame tracks by finding similar faces in adjacent frames.
+
+    For each track that has only 1 face (single-frame track):
+    1. Searches ±8 frames for similar faces (cosine similarity >= 0.70)
+    2. Merges matching faces into the single-frame track
+    3. Updates faces.jsonl and tracks.jsonl with new assignments
+
+    This helps convert "noise" clusters (single-frame-only) into reviewable clusters.
+
+    Returns:
+        tracks_analyzed: Number of single-frame tracks examined
+        tracks_expanded: Number of tracks that were expanded
+        faces_merged: Total faces added to tracks
+        details: List of {track_id, original_frame, added_frames}
+    """
+    from apps.api.services.track_recovery import recover_single_frame_tracks
+
+    try:
+        result = recover_single_frame_tracks(ep_id)
+
+        # After recovery, refresh similarity indexes for affected tracks
+        if result.get("tracks_expanded", 0) > 0:
+            affected_track_ids = [d["track_id"] for d in result.get("details", [])]
+            _refresh_similarity_indexes(ep_id, track_ids=affected_track_ids)
+
+        return result
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to recover noise tracks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get(
     "/episodes/{ep_id}/video_meta",
     response_model=EpisodeVideoMeta,
@@ -2682,26 +2724,41 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
         ep_ctx = episode_context_from_id(ep_id)
         show_slug = ep_ctx.show_slug.upper()
 
-        # Load people data
-        from apps.api.services.people import PeopleService
+        # Load identities first - we need this regardless of person lookup
+        identities_data = _load_identities(ep_id)
+        identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
 
+        # Try to find clusters via person registry first
+        episode_clusters = []
+
+        from apps.api.services.people import PeopleService
         people_service = PeopleService()
         person = people_service.get_person(show_slug, person_id)
 
-        if not person:
-            raise HTTPException(status_code=404, detail="Person not found")
+        if person:
+            # Person exists in registry - use their cluster_ids
+            cluster_ids = person.get("cluster_ids", []) if isinstance(person, dict) else []
+            if not isinstance(cluster_ids, list):
+                LOGGER.warning(f"cluster_ids is not a list: {type(cluster_ids)}, value: {cluster_ids}")
+                cluster_ids = []
 
-        # Filter cluster IDs for this episode
-        cluster_ids = person.get("cluster_ids", []) if isinstance(person, dict) else []
-        if not isinstance(cluster_ids, list):
-            LOGGER.warning(f"cluster_ids is not a list: {type(cluster_ids)}, value: {cluster_ids}")
-            cluster_ids = []
+            episode_clusters = [
+                cid.split(":", 1)[1] if ":" in cid else cid
+                for cid in cluster_ids
+                if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
+            ]
+        else:
+            # Person not in registry - find identities assigned to this person_id
+            # This handles auto-clustered people that don't have person records yet
+            LOGGER.info(f"Person {person_id} not in registry, checking identities for this episode")
+            for ident in identities_list:
+                if isinstance(ident, dict) and ident.get("person_id") == person_id:
+                    identity_id = ident.get("identity_id")
+                    if identity_id:
+                        episode_clusters.append(identity_id)
 
-        episode_clusters = [
-            cid.split(":", 1)[1] if ":" in cid else cid
-            for cid in cluster_ids
-            if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
-        ]
+            if not episode_clusters:
+                raise HTTPException(status_code=404, detail="Person not found")
 
         if not episode_clusters:
             return {
@@ -2715,15 +2772,7 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
         track_reps = load_track_reps(ep_id)
         cluster_centroids = load_cluster_centroids(ep_id)
 
-        # Load identities for face counts
-        identities_data = _load_identities(ep_id)
-        LOGGER.info(
-            f"identities_data type: {type(identities_data)}, keys: {list(identities_data.keys()) if isinstance(identities_data, dict) else 'not a dict'}"
-        )
-        identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
-        LOGGER.info(
-            f"identities_list type: {type(identities_list)}, length: {len(identities_list) if isinstance(identities_list, list) else 'not a list'}"
-        )
+        # Build identity index for face counts (identities_list already loaded above)
         identity_index = {}
         for ident in identities_list:
             if isinstance(ident, dict) and "identity_id" in ident:
@@ -3138,6 +3187,37 @@ def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> d
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/episodes/{ep_id}/tracks/bulk_assign")
+def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
+    """Bulk assign multiple tracks to a cast member by name.
+
+    This creates or updates identity assignments for each track, similar to
+    calling assign_track_name for each track individually but more efficient.
+    """
+    assigned = 0
+    failed = 0
+    errors: list[str] = []
+
+    for track_id in body.track_ids:
+        try:
+            identity_service.assign_track_name(
+                ep_id, track_id, body.name, body.show, body.cast_id
+            )
+            assigned += 1
+        except ValueError as exc:
+            failed += 1
+            errors.append(f"track {track_id}: {exc}")
+        except Exception as exc:
+            failed += 1
+            errors.append(f"track {track_id}: {exc}")
+
+    return {
+        "assigned": assigned,
+        "failed": failed,
+        "errors": errors if errors else None,
+    }
+
+
 @router.post("/episodes/{ep_id}/identities/merge")
 def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
     payload = _load_identities(ep_id)
@@ -3220,18 +3300,199 @@ def move_faces(ep_id: str, body: FaceMoveRequest) -> dict:
     return result
 
 
+@router.post("/episodes/{ep_id}/frames/{frame_idx}/overlay")
+def generate_frame_overlay(ep_id: str, frame_idx: int) -> dict:
+    """Generate a full-frame image with bounding boxes for all faces in that frame.
+
+    This extracts the frame from the video, draws colored bounding boxes for each
+    track present in that frame, and saves the result as an overlay image.
+
+    Returns:
+        {
+            "url": "path/to/overlay.jpg",
+            "frame_idx": 804,
+            "tracks": [{"track_id": 1, "bbox": [x1,y1,x2,y2]}, ...]
+        }
+    """
+    import hashlib
+    import numpy as np
+
+    # Load faces for this episode
+    faces = identity_service.load_faces(ep_id)
+    if not faces:
+        raise HTTPException(status_code=404, detail="No faces found for episode")
+
+    # Filter to faces in the requested frame
+    frame_faces = [f for f in faces if f.get("frame_idx") == frame_idx]
+    if not frame_faces:
+        raise HTTPException(status_code=404, detail=f"No faces found in frame {frame_idx}")
+
+    # Get video path
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    # Extract the frame from video
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=404, detail=f"Could not read frame {frame_idx}")
+
+        # Draw bounding boxes for each face/track
+        # Use different colors for different tracks
+        colors = [
+            (66, 133, 244),   # Blue
+            (52, 168, 83),    # Green
+            (251, 188, 4),    # Yellow
+            (234, 67, 53),    # Red
+            (154, 0, 255),    # Purple
+            (0, 188, 212),    # Cyan
+            (255, 152, 0),    # Orange
+            (156, 39, 176),   # Deep Purple
+        ]
+
+        track_info = []
+        track_ids_seen = set()
+        for face in frame_faces:
+            track_id = face.get("track_id")
+            bbox = face.get("bbox_xyxy")
+            if track_id is None or not bbox:
+                continue
+
+            # Get color based on track_id
+            color_idx = track_id % len(colors)
+            color = colors[color_idx]
+
+            # Draw bbox
+            try:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # Add track ID label
+                label = f"T{track_id}"
+                font_scale = 0.6
+                thickness = 2
+                (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+                # Draw label background
+                cv2.rectangle(frame, (x1, y1 - label_h - 4), (x1 + label_w + 4, y1), color, -1)
+                cv2.putText(frame, label, (x1 + 2, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+                if track_id not in track_ids_seen:
+                    track_info.append({"track_id": track_id, "bbox": bbox})
+                    track_ids_seen.add(track_id)
+            except (TypeError, ValueError):
+                continue
+
+        # Save overlay image locally first
+        import tempfile
+        overlay_filename = f"frame_{frame_idx:06d}_overlay.jpg"
+
+        # Create temp file for the overlay
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        success = cv2.imwrite(str(tmp_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not success:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="Failed to save overlay image")
+
+        # Upload to S3 and get presigned URL
+        try:
+            # S3 key for overlays: artifacts/{ep_id}/overlays/frame_XXXXXX_overlay.jpg
+            s3_key = f"artifacts/{ep_id}/overlays/{overlay_filename}"
+
+            # Upload using STORAGE service
+            if STORAGE.backend in {"s3", "minio"} and STORAGE._client is not None:
+                extra_args = {"ContentType": "image/jpeg"}
+                STORAGE._client.upload_file(
+                    str(tmp_path),
+                    STORAGE.bucket,
+                    s3_key,
+                    ExtraArgs=extra_args,
+                )
+                # Get presigned URL
+                url = STORAGE.presign_get(s3_key, expires_in=3600)
+                if not url:
+                    raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+            else:
+                # Local mode - save to artifacts directory
+                artifacts_dir = get_path(ep_id, "frames_root").parent / "overlays"
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                local_path = artifacts_dir / overlay_filename
+                import shutil
+                shutil.copy(tmp_path, local_path)
+                url = str(local_path)
+        finally:
+            # Clean up temp file
+            tmp_path.unlink(missing_ok=True)
+
+        return {
+            "url": url,
+            "frame_idx": frame_idx,
+            "tracks": track_info,
+        }
+    finally:
+        cap.release()
+
+
 @router.delete("/episodes/{ep_id}/identities/{identity_id}")
 def delete_identity(ep_id: str, identity_id: str) -> dict:
+    """Delete (archive) an identity/cluster.
+
+    The cluster is moved to the archive where its centroid is stored.
+    This allows matching faces in future episodes to be auto-archived.
+    """
     payload = _load_identities(ep_id)
     identities = payload.get("identities", [])
-    before = len(identities)
-    payload["identities"] = [item for item in identities if item.get("identity_id") != identity_id]
-    if len(payload["identities"]) == before:
+
+    # Find the identity to archive before deleting
+    identity_to_delete = None
+    for item in identities:
+        if item.get("identity_id") == identity_id:
+            identity_to_delete = item
+            break
+
+    if not identity_to_delete:
         raise HTTPException(status_code=404, detail="Identity not found")
+
+    # Extract show_id from episode_id (e.g., "rhoslc-s06e02" -> "RHOSLC")
+    show_id = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
+
+    # Archive the cluster with its centroid for future matching
+    try:
+        centroid = identity_to_delete.get("centroid")
+        rep_crop_url = identity_to_delete.get("rep_crop_url")
+        track_ids = identity_to_delete.get("track_ids", [])
+        face_count = identity_to_delete.get("face_count", 0)
+
+        archive_service.archive_cluster(
+            show_id=show_id,
+            episode_id=ep_id,
+            cluster_id=identity_id,
+            reason="user_deleted",
+            centroid=centroid,
+            rep_crop_url=rep_crop_url,
+            track_ids=track_ids,
+            face_count=face_count,
+        )
+        LOGGER.info(f"Archived cluster {identity_id} before deletion")
+    except Exception as e:
+        LOGGER.warning(f"Failed to archive cluster {identity_id}: {e}")
+        # Continue with deletion even if archive fails
+
+    # Remove the identity
+    payload["identities"] = [item for item in identities if item.get("identity_id") != identity_id]
     _update_identity_stats(ep_id, payload)
     path = _write_identities(ep_id, payload)
     _sync_manifests(ep_id, path)
-    return {"deleted": identity_id, "remaining": len(payload["identities"])}
+
+    return {"deleted": identity_id, "archived": True, "remaining": len(payload["identities"])}
 
 
 @router.delete("/episodes/{ep_id}/tracks/{track_id}")

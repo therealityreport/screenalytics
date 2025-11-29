@@ -1590,7 +1590,7 @@ class GroupingService:
 
         # Load cast data for names
         cast_service = CastService()
-        cast_list = cast_service.get_cast(show_id)
+        cast_list = cast_service.list_cast(show_id)
         cast_by_id = {c.get("cast_id"): c for c in cast_list}
 
         results = []
@@ -1894,14 +1894,15 @@ class GroupingService:
         min_similarity: float = 0.50,
         top_k: int = 3,
     ) -> Dict[str, Any]:
-        """Suggest cast members for unassigned clusters based on facebank similarity.
+        """Suggest cast members for unassigned clusters based on episode-assigned clusters.
 
         For each unassigned cluster:
-        1. Load all cast member facebanks for the show
-        2. Compute cosine similarity: cluster_centroid vs each seed embedding
-        3. Take best match per cast member (highest similarity seed)
-        4. Rank cast members by best match score
-        5. Return top_k suggestions with confidence %
+        1. Find clusters already assigned to cast members in THIS episode
+        2. Load face embeddings from those assigned clusters
+        3. Compute cosine similarity: unassigned centroid vs assigned face embeddings
+        4. Take best match per cast member (highest similarity)
+        5. Fall back to facebank seeds if no episode assignments exist
+        6. Return top_k suggestions with confidence %
 
         Args:
             ep_id: Episode ID
@@ -1929,7 +1930,7 @@ class GroupingService:
             raise ValueError(f"Invalid episode ID: {ep_id}")
         show_id = parsed["show"]
 
-        # Load identities to find unassigned clusters
+        # Load identities to find assigned/unassigned clusters
         identities_path = self._identities_path(ep_id)
         if not identities_path.exists():
             raise FileNotFoundError(f"identities.json not found for {ep_id}")
@@ -1944,39 +1945,104 @@ class GroupingService:
         except FileNotFoundError:
             return {"suggestions": [], "message": "No centroids found. Run clustering first."}
 
-        # Get all seeds for the show
-        seeds = self.facebank_service.get_all_seeds_for_show(show_id)
-        if not seeds:
-            return {"suggestions": [], "message": f"No facebank seeds available for show {show_id}"}
-
         # Get cast member names for display
         cast_members = self.cast_service.list_cast(show_id)
         cast_lookup = {member["cast_id"]: member for member in cast_members if member.get("cast_id")}
 
-        # Group seeds by cast_id
-        seeds_by_cast: Dict[str, List[Dict[str, Any]]] = {}
-        for seed in seeds:
-            cast_id = seed.get("cast_id")
-            if cast_id and seed.get("embedding"):
-                seeds_by_cast.setdefault(cast_id, []).append(seed)
-
-        # Load people to check which have cast_id assigned
+        # Load people to get person_id -> cast_id mapping
         people = self.people_service.list_people(show_id)
-        people_with_cast = {p.get("person_id") for p in people if p.get("cast_id")}
+        person_to_cast: Dict[str, str] = {}
+        for p in people:
+            if p.get("person_id") and p.get("cast_id"):
+                person_to_cast[p["person_id"]] = p["cast_id"]
+        people_with_cast = set(person_to_cast.keys())
 
-        # Find clusters needing suggestions:
-        # 1. No person_id (completely unassigned)
-        # 2. Has person_id but that person has no cast_id (auto-detected people)
+        # Separate clusters into assigned (to cast) and needing suggestions
         clusters_needing_suggestions = []
+        assigned_clusters_by_cast: Dict[str, List[str]] = {}  # cast_id -> [cluster_ids]
+        cluster_to_tracks: Dict[str, List[int]] = {}  # cluster_id -> [track_ids]
+
         for identity in identities:
             cluster_id = identity.get("identity_id")
             person_id = identity.get("person_id")
+            track_ids = identity.get("track_ids", [])
+
             if cluster_id not in centroids_map:
                 continue
-            # Include if no person, OR person has no cast_id
-            if not person_id or person_id not in people_with_cast:
+
+            # Store track mapping for all clusters
+            cluster_to_tracks[cluster_id] = [int(tid) for tid in track_ids]
+
+            if person_id and person_id in people_with_cast:
+                # This cluster is assigned to a cast member
+                cast_id = person_to_cast[person_id]
+                assigned_clusters_by_cast.setdefault(cast_id, []).append(cluster_id)
+            else:
+                # This cluster needs suggestions
                 clusters_needing_suggestions.append(cluster_id)
 
+        # Build reverse map: track_id -> cast_id for fast embedding lookups
+        track_to_cast: Dict[int, str] = {}
+        for cast_id, cluster_ids in assigned_clusters_by_cast.items():
+            for cid in cluster_ids:
+                for tid in cluster_to_tracks.get(cid, []):
+                    track_to_cast[tid] = cast_id
+
+        # Load face embeddings from episode, grouped by cast_id
+        embeddings_by_cast: Dict[str, List[np.ndarray]] = {}
+        faces_path = self._faces_path(ep_id)
+
+        if faces_path.exists() and track_to_cast:
+            with faces_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        face = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    track_id = face.get("track_id")
+                    embedding = face.get("embedding")
+                    if track_id is None or not embedding:
+                        continue
+
+                    # Check if this track belongs to an assigned cast member
+                    cast_id = track_to_cast.get(int(track_id))
+                    if cast_id:
+                        emb_vec = np.array(embedding, dtype=np.float32)
+                        embeddings_by_cast.setdefault(cast_id, []).append(emb_vec)
+
+        LOGGER.info(
+            f"[{ep_id}] Loaded episode embeddings for {len(embeddings_by_cast)} cast members "
+            f"({sum(len(v) for v in embeddings_by_cast.values())} total faces)"
+        )
+
+        # Fall back to facebank seeds for cast members without episode assignments
+        seeds_by_cast: Dict[str, List[np.ndarray]] = {}
+        if len(embeddings_by_cast) < len(cast_lookup):
+            seeds = self.facebank_service.get_all_seeds_for_show(show_id)
+            for seed in seeds:
+                cast_id = seed.get("cast_id")
+                if cast_id and seed.get("embedding") and cast_id not in embeddings_by_cast:
+                    emb_vec = np.array(seed["embedding"], dtype=np.float32)
+                    seeds_by_cast.setdefault(cast_id, []).append(emb_vec)
+            if seeds_by_cast:
+                LOGGER.info(f"[{ep_id}] Using facebank seeds for {len(seeds_by_cast)} cast members without episode assignments")
+
+        # Combine episode embeddings with facebank fallback
+        all_embeddings_by_cast: Dict[str, List[np.ndarray]] = {}
+        for cast_id in cast_lookup:
+            if cast_id in embeddings_by_cast:
+                all_embeddings_by_cast[cast_id] = embeddings_by_cast[cast_id]
+            elif cast_id in seeds_by_cast:
+                all_embeddings_by_cast[cast_id] = seeds_by_cast[cast_id]
+
+        if not all_embeddings_by_cast:
+            return {"suggestions": [], "message": "No assigned clusters or facebank seeds available for comparison"}
+
+        # Generate suggestions
         suggestions = []
         for cluster_id in clusters_needing_suggestions:
             centroid_data = centroids_map.get(cluster_id)
@@ -1987,16 +2053,13 @@ class GroupingService:
 
             # Find best similarity per cast member
             cast_matches: List[Dict[str, Any]] = []
-            for cast_id, cast_seeds in seeds_by_cast.items():
+            for cast_id, cast_embeddings in all_embeddings_by_cast.items():
                 best_sim = -1.0
-                best_seed_id = None
 
-                for seed in cast_seeds:
-                    seed_emb = np.array(seed["embedding"], dtype=np.float32)
-                    sim = cosine_similarity(centroid_vec, seed_emb)
+                for emb in cast_embeddings:
+                    sim = cosine_similarity(centroid_vec, emb)
                     if sim > best_sim:
                         best_sim = sim
-                        best_seed_id = seed.get("fb_id")
 
                 if best_sim >= min_similarity:
                     cast_meta = cast_lookup.get(cast_id, {})
@@ -2010,12 +2073,15 @@ class GroupingService:
                     else:
                         confidence = "low"
 
+                    # Indicate source of embeddings
+                    source = "episode" if cast_id in embeddings_by_cast else "facebank"
+
                     cast_matches.append({
                         "cast_id": cast_id,
                         "name": cast_name,
                         "similarity": round(float(best_sim), 3),
                         "confidence": confidence,
-                        "best_seed_id": best_seed_id,
+                        "source": source,
                     })
 
             # Sort by similarity (descending) and take top_k

@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+from apps.api.services.archive import archive_service
 from apps.api.services.people import PeopleService
 from apps.api.services.storage import StorageService
 
@@ -134,11 +135,38 @@ def update_person(show_id: str, person_id: str, body: PersonUpdateRequest) -> Pe
 
 @router.delete("/shows/{show_id}/people/{person_id}")
 def delete_person(show_id: str, person_id: str) -> dict:
-    """Delete a person."""
+    """Delete (archive) a person.
+
+    The person is moved to the archive where their centroid is stored.
+    This allows matching faces in future episodes to be auto-archived.
+    """
+    # Get person data before deleting (for archive)
+    person = people_service.get_person(show_id, person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
+
+    # Archive the person with their centroid for future matching
+    try:
+        centroid = person.get("prototype")  # Person's prototype embedding
+        rep_crop_url = person.get("rep_crop_url")
+        archive_service.archive_person(
+            show_id=show_id,
+            person_data=person,
+            reason="user_deleted",
+            centroid=centroid,
+            rep_crop_url=rep_crop_url,
+        )
+        LOGGER.info(f"Archived person {person_id} before deletion")
+    except Exception as e:
+        LOGGER.warning(f"Failed to archive person {person_id}: {e}")
+        # Continue with deletion even if archive fails
+
+    # Delete the person
     success = people_service.delete_person(show_id, person_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-    return {"status": "deleted", "person_id": person_id}
+
+    return {"status": "archived_and_deleted", "person_id": person_id}
 
 
 @router.post("/shows/{show_id}/people/merge")

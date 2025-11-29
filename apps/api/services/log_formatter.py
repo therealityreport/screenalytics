@@ -129,6 +129,16 @@ class LogFormatter:
         re.compile(r'^\[LOCAL MODE\] (faces_embed|cluster) (starting|config)', re.IGNORECASE),  # Duplicate start messages
         re.compile(r'^device=\w+,\s*cluster_thresh='),  # Duplicate cluster config
         re.compile(r'^faces_total=\d+'),  # Duplicate faces count
+        # Faces embed per-frame debug noise (very frequent)
+        re.compile(r'^\[EMBED\]\s+Frame\s+\d+:', re.IGNORECASE),  # [EMBED] Frame 123: embedding X faces...
+        # Initialization messages (shown in config block instead)
+        re.compile(r'^\[INIT\]\s+', re.IGNORECASE),  # [INIT] Loading ArcFace embedder...
+        # Standalone config lines
+        re.compile(r'^device=\w+$'),  # device=coreml (standalone)
+        re.compile(r'^min_face_size='),  # min_face_size=20.0
+        re.compile(r'^cpu_threads=\d+$'),  # cpu_threads=2 (standalone)
+        re.compile(r'^save_crops='),  # save_crops=True, save_frames=False
+        re.compile(r'^total_frames=\d+$'),  # total_frames=61494 (standalone)
     ]
 
     # Pattern for warnings.warn( which appears as a standalone line
@@ -487,17 +497,21 @@ def format_config_block(
     stride: int | None = None,
     total_frames: int | None = None,
     fps: float | None = None,
-    cpulimit_percent: int | None = None,
+    thermal_limit_info: str | None = None,
 ) -> str:
     """Generate a canonical config block for the start of a run.
 
     This replaces all the scattered config lines with a single, clean summary.
 
+    Args:
+        thermal_limit_info: String describing thermal limiter, e.g. "taskpolicy -c utility"
+                           or "cpulimit 200%". None if no thermal limiting applied.
+
     Example output:
         [LOCAL MODE] Detect/Track started for rhoslc-s06e08
           Device: COREML  •  Profile: Balanced  •  Stride: 6
           Total: 2,868 frames @ 23.98 fps
-          CPU threads: 2 (capped for thermal safety, cpulimit=200%)
+          CPU threads: 2 (capped for thermal safety, taskpolicy -c utility)
     """
     op_label = {
         "detect_track": "Detect/Track",
@@ -523,8 +537,8 @@ def format_config_block(
 
     # CPU threads line
     thread_info = f"  CPU threads: {cpu_threads}"
-    if cpulimit_percent is not None and cpulimit_percent > 0:
-        thread_info += f" (capped for thermal safety, cpulimit={cpulimit_percent}%)"
+    if thermal_limit_info:
+        thread_info += f" (capped for thermal safety, {thermal_limit_info})"
     else:
         thread_info += " (capped for thermal safety)"
     lines.append(thread_info)

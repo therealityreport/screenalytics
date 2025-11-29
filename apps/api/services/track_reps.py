@@ -744,6 +744,7 @@ def build_cluster_track_reps(
                         "crop_key": None,
                         "similarity": None,
                         "quality": None,
+                        "embedding": None,
                     }
                 )
                 continue
@@ -755,6 +756,7 @@ def build_cluster_track_reps(
                     "crop_key": rep.get("crop_key"),
                     "similarity": None,  # No centroid to compare against
                     "quality": rep.get("quality"),
+                    "embedding": rep.get("embed"),  # Include embedding for cross-track scoring
                 }
             )
 
@@ -783,6 +785,7 @@ def build_cluster_track_reps(
                     "crop_key": None,
                     "similarity": None,
                     "quality": None,
+                    "embedding": None,
                 }
             )
             continue
@@ -798,6 +801,7 @@ def build_cluster_track_reps(
                 "crop_key": rep.get("crop_key"),
                 "similarity": round(float(similarity), 3),
                 "quality": rep.get("quality"),
+                "embedding": rep.get("embed"),  # Include embedding for cross-track scoring
             }
         )
 

@@ -14,26 +14,20 @@ st.caption("Launch the upload helper or jump into any workspace page. Configure 
 
 nav_cols = st.columns(2)
 with nav_cols[0]:
-    if st.button("Upload Video", use_container_width=True):
-        helpers.try_switch_page("pages/0_Upload_Video.py")
+    st.page_link("pages/0_Upload_Video.py", label="Upload Video", icon="⏫")
 with nav_cols[1]:
-    if st.button("Episodes Browser", use_container_width=True):
-        helpers.try_switch_page("pages/1_Episodes.py")
+    st.page_link("pages/1_Episodes.py", label="Episodes Browser", icon="🎞️")
 
 more_cols = st.columns(2)
 with more_cols[0]:
-    if st.button("Episode Detail", use_container_width=True):
-        helpers.try_switch_page("pages/2_Episode_Detail.py")
+    st.page_link("pages/2_Episode_Detail.py", label="Episode Detail", icon="📺")
 with more_cols[1]:
-    if st.button("Cast Management", use_container_width=True):
-        helpers.try_switch_page("pages/4_Cast.py")
+    st.page_link("pages/4_Cast.py", label="Cast Management", icon="🎭")
 
 st.divider()
 st.caption("Need more tools?")
 misc_cols = st.columns(2)
 with misc_cols[0]:
-    if st.button("Faces Review", use_container_width=True):
-        helpers.try_switch_page("pages/3_Faces_Review.py")
+    st.page_link("pages/3_Faces_Review.py", label="Faces Review", icon="👁️")
 with misc_cols[1]:
-    if st.button("Screentime & Health", use_container_width=True):
-        helpers.try_switch_page("pages/4_Screentime.py")
+    st.page_link("pages/4_Screentime.py", label="Screentime & Health", icon="⏱️")

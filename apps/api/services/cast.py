@@ -181,10 +181,13 @@ class CastService:
         cast_members = data.get("cast", [])
 
         if season:
-            # Filter by season (case-insensitive)
+            # Filter by season (case-insensitive). Empty seasons list = all seasons.
             season_lower = season.lower()
             cast_members = [
-                member for member in cast_members if any(s.lower() == season_lower for s in member.get("seasons", []))
+                member
+                for member in cast_members
+                if not member.get("seasons")  # blank seasons means all seasons
+                or any(s.lower() == season_lower for s in member.get("seasons", []))
             ]
 
         return cast_members

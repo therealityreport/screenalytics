@@ -765,6 +765,8 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     # Clear render flags at the start of each page run to allow widgets to be rendered fresh
     st.session_state.pop("_episode_selector_rendered", None)
 
+    inject_custom_fonts()
+
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
     st.session_state.setdefault("api_base", api_base)
     backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
@@ -792,6 +794,10 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     st.session_state.setdefault("scene_detector_choice", SCENE_DETECTOR_DEFAULT)
 
     sidebar = st.sidebar
+    # Episode selector at top of sidebar (with lock)
+    render_sidebar_episode_selector()
+
+    render_workspace_nav()
     sidebar.header("API")
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
@@ -887,15 +893,20 @@ def render_sidebar_episode_selector() -> str | None:
 
     episodes = sorted(episodes, key=sort_key, reverse=True)
 
-    # Determine current ep_id
-    current_ep_id = st.session_state.get("ep_id", "")
+    # Determine current ep_id with lock support
     ep_ids = [ep["ep_id"] for ep in episodes]
+    locked = bool(st.session_state.get("ep_locked", True))
+    locked_ep_id = st.session_state.get("locked_ep_id", "")
+    current_ep_id = st.session_state.get("ep_id", "")
 
-    # If current ep_id doesn't exist in list, fallback to most recent
-    if current_ep_id and current_ep_id not in ep_ids:
-        current_ep_id = ep_ids[0]  # Most recent episode
-    elif not current_ep_id:
-        current_ep_id = ep_ids[0]  # Default to most recent
+    if locked and locked_ep_id in ep_ids:
+        current_ep_id = locked_ep_id
+    else:
+        # If current ep_id doesn't exist in list, fallback to most recent
+        if current_ep_id and current_ep_id not in ep_ids:
+            current_ep_id = ep_ids[0]  # Most recent episode
+        elif not current_ep_id:
+            current_ep_id = ep_ids[0]  # Default to most recent
 
     # Build labels for selectbox
     def format_label(ep: Dict[str, Any]) -> str:
@@ -916,18 +927,43 @@ def render_sidebar_episode_selector() -> str | None:
     except ValueError:
         current_index = 0
 
+    # Header + lock toggle
+    header_cols = st.sidebar.columns([4, 1])
+    header_cols[0].markdown("**Episode**")
+    lock_label = "🔒" if locked else "💾"
+    lock_help = "Unlock to change episode" if locked else "Lock selection across page reloads"
+    toggle = header_cols[1].button(lock_label, key="ep_lock_toggle", help=lock_help)
+    if toggle:
+        if locked:
+            st.session_state["ep_locked"] = False
+            st.session_state["locked_ep_id"] = ""
+            locked = False
+            locked_ep_id = ""
+        else:
+            st.session_state["ep_locked"] = True
+            st.session_state["locked_ep_id"] = current_ep_id
+            locked = True
+            locked_ep_id = current_ep_id
+
     # Render selectbox in sidebar
     selected_ep_id = st.sidebar.selectbox(
-        "Episode",
+        f"Episode {'🔒' if locked else '🔓'}",
         options=ep_ids,
         format_func=lambda eid: labels.get(eid, eid),
         index=current_index,
         key="global_episode_selector",
+        disabled=locked,
     )
 
-    # Update session state if selection changed
-    if selected_ep_id != current_ep_id:
+    # Update session state if selection changed (and not locked)
+    if not locked and selected_ep_id != current_ep_id:
         set_ep_id(selected_ep_id, rerun=False)
+        current_ep_id = selected_ep_id
+
+    # Keep locked ep_id consistent
+    if locked:
+        st.session_state["locked_ep_id"] = current_ep_id
+        set_ep_id(current_ep_id, rerun=False)
 
     # Cache clear button
     st.sidebar.divider()
@@ -995,6 +1031,168 @@ def api_delete(path: str, **kwargs) -> Dict[str, Any]:
 ASYNC_JOB_KEY = "_async_job"
 
 
+def _run_local_job_with_progress(
+    base: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+    episode_id: str,
+    progress_endpoint: str,
+) -> Optional[Dict[str, Any]]:
+    """Run a local-mode job with real-time progress polling.
+
+    Uses a background thread to make the HTTP request while the main thread
+    polls for progress updates and displays them in a Streamlit status container.
+
+    Args:
+        base: API base URL
+        endpoint: API endpoint for the job
+        payload: Request payload
+        operation: Operation name for display
+        episode_id: Episode ID
+        progress_endpoint: Endpoint to poll for progress
+
+    Returns:
+        Response dict from the API, or None if failed
+    """
+    import queue
+
+    # Shared state between threads
+    result_queue: queue.Queue = queue.Queue()
+
+    def _run_request():
+        """Background thread to run the HTTP request."""
+        try:
+            resp = requests.post(f"{base}{endpoint}", json=payload, timeout=600)
+            resp.raise_for_status()
+            result_queue.put(("success", resp.json()))
+        except requests.RequestException as e:
+            result_queue.put(("error", str(e)))
+        except Exception as e:
+            result_queue.put(("error", str(e)))
+
+    # Start the request in a background thread
+    worker = threading.Thread(target=_run_request, daemon=True)
+    worker.start()
+
+    # Use st.status for expandable progress display
+    with st.status(f"Running {operation} (local mode)...", expanded=True) as status:
+        last_step = ""
+        last_progress = 0.0
+        poll_count = 0
+        max_polls = 1200  # 10 minutes at 0.5s intervals
+
+        while worker.is_alive() and poll_count < max_polls:
+            poll_count += 1
+
+            # Check if we have a result
+            try:
+                result_type, result_data = result_queue.get_nowait()
+                break
+            except queue.Empty:
+                pass
+
+            # Poll for progress
+            try:
+                progress_resp = requests.get(f"{base}{progress_endpoint}", timeout=5)
+                if progress_resp.status_code == 200:
+                    progress_data = progress_resp.json()
+                    entries = progress_data.get("entries", [])
+
+                    if entries:
+                        latest = entries[-1]
+                        step = latest.get("step", "")
+                        progress = latest.get("progress", 0)
+                        message = latest.get("message", "")
+
+                        # Update status display
+                        if step != last_step or progress != last_progress:
+                            pct = int(progress * 100)
+                            status.update(label=f"{operation}: {step} ({pct}%)")
+                            st.write(f"**{step}**: {message}")
+                            last_step = step
+                            last_progress = progress
+
+                    # Check if finished
+                    if progress_data.get("finished"):
+                        if progress_data.get("error"):
+                            status.update(label=f"{operation} failed", state="error")
+                            st.error(f"Error: {progress_data.get('error')}")
+                        break
+            except requests.RequestException:
+                pass  # Progress polling failed, continue waiting
+
+            time.sleep(0.5)
+
+        # Wait for thread to finish if still running
+        worker.join(timeout=5)
+
+        # Get final result
+        try:
+            result_type, result_data = result_queue.get(timeout=1)
+        except queue.Empty:
+            status.update(label=f"{operation} timed out", state="error")
+            st.error(f"Job timed out after {max_polls * 0.5:.0f} seconds")
+            return None
+
+        if result_type == "error":
+            status.update(label=f"{operation} failed", state="error")
+            st.error(f"Failed: {result_data}")
+            return None
+
+        # Success - show detailed results
+        data = result_data
+        job_status = data.get("status", "")
+        result = data.get("result", {})
+
+        if job_status in ("completed", "success"):
+            status.update(label=f"✅ {operation} complete!", state="complete", expanded=True)
+
+            # Show summary stats
+            if result:
+                summary = result.get("summary", result)
+                clusters = summary.get("clusters", summary.get("total_clusters", 0))
+                identities = summary.get("identities", 0)
+                assigned = summary.get("assignments_count", summary.get("assigned_clusters", 0))
+                new_people = summary.get("new_people_count", 0)
+
+                cols = st.columns(4)
+                cols[0].metric("Clusters", clusters)
+                cols[1].metric("Assigned", assigned)
+                cols[2].metric("New People", new_people)
+                cols[3].metric("Identities", identities)
+
+            # Show detailed log if available
+            progress_log = data.get("progress_log", [])
+            log_data = result.get("log", {})
+
+            if log_data and log_data.get("steps"):
+                with st.expander("📋 Detailed Log", expanded=False):
+                    log_lines = []
+                    for step_info in log_data.get("steps", []):
+                        step_name = step_info.get("step", "")
+                        step_status = step_info.get("status", "")
+                        duration_ms = step_info.get("duration_ms", 0)
+                        icon = "✓" if step_status == "success" else ("⊘" if step_status == "skipped" else "✗")
+                        log_lines.append(f"[{icon}] {step_name}: {step_status} ({duration_ms}ms)")
+                        for detail in step_info.get("details", []):
+                            log_lines.append(f"    • {detail}")
+                    st.code("\n".join(log_lines), language=None)
+            elif progress_log:
+                with st.expander("📋 Progress Log", expanded=False):
+                    for entry in progress_log:
+                        pct = int(entry.get("progress", 0) * 100)
+                        st.write(f"[{pct}%] **{entry.get('step', '')}**: {entry.get('message', '')}")
+
+        elif job_status == "error":
+            status.update(label=f"❌ {operation} failed", state="error")
+            st.error(f"Error: {data.get('error', 'Unknown error')}")
+        else:
+            status.update(label=f"✅ {operation} complete", state="complete")
+
+        return data
+
+
 def submit_async_job(
     endpoint: str,
     payload: Dict[str, Any],
@@ -1025,27 +1223,43 @@ def submit_async_job(
     execution_mode = get_execution_mode(episode_id)
     payload = {**payload, "execution_mode": execution_mode}
 
-    # For local mode, skip the job-already-running check since it's synchronous
+    # For local mode, use threading + progress polling for real-time updates
     if execution_mode == "local":
-        with st.spinner(f"Running {operation} in local mode..."):
-            try:
-                resp = requests.post(f"{base}{endpoint}", json=payload, timeout=600)
-                resp.raise_for_status()
-                data = resp.json()
+        # Determine progress endpoint based on the job type
+        progress_endpoint = None
+        if "clusters/group" in endpoint:
+            progress_endpoint = f"/episodes/{episode_id}/clusters/group/progress"
 
-                status = data.get("status", "")
-                if status in ("completed", "success"):
-                    st.success(f"✅ {operation} completed (local mode)")
-                elif status == "error":
-                    st.error(f"❌ {operation} failed: {data.get('error', 'Unknown error')}")
-                else:
-                    # Could be partial success
-                    if data.get("async") is False:
-                        st.info(f"{operation} completed (sync fallback)")
-                return data
-            except requests.RequestException as e:
-                st.error(f"Failed to run {operation}: {describe_error(f'{base}{endpoint}', e)}")
-                return None
+        if progress_endpoint:
+            # Use threading + polling for operations that support progress
+            return _run_local_job_with_progress(
+                base=base,
+                endpoint=endpoint,
+                payload=payload,
+                operation=operation,
+                episode_id=episode_id,
+                progress_endpoint=progress_endpoint,
+            )
+        else:
+            # Fallback to simple spinner for operations without progress endpoints
+            with st.spinner(f"Running {operation} in local mode..."):
+                try:
+                    resp = requests.post(f"{base}{endpoint}", json=payload, timeout=600)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    status = data.get("status", "")
+                    if status in ("completed", "success"):
+                        st.success(f"✅ {operation} completed (local mode)")
+                    elif status == "error":
+                        st.error(f"❌ {operation} failed: {data.get('error', 'Unknown error')}")
+                    else:
+                        if data.get("async") is False:
+                            st.info(f"{operation} completed (sync fallback)")
+                    return data
+                except requests.RequestException as e:
+                    st.error(f"Failed to run {operation}: {describe_error(f'{base}{endpoint}', e)}")
+                    return None
 
     # Redis mode - check if a job is already running
     existing = st.session_state.get(ASYNC_JOB_KEY)
@@ -1082,9 +1296,11 @@ def get_active_async_job() -> Optional[Dict[str, Any]]:
 
 
 def clear_async_job() -> None:
-    """Clear the active async job from session state."""
-    if ASYNC_JOB_KEY in st.session_state:
-        del st.session_state[ASYNC_JOB_KEY]
+    """Clear the active async job and related tracking state from session state."""
+    st.session_state.pop(ASYNC_JOB_KEY, None)
+    st.session_state.pop("_async_job_state_tracking", None)
+    st.session_state.pop("_async_job_poll_failures", None)
+    st.session_state.pop("_async_job_retry_count", None)
 
 
 def poll_async_job() -> Optional[Dict[str, Any]]:
@@ -1121,11 +1337,17 @@ def render_async_job_status() -> bool:
     if not job:
         return False
 
-    # Stale job detection: if job was created > 30 minutes ago, clear it
-    STALE_JOB_TIMEOUT = 30 * 60  # 30 minutes
+    # Timeouts for stale job detection
+    STALE_JOB_TIMEOUT = 15 * 60  # 15 minutes max total job time
+    QUEUED_TIMEOUT = 2 * 60  # 2 minutes stuck in queued
+    NO_PROGRESS_TIMEOUT = 5 * 60  # 5 minutes without progress update
+
     created_at = job.get("created_at", 0)
-    if time.time() - created_at > STALE_JOB_TIMEOUT:
-        st.warning(f"Job timed out after 30 minutes: {job.get('operation', 'unknown')}")
+    now = time.time()
+
+    # Overall job timeout
+    if now - created_at > STALE_JOB_TIMEOUT:
+        st.warning(f"Job timed out after 15 minutes: {job.get('operation', 'unknown')}")
         clear_async_job()
         return False
 
@@ -1152,37 +1374,178 @@ def render_async_job_status() -> bool:
     operation = job.get("operation", "Operation")
     job_id_short = job["job_id"][:8]
 
+    # Track state transitions and progress to detect stuck jobs
+    state_key = "_async_job_state_tracking"
+    state_tracking = st.session_state.get(state_key, {})
+    prev_state = state_tracking.get("state")
+    prev_progress = state_tracking.get("progress_pct", 0)
+
+    # Get current progress percentage
+    progress = status.get("progress", {})
+    current_progress_pct = progress.get("progress", 0) if progress else 0
+
+    # Detect if state or progress changed
+    state_changed = prev_state != state
+    progress_changed = current_progress_pct != prev_progress
+
+    if state_changed or progress_changed:
+        # Update tracking with current state and time
+        st.session_state[state_key] = {
+            "state": state,
+            "progress_pct": current_progress_pct,
+            "last_update": now,
+        }
+    else:
+        # Check for stuck job
+        last_update = state_tracking.get("last_update", created_at)
+
+        # Jobs stuck in 'queued' for too long (worker likely not running)
+        if state == "queued" and (now - last_update) > QUEUED_TIMEOUT:
+            st.warning(
+                f"Job stuck in queue for over 2 minutes. Celery worker may not be running. "
+                f"Clearing job: {job.get('operation', 'unknown')}"
+            )
+            clear_async_job()
+            st.session_state.pop(state_key, None)
+            return False
+
+        # Jobs without progress update for too long
+        if state == "in_progress" and (now - last_update) > NO_PROGRESS_TIMEOUT:
+            st.warning(
+                f"Job has not reported progress for 5 minutes. "
+                f"Clearing stale job: {job.get('operation', 'unknown')}"
+            )
+            clear_async_job()
+            st.session_state.pop(state_key, None)
+            return False
+
+    # Handle unexpected states
+    if state in ("retrying", "unknown"):
+        retry_count_key = "_async_job_retry_count"
+        retry_count = st.session_state.get(retry_count_key, 0) + 1
+        st.session_state[retry_count_key] = retry_count
+        if retry_count >= 3:
+            st.warning(f"Job in unexpected state '{state}' after {retry_count} checks. Clearing.")
+            clear_async_job()
+            st.session_state.pop(retry_count_key, None)
+            st.session_state.pop(state_key, None)
+            return False
+        st.info(f"⏳ **{operation}** {state}... ({job_id_short}...)")
+        return True
+
     if state in ("queued", "in_progress"):
-        # Show progress
+        # Show progress with visual progress bar
         progress = status.get("progress", {})
         step = progress.get("step", "")
         message = progress.get("message", "Working...")
+        progress_pct = progress.get("progress", 0)  # 0.0-1.0
+        current = progress.get("current", 0)
+        total = progress.get("total", 0)
 
-        if progress and step:
+        # Build info message
+        if step:
             st.info(f"⏳ **{operation}** in progress ({job_id_short}...)\n\n**{step}**: {message}")
         else:
             st.info(f"⏳ **{operation}** in progress ({job_id_short}...)")
+
+        # Show visual progress bar
+        if progress_pct > 0:
+            st.progress(min(progress_pct, 1.0))
+            if current and total:
+                st.caption(f"Progress: {current:,} / {total:,} ({progress_pct * 100:.1f}%)")
+            else:
+                st.caption(f"Progress: {progress_pct * 100:.1f}%")
+        elif state == "queued":
+            st.caption("Waiting in queue...")
+        else:
+            st.caption("Starting...")
+
         return True
 
     elif state == "success":
         result = status.get("result", {})
+        log_data = result.get("log", {})
+        summary = result.get("summary", result)  # Fallback to result if no summary
+
+        # Build detailed log lines
+        log_lines = []
+        has_log = False
+
+        if log_data and log_data.get("steps"):
+            has_log = True
+            log_lines.append("=" * 50)
+            log_lines.append(f"{operation.upper()} - DETAILED LOG")
+            log_lines.append("=" * 50)
+
+            for step_info in log_data.get("steps", []):
+                step_name = step_info.get("step", "")
+                step_status = step_info.get("status", "")
+                duration_ms = step_info.get("duration_ms", 0)
+                details = step_info.get("details", [])
+
+                status_icon = "✓" if step_status == "success" else ("⊘" if step_status == "skipped" else "✗")
+                step_display = step_name.replace("_", " ").title()
+
+                log_lines.append("")
+                log_lines.append(f"[{status_icon}] {step_display}")
+                log_lines.append(f"    Duration: {duration_ms}ms")
+
+                for detail in details:
+                    log_lines.append(f"    • {detail}")
+
+                if step_info.get("error"):
+                    log_lines.append(f"    ⚠️ ERROR: {step_info.get('error')}")
+
+            total_duration = log_data.get("total_duration_ms", 0)
+            log_lines.append("")
+            log_lines.append("=" * 50)
+            log_lines.append(f"Total Duration: {total_duration}ms")
+            log_lines.append("=" * 50)
+
         # Format success message based on operation type
         if "auto" in operation.lower() or "group" in operation.lower():
-            assigned = result.get("assignments_count", result.get("succeeded", 0))
-            new_people = result.get("new_people_count", 0)
-            facebank = result.get("facebank_assigned", 0)
-            msg = f"✅ **{operation}** complete! {assigned} clusters processed"
+            assigned = summary.get("assignments_count", summary.get("succeeded", 0))
+            new_people = summary.get("new_people_count", 0)
+            facebank = summary.get("facebank_assigned", 0)
+            clusters = summary.get("clusters", 0)
+            identities = summary.get("identities", 0)
+
+            msg_parts = [f"✅ **{operation}** complete!"]
+            if clusters:
+                msg_parts.append(f"\n• **Clusters:** {clusters}")
+            if assigned:
+                msg_parts.append(f"\n• **Processed:** {assigned}")
             if new_people:
-                msg += f", {new_people} new people"
+                msg_parts.append(f"\n• **New people:** {new_people}")
             if facebank:
-                msg += f", {facebank} facebank matches"
-            st.success(msg)
+                msg_parts.append(f"\n• **Facebank matches:** {facebank}")
+            if identities:
+                msg_parts.append(f"\n• **Identities:** {identities}")
+
+            st.success("".join(msg_parts))
+
         elif "assign" in operation.lower():
-            succeeded = result.get("succeeded", 0)
-            failed = result.get("failed", 0)
-            st.success(f"✅ **{operation}** complete! {succeeded} succeeded, {failed} failed")
+            succeeded = summary.get("succeeded", 0)
+            failed = summary.get("failed", 0)
+            st.success(f"✅ **{operation}** complete!\n\n• **Succeeded:** {succeeded}\n• **Failed:** {failed}")
+        elif "cleanup" in operation.lower():
+            tracks_before = summary.get("tracks_before", 0)
+            tracks_after = summary.get("tracks_after", 0)
+            clusters_before = summary.get("clusters_before", 0)
+            clusters_after = summary.get("clusters_after", 0)
+            st.success(
+                f"✅ **{operation}** complete!\n\n"
+                f"• **Tracks:** {tracks_before:,} → {tracks_after:,}\n"
+                f"• **Clusters:** {clusters_before:,} → {clusters_after:,}"
+            )
         else:
             st.success(f"✅ **{operation}** complete!")
+
+        # Show detailed log if available
+        if has_log:
+            with st.expander("📋 Detailed Log", expanded=False):
+                st.code("\n".join(log_lines), language=None)
+
         clear_async_job()
         return False
 
@@ -1704,10 +2067,95 @@ def tracks_tracker_label(ep_id: str) -> str:
 
 
 def try_switch_page(page_path: str) -> None:
+    """Switch pages without surfacing the sidebar warning fallback."""
     try:
         st.switch_page(page_path)
     except Exception:
-        st.info("Use the sidebar navigation to open the target page.")
+        # Fallback: set query param so sidebar nav picks up the target page
+        params = st.query_params
+        params["page"] = page_path
+        st.query_params = params
+        st.rerun()
+
+
+def inject_custom_fonts() -> None:
+    """Inject custom font faces and set defaults for body/headings."""
+    font_base = Path(__file__).resolve().parent / "assets" / "fonts"
+
+    # Remote font hosting (Vercel) for easier loading in Streamlit
+    remote_base = "https://trr-app.vercel.app/admin/fonts"
+    remote_plymouth = f"{remote_base}/PlymouthSerial-ExtraBold.otf"
+    remote_rude = f"{remote_base}/RudeSlabCondensedCondensedBold.otf"
+
+    # Local fallbacks (copied into repo)
+    local_plymouth = (font_base / "Plymouth Serial" / "PlymouthSerialExtraBold-10035290.otf").as_posix()
+    local_rude = (font_base / "Rude Slab Condensed" / "RudeSlabCondensedCondensedBold-930861866.otf").as_posix()
+
+    plymouth_src = remote_plymouth if remote_plymouth else local_plymouth
+    rude_src = remote_rude if remote_rude else local_rude
+
+    css = f"""
+    <style>
+    @font-face {{
+        font-family: 'PlymouthSerialExtraBold';
+        src: url('{plymouth_src}') format('opentype'),
+             url('{local_plymouth}') format('opentype');
+        font-weight: 800;
+    }}
+    @font-face {{
+        font-family: 'RudeSlabCondensedBold';
+        src: url('{rude_src}') format('opentype'),
+             url('{local_rude}') format('opentype');
+        font-weight: 700;
+    }}
+    html, body, div, button, input, textarea {{
+        font-family: 'PlymouthSerialExtraBold', 'Inter', 'Helvetica', sans-serif;
+        font-weight: 800;
+    }}
+    h1, h2, h3, h4, h5, h6 {{
+        font-family: 'RudeSlabCondensedBold', 'PlymouthSerialExtraBold', 'Inter', 'Helvetica', sans-serif;
+        font-weight: 700;
+    }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def _nav_to_faces(view: str | None = None) -> None:
+    """Helper to jump to Faces Review with a preset view."""
+    if view:
+        st.session_state["facebank_view"] = view
+        st.session_state.pop("selected_person", None)
+        st.session_state.pop("selected_identity", None)
+        st.session_state.pop("selected_track", None)
+    try_switch_page("pages/3_Faces_Review.py")
+
+
+def render_workspace_nav() -> None:
+    """Render grouped navigation with Faces Review sub-pages."""
+    with st.sidebar:
+        st.markdown("### Workspace")
+        if hasattr(st, "page_link"):
+            st.page_link("streamlit_app.py", label="Home")
+            st.page_link("pages/0_Upload_Video.py", label="Upload Video")
+            st.page_link("pages/1_Episodes.py", label="Episodes")
+            st.page_link("pages/2_Episode_Detail.py", label="Episode Detail")
+            st.page_link("pages/4_Cast.py", label="Cast Management")
+            # Faces Review with visible sub-pages (indented, no emojis)
+            st.page_link("pages/3_Faces_Review.py", label="Faces Review")
+            st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;Cast Members (12)", unsafe_allow_html=True)
+            st.page_link("pages/3_Smart_Suggestions.py", label="    Smart Suggestions")
+            st.page_link("pages/4_Screentime.py", label="Screentime & Health")
+        else:
+            st.button("Home", key="nav_home", on_click=lambda: try_switch_page("streamlit_app.py"))
+            st.button("Upload Video", key="nav_upload", on_click=lambda: try_switch_page("pages/0_Upload_Video.py"))
+            st.button("Episodes", key="nav_episodes", on_click=lambda: try_switch_page("pages/1_Episodes.py"))
+            st.button("Episode Detail", key="nav_ep_detail", on_click=lambda: try_switch_page("pages/2_Episode_Detail.py"))
+            st.button("Cast Management", key="nav_cast", on_click=lambda: try_switch_page("pages/4_Cast.py"))
+            st.button("Faces Review", key="nav_faces_overview", on_click=lambda: try_switch_page("pages/3_Faces_Review.py"))
+            st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;Cast Members (12)", unsafe_allow_html=True)
+            st.button("    Smart Suggestions", key="nav_suggestions", on_click=lambda: try_switch_page("pages/3_Smart_Suggestions.py"))
+            st.button("Screentime & Health", key="nav_screentime", on_click=lambda: try_switch_page("pages/4_Screentime.py"))
 
 
 def format_mmss(seconds: float | int | None) -> str:
@@ -3307,6 +3755,241 @@ def run_async_job_with_mode(
         )
 
 
+def track_skeleton_html(num_frames: int = 12, thumb_width: int = 120) -> str:
+    """Generate skeleton HTML for track detail loading state.
+
+    Shows animated placeholder frames in a carousel-style layout while track data is being loaded.
+    Uses the same 4:5 aspect ratio as the actual carousel.
+    """
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio
+    frames = "".join([
+        f'<div class="skeleton-frame" style="width:{thumb_width}px;height:{thumb_height}px;"></div>'
+        for _ in range(num_frames)
+    ])
+    return f'''
+    <style>
+        .skeleton-carousel {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 16px 0;
+        }}
+        .skeleton-arrow {{
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.1);
+            flex-shrink: 0;
+        }}
+        .skeleton-track {{
+            display: flex;
+            gap: 8px;
+            overflow: hidden;
+            flex: 1;
+        }}
+        .skeleton-frame {{
+            flex-shrink: 0;
+            border-radius: 6px;
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: skeleton-shimmer 1.5s infinite;
+        }}
+        @keyframes skeleton-shimmer {{
+            0% {{ background-position: 200% 0; }}
+            100% {{ background-position: -200% 0; }}
+        }}
+    </style>
+    <div class="skeleton-carousel">
+        <div class="skeleton-arrow"></div>
+        <div class="skeleton-track">{frames}</div>
+        <div class="skeleton-arrow"></div>
+    </div>
+    '''
+
+
+def track_carousel_html(
+    track_id: int,
+    frames: List[Dict[str, Any]],
+    *,
+    thumb_width: int = 120,
+    visible_count: int = 8,
+) -> str:
+    """Generate a carousel-style frame viewer with navigation arrows.
+
+    Args:
+        track_id: Track ID for unique element IDs
+        frames: List of frame dicts with 'crop_url' or 'url' and 'frame_idx'
+        thumb_width: Width of each thumbnail in pixels
+        visible_count: Number of frames visible at once
+
+    Returns:
+        HTML string for the carousel with CSS and JavaScript
+    """
+    if not frames:
+        return '<div class="track-carousel empty"><span>No frames available</span></div>'
+
+    carousel_id = f"carousel_{track_id}"
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio
+
+    # Build frame thumbnails
+    frame_items = []
+    for i, frame in enumerate(frames):
+        url = frame.get("crop_url") or frame.get("url") or frame.get("thumbnail_url")
+        frame_idx = frame.get("frame_idx", i)
+        similarity = frame.get("similarity")
+
+        if url:
+            src = html.escape(str(url))
+            alt = html.escape(f"Frame {frame_idx}")
+
+            # Add similarity badge if available
+            badge = ""
+            if similarity is not None:
+                pct = int(similarity * 100)
+                badge = f'<span class="frame-badge">{pct}%</span>'
+
+            frame_items.append(f'''
+                <div class="carousel-frame" data-idx="{frame_idx}">
+                    <img src="{src}" alt="{alt}" loading="lazy" />
+                    {badge}
+                    <span class="frame-label">#{frame_idx}</span>
+                </div>
+            ''')
+
+    frames_html = "".join(frame_items)
+    total_frames = len(frame_items)
+
+    return f'''
+    <style>
+        .track-carousel {{
+            position: relative;
+            width: 100%;
+            margin: 16px 0;
+        }}
+        .track-carousel.empty {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100px;
+            color: #666;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }}
+        .carousel-container {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .carousel-arrow {{
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: background 0.2s, transform 0.1s;
+            z-index: 10;
+        }}
+        .carousel-arrow:hover {{
+            background: rgba(0,0,0,0.8);
+            transform: scale(1.1);
+        }}
+        .carousel-arrow:disabled {{
+            background: rgba(0,0,0,0.2);
+            cursor: not-allowed;
+            transform: none;
+        }}
+        .carousel-track {{
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            scroll-behavior: smooth;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+            padding: 4px 0;
+            flex: 1;
+        }}
+        .carousel-track::-webkit-scrollbar {{
+            display: none;
+        }}
+        .carousel-frame {{
+            position: relative;
+            flex-shrink: 0;
+            width: {thumb_width}px;
+            height: {thumb_height}px;
+            border-radius: 6px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            background: #f0f0f0;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }}
+        .carousel-frame:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+        }}
+        .carousel-frame img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }}
+        .carousel-frame .frame-badge {{
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            background: rgba(33, 150, 243, 0.9);
+            color: white;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }}
+        .carousel-frame .frame-label {{
+            position: absolute;
+            bottom: 4px;
+            left: 4px;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            font-size: 10px;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }}
+        .carousel-info {{
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+        }}
+    </style>
+
+    <div class="track-carousel" id="{carousel_id}">
+        <div class="carousel-container">
+            <button class="carousel-arrow carousel-prev" onclick="scrollCarousel('{carousel_id}', -1)">◀</button>
+            <div class="carousel-track">
+                {frames_html}
+            </div>
+            <button class="carousel-arrow carousel-next" onclick="scrollCarousel('{carousel_id}', 1)">▶</button>
+        </div>
+        <div class="carousel-info">{total_frames} frames · Scroll or use arrows to navigate</div>
+    </div>
+
+    <script>
+        function scrollCarousel(carouselId, direction) {{
+            const carousel = document.getElementById(carouselId);
+            const track = carousel.querySelector('.carousel-track');
+            const frameWidth = {thumb_width} + 8; // width + gap
+            const scrollAmount = frameWidth * 4; // scroll 4 frames at a time
+            track.scrollBy({{ left: direction * scrollAmount, behavior: 'smooth' }});
+        }}
+    </script>
+    '''
+
+
 def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
     if not items:
         return '<div class="track-grid empty">' "<span>No frames available for this track yet.</span>" "</div>"
@@ -3413,6 +4096,33 @@ def inject_thumb_css() -> None:
     """,
         unsafe_allow_html=True,
     )
+
+
+def inject_log_container_css() -> None:
+    """Inject CSS to limit log container height and make scrollable.
+
+    Prevents logs from extending the page indefinitely by adding max-height
+    with overflow-y scroll to code blocks used for log display.
+    """
+    st.markdown(
+        """
+    <style>
+        /* Limit log height and make scrollable */
+        [data-testid="stCodeBlock"] {
+            max-height: 400px;
+            overflow-y: auto !important;
+        }
+        /* Ensure the pre inside also scrolls properly */
+        [data-testid="stCodeBlock"] pre {
+            max-height: 380px;
+            overflow-y: auto !important;
+        }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+
+
 def _thumb_async_cache() -> Dict[str, Dict[str, Any]]:
     cache = st.session_state.setdefault(_THUMB_CACHE_STATE_KEY, {})
     if not isinstance(cache, dict):

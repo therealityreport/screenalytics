@@ -42,6 +42,7 @@ import json
 import logging
 import math
 import os
+import platform
 import shutil
 import signal
 import sys
@@ -85,21 +86,51 @@ except ImportError:
     _PSUTIL_AVAILABLE = False
 
 
-def _maybe_wrap_with_cpulimit_local(command: list[str]) -> tuple[list[str], bool]:
-    """Wrap command with cpulimit for local mode thermal safety.
+def _maybe_wrap_with_cpulimit_local(command: list[str], profile: str = "balanced") -> tuple[list[str], bool]:
+    """Wrap command with thermal limiting for local mode safety.
+
+    On macOS: Uses taskpolicy with QoS clamps (works with Metal/CoreML threads)
+    On Linux: Uses cpulimit (SIGSTOP/SIGCONT based)
+
+    Note: cpulimit does NOT work on macOS with CoreML/Metal because those
+    frameworks use GPU threads that ignore SIGSTOP/SIGCONT signals.
+
+    Args:
+        command: The command to wrap
+        profile: Thermal profile - "low_power" uses background QoS, others use utility
 
     Returns:
-        tuple of (wrapped_command, cpulimit_applied)
+        tuple of (wrapped_command, thermal_limit_applied)
     """
     if _LOCAL_CPULIMIT_PERCENT <= 0:
         return command, False
 
+    # macOS: use taskpolicy with QoS clamp (works with CoreML/Metal threads)
+    if platform.system() == "Darwin":
+        # background = lowest priority, minimal thermal impact (for low_power)
+        # utility = reduced priority, thermally managed (for balanced/performance)
+        qos_clamp = "background" if profile == "low_power" else "utility"
+        taskpolicy = shutil.which("taskpolicy")
+        if taskpolicy:
+            LOGGER.info(
+                "[LOCAL MODE] Using taskpolicy -c %s for thermal safety (macOS native)",
+                qos_clamp,
+            )
+            return [taskpolicy, "-c", qos_clamp, "--", *command], True
+        else:
+            LOGGER.warning(
+                "taskpolicy not found on macOS. This is unexpected - taskpolicy should "
+                "be available on all modern macOS versions. Falling back to no thermal limit."
+            )
+            return command, False
+
+    # Linux: use cpulimit (SIGSTOP/SIGCONT based - works for CPU-bound processes)
     binary = shutil.which("cpulimit")
     if not binary:
         LOGGER.warning(
             "cpulimit binary not found for local mode. "
             "CPU usage will NOT be capped at %d%%. "
-            "Install cpulimit (brew install cpulimit / apt install cpulimit) "
+            "Install cpulimit (apt install cpulimit) "
             "or use psutil CPU affinity fallback.",
             _LOCAL_CPULIMIT_PERCENT,
         )
@@ -1348,10 +1379,16 @@ def _run_local_subprocess_blocking(
     logs.append(f"Local mode: CPU threads capped at {local_max_threads} for thermal safety")
     LOGGER.info(f"[{episode_id}] Local mode CPU threads capped at {local_max_threads}")
 
-    # Apply cpulimit wrapper for thermal safety
-    effective_command, cpulimit_applied = _maybe_wrap_with_cpulimit_local(command)
-    if cpulimit_applied:
-        logs.append(f"Local mode: Using cpulimit at {_LOCAL_CPULIMIT_PERCENT}% for thermal safety")
+    # Apply thermal limiting wrapper for thermal safety
+    # On macOS: uses taskpolicy with QoS clamp (works with CoreML/Metal)
+    # On Linux: uses cpulimit (SIGSTOP/SIGCONT based)
+    effective_command, thermal_limit_applied = _maybe_wrap_with_cpulimit_local(command, profile)
+    if thermal_limit_applied:
+        if platform.system() == "Darwin":
+            qos = "background" if profile == "low_power" else "utility"
+            logs.append(f"Local mode: Using taskpolicy -c {qos} for thermal safety (macOS)")
+        else:
+            logs.append(f"Local mode: Using cpulimit at {_LOCAL_CPULIMIT_PERCENT}% for thermal safety")
 
     start_time = time.time()
     process: subprocess.Popen | None = None
@@ -1387,10 +1424,10 @@ def _run_local_subprocess_blocking(
             start_new_session=True,  # Create new process group for clean termination
         )
 
-        # Apply CPU affinity fallback if cpulimit wasn't available
-        if not cpulimit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
+        # Apply CPU affinity fallback if thermal limiting wasn't available
+        if not thermal_limit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
             if _apply_cpu_affinity_fallback_local(process.pid, _LOCAL_CPULIMIT_PERCENT):
-                logs.append(f"Local mode: Using CPU affinity fallback (cpulimit not available)")
+                logs.append(f"Local mode: Using CPU affinity fallback (thermal limiter not available)")
 
         # Register the job for tracking/duplicate prevention
         _register_local_job(episode_id, operation, process.pid, job_id=None)
@@ -1950,9 +1987,17 @@ def _stream_local_subprocess(
         "PYTHONUNBUFFERED": "1",
     })
 
-    # Apply cpulimit wrapper for thermal safety
-    effective_command, cpulimit_applied = _maybe_wrap_with_cpulimit_local(command)
-    cpulimit_percent = _LOCAL_CPULIMIT_PERCENT if cpulimit_applied else None
+    # Apply thermal limiting wrapper for thermal safety
+    # On macOS: uses taskpolicy with QoS clamp (works with CoreML/Metal)
+    # On Linux: uses cpulimit (SIGSTOP/SIGCONT based)
+    effective_command, thermal_limit_applied = _maybe_wrap_with_cpulimit_local(command, profile)
+    thermal_limit_info = None
+    if thermal_limit_applied:
+        if platform.system() == "Darwin":
+            qos = "background" if profile == "low_power" else "utility"
+            thermal_limit_info = f"taskpolicy -c {qos}"
+        else:
+            thermal_limit_info = f"cpulimit {_LOCAL_CPULIMIT_PERCENT}%"
 
     # Try to get video metadata for frame count
     total_frames = None
@@ -1980,7 +2025,7 @@ def _stream_local_subprocess(
         stride=stride if operation == "detect_track" else None,
         total_frames=total_frames,
         fps=fps,
-        cpulimit_percent=cpulimit_percent,
+        thermal_limit_info=thermal_limit_info,
     )
     for line in config_block.split("\n"):
         yield _emit_formatted(line, line)
@@ -2040,10 +2085,10 @@ def _stream_local_subprocess(
             start_new_session=True,
         )
 
-        # Apply CPU affinity fallback if cpulimit wasn't available
-        if not cpulimit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
+        # Apply CPU affinity fallback if thermal limiting wasn't available
+        if not thermal_limit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
             if _apply_cpu_affinity_fallback_local(process.pid, _LOCAL_CPULIMIT_PERCENT):
-                affinity_msg = "[INFO] Using CPU affinity fallback (cpulimit not available)"
+                affinity_msg = "[INFO] Using CPU affinity fallback (thermal limiter not available)"
                 yield _emit_formatted(affinity_msg, affinity_msg)
 
         # Register the job

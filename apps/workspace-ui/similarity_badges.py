@@ -316,6 +316,8 @@ UNASSIGNED_CLUSTER_SORT_OPTIONS = [
 # Person sort options for auto-clustered people listings
 PERSON_SORT_OPTIONS = [
     "Impact (Clusters × Faces)",
+    "Identity Similarity (High to Low)",
+    "Identity Similarity (Low to High)",
     "Face Count (High to Low)",
     "Face Count (Low to High)",
     "Track Count (High to Low)",
@@ -514,6 +516,17 @@ def sort_people(
                 -(entry.get("counts", {}).get("faces") or 0),
                 (entry.get("person", {}).get("name") or "").lower(),
             )
+        )
+    elif sort_option == "Identity Similarity (High to Low)":
+        # Sort by avg_cohesion (identity similarity) - higher is better
+        people.sort(
+            key=lambda e: (e.get("avg_cohesion") if e.get("avg_cohesion") is not None else -999.0),
+            reverse=True,
+        )
+    elif sort_option == "Identity Similarity (Low to High)":
+        # Sort by avg_cohesion - lower first (potential outliers)
+        people.sort(
+            key=lambda e: (e.get("avg_cohesion") if e.get("avg_cohesion") is not None else 999.0)
         )
     elif sort_option == "Face Count (High to Low)":
         people.sort(key=lambda e: e.get("counts", {}).get("faces", 0), reverse=True)

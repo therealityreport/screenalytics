@@ -396,6 +396,27 @@ def cluster_track_summary(
     tracks = load_tracks(ep_id)
     faces = load_faces(ep_id)
     track_lookup = _track_lookup(tracks)
+
+    # Load cluster centroids for cohesion data and track similarity computation
+    cluster_cohesion: Dict[str, float] = {}
+    cluster_centroids_data: Dict[str, Dict[str, Any]] = {}
+    track_reps_data: Dict[str, Dict[str, Any]] = {}
+    try:
+        from apps.api.services.track_reps import load_cluster_centroids, load_track_reps
+        import numpy as np
+
+        centroids = load_cluster_centroids(ep_id)
+        for cluster_id, cluster_data in centroids.items():
+            if isinstance(cluster_data, dict):
+                if cluster_data.get("cohesion") is not None:
+                    cluster_cohesion[cluster_id] = cluster_data["cohesion"]
+                if cluster_data.get("centroid") is not None:
+                    cluster_centroids_data[cluster_id] = cluster_data
+
+        # Load track reps for similarity computation
+        track_reps_data = load_track_reps(ep_id)
+    except Exception:
+        pass  # Cohesion/similarity data not available
     face_counts: Dict[int, int] = {}
     for row in faces:
         try:
@@ -403,6 +424,18 @@ def cluster_track_summary(
         except (TypeError, ValueError):
             continue
         face_counts[tid] = face_counts.get(tid, 0) + 1
+
+    # Helper to compute cosine similarity
+    def _cosine_sim(a: Any, b: Any) -> float | None:
+        try:
+            import numpy as np
+            a_vec = np.array(a, dtype=np.float32)
+            b_vec = np.array(b, dtype=np.float32)
+            norm_a = np.linalg.norm(a_vec) + 1e-12
+            norm_b = np.linalg.norm(b_vec) + 1e-12
+            return float(np.dot(a_vec / norm_a, b_vec / norm_b))
+        except Exception:
+            return None
 
     clusters: List[Dict[str, Any]] = []
     for identity in identities_payload.get("identities", []):
@@ -412,6 +445,13 @@ def cluster_track_summary(
         if include_set and identity_id.lower() not in include_set:
             continue
         track_ids = identity.get("track_ids", []) or []
+
+        # Get cluster centroid for similarity computation
+        cluster_centroid = None
+        cluster_data = cluster_centroids_data.get(identity_id)
+        if cluster_data:
+            cluster_centroid = cluster_data.get("centroid")
+
         tracks_payload: List[Dict[str, Any]] = []
         for raw_tid in track_ids:
             try:
@@ -423,12 +463,25 @@ def cluster_track_summary(
                 continue
             # Use _track_media_url to prioritize crops (authoritative) over thumbs
             thumb_url = _track_media_url(ep_id, track_row)
+
+            # Compute track similarity to cluster centroid
+            track_similarity = None
+            if cluster_centroid is not None:
+                # Try to get track embedding from track_reps
+                track_key = f"track_{tid:04d}"
+                track_rep = track_reps_data.get(track_key)
+                if track_rep and track_rep.get("embed"):
+                    track_similarity = _cosine_sim(track_rep["embed"], cluster_centroid)
+                    if track_similarity is not None:
+                        track_similarity = round(track_similarity, 3)
+
             tracks_payload.append(
                 {
                     "track_id": tid,
                     "faces": track_row.get("faces_count") or face_counts.get(tid) or 0,
                     "frames": track_row.get("frame_count"),
                     "rep_thumb_url": thumb_url,
+                    "similarity": track_similarity,
                 }
             )
         if limit_per_cluster:
@@ -439,6 +492,8 @@ def cluster_track_summary(
                 "identity_id": identity_id,
                 "name": identity.get("name"),
                 "label": identity.get("label"),
+                "person_id": identity.get("person_id"),  # For filtering assigned vs unassigned
+                "cohesion": cluster_cohesion.get(identity_id),  # Add cohesion from centroids
                 "counts": {
                     "tracks": len(track_ids),
                     "faces": identity.get("faces") or sum(face_counts.get(int(tid), 0) for tid in track_ids),

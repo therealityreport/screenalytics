@@ -337,6 +337,7 @@ def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int |
 
 cfg = helpers.init_page("Episode Detail")
 st.title("Episode Detail")
+helpers.inject_log_container_css()  # Limit log container height with scrolling
 flash_message = st.session_state.pop("episode_detail_flash", None)
 if flash_message:
     st.success(flash_message)
@@ -2497,3 +2498,25 @@ for group, paths in artifact_groups.items():
             st.error(err)
             continue
         st.code(content or "", language="json")
+
+
+# =============================================================================
+# Auto-refresh when jobs are running
+# =============================================================================
+# If ANY job is running for this episode, auto-refresh every 3 seconds
+# to poll for updates. This MUST be at the end of the page so content
+# fully renders before the refresh.
+
+_any_job_running = running_detect_job or running_faces_job or running_cluster_job
+if _any_job_running:
+    import time as _time
+    _running_ops = []
+    if running_detect_job:
+        _running_ops.append("Detect/Track")
+    if running_faces_job:
+        _running_ops.append("Faces Harvest")
+    if running_cluster_job:
+        _running_ops.append("Cluster")
+    st.caption(f"⏳ Auto-refreshing for running job(s): {', '.join(_running_ops)}...")
+    _time.sleep(3)
+    st.rerun()
