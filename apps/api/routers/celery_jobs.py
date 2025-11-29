@@ -42,6 +42,8 @@ import os
 import sys
 import json
 import subprocess
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional, Literal, Any, Dict
 
@@ -63,6 +65,44 @@ from apps.api.tasks import (
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/celery_jobs", tags=["celery_jobs"])
+
+
+# =============================================================================
+# Local Job Tracking (for execution_mode="local")
+# =============================================================================
+# In-memory tracking for local jobs. These don't use Celery but we track them
+# so the UI can poll for status just like Redis mode.
+
+_local_jobs: Dict[str, Dict[str, Any]] = {}
+_local_jobs_lock = threading.Lock()
+
+
+def _register_local_job(job_id: str, episode_id: str, operation: str) -> None:
+    """Register a new local job for tracking."""
+    with _local_jobs_lock:
+        _local_jobs[job_id] = {
+            "job_id": job_id,
+            "ep_id": episode_id,
+            "operation": operation,
+            "state": "in_progress",
+            "progress": 0.0,
+            "message": f"Starting {operation}...",
+            "result": None,
+            "error": None,
+        }
+
+
+def _update_local_job(job_id: str, **kwargs) -> None:
+    """Update a local job's status."""
+    with _local_jobs_lock:
+        if job_id in _local_jobs:
+            _local_jobs[job_id].update(kwargs)
+
+
+def _get_local_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get a local job's current status."""
+    with _local_jobs_lock:
+        return _local_jobs.get(job_id, {}).copy() if job_id in _local_jobs else None
 
 
 # =============================================================================
@@ -286,15 +326,39 @@ def _map_celery_state(state: str) -> str:
 
 @router.get("/{job_id}")
 async def get_celery_job_status(job_id: str):
-    """Get status of a Celery background job.
+    """Get status of a background job (Celery or local).
+
+    This endpoint handles both Celery jobs and local jobs (execution_mode="local").
+    Local jobs are tracked in-memory and identified by their UUID prefix "local-".
 
     Returns:
         - job_id: The job ID
         - state: Simplified state (queued, in_progress, success, failed, cancelled)
-        - raw_state: Original Celery state
+        - raw_state: Original Celery state (or "LOCAL" for local jobs)
         - result: Job result if completed (success or failure)
         - progress: Progress metadata if job is running
     """
+    # Check if this is a local job first
+    local_job = _get_local_job(job_id)
+    if local_job:
+        response = {
+            "job_id": job_id,
+            "state": local_job.get("state", "unknown"),
+            "raw_state": "LOCAL",
+            "execution_mode": "local",
+        }
+        if local_job.get("progress") is not None:
+            response["progress"] = {
+                "progress": local_job["progress"],
+                "message": local_job.get("message", ""),
+            }
+        if local_job.get("result"):
+            response["result"] = local_job["result"]
+        if local_job.get("error"):
+            response["error"] = local_job["error"]
+        return response
+
+    # Otherwise, check Celery
     result = AsyncResult(job_id, app=celery_app)
 
     # In eager/unit-test mode, a PENDING task id usually means "unknown"
@@ -305,6 +369,7 @@ async def get_celery_job_status(job_id: str):
         "job_id": job_id,
         "state": _map_celery_state(result.state),
         "raw_state": result.state,
+        "execution_mode": "redis",
     }
 
     if result.state == "PROGRESS":
@@ -420,6 +485,7 @@ def _run_local_subprocess(
     episode_id: str,
     operation: str,
     options: Dict[str, Any],
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a pipeline command synchronously as subprocess.
 
@@ -432,14 +498,18 @@ def _run_local_subprocess(
         episode_id: Episode ID for logging
         operation: Operation name (detect_track, faces_embed, cluster)
         options: Job options for logging and env setup
+        job_id: Optional job ID for tracking (used by async local mode)
 
     Returns:
         Result dict with status, output, and progress data
     """
     project_root = _find_project_root()
 
-    LOGGER.info(f"[{episode_id}] Starting local {operation}")
+    LOGGER.info(f"[{episode_id}] Starting local {operation} (job_id={job_id})")
     LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
+
+    if job_id:
+        _update_local_job(job_id, message=f"Running {operation}...", progress=0.1)
 
     # Set up environment with CPU thread limits
     env = os.environ.copy()
@@ -472,7 +542,7 @@ def _run_local_subprocess(
         if result.returncode != 0:
             error_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
             LOGGER.error(f"[{episode_id}] local {operation} failed: {error_msg}")
-            return {
+            result_dict = {
                 "status": "error",
                 "ep_id": episode_id,
                 "operation": operation,
@@ -480,9 +550,12 @@ def _run_local_subprocess(
                 "error": error_msg,
                 "return_code": result.returncode,
             }
+            if job_id:
+                _update_local_job(job_id, state="failed", error=error_msg, progress=1.0, result=result_dict)
+            return result_dict
 
         LOGGER.info(f"[{episode_id}] local {operation} completed successfully")
-        return {
+        result_dict = {
             "status": "completed",
             "ep_id": episode_id,
             "operation": operation,
@@ -490,25 +563,34 @@ def _run_local_subprocess(
             "return_code": 0,
             "stdout": result.stdout[:2000] if result.stdout else None,
         }
+        if job_id:
+            _update_local_job(job_id, state="success", progress=1.0, result=result_dict)
+        return result_dict
 
     except subprocess.TimeoutExpired:
         LOGGER.error(f"[{episode_id}] local {operation} timed out after 1 hour")
-        return {
+        result_dict = {
             "status": "error",
             "ep_id": episode_id,
             "operation": operation,
             "execution_mode": "local",
             "error": "Job timed out after 1 hour",
         }
+        if job_id:
+            _update_local_job(job_id, state="failed", error="Job timed out after 1 hour", progress=1.0, result=result_dict)
+        return result_dict
     except Exception as e:
         LOGGER.exception(f"[{episode_id}] local {operation} raised exception: {e}")
-        return {
+        result_dict = {
             "status": "error",
             "ep_id": episode_id,
             "operation": operation,
             "execution_mode": "local",
             "error": str(e),
         }
+        if job_id:
+            _update_local_job(job_id, state="failed", error=str(e), progress=1.0, result=result_dict)
+        return result_dict
 
 
 def _build_detect_track_command(
@@ -717,20 +799,35 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
 
     # Handle local execution mode
     if execution_mode == "local":
+        # Generate a local job ID and register it
+        job_id = f"local-{uuid.uuid4().hex[:12]}"
+        _register_local_job(job_id, req.ep_id, "detect_track")
+
         project_root = _find_project_root()
         command = _build_detect_track_command(req.ep_id, options, project_root)
-        # Run blocking subprocess in thread pool to avoid blocking the event loop
-        result = await asyncio.to_thread(
-            _run_local_subprocess, command, req.ep_id, "detect_track", options
-        )
 
+        # Start subprocess in background thread (don't await)
+        async def _run_in_background():
+            await asyncio.to_thread(
+                _run_local_subprocess, command, req.ep_id, "detect_track", options, job_id
+            )
+
+        asyncio.create_task(_run_in_background())
+
+        # Return immediately with job_id (like Redis mode)
+        response = {
+            "job_id": job_id,
+            "ep_id": req.ep_id,
+            "state": "queued",
+            "operation": "detect_track",
+            "execution_mode": "local",
+            "profile": resolved_profile,
+            "cpu_threads": options.get("cpu_threads"),
+            "message": "Detect/track job started locally (poll for status)",
+        }
         if all_warnings:
-            result["warnings"] = all_warnings
-        result["profile"] = resolved_profile
-
-        if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=result)
-        return result
+            response["warnings"] = all_warnings
+        return response
 
     # Redis/Celery mode (default)
     result = run_detect_track_task.delay(req.ep_id, options)
@@ -810,20 +907,35 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
 
     # Handle local execution mode
     if execution_mode == "local":
+        # Generate a local job ID and register it
+        job_id = f"local-{uuid.uuid4().hex[:12]}"
+        _register_local_job(job_id, req.ep_id, "faces_embed")
+
         project_root = _find_project_root()
         command = _build_faces_embed_command(req.ep_id, options, project_root)
-        # Run blocking subprocess in thread pool to avoid blocking the event loop
-        result = await asyncio.to_thread(
-            _run_local_subprocess, command, req.ep_id, "faces_embed", options
-        )
 
+        # Start subprocess in background thread (don't await)
+        async def _run_in_background():
+            await asyncio.to_thread(
+                _run_local_subprocess, command, req.ep_id, "faces_embed", options, job_id
+            )
+
+        asyncio.create_task(_run_in_background())
+
+        # Return immediately with job_id (like Redis mode)
+        response = {
+            "job_id": job_id,
+            "ep_id": req.ep_id,
+            "state": "queued",
+            "operation": "faces_embed",
+            "execution_mode": "local",
+            "profile": resolved_profile,
+            "cpu_threads": options.get("cpu_threads"),
+            "message": "Faces embed job started locally (poll for status)",
+        }
         if all_warnings:
-            result["warnings"] = all_warnings
-        result["profile"] = resolved_profile
-
-        if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=result)
-        return result
+            response["warnings"] = all_warnings
+        return response
 
     # Redis/Celery mode (default)
     result = run_faces_embed_task.delay(req.ep_id, options)
@@ -901,20 +1013,35 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
 
     # Handle local execution mode
     if execution_mode == "local":
+        # Generate a local job ID and register it
+        job_id = f"local-{uuid.uuid4().hex[:12]}"
+        _register_local_job(job_id, req.ep_id, "cluster")
+
         project_root = _find_project_root()
         command = _build_cluster_command(req.ep_id, options, project_root)
-        # Run blocking subprocess in thread pool to avoid blocking the event loop
-        result = await asyncio.to_thread(
-            _run_local_subprocess, command, req.ep_id, "cluster", options
-        )
 
+        # Start subprocess in background thread (don't await)
+        async def _run_in_background():
+            await asyncio.to_thread(
+                _run_local_subprocess, command, req.ep_id, "cluster", options, job_id
+            )
+
+        asyncio.create_task(_run_in_background())
+
+        # Return immediately with job_id (like Redis mode)
+        response = {
+            "job_id": job_id,
+            "ep_id": req.ep_id,
+            "state": "queued",
+            "operation": "cluster",
+            "execution_mode": "local",
+            "profile": resolved_profile,
+            "cpu_threads": options.get("cpu_threads"),
+            "message": "Cluster job started locally (poll for status)",
+        }
         if all_warnings:
-            result["warnings"] = all_warnings
-        result["profile"] = resolved_profile
-
-        if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=result)
-        return result
+            response["warnings"] = all_warnings
+        return response
 
     # Redis/Celery mode (default)
     result = run_cluster_task.delay(req.ep_id, options)
