@@ -123,6 +123,12 @@ class LogFormatter:
         re.compile(r'^detection_fps_limit='),  # Duplicate config line
         re.compile(r'^VerifyOutputSizes'),  # ONNX internal warnings
         re.compile(r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}'),  # Timestamped debug lines
+        # Cluster-specific noise
+        re.compile(r'^No embeddings found for track'),  # Track without embeddings
+        re.compile(r'^Track \d+: using low-quality fallback'),  # Low-quality fallback warnings
+        re.compile(r'^\[LOCAL MODE\] (faces_embed|cluster) (starting|config)', re.IGNORECASE),  # Duplicate start messages
+        re.compile(r'^device=\w+,\s*cluster_thresh='),  # Duplicate cluster config
+        re.compile(r'^faces_total=\d+'),  # Duplicate faces count
     ]
 
     # Pattern for warnings.warn( which appears as a standalone line
