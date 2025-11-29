@@ -1,5 +1,5 @@
 {
-  "name": "youth-league-web",
+  "name": "@therealityreport/screenalytics-web",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -12,6 +12,7 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio"
   },
+  "description": "Screenalytics Next.js workspace UI",
   "dependencies": {
     "@prisma/client": "^5.10.1",
     "@radix-ui/react-toast": "^1.2.1",

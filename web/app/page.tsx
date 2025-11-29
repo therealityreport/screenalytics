@@ -1,48 +1,33 @@
 import Link from "next/link";
-import { prisma } from "@/src/lib/prisma";
+import styles from "./home.module.css";
 
-async function getEvents() {
-  return prisma.event.findMany({
-    orderBy: { createdAt: "desc" },
-  });
-}
-
-async function createSampleEvent() {
-  "use server";
-  const now = new Date();
-  const name = `Sample Event ${now.toISOString().slice(0, 10)}`;
-  await prisma.event.create({
-    data: {
-      name,
-      startDate: now,
-    },
-  });
-}
-
-export default async function HomePage() {
-  const events = await getEvents();
+export default function ScreenalyticsHome() {
   return (
     <div className="card">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Events</h1>
-        <form action={createSampleEvent}>
-          <button type="submit">Create sample event</button>
-        </form>
+      <div className={styles.hero}>
+        <div>
+          <p className={styles.kicker}>Screenalytics</p>
+          <h1 className={styles.title}>Next.js workspace UI</h1>
+          <p className={styles.body}>
+            Manage uploads, monitor pipeline phases, and review faces in the new Screenalytics experience. Streamlit remains
+            available while the Next.js UI reaches full parity.
+          </p>
+          <div className={styles.actions}>
+            <Link href="/screenalytics/upload" className={styles.primary}>
+              Go to Upload
+            </Link>
+            <Link href="/screenalytics/episodes/demo" className={styles.secondary}>
+              View Episode Detail
+            </Link>
+          </div>
+        </div>
+        <div className={styles.callout}>
+          <div className={styles.badge}>Beta</div>
+          <div className={styles.calloutText}>
+            Need legacy youth-league tools? They&apos;re archived under <code>/_archive-youth-league</code>.
+          </div>
+        </div>
       </div>
-      {events.length === 0 ? (
-        <p style={{ marginTop: 16 }}>No events yet. Create one to get started.</p>
-      ) : (
-        <ul style={{ marginTop: 16, paddingLeft: 18 }}>
-          {events.map((event) => (
-            <li key={event.id} style={{ marginBottom: 8 }}>
-              <Link href={`/events/${event.id}`}>{event.name}</Link>
-            </li>
-          ))}
-        </ul>
-      )}
-      <p style={{ marginTop: 16 }}>
-        Need request analysis? Visit <Link href="/request-analysis">Request Analysis</Link>.
-      </p>
     </div>
   );
 }

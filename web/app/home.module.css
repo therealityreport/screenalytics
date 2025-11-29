@@ -1,0 +1,81 @@
+.hero {
+  display: grid;
+  gap: 18px;
+  align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.kicker {
+  margin: 0 0 6px;
+  color: #0ea5e9;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+.title {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1.2;
+}
+
+.body {
+  margin: 10px 0 14px;
+  color: #475569;
+  max-width: 620px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #0ea5e9, #2563eb);
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid #cbd5e1;
+  color: #0f172a;
+  background: #ffffff;
+  font-weight: 700;
+}
+
+.callout {
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #e0f2fe;
+  color: #0369a1;
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.calloutText {
+  color: #475569;
+  font-size: 14px;
+  line-height: 1.4;
+}

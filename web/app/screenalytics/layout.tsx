@@ -30,7 +30,7 @@ export default function ScreenalyticsLayout({ children }: { children: ReactNode 
           <div className={styles.header}>
             <div>
               <div className={styles.breadcrumb}>Streamlit → Next.js (Phase 1)</div>
-              <h1 style={{ margin: "4px 0 0", fontSize: 24, fontWeight: 700 }}>Workspace UI</h1>
+              <h1 className={styles.pageTitle}>Workspace UI</h1>
             </div>
             <span className={styles.badge}>CSS Modules</span>
           </div>
