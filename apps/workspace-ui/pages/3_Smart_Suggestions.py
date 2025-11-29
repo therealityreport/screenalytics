@@ -154,6 +154,7 @@ if isinstance(season_value, int):
 cluster_payload = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks") or {"clusters": []}
 cast_api_resp = _safe_api_get(f"/shows/{show_slug}/cast" + (f"?season={season_label}" if season_label else ""))
 people_resp = _fetch_people_cached(show_slug)
+unlinked_resp = _safe_api_get(f"/episodes/{ep_id}/unlinked_entities")
 
 # Build cluster lookup
 cluster_lookup: Dict[str, Dict[str, Any]] = {}
@@ -175,25 +176,25 @@ if cast_api_resp:
 
 # Identify auto-clustered people (people without cast_id)
 people = people_resp.get("people", []) if people_resp else []
+people_by_id = {p.get("person_id"): p for p in people if p.get("person_id")}
+unlinked_entities = unlinked_resp.get("entities", []) if unlinked_resp else []
 auto_clustered_people: List[Dict[str, Any]] = []
-for person in people:
-    if not person.get("cast_id"):
-        # This person has no cast member link - they're auto-clustered
-        person_id = person.get("person_id")
-        # Get clusters for this person in this episode
-        cluster_ids = person.get("cluster_ids", [])
-        episode_clusters = [
-            cid.split(":", 1)[1] if ":" in cid else cid
-            for cid in cluster_ids
-            if isinstance(cid, str) and (cid.startswith(f"{ep_id}:") or ":" not in cid)
-        ]
-        if episode_clusters:
-            auto_clustered_people.append({
-                "person": person,
-                "person_id": person_id,
-                "name": person.get("name", f"Person {person_id}"),
-                "episode_clusters": episode_clusters,
-            })
+unlinked_cluster_ids: set[str] = set()
+for entity in unlinked_entities:
+    cluster_ids = [cid for cid in entity.get("cluster_ids", []) if cid]
+    if not cluster_ids:
+        continue
+    if entity.get("entity_type") == "person":
+        person_id = entity.get("entity_id")
+        person = people_by_id.get(person_id) or entity.get("person") or {"person_id": person_id}
+        auto_clustered_people.append({
+            "person": person,
+            "person_id": person_id,
+            "name": person.get("name", f"Person {person_id}"),
+            "episode_clusters": cluster_ids,
+        })
+    else:
+        unlinked_cluster_ids.update(cluster_ids)
 
 # Navigation back to Faces Review
 col1, col2 = st.columns([1, 4])
@@ -222,6 +223,8 @@ if not cast_suggestions and not st.session_state.get(auto_attempt_key, False):
 # Collect clusters with suggestions, sorted by confidence
 suggestion_entries = []
 for cluster_id, cluster_data in cluster_lookup.items():
+    if unlinked_cluster_ids and cluster_id not in unlinked_cluster_ids:
+        continue
     # Skip if dismissed
     if cluster_id in dismissed:
         continue
@@ -254,6 +257,57 @@ for cluster_id, cluster_data in cluster_lookup.items():
             "thumb_urls": thumb_urls,
         })
 
+# Collect person-level suggestions by aggregating cluster suggestions
+person_suggestion_entries = []
+for person_entry in auto_clustered_people:
+    person_id = person_entry["person_id"]
+    if f"person:{person_id}" in dismissed:
+        continue
+    episode_clusters = person_entry["episode_clusters"]
+    suggestion_bucket: Dict[str, Dict[str, Any]] = {}
+    total_faces = 0
+    total_tracks = 0
+    thumb_urls: List[str] = []
+
+    for cluster_id in episode_clusters:
+        cluster_data = cluster_lookup.get(cluster_id, {})
+        counts = cluster_data.get("counts", {}) if isinstance(cluster_data, dict) else {}
+        total_faces += counts.get("faces", 0)
+        total_tracks += counts.get("tracks", 0)
+
+        # Aggregate suggestions by cast_id, keep the strongest similarity
+        cluster_suggestions = cast_suggestions.get(cluster_id, [])
+        for sugg in cluster_suggestions:
+            cast_id = sugg.get("cast_id")
+            if not cast_id:
+                continue
+            current = suggestion_bucket.get(cast_id)
+            if not current or sugg.get("similarity", 0) > current.get("similarity", 0):
+                suggestion_bucket[cast_id] = dict(sugg)
+
+        # Collect thumbnails (limit to 5 total)
+        tracks = cluster_data.get("tracks", [])
+        for track in tracks:
+            url = track.get("rep_thumb_url") or track.get("rep_media_url")
+            if url and len(thumb_urls) < 5:
+                thumb_urls.append(url)
+
+    if not suggestion_bucket:
+        continue
+
+    sorted_suggs = sorted(suggestion_bucket.values(), key=lambda x: x.get("similarity", 0), reverse=True)
+    person_suggestion_entries.append({
+        "person": person_entry["person"],
+        "person_id": person_id,
+        "name": person_entry["name"],
+        "episode_clusters": episode_clusters,
+        "best_suggestion": sorted_suggs[0],
+        "all_suggestions": sorted_suggs,
+        "faces": total_faces,
+        "tracks": total_tracks,
+        "thumb_urls": thumb_urls,
+    })
+
 # Sort options
 SORT_OPTIONS = {
     "Similarity (High → Low)": ("similarity", True),
@@ -284,15 +338,15 @@ def _sort_entries(entries: List[Dict[str, Any]], sort_key: str, reverse: bool) -
     return entries
 
 
-# Stats bar
-total_unassigned = sum(1 for c in cluster_lookup.values() if not c.get("person_id"))
-with_suggestions = len(suggestion_entries)
+# Stats bar (fallback to legacy unassigned count if endpoint empty)
+total_unassigned = len(unlinked_entities) or sum(1 for c in cluster_lookup.values() if not c.get("person_id"))
+with_suggestions = len(suggestion_entries) + len(person_suggestion_entries)
 dismissed_count = len(dismissed)
 auto_clustered_count = len(auto_clustered_people)
 
 col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
-    st.metric("Unassigned Clusters", total_unassigned)
+    st.metric("Needs Cast Assignment", total_unassigned)
 with col2:
     st.metric("Auto-Clustered People", auto_clustered_count)
 with col3:
@@ -327,7 +381,7 @@ with sort_col1:
 sort_key, sort_reverse = SORT_OPTIONS[selected_sort]
 suggestion_entries = _sort_entries(suggestion_entries, sort_key, sort_reverse)
 
-if not suggestion_entries and not auto_clustered_people:
+if not suggestion_entries and not person_suggestion_entries:
     st.info("No pending suggestions. Click 'Refresh Suggestions' to find matches for unassigned clusters.")
     # Clear dismissed button if there are dismissed entries
     if dismissed:
@@ -484,64 +538,22 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                 st.rerun()
 
 
-# --- UNASSIGNED CLUSTERS SECTION ---
-if suggestion_entries:
-    st.markdown("### 🔍 Unassigned Clusters")
-    st.caption("Clusters not yet assigned to any person. Suggestions show which cast member they might belong to.")
+# --- UNIFIED NEEDS-ASSIGNMENT SECTION ---
+if suggestion_entries or person_suggestion_entries:
+    st.markdown("### 🔍 Needs Cast Assignment")
+    st.caption("Clusters and auto-people that are not linked to cast. Review and accept suggestions.")
     for idx, entry in enumerate(suggestion_entries):
         render_suggestion_row(entry, idx)
 
-# --- AUTO-CLUSTERED PEOPLE SECTION ---
-if auto_clustered_people:
-    st.markdown("---")
-    st.markdown("### 👤 Auto-Clustered People (No Cast Link)")
-    st.caption("People created from clustering that haven't been linked to a cast member yet.")
-
-    for person_entry in auto_clustered_people:
-        person = person_entry["person"]
+    for person_entry in person_suggestion_entries:
         person_id = person_entry["person_id"]
         person_name = person_entry["name"]
         episode_clusters = person_entry["episode_clusters"]
-
-        # Skip if dismissed
-        if f"person:{person_id}" in dismissed:
-            continue
-
-        # Collect suggestions for this person's clusters
-        person_suggestions: List[Dict[str, Any]] = []
-        person_thumb_urls: List[str] = []
-        total_faces = 0
-        total_tracks = 0
-
-        for cluster_id in episode_clusters:
-            cluster_data = cluster_lookup.get(cluster_id, {})
-            # Get suggestions for this cluster
-            cluster_suggs = cast_suggestions.get(cluster_id, [])
-            for sugg in cluster_suggs:
-                # Check if we already have this cast member
-                existing = next((s for s in person_suggestions if s.get("cast_id") == sugg.get("cast_id")), None)
-                if existing:
-                    # Update with better similarity if found
-                    if sugg.get("similarity", 0) > existing.get("similarity", 0):
-                        existing["similarity"] = sugg["similarity"]
-                        existing["confidence"] = sugg.get("confidence", "low")
-                else:
-                    person_suggestions.append(dict(sugg))
-
-            # Collect thumbnails from tracks
-            tracks = cluster_data.get("tracks", [])
-            for track in tracks[:3]:
-                url = track.get("rep_thumb_url") or track.get("rep_media_url")
-                if url and len(person_thumb_urls) < 5:
-                    person_thumb_urls.append(url)
-
-            counts = cluster_data.get("counts", {})
-            total_faces += counts.get("faces", 0)
-            total_tracks += counts.get("tracks", 0)
-
-        # Sort suggestions by similarity
-        person_suggestions.sort(key=lambda x: x.get("similarity", 0), reverse=True)
-        best_suggestion = person_suggestions[0] if person_suggestions else None
+        best_suggestion = person_entry["best_suggestion"]
+        all_suggestions = person_entry["all_suggestions"]
+        faces = person_entry["faces"]
+        tracks = person_entry["tracks"]
+        person_thumb_urls = person_entry["thumb_urls"]
 
         with st.container(border=True):
             thumb_col, info_col, action_col = st.columns([5, 3, 1])
@@ -558,7 +570,7 @@ if auto_clustered_people:
 
             with info_col:
                 st.markdown(f"**{person_name}** `{person_id}`")
-                st.caption(f"{len(episode_clusters)} cluster(s) · {total_tracks} tracks · {total_faces} faces")
+                st.caption(f"{len(episode_clusters)} cluster(s) · {tracks} tracks · {faces} faces")
 
                 if best_suggestion:
                     cast_id = best_suggestion.get("cast_id")
@@ -579,8 +591,7 @@ if auto_clustered_people:
                         unsafe_allow_html=True
                     )
 
-                    # Show alternative suggestions
-                    alt_suggestions = person_suggestions[1:3]
+                    alt_suggestions = all_suggestions[1:3]
                     if alt_suggestions:
                         alt_text = " · ".join([
                             f"{alt.get('name', 'Unknown')} ({int(alt.get('similarity', 0) * 100)}%)"
@@ -596,12 +607,10 @@ if auto_clustered_people:
                     cast_name = best_suggestion.get("name") or cast_options.get(cast_id, cast_id)
 
                     if st.button("✓ Link", key=f"sp_link_person_{person_id}", use_container_width=True):
-                        # Link this person to the cast member using PATCH endpoint
                         payload = {"cast_id": cast_id}
                         resp = _api_patch(f"/shows/{show_slug}/people/{person_id}", payload)
                         if resp:
                             st.toast(f"Linked {person_name} to {cast_name}")
-                            # Clear people cache
                             people_cache_key = f"people_cache:{show_slug}"
                             if people_cache_key in st.session_state:
                                 del st.session_state[people_cache_key]
@@ -610,7 +619,6 @@ if auto_clustered_people:
                             st.error("Failed to link")
 
                 if st.button("👁 View", key=f"sp_view_person_{person_id}", use_container_width=True):
-                    # Navigate to Faces Review with this person selected
                     st.session_state["facebank_ep"] = ep_id
                     st.session_state["facebank_view"] = "person_clusters"
                     st.session_state["selected_person"] = person_id

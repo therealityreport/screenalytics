@@ -44,7 +44,7 @@ COHESION_BONUS_MAX = float(os.getenv("COHESION_BONUS_MAX", "0.05"))  # Max dista
 
 # Enhancement: Facebank-first matching (try facebank before people prototypes)
 FACEBANK_FIRST_MATCHING = os.getenv("FACEBANK_FIRST_MATCHING", "1").lower() in ("1", "true", "yes")
-FACEBANK_MATCH_SIMILARITY = float(os.getenv("FACEBANK_MATCH_SIMILARITY", "0.55"))  # Min similarity for facebank match
+FACEBANK_MATCH_SIMILARITY = float(os.getenv("FACEBANK_MATCH_SIMILARITY", "0.68"))  # Min similarity for auto-assign (matches UI: ≥68%)
 
 # Enhancement: Protect manual assignments by default
 PROTECT_MANUAL_DEFAULT = os.getenv("PROTECT_MANUAL_DEFAULT", "1").lower() in ("1", "true", "yes")
@@ -471,6 +471,17 @@ class GroupingService:
             LOGGER.error(f"[{ep_id}] Failed to write progress file: {e}")
             # Don't raise - progress updates are non-critical
 
+    def _cleanup_progress_file(self, ep_id: str) -> None:
+        """Remove progress file after job completes to prevent stale data."""
+        path = self._group_progress_path(ep_id)
+        try:
+            if path.exists():
+                path.unlink()
+                LOGGER.debug(f"[{ep_id}] Cleaned up progress file")
+        except OSError as e:
+            LOGGER.warning(f"[{ep_id}] Failed to cleanup progress file: {e}")
+            # Don't raise - cleanup is non-critical
+
     def compute_cluster_centroids(self, ep_id: str, *, progress_callback=None) -> Dict[str, Any]:
         """Compute centroids for all clusters in an episode.
 
@@ -807,6 +818,7 @@ class GroupingService:
         assigned = []
         new_people = []
         suggestions = []
+        warnings = []  # Track dimension mismatches and other issues
         total_clusters = len(centroids_map)
         processed_clusters = 0
 
@@ -840,10 +852,18 @@ class GroupingService:
                             proto_vec = np.array(seed_person["prototype"], dtype=np.float32)
                             # Validate dimensions match before computing distance
                             if proto_vec.shape != centroid.shape:
-                                LOGGER.warning(
-                                    f"[{ep_id}] Dimension mismatch for seed person {seed_person_id}: "
-                                    f"prototype={proto_vec.shape}, centroid={centroid.shape} - skipping seed match"
+                                warning_msg = (
+                                    f"Dimension mismatch for cluster {cluster_id}: "
+                                    f"prototype has {proto_vec.shape[0]} dims, centroid has {centroid.shape[0]} dims. "
+                                    f"This may indicate different embedding models were used. Seed match skipped."
                                 )
+                                LOGGER.warning(f"[{ep_id}] {warning_msg}")
+                                warnings.append({
+                                    "type": "dimension_mismatch",
+                                    "cluster_id": cluster_id,
+                                    "person_id": seed_person_id,
+                                    "message": warning_msg,
+                                })
                             else:
                                 seed_distance = cosine_distance(centroid, proto_vec)
                                 # Apply seed delta bonus - reduce threshold for seed matches
@@ -950,6 +970,7 @@ class GroupingService:
             "suggestions": suggestions if not auto_assign else [],
             "new_people_count": len(new_people),
             "new_people": new_people,
+            "warnings": warnings,  # Include dimension mismatch and other warnings
         }
 
     def _clear_person_assignments(self, ep_id: str) -> int:
@@ -1069,32 +1090,33 @@ class GroupingService:
 
         progress_entries: List[Dict[str, Any]] = []
 
-        def _progress(step: str, pct: float, msg: str, meta: Optional[Dict[str, Any]] = None):
-            entry: Dict[str, Any] = {
-                "step": step,
-                "progress": pct,
-                "message": msg,
-            }
-            if meta:
-                entry.update(meta)
-            progress_entries.append(entry)
-            if progress_callback:
-                progress_callback(step, pct, msg)
-            LOGGER.info(f"[{ep_id}] {step}: {msg} ({int(pct*100)}%)")
-            self._write_progress(
-                ep_id,
-                progress_entries,
-                started_at=log["started_at"],
-                finished=False,
-            )
+        try:
+            def _progress(step: str, pct: float, msg: str, meta: Optional[Dict[str, Any]] = None):
+                entry: Dict[str, Any] = {
+                    "step": step,
+                    "progress": pct,
+                    "message": msg,
+                }
+                if meta:
+                    entry.update(meta)
+                progress_entries.append(entry)
+                if progress_callback:
+                    progress_callback(step, pct, msg)
+                LOGGER.info(f"[{ep_id}] {step}: {msg} ({int(pct*100)}%)")
+                self._write_progress(
+                    ep_id,
+                    progress_entries,
+                    started_at=log["started_at"],
+                    finished=False,
+                )
 
-        log = {
-            "ep_id": ep_id,
-            "started_at": _now_iso(),
-            "steps": [],
-        }
-        # Initialize progress file so UI polling can show immediate state
-        self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=False)
+            log = {
+                "ep_id": ep_id,
+                "started_at": _now_iso(),
+                "steps": [],
+            }
+            # Initialize progress file so UI polling can show immediate state
+            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=False)
 
         # Step 0: Clear stale person_id assignments from previous runs
         _progress("clear_assignments", 0.0, "Clearing stale person assignments...")
@@ -1456,20 +1478,23 @@ class GroupingService:
             f"Applied {len(groups)} group(s); merged {merged_clusters} cluster(s); facebank matched {facebank_assigned}",
         )
 
-        log["finished_at"] = _now_iso()
-        self._save_group_log(ep_id, log)
-        self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True)
+            log["finished_at"] = _now_iso()
+            self._save_group_log(ep_id, log)
+            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True)
 
-        return {
-            "ep_id": ep_id,
-            "centroids": centroids_result,
-            "facebank_matching": facebank_result,
-            "facebank_assigned": facebank_assigned,
-            "within_episode": within_result,
-            "across_episodes": across_result,
-            "assignments": final_assignments,
-            "log": log,
-        }
+            return {
+                "ep_id": ep_id,
+                "centroids": centroids_result,
+                "facebank_matching": facebank_result,
+                "facebank_assigned": facebank_assigned,
+                "within_episode": within_result,
+                "across_episodes": across_result,
+                "assignments": final_assignments,
+                "log": log,
+            }
+        finally:
+            # Remove progress file so new runs don't inherit stale progress states
+            self._cleanup_progress_file(ep_id)
 
     def _save_group_log(self, ep_id: str, log: Dict[str, Any]) -> None:
         """Save grouping audit log."""
@@ -2057,14 +2082,6 @@ class GroupingService:
         if not all_embeddings_by_cast:
             return {"suggestions": [], "message": "No assigned clusters or facebank seeds available for comparison"}
 
-        # Identify single-track clusters for per-frame matching
-        single_track_clusters = {
-            cid for cid in clusters_needing_suggestions
-            if len(cluster_to_tracks.get(cid, [])) == 1
-        }
-        if single_track_clusters:
-            LOGGER.info(f"[{ep_id}] Found {len(single_track_clusters)} single-track clusters for centroid comparison")
-
         # Generate suggestions
         suggestions = []
         for cluster_id in clusters_needing_suggestions:
@@ -2073,16 +2090,33 @@ class GroupingService:
                 continue
 
             centroid_vec = centroid_data["centroid"]
+            cluster_track_ids = cluster_to_tracks.get(cluster_id, [])
+            cluster_face_embeddings: List[np.ndarray] = []
+            for tid in cluster_track_ids:
+                cluster_face_embeddings.extend(unassigned_track_embeddings.get(int(tid), []))
+
+            use_frame_matching = len(cluster_track_ids) == 1 and len(cluster_face_embeddings) > 0
 
             # Find best similarity per cast member
             cast_matches: List[Dict[str, Any]] = []
             for cast_id, cast_embeddings in all_embeddings_by_cast.items():
                 best_sim = -1.0
+                source = "episode" if cast_id in embeddings_by_cast else "facebank"
+                faces_used: int | None = None
 
-                for emb in cast_embeddings:
-                    sim = cosine_similarity(centroid_vec, emb)
-                    if sim > best_sim:
-                        best_sim = sim
+                if use_frame_matching:
+                    faces_used = len(cluster_face_embeddings)
+                    for face_emb in cluster_face_embeddings:
+                        for emb in cast_embeddings:
+                            sim = cosine_similarity(face_emb, emb)
+                            if sim > best_sim:
+                                best_sim = sim
+                    source = "frame"
+                else:
+                    for emb in cast_embeddings:
+                        sim = cosine_similarity(centroid_vec, emb)
+                        if sim > best_sim:
+                            best_sim = sim
 
                 if best_sim >= min_similarity:
                     cast_meta = cast_lookup.get(cast_id, {})
@@ -2096,71 +2130,14 @@ class GroupingService:
                     else:
                         confidence = "low"
 
-                    # Indicate source of embeddings
-                    source = "episode" if cast_id in embeddings_by_cast else "facebank"
-
                     cast_matches.append({
                         "cast_id": cast_id,
                         "name": cast_name,
                         "similarity": round(float(best_sim), 3),
                         "confidence": confidence,
                         "source": source,
+                        "faces_used": faces_used,
                     })
-
-            # --- NEW: For single-track clusters, use per-frame max similarity instead of centroid ---
-            # This bypasses centroid-only matching for sparse clusters where centroids may be unreliable
-            if cluster_id in single_track_clusters:
-                track_ids = cluster_to_tracks.get(cluster_id, [])
-                if track_ids:
-                    # Get face embeddings for this cluster's track(s)
-                    cluster_face_embeddings: List[np.ndarray] = []
-                    for tid in track_ids:
-                        embs = unassigned_track_embeddings.get(tid, [])
-                        cluster_face_embeddings.extend(embs)
-
-                    if cluster_face_embeddings:
-                        n_faces_used = len(cluster_face_embeddings)
-
-                        # Compare each face embedding to all cast embeddings, take max
-                        for cast_id, cast_embeddings in all_embeddings_by_cast.items():
-                            best_frame_sim = -1.0
-
-                            for face_emb in cluster_face_embeddings:
-                                for cast_emb in cast_embeddings:
-                                    sim = cosine_similarity(face_emb, cast_emb)
-                                    if sim > best_frame_sim:
-                                        best_frame_sim = sim
-
-                            if best_frame_sim >= min_similarity:
-                                cast_meta = cast_lookup.get(cast_id, {})
-                                cast_name = cast_meta.get("name", cast_id)
-
-                                # Determine confidence level (slightly stricter for frame-based)
-                                if best_frame_sim >= 0.82:
-                                    confidence = "high"
-                                elif best_frame_sim >= 0.68:
-                                    confidence = "medium"
-                                else:
-                                    confidence = "low"
-
-                                # Check if we already have a suggestion for this cast_id
-                                existing = next((m for m in cast_matches if m["cast_id"] == cast_id), None)
-                                if existing:
-                                    # Keep the higher similarity, update source if frame-based is better
-                                    if best_frame_sim > existing["similarity"]:
-                                        existing["similarity"] = round(float(best_frame_sim), 3)
-                                        existing["confidence"] = confidence
-                                        existing["source"] = "frame"
-                                        existing["faces_used"] = n_faces_used
-                                else:
-                                    cast_matches.append({
-                                        "cast_id": cast_id,
-                                        "name": cast_name,
-                                        "similarity": round(float(best_frame_sim), 3),
-                                        "confidence": confidence,
-                                        "source": "frame",
-                                        "faces_used": n_faces_used,
-                                    })
 
             # Sort by similarity (descending) and take top_k
             cast_matches.sort(key=lambda x: x["similarity"], reverse=True)
@@ -2236,6 +2213,90 @@ class GroupingService:
         return {
             "auto_assigned": len(auto_assigned),
             "assignments": auto_assigned,
+        }
+
+    def list_unlinked_entities(self, ep_id: str) -> Dict[str, Any]:
+        """Return clusters that are not linked to a cast member, grouping single- and multi-cluster auto-people together."""
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
+
+        identities_path = self._identities_path(ep_id)
+        if not identities_path.exists():
+            raise FileNotFoundError(f"identities.json not found for {ep_id}")
+
+        identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+        identities = identities_data.get("identities", [])
+
+        people = self.people_service.list_people(show_id)
+        people_by_id = {p.get("person_id"): p for p in people if p.get("person_id")}
+
+        # Optional cohesion metadata
+        centroids_map: Dict[str, Dict[str, Any]] = {}
+        try:
+            centroids_data = self.load_cluster_centroids(ep_id)
+            centroids_map = _normalize_centroids_to_map(centroids_data.get("centroids", {}), validate=False)
+        except FileNotFoundError:
+            centroids_map = {}
+
+        entities: Dict[str, Dict[str, Any]] = {}
+
+        for identity in identities:
+            cluster_id = identity.get("identity_id")
+            if not cluster_id:
+                continue
+            person_id = identity.get("person_id")
+            person = people_by_id.get(person_id) if person_id else None
+            cast_id = person.get("cast_id") if person else None
+
+            # Skip anything already linked to a cast member
+            if cast_id:
+                continue
+
+            key = person_id or cluster_id  # group multi-cluster auto people by person_id; singletons by cluster_id
+            entry = entities.setdefault(
+                key,
+                {
+                    "entity_id": key,
+                    "entity_type": "person" if person_id else "cluster",
+                    "person": person or {},
+                    "cluster_ids": [],
+                    "tracks": 0,
+                    "faces": 0,
+                    "cohesion_sum": 0.0,
+                    "cohesion_count": 0,
+                },
+            )
+
+            entry["cluster_ids"].append(cluster_id)
+            track_ids = identity.get("track_ids", []) or []
+            entry["tracks"] += len(track_ids)
+            faces_count = identity.get("size") or 0
+            entry["faces"] += faces_count
+
+            centroid_meta = centroids_map.get(cluster_id) or {}
+            cohesion = centroid_meta.get("cohesion")
+            if cohesion is not None:
+                entry["cohesion_sum"] += cohesion
+                entry["cohesion_count"] += 1
+
+        # Finalize averages and trim internal fields
+        output_entities = []
+        for entity in entities.values():
+            cohesion_sum = entity.pop("cohesion_sum", 0.0)
+            cohesion_count = entity.pop("cohesion_count", 0)
+            avg_cohesion = cohesion_sum / cohesion_count if cohesion_count else None
+            entity["avg_cohesion"] = avg_cohesion
+            output_entities.append(entity)
+
+        return {
+            "ep_id": ep_id,
+            "entities": output_entities,
+            "counts": {
+                "total": len(output_entities),
+                "clusters": sum(len(e.get("cluster_ids", [])) for e in output_entities),
+            },
         }
 
     def save_current_assignments(self, ep_id: str) -> Dict[str, Any]:

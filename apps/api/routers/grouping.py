@@ -15,12 +15,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from apps.api.services.grouping import GroupingService
+from apps.api.services.grouping import GroupingService, _parse_ep_id
+from apps.api.services.cast import CastService
 from apps.api.routers.episodes import _refresh_similarity_indexes
 
 LOGGER = logging.getLogger(__name__)
 router = APIRouter()
 grouping_service = GroupingService()
+cast_service = CastService()
 
 # Lazy imports for Celery (only when needed)
 _celery_available = None
@@ -80,6 +82,24 @@ def _trigger_similarity_refresh(ep_id: str, cluster_ids: Iterable[str] | None) -
     if not unique:
         return
     _refresh_similarity_indexes(ep_id, identity_ids=unique)
+
+
+def _queue_async_similarity_refresh(ep_id: str) -> Optional[str]:
+    """Queue async similarity refresh (fire-and-forget, doesn't block response).
+
+    Returns job_id if queued successfully, None if Celery unavailable.
+    """
+    if not _check_celery_available():
+        LOGGER.debug(f"[{ep_id}] Skipping async similarity refresh (Celery unavailable)")
+        return None
+    try:
+        from apps.api.tasks import run_refresh_similarity_task
+        task = run_refresh_similarity_task.delay(episode_id=ep_id)
+        LOGGER.info(f"[{ep_id}] Queued async similarity refresh: {task.id}")
+        return task.id
+    except Exception as e:
+        LOGGER.warning(f"[{ep_id}] Failed to queue async similarity refresh: {e}")
+        return None
 
 
 @router.post("/episodes/{ep_id}/clusters/group")
@@ -156,15 +176,15 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                 cast_id=body.cast_id,
                 name=body.name,
             )
-            # NOTE: Skip _trigger_similarity_refresh for manual assignments.
-            # The full regeneration of all track reps is expensive (60s+ timeout).
-            # Manual assignments update identities and people directly, so similarity
-            # indexes can be refreshed on next auto-cluster or explicit refresh.
+            # Queue async similarity refresh (fire-and-forget, doesn't block response)
+            # This ensures similarity badges update after manual assignments without timeout
+            refresh_job_id = _queue_async_similarity_refresh(ep_id)
             return {
                 "status": "success",
                 "strategy": "manual",
                 "ep_id": ep_id,
                 "result": result,
+                "similarity_refresh_job_id": refresh_job_id,  # None if Celery unavailable
             }
         elif body.strategy == "facebank":
             result = grouping_service.group_using_facebank(ep_id)
@@ -243,6 +263,24 @@ def batch_assign_clusters_async(ep_id: str, body: BatchAssignRequest) -> dict:
     """
     if not body.assignments:
         raise HTTPException(status_code=400, detail="No assignments provided")
+
+    # Validate cast IDs exist before enqueuing job
+    parsed = _parse_ep_id(ep_id)
+    if not parsed:
+        raise HTTPException(status_code=400, detail=f"Invalid episode ID format: {ep_id}")
+    show_id = parsed["show"]
+
+    cast_ids_to_validate = {a.target_cast_id for a in body.assignments if a.target_cast_id}
+    if cast_ids_to_validate:
+        invalid_cast_ids = []
+        for cast_id in cast_ids_to_validate:
+            if not cast_service.get_cast_member(show_id, cast_id):
+                invalid_cast_ids.append(cast_id)
+        if invalid_cast_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid cast member ID(s) for show {show_id}: {', '.join(invalid_cast_ids)}"
+            )
 
     execution_mode = body.execution_mode or "redis"
 
@@ -656,6 +694,33 @@ def get_cast_suggestions(ep_id: str, min_similarity: float = 0.50, top_k: int = 
         )
 
 
+@router.get("/episodes/{ep_id}/unlinked_entities")
+def list_unlinked_entities(ep_id: str) -> dict:
+    """Return clusters that are not linked to a cast member (auto-people + unassigned clusters)."""
+    try:
+        result = grouping_service.list_unlinked_entities(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except FileNotFoundError as e:
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "entities": [],
+            "counts": {"total": 0, "clusters": 0},
+            "message": str(e),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load unlinked entities: {str(e)}",
+        )
+
+
 @router.post("/episodes/{ep_id}/auto_link_cast")
 def auto_link_cast(ep_id: str, min_confidence: float = 0.85) -> dict:
     """Auto-assign unassigned clusters to cast members with high confidence (Enhancement #8).
@@ -725,6 +790,7 @@ def cleanup_preview(ep_id: str) -> dict:
 
         # Estimate potential merges (clusters that could be merged based on similarity)
         potential_merges = 0
+        merge_estimate_error = None
         if centroids_count > 1:
             try:
                 within_result = grouping_service.group_within_episode(
@@ -732,8 +798,9 @@ def cleanup_preview(ep_id: str) -> dict:
                     protect_manual=False,  # Check without protection to see full impact
                 )
                 potential_merges = within_result.get("merged_count", 0)
-            except Exception:
-                pass
+            except Exception as e:
+                LOGGER.warning(f"[{ep_id}] Failed to estimate merges in cleanup preview: {e}")
+                merge_estimate_error = str(e)
 
         # Count unassigned vs assigned clusters
         assigned_clusters = sum(1 for i in identities if i.get("person_id"))
@@ -766,6 +833,13 @@ def cleanup_preview(ep_id: str) -> dict:
         if unassigned_clusters > 0:
             preview["warnings"].append(
                 f"ℹ️ {unassigned_clusters} unassigned cluster(s) may be grouped."
+            )
+
+        # Add error warning if merge estimation failed
+        if merge_estimate_error:
+            preview["warning_level"] = "high"
+            preview["warnings"].append(
+                f"⚠️ Could not estimate merges: {merge_estimate_error}"
             )
 
         return {
