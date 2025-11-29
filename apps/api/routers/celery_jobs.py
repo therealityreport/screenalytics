@@ -36,6 +36,7 @@ Override defaults by setting SCREENALYTICS_MAX_CPU_THREADS environment variable.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -62,6 +63,178 @@ from apps.api.tasks import (
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/celery_jobs", tags=["celery_jobs"])
+
+
+# =============================================================================
+# Local Job Tracking - Prevents duplicate jobs and enables cancellation
+# =============================================================================
+import threading
+
+_running_local_jobs: Dict[str, Dict[str, Any]] = {}  # ep_id::operation -> job info
+_running_local_jobs_lock = threading.Lock()
+
+
+def _get_running_local_job(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Check if a local job is already running for this episode/operation."""
+    key = f"{ep_id}::{operation}"
+    with _running_local_jobs_lock:
+        return _running_local_jobs.get(key)
+
+
+def _register_local_job(ep_id: str, operation: str, pid: int, job_id: str | None = None) -> None:
+    """Register a running local job."""
+    key = f"{ep_id}::{operation}"
+    with _running_local_jobs_lock:
+        _running_local_jobs[key] = {
+            "ep_id": ep_id,
+            "operation": operation,
+            "pid": pid,
+            "job_id": job_id or f"local-{ep_id}-{operation}",
+            "started_at": __import__("time").time(),
+        }
+    LOGGER.info(f"[{ep_id}] Registered local {operation} job (PID {pid}, job_id={job_id})")
+
+
+def _unregister_local_job(ep_id: str, operation: str) -> None:
+    """Unregister a local job when it completes or is cancelled."""
+    key = f"{ep_id}::{operation}"
+    with _running_local_jobs_lock:
+        if key in _running_local_jobs:
+            del _running_local_jobs[key]
+            LOGGER.info(f"[{ep_id}] Unregistered local {operation} job")
+
+
+def _list_local_jobs(ep_id: str | None = None) -> List[Dict[str, Any]]:
+    """List all running local jobs, optionally filtered by episode.
+
+    Also cleans up stale entries for processes that are no longer running.
+    """
+    import psutil
+
+    result = []
+    stale_keys = []
+
+    with _running_local_jobs_lock:
+        for key, job_info in list(_running_local_jobs.items()):
+            job_ep_id = job_info.get("ep_id")
+            pid = job_info.get("pid")
+
+            # Filter by episode if specified
+            if ep_id and job_ep_id != ep_id:
+                continue
+
+            # Check if process is still running
+            is_running = False
+            try:
+                proc = psutil.Process(pid)
+                is_running = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                is_running = False
+
+            if not is_running:
+                stale_keys.append(key)
+                continue
+
+            result.append({
+                "job_id": job_info.get("job_id", f"local-{job_ep_id}-{job_info.get('operation')}"),
+                "ep_id": job_ep_id,
+                "operation": job_info.get("operation"),
+                "pid": pid,
+                "started_at": job_info.get("started_at"),
+                "state": "running",
+                "source": "local",
+            })
+
+        # Clean up stale entries
+        for key in stale_keys:
+            del _running_local_jobs[key]
+            LOGGER.info(f"Cleaned up stale local job: {key}")
+
+    return result
+
+
+def _is_local_job_running(ep_id: str, operation: str) -> bool:
+    """Check if a local job is currently running for this episode/operation."""
+    jobs = _list_local_jobs(ep_id)
+    return any(j.get("operation") == operation for j in jobs)
+
+
+def _detect_running_episode_processes() -> List[Dict[str, Any]]:
+    """Detect running episode_run.py processes by scanning the process list.
+
+    This catches processes that weren't registered (e.g., after API restart).
+    """
+    import psutil
+    import re
+
+    result = []
+    ep_id_pattern = re.compile(r"--ep-id\s+(\S+)")
+
+    try:
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+            try:
+                cmdline = proc.info.get("cmdline") or []
+                cmdline_str = " ".join(cmdline) if cmdline else ""
+
+                # Check if this is an episode_run.py process
+                if "episode_run.py" not in cmdline_str:
+                    continue
+
+                # Extract ep_id from command line
+                match = ep_id_pattern.search(cmdline_str)
+                if not match:
+                    continue
+
+                ep_id = match.group(1)
+                pid = proc.info["pid"]
+                create_time = proc.info.get("create_time", 0)
+
+                # Determine operation type
+                if "--faces-embed" in cmdline_str:
+                    operation = "faces_embed"
+                elif "--cluster" in cmdline_str:
+                    operation = "cluster"
+                else:
+                    operation = "detect_track"
+
+                result.append({
+                    "job_id": f"orphan-{pid}",
+                    "ep_id": ep_id,
+                    "operation": operation,
+                    "pid": pid,
+                    "started_at": create_time,
+                    "state": "running",
+                    "source": "detected",  # Not registered, detected by scanning
+                })
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+    except Exception as e:
+        LOGGER.warning(f"Failed to scan for episode_run processes: {e}")
+
+    return result
+
+
+def get_all_running_jobs(ep_id: str | None = None) -> List[Dict[str, Any]]:
+    """Get all running jobs (registered + detected orphan processes)."""
+    # Get registered local jobs
+    registered = _list_local_jobs(ep_id)
+    registered_pids = {j.get("pid") for j in registered}
+
+    # Detect any orphan processes not in our registry
+    detected = _detect_running_episode_processes()
+
+    # Filter by ep_id if specified and exclude already-registered PIDs
+    result = list(registered)
+    for job in detected:
+        if job.get("pid") in registered_pids:
+            continue
+        if ep_id and job.get("ep_id") != ep_id:
+            continue
+        result.append(job)
+
+    return result
 
 
 # =============================================================================
@@ -283,6 +456,23 @@ def _map_celery_state(state: str) -> str:
     return mapping.get(state, "unknown")
 
 
+@router.get("/local")
+async def list_local_jobs(ep_id: str | None = None):
+    """List running local jobs (not Celery).
+
+    These are subprocess jobs running on the local machine, detected either
+    from our registry or by scanning for episode_run.py processes.
+
+    Args:
+        ep_id: Optional filter by episode ID
+    """
+    jobs = get_all_running_jobs(ep_id)
+    return {
+        "jobs": jobs,
+        "count": len(jobs),
+    }
+
+
 @router.get("/{job_id}")
 async def get_celery_job_status(job_id: str):
     """Get status of a Celery background job.
@@ -398,6 +588,18 @@ async def list_active_celery_jobs():
                 "worker": worker,
             })
 
+    # Also include local running jobs (registered + detected orphan processes)
+    local_jobs = get_all_running_jobs()
+    for local_job in local_jobs:
+        jobs.append({
+            "job_id": local_job.get("job_id"),
+            "name": f"local_{local_job.get('operation', 'unknown')}",
+            "state": local_job.get("state", "running"),
+            "worker": f"local (PID {local_job.get('pid')})",
+            "ep_id": local_job.get("ep_id"),
+            "source": local_job.get("source", "local"),
+        })
+
     return {
         "jobs": jobs,
         "count": len(jobs),
@@ -418,17 +620,141 @@ def _find_project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _run_local_subprocess(
+def _start_local_subprocess(
     command: list[str],
     episode_id: str,
     operation: str,
     options: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Run a pipeline command synchronously as subprocess.
+    """Start a pipeline subprocess in the background (non-blocking).
 
-    This is used for local execution mode to run the pipeline directly
-    instead of queuing via Celery. The call blocks until completion and
-    returns the result directly - no job ID, no polling, no background task.
+    This starts the subprocess and returns immediately with job info.
+    The UI should poll for progress using /episodes/{ep_id}/progress.
+
+    Args:
+        command: Command list to execute
+        episode_id: Episode ID for logging
+        operation: Operation name (detect_track, faces_embed, cluster)
+        options: Job options for logging and env setup
+
+    Returns:
+        Dict with job_id, status, etc.
+    """
+    import uuid
+
+    # Check for existing running job
+    existing_job = _get_running_local_job(episode_id, operation)
+    if existing_job:
+        existing_pid = existing_job.get("pid")
+        job_id = existing_job.get("job_id", f"local-{episode_id}-{operation}")
+        LOGGER.info(f"[{episode_id}] {operation} already running (PID {existing_pid})")
+        return {
+            "job_id": job_id,
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "state": "already_running",
+            "pid": existing_pid,
+            "message": f"Job already running (PID {existing_pid})",
+        }
+
+    project_root = _find_project_root()
+    job_id = f"local-{uuid.uuid4().hex[:12]}"
+
+    # Build context string for logging
+    device = options.get("device", "auto")
+    stride = options.get("stride", 6)
+
+    LOGGER.info(f"[{episode_id}] Starting local {operation} (device={device}, stride={stride})")
+    LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
+
+    # Set up environment with CPU thread limits
+    env = os.environ.copy()
+    cpu_threads = options.get("cpu_threads")
+    if cpu_threads:
+        max_allowed = os.cpu_count() or 8
+        threads = max(1, min(int(cpu_threads), max_allowed))
+        env.update({
+            "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+            "OMP_NUM_THREADS": str(threads),
+            "MKL_NUM_THREADS": str(threads),
+            "OPENBLAS_NUM_THREADS": str(threads),
+            "VECLIB_MAXIMUM_THREADS": str(threads),
+            "NUMEXPR_NUM_THREADS": str(threads),
+            "ORT_INTRA_OP_NUM_THREADS": str(threads),
+            "ORT_INTER_OP_NUM_THREADS": "1",
+        })
+        LOGGER.info(f"[{episode_id}] CPU threads limited to {threads}")
+    else:
+        # CRITICAL: Always set CPU limits to prevent thermal issues
+        default_threads = 2
+        env.update({
+            "SCREENALYTICS_MAX_CPU_THREADS": str(default_threads),
+            "OMP_NUM_THREADS": str(default_threads),
+            "MKL_NUM_THREADS": str(default_threads),
+            "OPENBLAS_NUM_THREADS": str(default_threads),
+            "VECLIB_MAXIMUM_THREADS": str(default_threads),
+            "NUMEXPR_NUM_THREADS": str(default_threads),
+            "ORT_INTRA_OP_NUM_THREADS": str(default_threads),
+            "ORT_INTER_OP_NUM_THREADS": "1",
+        })
+        LOGGER.info(f"[{episode_id}] CPU threads limited to {default_threads} (default)")
+
+    try:
+        # Start subprocess in new process group (non-blocking)
+        process = subprocess.Popen(
+            command,
+            cwd=str(project_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,  # Create new process group
+        )
+
+        # Register the job for tracking
+        _register_local_job(episode_id, operation, process.pid, job_id)
+        LOGGER.info(f"[{episode_id}] Process started (PID {process.pid}, job_id={job_id})")
+
+        return {
+            "job_id": job_id,
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "state": "started",
+            "pid": process.pid,
+            "message": f"Job started (PID {process.pid}). Poll /episodes/{episode_id}/progress for updates.",
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"[{episode_id}] Failed to start local {operation}: {e}")
+        return {
+            "job_id": job_id,
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "state": "error",
+            "error": str(e),
+            "message": f"Failed to start: {e}",
+        }
+
+
+async def _run_local_subprocess_async(
+    command: list[str],
+    episode_id: str,
+    operation: str,
+    options: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run a pipeline command as subprocess, tied to the HTTP request lifecycle.
+
+    DEPRECATED: This blocking version is kept for backwards compatibility.
+    New code should use _start_local_subprocess() for non-blocking execution.
+
+    This is used for local execution mode. The subprocess is killed if the
+    HTTP request is cancelled (e.g., page refresh). This ensures local mode
+    is truly synchronous and tied to the browser session.
+
+    IMPORTANT: Uses process group to ensure all child processes are killed
+    when the parent is terminated.
 
     Args:
         command: Command list to execute
@@ -439,12 +765,37 @@ def _run_local_subprocess(
     Returns:
         Result dict with status, logs, and summary data
     """
+    import signal
+    import time
+
+    # Check for existing running job
+    existing_job = _get_running_local_job(episode_id, operation)
+    if existing_job:
+        existing_pid = existing_job.get("pid")
+        LOGGER.warning(f"[{episode_id}] {operation} already running (PID {existing_pid})")
+        return {
+            "status": "error",
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "error": f"A {operation} job is already running for this episode (PID {existing_pid}). "
+                     "Wait for it to complete or kill it manually.",
+            "logs": [f"Existing job PID: {existing_pid}"],
+            "elapsed_seconds": 0,
+        }
+
     project_root = _find_project_root()
     logs: List[str] = []
 
-    logs.append(f"Starting {operation} in local mode...")
-    logs.append(f"Command: {' '.join(command)}")
-    LOGGER.info(f"[{episode_id}] Starting local {operation}")
+    # Build context string for logging
+    device = options.get("device", "auto")
+    stride = options.get("stride", 6)
+    profile = options.get("profile", "default")
+
+    logs.append(f"[LOCAL MODE] Starting {operation}")
+    logs.append(f"  Device: {device}, Stride: {stride}")
+    logs.append(f"  This runs synchronously - page refresh will cancel the job.")
+    LOGGER.info(f"[{episode_id}] Starting local {operation} (device={device}, stride={stride})")
     LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
 
     # Set up environment with CPU thread limits
@@ -464,31 +815,93 @@ def _run_local_subprocess(
             "ORT_INTER_OP_NUM_THREADS": "1",
         })
         logs.append(f"CPU threads limited to {threads}")
+    else:
+        # CRITICAL: Always set CPU limits to prevent thermal issues
+        default_threads = 2
+        env.update({
+            "SCREENALYTICS_MAX_CPU_THREADS": str(default_threads),
+            "OMP_NUM_THREADS": str(default_threads),
+            "MKL_NUM_THREADS": str(default_threads),
+            "OPENBLAS_NUM_THREADS": str(default_threads),
+            "VECLIB_MAXIMUM_THREADS": str(default_threads),
+            "NUMEXPR_NUM_THREADS": str(default_threads),
+            "ORT_INTRA_OP_NUM_THREADS": str(default_threads),
+            "ORT_INTER_OP_NUM_THREADS": "1",
+        })
+        logs.append(f"CPU threads limited to {default_threads} (default)")
 
-    import time
     start_time = time.time()
+    process: subprocess.Popen | None = None
+
+    def _kill_process_tree(proc: subprocess.Popen) -> None:
+        """Kill process and all its children using process group."""
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait(timeout=5)
+        except (ProcessLookupError, OSError) as e:
+            LOGGER.debug(f"Process already dead: {e}")
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
 
     try:
-        # Run subprocess synchronously - blocks until completion
-        result = subprocess.run(
+        # Use Popen with start_new_session=True to create a new process group
+        # This allows us to kill all child processes when cancelling
+        process = subprocess.Popen(
             command,
             cwd=str(project_root),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             env=env,
-            timeout=3600,  # 1 hour timeout
+            start_new_session=True,  # Create new process group
         )
 
-        elapsed = time.time() - start_time
+        # Register the job
+        _register_local_job(episode_id, operation, process.pid)
+        logs.append(f"Process started (PID {process.pid})")
 
-        # Collect stdout lines as logs
-        if result.stdout:
-            for line in result.stdout.strip().split("\n"):
+        # Wait for process in a way that allows cancellation
+        # Poll every 0.5 seconds to check if we should cancel
+        timeout_seconds = 3600  # 1 hour
+        elapsed = 0.0
+        while process.poll() is None:
+            await asyncio.sleep(0.5)
+            elapsed = time.time() - start_time
+            if elapsed > timeout_seconds:
+                _kill_process_tree(process)
+                _unregister_local_job(episode_id, operation)
+                logs.append(f"TIMEOUT: Job timed out after 1 hour")
+                LOGGER.error(f"[{episode_id}] local {operation} timed out after 1 hour")
+                return {
+                    "status": "error",
+                    "ep_id": episode_id,
+                    "operation": operation,
+                    "execution_mode": "local",
+                    "error": "Job timed out after 1 hour",
+                    "logs": logs,
+                    "elapsed_seconds": elapsed,
+                }
+
+        elapsed = time.time() - start_time
+        _unregister_local_job(episode_id, operation)
+
+        # Collect output
+        stdout, stderr = process.communicate(timeout=10)
+        if stdout:
+            for line in stdout.strip().split("\n"):
                 if line.strip():
                     logs.append(line.strip())
 
-        if result.returncode != 0:
-            error_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
+        if process.returncode != 0:
+            error_msg = stderr.strip() if stderr else f"Exit code {process.returncode}"
             logs.append(f"ERROR: {error_msg}")
             LOGGER.error(f"[{episode_id}] local {operation} failed: {error_msg}")
             return {
@@ -497,13 +910,20 @@ def _run_local_subprocess(
                 "operation": operation,
                 "execution_mode": "local",
                 "error": error_msg,
-                "return_code": result.returncode,
+                "return_code": process.returncode,
                 "logs": logs,
                 "elapsed_seconds": elapsed,
             }
 
-        logs.append(f"{operation} completed successfully in {elapsed:.1f}s")
-        LOGGER.info(f"[{episode_id}] local {operation} completed successfully in {elapsed:.1f}s")
+        # Format elapsed time nicely
+        if elapsed >= 60:
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            elapsed_str = f"{mins}m {secs}s"
+        else:
+            elapsed_str = f"{elapsed:.1f}s"
+        logs.append(f"[LOCAL MODE] {operation} completed successfully in {elapsed_str}")
+        LOGGER.info(f"[{episode_id}] local {operation} completed successfully in {elapsed_str}")
         return {
             "status": "completed",
             "ep_id": episode_id,
@@ -514,22 +934,21 @@ def _run_local_subprocess(
             "elapsed_seconds": elapsed,
         }
 
-    except subprocess.TimeoutExpired:
+    except asyncio.CancelledError:
+        # Request was cancelled (e.g., page refresh) - kill the subprocess tree
         elapsed = time.time() - start_time
-        error_msg = "Job timed out after 1 hour"
-        logs.append(f"TIMEOUT: {error_msg}")
-        LOGGER.error(f"[{episode_id}] local {operation} timed out after 1 hour")
-        return {
-            "status": "error",
-            "ep_id": episode_id,
-            "operation": operation,
-            "execution_mode": "local",
-            "error": error_msg,
-            "logs": logs,
-            "elapsed_seconds": elapsed,
-        }
+        if process and process.poll() is None:
+            LOGGER.warning(f"[{episode_id}] Request cancelled, killing {operation} process tree (PID {process.pid})")
+            _kill_process_tree(process)
+            logs.append(f"CANCELLED: Request cancelled after {elapsed:.1f}s, process tree killed")
+        _unregister_local_job(episode_id, operation)
+        raise  # Re-raise to propagate cancellation
+
     except Exception as e:
         elapsed = time.time() - start_time
+        if process and process.poll() is None:
+            _kill_process_tree(process)
+        _unregister_local_job(episode_id, operation)
         error_msg = str(e)
         logs.append(f"EXCEPTION: {error_msg}")
         LOGGER.exception(f"[{episode_id}] local {operation} raised exception: {e}")
@@ -748,13 +1167,13 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         f"execution_mode={execution_mode}"
     )
 
-    # Handle local execution mode - runs synchronously, blocks until complete
+    # Handle local execution mode - start subprocess and return immediately
     if execution_mode == "local":
         project_root = _find_project_root()
         command = _build_detect_track_command(req.ep_id, options, project_root)
 
-        # Run synchronously - blocks until completion
-        result = _run_local_subprocess(command, req.ep_id, "detect_track", options)
+        # Start subprocess (non-blocking) - UI will poll for progress
+        result = _start_local_subprocess(command, req.ep_id, "detect_track", options)
 
         # Add profile and warnings to result
         result["profile"] = resolved_profile
@@ -762,8 +1181,8 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         if all_warnings:
             result["warnings"] = all_warnings
 
-        # Return error status code if job failed
-        if result.get("status") == "error":
+        # Return error status code if job failed to start
+        if result.get("state") == "error":
             return JSONResponse(status_code=500, content=result)
 
         return result
@@ -844,13 +1263,13 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
         all_warnings.append(profile_warning)
     all_warnings.extend(config_warnings)
 
-    # Handle local execution mode - runs synchronously, blocks until complete
+    # Handle local execution mode - subprocess tied to request lifecycle
     if execution_mode == "local":
         project_root = _find_project_root()
         command = _build_faces_embed_command(req.ep_id, options, project_root)
 
-        # Run synchronously - blocks until completion
-        result = _run_local_subprocess(command, req.ep_id, "faces_embed", options)
+        # Start subprocess (non-blocking) - UI will poll for progress
+        result = _start_local_subprocess(command, req.ep_id, "faces_embed", options)
 
         # Add profile and warnings to result
         result["profile"] = resolved_profile
@@ -858,8 +1277,8 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
         if all_warnings:
             result["warnings"] = all_warnings
 
-        # Return error status code if job failed
-        if result.get("status") == "error":
+        # Return error status code if job failed to start
+        if result.get("state") == "error":
             return JSONResponse(status_code=500, content=result)
 
         return result
@@ -938,13 +1357,13 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
         all_warnings.append(profile_warning)
     all_warnings.extend(config_warnings)
 
-    # Handle local execution mode - runs synchronously, blocks until complete
+    # Handle local execution mode - subprocess tied to request lifecycle
     if execution_mode == "local":
         project_root = _find_project_root()
         command = _build_cluster_command(req.ep_id, options, project_root)
 
-        # Run synchronously - blocks until completion
-        result = _run_local_subprocess(command, req.ep_id, "cluster", options)
+        # Start subprocess (non-blocking) - UI will poll for progress
+        result = _start_local_subprocess(command, req.ep_id, "cluster", options)
 
         # Add profile and warnings to result
         result["profile"] = resolved_profile
@@ -952,8 +1371,8 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
         if all_warnings:
             result["warnings"] = all_warnings
 
-        # Return error status code if job failed
-        if result.get("status") == "error":
+        # Return error status code if job failed to start
+        if result.get("state") == "error":
             return JSONResponse(status_code=500, content=result)
 
         return result

@@ -1348,9 +1348,52 @@ combo_detector, combo_tracker = helpers.detect_tracker_combo(ep_id, detect_phase
 combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_detector, combo_tracker)
 combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
 col_detect, col_faces, col_cluster = st.columns(3)
+
+# Check for running jobs for each phase
+running_detect_job = helpers.get_running_job_for_episode(ep_id, "detect_track")
+running_faces_job = helpers.get_running_job_for_episode(ep_id, "faces_embed")
+running_cluster_job = helpers.get_running_job_for_episode(ep_id, "cluster")
+
+# Session state keys for cancel confirmation dialogs
+confirm_cancel_detect_key = f"{ep_id}::confirm_cancel_detect"
+confirm_cancel_faces_key = f"{ep_id}::confirm_cancel_faces"
+confirm_cancel_cluster_key = f"{ep_id}::confirm_cancel_cluster"
+
 with col_detect:
     st.markdown("### Detect/Track Faces")
     session_prefix = f"episode_detail_detect::{ep_id}"
+
+    # Show running job progress if a job is active
+    if running_detect_job:
+        job_id = running_detect_job.get("job_id", "unknown")
+        progress_pct = running_detect_job.get("progress_pct", 0)
+        frames_done = running_detect_job.get("frames_done", 0)
+        frames_total = running_detect_job.get("frames_total", 0)
+        state = running_detect_job.get("state", "running")
+
+        st.info(f"🔄 **Detect/Track job running** ({state})")
+        if frames_total > 0:
+            st.progress(min(progress_pct / 100, 1.0))
+            st.caption(f"Progress: {frames_done:,} / {frames_total:,} frames ({progress_pct:.1f}%)")
+        else:
+            st.caption(f"Progress: {progress_pct:.1f}%")
+
+        # Refresh and Cancel buttons
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("🔄 Refresh", key=f"refresh_detect_{job_id}", use_container_width=True):
+                st.rerun()
+        with btn_col2:
+            if st.button("❌ Cancel", key=f"cancel_detect_{job_id}", use_container_width=True):
+                success, msg = helpers.cancel_running_job(job_id)
+                if success:
+                    st.success(msg)
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        st.divider()
 
     profile_default_value = detect_job_defaults.get("profile") or detect_phase_status.get("profile")
     if not profile_default_value:
@@ -1801,7 +1844,13 @@ with col_detect:
         st.markdown(f"**Total Frames:** {total_frames:,}")
 
     run_label = "Detect/Track (auto-mirrors from S3)"
-    detect_button_disabled = job_running or detect_status_value == "running"
+    # Disable button if any job is running (ours or detected from API)
+    detect_button_disabled = job_running or detect_status_value == "running" or running_detect_job is not None
+
+    if running_detect_job:
+        # Show warning that a job is already running
+        st.warning(f"⚠️ A detect/track job is already running ({running_detect_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
+
     if st.button(run_label, use_container_width=True, disabled=detect_button_disabled):
         local_video_exists, summary, error_message = _launch_detect_job(
             local_video_exists,
@@ -1823,6 +1872,33 @@ with col_detect:
 with col_faces:
     st.markdown("### Faces Harvest")
     st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
+
+    # Show running job progress if a job is active
+    if running_faces_job:
+        job_id = running_faces_job.get("job_id", "unknown")
+        progress_pct = running_faces_job.get("progress_pct", 0)
+        state = running_faces_job.get("state", "running")
+
+        st.info(f"🔄 **Faces Harvest job running** ({state})")
+        st.progress(min(progress_pct / 100, 1.0))
+        st.caption(f"Progress: {progress_pct:.1f}%")
+
+        # Refresh and Cancel buttons
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("🔄 Refresh", key=f"refresh_faces_{job_id}", use_container_width=True):
+                st.rerun()
+        with btn_col2:
+            if st.button("❌ Cancel", key=f"cancel_faces_{job_id}", use_container_width=True):
+                success, msg = helpers.cancel_running_job(job_id)
+                if success:
+                    st.success(msg)
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        st.divider()
 
     # Add pipeline state indicator
     detect_track_info = detect_phase_status
@@ -1974,7 +2050,12 @@ with col_faces:
         or faces_status_value == "running"
         or (not combo_supported_harvest)
         or tracks_only_fallback
+        or running_faces_job is not None
     )
+
+    if running_faces_job:
+        st.warning(f"⚠️ A faces harvest job is already running ({running_faces_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
+
     if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
         can_run_faces = True
         if not local_video_exists:
@@ -2032,6 +2113,34 @@ with col_faces:
 with col_cluster:
     st.markdown("### Cluster Identities")
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
+
+    # Show running job progress if a job is active
+    if running_cluster_job:
+        job_id = running_cluster_job.get("job_id", "unknown")
+        progress_pct = running_cluster_job.get("progress_pct", 0)
+        state = running_cluster_job.get("state", "running")
+
+        st.info(f"🔄 **Cluster job running** ({state})")
+        st.progress(min(progress_pct / 100, 1.0))
+        st.caption(f"Progress: {progress_pct:.1f}%")
+
+        # Refresh and Cancel buttons
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("🔄 Refresh", key=f"refresh_cluster_{job_id}", use_container_width=True):
+                st.rerun()
+        with btn_col2:
+            if st.button("❌ Cancel", key=f"cancel_cluster_{job_id}", use_container_width=True):
+                success, msg = helpers.cancel_running_job(job_id)
+                if success:
+                    st.success(msg)
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        st.divider()
+
     cluster_device_choice = st.selectbox(
         "Device (for clustering)",
         helpers.DEVICE_LABELS,
@@ -2125,7 +2234,12 @@ with col_cluster:
         or (not combo_supported_cluster)
         or faces_status_value == "stale"
         or cluster_status_value == "running"
+        or running_cluster_job is not None
     )
+
+    if running_cluster_job:
+        st.warning(f"⚠️ A cluster job is already running ({running_cluster_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
+
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True
         if not local_video_exists:

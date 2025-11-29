@@ -87,12 +87,16 @@ Poll `GET /celery_jobs/{job_id}` to check job status. The job runs in the backgr
   "ep_id": "show-s01e01",
   "operation": "detect_track",
   "execution_mode": "local",
-  "elapsed_seconds": 66.3,
+  "elapsed_seconds": 432.5,
   "logs": [
-    "Starting detect_track in local mode...",
-    "Loading RetinaFace on CoreML...",
-    "Processing 10249 frames...",
-    "detect_track completed successfully in 66.3s"
+    "[LOCAL MODE] Starting detect_track",
+    "  Device: coreml, Stride: 6",
+    "  This runs synchronously - page refresh will cancel the job.",
+    "CPU threads limited to 2",
+    "Process started (PID 12345)",
+    "Loading models...",
+    "Processing frames...",
+    "[LOCAL MODE] detect_track completed successfully in 7m 12s"
   ]
 }
 ```
@@ -145,8 +149,34 @@ Local mode respects the same performance profiles and safety guardrails as Redis
 **Local Worker mode**: If you start a job and refresh the page:
 - The job is tied to the HTTP request
 - Refreshing cancels the in-flight request
-- The subprocess may be orphaned (will complete but results are lost)
-- This is the expected behavior for synchronous execution
+- The subprocess is **killed** along with all child processes (using process groups)
+- This is the expected behavior for synchronous execution - truly tied to the browser session
+
+## Thermal Safety (Laptop Mode)
+
+Local Worker mode is designed to be laptop-friendly with conservative thermal defaults:
+
+### CPU Thread Limits
+- Default: 2 threads for CPU/CoreML/MPS devices
+- Environment variables set: `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`, etc.
+- Override via: `cpu_threads` parameter or `SCREENALYTICS_MAX_CPU_THREADS` env var
+
+### Profile Auto-Selection
+- CoreML/MPS/CPU devices default to `low_power` profile (stride=12, fps=15)
+- CUDA devices default to `balanced` profile (stride=6, fps=24)
+- The `performance` profile auto-downgrades to `balanced` on non-CUDA devices
+
+### Comparison to Pre-Celery Behavior
+Local Worker mode is designed to match the old pre-Redis/Celery pipeline behavior:
+- Direct subprocess execution
+- Same thermal safety limits
+- Same device/profile defaults
+- Linear logging (no "Job submitted" or "Polling" messages)
+
+If you experience different performance or thermal behavior in local mode compared to the old pipeline:
+1. Restart the API server to pick up latest code
+2. Check that CPU thread limits are being applied (look for "CPU threads limited to X" in logs)
+3. Verify device is correctly detected (look for "CoreMLExecutionProvider" vs "CPUExecutionProvider")
 
 ## Troubleshooting
 
