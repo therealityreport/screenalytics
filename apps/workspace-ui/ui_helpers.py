@@ -175,6 +175,120 @@ SCENE_DETECTOR_DEFAULT = _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DET
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
 
+# =============================================================================
+# Execution Mode (Local vs Redis/Celery)
+# =============================================================================
+# This controls whether jobs run synchronously in-process ("local") or are
+# queued via Redis/Celery ("redis"). The mode is stored per-episode in session
+# state and persisted to localStorage for the browser.
+
+EXECUTION_MODE_SESSION_KEY = "_execution_mode"
+EXECUTION_MODE_OPTIONS = [
+    ("Redis/Celery (queued)", "redis"),
+    ("Local Worker (direct)", "local"),
+]
+EXECUTION_MODE_LABELS = [label for label, _ in EXECUTION_MODE_OPTIONS]
+EXECUTION_MODE_VALUE_MAP = {label: value for label, value in EXECUTION_MODE_OPTIONS}
+EXECUTION_MODE_LABEL_MAP = {value: label for label, value in EXECUTION_MODE_OPTIONS}
+EXECUTION_MODE_DEFAULT = "local"  # Default to local for laptop-friendly thermal management
+
+
+def _execution_mode_key(ep_id: str) -> str:
+    """Return session state key for execution mode per episode."""
+    return f"{EXECUTION_MODE_SESSION_KEY}::{ep_id}"
+
+
+def get_execution_mode(ep_id: str) -> str:
+    """Get the current execution mode for an episode.
+
+    Returns:
+        "local" (default) or "redis"
+    """
+    if not ep_id:
+        return EXECUTION_MODE_DEFAULT
+    key = _execution_mode_key(ep_id)
+    mode = st.session_state.get(key)
+    if mode in ("redis", "local"):
+        return mode
+    return EXECUTION_MODE_DEFAULT
+
+
+def set_execution_mode(ep_id: str, mode: str) -> None:
+    """Set the execution mode for an episode.
+
+    Args:
+        ep_id: Episode identifier
+        mode: "redis" or "local"
+    """
+    if not ep_id:
+        return
+    if mode not in ("redis", "local"):
+        mode = EXECUTION_MODE_DEFAULT
+    key = _execution_mode_key(ep_id)
+    st.session_state[key] = mode
+
+
+def execution_mode_label(mode: str) -> str:
+    """Convert execution mode value to display label."""
+    return EXECUTION_MODE_LABEL_MAP.get(mode, EXECUTION_MODE_LABELS[0])
+
+
+def execution_mode_index(mode: str) -> int:
+    """Get the index of an execution mode in the options list."""
+    try:
+        values = [v for _, v in EXECUTION_MODE_OPTIONS]
+        return values.index(mode)
+    except ValueError:
+        return 0
+
+
+def render_execution_mode_selector(ep_id: str, key_suffix: str = "") -> str:
+    """Render an execution mode dropdown and return the current mode.
+
+    This component allows switching between local (direct) and redis (queued)
+    execution modes. The selection is stored in session state per episode.
+
+    Args:
+        ep_id: Episode identifier
+        key_suffix: Optional suffix for the selectbox key to avoid conflicts
+
+    Returns:
+        Current execution mode ("redis" or "local")
+    """
+    if not ep_id:
+        return EXECUTION_MODE_DEFAULT
+
+    current_mode = get_execution_mode(ep_id)
+    current_index = execution_mode_index(current_mode)
+
+    widget_key = f"execution_mode_selector::{ep_id}::{key_suffix}"
+
+    selected_label = st.selectbox(
+        "Execution Mode",
+        EXECUTION_MODE_LABELS,
+        index=current_index,
+        key=widget_key,
+        help="Local Worker runs jobs synchronously in-process. Redis/Celery queues jobs for background workers.",
+    )
+
+    selected_mode = EXECUTION_MODE_VALUE_MAP.get(selected_label, EXECUTION_MODE_DEFAULT)
+
+    # Update state if changed
+    if selected_mode != current_mode:
+        set_execution_mode(ep_id, selected_mode)
+
+    return selected_mode
+
+
+def is_local_mode(ep_id: str) -> bool:
+    """Check if the current execution mode is 'local' for an episode."""
+    return get_execution_mode(ep_id) == "local"
+
+
+def is_redis_mode(ep_id: str) -> bool:
+    """Check if the current execution mode is 'redis' for an episode."""
+    return get_execution_mode(ep_id) == "redis"
+
 
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
@@ -329,7 +443,7 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
 
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
     st.session_state.setdefault("api_base", api_base)
-    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "local").lower()
+    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
     st.session_state.setdefault("backend", backend)
     bucket = st.session_state.get("bucket") or (
         _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "")
@@ -552,6 +666,10 @@ def submit_async_job(
 ) -> Optional[Dict[str, Any]]:
     """Submit an async job to the API and store in session state.
 
+    Respects the execution mode setting for the episode:
+    - Redis mode: Queues job via Celery, stores job_id for polling
+    - Local mode: Runs job synchronously and returns result directly
+
     Args:
         endpoint: API endpoint (e.g., /episodes/{ep_id}/clusters/group_async)
         payload: Request payload
@@ -566,7 +684,33 @@ def submit_async_job(
         st.error("API not initialized")
         return None
 
-    # Check if a job is already running
+    # Get execution mode for this episode and add to payload
+    execution_mode = get_execution_mode(episode_id)
+    payload = {**payload, "execution_mode": execution_mode}
+
+    # For local mode, skip the job-already-running check since it's synchronous
+    if execution_mode == "local":
+        with st.spinner(f"Running {operation} in local mode..."):
+            try:
+                resp = requests.post(f"{base}{endpoint}", json=payload, timeout=600)
+                resp.raise_for_status()
+                data = resp.json()
+
+                status = data.get("status", "")
+                if status in ("completed", "success"):
+                    st.success(f"✅ {operation} completed (local mode)")
+                elif status == "error":
+                    st.error(f"❌ {operation} failed: {data.get('error', 'Unknown error')}")
+                else:
+                    # Could be partial success
+                    if data.get("async") is False:
+                        st.info(f"{operation} completed (sync fallback)")
+                return data
+            except requests.RequestException as e:
+                st.error(f"Failed to run {operation}: {describe_error(f'{base}{endpoint}', e)}")
+                return None
+
+    # Redis mode - check if a job is already running
     existing = st.session_state.get(ASYNC_JOB_KEY)
     if existing:
         st.warning(f"⏳ A job is already running: {existing.get('operation')} ({existing.get('job_id', '')[:8]}...)")
@@ -1988,6 +2132,7 @@ def run_celery_job_with_progress(
     max_poll_time = 3600  # 1 hour max
     elapsed = 0.0
     queued_since: float | None = None
+    last_log_message: str | None = None  # Track last logged message to avoid duplicates
 
     while elapsed < max_poll_time:
         time.sleep(poll_interval)
@@ -2054,7 +2199,11 @@ def run_celery_job_with_progress(
 
             progress_bar.progress(min(progress_pct, 1.0))
             status_placeholder.info(f"⏳ {step}: {message}")
-            _append_log(f"Progress: {progress_pct*100:.1f}% - {message}")
+            # Only log when progress actually changes
+            log_msg = f"Progress: {progress_pct*100:.1f}% - {message}"
+            if log_msg != last_log_message:
+                _append_log(log_msg)
+                last_log_message = log_msg
 
         else:
             # queued, retrying, or unknown
@@ -2064,15 +2213,19 @@ def run_celery_job_with_progress(
                 or status_data.get("message")
                 or f"Starting {operation} pipeline..."
             )
-            # Mirror legacy log style to keep user feedback consistent while waiting for the worker
-            _append_log(f"Progress: 0.0% - {default_msg}")
+            # Only log when message changes
+            log_msg = f"Progress: 0.0% - {default_msg}"
+            if log_msg != last_log_message:
+                _append_log(log_msg)
+                last_log_message = log_msg
             # Detect stuck queued jobs (common when Celery worker or Redis is down)
             if state in {"queued", "unknown"}:
                 queued_since = queued_since or time.time()
-                if time.time() - queued_since > 60:
+                if time.time() - queued_since > 15:
                     error_msg = (
-                        f"{operation} has been queued for over 60s without starting. "
-                        "Check that the Celery worker and Redis are running."
+                        f"{operation} has been queued for over 15s without starting. "
+                        "Check that the Celery worker and Redis are running. "
+                        "Run 'scripts/dev_auto.sh' or start Redis/Celery manually."
                     )
                     status_placeholder.error(f"⚠️ {error_msg}")
                     _append_log(error_msg)
@@ -2120,6 +2273,173 @@ def check_celery_job_status(job_id: str) -> Dict[str, Any] | None:
         return resp.json()
     except requests.RequestException:
         return None
+
+
+# =============================================================================
+# Execution Mode Job Helpers
+# =============================================================================
+
+
+def run_pipeline_job_with_mode(
+    ep_id: str,
+    operation: str,
+    payload: Dict[str, Any],
+    *,
+    requested_device: str = "auto",
+    requested_detector: str | None = None,
+    requested_tracker: str | None = None,
+    timeout: int = 3600,
+):
+    """Run a pipeline job respecting the current execution mode for the episode.
+
+    This function handles both local and redis execution modes:
+    - Local mode: Runs synchronously with a loading spinner
+    - Redis mode: Queues via Celery and polls for completion
+
+    Args:
+        ep_id: Episode identifier
+        operation: One of "detect_track", "faces_embed", "cluster"
+        payload: Request payload for the job (execution_mode will be added)
+        requested_device: Device string for context display
+        requested_detector: Detector string for context display
+        requested_tracker: Tracker string for context display
+        timeout: Timeout in seconds for local mode (default 3600 = 1 hour)
+
+    Returns:
+        Tuple of (summary_dict, error_message)
+    """
+    execution_mode = get_execution_mode(ep_id)
+
+    # Add execution_mode to payload
+    payload = {**payload, "execution_mode": execution_mode}
+
+    # Map operation to endpoint
+    endpoint_map = {
+        "detect_track": "/celery_jobs/detect_track",
+        "faces_embed": "/celery_jobs/faces_embed",
+        "cluster": "/celery_jobs/cluster",
+    }
+    endpoint = endpoint_map.get(operation)
+    if not endpoint:
+        return None, f"Unknown operation: {operation}"
+
+    if execution_mode == "local":
+        # Run synchronously with loading spinner
+        progress_bar = st.progress(0.0)
+        status_placeholder = st.empty()
+        detail_placeholder = st.empty()
+
+        status_placeholder.info(f"⏳ Running {operation} in local mode...")
+
+        try:
+            # Call the endpoint with a longer timeout for local execution
+            resp = requests.post(
+                f"{_api_base()}{endpoint}",
+                json=payload,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            status = result.get("status", "unknown")
+            if status == "completed":
+                progress_bar.progress(1.0)
+                status_placeholder.success(f"✅ {operation} completed successfully (local mode)")
+                detail_placeholder.caption(f"Mode: local, Device: {requested_device}")
+                return result, None
+            elif status == "error":
+                progress_bar.progress(1.0)
+                error_msg = result.get("error", "Unknown error")
+                status_placeholder.error(f"❌ {operation} failed: {error_msg}")
+                return result, error_msg
+            else:
+                # Unexpected status
+                progress_bar.progress(1.0)
+                status_placeholder.warning(f"⚠️ {operation} returned status: {status}")
+                return result, None
+
+        except requests.Timeout:
+            progress_bar.progress(1.0)
+            error_msg = f"Local {operation} timed out after {timeout}s"
+            status_placeholder.error(f"❌ {error_msg}")
+            return None, error_msg
+        except requests.RequestException as exc:
+            progress_bar.progress(1.0)
+            error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+            status_placeholder.error(f"❌ {operation} failed: {error_msg}")
+            return None, error_msg
+
+    else:
+        # Redis mode - use existing Celery job flow
+        return run_celery_job_with_progress(
+            ep_id,
+            operation,
+            payload,
+            requested_device=requested_device,
+            requested_detector=requested_detector,
+            requested_tracker=requested_tracker,
+        )
+
+
+def run_async_job_with_mode(
+    ep_id: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any] | None:
+    """Run an async job respecting the current execution mode for the episode.
+
+    This function handles async jobs (like refresh_similarity, batch_assign, group_async):
+    - Local mode: Runs synchronously and returns result directly
+    - Redis mode: Queues via Celery and returns job info for polling
+
+    Args:
+        ep_id: Episode identifier
+        endpoint: API endpoint to call (e.g., /episodes/{ep_id}/refresh_similarity_async)
+        payload: Request payload for the job (execution_mode will be added)
+        operation: Operation name for display purposes
+
+    Returns:
+        Response dict from the API, or None if failed
+    """
+    execution_mode = get_execution_mode(ep_id)
+
+    # Add execution_mode to payload
+    payload = {**payload, "execution_mode": execution_mode}
+
+    if execution_mode == "local":
+        # Run synchronously with loading spinner
+        with st.spinner(f"Running {operation} in local mode..."):
+            try:
+                resp = requests.post(
+                    f"{_api_base()}{endpoint}",
+                    json=payload,
+                    timeout=600,  # 10 minute timeout for local mode
+                )
+                resp.raise_for_status()
+                result = resp.json()
+
+                status = result.get("status", "unknown")
+                if status in ("completed", "success"):
+                    st.success(f"✅ {operation} completed successfully (local mode)")
+                elif status == "error":
+                    st.error(f"❌ {operation} failed: {result.get('error', 'Unknown error')}")
+                else:
+                    st.info(f"{operation} returned: {status}")
+
+                return result
+
+            except requests.RequestException as exc:
+                st.error(f"❌ {operation} failed: {describe_error(f'{_api_base()}{endpoint}', exc)}")
+                return None
+    else:
+        # Redis mode - use existing async job submission
+        return submit_async_job(
+            endpoint=endpoint,
+            payload=payload,
+            operation=operation,
+            episode_id=ep_id,
+        )
 
 
 def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:

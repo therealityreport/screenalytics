@@ -52,6 +52,10 @@ class GroupClustersRequest(BaseModel):
     name: Optional[str] = Field(None, description="Name for new person (when target_person_id is None)")
     protect_manual: bool = Field(True, description="If True, don't merge manually assigned clusters to different people")
     facebank_first: bool = Field(True, description="If True, try facebank matching before people prototypes (more accurate)")
+    execution_mode: Optional[Literal["redis", "local"]] = Field(
+        "redis",
+        description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
+    )
 
 
 class BatchAssignmentItem(BaseModel):
@@ -63,6 +67,10 @@ class BatchAssignmentItem(BaseModel):
 class BatchAssignRequest(BaseModel):
     """Batch assignment request for multiple clusters to multiple cast members."""
     assignments: List[BatchAssignmentItem] = Field(..., description="List of cluster-to-cast assignments")
+    execution_mode: Optional[Literal["redis", "local"]] = Field(
+        "redis",
+        description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
+    )
 
 
 def _trigger_similarity_refresh(ep_id: str, cluster_ids: Iterable[str] | None) -> None:
@@ -227,18 +235,21 @@ def batch_assign_clusters(ep_id: str, body: BatchAssignRequest) -> dict:
 def batch_assign_clusters_async(ep_id: str, body: BatchAssignRequest) -> dict:
     """Enqueue batch cluster assignment as background job (non-blocking).
 
-    Returns immediately with HTTP 202 Accepted and a job_id.
-    Poll /celery_jobs/{job_id} to check status.
+    Execution Mode:
+        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
+        - execution_mode="local": Runs job synchronously in-process, returns result when done
 
     If Celery/Redis are unavailable, falls back to synchronous execution.
     """
     if not body.assignments:
         raise HTTPException(status_code=400, detail="No assignments provided")
 
-    # Check if Celery is available
-    if not _check_celery_available():
-        LOGGER.info(f"[{ep_id}] Celery unavailable, falling back to sync batch_assign")
-        # Fall back to synchronous execution
+    execution_mode = body.execution_mode or "redis"
+
+    # Handle local execution mode or Celery unavailability
+    if execution_mode == "local" or not _check_celery_available():
+        reason = "local mode requested" if execution_mode == "local" else "Celery unavailable"
+        LOGGER.info(f"[{ep_id}] Running sync batch_assign ({reason})")
         try:
             result = grouping_service.batch_assign_clusters(ep_id, body.assignments)
             status = "success" if result.get("failed", 0) == 0 else "partial"
@@ -246,7 +257,8 @@ def batch_assign_clusters_async(ep_id: str, body: BatchAssignRequest) -> dict:
                 "status": status,
                 "ep_id": ep_id,
                 "async": False,
-                "message": "Executed synchronously (Celery unavailable)",
+                "execution_mode": "local",
+                "message": f"Executed synchronously ({reason})",
                 **result,
             }
         except Exception as e:
@@ -282,6 +294,7 @@ def batch_assign_clusters_async(ep_id: str, body: BatchAssignRequest) -> dict:
             "status": "queued",
             "ep_id": ep_id,
             "async": True,
+            "execution_mode": "redis",
         }
     except HTTPException:
         raise
@@ -294,11 +307,11 @@ def batch_assign_clusters_async(ep_id: str, body: BatchAssignRequest) -> dict:
 def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
     """Enqueue auto-grouping as background job (non-blocking).
 
+    Execution Mode:
+        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
+        - execution_mode="local": Runs job synchronously in-process, returns result when done
+
     Only supports strategy="auto". For manual/facebank, use the synchronous endpoint.
-
-    Returns immediately with HTTP 202 Accepted and a job_id.
-    Poll /celery_jobs/{job_id} to check status.
-
     If Celery/Redis are unavailable, falls back to synchronous execution.
     """
     if body.strategy != "auto":
@@ -308,10 +321,12 @@ def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
             "Use /clusters/group for manual/facebank.",
         )
 
-    # Check if Celery is available
-    if not _check_celery_available():
-        LOGGER.info(f"[{ep_id}] Celery unavailable, falling back to sync group_clusters")
-        # Fall back to synchronous execution
+    execution_mode = body.execution_mode or "redis"
+
+    # Handle local execution mode or Celery unavailability
+    if execution_mode == "local" or not _check_celery_available():
+        reason = "local mode requested" if execution_mode == "local" else "Celery unavailable"
+        LOGGER.info(f"[{ep_id}] Running sync group_clusters ({reason})")
         try:
             progress_log = []
 
@@ -329,7 +344,8 @@ def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
                 "strategy": "auto",
                 "ep_id": ep_id,
                 "async": False,
-                "message": "Executed synchronously (Celery unavailable)",
+                "execution_mode": "local",
+                "message": f"Executed synchronously ({reason})",
                 "result": result,
                 "progress_log": progress_log,
             }
@@ -361,6 +377,7 @@ def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
             "status": "queued",
             "ep_id": ep_id,
             "async": True,
+            "execution_mode": "redis",
         }
     except HTTPException:
         raise

@@ -21,7 +21,6 @@ import ui_helpers as helpers  # noqa: E402
 
 from py_screenalytics.artifacts import get_path  # noqa: E402
 
-SCREENTIME_JOB_KEY = "episode_detail_screentime_job"
 FRAME_JPEG_SIZE_EST_BYTES = 220_000
 CROP_JPEG_SIZE_EST_BYTES = 40_000
 AVG_FACES_PER_FRAME = 1.5
@@ -150,25 +149,12 @@ def _status_mtimes_key(ep_id: str) -> str:
     return f"{ep_id}::status_mtimes"
 
 
-def _screentime_job_key(ep_id: str) -> str:
-    return f"{ep_id}::screentime_job"
-
-
 def _navigate_to_upload(ep_id: str) -> None:
     helpers.set_ep_id(ep_id, rerun=False, origin="replace")
     params = st.query_params
     params["ep_id"] = ep_id
     st.query_params = params
     helpers.try_switch_page("pages/0_Upload_Video.py")
-
-
-def _trigger_safe_detect_rerun(ep_id: str, message: str) -> None:
-    st.session_state["episode_detail_detector_override"] = helpers.DEFAULT_DETECTOR
-    st.session_state["episode_detail_tracker_override"] = helpers.DEFAULT_TRACKER
-    st.session_state["episode_detail_device_override"] = helpers.DEFAULT_DEVICE
-    st.session_state["episode_detail_detect_autorun_flag"] = True
-    st.session_state["episode_detail_flash"] = message
-    st.rerun()
 
 
 def _render_device_summary(requested: str | None, resolved: str | None) -> None:
@@ -548,29 +534,18 @@ def _launch_detect_job(
     if detect_flag_key:
         st.session_state[detect_flag_key] = True
     try:
-        # Use Celery for async execution via Redis queue
-        use_celery = os.environ.get("USE_CELERY_JOBS", "1") == "1"
-        if use_celery:
-            with st.spinner(f"Running detect/track via Celery ({mode_label} on {device_label})…"):
-                summary, error_message = helpers.run_celery_job_with_progress(
-                    ep_id,
-                    "detect_track",
-                    job_payload,
-                    requested_device=device_value,
-                    requested_detector=detector_value,
-                    requested_tracker=tracker_value,
-                )
-        else:
-            with st.spinner(f"Running detect/track ({mode_label} on {device_label})…"):
-                summary, error_message = helpers.run_job_with_progress(
-                    ep_id,
-                    "/jobs/detect_track",
-                    job_payload,
-                    requested_device=device_value,
-                    async_endpoint="/jobs/detect_track_async",
-                    requested_detector=detector_value,
-                    requested_tracker=tracker_value,
-                )
+        # Use execution mode from UI settings (respects local/redis toggle)
+        execution_mode = helpers.get_execution_mode(ep_id)
+        mode_desc = "local" if execution_mode == "local" else "Celery"
+        with st.spinner(f"Running detect/track via {mode_desc} ({mode_label} on {device_label})…"):
+            summary, error_message = helpers.run_pipeline_job_with_mode(
+                ep_id,
+                "detect_track",
+                job_payload,
+                requested_device=device_value,
+                requested_detector=detector_value,
+                requested_tracker=tracker_value,
+            )
     finally:
         if running_state_key:
             st.session_state[running_state_key] = False
@@ -682,6 +657,21 @@ if local_video_exists:
             st.session_state[video_meta_key] = video_meta
 else:
     st.session_state.pop(video_meta_key, None)
+
+
+# =============================================================================
+# Execution Mode Selector
+# =============================================================================
+# Store execution mode globally for this episode so all actions respect it
+with st.expander("🔧 Execution Settings", expanded=False):
+    exec_mode_col1, exec_mode_col2 = st.columns([2, 3])
+    with exec_mode_col1:
+        execution_mode = helpers.render_execution_mode_selector(ep_id, key_suffix="episode_detail")
+    with exec_mode_col2:
+        if execution_mode == "local":
+            st.info("**Local Mode**: Jobs run synchronously in-process. No Redis/Celery needed.")
+        else:
+            st.info("**Redis Mode**: Jobs are queued via Celery for background processing.")
 
 
 # =============================================================================
@@ -966,7 +956,7 @@ with st.expander("Pipeline Status", expanded=False):
         st.warning(
             "⚠️ CoreML acceleration isn't available on this host. Install `onnxruntime-coreml` to avoid CPU-only runs."
         )
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         detect_params: list[str] = []
@@ -1264,31 +1254,6 @@ with st.expander("Pipeline Status", expanded=False):
         elif cluster_status_value == "success" and cluster_runtime is None:
             st.caption("Runtime: n/a")
 
-    with col4:
-        screentime_started_label = _format_timestamp(screentime_started_at)
-        screentime_finished_label = _format_timestamp(screentime_finished_at)
-        if screentime_status_value == "success":
-            runtime_label = screentime_runtime or "n/a"
-            st.success(f"✅ **Screentime**: Complete (Runtime: {runtime_label})")
-            st.caption(f"JSON: {helpers.link_local(screentime_json_path)}")
-        elif screentime_status_value == "running":
-            st.info("⏳ **Screentime**: Running")
-            if screentime_started_label:
-                st.caption(f"Started at {screentime_started_label}")
-        elif screentime_status_value == "error":
-            st.error("⚠️ **Screentime**: Failed")
-            if screentime_error:
-                st.caption(screentime_error)
-        else:
-            st.info("⏳ **Screentime**: Ready")
-            st.caption("Click 'Compute screentime' below.")
-        if screentime_finished_label and screentime_status_value == "success":
-            st.caption(f"Last run: {screentime_finished_label}")
-        if screentime_status_value != "success" and screentime_runtime:
-            st.caption(f"Runtime: {screentime_runtime}")
-        elif screentime_status_value == "success" and screentime_runtime is None:
-            st.caption("Runtime: n/a")
-
 
 detector_override = st.session_state.pop("episode_detail_detector_override", None)
 tracker_override = st.session_state.pop("episode_detail_tracker_override", None)
@@ -1375,7 +1340,15 @@ if min_cluster_size_default is None:
     min_cluster_size_default = 2
 
 detect_inflight = bool(st.session_state.get(detect_running_key))
-with st.container():
+faces_ready = faces_ready_state
+detector_manifest_value = helpers.tracks_detector_value(ep_id)
+tracker_manifest_value = helpers.tracks_tracker_value(ep_id)
+detector_face_only = helpers.detector_is_face_only(ep_id, detect_phase_status)
+combo_detector, combo_tracker = helpers.detect_tracker_combo(ep_id, detect_phase_status)
+combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_detector, combo_tracker)
+combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
+col_detect, col_faces, col_cluster = st.columns(3)
+with col_detect:
     st.markdown("### Detect/Track Faces")
     session_prefix = f"episode_detail_detect::{ep_id}"
 
@@ -1847,14 +1820,6 @@ with st.container():
         _process_detect_result(summary, error_message)
     st.caption("Mirrors required video artifacts automatically before detect/track starts.")
 
-faces_ready = faces_ready_state
-detector_manifest_value = helpers.tracks_detector_value(ep_id)
-tracker_manifest_value = helpers.tracks_tracker_value(ep_id)
-detector_face_only = helpers.detector_is_face_only(ep_id, detect_phase_status)
-combo_detector, combo_tracker = helpers.detect_tracker_combo(ep_id, detect_phase_status)
-combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_detector, combo_tracker)
-combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
-col_faces, col_cluster, col_screen = st.columns(3)
 with col_faces:
     st.markdown("### Faces Harvest")
     st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
@@ -1981,27 +1946,6 @@ with col_faces:
                 "⚠️ **Scene detection only**: Your last run only executed scene detection (PySceneDetect), "
                 "not full face detection + tracking. Please run **Detect/Track Faces** again to generate tracks."
             )
-        if st.button(
-            "Rerun Detect/Track",
-            key=f"faces_inline_detect::{ep_id}",
-            use_container_width=True,
-            disabled=job_running,
-        ):
-            local_video_exists, summary, error_message = _launch_detect_job(
-                local_video_exists,
-                ep_id,
-                details,
-                job_payload,
-                detect_device_value,
-                detect_detector_value,
-                detect_tracker_value,
-                mode_label,
-                detect_device_label,
-                running_state_key=running_job_key,
-                active_job_key=_job_activity_key(ep_id),
-                detect_flag_key=detect_running_key,
-            )
-            _process_detect_result(summary, error_message)
     elif faces_status_value == "running":
         st.info("Faces harvest is running. Progress will update automatically; clustering remains disabled until completion.")
     elif not detector_face_only:
@@ -2016,26 +1960,12 @@ with col_faces:
                 f"{helpers.detector_label_from_value(detector_manifest_value)}. Rerun Detect/Track Faces "
                 "with a supported detector/tracker before harvesting."
             )
-        if st.button(
-            "Rerun Detect/Track (RetinaFace + ByteTrack)",
-            key=f"faces_rerun_detect::{ep_id}",
-            use_container_width=True,
-            disabled=job_running,
-        ):
-            _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
     elif not combo_supported_harvest:
         current_combo = f"{helpers.detector_label_from_value(combo_detector)} + {helpers.tracker_label_from_value(combo_tracker)}"
         st.error(
             f"Harvest requires a supported detector/tracker combo. Last detect run used **{current_combo}**. "
             "Select a supported combo (e.g., RetinaFace + ByteTrack/StrongSORT) and rerun detect/track."
         )
-        if st.button(
-            "Fix + rerun detect",
-            key=f"faces_fix_combo::{ep_id}",
-            use_container_width=True,
-            disabled=job_running,
-        ):
-            _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
 
     faces_disabled = (
         (not tracks_ready)
@@ -2064,29 +1994,18 @@ with col_faces:
             st.session_state[running_job_key] = True
             _set_job_active(ep_id, True)
             try:
-                # Use Celery for async execution via Redis queue
-                use_celery = os.environ.get("USE_CELERY_JOBS", "1") == "1"
-                if use_celery:
-                    with st.spinner("Running faces harvest via Celery…"):
-                        summary, error_message = helpers.run_celery_job_with_progress(
-                            ep_id,
-                            "faces_embed",
-                            payload,
-                            requested_device=faces_device_value,
-                            requested_detector=helpers.tracks_detector_value(ep_id),
-                            requested_tracker=helpers.tracks_tracker_value(ep_id),
-                        )
-                else:
-                    with st.spinner("Running faces harvest…"):
-                        summary, error_message = helpers.run_job_with_progress(
-                            ep_id,
-                            "/jobs/faces_embed",
-                            payload,
-                            requested_device=faces_device_value,
-                            async_endpoint="/jobs/faces_embed_async",
-                            requested_detector=helpers.tracks_detector_value(ep_id),
-                            requested_tracker=helpers.tracks_tracker_value(ep_id),
-                        )
+                # Use execution mode from UI settings (respects local/redis toggle)
+                execution_mode = helpers.get_execution_mode(ep_id)
+                mode_desc = "local" if execution_mode == "local" else "Celery"
+                with st.spinner(f"Running faces harvest via {mode_desc}…"):
+                    summary, error_message = helpers.run_pipeline_job_with_mode(
+                        ep_id,
+                        "faces_embed",
+                        payload,
+                        requested_device=faces_device_value,
+                        requested_detector=helpers.tracks_detector_value(ep_id),
+                        requested_tracker=helpers.tracks_tracker_value(ep_id),
+                    )
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
@@ -2158,27 +2077,6 @@ with col_cluster:
             st.warning("Video not found locally or in S3. Upload the video first.")
     elif not tracks_ready:
         st.caption("Run detect/track first; clustering requires fresh tracks and faces.")
-        if st.button(
-            "Rerun Detect/Track",
-            key="cluster_inline_detect",
-            use_container_width=True,
-            disabled=job_running,
-        ):
-            local_video_exists, summary, error_message = _launch_detect_job(
-                local_video_exists,
-                ep_id,
-                details,
-                job_payload,
-                detect_device_value,
-                detect_detector_value,
-                detect_tracker_value,
-                mode_label,
-                detect_device_label,
-                running_state_key=running_job_key,
-                active_job_key=_job_activity_key(ep_id),
-                detect_flag_key=detect_running_key,
-            )
-            _process_detect_result(summary, error_message)
 
     # Check if faces harvest succeeded with zero faces
     zero_faces_success = faces_status_value == "success" and (
@@ -2215,13 +2113,6 @@ with col_cluster:
             f"Cluster requires RetinaFace + ByteTrack tracks. Last detect run used **{combo_label}**. "
             "Rerun detect/track with the supported combo before clustering."
         )
-        if st.button(
-            "Fix + rerun detect",
-            key="cluster_fix_combo",
-            use_container_width=True,
-            disabled=job_running,
-        ):
-            _trigger_safe_detect_rerun(ep_id, "Starting Detect/Track with RetinaFace + ByteTrack…")
     elif cluster_status_value == "running":
         st.info("Clustering is currently running. Wait for it to complete before starting another run.")
 
@@ -2260,29 +2151,18 @@ with col_cluster:
             st.session_state[running_job_key] = True
             _set_job_active(ep_id, True)
             try:
-                # Use Celery for async execution via Redis queue
-                use_celery = os.environ.get("USE_CELERY_JOBS", "1") == "1"
-                if use_celery:
-                    with st.spinner("Clustering faces via Celery…"):
-                        summary, error_message = helpers.run_celery_job_with_progress(
-                            ep_id,
-                            "cluster",
-                            payload,
-                            requested_device=cluster_device_value,
-                            requested_detector=helpers.tracks_detector_value(ep_id),
-                            requested_tracker=helpers.tracks_tracker_value(ep_id),
-                        )
-                else:
-                    with st.spinner("Clustering faces…"):
-                        summary, error_message = helpers.run_job_with_progress(
-                            ep_id,
-                            "/jobs/cluster",
-                            payload,
-                            requested_device=cluster_device_value,
-                            async_endpoint="/jobs/cluster_async",
-                            requested_detector=helpers.tracks_detector_value(ep_id),
-                            requested_tracker=helpers.tracks_tracker_value(ep_id),
-                        )
+                # Use execution mode from UI settings (respects local/redis toggle)
+                execution_mode = helpers.get_execution_mode(ep_id)
+                mode_desc = "local" if execution_mode == "local" else "Celery"
+                with st.spinner(f"Clustering faces via {mode_desc}…"):
+                    summary, error_message = helpers.run_pipeline_job_with_mode(
+                        ep_id,
+                        "cluster",
+                        payload,
+                        requested_device=cluster_device_value,
+                        requested_detector=helpers.tracks_detector_value(ep_id),
+                        requested_tracker=helpers.tracks_tracker_value(ep_id),
+                    )
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
@@ -2307,72 +2187,6 @@ with col_cluster:
                 # Force status refresh after job completion to pick up new cluster status
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
-with col_screen:
-    st.markdown("### Screentime")
-    screentime_disabled = (
-        job_running
-        or screentime_status_value == "running"
-        or cluster_status_value != "success"
-    )
-    if not local_video_exists:
-        st.info("Local mirror missing; video will be mirrored automatically when screentime starts.")
-    elif screentime_status_value == "running":
-        st.info("Screentime analysis is currently running.")
-    elif cluster_status_value != "success":
-        st.caption("Complete clustering before computing screentime.")
-    if st.button("Compute screentime", use_container_width=True, disabled=screentime_disabled):
-        can_run_screen = True
-        if not local_video_exists:
-            can_run_screen = _ensure_local_artifacts(ep_id, details)
-            if can_run_screen:
-                local_video_exists = True
-        if can_run_screen:
-            with st.spinner("Starting screentime analysis…"):
-                try:
-                    resp = helpers.api_post("/jobs/screen_time/analyze", {"ep_id": ep_id})
-                except requests.RequestException as exc:
-                    st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/screen_time/analyze", exc))
-                else:
-                    job_id = resp.get("job_id")
-                    if job_id:
-                        st.session_state[_screentime_job_key(ep_id)] = job_id
-                    st.success("Screen time job queued.")
-                    st.rerun()
-
-    screentime_job_id = st.session_state.get(_screentime_job_key(ep_id))
-    if screentime_job_id:
-        try:
-            job_progress_resp = helpers.api_get(f"/jobs/{screentime_job_id}/progress")
-        except requests.RequestException as exc:
-            st.warning(helpers.describe_error(f"{cfg['api_base']}/jobs/{screentime_job_id}/progress", exc))
-        else:
-            job_state = job_progress_resp.get("state")
-            progress_data = job_progress_resp.get("progress") or {}
-            if job_state == "running":
-                st.info(f"Screentime job {screentime_job_id[:12]}… is running")
-                frames_done = progress_data.get("frames_done", 0)
-                frames_total = max(int(progress_data.get("frames_total") or 1), 1)
-                st.progress(min(frames_done / frames_total, 1.0))
-                st.caption(f"Frames {frames_done:,} / {frames_total:,}")
-                if st.button("Refresh progress", key="refresh_screentime_progress", use_container_width=True):
-                    st.rerun()
-            elif job_state == "succeeded":
-                st.success("Screentime analysis complete.")
-                st.caption(f"JSON → {helpers.link_local(helpers.DATA_ROOT / 'analytics' / ep_id / 'screentime.json')}")
-                st.caption(f"CSV → {helpers.link_local(helpers.DATA_ROOT / 'analytics' / ep_id / 'screentime.csv')}")
-                if st.button("Dismiss screentime status", key="dismiss_screentime_job_success"):
-                    st.session_state.pop(_screentime_job_key(ep_id), None)
-                    st.rerun()
-            elif job_state == "failed":
-                st.error(f"Screentime job failed: {job_progress_resp.get('error') or 'unknown error'}")
-                if st.button("Dismiss screentime status", key="dismiss_screentime_job_failed"):
-                    st.session_state.pop(_screentime_job_key(ep_id), None)
-                    st.rerun()
-            else:
-                st.info(f"Screentime job status: {job_state or 'unknown'}")
-                if st.button("Dismiss screentime status", key="dismiss_screentime_job_other"):
-                    st.session_state.pop(_screentime_job_key(ep_id), None)
-                    st.rerun()
 
 st.subheader("Artifacts")
 

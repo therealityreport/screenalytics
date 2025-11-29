@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Literal, Optional, Set
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -2069,29 +2069,55 @@ def _check_celery_available() -> bool:
     return _celery_available_cache
 
 
+class RefreshSimilarityRequest(BaseModel):
+    """Request model for similarity refresh with optional execution mode."""
+    execution_mode: Optional[Literal["redis", "local"]] = Field(
+        "redis",
+        description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
+    )
+
+
 @router.post("/episodes/{ep_id}/refresh_similarity_async", status_code=202, tags=["episodes"])
-def refresh_similarity_async(ep_id: str) -> dict:
+def refresh_similarity_async(ep_id: str, body: RefreshSimilarityRequest = Body(default=RefreshSimilarityRequest())) -> dict:
     """Enqueue similarity refresh as background job (non-blocking).
 
-    Returns immediately with HTTP 202 Accepted and a job_id.
-    Poll /celery_jobs/{job_id} to check status.
+    Execution Mode:
+        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
+        - execution_mode="local": Runs job synchronously in-process, returns result when done
 
-    If Celery/Redis are unavailable, falls back to synchronous execution.
+    If Celery/Redis are unavailable in redis mode, returns an error.
     """
-    # Check if Celery is available
-    if not _check_celery_available():
-        LOGGER.info(f"[{ep_id}] Celery unavailable, falling back to sync refresh_similarity")
-        # Fall back to synchronous execution (with reduced timeout risk by returning early)
+    execution_mode = body.execution_mode or "redis"
+
+    # Handle local execution mode
+    if execution_mode == "local":
+        LOGGER.info(f"[{ep_id}] Running local refresh_similarity")
         try:
-            # Just return a message that async is not available
+            # Import and run the similarity refresh directly
+            from apps.api.services.similarity_refresh import refresh_similarity_indexes
+            result = refresh_similarity_indexes(ep_id)
             return {
-                "status": "error",
+                "status": "completed",
                 "ep_id": ep_id,
                 "async": False,
-                "message": "Background jobs unavailable (Celery/Redis not running). Please start background services.",
+                "execution_mode": "local",
+                "message": "Executed synchronously (local mode)",
+                "result": result,
             }
         except Exception as e:
+            LOGGER.exception(f"[{ep_id}] Local refresh_similarity failed: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    # Redis/Celery mode - check if Celery is available
+    if not _check_celery_available():
+        LOGGER.info(f"[{ep_id}] Celery unavailable for refresh_similarity")
+        return {
+            "status": "error",
+            "ep_id": ep_id,
+            "async": False,
+            "execution_mode": "redis",
+            "message": "Background jobs unavailable (Celery/Redis not running). Please start background services or use execution_mode='local'.",
+        }
 
     try:
         from apps.api.tasks import run_refresh_similarity_task, check_active_job
@@ -2112,6 +2138,7 @@ def refresh_similarity_async(ep_id: str) -> dict:
             "status": "queued",
             "ep_id": ep_id,
             "async": True,
+            "execution_mode": "redis",
             "message": "Refresh similarity job queued. Poll /celery_jobs/{job_id} for status.",
         }
     except HTTPException:

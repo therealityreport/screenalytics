@@ -1137,6 +1137,25 @@ def run_faces_embed_task(
             command += ["--thumb-size", str(options["thumb_size"])]
         # Note: --profile is not a valid argument for episode_run.py
 
+        # Apply CPU thread limits for laptop-friendly runs
+        env = os.environ.copy()
+        cpu_threads = options.get("cpu_threads")
+        if cpu_threads:
+            max_allowed = os.cpu_count() or 8
+            threads = max(1, min(int(cpu_threads), max_allowed))
+            env.update(
+                {
+                    "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+                    "OMP_NUM_THREADS": str(threads),
+                    "MKL_NUM_THREADS": str(threads),
+                    "OPENBLAS_NUM_THREADS": str(threads),
+                    "VECLIB_MAXIMUM_THREADS": str(threads),
+                    "NUMEXPR_NUM_THREADS": str(threads),
+                    "ORT_INTRA_OP_NUM_THREADS": str(threads),
+                    "ORT_INTER_OP_NUM_THREADS": "1",
+                }
+            )
+
         # Update progress
         self.update_state(
             state="PROGRESS",
@@ -1149,7 +1168,7 @@ def run_faces_embed_task(
         )
 
         result = self._run_subprocess(
-            command, episode_id, "faces_embed", str(progress_file)
+            command, episode_id, "faces_embed", str(progress_file), env
         )
 
         return result
@@ -1213,6 +1232,25 @@ def run_cluster_task(
             command += ["--min-identity-sim", str(options["min_identity_sim"])]
         # Note: --profile is not a valid argument for episode_run.py
 
+        # Apply CPU thread limits for laptop-friendly runs
+        env = os.environ.copy()
+        cpu_threads = options.get("cpu_threads")
+        if cpu_threads:
+            max_allowed = os.cpu_count() or 8
+            threads = max(1, min(int(cpu_threads), max_allowed))
+            env.update(
+                {
+                    "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+                    "OMP_NUM_THREADS": str(threads),
+                    "MKL_NUM_THREADS": str(threads),
+                    "OPENBLAS_NUM_THREADS": str(threads),
+                    "VECLIB_MAXIMUM_THREADS": str(threads),
+                    "NUMEXPR_NUM_THREADS": str(threads),
+                    "ORT_INTRA_OP_NUM_THREADS": str(threads),
+                    "ORT_INTER_OP_NUM_THREADS": "1",
+                }
+            )
+
         # Update progress
         self.update_state(
             state="PROGRESS",
@@ -1225,7 +1263,7 @@ def run_cluster_task(
         )
 
         result = self._run_subprocess(
-            command, episode_id, "cluster", str(progress_file)
+            command, episode_id, "cluster", str(progress_file), env
         )
 
         return result

@@ -13,7 +13,7 @@ CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL)
 
 # Storage Configuration
-STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "s3")
 S3_BUCKET = os.getenv("S3_BUCKET", os.getenv("BUCKET", ""))
 
 # API Configuration

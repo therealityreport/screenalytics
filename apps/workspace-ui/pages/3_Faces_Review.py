@@ -135,6 +135,21 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
         """,
     )
 
+# Execution Mode Selector (shared with Episode Detail page)
+# Get ep_id early so we can show execution mode for this episode
+_temp_ep_id = helpers.get_ep_id()
+if _temp_ep_id:
+    with st.expander("🔧 Execution Settings", expanded=False):
+        exec_mode_col1, exec_mode_col2 = st.columns([2, 3])
+        with exec_mode_col1:
+            execution_mode = helpers.render_execution_mode_selector(_temp_ep_id, key_suffix="faces_review")
+        with exec_mode_col2:
+            if execution_mode == "local":
+                st.info("**Local Mode**: Jobs run synchronously in-process. No Redis/Celery needed.")
+            else:
+                st.info("**Redis Mode**: Jobs are queued via Celery for background processing.")
+
+
 # Current Jobs Panel
 with st.expander("⚙️ Current Jobs", expanded=False):
     try:
@@ -615,30 +630,44 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
         if st.button(
             "🔄 Refresh Values",
             key="facebank_refresh_similarity_button",
-            help="Recompute all similarity scores and refresh suggestions (background job)",
+            help="Recompute all similarity scores and refresh suggestions (respects Execution Mode setting)",
         ):
-            # Start async job
+            # Use execution mode from UI settings (respects local/redis toggle)
+            execution_mode = helpers.get_execution_mode(ep_id)
             should_rerun = False
             try:
-                # Use async endpoint to queue background job
-                refresh_resp = _api_post(f"/episodes/{ep_id}/refresh_similarity_async", {})
+                # Use helper that respects execution mode
+                refresh_resp = helpers.run_async_job_with_mode(
+                    ep_id,
+                    f"/episodes/{ep_id}/refresh_similarity_async",
+                    {},
+                    "Refresh Values",
+                )
 
-                if refresh_resp and refresh_resp.get("status") == "queued":
-                    job_id = refresh_resp.get("job_id")
-                    st.success(f"✅ Refresh job queued! Job ID: `{job_id[:12]}...`")
-                    st.info("Check **Current Jobs** panel above to monitor progress. Page will refresh when done.")
-                    # Store job ID for tracking
-                    st.session_state["refresh_similarity_job_id"] = job_id
-                    should_rerun = True
-                elif refresh_resp and refresh_resp.get("async") is False:
-                    # Celery not available
-                    st.error(f"❌ {refresh_resp.get('message', 'Background jobs unavailable')}")
-                    st.warning("Please ensure Redis and Celery worker are running.")
+                if refresh_resp:
+                    status = refresh_resp.get("status", "")
+                    if status == "queued":
+                        job_id = refresh_resp.get("job_id")
+                        st.success(f"✅ Refresh job queued! Job ID: `{job_id[:12]}...`")
+                        st.info("Check **Current Jobs** panel above to monitor progress. Page will refresh when done.")
+                        # Store job ID for tracking
+                        st.session_state["refresh_similarity_job_id"] = job_id
+                        should_rerun = True
+                    elif status in ("completed", "success"):
+                        # Local mode completed synchronously
+                        st.success("✅ Refresh completed!")
+                        should_rerun = True
+                    elif refresh_resp.get("async") is False:
+                        # Celery not available and not local mode
+                        st.error(f"❌ {refresh_resp.get('message', 'Background jobs unavailable')}")
+                        st.warning("Switch to Local Worker mode or ensure Redis and Celery worker are running.")
+                    else:
+                        error_detail = refresh_resp.get("detail", refresh_resp.get("error", "Unknown error"))
+                        st.error(f"❌ Failed to run refresh: {error_detail}")
                 else:
-                    error_detail = refresh_resp.get("detail", "Unknown error") if refresh_resp else "No response"
-                    st.error(f"❌ Failed to queue refresh job: {error_detail}")
+                    st.error("❌ Failed to run refresh: No response")
             except Exception as exc:
-                st.error(f"❌ Failed to queue refresh job: {exc}")
+                st.error(f"❌ Failed to run refresh: {exc}")
             # Call st.rerun() outside try-except to avoid catching RerunException
             if should_rerun:
                 st.rerun()
