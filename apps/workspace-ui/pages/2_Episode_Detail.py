@@ -77,6 +77,25 @@ def _format_runtime(runtime_sec: Any) -> str | None:
     return f"{hours}h {minutes:02d}m"
 
 
+def _format_video_duration(duration_sec: Any) -> str | None:
+    """Format video duration in human-readable form (e.g., '45m 30s' or '1h 23m')."""
+    try:
+        total = float(duration_sec)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    seconds = int(round(total))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        minutes, rem = divmod(seconds, 60)
+        return f"{minutes}m {rem:02d}s"
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes:02d}m"
+
+
 def _runtime_from_iso(start: str | None, end: str | None) -> float | None:
     if not start or not end:
         return None
@@ -1066,10 +1085,14 @@ with st.expander("Pipeline Status", expanded=False):
         finished = _format_timestamp(detect_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
-        if detect_status_value != "success" and detect_runtime:
-            st.caption(f"Runtime: {detect_runtime}")
-        elif detect_status_value == "success" and detect_runtime is None:
-            st.caption("Runtime: n/a")
+        # Show video duration and run duration on separate lines
+        video_duration = _format_video_duration(detect_phase_status.get("video_duration_sec"))
+        if video_duration:
+            st.caption(f"Video Duration: {video_duration}")
+        if detect_runtime:
+            st.caption(f"Run Duration: {detect_runtime}")
+        elif detect_status_value == "success":
+            st.caption("Run Duration: n/a")
 
     with col2:
         faces_params: list[str] = []
@@ -1128,11 +1151,10 @@ with st.expander("Pipeline Status", expanded=False):
         finished = _format_timestamp(faces_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
-        if not faces_ready_state:
-            if faces_runtime:
-                st.caption(f"Runtime: {faces_runtime}")
-            elif faces_status_value == "success":
-                st.caption("Runtime: n/a")
+        if faces_runtime:
+            st.caption(f"Run Duration: {faces_runtime}")
+        elif faces_status_value == "success":
+            st.caption("Run Duration: n/a")
 
     with col3:
         cluster_params: list[str] = []
@@ -1264,10 +1286,10 @@ with st.expander("Pipeline Status", expanded=False):
         finished = _format_timestamp(cluster_phase_status.get("finished_at"))
         if finished:
             st.caption(f"Last run: {finished}")
-        if cluster_status_value != "success" and cluster_runtime:
-            st.caption(f"Runtime: {cluster_runtime}")
-        elif cluster_status_value == "success" and cluster_runtime is None:
-            st.caption("Runtime: n/a")
+        if cluster_runtime:
+            st.caption(f"Run Duration: {cluster_runtime}")
+        elif cluster_status_value == "success":
+            st.caption("Run Duration: n/a")
 
 
 detector_override = st.session_state.pop("episode_detail_detector_override", None)

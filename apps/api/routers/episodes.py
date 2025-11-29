@@ -304,6 +304,9 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
         "version": marker.get("version"),
         "source": "marker",
         "runtime_sec": runtime_sec,
+        "frames_total": _safe_int(marker.get("frames_total")),
+        "video_duration_sec": _safe_float(marker.get("video_duration_sec")),
+        "fps": _safe_float(marker.get("fps")),
     }
 
 

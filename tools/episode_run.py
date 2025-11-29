@@ -4515,6 +4515,8 @@ def _run_detect_track_stage(
                 "track_high_thresh": getattr(args, "track_high_thresh", None),
                 "new_track_thresh": getattr(args, "new_track_thresh", None),
                 "fps": analyzed_fps,
+                "frames_total": progress.target_frames,
+                "video_duration_sec": progress.secs_total,
                 "save_frames": save_frames,
                 "save_crops": save_crops,
                 "jpeg_quality": jpeg_quality,
