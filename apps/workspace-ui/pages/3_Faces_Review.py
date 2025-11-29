@@ -156,6 +156,9 @@ with st.expander("⚙️ Current Jobs", expanded=False):
         jobs_response = helpers.api_get("/celery_jobs")
         jobs = jobs_response.get("jobs", []) if jobs_response else []
 
+        # Count local/orphan jobs for kill all button
+        local_jobs = [j for j in jobs if j.get("source") in ("local", "detected")]
+
         if not jobs:
             st.info("No background jobs currently running.")
         else:
@@ -165,46 +168,75 @@ with st.expander("⚙️ Current Jobs", expanded=False):
                 job_name = job.get("name", "unknown task")
                 state = job.get("state", "unknown")
                 worker = job.get("worker", "")
+                source = job.get("source", "celery")
+                pid = job.get("pid")
 
                 # State badge colors
                 state_colors = {
                     "in_progress": "#2196F3",
+                    "running": "#2196F3",
                     "queued": "#FF9800",
                     "scheduled": "#9C27B0",
                 }
                 badge_color = state_colors.get(state, "#666")
 
-                st.markdown(
-                    f"""
-                    <div style="
-                        display: flex;
-                        align-items: center;
-                        gap: 10px;
-                        margin-bottom: 8px;
-                        background: rgba(255,255,255,0.03);
-                        border-radius: 6px;
-                        padding: 8px 12px;
-                    ">
-                        <span style="
-                            background: {badge_color};
-                            color: white;
-                            padding: 2px 8px;
-                            border-radius: 4px;
-                            font-size: 0.75em;
-                            font-weight: bold;
-                            text-transform: uppercase;
-                        ">{state}</span>
-                        <span style="flex: 1;">
-                            <strong>{job_name}</strong>
-                            <br/><code style="font-size: 0.8em; opacity: 0.7;">{job_id[:8]}...</code>
-                        </span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                # Show source indicator for local/orphan jobs
+                source_label = ""
+                if source == "detected":
+                    source_label = " (orphan)"
+                elif source == "local":
+                    source_label = " (local)"
 
-            if st.button("🔄 Refresh Jobs"):
-                st.rerun()
+                job_cols = st.columns([4, 1])
+                with job_cols[0]:
+                    st.markdown(
+                        f"""
+                        <div style="
+                            display: flex;
+                            align-items: center;
+                            gap: 10px;
+                            margin-bottom: 8px;
+                            background: rgba(255,255,255,0.03);
+                            border-radius: 6px;
+                            padding: 8px 12px;
+                        ">
+                            <span style="
+                                background: {badge_color};
+                                color: white;
+                                padding: 2px 8px;
+                                border-radius: 4px;
+                                font-size: 0.75em;
+                                font-weight: bold;
+                                text-transform: uppercase;
+                            ">{state}</span>
+                            <span style="flex: 1;">
+                                <strong>{job_name}{source_label}</strong>
+                                <br/><code style="font-size: 0.8em; opacity: 0.7;">{job_id[:12]}... {f'PID {pid}' if pid else ''}</code>
+                            </span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with job_cols[1]:
+                    if st.button("❌", key=f"cancel_job_{job_id}", help=f"Cancel {job_name}"):
+                        cancel_resp = helpers.api_post(f"/celery_jobs/{job_id}/cancel")
+                        if cancel_resp and cancel_resp.get("status") in ("cancelled", "killed", "already_finished", "already_dead"):
+                            st.success(f"Cancelled {job_id[:8]}...")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to cancel: {cancel_resp}")
+
+            btn_cols = st.columns(2)
+            with btn_cols[0]:
+                if st.button("🔄 Refresh Jobs"):
+                    st.rerun()
+            with btn_cols[1]:
+                if local_jobs and st.button("🛑 Kill All Local", type="secondary"):
+                    kill_resp = helpers.api_post("/celery_jobs/kill_all_local")
+                    if kill_resp:
+                        killed = kill_resp.get("killed_count", 0)
+                        st.success(f"Killed {killed} local job(s)")
+                        st.rerun()
     except Exception as e:
         st.warning(f"Could not fetch jobs: {e}")
 
@@ -212,13 +244,13 @@ with st.expander("⚙️ Current Jobs", expanded=False):
 # Inject thumbnail CSS
 helpers.inject_thumb_css()
 
-# Render any active async job status
+# Render any active async job status (auto-refresh moved to end of page)
 _job_running = helpers.render_async_job_status()
 if _job_running:
-    # Auto-refresh every 2 seconds while job is running
-    import time as _time
-    _time.sleep(2)
-    st.rerun()
+    # Show clear button for stuck jobs
+    if st.button("🛑 Clear Stuck Job", key="clear_stuck_async_job"):
+        helpers.clear_async_job()
+        st.rerun()
 
 MAX_TRACKS_PER_ROW = 6
 TRACK_SAMPLE_LONG_THRESHOLD = 10_000
@@ -2831,3 +2863,12 @@ elif view_state == "person_clusters" and selected_person:
     )
 else:
     _render_people_view(ep_id, show_id, people, cluster_lookup, identity_index, season_label)
+
+# ============================================================================
+# Auto-refresh for async jobs (at END of page so full content renders first)
+# ============================================================================
+if _job_running:
+    import time as _time
+    st.caption("⏳ Page will auto-refresh in 3 seconds for job progress...")
+    _time.sleep(3)
+    st.rerun()

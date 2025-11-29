@@ -1121,10 +1121,32 @@ def render_async_job_status() -> bool:
     if not job:
         return False
 
+    # Stale job detection: if job was created > 30 minutes ago, clear it
+    STALE_JOB_TIMEOUT = 30 * 60  # 30 minutes
+    created_at = job.get("created_at", 0)
+    if time.time() - created_at > STALE_JOB_TIMEOUT:
+        st.warning(f"Job timed out after 30 minutes: {job.get('operation', 'unknown')}")
+        clear_async_job()
+        return False
+
+    # Track consecutive poll failures
+    poll_fail_key = "_async_job_poll_failures"
+    max_poll_failures = 5  # Clear job after 5 consecutive failures
+
     status = poll_async_job()
     if not status:
-        st.warning(f"Unable to check job status: {job['job_id'][:8]}...")
+        failures = st.session_state.get(poll_fail_key, 0) + 1
+        st.session_state[poll_fail_key] = failures
+        if failures >= max_poll_failures:
+            st.warning(f"Unable to check job status after {failures} attempts. Clearing stale job.")
+            clear_async_job()
+            st.session_state.pop(poll_fail_key, None)
+            return False
+        st.warning(f"Unable to check job status: {job['job_id'][:8]}... (attempt {failures}/{max_poll_failures})")
         return False
+
+    # Reset poll failure counter on success
+    st.session_state.pop(poll_fail_key, None)
 
     state = status.get("state", "unknown")
     operation = job.get("operation", "Operation")

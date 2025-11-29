@@ -875,11 +875,68 @@ async def get_celery_job_status(job_id: str):
 
 @router.post("/{job_id}/cancel")
 async def cancel_celery_job(job_id: str):
-    """Cancel a running Celery background job.
+    """Cancel a running Celery or local background job.
+
+    Supports:
+    - Celery jobs: Sends revoke signal
+    - Local jobs (orphan-{pid}, local-{ep_id}-{operation}): Kills process by PID
 
     Note: This sends a termination signal. Long-running operations may take
     a moment to actually stop.
     """
+    import psutil
+
+    # Handle local/orphan jobs by PID
+    if job_id.startswith("orphan-"):
+        # Extract PID from orphan-{pid} format
+        try:
+            pid = int(job_id.replace("orphan-", ""))
+            try:
+                proc = psutil.Process(pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                LOGGER.info(f"Killed orphan process PID {pid}")
+                return {"job_id": job_id, "status": "cancelled", "pid": pid}
+            except psutil.NoSuchProcess:
+                return {"job_id": job_id, "status": "already_finished", "message": "Process not found"}
+            except psutil.AccessDenied:
+                return {"job_id": job_id, "status": "error", "message": "Access denied killing process"}
+        except ValueError:
+            return {"job_id": job_id, "status": "error", "message": "Invalid orphan job ID format"}
+
+    if job_id.startswith("local-"):
+        # Extract info from local-{ep_id}-{operation} format
+        parts = job_id.replace("local-", "").rsplit("-", 1)
+        if len(parts) >= 2:
+            ep_id, operation = parts[0], parts[1]
+            # Find job in registry
+            jobs = _list_local_jobs(ep_id)
+            for job in jobs:
+                if job.get("operation") == operation:
+                    pid = job.get("pid")
+                    if pid:
+                        try:
+                            proc = psutil.Process(pid)
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                            _unregister_local_job(ep_id, operation)
+                            LOGGER.info(f"Killed local job PID {pid} ({ep_id}::{operation})")
+                            return {"job_id": job_id, "status": "cancelled", "pid": pid}
+                        except psutil.NoSuchProcess:
+                            _unregister_local_job(ep_id, operation)
+                            return {"job_id": job_id, "status": "already_finished", "message": "Process not found"}
+                        except psutil.AccessDenied:
+                            return {"job_id": job_id, "status": "error", "message": "Access denied killing process"}
+            return {"job_id": job_id, "status": "not_found", "message": "Local job not found in registry"}
+        return {"job_id": job_id, "status": "error", "message": "Invalid local job ID format"}
+
+    # Standard Celery job cancellation
     result = AsyncResult(job_id, app=celery_app)
 
     # Check if the job is still running
@@ -935,6 +992,68 @@ def _extract_job_metadata(task_info: Dict) -> Dict[str, Any]:
             result["operation"] = last_part
 
     return result
+
+
+@router.post("/kill_all_local")
+async def kill_all_local_jobs(ep_id: str | None = None):
+    """Kill all local/orphan jobs, optionally filtered by episode.
+
+    This is useful for cleaning up stale processes that weren't properly
+    terminated (e.g., after a crash or page refresh).
+
+    Args:
+        ep_id: Optional episode ID to filter jobs. If not provided, kills all local jobs.
+
+    Returns:
+        List of killed job IDs and their status.
+    """
+    import psutil
+
+    jobs = get_all_running_jobs(ep_id)
+    results = []
+
+    for job in jobs:
+        job_id = job.get("job_id", "")
+        pid = job.get("pid")
+        source = job.get("source", "")
+        operation = job.get("operation", "")
+        job_ep_id = job.get("ep_id", "")
+
+        if not pid:
+            continue
+
+        # Only kill local/detected jobs, not Celery jobs
+        if source not in ("local", "detected"):
+            continue
+
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+            # Unregister from local job registry if registered
+            if source == "local" and job_ep_id and operation:
+                _unregister_local_job(job_ep_id, operation)
+
+            LOGGER.info(f"Killed local job PID {pid} ({job_ep_id}::{operation})")
+            results.append({"job_id": job_id, "pid": pid, "status": "killed"})
+        except psutil.NoSuchProcess:
+            if source == "local" and job_ep_id and operation:
+                _unregister_local_job(job_ep_id, operation)
+            results.append({"job_id": job_id, "pid": pid, "status": "already_dead"})
+        except psutil.AccessDenied:
+            results.append({"job_id": job_id, "pid": pid, "status": "access_denied"})
+        except Exception as e:
+            results.append({"job_id": job_id, "pid": pid, "status": "error", "message": str(e)})
+
+    return {
+        "killed_count": len([r for r in results if r.get("status") == "killed"]),
+        "already_dead_count": len([r for r in results if r.get("status") == "already_dead"]),
+        "results": results,
+    }
 
 
 @router.get("")
