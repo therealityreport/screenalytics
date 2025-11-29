@@ -38,15 +38,21 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
+import math
 import os
+import shutil
+import signal
 import sys
 import subprocess
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Literal, Any, Dict, List
+from typing import Optional, Literal, Any, Dict, List, Generator
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from celery.result import AsyncResult
 from pydantic import BaseModel, Field
 
@@ -63,6 +69,82 @@ from apps.api.tasks import (
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/celery_jobs", tags=["celery_jobs"])
+
+
+# =============================================================================
+# Local Mode CPU Limiting - Thermal Safety
+# =============================================================================
+# Default CPU limit for local mode: 200% (2 cores worth) for thermal safety
+_LOCAL_CPULIMIT_PERCENT = int(os.environ.get("SCREENALYTICS_LOCAL_CPULIMIT_PERCENT", "200"))
+
+try:
+    import psutil  # type: ignore
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _PSUTIL_AVAILABLE = False
+
+
+def _maybe_wrap_with_cpulimit_local(command: list[str]) -> tuple[list[str], bool]:
+    """Wrap command with cpulimit for local mode thermal safety.
+
+    Returns:
+        tuple of (wrapped_command, cpulimit_applied)
+    """
+    if _LOCAL_CPULIMIT_PERCENT <= 0:
+        return command, False
+
+    binary = shutil.which("cpulimit")
+    if not binary:
+        LOGGER.warning(
+            "cpulimit binary not found for local mode. "
+            "CPU usage will NOT be capped at %d%%. "
+            "Install cpulimit (brew install cpulimit / apt install cpulimit) "
+            "or use psutil CPU affinity fallback.",
+            _LOCAL_CPULIMIT_PERCENT,
+        )
+        return command, False
+
+    LOGGER.info(
+        "[LOCAL MODE] Wrapping command with cpulimit at %d%% for thermal safety",
+        _LOCAL_CPULIMIT_PERCENT,
+    )
+    return [binary, "-l", str(_LOCAL_CPULIMIT_PERCENT), "-i", "--", *command], True
+
+
+def _apply_cpu_affinity_fallback_local(pid: int, limit_percent: int) -> bool:
+    """Apply CPU affinity as fallback when cpulimit is not available.
+
+    Uses psutil to restrict the process to a subset of available CPUs
+    proportional to the requested CPU limit percentage.
+
+    Returns:
+        True if affinity was successfully applied, False otherwise.
+    """
+    if not _PSUTIL_AVAILABLE:
+        LOGGER.debug("psutil not available; CPU affinity fallback skipped for pid %d", pid)
+        return False
+
+    try:
+        proc = psutil.Process(pid)
+        cpu_count = psutil.cpu_count()
+        if cpu_count is None or cpu_count <= 1:
+            return False
+
+        # Calculate how many CPUs to use based on limit percentage
+        # e.g., 200% with 8 cores -> use min(2, 8) = 2 cores
+        cores_to_use = max(1, min(cpu_count, int(math.ceil(limit_percent / 100.0))))
+
+        # Set affinity to first N cores
+        affinity_list = list(range(cores_to_use))
+        proc.cpu_affinity(affinity_list)
+        LOGGER.info(
+            "[LOCAL MODE] Applied CPU affinity fallback for pid %d: using %d of %d cores (limit=%d%%)",
+            pid, cores_to_use, cpu_count, limit_percent
+        )
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError) as exc:
+        LOGGER.debug("CPU affinity fallback failed for pid %d: %s", pid, exc)
+        return False
 
 
 # =============================================================================
@@ -235,6 +317,87 @@ def get_all_running_jobs(ep_id: str | None = None) -> List[Dict[str, Any]]:
         result.append(job)
 
     return result
+
+
+# =============================================================================
+# Per-Episode Log Storage - Persist logs for UI display after completion
+# =============================================================================
+# Logs are stored at: data/manifests/{episode_id}/logs/{operation}_latest.json
+# Each log file contains: {"logs": [...], "status": "completed"|"error", "elapsed_seconds": N, ...}
+
+
+def _get_log_storage_path(episode_id: str, operation: str) -> Path:
+    """Get the path for storing/retrieving operation logs."""
+    from py_screenalytics.artifacts import get_path
+
+    manifests_dir = get_path(episode_id, "detections").parent
+    logs_dir = manifests_dir / "logs"
+    return logs_dir / f"{operation}_latest.json"
+
+
+def save_operation_logs(
+    episode_id: str,
+    operation: str,
+    logs: List[str],
+    status: str,
+    elapsed_seconds: float,
+    extra: Dict[str, Any] | None = None,
+) -> bool:
+    """Save operation logs to persistent storage.
+
+    Args:
+        episode_id: Episode identifier
+        operation: Operation name (detect_track, faces_embed, cluster)
+        logs: List of log lines
+        status: Final status (completed, error, cancelled, timeout)
+        elapsed_seconds: Total runtime in seconds
+        extra: Additional metadata to store
+
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    try:
+        log_path = _get_log_storage_path(episode_id, operation)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "episode_id": episode_id,
+            "operation": operation,
+            "status": status,
+            "logs": logs,
+            "elapsed_seconds": elapsed_seconds,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **(extra or {}),
+        }
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+        LOGGER.info(f"[{episode_id}] Saved {len(logs)} log lines for {operation}")
+        return True
+
+    except Exception as e:
+        LOGGER.warning(f"[{episode_id}] Failed to save logs for {operation}: {e}")
+        return False
+
+
+def load_operation_logs(episode_id: str, operation: str) -> Dict[str, Any] | None:
+    """Load operation logs from persistent storage.
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if not found
+    """
+    try:
+        log_path = _get_log_storage_path(episode_id, operation)
+        if not log_path.exists():
+            return None
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    except Exception as e:
+        LOGGER.warning(f"[{episode_id}] Failed to load logs for {operation}: {e}")
+        return None
 
 
 # =============================================================================
@@ -471,6 +634,45 @@ async def list_local_jobs(ep_id: str | None = None):
         "jobs": jobs,
         "count": len(jobs),
     }
+
+
+@router.get("/logs/{ep_id}/{operation}")
+async def get_operation_logs(ep_id: str, operation: str):
+    """Get the most recent logs for an operation.
+
+    This endpoint returns the last saved logs for a given episode and operation.
+    Logs are persisted when local mode jobs complete (success, error, or cancelled).
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name (detect_track, faces_embed, cluster)
+
+    Returns:
+        - status: "completed" | "error" | "cancelled" | "timeout" | "none"
+        - logs: List of log lines (empty if status is "none")
+        - elapsed_seconds: Runtime in seconds
+        - updated_at: ISO timestamp of when logs were saved
+    """
+    valid_operations = {"detect_track", "faces_embed", "cluster"}
+    if operation not in valid_operations:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid operation '{operation}'. Must be one of: {', '.join(valid_operations)}"
+        )
+
+    data = load_operation_logs(ep_id, operation)
+
+    if data is None:
+        return {
+            "status": "none",
+            "logs": [],
+            "elapsed_seconds": 0,
+            "updated_at": None,
+            "episode_id": ep_id,
+            "operation": operation,
+        }
+
+    return data
 
 
 @router.get("/{job_id}")
@@ -738,6 +940,212 @@ def _start_local_subprocess(
         }
 
 
+def _run_local_subprocess_blocking(
+    command: list[str],
+    episode_id: str,
+    operation: str,
+    options: Dict[str, Any],
+    timeout: int = 3600,
+) -> Dict[str, Any]:
+    """Run a pipeline command synchronously, blocking until completion.
+
+    This is the correct implementation for local mode - runs the subprocess
+    in the foreground, tied to the HTTP request lifecycle. If the request
+    is cancelled, the subprocess is terminated.
+
+    Args:
+        command: Command list to execute
+        episode_id: Episode ID for logging
+        operation: Operation name (detect_track, faces_embed, cluster)
+        options: Job options for logging and env setup
+        timeout: Maximum time in seconds (default 3600 = 1 hour)
+
+    Returns:
+        Result dict with status, logs, and summary data
+    """
+    import signal
+    import time
+
+    # Check for existing running job
+    existing_job = _get_running_local_job(episode_id, operation)
+    if existing_job:
+        existing_pid = existing_job.get("pid")
+        LOGGER.warning(f"[{episode_id}] {operation} already running (PID {existing_pid})")
+        return {
+            "status": "error",
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "error": f"A {operation} job is already running for this episode (PID {existing_pid}). "
+                     "Wait for it to complete or kill it manually.",
+            "logs": [f"Existing job PID: {existing_pid}"],
+            "elapsed_seconds": 0,
+        }
+
+    project_root = _find_project_root()
+    logs: List[str] = []
+
+    # Build context string for logging
+    device = options.get("device", "auto")
+    stride = options.get("stride", 6)
+    profile = options.get("profile", "default")
+    cpu_threads = options.get("cpu_threads", 2)
+
+    logs.append(f"[LOCAL MODE] Starting {operation}")
+    logs.append(f"  Device: {device}, Profile: {profile}")
+    logs.append(f"  Stride: {stride}, CPU threads: {cpu_threads}")
+    logs.append(f"  This runs synchronously - page refresh will cancel the job.")
+    LOGGER.info(f"[{episode_id}] Starting local {operation} (device={device}, stride={stride}, threads={cpu_threads})")
+    LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
+
+    # Set up environment with CPU thread limits
+    # For local mode, we enforce a hard cap of 2 threads for thermal safety on laptops
+    env = os.environ.copy()
+    local_max_threads = min(int(cpu_threads or 2), 2)  # Hard cap at 2 for local mode thermal safety
+    env.update({
+        "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
+        "OMP_NUM_THREADS": str(local_max_threads),
+        "MKL_NUM_THREADS": str(local_max_threads),
+        "OPENBLAS_NUM_THREADS": str(local_max_threads),
+        "VECLIB_MAXIMUM_THREADS": str(local_max_threads),
+        "NUMEXPR_NUM_THREADS": str(local_max_threads),
+        "ORT_INTRA_OP_NUM_THREADS": str(local_max_threads),
+        "ORT_INTER_OP_NUM_THREADS": "1",
+        # Enable local mode instrumentation for verbose phase-level logging
+        "LOCAL_MODE_INSTRUMENTATION": "1",
+    })
+    logs.append(f"Local mode: CPU threads capped at {local_max_threads} for thermal safety")
+    LOGGER.info(f"[{episode_id}] Local mode CPU threads capped at {local_max_threads}")
+
+    # Apply cpulimit wrapper for thermal safety
+    effective_command, cpulimit_applied = _maybe_wrap_with_cpulimit_local(command)
+    if cpulimit_applied:
+        logs.append(f"Local mode: Using cpulimit at {_LOCAL_CPULIMIT_PERCENT}% for thermal safety")
+
+    start_time = time.time()
+    process: subprocess.Popen | None = None
+
+    def _kill_process_tree(proc: subprocess.Popen) -> None:
+        """Kill process and all its children using process group."""
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait(timeout=5)
+        except (ProcessLookupError, OSError) as e:
+            LOGGER.debug(f"Process already dead: {e}")
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    try:
+        # Start subprocess in a new process group so we can kill all children
+        # BUT NOT with start_new_session=True so it stays attached to this request
+        process = subprocess.Popen(
+            effective_command,
+            cwd=str(project_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,  # Create new process group for clean termination
+        )
+
+        # Apply CPU affinity fallback if cpulimit wasn't available
+        if not cpulimit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
+            if _apply_cpu_affinity_fallback_local(process.pid, _LOCAL_CPULIMIT_PERCENT):
+                logs.append(f"Local mode: Using CPU affinity fallback (cpulimit not available)")
+
+        # Register the job for tracking/duplicate prevention
+        _register_local_job(episode_id, operation, process.pid, job_id=None)
+        logs.append(f"Process started (PID {process.pid})")
+
+        # Wait for process to complete with timeout
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(process)
+            _unregister_local_job(episode_id, operation)
+            elapsed = time.time() - start_time
+            logs.append(f"TIMEOUT: Job timed out after {timeout}s")
+            LOGGER.error(f"[{episode_id}] local {operation} timed out after {timeout}s")
+            return {
+                "status": "error",
+                "ep_id": episode_id,
+                "operation": operation,
+                "execution_mode": "local",
+                "error": f"Job timed out after {timeout} seconds",
+                "logs": logs,
+                "elapsed_seconds": elapsed,
+            }
+
+        elapsed = time.time() - start_time
+        _unregister_local_job(episode_id, operation)
+
+        # Collect output
+        if stdout:
+            for line in stdout.strip().split("\n"):
+                if line.strip():
+                    logs.append(line.strip())
+
+        if process.returncode != 0:
+            error_msg = stderr.strip() if stderr else f"Exit code {process.returncode}"
+            logs.append(f"ERROR: {error_msg}")
+            LOGGER.error(f"[{episode_id}] local {operation} failed: {error_msg}")
+            return {
+                "status": "error",
+                "ep_id": episode_id,
+                "operation": operation,
+                "execution_mode": "local",
+                "error": error_msg,
+                "return_code": process.returncode,
+                "logs": logs,
+                "elapsed_seconds": elapsed,
+            }
+
+        # Format elapsed time nicely
+        if elapsed >= 60:
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            elapsed_str = f"{mins}m {secs}s"
+        else:
+            elapsed_str = f"{elapsed:.1f}s"
+        logs.append(f"[LOCAL MODE] {operation} completed successfully in {elapsed_str}")
+        LOGGER.info(f"[{episode_id}] local {operation} completed successfully in {elapsed_str}")
+        return {
+            "status": "completed",
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "return_code": 0,
+            "logs": logs,
+            "elapsed_seconds": elapsed,
+        }
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        if process and process.poll() is None:
+            _kill_process_tree(process)
+        _unregister_local_job(episode_id, operation)
+        error_msg = str(e)
+        logs.append(f"EXCEPTION: {error_msg}")
+        LOGGER.exception(f"[{episode_id}] local {operation} raised exception: {e}")
+        return {
+            "status": "error",
+            "ep_id": episode_id,
+            "operation": operation,
+            "execution_mode": "local",
+            "error": error_msg,
+            "logs": logs,
+            "elapsed_seconds": elapsed,
+        }
+
+
 async def _run_local_subprocess_async(
     command: list[str],
     episode_id: str,
@@ -746,8 +1154,7 @@ async def _run_local_subprocess_async(
 ) -> Dict[str, Any]:
     """Run a pipeline command as subprocess, tied to the HTTP request lifecycle.
 
-    DEPRECATED: This blocking version is kept for backwards compatibility.
-    New code should use _start_local_subprocess() for non-blocking execution.
+    DEPRECATED: Use _run_local_subprocess_blocking() instead for synchronous local mode.
 
     This is used for local execution mode. The subprocess is killed if the
     HTTP request is cancelled (e.g., page refresh). This ensures local mode
@@ -1050,8 +1457,9 @@ def _build_faces_embed_command(
         command.append("--save-crops")
     if options.get("jpeg_quality"):
         command += ["--jpeg-quality", str(options["jpeg_quality"])]
+    # Use --sample-every-n-frames instead of deprecated --min-frames-between-crops
     if options.get("min_frames_between_crops"):
-        command += ["--min-frames-between-crops", str(options["min_frames_between_crops"])]
+        command += ["--sample-every-n-frames", str(options["min_frames_between_crops"])]
     if options.get("thumb_size"):
         command += ["--thumb-size", str(options["thumb_size"])]
 
@@ -1087,6 +1495,258 @@ def _build_cluster_command(
         command += ["--min-identity-sim", str(options["min_identity_sim"])]
 
     return command
+
+
+# =============================================================================
+# Streaming Local Subprocess - Live log output for Local mode
+# =============================================================================
+
+
+def _stream_local_subprocess(
+    command: list[str],
+    episode_id: str,
+    operation: str,
+    options: Dict[str, Any],
+    timeout: int = 3600,
+) -> Generator[str, None, None]:
+    """Run a pipeline command and yield log lines as newline-delimited JSON.
+
+    This generator streams log lines as they are produced by the subprocess,
+    enabling live updates in the UI. Each line is a JSON object:
+    - {"type": "log", "line": "..."} for log lines
+    - {"type": "summary", "status": "completed"|"error", ...} at the end
+
+    Args:
+        command: Command list to execute
+        episode_id: Episode ID for logging
+        operation: Operation name (detect_track, faces_embed, cluster)
+        options: Job options for logging and env setup
+        timeout: Maximum time in seconds (default 3600 = 1 hour)
+
+    Yields:
+        Newline-delimited JSON strings
+    """
+    # Check for existing running job
+    existing_job = _get_running_local_job(episode_id, operation)
+    if existing_job:
+        existing_pid = existing_job.get("pid")
+        yield json.dumps({
+            "type": "error",
+            "message": f"A {operation} job is already running for this episode (PID {existing_pid})"
+        }) + "\n"
+        return
+
+    project_root = _find_project_root()
+    logs: List[str] = []
+
+    # Build context string for logging
+    device = options.get("device", "auto")
+    stride = options.get("stride", 6)
+    profile = options.get("profile", "default")
+    cpu_threads = options.get("cpu_threads", 2)
+
+    # Yield initial status
+    start_msg = f"[LOCAL MODE] Starting {operation} (device={device}, profile={profile})"
+    logs.append(start_msg)
+    yield json.dumps({"type": "log", "line": start_msg}) + "\n"
+
+    config_msg = f"  Stride: {stride}, CPU threads: {cpu_threads}"
+    logs.append(config_msg)
+    yield json.dumps({"type": "log", "line": config_msg}) + "\n"
+
+    sync_msg = "  This runs synchronously - page refresh will cancel the job."
+    logs.append(sync_msg)
+    yield json.dumps({"type": "log", "line": sync_msg}) + "\n"
+
+    LOGGER.info(f"[{episode_id}] Starting streaming local {operation}")
+    LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
+
+    # Set up environment with CPU thread limits
+    env = os.environ.copy()
+    local_max_threads = min(int(cpu_threads or 2), 2)
+    env.update({
+        "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
+        "OMP_NUM_THREADS": str(local_max_threads),
+        "MKL_NUM_THREADS": str(local_max_threads),
+        "OPENBLAS_NUM_THREADS": str(local_max_threads),
+        "VECLIB_MAXIMUM_THREADS": str(local_max_threads),
+        "NUMEXPR_NUM_THREADS": str(local_max_threads),
+        "ORT_INTRA_OP_NUM_THREADS": str(local_max_threads),
+        "ORT_INTER_OP_NUM_THREADS": "1",
+        "LOCAL_MODE_INSTRUMENTATION": "1",
+        # Force unbuffered Python output for real-time streaming
+        "PYTHONUNBUFFERED": "1",
+    })
+
+    thermal_msg = f"Local mode: CPU threads capped at {local_max_threads} for thermal safety"
+    logs.append(thermal_msg)
+    yield json.dumps({"type": "log", "line": thermal_msg}) + "\n"
+
+    # Apply cpulimit wrapper for thermal safety
+    effective_command, cpulimit_applied = _maybe_wrap_with_cpulimit_local(command)
+    if cpulimit_applied:
+        cpu_msg = f"Local mode: Using cpulimit at {_LOCAL_CPULIMIT_PERCENT}% for thermal safety"
+        logs.append(cpu_msg)
+        yield json.dumps({"type": "log", "line": cpu_msg}) + "\n"
+
+    start_time = time.time()
+    process: subprocess.Popen | None = None
+
+    def _kill_process_tree(proc: subprocess.Popen) -> None:
+        """Kill process and all its children using process group."""
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait(timeout=5)
+        except (ProcessLookupError, OSError) as e:
+            LOGGER.debug(f"Process already dead: {e}")
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    try:
+        # Start subprocess with line-buffered output for streaming
+        process = subprocess.Popen(
+            effective_command,
+            cwd=str(project_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
+            text=True,
+            bufsize=1,  # Line-buffered
+            env=env,
+            start_new_session=True,
+        )
+
+        # Apply CPU affinity fallback if cpulimit wasn't available
+        if not cpulimit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
+            if _apply_cpu_affinity_fallback_local(process.pid, _LOCAL_CPULIMIT_PERCENT):
+                affinity_msg = "Local mode: Using CPU affinity fallback (cpulimit not available)"
+                logs.append(affinity_msg)
+                yield json.dumps({"type": "log", "line": affinity_msg}) + "\n"
+
+        # Register the job
+        _register_local_job(episode_id, operation, process.pid, job_id=None)
+        pid_msg = f"Process started (PID {process.pid})"
+        logs.append(pid_msg)
+        yield json.dumps({"type": "log", "line": pid_msg}) + "\n"
+
+        # Stream stdout lines as they arrive
+        assert process.stdout is not None
+        for line in iter(process.stdout.readline, ""):
+            if not line:
+                break
+
+            # Check for timeout
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                _kill_process_tree(process)
+                _unregister_local_job(episode_id, operation)
+                timeout_msg = f"TIMEOUT: Job timed out after {timeout}s"
+                logs.append(timeout_msg)
+                yield json.dumps({"type": "log", "line": timeout_msg}) + "\n"
+
+                # Save logs before yielding summary
+                save_operation_logs(episode_id, operation, logs, "timeout", elapsed)
+
+                yield json.dumps({
+                    "type": "summary",
+                    "status": "timeout",
+                    "elapsed_seconds": elapsed,
+                    "error": f"Job timed out after {timeout} seconds",
+                }) + "\n"
+                return
+
+            stripped = line.rstrip()
+            if stripped:
+                logs.append(stripped)
+                yield json.dumps({"type": "log", "line": stripped}) + "\n"
+
+        # Wait for process to complete
+        process.wait()
+        elapsed = time.time() - start_time
+        _unregister_local_job(episode_id, operation)
+
+        # Handle result
+        if process.returncode != 0:
+            error_msg = f"Process exited with code {process.returncode}"
+            logs.append(f"ERROR: {error_msg}")
+            yield json.dumps({"type": "log", "line": f"ERROR: {error_msg}"}) + "\n"
+            LOGGER.error(f"[{episode_id}] local {operation} failed: {error_msg}")
+
+            # Save logs
+            save_operation_logs(episode_id, operation, logs, "error", elapsed, {"return_code": process.returncode})
+
+            yield json.dumps({
+                "type": "summary",
+                "status": "error",
+                "elapsed_seconds": elapsed,
+                "return_code": process.returncode,
+                "error": error_msg,
+            }) + "\n"
+            return
+
+        # Success
+        if elapsed >= 60:
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            elapsed_str = f"{mins}m {secs}s"
+        else:
+            elapsed_str = f"{elapsed:.1f}s"
+
+        success_msg = f"[LOCAL MODE] {operation} completed successfully in {elapsed_str}"
+        logs.append(success_msg)
+        yield json.dumps({"type": "log", "line": success_msg}) + "\n"
+        LOGGER.info(f"[{episode_id}] local {operation} completed successfully in {elapsed_str}")
+
+        # Save logs
+        save_operation_logs(episode_id, operation, logs, "completed", elapsed)
+
+        yield json.dumps({
+            "type": "summary",
+            "status": "completed",
+            "elapsed_seconds": elapsed,
+            "return_code": 0,
+        }) + "\n"
+
+    except GeneratorExit:
+        # Client disconnected (page refresh, navigation, etc.) - kill the subprocess
+        elapsed = time.time() - start_time
+        if process and process.poll() is None:
+            LOGGER.warning(f"[{episode_id}] Client disconnected, killing {operation} process tree (PID {process.pid})")
+            _kill_process_tree(process)
+            logs.append(f"CANCELLED: Client disconnected after {elapsed:.1f}s, process killed")
+        _unregister_local_job(episode_id, operation)
+
+        # Save partial logs as cancelled
+        save_operation_logs(episode_id, operation, logs, "cancelled", elapsed)
+        raise
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        if process and process.poll() is None:
+            _kill_process_tree(process)
+        _unregister_local_job(episode_id, operation)
+
+        error_msg = str(e)
+        logs.append(f"EXCEPTION: {error_msg}")
+        yield json.dumps({"type": "log", "line": f"EXCEPTION: {error_msg}"}) + "\n"
+        LOGGER.exception(f"[{episode_id}] local {operation} raised exception: {e}")
+
+        # Save logs
+        save_operation_logs(episode_id, operation, logs, "error", elapsed, {"exception": error_msg})
+
+        yield json.dumps({
+            "type": "summary",
+            "status": "error",
+            "elapsed_seconds": elapsed,
+            "error": error_msg,
+        }) + "\n"
 
 
 # =============================================================================
@@ -1167,25 +1827,23 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         f"execution_mode={execution_mode}"
     )
 
-    # Handle local execution mode - start subprocess and return immediately
+    # Handle local execution mode - streaming subprocess with live log output
     if execution_mode == "local":
+        # Add profile to options for logging
+        options["profile"] = resolved_profile
+
         project_root = _find_project_root()
         command = _build_detect_track_command(req.ep_id, options, project_root)
 
-        # Start subprocess (non-blocking) - UI will poll for progress
-        result = _start_local_subprocess(command, req.ep_id, "detect_track", options)
-
-        # Add profile and warnings to result
-        result["profile"] = resolved_profile
-        result["cpu_threads"] = options.get("cpu_threads")
-        if all_warnings:
-            result["warnings"] = all_warnings
-
-        # Return error status code if job failed to start
-        if result.get("state") == "error":
-            return JSONResponse(status_code=500, content=result)
-
-        return result
+        # Return streaming response for live log updates
+        return StreamingResponse(
+            _stream_local_subprocess(command, req.ep_id, "detect_track", options),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
 
     # Redis/Celery mode (default) - enqueues job and returns immediately
     result = run_detect_track_task.delay(req.ep_id, options)
@@ -1263,25 +1921,23 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
         all_warnings.append(profile_warning)
     all_warnings.extend(config_warnings)
 
-    # Handle local execution mode - subprocess tied to request lifecycle
+    # Handle local execution mode - streaming subprocess with live log output
     if execution_mode == "local":
+        # Add profile to options for logging
+        options["profile"] = resolved_profile
+
         project_root = _find_project_root()
         command = _build_faces_embed_command(req.ep_id, options, project_root)
 
-        # Start subprocess (non-blocking) - UI will poll for progress
-        result = _start_local_subprocess(command, req.ep_id, "faces_embed", options)
-
-        # Add profile and warnings to result
-        result["profile"] = resolved_profile
-        result["cpu_threads"] = options.get("cpu_threads")
-        if all_warnings:
-            result["warnings"] = all_warnings
-
-        # Return error status code if job failed to start
-        if result.get("state") == "error":
-            return JSONResponse(status_code=500, content=result)
-
-        return result
+        # Return streaming response for live log updates
+        return StreamingResponse(
+            _stream_local_subprocess(command, req.ep_id, "faces_embed", options),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
 
     # Redis/Celery mode (default) - enqueues job and returns immediately
     result = run_faces_embed_task.delay(req.ep_id, options)
@@ -1357,25 +2013,23 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
         all_warnings.append(profile_warning)
     all_warnings.extend(config_warnings)
 
-    # Handle local execution mode - subprocess tied to request lifecycle
+    # Handle local execution mode - streaming subprocess with live log output
     if execution_mode == "local":
+        # Add profile to options for logging
+        options["profile"] = resolved_profile
+
         project_root = _find_project_root()
         command = _build_cluster_command(req.ep_id, options, project_root)
 
-        # Start subprocess (non-blocking) - UI will poll for progress
-        result = _start_local_subprocess(command, req.ep_id, "cluster", options)
-
-        # Add profile and warnings to result
-        result["profile"] = resolved_profile
-        result["cpu_threads"] = options.get("cpu_threads")
-        if all_warnings:
-            result["warnings"] = all_warnings
-
-        # Return error status code if job failed to start
-        if result.get("state") == "error":
-            return JSONResponse(status_code=500, content=result)
-
-        return result
+        # Return streaming response for live log updates
+        return StreamingResponse(
+            _stream_local_subprocess(command, req.ep_id, "cluster", options),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
 
     # Redis/Celery mode (default) - enqueues job and returns immediately
     result = run_cluster_task.delay(req.ep_id, options)

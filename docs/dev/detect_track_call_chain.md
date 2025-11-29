@@ -4,9 +4,11 @@
 
 This document describes how Detect/Track operations flow through the system for both execution modes: **Local Worker (direct)** and **Redis/Celery (queued)**.
 
-## Current Implementation (as of nov-24 branch)
+## Current Implementation (fixed in nov-24 branch)
 
 ### Local Mode Call Chain
+
+Local mode is **truly synchronous**: a single blocking HTTP request that waits for the job to complete. No job IDs, no polling, and page refresh cancels the job.
 
 ```
 User clicks "Run Detect/Track" button (Execution Mode = Local)
@@ -16,31 +18,35 @@ User clicks "Run Detect/Track" button (Execution Mode = Local)
     └── helpers.run_pipeline_job_with_mode(ep_id, "detect_track", job_payload, ...)
             │
             ▼
-ui_helpers.py::run_pipeline_job_with_mode (line 2419-2472)
+ui_helpers.py::run_pipeline_job_with_mode (line ~2419)
     └── For execution_mode == "local":
-        ├── Display: "⏳ Running {operation} synchronously..."
+        ├── Display: "⏳ [LOCAL MODE] Running {operation} (device=X)..."
         ├── Single blocking HTTP POST to /celery_jobs/detect_track
         │   (timeout=3600 seconds = 1 hour)
-        └── Wait for response, display logs directly
+        ├── NO job_id returned
+        ├── NO polling loop
+        └── Response: {"status": "completed", "logs": [...], "elapsed_seconds": X}
                 │
                 ▼
-celery_jobs.py::start_detect_track_celery (line 874-891)
+celery_jobs.py::start_detect_track_celery (line ~1363)
     └── For execution_mode == "local":
         ├── Build command for tools/episode_run.py
-        └── await _run_local_subprocess_async(command, ep_id, "detect_track", options)
+        └── result = _run_local_subprocess_blocking(command, ep_id, "detect_track", options)
                 │
                 ▼
-celery_jobs.py::_run_local_subprocess_async (line 460-666)
-    ├── Spawn subprocess with start_new_session=True (new process group)
-    ├── Register in _running_local_jobs (prevents duplicates)
-    ├── Poll every 0.5s via await asyncio.sleep(0.5)
-    ├── On request cancel (page refresh): kill process group
-    └── Return: {"status": "completed", "logs": [...], "elapsed_seconds": X}
+celery_jobs.py::_run_local_subprocess_blocking (line ~741)
+    ├── Check for duplicate job via _running_local_jobs (prevents concurrent runs)
+    ├── Set CPU thread limits to max 2 for thermal safety
+    ├── Spawn subprocess with subprocess.Popen()
+    ├── Register PID in _running_local_jobs
+    ├── Call process.communicate(timeout=3600) - BLOCKS until complete
+    ├── Unregister from _running_local_jobs
+    └── Return: {"status": "completed" | "error", "logs": [...], "elapsed_seconds": X}
                 │
                 ▼
 tools/episode_run.py
     └── Runs detection and tracking pipeline
-        ├── Applies CPU thread limits
+        ├── Applies CPU thread limits (inherited from parent env)
         ├── Loads video via cv2
         ├── Runs RetinaFace detection
         ├── Runs ByteTrack/StrongSORT tracking
@@ -48,6 +54,8 @@ tools/episode_run.py
 ```
 
 ### Redis/Celery Mode Call Chain
+
+Redis mode uses **background job execution**: the job is queued, and the UI polls for status updates.
 
 ```
 User clicks "Run Detect/Track" button (Execution Mode = Redis)
@@ -57,7 +65,7 @@ User clicks "Run Detect/Track" button (Execution Mode = Redis)
     └── helpers.run_pipeline_job_with_mode(ep_id, "detect_track", job_payload, ...)
             │
             ▼
-ui_helpers.py::run_pipeline_job_with_mode (line 2490-2499)
+ui_helpers.py::run_pipeline_job_with_mode (line ~2503)
     └── For execution_mode != "local":
         └── run_celery_job_with_progress(ep_id, operation, payload, ...)
                 │
@@ -68,7 +76,7 @@ ui_helpers.py::run_celery_job_with_progress
     └── Display progress until job completes
                 │
                 ▼
-celery_jobs.py::start_detect_track_celery (line 893-910)
+celery_jobs.py::start_detect_track_celery (line ~1387)
     └── For execution_mode == "redis":
         └── run_detect_track_task.delay(ep_id, options) → returns Celery AsyncResult
                 │
@@ -82,59 +90,68 @@ tasks.py::run_detect_track_task (Celery task)
 
 ### Does `execution_mode="local"` create a job ID?
 
-**NO** - The current implementation does NOT create a job ID for local mode. The response contains:
+**NO** - Local mode does NOT create a job ID. The response contains:
 - `status`: "completed" or "error"
-- `logs`: List of log lines
+- `logs`: List of log lines from the subprocess
 - `elapsed_seconds`: Runtime in seconds
 - `ep_id`, `operation`, `execution_mode`
+- `device`, `profile`, `cpu_threads`
 
 There is no `job_id` field in local mode responses.
 
 ### Does local mode use any polling loop?
 
-**Internally yes, externally no.**
+**NO** - Neither client-side nor server-side polling.
 
-- **Internal (server-side)**: The FastAPI handler uses `await asyncio.sleep(0.5)` to poll the subprocess status. This keeps the async event loop responsive.
-- **External (client-side)**: The UI makes a single blocking HTTP request with a 1-hour timeout. No client-side polling.
-
-### Does local mode use a jobs store or tracking map?
-
-**Partially** - The `_running_local_jobs` dict tracks running jobs by `ep_id::operation` key to:
-1. Prevent duplicate jobs for the same episode/operation
-2. Store PID for process group cleanup
-
-This is NOT a persistent job store - it's ephemeral in-memory tracking that clears on server restart.
+- **Server-side**: Uses `subprocess.Popen().communicate()` which blocks until completion
+- **Client-side**: Makes a single HTTP POST with a 1-hour timeout
 
 ### Does local mode continue if the page is refreshed?
 
-**NO** - When the HTTP request is cancelled (page refresh), the `asyncio.CancelledError` is raised, which triggers `_kill_process_tree()` to terminate the subprocess and all its children.
+**NO** - The subprocess is tied to the HTTP request lifecycle. When the request times out or is cancelled:
+1. The subprocess and all its children are terminated via process group kill
+2. The job is unregistered from `_running_local_jobs`
+
+### What about thermal safety?
+
+Local mode enforces **hard cap of 2 CPU threads** regardless of profile:
+```python
+local_max_threads = min(int(cpu_threads or 2), 2)  # Hard cap at 2
+```
+
+This prevents laptop overheating during synchronous local runs.
+
+## Comparison: Local vs Redis Mode
+
+| Aspect | Local Mode | Redis Mode |
+|--------|------------|------------|
+| HTTP call | Single blocking (up to 1 hour) | Quick POST + polling |
+| Job ID | None | Celery task ID |
+| UI feedback | Status + logs on completion | Progress polling |
+| Page refresh | Kills subprocess | Job continues |
+| CPU thread cap | 2 (hard limit) | Profile-based (up to 8) |
+| Use case | Development, testing | Production, long runs |
 
 ## Historical Context
 
-### Old Version (commit d499c64)
+### Regression (commit 4badd97)
 
-The older implementation had job-style behavior even for local mode:
+Commit `4badd97` introduced job-like behavior for local mode:
 - Created "local-{uuid}" job IDs
-- Used `_local_jobs` in-memory dict for tracking
-- UI showed "Job submitted: local-xxx" and "Polling for status..."
-- Kept polling via client-side rerun
+- Started detached subprocesses with `start_new_session=True`
+- UI polled for status like Redis mode
+- Process continued after page refresh
 
-### Fix Commit (45b5d96)
+### Original Fix (commit 45b5d96)
 
-Commit `45b5d96` attempted to fix this by:
-- Removing job IDs from local mode
-- Making UI use single blocking request
-- Removing "Job submitted" / "Polling" log messages
+Commit `45b5d96` attempted to fix this but was incomplete:
+- Made UI use blocking request
+- But backend still started detached process
 
-### Current Working Directory
+### Current Fix (nov-24 branch)
 
-The current uncommitted changes refined the fix:
-- Added `_run_local_subprocess_async` with process group management
-- Added proper request cancellation handling
-- Retained `_running_local_jobs` for duplicate prevention only (not job tracking)
-
-## Remaining Issues
-
-1. **Logging clarity**: Need to ensure local mode logs are clearly different from job-style logs
-2. **Performance regression**: Local mode may be slower than the pre-Redis pipeline (investigation needed)
-3. **Thermal behavior**: Need to verify CPU thread limits are properly applied
+The current implementation properly fixes local mode:
+- Backend: `_run_local_subprocess_blocking()` uses `communicate()` for true blocking
+- UI: Single request with long timeout, no polling
+- Thermal: Hard 2-thread cap for local mode
+- Cleanup: Process killed on request cancellation

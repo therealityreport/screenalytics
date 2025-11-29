@@ -2,12 +2,11 @@
 
 These tests verify:
 1. Celery job endpoints accept execution_mode parameter
-2. execution_mode="local" starts jobs in background and returns immediately with job_id
+2. execution_mode="local" runs jobs synchronously (blocking) and returns status directly
 3. execution_mode="redis" (default) enqueues jobs via Celery
-4. Grouping endpoints support execution_mode
-5. Refresh similarity supports execution_mode
-6. Local mode respects CPU thread limits for thermal safety
-7. /celery_jobs/local endpoint returns running local jobs
+4. Local mode does NOT return job_id (truly synchronous)
+5. Local mode respects CPU thread limits for thermal safety (hard cap at 2)
+6. Local mode prevents duplicate concurrent runs
 """
 
 from __future__ import annotations
@@ -82,19 +81,25 @@ class TestExecutionModeParameter:
         assert data.get("state") == "queued"
         assert data.get("execution_mode") == "redis"
 
-    def test_detect_track_accepts_execution_mode_local(self, api_client, monkeypatch):
-        """POST /celery_jobs/detect_track accepts execution_mode='local'.
+    def test_detect_track_local_mode_synchronous(self, api_client, monkeypatch):
+        """POST /celery_jobs/detect_track with execution_mode='local' runs synchronously.
 
-        Local mode starts the job in background and returns immediately with job_id.
-        The UI then polls /celery_jobs/local and /episodes/{ep_id}/progress for updates.
+        Local mode should:
+        - NOT return a job_id
+        - Return status directly (completed/error)
+        - Return logs from the subprocess
+        - Include elapsed_seconds
         """
-        mock_process = MockProcess(returncode=0, stdout="Success\n")
+        mock_process = MockProcess(returncode=0, stdout="Line 1\nLine 2\nSuccess\n")
 
         def fake_popen(*args, **kwargs):
             return mock_process
 
         monkeypatch.setattr("subprocess.Popen", fake_popen)
         monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
+        # Clear any existing registered jobs
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
 
         payload = {
             "ep_id": "demo-s01e01",
@@ -107,15 +112,19 @@ class TestExecutionModeParameter:
         assert resp.status_code == 200
         data = resp.json()
 
-        # Local mode starts job and returns immediately
-        assert data.get("state") == "started"
+        # Local mode returns synchronous response - no job_id
+        assert "job_id" not in data
+        assert data.get("status") == "completed"
         assert data.get("execution_mode") == "local"
-        assert "job_id" in data  # Has job_id for tracking
-        assert data["job_id"].startswith("local-")
-        assert "pid" in data  # Has process ID
+        assert "logs" in data
+        assert isinstance(data["logs"], list)
+        assert "elapsed_seconds" in data
 
-    def test_faces_embed_accepts_execution_mode_local(self, api_client, monkeypatch):
-        """POST /celery_jobs/faces_embed accepts execution_mode='local'."""
+        # Cleanup
+        celery_jobs._running_local_jobs.clear()
+
+    def test_faces_embed_local_mode_synchronous(self, api_client, monkeypatch):
+        """POST /celery_jobs/faces_embed with execution_mode='local' runs synchronously."""
         mock_process = MockProcess(returncode=0, stdout="Success\n")
 
         def fake_popen(*args, **kwargs):
@@ -123,6 +132,8 @@ class TestExecutionModeParameter:
 
         monkeypatch.setattr("subprocess.Popen", fake_popen)
         monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
 
         payload = {
             "ep_id": "demo-s01e01",
@@ -132,12 +143,16 @@ class TestExecutionModeParameter:
 
         resp = api_client.post("/celery_jobs/faces_embed", json=payload)
         data = resp.json()
-        assert data.get("state") == "started"
-        assert data.get("execution_mode") == "local"
-        assert data["job_id"].startswith("local-")
 
-    def test_cluster_accepts_execution_mode_local(self, api_client, monkeypatch):
-        """POST /celery_jobs/cluster accepts execution_mode='local'."""
+        # Local mode returns synchronous response - no job_id
+        assert "job_id" not in data
+        assert data.get("status") == "completed"
+        assert data.get("execution_mode") == "local"
+
+        celery_jobs._running_local_jobs.clear()
+
+    def test_cluster_local_mode_synchronous(self, api_client, monkeypatch):
+        """POST /celery_jobs/cluster with execution_mode='local' runs synchronously."""
         mock_process = MockProcess(returncode=0, stdout="Success\n")
 
         def fake_popen(*args, **kwargs):
@@ -145,6 +160,8 @@ class TestExecutionModeParameter:
 
         monkeypatch.setattr("subprocess.Popen", fake_popen)
         monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
 
         payload = {
             "ep_id": "demo-s01e01",
@@ -156,9 +173,42 @@ class TestExecutionModeParameter:
 
         resp = api_client.post("/celery_jobs/cluster", json=payload)
         data = resp.json()
-        assert data.get("state") == "started"
+
+        # Local mode returns synchronous response - no job_id
+        assert "job_id" not in data
+        assert data.get("status") == "completed"
         assert data.get("execution_mode") == "local"
-        assert data["job_id"].startswith("local-")
+
+        celery_jobs._running_local_jobs.clear()
+
+    def test_local_mode_returns_error_on_failure(self, api_client, monkeypatch):
+        """Local mode should return status='error' when subprocess fails."""
+        mock_process = MockProcess(returncode=1, stdout="", stderr="Something went wrong")
+
+        def fake_popen(*args, **kwargs):
+            return mock_process
+
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
+
+        payload = {
+            "ep_id": "demo-s01e01",
+            "stride": 6,
+            "device": "cpu",
+            "execution_mode": "local",
+        }
+
+        resp = api_client.post("/celery_jobs/detect_track", json=payload)
+        assert resp.status_code == 500
+        data = resp.json()
+
+        assert data.get("status") == "error"
+        assert "error" in data
+        assert data.get("return_code") == 1
+
+        celery_jobs._running_local_jobs.clear()
 
     def test_execution_mode_defaults_to_redis(self, api_client, monkeypatch):
         """Execution mode should default to 'redis' when not specified."""
@@ -288,6 +338,8 @@ class TestLocalJobsEndpoint:
             "apps.api.routers.celery_jobs._detect_running_episode_processes",
             lambda: [],
         )
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
 
         resp = api_client.get("/celery_jobs/local")
         assert resp.status_code == 200
@@ -299,11 +351,12 @@ class TestLocalJobsEndpoint:
         """GET /celery_jobs/local returns running jobs."""
         mock_jobs = [
             {
-                "job_id": "local-abc123",
+                "job_id": "orphan-12345",
                 "ep_id": "test-s01e01",
                 "operation": "detect_track",
                 "pid": 12345,
                 "state": "running",
+                "source": "detected",
             }
         ]
 
@@ -326,8 +379,8 @@ class TestLocalJobsEndpoint:
     def test_list_local_jobs_filter_by_ep_id(self, api_client, monkeypatch):
         """GET /celery_jobs/local?ep_id=X filters by episode."""
         mock_jobs = [
-            {"job_id": "local-1", "ep_id": "show-s01e01", "operation": "detect_track", "state": "running"},
-            {"job_id": "local-2", "ep_id": "show-s01e02", "operation": "detect_track", "state": "running"},
+            {"job_id": "orphan-1", "ep_id": "show-s01e01", "operation": "detect_track", "state": "running", "source": "detected"},
+            {"job_id": "orphan-2", "ep_id": "show-s01e02", "operation": "detect_track", "state": "running", "source": "detected"},
         ]
 
         monkeypatch.setattr(
@@ -344,11 +397,11 @@ class TestLocalJobsEndpoint:
         assert data["jobs"][0]["ep_id"] == "show-s01e01"
 
 
-class TestProfileAndSafetyInLocalMode:
-    """Tests that performance profiles and safety are honored in local mode."""
+class TestLocalModeThermalSafety:
+    """Tests that local mode enforces thermal safety limits."""
 
-    def test_local_mode_respects_cpu_threads(self, api_client, monkeypatch):
-        """Local mode should respect cpu_threads setting."""
+    def test_local_mode_caps_cpu_threads_at_2(self, api_client, monkeypatch):
+        """Local mode should hard-cap CPU threads at 2 regardless of profile."""
         captured_env: dict = {}
         mock_process = MockProcess(returncode=0, stdout="Success\n")
 
@@ -358,26 +411,26 @@ class TestProfileAndSafetyInLocalMode:
 
         monkeypatch.setattr("subprocess.Popen", fake_popen)
         monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
-        # Clear any existing registered jobs
         from apps.api.routers import celery_jobs
         celery_jobs._running_local_jobs.clear()
 
+        # Request 8 threads - should be capped at 2
         payload = {
             "ep_id": "demo-s01e01",
             "stride": 6,
             "device": "cpu",
-            "cpu_threads": 2,
+            "cpu_threads": 8,  # Request more threads
             "execution_mode": "local",
         }
 
         resp = api_client.post("/celery_jobs/detect_track", json=payload)
         assert resp.status_code == 200
 
-        # Verify CPU thread limits were set in environment
+        # Verify CPU thread limits were capped at 2 (local mode hard cap)
         assert captured_env.get("SCREENALYTICS_MAX_CPU_THREADS") == "2"
         assert captured_env.get("OMP_NUM_THREADS") == "2"
+        assert captured_env.get("MKL_NUM_THREADS") == "2"
 
-        # Cleanup
         celery_jobs._running_local_jobs.clear()
 
     def test_local_mode_uses_process_group(self, api_client, monkeypatch):
@@ -391,7 +444,6 @@ class TestProfileAndSafetyInLocalMode:
 
         monkeypatch.setattr("subprocess.Popen", fake_popen)
         monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
-        # Clear any existing registered jobs
         from apps.api.routers import celery_jobs
         celery_jobs._running_local_jobs.clear()
 
@@ -408,7 +460,6 @@ class TestProfileAndSafetyInLocalMode:
         # Verify process group is used (for killing child processes on cancel)
         assert captured_kwargs.get("start_new_session") is True
 
-        # Cleanup
         celery_jobs._running_local_jobs.clear()
 
 
@@ -427,19 +478,12 @@ class TestLocalModeAlreadyRunning:
 
         # Register a fake running job
         from apps.api.routers import celery_jobs
-        celery_jobs._running_local_jobs["demo-s01e01:detect_track"] = {
-            "job_id": "local-existing",
+        celery_jobs._running_local_jobs.clear()
+        celery_jobs._running_local_jobs["demo-s01e01::detect_track"] = {
             "ep_id": "demo-s01e01",
             "operation": "detect_track",
             "pid": 99999,
-            "state": "running",
         }
-
-        # Mock psutil to say process is still running
-        monkeypatch.setattr(
-            "apps.api.routers.celery_jobs._get_running_local_job",
-            lambda ep_id, op: celery_jobs._running_local_jobs.get(f"{ep_id}:{op}"),
-        )
 
         payload = {
             "ep_id": "demo-s01e01",
@@ -451,9 +495,74 @@ class TestLocalModeAlreadyRunning:
         resp = api_client.post("/celery_jobs/detect_track", json=payload)
         data = resp.json()
 
-        # Should indicate job is already running
-        assert data.get("state") == "already_running"
-        assert data.get("job_id") == "local-existing"
+        # Should indicate job is already running with error status
+        assert data.get("status") == "error"
+        assert "already running" in data.get("error", "").lower()
 
         # Cleanup
+        celery_jobs._running_local_jobs.clear()
+
+
+class TestLocalModeResponseStructure:
+    """Tests that verify the response structure for local mode."""
+
+    def test_local_mode_includes_device_and_profile(self, api_client, monkeypatch):
+        """Local mode response should include device and profile info."""
+        mock_process = MockProcess(returncode=0, stdout="Success\n")
+
+        def fake_popen(*args, **kwargs):
+            return mock_process
+
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
+
+        payload = {
+            "ep_id": "demo-s01e01",
+            "stride": 6,
+            "device": "coreml",
+            "execution_mode": "local",
+        }
+
+        resp = api_client.post("/celery_jobs/detect_track", json=payload)
+        data = resp.json()
+
+        assert data.get("status") == "completed"
+        assert data.get("device") == "coreml"
+        assert data.get("profile") is not None  # Should have resolved profile
+        assert data.get("cpu_threads") == 2  # Capped at 2 for local mode
+
+        celery_jobs._running_local_jobs.clear()
+
+    def test_local_mode_logs_contain_context(self, api_client, monkeypatch):
+        """Local mode logs should include execution context."""
+        mock_process = MockProcess(returncode=0, stdout="Processing...\nDone.\n")
+
+        def fake_popen(*args, **kwargs):
+            return mock_process
+
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: Path("/tmp"))
+        from apps.api.routers import celery_jobs
+        celery_jobs._running_local_jobs.clear()
+
+        payload = {
+            "ep_id": "demo-s01e01",
+            "stride": 6,
+            "device": "cpu",
+            "execution_mode": "local",
+        }
+
+        resp = api_client.post("/celery_jobs/detect_track", json=payload)
+        data = resp.json()
+
+        logs = data.get("logs", [])
+        assert len(logs) > 0
+
+        # Should have [LOCAL MODE] markers and context
+        log_text = "\n".join(logs)
+        assert "[LOCAL MODE]" in log_text
+        assert "CPU threads capped at 2" in log_text
+
         celery_jobs._running_local_jobs.clear()

@@ -92,8 +92,96 @@ RETINAFACE_NMS = 0.45
 
 RUN_MARKERS_SUBDIR = "runs"
 
+# Local mode instrumentation - enabled via env var for verbose phase-level logging
+LOCAL_MODE_INSTRUMENTATION = os.environ.get("LOCAL_MODE_INSTRUMENTATION", "").lower() in ("1", "true", "yes")
+
 _APPLE_SILICON = sys.platform == "darwin" and platform.machine().lower().startswith(("arm", "aarch64"))
 APPLE_SILICON_HOST = _APPLE_SILICON
+
+
+class PhaseTracker:
+    """Track timing and frame counts for each pipeline phase (for local mode diagnostics)."""
+
+    def __init__(self) -> None:
+        self._phases: Dict[str, Dict[str, Any]] = {}
+        self._current_phase: str | None = None
+        self._current_start: float | None = None
+
+    def start_phase(self, phase: str) -> None:
+        """Begin timing a new phase."""
+        self._current_phase = phase
+        self._current_start = time.time()
+        if phase not in self._phases:
+            self._phases[phase] = {
+                "frames_processed": 0,
+                "frames_scanned": 0,
+                "stride": 1,
+                "duration_seconds": 0.0,
+            }
+
+    def end_phase(
+        self,
+        phase: str | None = None,
+        *,
+        frames_processed: int = 0,
+        frames_scanned: int = 0,
+        stride: int = 1,
+    ) -> None:
+        """End timing for a phase and record stats."""
+        target_phase = phase or self._current_phase
+        if not target_phase or target_phase not in self._phases:
+            return
+        if self._current_start is not None:
+            elapsed = time.time() - self._current_start
+            self._phases[target_phase]["duration_seconds"] += elapsed
+        self._phases[target_phase]["frames_processed"] = frames_processed
+        self._phases[target_phase]["frames_scanned"] = frames_scanned
+        self._phases[target_phase]["stride"] = stride
+        self._current_phase = None
+        self._current_start = None
+
+    def add_phase_stats(
+        self,
+        phase: str,
+        *,
+        frames_processed: int,
+        frames_scanned: int,
+        stride: int,
+        duration_seconds: float,
+    ) -> None:
+        """Directly add stats for a phase (for phases timed externally)."""
+        self._phases[phase] = {
+            "frames_processed": frames_processed,
+            "frames_scanned": frames_scanned,
+            "stride": stride,
+            "duration_seconds": round(duration_seconds, 2),
+        }
+
+    def summary(self) -> Dict[str, Dict[str, Any]]:
+        """Return summary of all phases."""
+        return dict(self._phases)
+
+    def log_summary(self, ep_id: str) -> None:
+        """Log a formatted summary of all phases for local mode diagnostics."""
+        if not LOCAL_MODE_INSTRUMENTATION:
+            return
+        lines = [f"[LOCAL MODE] detect_track phase summary for {ep_id}:"]
+        total_duration = 0.0
+        for phase_name, stats in self._phases.items():
+            duration = stats.get("duration_seconds", 0.0)
+            total_duration += duration
+            frames_proc = stats.get("frames_processed", 0)
+            frames_scan = stats.get("frames_scanned", 0)
+            stride = stats.get("stride", 1)
+            lines.append(
+                f"  {phase_name}: frames_processed={frames_proc} frames_scanned={frames_scan} "
+                f"stride={stride} duration={duration:.1f}s"
+            )
+        lines.append(f"  TOTAL: {total_duration:.1f}s ({total_duration/60:.1f}m)")
+        for line in lines:
+            LOGGER.info(line)
+            # Also print to stdout for local mode visibility
+            print(line)
 
 
 def _coreml_provider_available() -> bool:
@@ -352,16 +440,25 @@ def _onnx_providers_for(
     except Exception:
         available = []
 
+    def _log_providers(selected: list[str], resolved_device: str) -> None:
+        """Log provider selection when local mode instrumentation is enabled."""
+        if LOCAL_MODE_INSTRUMENTATION:
+            msg = f"[LOCAL MODE] ONNX providers: {selected} (resolved_device={resolved_device}, available={available})"
+            LOGGER.info(msg)
+            print(msg)
+
     # Explicit CUDA request (NVIDIA GPUs)
     if normalized in {"cuda", "0", "gpu"}:
         requested = ["CUDAExecutionProvider"]
         providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
         if "CUDAExecutionProvider" in providers:
             resolved = "cuda"
+            _log_providers(providers, resolved)
             return providers, resolved
         LOGGER.warning(
             "CUDA requested for RetinaFace/ArcFace but CUDAExecutionProvider unavailable; falling back to CPU"
         )
+        _log_providers(providers, resolved)
         return providers, resolved
 
     # Explicit MPS/CoreML request (Apple Silicon)
@@ -375,6 +472,7 @@ def _onnx_providers_for(
                     "CoreML-only mode enabled: CPU fallback disabled to enforce <300%% CPU budget. "
                     "Inference will fail if CoreML unavailable."
                 )
+            _log_providers(providers, resolved)
             return providers, resolved
         if allow_cpu_fallback:
             LOGGER.warning(
@@ -385,6 +483,7 @@ def _onnx_providers_for(
                 "CoreML requested with no CPU fallback, but CoreMLExecutionProvider unavailable. "
                 "Install onnxruntime-coreml or set allow_cpu_fallback=True."
             )
+        _log_providers(providers, resolved)
         return providers, resolved
 
     # Auto-detect best available provider
@@ -393,6 +492,7 @@ def _onnx_providers_for(
         if "CUDAExecutionProvider" in available:
             providers = _filter_providers(["CUDAExecutionProvider"], available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "cuda"
+            _log_providers(providers, resolved)
             return providers, resolved
 
         # Prefer CoreML on macOS (Apple Silicon) when CUDA is unavailable
@@ -400,6 +500,7 @@ def _onnx_providers_for(
             # On macOS with Apple Silicon, prefer CoreML over CPU
             providers = _filter_providers(["CoreMLExecutionProvider"], available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "coreml"
+            _log_providers(providers, resolved)
             return providers, resolved
 
     if auto_requested and resolved == "cpu":
@@ -408,6 +509,7 @@ def _onnx_providers_for(
             available or ["CPUExecutionProvider"],
         )
     # Fallback to CPU for unknown device values or when no accelerators available
+    _log_providers(providers, resolved)
     return providers, resolved
 
 
@@ -1949,29 +2051,23 @@ class ProgressEmitter:
         run_id_short = self.run_id[:8] if self.run_id else "unknown"
 
         if vt is not None and vtotal is not None:
-            LOGGER.info(
-                "[job=%s run=%s phase=%s step=%s frames=%s/%s vt=%.1f/%.1f fps=%.2f]",
-                self.ep_id,
-                run_id_short,
-                phase,
-                step,
-                frames,
-                total,
-                vt,
-                vtotal,
-                fps or 0.0,
+            log_msg = (
+                f"[job={self.ep_id} run={run_id_short} phase={phase} step={step} "
+                f"frames={frames}/{total} vt={vt:.1f}/{vtotal:.1f} fps={fps or 0.0:.2f}]"
             )
+            LOGGER.info(log_msg)
+            # Print to stdout for local mode streaming
+            if LOCAL_MODE_INSTRUMENTATION:
+                print(log_msg, flush=True)
         else:
-            LOGGER.info(
-                "[job=%s run=%s phase=%s step=%s frames=%s/%s fps=%.2f]",
-                self.ep_id,
-                run_id_short,
-                phase,
-                step,
-                frames,
-                total,
-                fps or 0.0,
+            log_msg = (
+                f"[job={self.ep_id} run={run_id_short} phase={phase} step={step} "
+                f"frames={frames}/{total} fps={fps or 0.0:.2f}]"
             )
+            LOGGER.info(log_msg)
+            # Print to stdout for local mode streaming
+            if LOCAL_MODE_INSTRUMENTATION:
+                print(log_msg, flush=True)
 
         if self.path:
             tmp_path = self.path.with_suffix(".tmp")
@@ -3152,6 +3248,30 @@ def _run_full_pipeline(
     # --max-samples-per-track, --min-samples-per-track, --sample-every-n-frames
     frame_stride = _effective_stride(args.stride, target_fps or analyzed_fps, source_fps)
     ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
+
+    # Initialize phase tracker for local mode instrumentation
+    phase_tracker = PhaseTracker() if LOCAL_MODE_INSTRUMENTATION else None
+
+    # Log structured config for Local mode diagnostics
+    if LOCAL_MODE_INSTRUMENTATION:
+        cpu_threads = os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "auto")
+        save_crops = getattr(args, "save_crops", False)
+        save_frames = getattr(args, "save_frames", False)
+        detection_fps_limit = getattr(args, "fps", None)
+        min_face_size = getattr(args, "min_box_area", MIN_FACE_AREA)
+        config_lines = [
+            f"[LOCAL MODE] detect_track config:",
+            f"  device={args.device}, profile=balanced",
+            f"  frame_stride={frame_stride} (requested={args.stride})",
+            f"  detection_fps_limit={detection_fps_limit}",
+            f"  min_face_size={min_face_size}",
+            f"  cpu_threads={cpu_threads}",
+            f"  save_crops={save_crops}, save_frames={save_frames}",
+            f"  total_frames={total_frames or 'unknown'}",
+        ]
+        for line in config_lines:
+            LOGGER.info(line)
+            print(line)
     frames_goal = None
     if total_frames and total_frames > 0:
         frames_goal = int(total_frames)
@@ -3242,6 +3362,7 @@ def _run_full_pipeline(
     scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
     scene_warmup = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
     scene_cuts: list[int] = []
+    scene_detect_start = time.time()
     if scene_detector_choice != "off":
         scene_cuts = detect_scene_cuts(
             str(video_dest),
@@ -3250,6 +3371,24 @@ def _run_full_pipeline(
             min_len=scene_min_len,
             progress=progress,
         )
+    scene_detect_duration = time.time() - scene_detect_start
+
+    # Record scene detection phase stats for local mode instrumentation
+    if phase_tracker and scene_detector_choice != "off":
+        phase_tracker.add_phase_stats(
+            "scene_detect",
+            frames_processed=total_frames or frames_goal or 0,
+            frames_scanned=total_frames or frames_goal or 0,
+            stride=1,  # Scene detection always processes all frames
+            duration_seconds=scene_detect_duration,
+        )
+        scene_msg = (
+            f"[LOCAL MODE] Phase=scene_detect frames={total_frames or frames_goal or '?'} "
+            f"stride=1 duration={scene_detect_duration:.1f}s cuts={len(scene_cuts)}"
+        )
+        LOGGER.info(scene_msg)
+        print(scene_msg)
+
     scene_summary = {
         "count": len(scene_cuts),
         "indices": scene_cuts,
@@ -3316,6 +3455,9 @@ def _run_full_pipeline(
     cap = cv2.VideoCapture(str(video_dest))
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video {video_dest}")
+
+    # Start timing for detect/track phase
+    detect_track_start = time.time()
 
     try:
         with det_path.open("w", encoding="utf-8") as det_handle:
@@ -3908,6 +4050,25 @@ def _run_full_pipeline(
     finally:
         cap.release()
 
+    # Calculate detect/track phase duration
+    detect_track_duration = time.time() - detect_track_start
+
+    # Record detect/track phase stats for local mode instrumentation
+    if phase_tracker:
+        phase_tracker.add_phase_stats(
+            "detect",
+            frames_processed=frames_sampled,
+            frames_scanned=frame_idx,
+            stride=frame_stride,
+            duration_seconds=detect_track_duration,
+        )
+        detect_msg = (
+            f"[LOCAL MODE] Phase=detect frames_processed={frames_sampled} "
+            f"frames_scanned={frame_idx} stride={frame_stride} duration={detect_track_duration:.1f}s"
+        )
+        LOGGER.info(detect_msg)
+        print(detect_msg)
+
     # Guard: Ensure detect loop actually processed frames
     if frames_sampled == 0:
         error_msg = (
@@ -3997,6 +4158,11 @@ def _run_full_pipeline(
             force=True,
             extra=track_done_meta,
         )
+
+    # Log final phase summary for local mode instrumentation
+    if phase_tracker:
+        phase_tracker.log_summary(args.ep_id)
+
     return (
         det_count,
         len(track_rows),
@@ -4270,6 +4436,12 @@ def _run_faces_embed_stage(
     ep_ctx: EpisodeContext | None,
     s3_prefixes: Dict[str, str] | None,
 ) -> Dict[str, Any]:
+    # Log startup for local mode streaming
+    if LOCAL_MODE_INSTRUMENTATION:
+        device = args.device or "auto"
+        print(f"[LOCAL MODE] faces_embed starting for {args.ep_id}", flush=True)
+        print(f"  device={device}", flush=True)
+
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
@@ -4286,6 +4458,8 @@ def _run_faces_embed_stage(
         raise RuntimeError("No track samples available for faces embedding")
 
     faces_total = len(samples)
+    if LOCAL_MODE_INSTRUMENTATION:
+        print(f"  faces_total={faces_total}", flush=True)
     progress = ProgressEmitter(
         args.ep_id,
         args.progress_file,
@@ -4780,6 +4954,13 @@ def _run_faces_embed_stage(
                 "finished_at": finished_at,
             },
         )
+
+        # Log completion for local mode streaming
+        if LOCAL_MODE_INSTRUMENTATION:
+            runtime_sec = summary.get("runtime_sec", 0)
+            print(f"[LOCAL MODE] faces_embed completed for {args.ep_id}", flush=True)
+            print(f"  faces={len(rows)}, runtime={runtime_sec:.1f}s", flush=True)
+
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -4894,6 +5075,13 @@ def _run_cluster_stage(
     ep_ctx: EpisodeContext | None,
     s3_prefixes: Dict[str, str] | None,
 ) -> Dict[str, Any]:
+    # Log startup for local mode streaming
+    if LOCAL_MODE_INSTRUMENTATION:
+        device = args.device or "auto"
+        cluster_thresh = getattr(args, "cluster_thresh", 0.7)
+        print(f"[LOCAL MODE] cluster starting for {args.ep_id}", flush=True)
+        print(f"  device={device}, cluster_thresh={cluster_thresh}", flush=True)
+
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     if not faces_path.exists():
@@ -4902,6 +5090,8 @@ def _run_cluster_stage(
     if not faces_rows:
         raise RuntimeError("faces.jsonl is empty; cannot cluster")
     faces_total = len(faces_rows)
+    if LOCAL_MODE_INSTRUMENTATION:
+        print(f"  faces_total={faces_total}", flush=True)
     faces_per_track: Dict[int, int] = defaultdict(int)
     for face_row in faces_rows:
         track_id_val = face_row.get("track_id")
@@ -5323,6 +5513,14 @@ def _run_cluster_stage(
                 "finished_at": finished_at,
             },
         )
+
+        # Log completion for local mode streaming
+        if LOCAL_MODE_INSTRUMENTATION:
+            runtime_sec = summary.get("runtime_sec", 0)
+            identities = len(identity_payload)
+            print(f"[LOCAL MODE] cluster completed for {args.ep_id}", flush=True)
+            print(f"  identities={identities}, faces={faces_total}, runtime={runtime_sec:.1f}s", flush=True)
+
         return summary
     except Exception as exc:
         progress.fail(str(exc))

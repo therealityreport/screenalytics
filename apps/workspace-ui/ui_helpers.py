@@ -2368,6 +2368,107 @@ def cancel_running_job(job_id: str) -> tuple[bool, str]:
         return False, describe_error(f"Cancel job {job_id}", exc)
 
 
+def load_operation_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Load the most recent logs for an operation from the API.
+
+    This fetches persisted logs that were saved when a local mode job completed.
+    Used to display previous run logs on page load.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name (detect_track, faces_embed, cluster)
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if no logs exist
+    """
+    try:
+        resp = requests.get(
+            f"{_api_base()}/celery_jobs/logs/{ep_id}/{operation}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Return None if no logs exist
+        if data.get("status") == "none":
+            return None
+
+        return data
+
+    except requests.RequestException as exc:
+        logging.debug(f"Failed to load logs for {ep_id}/{operation}: {exc}")
+        return None
+
+
+def render_previous_logs(
+    ep_id: str,
+    operation: str,
+    *,
+    expanded: bool = False,
+    show_if_none: bool = False,
+) -> bool:
+    """Render the most recent logs for an operation in a Streamlit expander.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name (detect_track, faces_embed, cluster)
+        expanded: Whether to expand the log expander by default
+        show_if_none: Whether to show a placeholder when no logs exist
+
+    Returns:
+        True if logs were found and rendered, False otherwise
+    """
+    data = load_operation_logs(ep_id, operation)
+
+    if data is None:
+        if show_if_none:
+            with st.expander("Previous run logs", expanded=False):
+                st.caption("No previous logs available for this operation.")
+        return False
+
+    status = data.get("status", "unknown")
+    logs = data.get("logs", [])
+    elapsed_seconds = data.get("elapsed_seconds", 0)
+    updated_at = data.get("updated_at", "")
+
+    # Format elapsed time
+    if elapsed_seconds >= 60:
+        elapsed_min = int(elapsed_seconds // 60)
+        elapsed_sec = int(elapsed_seconds % 60)
+        elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+    else:
+        elapsed_str = f"{elapsed_seconds:.1f}s"
+
+    # Format status icon
+    status_icons = {
+        "completed": "✅",
+        "error": "❌",
+        "cancelled": "⚠️",
+        "timeout": "⏱️",
+    }
+    icon = status_icons.get(status, "ℹ️")
+
+    # Format timestamp for display
+    timestamp_str = ""
+    if updated_at:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            timestamp_str = dt.strftime(" (%Y-%m-%d %H:%M)")
+        except (ValueError, TypeError):
+            pass
+
+    expander_label = f"{icon} Previous {operation} run ({status}, {elapsed_str}){timestamp_str}"
+
+    with st.expander(expander_label, expanded=expanded):
+        if logs:
+            st.code("\n".join(logs), language="text")
+        else:
+            st.caption("No log lines recorded.")
+
+    return True
+
+
 # =============================================================================
 # Execution Mode Job Helpers
 # =============================================================================
@@ -2417,17 +2518,12 @@ def run_pipeline_job_with_mode(
         return None, f"Unknown operation: {operation}"
 
     if execution_mode == "local":
-        # Local mode with progress bar and polling - similar to Redis mode
-        progress_bar = st.progress(0.0)
+        # Local mode: streaming response with live log updates
+        # The backend streams log lines as newline-delimited JSON
         status_placeholder = st.empty()
         log_expander = st.expander("Detailed log", expanded=True)
         with log_expander:
             log_placeholder = st.empty()
-        log_lines: List[str] = []
-
-        def _append_log(entry: str) -> None:
-            log_lines.append(entry)
-            log_placeholder.code("\n".join(log_lines[-25:]), language="text")
 
         # Build context string for display
         context_parts = [f"device={requested_device}"]
@@ -2437,173 +2533,98 @@ def run_pipeline_job_with_mode(
             context_parts.append(f"tracker={requested_tracker}")
         context_str = ", ".join(context_parts)
 
-        _append_log(f"[LOCAL MODE] Starting {operation} ({context_str})...")
-        status_placeholder.info(f"⏳ [LOCAL MODE] Submitting {operation}...")
+        status_placeholder.info(f"⏳ [LOCAL MODE] Running {operation} ({context_str})...")
+        log_lines: List[str] = []
+        log_placeholder.code(
+            f"[LOCAL MODE] Starting {operation} ({context_str})...\n"
+            "Waiting for live logs...",
+            language="text",
+        )
 
         try:
-            # Submit job (should return immediately with job_id or start the job)
-            resp = requests.post(
+            # Streaming request - reads lines as they arrive
+            with requests.post(
                 f"{_api_base()}{endpoint}",
                 json=payload,
-                timeout=30,  # Quick timeout for initial check
-            )
+                stream=True,
+                timeout=None,  # No timeout - stream can run for hours
+            ) as resp:
+                resp.raise_for_status()
 
-            # Check if response is immediate (blocking mode) or async
-            try:
-                submit_result = resp.json()
-            except Exception:
-                _append_log("Error: Invalid response from server")
-                status_placeholder.error("❌ Invalid response from server")
-                return None, "Invalid response"
+                summary: Dict[str, Any] = {}
 
-            job_id = submit_result.get("job_id")
-            state = submit_result.get("state", submit_result.get("status", "unknown"))
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
 
-            # If it's an error, report immediately
-            if state == "error" or submit_result.get("status") == "error":
-                error_msg = submit_result.get("error", "Failed to start job")
-                _append_log(f"Error: {error_msg}")
-                progress_bar.progress(1.0)
-                status_placeholder.error(f"❌ {error_msg}")
-                return submit_result, error_msg
-
-            # If job completed immediately (old blocking mode), return result
-            if state in ("completed", "success"):
-                progress_bar.progress(1.0)
-                elapsed = submit_result.get("elapsed_seconds", 0)
-                elapsed_str = f" in {elapsed:.1f}s" if elapsed else ""
-                _append_log(f"Job completed{elapsed_str}")
-                status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed{elapsed_str}")
-                return submit_result, None
-
-            # Job is starting/running - poll for progress
-            if job_id:
-                _append_log(f"Job started: {job_id}")
-            else:
-                _append_log(f"Job started (state={state})")
-
-            status_placeholder.info(f"⏳ [LOCAL MODE] Running {operation}...")
-            _append_log("Polling for progress...")
-
-            # Poll for progress using /episodes/{ep_id}/progress
-            poll_interval = 2.0
-            start_time = time.time()
-            last_phase = ""
-            last_frames = 0
-
-            while True:
-                elapsed = time.time() - start_time
-                if elapsed > timeout:
-                    error_msg = f"Job timed out after {int(elapsed)}s"
-                    _append_log(f"TIMEOUT: {error_msg}")
-                    progress_bar.progress(1.0)
-                    status_placeholder.error(f"❌ {error_msg}")
-                    return None, error_msg
-
-                # Check if job is still running
-                try:
-                    jobs_resp = requests.get(
-                        f"{_api_base()}/celery_jobs/local?ep_id={ep_id}",
-                        timeout=10,
-                    )
-                    jobs_data = jobs_resp.json() if jobs_resp.ok else {}
-                    running_jobs = jobs_data.get("jobs", [])
-
-                    # Filter for this operation
-                    job_running = any(
-                        j.get("operation") == operation or j.get("name", "").endswith(operation)
-                        for j in running_jobs
-                    )
-                except requests.RequestException:
-                    job_running = True  # Assume still running if we can't check
-
-                if not job_running:
-                    # Job completed
-                    progress_bar.progress(1.0)
-                    elapsed_min = int(elapsed // 60)
-                    elapsed_sec = int(elapsed % 60)
-                    _append_log(f"Job completed after {elapsed_min}m {elapsed_sec}s")
-
-                    # Try to read final progress data
                     try:
-                        progress_resp = requests.get(
-                            f"{_api_base()}/episodes/{ep_id}/progress",
-                            timeout=10,
-                        )
-                        if progress_resp.ok:
-                            progress_data = progress_resp.json().get("progress", {})
-                            final_phase = progress_data.get("phase", "done")
-                            _append_log(f"Final phase: {final_phase}")
+                        msg = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        # Treat non-JSON lines as plain log lines
+                        log_lines.append(raw_line)
+                        log_placeholder.code("\n".join(log_lines), language="text")
+                        continue
 
-                            if "error" in str(final_phase).lower():
-                                status_placeholder.error(f"❌ {operation} failed")
-                                return progress_data, "Job failed"
+                    msg_type = msg.get("type", "")
 
-                            status_placeholder.success(
-                                f"✅ [LOCAL MODE] {operation} completed in {elapsed_min}m {elapsed_sec}s"
-                            )
-                            return progress_data, None
-                    except Exception:
-                        pass
+                    if msg_type == "log":
+                        line = msg.get("line", "")
+                        log_lines.append(line)
+                        log_placeholder.code("\n".join(log_lines), language="text")
 
-                    status_placeholder.success(
-                        f"✅ [LOCAL MODE] {operation} completed in {elapsed_min}m {elapsed_sec}s"
-                    )
-                    return submit_result, None
+                    elif msg_type == "error":
+                        # Initial error (e.g., job already running)
+                        error_msg = msg.get("message", "Unknown error")
+                        log_lines.append(f"ERROR: {error_msg}")
+                        log_placeholder.code("\n".join(log_lines), language="text")
+                        status_placeholder.error(f"❌ [LOCAL MODE] {operation} failed: {error_msg}")
+                        return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
 
-                # Poll progress.json for updates
-                try:
-                    progress_resp = requests.get(
-                        f"{_api_base()}/episodes/{ep_id}/progress",
-                        timeout=10,
-                    )
-                    if progress_resp.ok:
-                        progress_data = progress_resp.json().get("progress", {})
-                        frames_done = progress_data.get("frames_done", 0)
-                        frames_total = progress_data.get("frames_total", 1)
-                        phase = progress_data.get("phase", "")
+                    elif msg_type == "summary":
+                        summary = msg
+                        break
 
-                        # Update progress bar
-                        if frames_total > 0:
-                            pct = min(frames_done / frames_total, 0.99)
-                            progress_bar.progress(pct)
+                # Process summary
+                status = summary.get("status", "unknown")
+                elapsed_seconds = summary.get("elapsed_seconds", 0)
+                error_msg = summary.get("error")
 
-                        # Log phase changes
-                        if phase and phase != last_phase:
-                            _append_log(f"Phase: {phase}")
-                            last_phase = phase
+                # Format elapsed time
+                if elapsed_seconds >= 60:
+                    elapsed_min = int(elapsed_seconds // 60)
+                    elapsed_sec = int(elapsed_seconds % 60)
+                    elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+                else:
+                    elapsed_str = f"{elapsed_seconds:.1f}s"
 
-                        # Log frame progress periodically
-                        if frames_done - last_frames >= 500:
-                            _append_log(
-                                f"Processed {frames_done}/{frames_total} frames "
-                                f"({100*frames_done/max(1,frames_total):.1f}%)"
-                            )
-                            last_frames = frames_done
+                result = {
+                    "status": status,
+                    "logs": log_lines,
+                    "elapsed_seconds": elapsed_seconds,
+                    **summary,
+                }
 
-                        # Update status with current progress
-                        elapsed_min = int(elapsed // 60)
-                        elapsed_sec = int(elapsed % 60)
-                        status_placeholder.info(
-                            f"⏳ [LOCAL MODE] {operation}: {phase or 'processing'} "
-                            f"({frames_done}/{frames_total} frames, {elapsed_min}m {elapsed_sec}s)"
-                        )
-                except requests.RequestException:
-                    pass  # Progress file might not exist yet
-
-                time.sleep(poll_interval)
+                if status == "completed":
+                    status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed in {elapsed_str}")
+                    return result, None
+                elif status == "error":
+                    status_placeholder.error(f"❌ [LOCAL MODE] {operation} failed: {error_msg}")
+                    return result, error_msg
+                elif status == "timeout":
+                    status_placeholder.error(f"❌ [LOCAL MODE] {operation} timed out after {elapsed_str}")
+                    return result, f"Timed out after {elapsed_str}"
+                else:
+                    # Unknown status
+                    status_placeholder.warning(f"⚠️ [LOCAL MODE] {operation} finished with status: {status}")
+                    return result, None
 
         except requests.exceptions.Timeout:
-            progress_bar.progress(1.0)
-            error_msg = "Request timed out during submission"
-            _append_log(f"TIMEOUT: {error_msg}")
+            error_msg = f"Request timed out after {timeout}s"
             status_placeholder.error(f"❌ {error_msg}")
             return None, error_msg
 
         except requests.RequestException as exc:
-            progress_bar.progress(1.0)
             error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
-            _append_log(f"ERROR: {error_msg}")
             status_placeholder.error(f"❌ {error_msg}")
             return None, error_msg
 

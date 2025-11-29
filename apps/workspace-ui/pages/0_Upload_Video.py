@@ -24,8 +24,5 @@ st.session_state.pop("_ep_id_query_origin", None)
 st.session_state.pop("upload_ep_params_cleaned", None)
 
 # Import the canonical upload page (top-level Upload_Video.py).
-# All Streamlit rendering happens inside that module.
+# All Streamlit rendering happens inside that module at import time.
 import Upload_Video  # noqa: F401  # type: ignore
-
-# Run the upload page.
-Upload_Video.main()

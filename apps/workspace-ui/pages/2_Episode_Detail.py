@@ -537,8 +537,9 @@ def _launch_detect_job(
         # Use execution mode from UI settings (respects local/redis toggle)
         execution_mode = helpers.get_execution_mode(ep_id)
         mode_desc = "local" if execution_mode == "local" else "Celery"
-        with st.spinner(f"Running detect/track via {mode_desc} ({mode_label} on {device_label})…"):
-            summary, error_message = helpers.run_pipeline_job_with_mode(
+        runner = helpers.run_pipeline_job_with_mode
+        if execution_mode == "local":
+            summary, error_message = runner(
                 ep_id,
                 "detect_track",
                 job_payload,
@@ -546,6 +547,16 @@ def _launch_detect_job(
                 requested_detector=detector_value,
                 requested_tracker=tracker_value,
             )
+        else:
+            with st.spinner(f"Running detect/track via {mode_desc} ({mode_label} on {device_label})…"):
+                summary, error_message = runner(
+                    ep_id,
+                    "detect_track",
+                    job_payload,
+                    requested_device=device_value,
+                    requested_detector=detector_value,
+                    requested_tracker=tracker_value,
+                )
     finally:
         if running_state_key:
             st.session_state[running_state_key] = False
@@ -1852,22 +1863,29 @@ with col_detect:
         st.warning(f"⚠️ A detect/track job is already running ({running_detect_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
 
     if st.button(run_label, use_container_width=True, disabled=detect_button_disabled):
-        local_video_exists, summary, error_message = _launch_detect_job(
-            local_video_exists,
-            ep_id,
-            details,
-            job_payload,
-            detect_device_value,
-            detect_detector_value,
-            detect_tracker_value,
-            mode_label,
-            detect_device_label,
-            running_state_key=running_job_key,
-            active_job_key=_job_activity_key(ep_id),
-            detect_flag_key=detect_running_key,
-        )
-        _process_detect_result(summary, error_message)
+        # Keep runtime logs anchored just below the button for local mode runs.
+        detect_log_container = st.container()
+        with detect_log_container:
+            local_video_exists, summary, error_message = _launch_detect_job(
+                local_video_exists,
+                ep_id,
+                details,
+                job_payload,
+                detect_device_value,
+                detect_detector_value,
+                detect_tracker_value,
+                mode_label,
+                detect_device_label,
+                running_state_key=running_job_key,
+                active_job_key=_job_activity_key(ep_id),
+                detect_flag_key=detect_running_key,
+            )
+            _process_detect_result(summary, error_message)
     st.caption("Mirrors required video artifacts automatically before detect/track starts.")
+
+    # Show previous run logs (only in local mode, collapsed by default)
+    if helpers.get_execution_mode(ep_id) == "local":
+        helpers.render_previous_logs(ep_id, "detect_track", expanded=False)
 
 with col_faces:
     st.markdown("### Faces Harvest")
@@ -2078,7 +2096,8 @@ with col_faces:
                 # Use execution mode from UI settings (respects local/redis toggle)
                 execution_mode = helpers.get_execution_mode(ep_id)
                 mode_desc = "local" if execution_mode == "local" else "Celery"
-                with st.spinner(f"Running faces harvest via {mode_desc}…"):
+                if execution_mode == "local":
+                    # Local mode handles its own UI - no spinner needed
                     summary, error_message = helpers.run_pipeline_job_with_mode(
                         ep_id,
                         "faces_embed",
@@ -2087,6 +2106,16 @@ with col_faces:
                         requested_detector=helpers.tracks_detector_value(ep_id),
                         requested_tracker=helpers.tracks_tracker_value(ep_id),
                     )
+                else:
+                    with st.spinner(f"Running faces harvest via {mode_desc}…"):
+                        summary, error_message = helpers.run_pipeline_job_with_mode(
+                            ep_id,
+                            "faces_embed",
+                            payload,
+                            requested_device=faces_device_value,
+                            requested_detector=helpers.tracks_detector_value(ep_id),
+                            requested_tracker=helpers.tracks_tracker_value(ep_id),
+                        )
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
@@ -2110,6 +2139,11 @@ with col_faces:
                 # Force status refresh after job completion to pick up new faces status
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
+
+    # Show previous run logs (only in local mode, collapsed by default)
+    if helpers.get_execution_mode(ep_id) == "local":
+        helpers.render_previous_logs(ep_id, "faces_embed", expanded=False)
+
 with col_cluster:
     st.markdown("### Cluster Identities")
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
@@ -2268,7 +2302,8 @@ with col_cluster:
                 # Use execution mode from UI settings (respects local/redis toggle)
                 execution_mode = helpers.get_execution_mode(ep_id)
                 mode_desc = "local" if execution_mode == "local" else "Celery"
-                with st.spinner(f"Clustering faces via {mode_desc}…"):
+                if execution_mode == "local":
+                    # Local mode handles its own UI - no spinner needed
                     summary, error_message = helpers.run_pipeline_job_with_mode(
                         ep_id,
                         "cluster",
@@ -2277,6 +2312,16 @@ with col_cluster:
                         requested_detector=helpers.tracks_detector_value(ep_id),
                         requested_tracker=helpers.tracks_tracker_value(ep_id),
                     )
+                else:
+                    with st.spinner(f"Clustering faces via {mode_desc}…"):
+                        summary, error_message = helpers.run_pipeline_job_with_mode(
+                            ep_id,
+                            "cluster",
+                            payload,
+                            requested_device=cluster_device_value,
+                            requested_detector=helpers.tracks_detector_value(ep_id),
+                            requested_tracker=helpers.tracks_tracker_value(ep_id),
+                        )
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
@@ -2301,6 +2346,10 @@ with col_cluster:
                 # Force status refresh after job completion to pick up new cluster status
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
+
+    # Show previous run logs (only in local mode, collapsed by default)
+    if helpers.get_execution_mode(ep_id) == "local":
+        helpers.render_previous_logs(ep_id, "cluster", expanded=False)
 
 st.subheader("Artifacts")
 
