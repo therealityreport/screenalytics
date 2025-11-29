@@ -1396,6 +1396,7 @@ col_detect, col_faces, col_cluster = st.columns(3)
 running_detect_job = helpers.get_running_job_for_episode(ep_id, "detect_track")
 running_faces_job = helpers.get_running_job_for_episode(ep_id, "faces_embed")
 running_cluster_job = helpers.get_running_job_for_episode(ep_id, "cluster")
+running_audio_job = helpers.get_running_job_for_episode(ep_id, "audio_pipeline")
 
 # Session state keys for cancel confirmation dialogs
 confirm_cancel_detect_key = f"{ep_id}::confirm_cancel_detect"
@@ -2454,6 +2455,175 @@ with col_cluster:
     if helpers.get_execution_mode(ep_id) == "local":
         helpers.render_previous_logs(ep_id, "cluster", expanded=False)
 
+# =============================================================================
+# Audio & Transcript Section
+# =============================================================================
+st.subheader("Audio & Transcript")
+
+# Define audio/transcript paths
+audio_dir = helpers.DATA_ROOT / "audio" / ep_id
+transcript_jsonl_path = manifests_dir / "episode_transcript.jsonl"
+transcript_vtt_path = manifests_dir / "episode_transcript.vtt"
+audio_qc_path = manifests_dir / "audio_qc.json"
+voice_clusters_path = manifests_dir / "audio_voice_clusters.json"
+voice_mapping_path = manifests_dir / "audio_voice_mapping.json"
+
+# Check what exists
+has_transcript_jsonl = transcript_jsonl_path.exists()
+has_transcript_vtt = transcript_vtt_path.exists()
+has_audio_qc = audio_qc_path.exists()
+has_voice_clusters = voice_clusters_path.exists()
+has_voice_mapping = voice_mapping_path.exists()
+
+# Determine audio pipeline status
+audio_status = "not_started"
+audio_qc_status = None
+voice_cluster_count = 0
+labeled_voices = 0
+unlabeled_voices = 0
+
+if has_audio_qc:
+    try:
+        audio_qc_data = json.loads(audio_qc_path.read_text(encoding="utf-8"))
+        audio_qc_status = audio_qc_data.get("status", "unknown")
+        voice_cluster_count = audio_qc_data.get("voice_cluster_count", 0)
+        labeled_voices = audio_qc_data.get("labeled_voices", 0)
+        unlabeled_voices = audio_qc_data.get("unlabeled_voices", 0)
+        audio_status = "complete"
+    except Exception:
+        audio_status = "error"
+elif has_voice_mapping:
+    # Fallback: read voice stats from voice_mapping.json if QC not available
+    try:
+        voice_mapping_data = json.loads(voice_mapping_path.read_text(encoding="utf-8"))
+        voice_cluster_count = len(voice_mapping_data)
+        labeled_voices = sum(1 for m in voice_mapping_data if m.get("similarity") is not None)
+        unlabeled_voices = voice_cluster_count - labeled_voices
+        audio_status = "in_progress"  # QC not complete yet
+    except Exception:
+        pass
+elif has_transcript_jsonl:
+    audio_status = "complete"  # Transcript exists but no QC
+elif running_audio_job:
+    audio_status = "running"
+
+# Status display
+audio_col1, audio_col2 = st.columns([3, 1])
+with audio_col1:
+    if audio_status == "complete":
+        qc_badge = "✅" if audio_qc_status == "ok" else ("⚠️" if audio_qc_status == "warn" else "🔴")
+        st.success(f"Audio pipeline complete {qc_badge} QC: {audio_qc_status or 'unknown'}")
+        if voice_cluster_count > 0:
+            st.caption(f"Voices: {voice_cluster_count} clusters ({labeled_voices} labeled, {unlabeled_voices} unlabeled)")
+        elif not has_voice_mapping:
+            st.caption("Voice mapping: Not generated yet")
+    elif audio_status == "in_progress":
+        st.warning("Audio pipeline in progress (QC not complete)")
+        if voice_cluster_count > 0:
+            st.caption(f"Voices: {voice_cluster_count} clusters ({labeled_voices} labeled, {unlabeled_voices} unlabeled)")
+    elif audio_status == "running":
+        job_id = running_audio_job.get("job_id", "unknown")
+        progress_pct = running_audio_job.get("progress_pct", 0)
+        state = running_audio_job.get("state", "running")
+        message = running_audio_job.get("message", "")
+        st.info(f"🔄 **Audio pipeline running** ({state})")
+        st.progress(min(progress_pct / 100, 1.0))
+        if message:
+            st.caption(f"Step: {message} ({progress_pct:.1f}%)")
+        else:
+            st.caption(f"Progress: {progress_pct:.1f}%")
+    elif audio_status == "error":
+        st.error("Audio pipeline encountered an error")
+    else:
+        st.info("Audio pipeline not yet run")
+
+with audio_col2:
+    if has_transcript_vtt:
+        try:
+            vtt_content = transcript_vtt_path.read_text(encoding="utf-8")
+            st.download_button(
+                "📥 VTT",
+                data=vtt_content,
+                file_name=f"{ep_id}_transcript.vtt",
+                mime="text/vtt",
+                key=f"download_vtt_{ep_id}",
+            )
+        except Exception:
+            pass
+    if has_transcript_jsonl:
+        try:
+            jsonl_content = transcript_jsonl_path.read_text(encoding="utf-8")
+            st.download_button(
+                "📥 JSONL",
+                data=jsonl_content,
+                file_name=f"{ep_id}_transcript.jsonl",
+                mime="application/jsonl",
+                key=f"download_jsonl_{ep_id}",
+            )
+        except Exception:
+            pass
+
+# Running job controls
+if running_audio_job:
+    job_id = running_audio_job.get("job_id", "unknown")
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("🔄 Refresh", key=f"refresh_audio_{job_id}", use_container_width=True):
+            st.rerun()
+    with btn_col2:
+        if st.button("❌ Cancel", key=f"cancel_audio_{job_id}", use_container_width=True):
+            success, msg = helpers.cancel_running_job(job_id)
+            if success:
+                st.success(msg)
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(msg)
+
+# Audio pipeline controls (when not running)
+audio_job_running = running_audio_job is not None
+with st.expander("Audio Pipeline Settings", expanded=not audio_status == "complete"):
+    audio_overwrite = st.checkbox(
+        "Overwrite existing audio artifacts",
+        value=False,
+        key=f"audio_overwrite_{ep_id}",
+        disabled=audio_job_running,
+    )
+    asr_provider = st.selectbox(
+        "ASR Provider",
+        options=["openai_whisper", "gemini"],
+        index=0,
+        key=f"audio_asr_provider_{ep_id}",
+        disabled=audio_job_running,
+    )
+
+    run_audio_disabled = audio_job_running
+    if st.button(
+        "🎙️ Generate Audio + Transcript",
+        key=f"run_audio_pipeline_{ep_id}",
+        disabled=run_audio_disabled,
+        use_container_width=True,
+    ):
+        try:
+            payload = {
+                "ep_id": ep_id,
+                "overwrite": audio_overwrite,
+                "asr_provider": asr_provider,
+            }
+            resp = helpers.api_post("/jobs/episode_audio_pipeline", json=payload)
+            job_id = resp.get("job_id")
+            if job_id:
+                helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
+                st.success(f"Audio pipeline started: {job_id}")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(f"Failed to start audio pipeline: {resp}")
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/episode_audio_pipeline", exc))
+
+st.divider()
+
 st.subheader("Artifacts")
 
 
@@ -2569,7 +2739,7 @@ for group, paths in artifact_groups.items():
 # to poll for updates. This MUST be at the end of the page so content
 # fully renders before the refresh.
 
-_any_job_running = running_detect_job or running_faces_job or running_cluster_job
+_any_job_running = running_detect_job or running_faces_job or running_cluster_job or running_audio_job
 if _any_job_running:
     import time as _time
     _running_ops = []
@@ -2579,6 +2749,8 @@ if _any_job_running:
         _running_ops.append("Faces Harvest")
     if running_cluster_job:
         _running_ops.append("Cluster")
+    if running_audio_job:
+        _running_ops.append("Audio Pipeline")
     st.caption(f"⏳ Auto-refreshing for running job(s): {', '.join(_running_ops)}...")
     _time.sleep(3)
     st.rerun()

@@ -19,3 +19,9 @@ S3_BUCKET = os.getenv("S3_BUCKET", os.getenv("BUCKET", ""))
 # API Configuration
 API_HOST = os.getenv("API_HOST", "localhost")
 API_PORT = int(os.getenv("API_PORT", "8000"))
+
+# Audio Pipeline API Keys
+RESEMBLE_API_KEY = os.getenv("RESEMBLE_API_KEY", "")
+PYANNOTE_AUTH_TOKEN = os.getenv("PYANNOTE_AUTH_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")

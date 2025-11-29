@@ -172,13 +172,26 @@ tracks.jsonl + speech_segments.jsonl
   - Updated `tracks.jsonl`, `faces.jsonl`, `identities.json`, `track_metrics.json`
 - **Docs:** [episode_cleanup.md](episode_cleanup.md)
 
-### 4.6 Audio Diarize (Optional, TBD)
-- **CLI:** `python tools/episode_run.py --ep-id <ep_id> --audio-diarize`
+### 4.6 Audio Pipeline (Implemented)
+- **API:** `POST /jobs/episode_audio_pipeline`
 - **Config:** `config/pipeline/audio.yaml`
-- **Models:** Pyannote speaker diarization, Faster-Whisper ASR
+- **Models:**
+  - MDX-Extra/Demucs for stem separation
+  - Resemble Enhance for audio denoising
+  - Pyannote 3.1 for speaker diarization
+  - OpenAI Whisper (primary) or Gemini (secondary) for ASR
 - **Artifacts:**
-  - `data/manifests/{ep_id}/speech_segments.jsonl`
-  - `data/manifests/{ep_id}/transcripts.jsonl`
+  - `data/audio/{ep_id}/episode_original.wav`
+  - `data/audio/{ep_id}/episode_vocals.wav`
+  - `data/audio/{ep_id}/episode_vocals_enhanced.wav`
+  - `data/manifests/{ep_id}/audio_diarization.jsonl`
+  - `data/manifests/{ep_id}/audio_asr_raw.jsonl`
+  - `data/manifests/{ep_id}/audio_voice_clusters.json`
+  - `data/manifests/{ep_id}/audio_voice_mapping.json`
+  - `data/manifests/{ep_id}/episode_transcript.jsonl`
+  - `data/manifests/{ep_id}/episode_transcript.vtt`
+  - `data/manifests/{ep_id}/audio_qc.json`
+- **Docs:** [audio_pipeline.md](audio_pipeline.md)
 
 ### 4.7 A/V Fusion (Optional, TBD)
 - **CLI:** `python tools/episode_run.py --ep-id <ep_id> --av-fusion`

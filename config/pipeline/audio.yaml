@@ -1,0 +1,90 @@
+# Audio pipeline configuration for SCREENALYTICS
+# Episode Audio + Transcript + Voice Identity pipeline
+#
+# Stack:
+# - MDX-Extra for stem separation (speech vs music/SFX)
+# - Resemble Enhance for denoise/enhance
+# - Pyannote for diarization
+# - OpenAI Whisper as primary ASR (API-based)
+# - Gemini 3 as optional second-pass (cleanup, enrichment, alt-ASR)
+
+audio_pipeline:
+  # Stem separation settings
+  separation:
+    provider: "mdx_extra"
+    model_name: "mdx_extra_q"        # tunable: mdx_extra_q (quality) or mdx_extra (fast)
+    chunk_seconds: 15
+    overlap_seconds: 2
+    device: "auto"                   # auto, cpu, cuda, mps
+
+  # Audio enhancement settings
+  enhance:
+    provider: "resemble"
+    mode: "studio"                   # "studio" | "broadcast"
+    batch_seconds: 20
+    max_retries: 3
+    retry_delay_seconds: 2
+
+  # Speaker diarization settings
+  diarization:
+    provider: "pyannote"
+    model_name: "pyannote/speaker-diarization-3.1"
+    min_speech: 0.2                  # Minimum speech duration (seconds)
+    max_overlap: 0.1                 # Maximum allowed overlap ratio
+    merge_gap_ms: 300                # Gap threshold for merging segments
+    min_speakers: 1
+    max_speakers: 10
+
+  # Automatic speech recognition settings
+  asr:
+    provider: "openai_whisper"       # "openai_whisper" | "gemini_3"
+    model: "whisper-1"               # OpenAI Whisper model
+    language: "en"
+    enable_word_timestamps: true
+    chunk_duration_seconds: 30       # Audio chunk size for API calls
+    temperature: 0.0                 # Lower = more deterministic
+    # Gemini settings (when provider=gemini_3)
+    gemini_model: "gemini-2.0-flash-exp"
+    gemini_use_for_cleanup: true     # Use Gemini to clean/repair Whisper transcripts
+
+  # Voice clustering and bank settings
+  voice_clustering:
+    similarity_threshold: 0.78       # Cosine similarity for matching to voice bank
+    min_segments_per_cluster: 2      # Minimum segments to form a cluster
+    embedding_model: "pyannote/embedding"
+    centroid_method: "mean"          # "mean" | "median"
+
+  # Voice bank configuration
+  voice_bank:
+    data_dir: "data/voice_bank"      # Directory for voice bank data
+    auto_create_unlabeled: true      # Create unlabeled entries for unknown voices
+    max_unlabeled_per_episode: 20    # Limit unlabeled voice entries
+
+  # Quality control thresholds
+  qc:
+    max_duration_drift_pct: 1.0      # Max % drift between original and final audio
+    min_snr_db: 14.0                 # Minimum signal-to-noise ratio (dB)
+    warn_snr_db: 12.0                # Warning threshold for SNR
+    min_diarization_conf: 0.65       # Minimum diarization confidence
+    max_der_sample_pct: 12.0         # Maximum diarization error rate sample %
+    min_asr_conf: 0.60               # Minimum ASR confidence threshold
+    min_cluster_duration_s: 2.0      # Minimum duration per voice cluster
+    require_all_speaker_fields: true # Require all speaker fields in transcript
+
+  # Export settings
+  export:
+    sample_rate: 48000               # Output sample rate (Hz)
+    bit_depth: 24                    # Output bit depth
+    peak_dbfs: -1.0                  # Target peak level (dBFS)
+    audio_format: "wav"              # Output format
+    vtt_include_speaker_notes: true  # Include speaker notes in VTT
+
+# S3 layout for audio artifacts
+# Base prefix: artifacts/audio/{show_slug}/s{ss}/e{ee}/
+s3_layout:
+  audio_subdir: "audio"
+  transcripts_subdir: "transcripts"
+  qc_subdir: "qc"
+
+# Description
+description: "Audio pipeline: MDX-Extra + Resemble + Pyannote + OpenAI Whisper for episode transcription"

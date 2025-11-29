@@ -125,7 +125,52 @@ A module is considered **Accepted** only when all associated checkpoints below a
 
 ---
 
-### 3.5 Facebank Management (`facebank`)
+### 3.5 Audio + Voice Identity (`audio_pipeline`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **duration_drift_pct** | < 1.0% | > 2.0% | Integration test |
+| **snr_db** | ≥ 18 dB | < 14 dB | Integration test |
+| **mean_diarization_conf** | ≥ 0.75 | < 0.65 | Integration test |
+| **mean_asr_conf** | ≥ 0.80 | < 0.70 | Integration test |
+| **voice_cluster_count** | 3–15 (typical TV episode) | > 20 | Integration test |
+| **transcript_speaker_fields** | 100% rows have all fields | < 95% | Unit test |
+| **voice_cluster_consistency** | All transcript IDs in clusters.json | Missing IDs | Unit test |
+| **voice_mapping_consistency** | All clusters mapped | Missing mappings | Unit test |
+| **Runtime (1hr episode)** | ≤ 15 min | > 30 min | Benchmark |
+
+**Required Transcript Fields (per row):**
+- `speaker_id` (e.g., `SPK_LISA_BARLOW`)
+- `speaker_display_name` (e.g., `"Lisa Barlow"`)
+- `voice_cluster_id` (e.g., `VC_01`)
+- `voice_bank_id` (e.g., `voice_lisa_barlow`)
+
+**Artifacts Validated:**
+- `audio_voice_clusters.json` - Cluster IDs and segments
+- `audio_voice_mapping.json` - Cluster-to-speaker mapping
+- `episode_transcript.jsonl` - Speaker-labeled transcript
+- `episode_transcript.vtt` - WebVTT with speaker metadata
+- `audio_qc.json` - QC report with voice stats
+
+**Tests:**
+- `tests/audio/test_audio_models.py`
+- `tests/audio/test_audio_qc.py`
+- `tests/audio/test_voice_clusters.py`
+- `tests/audio/test_voice_bank.py`
+- `tests/audio/test_fuse_diarization_asr.py`
+- `tests/audio/test_episode_audio_pipeline_e2e.py`
+
+**Config Dependencies:**
+- `config/pipeline/audio.yaml`
+
+**Docs:**
+- [docs/pipeline/audio_pipeline.md](docs/pipeline/audio_pipeline.md)
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.6 Facebank Management (`facebank`)
 
 | Metric | Target | Warning Threshold | Verification |
 |--------|--------|-------------------|--------------|
@@ -207,6 +252,7 @@ A module is considered **Accepted** only when all associated checkpoints below a
 | **faces_embed** | ⚠ Pending | Tests not implemented | Write integration tests |
 | **cluster** | ⚠ Pending | Tests not implemented | Write integration tests |
 | **episode_cleanup** | ⚠ Pending | Tests not implemented | Write integration tests |
+| **audio_pipeline** | ⚠ Pending | E2E tests incomplete | Add voice clustering + bank tests |
 | **facebank** | ⚠ Pending | Cross-episode matching not validated | Manual QA on validation episodes |
 | **jobs_api** | ⚠ Pending | Integration tests incomplete | Extend API test coverage |
 | **facebank_ui** | ⚠ Pending | UI smoke tests not automated | Add Playwright/Cypress tests |
