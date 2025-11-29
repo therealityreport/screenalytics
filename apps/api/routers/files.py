@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from mimetypes import guess_type
 
 from apps.api.services.storage import StorageService
@@ -13,6 +14,33 @@ from apps.api.services.storage import StorageService
 LOGGER = logging.getLogger(__name__)
 router = APIRouter()
 storage_service = StorageService()
+
+# Allowed roots for file access - prevents arbitrary file disclosure
+DATA_ROOT_ENV = "SCREENALYTICS_DATA_ROOT"
+
+
+def _get_allowed_roots() -> list[Path]:
+    """Return list of allowed root directories for file access."""
+    data_root = Path(os.environ.get(DATA_ROOT_ENV, "data")).resolve()
+    return [data_root]
+
+
+def _is_safe_path(path_str: str) -> bool:
+    """Check if a path is within allowed directories (prevents path traversal)."""
+    try:
+        # Resolve to absolute path
+        resolved = Path(path_str).resolve()
+        allowed_roots = _get_allowed_roots()
+        # Check if path is under any allowed root
+        for root in allowed_roots:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+    except Exception:
+        return False
 
 
 def _infer_mime_for_key(key: str) -> str:
@@ -51,6 +79,12 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
 
     # Check if it's a local path
     if path_or_key.startswith("/") or path_or_key.startswith("data/"):
+        # Security: reject paths outside allowed directories
+        if not _is_safe_path(path_or_key):
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: path is outside allowed directories",
+            )
         try:
             p = Path(path_or_key)
             if p.exists() and p.is_file():
@@ -121,9 +155,6 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
 @router.get("/health/detector")
 def check_detector_health() -> dict:
     """Check RetinaFace detector availability and status."""
-    import os
-    from pathlib import Path
-
     result = {
         "retinaface_ready": False,
         "resolved_provider": None,
@@ -142,7 +173,7 @@ def check_detector_health() -> dict:
 
         detector = RetinaFaceDetectorBackend(device="auto")
         # Try to load model to verify it's available
-        detector._get_or_create_model()
+        detector.ensure_ready()
 
         result["retinaface_ready"] = True
 
