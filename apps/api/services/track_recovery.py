@@ -21,10 +21,14 @@ from apps.api.services.identities import (
     write_faces,
     load_tracks,
     write_tracks,
+    load_identities,
+    write_identities,
+    update_identity_stats,
     sync_manifests,
     _episode_lock,
     _faces_path,
     _tracks_path,
+    _identities_path,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -151,6 +155,11 @@ def recover_single_frame_tracks(
                     if candidate_track_id == track_id:
                         continue
 
+                    # Skip faces from OTHER single-frame tracks - don't steal from them
+                    # Only merge faces that have no track or are unassigned
+                    if candidate_track_id in single_frame_tracks:
+                        continue
+
                     candidate_embedding = candidate.get("embedding")
                     if candidate_embedding is None:
                         continue
@@ -186,8 +195,11 @@ def recover_single_frame_tracks(
             # Update tracks.jsonl statistics
             _update_tracks_statistics(ep_id, faces)
 
-            # Sync manifests to S3
-            sync_manifests(ep_id, _faces_path(ep_id), _tracks_path(ep_id))
+            # Update identities.json stats (face counts per cluster)
+            _update_identities_statistics(ep_id, faces)
+
+            # Sync manifests to S3 (include identities.json)
+            sync_manifests(ep_id, _faces_path(ep_id), _tracks_path(ep_id), _identities_path(ep_id))
 
             LOGGER.info(f"[{ep_id}] Track recovery complete: expanded {tracks_expanded} tracks with {faces_merged} faces")
         else:
@@ -222,3 +234,25 @@ def _update_tracks_statistics(ep_id: str, faces: List[Dict[str, Any]]) -> None:
             track["faces_count"] = faces_by_track[track_id]
 
     write_tracks(ep_id, tracks)
+
+
+def _update_identities_statistics(ep_id: str, faces: List[Dict[str, Any]]) -> None:
+    """Update identities.json with corrected face counts after recovery.
+
+    This updates the overall stats in identities.json to reflect
+    the new face counts after tracks have been expanded.
+    """
+    try:
+        identities_payload = load_identities(ep_id)
+        if not identities_payload:
+            return
+
+        # Update the stats with current face count
+        update_identity_stats(ep_id, identities_payload)
+
+        # Write back
+        write_identities(ep_id, identities_payload)
+
+        LOGGER.info(f"[{ep_id}] Updated identities.json stats after recovery")
+    except Exception as e:
+        LOGGER.warning(f"[{ep_id}] Failed to update identities.json: {e}")

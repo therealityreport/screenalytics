@@ -338,7 +338,10 @@ def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int |
 cfg = helpers.init_page("Episode Detail")
 st.title("Episode Detail")
 helpers.inject_log_container_css()  # Limit log container height with scrolling
+flash_error = st.session_state.pop("episode_detail_flash_error", None)
 flash_message = st.session_state.pop("episode_detail_flash", None)
+if flash_error:
+    st.error(flash_error)
 if flash_message:
     st.success(flash_message)
 
@@ -2305,6 +2308,55 @@ with col_cluster:
     if running_cluster_job:
         st.warning(f"⚠️ A cluster job is already running ({running_cluster_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
 
+    def _auto_group_clusters(ep_id: str) -> Tuple[Dict[str, Any] | None, str | None]:
+        payload = {
+            "strategy": "auto",
+            "protect_manual": True,
+            "facebank_first": True,
+        }
+        try:
+            resp = helpers.api_post(f"/episodes/{ep_id}/clusters/group", json=payload, timeout=300)
+        except requests.RequestException as exc:
+            return None, helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/clusters/group", exc)
+        if not resp:
+            return None, "Grouping API returned no response"
+        if isinstance(resp, dict):
+            err_msg = resp.get("error") or resp.get("detail")
+            status_value = str(resp.get("status") or "").lower()
+            if status_value and status_value not in {"success", "ok"} and not err_msg:
+                err_msg = f"Unexpected status: {status_value}"
+            if err_msg:
+                return None, str(err_msg)
+        return resp, None
+
+    def _group_flash_text(group_response: Dict[str, Any]) -> str | None:
+        group_result = group_response.get("result") if isinstance(group_response, dict) else None
+        if not isinstance(group_result, dict):
+            return "Auto-group complete"
+        within = group_result.get("within_episode") or {}
+        across = group_result.get("across_episodes") or {}
+        merged_groups = helpers.coerce_int(within.get("merged_count"))
+        assignments = group_result.get("assignments")
+        if isinstance(assignments, dict):
+            assignments = assignments.get("assigned") or assignments.get("assignments")
+        if assignments is None:
+            assignments = across.get("assigned")
+        assigned_count = len(assignments or []) if isinstance(assignments, list) else 0
+        new_people = helpers.coerce_int(across.get("new_people_count"))
+        facebank_assigned = helpers.coerce_int(group_result.get("facebank_assigned"))
+        parts = []
+        if merged_groups:
+            parts.append(f"merged {merged_groups} group(s)")
+        if assigned_count:
+            parts.append(f"assigned {assigned_count} cluster(s)")
+        if new_people:
+            parts.append(f"{new_people} new people")
+        if facebank_assigned:
+            parts.append(f"{facebank_assigned} facebank matches")
+        if not parts:
+            return "Auto-group complete"
+        return "Auto-grouped " + ", ".join(parts)
+
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True
         if not local_video_exists:
@@ -2383,6 +2435,16 @@ with col_cluster:
                 flash_msg = f"Clustered (thresh {cluster_thresh_value:.2f}, min {int(min_cluster_size_value)})" + (
                     " · " + ", ".join(cluster_flash_parts) if cluster_flash_parts else ""
                 )
+                group_flash = None
+                group_error = None
+                with st.spinner("Auto-grouping clusters…"):
+                    group_response, group_error = _auto_group_clusters(ep_id)
+                if group_response:
+                    group_flash = _group_flash_text(group_response)
+                elif group_error:
+                    st.session_state["episode_detail_flash_error"] = f"Auto-group failed: {group_error}"
+                if group_flash:
+                    flash_msg = flash_msg + " · " + group_flash
                 st.session_state["episode_detail_flash"] = flash_msg
                 # Force status refresh after job completion to pick up new cluster status
                 st.session_state[_status_force_refresh_key(ep_id)] = True

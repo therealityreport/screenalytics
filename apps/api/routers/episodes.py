@@ -1320,6 +1320,10 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     for entry in page_entries:
         frame_idx = entry["frame_idx"]
         meta = face_rows.get(frame_idx, {})
+        # Skip frames that don't have a corresponding entry in faces.json
+        # Without this, the UI would show frames that can't be moved/deleted
+        if not meta:
+            continue
         local_path = entry.get("abs_path")
         local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
         rel_path = entry.get("rel_path")
@@ -2547,10 +2551,19 @@ def recover_noise_tracks(ep_id: str) -> dict:
     try:
         result = recover_single_frame_tracks(ep_id)
 
-        # After recovery, refresh similarity indexes for affected tracks
+        # After recovery, refresh similarity indexes and recompute centroids for affected clusters
         if result.get("tracks_expanded", 0) > 0:
             affected_track_ids = [d["track_id"] for d in result.get("details", [])]
             _refresh_similarity_indexes(ep_id, track_ids=affected_track_ids)
+
+            # Recompute cluster centroids since track assignments have changed
+            try:
+                from apps.api.services.grouping import GroupingService
+                grouping_service = GroupingService()
+                grouping_service.compute_cluster_centroids(ep_id)
+                LOGGER.info(f"[{ep_id}] Recomputed cluster centroids after recovery")
+            except Exception as centroid_err:
+                LOGGER.warning(f"[{ep_id}] Failed to recompute centroids after recovery: {centroid_err}")
 
         return result
     except Exception as e:

@@ -2540,4 +2540,126 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
     return response
 
 
+# =============================================================================
+# Enhancement #1: Parallel Job Execution Endpoints
+# =============================================================================
+
+
+class ParallelJobRequest(BaseModel):
+    """Request model for running parallel jobs across multiple episodes."""
+    episode_ids: List[str] = Field(..., description="List of episode IDs to process")
+    operation: str = Field(..., description="Operation to run: auto_group, refresh_similarity, manual_assign")
+    options: Optional[Dict[str, Any]] = Field(None, description="Options to pass to each task")
+
+
+@router.post("/parallel")
+async def start_parallel_jobs(req: ParallelJobRequest):
+    """Start the same operation on multiple episodes in parallel.
+
+    Uses Celery group to execute jobs concurrently across episodes.
+    Returns a group_id that can be used to track overall progress.
+
+    Args:
+        episode_ids: List of episode IDs to process
+        operation: Operation to run (auto_group, refresh_similarity, manual_assign)
+        options: Options to pass to each task
+
+    Returns:
+        - group_id: ID to track the parallel job group
+        - job_ids: Map of episode_id to individual job_id
+        - status: "queued" or "error"
+    """
+    from apps.api.tasks import run_parallel_jobs
+
+    result = run_parallel_jobs(
+        episode_ids=req.episode_ids,
+        operation=req.operation,
+        options=req.options,
+    )
+
+    if result.get("status") == "error":
+        return JSONResponse(
+            status_code=400,
+            content=result,
+        )
+
+    return result
+
+
+@router.get("/parallel/{group_id}")
+async def get_parallel_job_status(group_id: str):
+    """Get status of a parallel job group.
+
+    Returns overall progress and per-episode results.
+
+    Args:
+        group_id: The group ID returned from /parallel endpoint
+
+    Returns:
+        - status: overall status (in_progress, success, partial_success, failed)
+        - progress: fraction complete (0.0 to 1.0)
+        - completed: number of completed jobs
+        - failed: number of failed jobs
+        - results: per-episode job status
+    """
+    from apps.api.tasks import get_parallel_job_status as get_status
+
+    return get_status(group_id)
+
+
+# =============================================================================
+# Enhancement #9: Job History Persistence Endpoints
+# =============================================================================
+
+
+@router.get("/history")
+async def get_job_history_endpoint(
+    user_id: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """Get job history for a user.
+
+    Returns list of recent jobs with status and timing information.
+
+    Args:
+        user_id: User identifier (defaults to "anonymous")
+        limit: Maximum number of records (default 20)
+        offset: Number of records to skip (for pagination)
+
+    Returns:
+        List of job records, newest first
+    """
+    from apps.api.tasks import get_job_history
+
+    records = get_job_history(user_id, limit, offset)
+    return {
+        "jobs": records,
+        "count": len(records),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/active")
+async def get_active_jobs_endpoint(user_id: Optional[str] = None):
+    """Get all active (queued/in_progress) jobs for a user.
+
+    This is useful for the "My Jobs" panel to show what's currently running.
+
+    Args:
+        user_id: User identifier (defaults to "anonymous")
+
+    Returns:
+        List of active job records with current status
+    """
+    from apps.api.tasks import get_active_jobs_for_user
+
+    jobs = get_active_jobs_for_user(user_id)
+    return {
+        "jobs": jobs,
+        "count": len(jobs),
+    }
+
+
 __all__ = ["router"]

@@ -614,6 +614,8 @@ async def upload_seeds(
             display_s3_key = None
             embed_s3_key = None
             orig_s3_key = None
+            s3_upload_failed = False
+            s3_upload_error = None
             try:
                 display_s3_key = storage_service.upload_facebank_seed(
                     show_id,
@@ -641,6 +643,8 @@ async def upload_seeds(
                         content_type_hint="image/png",
                     )
             except Exception as exc:  # pragma: no cover - best effort mirror
+                s3_upload_failed = True
+                s3_upload_error = str(exc)
                 LOGGER.error(
                     "Failed to upload facebank derivatives %s/%s/%s: %s",
                     show_id,
@@ -648,6 +652,12 @@ async def upload_seeds(
                     seed_id,
                     exc,
                 )
+                # If S3 is enabled and required, fail the upload
+                if storage_service.s3_enabled():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to upload seed to cloud storage: {exc}. Seed not saved."
+                    )
 
             _diag(
                 "SEED_S3",

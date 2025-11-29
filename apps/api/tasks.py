@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import redis
-from celery import Task, states
-from celery.result import AsyncResult
+from celery import Task, states, group, chord
+from celery.result import AsyncResult, GroupResult
 
 from apps.api.celery_app import celery_app
 from apps.api.config import REDIS_URL
@@ -1272,6 +1272,295 @@ def run_cluster_task(
         _release_lock(episode_id, "cluster", job_id)
 
 
+# =============================================================================
+# Enhancement #1: Parallel Job Execution
+# =============================================================================
+
+
+def run_parallel_jobs(
+    episode_ids: List[str],
+    operation: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run the same operation on multiple episodes in parallel.
+
+    Uses Celery group to execute jobs concurrently across episodes.
+
+    Args:
+        episode_ids: List of episode IDs to process
+        operation: Operation to run (auto_group, refresh_similarity, manual_assign)
+        options: Options to pass to each task
+
+    Returns:
+        Dict with group_id and individual job_ids for tracking
+    """
+    options = options or {}
+
+    # Map operation to task function
+    task_map = {
+        "auto_group": run_auto_group_task,
+        "refresh_similarity": run_refresh_similarity_task,
+        "manual_assign": run_manual_assign_task,
+    }
+
+    task_func = task_map.get(operation)
+    if not task_func:
+        return {
+            "status": "error",
+            "error": f"Unknown operation: {operation}. Valid: {list(task_map.keys())}",
+        }
+
+    # Check for existing jobs on any episode
+    conflicting = []
+    for ep_id in episode_ids:
+        existing_job = check_active_job(ep_id, operation)
+        if existing_job:
+            conflicting.append({"ep_id": ep_id, "job_id": existing_job})
+
+    if conflicting:
+        return {
+            "status": "error",
+            "error": "Jobs already running on some episodes",
+            "conflicts": conflicting,
+        }
+
+    # Create task signatures for each episode
+    if operation == "manual_assign":
+        # manual_assign requires payload
+        signatures = [
+            task_func.s(ep_id, options.get("payload", {}))
+            for ep_id in episode_ids
+        ]
+    else:
+        signatures = [
+            task_func.s(ep_id, options)
+            for ep_id in episode_ids
+        ]
+
+    # Execute as a group
+    job_group = group(signatures)
+    group_result = job_group.apply_async()
+
+    # Collect individual job IDs
+    job_ids = {}
+    for i, ep_id in enumerate(episode_ids):
+        if i < len(group_result.children):
+            job_ids[ep_id] = group_result.children[i].id
+
+    return {
+        "status": "queued",
+        "group_id": group_result.id,
+        "operation": operation,
+        "episode_count": len(episode_ids),
+        "job_ids": job_ids,
+    }
+
+
+def get_parallel_job_status(group_id: str) -> Dict[str, Any]:
+    """Get status of a parallel job group.
+
+    Args:
+        group_id: The group ID returned from run_parallel_jobs
+
+    Returns:
+        Dict with overall status and per-episode results
+    """
+    try:
+        group_result = GroupResult.restore(group_id, app=celery_app)
+        if not group_result:
+            return {
+                "status": "error",
+                "error": f"Group {group_id} not found",
+            }
+
+        # Collect results
+        results = []
+        completed = 0
+        failed = 0
+        in_progress = 0
+
+        for child in group_result.children:
+            child_status = get_job_status(child.id)
+            results.append(child_status)
+
+            state = child_status.get("state", "unknown")
+            if state == "success":
+                completed += 1
+            elif state == "failed":
+                failed += 1
+            elif state in ("queued", "in_progress"):
+                in_progress += 1
+
+        # Determine overall status
+        if in_progress > 0:
+            overall_status = "in_progress"
+        elif failed > 0 and completed == 0:
+            overall_status = "failed"
+        elif failed > 0:
+            overall_status = "partial_success"
+        elif completed == len(results):
+            overall_status = "success"
+        else:
+            overall_status = "unknown"
+
+        return {
+            "status": overall_status,
+            "group_id": group_id,
+            "total": len(results),
+            "completed": completed,
+            "failed": failed,
+            "in_progress": in_progress,
+            "progress": completed / max(len(results), 1),
+            "results": results,
+        }
+    except Exception as e:
+        LOGGER.exception(f"Failed to get parallel job status: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
+
+# =============================================================================
+# Enhancement #9: Job Progress Persistence
+# =============================================================================
+
+_JOB_HISTORY_KEY = "screanalytics:job_history"
+_JOB_HISTORY_MAX = 100  # Keep last 100 jobs per user
+
+
+def persist_job_record(
+    job_id: str,
+    episode_id: str,
+    operation: str,
+    status: str,
+    user_id: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Persist a job record to Redis for history tracking.
+
+    Args:
+        job_id: Celery task ID
+        episode_id: Episode ID
+        operation: Operation type
+        status: Job status (queued, in_progress, success, failed)
+        user_id: Optional user identifier
+        duration_ms: Duration in milliseconds
+        result: Optional result data
+
+    Returns:
+        True if persisted successfully
+    """
+    try:
+        r = _get_redis()
+
+        record = {
+            "job_id": job_id,
+            "episode_id": episode_id,
+            "operation": operation,
+            "status": status,
+            "user_id": user_id or "anonymous",
+            "duration_ms": duration_ms,
+            "created_at": time.time(),
+            "result_summary": _summarize_result(result) if result else None,
+        }
+
+        # Use a sorted set with timestamp as score for ordering
+        key = f"{_JOB_HISTORY_KEY}:{user_id or 'anonymous'}"
+        r.zadd(key, {json.dumps(record): time.time()})
+
+        # Trim to max entries
+        r.zremrangebyrank(key, 0, -(_JOB_HISTORY_MAX + 1))
+
+        # Also set TTL for cleanup (7 days)
+        r.expire(key, 7 * 24 * 3600)
+
+        return True
+    except Exception as e:
+        LOGGER.warning(f"Failed to persist job record: {e}")
+        return False
+
+
+def _summarize_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a summary of job result for storage (limit size)."""
+    if not result:
+        return {}
+
+    return {
+        "status": result.get("status"),
+        "error": result.get("error"),
+        "succeeded": result.get("succeeded"),
+        "failed": result.get("failed"),
+    }
+
+
+def get_job_history(
+    user_id: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Get job history for a user.
+
+    Args:
+        user_id: User identifier (None for anonymous)
+        limit: Maximum number of records to return
+        offset: Number of records to skip
+
+    Returns:
+        List of job records, newest first
+    """
+    try:
+        r = _get_redis()
+        key = f"{_JOB_HISTORY_KEY}:{user_id or 'anonymous'}"
+
+        # Get entries in reverse order (newest first)
+        start = -(offset + limit)
+        end = -(offset + 1) if offset > 0 else -1
+
+        entries = r.zrevrange(key, offset, offset + limit - 1)
+
+        records = []
+        for entry in entries:
+            try:
+                record = json.loads(entry)
+                records.append(record)
+            except json.JSONDecodeError:
+                continue
+
+        return records
+    except Exception as e:
+        LOGGER.warning(f"Failed to get job history: {e}")
+        return []
+
+
+def get_active_jobs_for_user(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all active (queued/in_progress) jobs for a user.
+
+    Returns:
+        List of active job records with current status
+    """
+    history = get_job_history(user_id, limit=50)
+
+    active = []
+    for record in history:
+        job_id = record.get("job_id")
+        if not job_id:
+            continue
+
+        # Check current status
+        try:
+            current = get_job_status(job_id)
+            state = current.get("state", "unknown")
+            if state in ("queued", "in_progress"):
+                record["current_status"] = current
+                active.append(record)
+        except Exception:
+            continue
+
+    return active
+
+
 __all__ = [
     "run_manual_assign_task",
     "run_auto_group_task",
@@ -1285,4 +1574,11 @@ __all__ = [
     "check_active_job",
     "get_job_status",
     "cancel_job",
+    # Enhancement #1: Parallel Job Execution
+    "run_parallel_jobs",
+    "get_parallel_job_status",
+    # Enhancement #9: Job Progress Persistence
+    "persist_job_record",
+    "get_job_history",
+    "get_active_jobs_for_user",
 ]

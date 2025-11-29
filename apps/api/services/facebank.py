@@ -299,7 +299,8 @@ class FacebankService:
 
     def get_all_seeds_for_show(self, show_id: str) -> List[Dict[str, Any]]:
         """Get all seed embeddings for a show (for detection boosting)."""
-        show_dir = self.facebank_dir / show_id
+        normalized_show = self._normalize_show_id(show_id)
+        show_dir = self.facebank_dir / normalized_show
         if not show_dir.exists():
             return []
 
@@ -307,7 +308,7 @@ class FacebankService:
         for cast_dir in show_dir.iterdir():
             if cast_dir.is_dir():
                 cast_id = cast_dir.name
-                data = self._load_facebank(show_id, cast_id)
+                data = self._load_facebank(normalized_show, cast_id)
                 seeds = data.get("seeds", [])
                 for seed in seeds:
                     seed["cast_id"] = cast_id
