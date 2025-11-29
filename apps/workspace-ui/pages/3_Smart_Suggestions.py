@@ -347,30 +347,44 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
     similarity = suggestion.get("similarity", 0)
     confidence = suggestion.get("confidence", "low")
     source = suggestion.get("source", "facebank")
+    faces_used = suggestion.get("faces_used")
     faces = entry["faces"]
     tracks = entry["tracks"]
     cohesion = entry["cohesion"]
     thumb_urls = entry["thumb_urls"]
     track_list = cluster_data.get("tracks", [])
 
+    # Build source label with extra info for frame-based suggestions
+    source_label = source
+    if source == "frame" and faces_used:
+        source_label = f"frame ({faces_used} face{'s' if faces_used > 1 else ''})"
+
     # Colors
     conf_colors = {"high": "#4CAF50", "medium": "#FF9800", "low": "#F44336"}
     conf_color = conf_colors.get(confidence, "#9E9E9E")
     sim_pct = int(similarity * 100)
 
-    # Determine which similarity to show: cluster cohesion for multi-track, track similarity for single-track
+    # Determine which similarity to show: cluster cohesion for multi-track, internal similarity for single-track
     similarity_value = None
     similarity_label = None
     if tracks > 1 and cohesion is not None:
         # Multi-track cluster: show cluster cohesion
         similarity_value = cohesion
         similarity_label = "Cluster Similarity"
-    elif tracks == 1 and track_list:
-        # Single-track cluster: show track similarity
-        track_sim = track_list[0].get("similarity")
-        if track_sim is not None:
-            similarity_value = track_sim
-            similarity_label = "Track Similarity"
+    elif track_list:
+        # Single/few-track cluster: show track internal similarity (frame consistency within track)
+        # Try internal_similarity first (how similar rep frame is to track centroid)
+        track = track_list[0]
+        internal_sim = track.get("internal_similarity")
+        if internal_sim is not None:
+            similarity_value = internal_sim
+            similarity_label = "Track Consistency"
+        else:
+            # Fallback to track-to-cluster similarity if available
+            track_sim = track.get("similarity")
+            if track_sim is not None:
+                similarity_value = track_sim
+                similarity_label = "Track Similarity"
     sim_badge_pct = int(similarity_value * 100) if similarity_value is not None else None
     sim_badge_color = "#4CAF50" if similarity_value and similarity_value >= 0.7 else "#FF9800" if similarity_value and similarity_value >= 0.5 else "#F44336"
 
@@ -408,7 +422,7 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                 f'<span style="background-color: {conf_color}; color: white; '
                 f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
                 f'{sim_pct}%</span> → **{cast_name}** '
-                f'<span style="font-size: 0.75em; color: #888;">({source})</span>',
+                f'<span style="font-size: 0.75em; color: #888;">({source_label})</span>',
                 unsafe_allow_html=True
             )
 

@@ -1282,31 +1282,70 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
     # Handle recovery button click
     if recover_clicked:
         with recovery_progress_area.container():
-            with st.spinner("Recovering single-frame tracks..."):
+            with st.status("Recovering noise tracks...", expanded=True) as status:
+                # Step 1: Call the recovery API
+                st.write("🔍 Analyzing single-frame tracks...")
+                progress_bar = st.progress(0, text="Searching for similar faces in adjacent frames...")
+
                 resp = _api_post(f"/episodes/{ep_id}/recover_noise_tracks", {})
-                if resp:
+                progress_bar.progress(50, text="Processing results...")
+
+                if not resp:
+                    progress_bar.progress(100, text="Failed")
+                    status.update(label="❌ Recovery failed", state="error")
+                    st.error("Failed to recover noise tracks. Check API logs.")
+                else:
                     tracks_analyzed = resp.get("tracks_analyzed", 0)
                     tracks_expanded = resp.get("tracks_expanded", 0)
                     faces_merged = resp.get("faces_merged", 0)
+                    details = resp.get("details", [])
+
+                    progress_bar.progress(70, text="Generating report...")
+
+                    # Step 2: Show analysis results
+                    st.write(f"📊 Analyzed **{tracks_analyzed}** single-frame tracks")
 
                     if tracks_expanded > 0:
-                        st.success(
-                            f"Recovered {tracks_expanded} track(s) by merging {faces_merged} adjacent face(s). "
-                            f"({tracks_analyzed} single-frame tracks analyzed)"
-                        )
-                        # Show details
-                        for detail in resp.get("details", [])[:5]:
+                        st.write(f"✅ Expanded **{tracks_expanded}** track(s) with **{faces_merged}** adjacent face(s)")
+
+                        # Step 3: Show detailed log of recovered tracks
+                        st.write("📋 **Recovery Details:**")
+                        for detail in details[:10]:  # Show up to 10 details
                             track_id = detail.get("track_id")
-                            added = detail.get("added_frames", [])
-                            st.write(f"  • Track {track_id}: +{len(added)} frame(s)")
+                            original_frame = detail.get("original_frame")
+                            added_frames = detail.get("added_frames", [])
+
+                            # Build frame info
+                            frame_info = []
+                            for af in added_frames[:5]:  # Show up to 5 added frames per track
+                                frame_idx = af.get("frame_idx")
+                                similarity = af.get("similarity", 0)
+                                frame_info.append(f"frame {frame_idx} ({int(similarity * 100)}% sim)")
+
+                            frames_str = ", ".join(frame_info)
+                            if len(added_frames) > 5:
+                                frames_str += f" +{len(added_frames) - 5} more"
+
+                            st.write(f"  • Track {track_id} (frame {original_frame}): +{len(added_frames)} → {frames_str}")
+
+                        if len(details) > 10:
+                            st.write(f"  ... and {len(details) - 10} more tracks recovered")
+
+                        progress_bar.progress(100, text="Complete!")
+                        status.update(
+                            label=f"✅ Recovered {tracks_expanded} track(s) with {faces_merged} face(s)",
+                            state="complete",
+                        )
+
+                        # Rerun to refresh the UI with new data
                         st.rerun()
                     else:
-                        st.info(
-                            f"No recoverable tracks found. "
-                            f"({tracks_analyzed} single-frame tracks analyzed, none had similar faces in adjacent frames)"
+                        progress_bar.progress(100, text="No recoverable tracks found")
+                        st.write("ℹ️ No similar faces found in adjacent frames (±8 frames, ≥70% similarity)")
+                        status.update(
+                            label="✅ Analysis complete - no recoverable tracks",
+                            state="complete",
                         )
-                else:
-                    st.error("Failed to recover noise tracks. Check logs.")
 
     if refresh_clicked:
         with refresh_progress_area.container():
@@ -2190,10 +2229,19 @@ def _render_unassigned_cluster_card(
     original_faces_count = counts.get("faces", 0)
     track_list = cluster_meta.get("tracks", [])
 
-    # Filter out tracks with only 1 frame (likely noise/false positives)
+    # For single-track clusters, show even single-frame tracks (with low-confidence badge)
+    # For multi-track clusters, filter out single-frame tracks as noise
     original_track_list = track_list
-    track_list = [t for t in track_list if t.get("faces", 0) > 1]
-    filtered_tracks_count = len(original_track_list) - len(track_list)
+    is_single_track_cluster = len(track_list) == 1
+    has_single_frame_track = any(t.get("faces", 0) <= 1 for t in track_list)
+
+    if is_single_track_cluster:
+        # Keep single-frame tracks for single-track clusters (show with low-confidence badge)
+        filtered_tracks_count = 0
+    else:
+        # Filter out single-frame tracks for multi-track clusters
+        track_list = [t for t in track_list if t.get("faces", 0) > 1]
+        filtered_tracks_count = len(original_track_list) - len(track_list)
 
     # Recalculate counts after filtering
     tracks_count = len(track_list)
@@ -2262,25 +2310,40 @@ def _render_unassigned_cluster_card(
             if filtered_tracks_count > 0:
                 caption_parts.append(f"({filtered_tracks_count} single-frame filtered)")
             st.caption(" ".join(caption_parts))
-            # Show similarity badge - use cluster cohesion for multi-track, track similarity for single-track
+            # Show similarity badge - use cluster cohesion for multi-track, internal similarity for single-track
             similarity_value = None
             similarity_label = None
             if tracks_count > 1 and cluster_cohesion is not None:
                 # Multi-track cluster: show cluster cohesion (how similar tracks are to each other)
                 similarity_value = cluster_cohesion
                 similarity_label = "Cluster Similarity"
-            elif tracks_count == 1 and track_list:
-                # Single-track cluster: show track similarity (how similar frames are within the track)
-                track_sim = track_list[0].get("similarity")
-                if track_sim is not None:
-                    similarity_value = track_sim
-                    similarity_label = "Track Similarity"
+            elif track_list:
+                # Single/few-track cluster: show track internal similarity (frame consistency within track)
+                # Try internal_similarity first (how similar rep frame is to track centroid)
+                track = track_list[0]
+                internal_sim = track.get("internal_similarity")
+                if internal_sim is not None:
+                    similarity_value = internal_sim
+                    similarity_label = "Track Consistency"
+                else:
+                    # Fallback to track-to-cluster similarity if available
+                    track_sim = track.get("similarity")
+                    if track_sim is not None:
+                        similarity_value = track_sim
+                        similarity_label = "Track Similarity"
             if similarity_value is not None and similarity_label:
                 sim_pct = int(similarity_value * 100)
                 sim_color = "#4CAF50" if similarity_value >= 0.7 else "#FF9800" if similarity_value >= 0.5 else "#F44336"
                 st.markdown(
                     f'<span style="background-color: {sim_color}; color: white; '
                     f'padding: 2px 6px; border-radius: 3px; font-size: 0.75em;">{similarity_label}: {sim_pct}%</span>',
+                    unsafe_allow_html=True
+                )
+            # Low-confidence badge for single-frame single-track clusters
+            if is_single_track_cluster and has_single_frame_track:
+                st.markdown(
+                    '<span style="background-color: #9E9E9E; color: white; '
+                    'padding: 2px 6px; border-radius: 3px; font-size: 0.75em;">⚠️ Single-Frame</span>',
                     unsafe_allow_html=True
                 )
             # Quality indicators (Feature 10)
@@ -2381,31 +2444,45 @@ def _render_unassigned_cluster_card(
                         track_id = track.get("track_id")
                         track_faces = track.get("faces", 0)
 
+                        # Show track info with similarity score if available
+                        track_sim = track.get("similarity")
+                        caption = f"Track {track_id} · {track_faces} faces"
+                        if track_sim is not None:
+                            sim_pct = int(track_sim * 100)
+                            caption = f"Track {track_id} · {track_faces} faces · {sim_pct}% sim"
+
                         if thumb_url:
-                            # Extract S3 key from presigned URL to generate fresh presign
-                            thumb_src = _extract_s3_key_from_url(thumb_url)
+                            # Use presigned URL directly if already HTTPS, otherwise extract key
+                            if thumb_url.startswith("https://"):
+                                thumb_src = thumb_url
+                            else:
+                                thumb_src = _extract_s3_key_from_url(thumb_url)
                             thumb_markup = helpers.thumb_html(
                                 thumb_src,
                                 alt=f"Track {track_id}",
                                 hide_if_missing=False,
                             )
                             st.markdown(thumb_markup, unsafe_allow_html=True)
-                            # Show track info with similarity score if available
-                            track_sim = track.get("similarity")
-                            if track_sim is not None:
-                                sim_pct = int(track_sim * 100)
-                                st.caption(f"Track {track_id} · {track_faces} faces · {sim_pct}% sim")
-                            else:
-                                st.caption(f"Track {track_id} · {track_faces} faces")
+                        else:
+                            # Show placeholder when no thumbnail
+                            st.markdown(
+                                '<div style="width:147px;height:184px;background:#333;border-radius:6px;'
+                                'display:flex;align-items:center;justify-content:center;color:#666;">'
+                                '📷</div>',
+                                unsafe_allow_html=True,
+                            )
+                        st.caption(caption)
 
-        # Show cast suggestions from facebank (Enhancement #1) if available
+        # Show cast suggestions (Enhancement #1) if available
         if cast_suggestions:
-            st.markdown("**🎯 Cast Suggestions from Facebank:**")
+            st.markdown("**🎯 Cast Suggestions:**")
             for idx, cast_sugg in enumerate(cast_suggestions[:3]):
                 sugg_cast_id = cast_sugg.get("cast_id")
                 sugg_name = cast_sugg.get("name", sugg_cast_id)
                 sugg_sim = cast_sugg.get("similarity", 0)
                 sugg_confidence = cast_sugg.get("confidence", "low")
+                sugg_source = cast_sugg.get("source", "facebank")
+                faces_used = cast_sugg.get("faces_used")
 
                 # Confidence badge colors
                 confidence_colors = {
@@ -2416,12 +2493,18 @@ def _render_unassigned_cluster_card(
                 badge_color = confidence_colors.get(sugg_confidence, "#9E9E9E")
                 sim_pct = int(sugg_sim * 100)
 
+                # Source label with extra info
+                source_label = sugg_source
+                if sugg_source == "frame" and faces_used:
+                    source_label = f"frame ({faces_used} face{'s' if faces_used > 1 else ''})"
+
                 sugg_col1, sugg_col2 = st.columns([5, 1])
                 with sugg_col1:
                     st.markdown(
                         f'<span style="background-color: {badge_color}; color: white; padding: 2px 8px; '
                         f'border-radius: 4px; font-size: 0.85em; font-weight: bold; margin-right: 8px;">'
-                        f'{sugg_confidence.upper()}</span> **{sugg_name}** ({sim_pct}% similarity)',
+                        f'{sugg_confidence.upper()}</span> **{sugg_name}** ({sim_pct}%) '
+                        f'<span style="font-size: 0.75em; color: #888;">via {source_label}</span>',
                         unsafe_allow_html=True,
                     )
                 with sugg_col2:

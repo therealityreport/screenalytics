@@ -464,16 +464,21 @@ def cluster_track_summary(
             # Use _track_media_url to prioritize crops (authoritative) over thumbs
             thumb_url = _track_media_url(ep_id, track_row)
 
+            # Get track rep data for similarity computation
+            track_key = f"track_{tid:04d}"
+            track_rep = track_reps_data.get(track_key)
+
             # Compute track similarity to cluster centroid
             track_similarity = None
-            if cluster_centroid is not None:
-                # Try to get track embedding from track_reps
-                track_key = f"track_{tid:04d}"
-                track_rep = track_reps_data.get(track_key)
-                if track_rep and track_rep.get("embed"):
-                    track_similarity = _cosine_sim(track_rep["embed"], cluster_centroid)
-                    if track_similarity is not None:
-                        track_similarity = round(track_similarity, 3)
+            if cluster_centroid is not None and track_rep and track_rep.get("embed"):
+                track_similarity = _cosine_sim(track_rep["embed"], cluster_centroid)
+                if track_similarity is not None:
+                    track_similarity = round(track_similarity, 3)
+
+            # Get track internal consistency (how similar rep frame is to track centroid)
+            internal_similarity = None
+            if track_rep and track_rep.get("sim_to_centroid") is not None:
+                internal_similarity = round(track_rep["sim_to_centroid"], 3)
 
             tracks_payload.append(
                 {
@@ -482,6 +487,7 @@ def cluster_track_summary(
                     "frames": track_row.get("frame_count"),
                     "rep_thumb_url": thumb_url,
                     "similarity": track_similarity,
+                    "internal_similarity": internal_similarity,  # Track internal consistency
                 }
             )
         if limit_per_cluster:

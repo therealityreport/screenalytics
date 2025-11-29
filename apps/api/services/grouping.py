@@ -1989,10 +1989,18 @@ class GroupingService:
                     track_to_cast[tid] = cast_id
 
         # Load face embeddings from episode, grouped by cast_id
+        # Also collect embeddings for unassigned tracks (for per-frame matching)
         embeddings_by_cast: Dict[str, List[np.ndarray]] = {}
+        unassigned_track_embeddings: Dict[int, List[np.ndarray]] = {}  # track_id -> embeddings
         faces_path = self._faces_path(ep_id)
 
-        if faces_path.exists() and track_to_cast:
+        # Build set of unassigned track IDs for faster lookup
+        unassigned_track_ids: set[int] = set()
+        for cluster_id in clusters_needing_suggestions:
+            for tid in cluster_to_tracks.get(cluster_id, []):
+                unassigned_track_ids.add(tid)
+
+        if faces_path.exists():
             with faces_path.open("r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -2008,15 +2016,22 @@ class GroupingService:
                     if track_id is None or not embedding:
                         continue
 
+                    tid = int(track_id)
+                    emb_vec = np.array(embedding, dtype=np.float32)
+
                     # Check if this track belongs to an assigned cast member
-                    cast_id = track_to_cast.get(int(track_id))
+                    cast_id = track_to_cast.get(tid)
                     if cast_id:
-                        emb_vec = np.array(embedding, dtype=np.float32)
                         embeddings_by_cast.setdefault(cast_id, []).append(emb_vec)
+
+                    # Also collect for unassigned tracks (for per-frame matching)
+                    if tid in unassigned_track_ids:
+                        unassigned_track_embeddings.setdefault(tid, []).append(emb_vec)
 
         LOGGER.info(
             f"[{ep_id}] Loaded episode embeddings for {len(embeddings_by_cast)} cast members "
-            f"({sum(len(v) for v in embeddings_by_cast.values())} total faces)"
+            f"({sum(len(v) for v in embeddings_by_cast.values())} total faces), "
+            f"{len(unassigned_track_embeddings)} unassigned tracks"
         )
 
         # Fall back to facebank seeds for cast members without episode assignments
@@ -2041,6 +2056,14 @@ class GroupingService:
 
         if not all_embeddings_by_cast:
             return {"suggestions": [], "message": "No assigned clusters or facebank seeds available for comparison"}
+
+        # Identify single-track clusters for per-frame matching
+        single_track_clusters = {
+            cid for cid in clusters_needing_suggestions
+            if len(cluster_to_tracks.get(cid, [])) == 1
+        }
+        if single_track_clusters:
+            LOGGER.info(f"[{ep_id}] Found {len(single_track_clusters)} single-track clusters for centroid comparison")
 
         # Generate suggestions
         suggestions = []
@@ -2083,6 +2106,61 @@ class GroupingService:
                         "confidence": confidence,
                         "source": source,
                     })
+
+            # --- NEW: For single-track clusters, use per-frame max similarity instead of centroid ---
+            # This bypasses centroid-only matching for sparse clusters where centroids may be unreliable
+            if cluster_id in single_track_clusters:
+                track_ids = cluster_to_tracks.get(cluster_id, [])
+                if track_ids:
+                    # Get face embeddings for this cluster's track(s)
+                    cluster_face_embeddings: List[np.ndarray] = []
+                    for tid in track_ids:
+                        embs = unassigned_track_embeddings.get(tid, [])
+                        cluster_face_embeddings.extend(embs)
+
+                    if cluster_face_embeddings:
+                        n_faces_used = len(cluster_face_embeddings)
+
+                        # Compare each face embedding to all cast embeddings, take max
+                        for cast_id, cast_embeddings in all_embeddings_by_cast.items():
+                            best_frame_sim = -1.0
+
+                            for face_emb in cluster_face_embeddings:
+                                for cast_emb in cast_embeddings:
+                                    sim = cosine_similarity(face_emb, cast_emb)
+                                    if sim > best_frame_sim:
+                                        best_frame_sim = sim
+
+                            if best_frame_sim >= min_similarity:
+                                cast_meta = cast_lookup.get(cast_id, {})
+                                cast_name = cast_meta.get("name", cast_id)
+
+                                # Determine confidence level (slightly stricter for frame-based)
+                                if best_frame_sim >= 0.82:
+                                    confidence = "high"
+                                elif best_frame_sim >= 0.68:
+                                    confidence = "medium"
+                                else:
+                                    confidence = "low"
+
+                                # Check if we already have a suggestion for this cast_id
+                                existing = next((m for m in cast_matches if m["cast_id"] == cast_id), None)
+                                if existing:
+                                    # Keep the higher similarity, update source if frame-based is better
+                                    if best_frame_sim > existing["similarity"]:
+                                        existing["similarity"] = round(float(best_frame_sim), 3)
+                                        existing["confidence"] = confidence
+                                        existing["source"] = "frame"
+                                        existing["faces_used"] = n_faces_used
+                                else:
+                                    cast_matches.append({
+                                        "cast_id": cast_id,
+                                        "name": cast_name,
+                                        "similarity": round(float(best_frame_sim), 3),
+                                        "confidence": confidence,
+                                        "source": "frame",
+                                        "faces_used": n_faces_used,
+                                    })
 
             # Sort by similarity (descending) and take top_k
             cast_matches.sort(key=lambda x: x["similarity"], reverse=True)
