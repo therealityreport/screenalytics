@@ -523,7 +523,9 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         # Add manifest existence info even when marker exists
         tracks_path = _tracks_path(ep_id)
         result["manifest_exists"] = tracks_path.exists()
-        result["last_run_at"] = _get_file_mtime_iso(tracks_path)
+        # Prefer marker timestamp for stale detection; fall back to manifest mtime if unavailable
+        # This ensures consistent timestamp comparison with faces_embed and cluster phases
+        result["last_run_at"] = marker.get("finished_at") or _get_file_mtime_iso(tracks_path)
         tracks_count = result.get("tracks") or 0
         result["zero_rows"] = result["manifest_exists"] and tracks_count == 0
         return result

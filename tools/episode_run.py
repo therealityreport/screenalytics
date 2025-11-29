@@ -2718,7 +2718,9 @@ def _episode_ctx(ep_id: str) -> EpisodeContext | None:
 def _storage_context(
     ep_id: str,
 ) -> tuple[StorageService | None, EpisodeContext | None, Dict[str, str] | None]:
-    storage_backend = os.environ.get("STORAGE_BACKEND", "local").lower()
+    # Default to "s3" for consistency with API (apps/api/services/storage.py defaults to "s3")
+    # This ensures artifacts are uploaded to S3 when running in local mode from the API
+    storage_backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
     storage: StorageService | None = None
     if storage_backend in {"s3", "minio"}:
         try:
