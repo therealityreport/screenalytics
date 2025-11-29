@@ -46,6 +46,16 @@ from similarity_badges import (  # noqa: E402
     render_quality_indicator,
     render_cluster_quality_badges,
     get_cluster_quality_indicators,
+    # Enhanced rendering functions (Nov 2024)
+    render_cluster_range_badge,
+    render_quality_breakdown_badge,
+    render_cast_rank_badge,
+    render_track_with_dropout,
+    render_outlier_severity_badge,
+    render_ambiguity_badge,
+    render_isolation_badge,
+    render_confidence_trend_badge,
+    render_temporal_badge,
 )
 from track_frame_utils import (  # noqa: E402
     best_track_frame_idx,
@@ -65,6 +75,15 @@ VIEW_NAMES = {
     "cluster_tracks": ("📦 Cluster View", "cluster"),
     "track": ("🖼️ Frames View", "frames"),
 }
+# Operator docs entry points; env overrides allow pointing at an internal wiki.
+FACES_REVIEW_GUIDE_URL = os.environ.get(
+    "SCREENALYTICS_FACES_REVIEW_GUIDE_URL",
+    "http://127.0.0.1:8505/Faces_Review/Docs",
+)
+FACES_REVIEW_GUIDE_FALLBACK = os.environ.get(
+    "SCREENALYTICS_FACES_REVIEW_GUIDE_FALLBACK",
+    "https://github.com/therealityreport/screenalytics/blob/nov-24/docs/ops/faces_review_guide.md",
+)
 
 
 def _render_view_header(view_state: str) -> None:
@@ -125,6 +144,18 @@ if MOCKED_STREAMLIT:
 
 cfg = helpers.init_page("Faces & Tracks")
 st.title("Faces & Tracks Review")
+help_cols = st.columns([3, 1])
+with help_cols[0]:
+    st.caption("Need the playbook? Open the full Faces Review guide for flow, job settings, and safety tips.")
+with help_cols[1]:
+    link_button = getattr(st, "link_button", None)
+    label = "📖 Faces Review Guide"
+    if callable(link_button):
+        link_button(label, FACES_REVIEW_GUIDE_URL, help="Full walkthrough of flows, job settings, and guardrails.")
+    else:
+        st.markdown(f"[{label}]({FACES_REVIEW_GUIDE_URL})")
+if FACES_REVIEW_GUIDE_FALLBACK and FACES_REVIEW_GUIDE_FALLBACK != FACES_REVIEW_GUIDE_URL:
+    st.caption(f"[Docs fallback]({FACES_REVIEW_GUIDE_FALLBACK})")
 
 # Global episode selector in sidebar to ensure ep_id is set for this page
 sidebar_ep_id = None
@@ -211,7 +242,7 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             ["≥ 80%: Strong match", "65–79%: Good match", "< 65%: Potential outlier"],
         )
 
-    # Row 3: Cluster Similarity (Green) and Cast Track Score (Teal)
+    # Row 3: Cluster Similarity (Green) and Person Cohesion (Teal)
     try:
         col5, col6 = st.columns(2)
     except Exception:
@@ -219,16 +250,16 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
     with col5:
         _render_similarity_card(
             SIMILARITY_COLORS[SimilarityType.CLUSTER].strong,
-            "Cluster Similarity",
-            "How cohesive/similar all tracks in a cluster are.",
+            "Cluster Cohesion",
+            "How cohesive/similar all tracks in a cluster are. Shows min-max range.",
             ["≥ 80%: Tight cluster", "60–79%: Moderate cohesion", "< 60%: Loose cluster"],
         )
     with col6:
         _render_similarity_card(
-            SIMILARITY_COLORS[SimilarityType.CAST_TRACK].strong,
-            "Cast Track Score",
-            "How similar a track is to other tracks assigned to same cast/identity.",
-            ["≥ 70%: Strong match", "55–69%: Possible match", "< 55%: Weak match"],
+            SIMILARITY_COLORS[SimilarityType.PERSON_COHESION].strong,
+            "Person Cohesion",
+            "How well a track fits with other tracks assigned to same person.",
+            ["≥ 70%: Strong fit", "50–69%: Good fit", "< 50%: Poor fit (review)"],
         )
 
     # Row 4: Quality Score (Green - separate from similarity)
@@ -1095,326 +1126,25 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
         key="facebank_open_detail",
         on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
     )
-    # Store Cluster Cleanup variables for use in recovery_row later
     with action_cols[1]:
-        # Enhancement #4: Selective Cleanup Actions + Enhancement #3: Preview
-        with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
-            st.info(
-                "Cleanup focuses on **Needs Cast Assignment** items only: unassigned clusters, tracks, frames, and crops. "
-                "It fixes noisy tracks, refreshes embeddings, and regroups unassigned clusters into draft people without touching named cast links."
-            )
-            # Show last cleanup timestamp if available
-            last_cleanup = st.session_state.get(f"last_cleanup:{ep_id}")
-            if last_cleanup:
-                try:
-                    dt = datetime.datetime.fromisoformat(last_cleanup)
-                    st.caption(f"🕐 Last cleanup: {dt.strftime('%b %d, %H:%M')}")
-                except (ValueError, TypeError):
-                    pass
-
-            # Enhancement #3: Show cleanup preview first
-            preview_resp = _safe_api_get(f"/episodes/{ep_id}/cleanup_preview")
-            if preview_resp and preview_resp.get("preview"):
-                preview = preview_resp["preview"]
-                warning_level = preview.get("warning_level", "low")
-                warnings = preview.get("warnings", [])
-
-                # Show warning banner based on level
-                if warning_level == "high":
-                    st.error("⚠️ **High Impact Warning**")
-                elif warning_level == "medium":
-                    st.warning("⚡ **Medium Impact Warning**")
-
-                # Show preview stats
-                st.caption(
-                    f"📊 {preview.get('total_clusters', 0)} clusters "
-                    f"({preview.get('assigned_clusters', 0)} assigned, "
-                    f"{preview.get('unassigned_clusters', 0)} unassigned)"
-                )
-                if preview.get("manual_assignments_count", 0) > 0:
-                    st.caption(f"🔒 {preview.get('manual_assignments_count')} manually assigned cluster(s)")
-                if preview.get("potential_merges", 0) > 0:
-                    st.caption(f"🔄 {preview.get('potential_merges')} potential merge(s)")
-
-                # Show warnings
-                for warning in warnings:
-                    st.info(warning)
-
-            st.markdown("---")
-
-            # Quick Cleanup Presets
-            st.markdown("**Quick Presets:**")
-            preset_cols = st.columns(2)
-            with preset_cols[0]:
-                if st.button("🚀 Quick Fix", key="preset_quick", help="Low risk: Just fix tracking issues"):
-                    st.session_state["cleanup_preset"] = "quick"
-                    st.rerun()
-            with preset_cols[1]:
-                if st.button("⚡ Standard", key="preset_standard", help="Recommended: Fix + reembed + regroup unassigned"):
-                    st.session_state["cleanup_preset"] = "standard"
-                    st.rerun()
-
-            # Apply preset if set
-            active_preset = st.session_state.get("cleanup_preset", "standard")
-            preset_defaults = {
-                "quick": {"split_tracks": True, "reembed": False, "group_clusters": False},
-                "standard": {"split_tracks": True, "reembed": True, "group_clusters": True},
-            }
-            current_defaults = preset_defaults.get(active_preset, preset_defaults["standard"])
-
-            st.markdown("---")
-            st.markdown("**Select cleanup actions (unassigned-only):**")
-
-            # Define actions with risk levels (defaults come from preset)
-            cleanup_actions = {
-                "split_tracks": {
-                    "label": "Fix tracking issues (split_tracks)",
-                    "help": "Use when: A track contains multiple different people (identity switch mid-track). Splits incorrectly merged tracks. Low risk - usually beneficial.",
-                    "default": current_defaults.get("split_tracks", True),
-                    "risk": "low",
-                    "est_time": "~30s",
-                },
-                "reembed": {
-                    "label": "Regenerate embeddings (reembed)",
-                    "help": "Use when: Face quality has changed or embeddings seem outdated. Recalculates face embeddings for unassigned clusters. Low risk - just regenerates vectors.",
-                    "default": current_defaults.get("reembed", True),
-                    "risk": "low",
-                    "est_time": "~1-2min",
-                },
-                "group_clusters": {
-                    "label": "Auto-group clusters (group_clusters)",
-                    "help": "Use when: You have unassigned clusters that need to be matched to people. Groups similar unassigned clusters into draft people (remains Needs Cast Assignment until named).",
-                    "default": current_defaults.get("group_clusters", True),
-                    "risk": "medium",
-                    "est_time": "~1min",
-                },
-            }
-
-            selected_actions = []
-            for action_key, action_info in cleanup_actions.items():
-                risk_badge = ""
-                if action_info["risk"] == "high":
-                    risk_badge = " ⚠️"
-                elif action_info["risk"] == "medium":
-                    risk_badge = " ⚡"
-
-                est_time = action_info.get("est_time", "")
-                time_badge = f" ({est_time})" if est_time else ""
-
-                checked = st.checkbox(
-                    f"{action_info['label']}{risk_badge}{time_badge}",
-                    value=action_info["default"],
-                    key=f"cleanup_action_{action_key}",
-                    help=action_info["help"],
-                )
-                if checked:
-                    selected_actions.append(action_key)
-
-            # Show total estimated time
-            if selected_actions:
-                time_map = {"split_tracks": 30, "reembed": 90, "group_clusters": 60}
-                total_seconds = sum(time_map.get(a, 0) for a in selected_actions)
-                if total_seconds >= 60:
-                    est_str = f"~{total_seconds // 60}min {total_seconds % 60}s" if total_seconds % 60 else f"~{total_seconds // 60}min"
-                else:
-                    est_str = f"~{total_seconds}s"
-                st.caption(f"⏱️ Estimated total time: {est_str}")
-
-            # Protection for recently-edited identities
-            recently_edited = st.session_state.get(f"recently_edited_identities:{ep_id}", {})
-            num_recent = len(recently_edited)
-            protect_recent = st.checkbox(
-                f"🛡️ Protect recently-edited ({num_recent})",
-                value=True if num_recent > 0 else False,
-                key="protect_recent_edits",
-                help="Skip identities you've manually edited during cleanup to preserve your work",
-                disabled=num_recent == 0,
-            )
-            if num_recent > 0 and protect_recent:
-                st.caption(f"  ↳ {num_recent} identitie(s) will be protected")
-
-            # Enhancement #7: Show backup/restore info
-            backups_resp = _safe_api_get(f"/episodes/{ep_id}/backups")
-            backups = backups_resp.get("backups", []) if backups_resp else []
-            if backups:
-                latest = backups[0].get("backup_id", "")
-                st.caption(f"💾 Last backup: {latest[-20:] if len(latest) > 20 else latest}")
-                if st.button("↩️ Undo Last Cleanup", key="restore_backup_btn", help="Restore to previous state"):
-                    restore_resp = _api_post(f"/episodes/{ep_id}/restore/{latest}", {})
-                    if restore_resp and restore_resp.get("files_restored", 0) > 0:
-                        _invalidate_assignment_caches()  # Clear caches so UI reflects restored state
-                        st.success("✓ Restored from backup!")
-                        st.rerun()
-                    else:
-                        st.error("Failed to restore from backup. Check API logs.")
-
-            # Show cleanup history
-            history = st.session_state.get(f"cleanup_history:{ep_id}", [])
-            if history:
-                with st.expander(f"📜 Cleanup History ({len(history)})", expanded=False):
-                    for i, entry in enumerate(history[:5]):  # Show last 5
-                        try:
-                            dt = datetime.datetime.fromisoformat(entry["timestamp"])
-                            time_str = dt.strftime("%b %d, %H:%M")
-                        except (ValueError, TypeError, KeyError):
-                            time_str = "Unknown"
-                        actions_str = ", ".join(entry.get("actions", []))
-                        details_str = " · ".join(entry.get("details", []))
-                        st.caption(f"**{time_str}**: {actions_str}")
-                        if details_str:
-                            st.caption(f"  ↳ {details_str}")
-
-            st.markdown("---")
-
-            # Dry-run option
-            dry_run_cols = st.columns([1, 1])
-            with dry_run_cols[0]:
-                if st.button("👁️ Preview Changes", key="cleanup_dry_run", help="Show what would change without making changes"):
-                    if not selected_actions:
-                        st.warning("No cleanup actions selected.")
-                    else:
-                        with st.spinner("Analyzing potential changes..."):
-                            # Get detailed preview
-                            preview_detail = _safe_api_get(f"/episodes/{ep_id}/cleanup_preview")
-                            if preview_detail and preview_detail.get("preview"):
-                                p = preview_detail["preview"]
-                                st.info("**Dry Run Results:**")
-                                st.write(f"• Current clusters: {p.get('total_clusters', 0)}")
-                                st.write(f"• Assigned: {p.get('assigned_clusters', 0)}")
-                                st.write(f"• Unassigned: {p.get('unassigned_clusters', 0)}")
-                                if "recluster" in selected_actions:
-                                    st.warning("⚠️ Recluster selected - all cluster assignments may be reset!")
-                                if "split_tracks" in selected_actions:
-                                    st.write("• split_tracks: May fix tracks with multiple identities")
-                                if "reembed" in selected_actions:
-                                    st.write("• reembed: Will regenerate all face embeddings")
-                                if "group_clusters" in selected_actions:
-                                    merges = p.get("potential_merges", 0)
-                                    st.write(f"• group_clusters: ~{merges} potential cluster merge(s)")
-
-            with dry_run_cols[1]:
-                pass  # Placeholder for layout
-
-            if st.button("Run Selected Cleanup", key="facebank_cleanup_button", type="primary"):
-                if not selected_actions:
-                    st.warning("No cleanup actions selected.")
-                else:
-                    # Enhancement #7: Auto-backup before cleanup
-                    backup_resp = _api_post(f"/episodes/{ep_id}/backup", {})
-                    if not backup_resp:
-                        st.error("Failed to create backup before cleanup. Aborting.")
-                    else:
-                        payload = helpers.default_cleanup_payload(ep_id)
-                        payload["actions"] = selected_actions
-                        # Add protected identity IDs if enabled
-                        if protect_recent and recently_edited:
-                            payload["protected_identity_ids"] = list(recently_edited.keys())
-                        with st.spinner(f"Running cleanup ({', '.join(selected_actions)})…"):
-                            summary, error_message = helpers.run_job_with_progress(
-                                ep_id,
-                                "/jobs/episode_cleanup_async",
-                                payload,
-                                requested_device=helpers.DEFAULT_DEVICE,
-                                async_endpoint="/jobs/episode_cleanup_async",
-                                requested_detector=helpers.DEFAULT_DETECTOR,
-                                requested_tracker=helpers.DEFAULT_TRACKER,
-                                use_async_only=True,
-                            )
-                        if error_message:
-                            st.error(error_message)
-                        else:
-                            report = summary or {}
-                            if isinstance(report.get("summary"), dict):
-                                report = report["summary"]
-                            # Build summary of changes
-                            details: List[str] = []
-                            tb = helpers.coerce_int(report.get("tracks_before"))
-                            ta = helpers.coerce_int(report.get("tracks_after"))
-                            cbefore = helpers.coerce_int(report.get("clusters_before"))
-                            cafter = helpers.coerce_int(report.get("clusters_after"))
-                            faces_after = helpers.coerce_int(report.get("faces_after"))
-                            if tb is not None and ta is not None:
-                                track_delta = ta - tb
-                                delta_str = f"+{track_delta}" if track_delta > 0 else str(track_delta)
-                                details.append(f"Tracks: {tb} → {ta} ({delta_str})")
-                            if cbefore is not None and cafter is not None:
-                                cluster_delta = cafter - cbefore
-                                delta_str = f"+{cluster_delta}" if cluster_delta > 0 else str(cluster_delta)
-                                details.append(f"Clusters: {cbefore} → {cafter} ({delta_str})")
-                            if faces_after is not None:
-                                details.append(f"Faces: {faces_after}")
-                            # Display success message with details
-                            _invalidate_assignment_caches()  # Clear caches so UI reflects changes
-                            # Track last cleanup timestamp and add to history
-                            now_iso = datetime.datetime.now().isoformat()
-                            st.session_state[f"last_cleanup:{ep_id}"] = now_iso
-                            # Add to cleanup history (keep last 10)
-                            history_key = f"cleanup_history:{ep_id}"
-                            history = st.session_state.get(history_key, [])
-                            history.insert(0, {
-                                "timestamp": now_iso,
-                                "actions": selected_actions,
-                                "details": details,
-                                "backup_id": backup_resp.get("backup_id") if backup_resp else None,
-                            })
-                            st.session_state[history_key] = history[:10]  # Keep last 10
-                            if details:
-                                st.success(f"✓ Cleanup complete! {' · '.join(details)}")
-                            else:
-                                st.success("✓ Cleanup complete!")
-                            st.rerun()
-    with action_cols[2]:
-        # Enhancement #8: Auto-link option
-        auto_link_enabled = st.checkbox(
-            "🔗 Auto-assign",
-            value=True,
-            key="auto_link_checkbox",
-            help="Automatically assign clusters to cast members when facebank similarity ≥85%",
-        )
-        # Row of action buttons
-        btn_row = st.columns([1, 1, 1])
+        # Row of action buttons: REFRESH and AUTO-ASSIGN
+        btn_row = st.columns([1, 1])
         with btn_row[0]:
             refresh_clicked = st.button(
-                "🔄 Refresh Values",
+                "🔄 Refresh",
                 key="facebank_refresh_similarity_button",
                 type="primary",
-                help="Recompute similarity scores and refresh suggestions",
+                help="Recompute similarity scores, refresh suggestions, and save progress",
             )
         with btn_row[1]:
-            if st.button(
-                "💾 Save Progress",
-                key="facebank_save_progress_top",
-                help="Save all current assignments to disk",
-            ):
-                with st.spinner("Saving assignments and refreshing suggestions..."):
-                    suggestions_map, saved_count = _persist_and_refresh_cast_suggestions(ep_id)
-                if saved_count is not None:
-                    st.toast(f"✅ Saved {saved_count} assignment(s)")
-                elif suggestions_map:
-                    st.toast("✅ Assignments saved")
-                else:
-                    st.error("Failed to save assignments - see logs for details")
-        with btn_row[2]:
-            if st.button(
-                "💡 Smart Suggestions",
-                key="open_smart_suggestions",
-                help="Review and accept cast suggestions for unassigned clusters and auto-clustered people",
-            ):
-                success = False
-                with st.spinner("Recomputing Smart Suggestions from latest assignments..."):
-                    suggestions_map, saved_count = _persist_and_refresh_cast_suggestions(ep_id)
-                    success = bool(suggestions_map) or saved_count is not None
-                    if suggestions_map:
-                        st.toast(f"Refreshed suggestions for {len(suggestions_map)} cluster(s)")
-                    elif saved_count is not None:
-                        st.toast("Assignments saved; no new suggestions found")
-                    else:
-                        st.error("Failed to refresh Smart Suggestions")
-                if success:
-                    helpers.try_switch_page("pages/3_Smart_Suggestions.py")
+            auto_assign_clicked = st.button(
+                "🔗 Auto-assign",
+                key="facebank_auto_assign_button",
+                help="Automatically assign clusters to cast members when facebank similarity ≥85%",
+            )
 
-        # Recovery button row with settings
-        recovery_row = st.columns([1, 1, 1])
+        # Recovery button row: RECOVER NOISE TRACKS and CLUSTER CLEANUP
+        recovery_row = st.columns([1, 1])
         with recovery_row[0]:
             with st.popover("🔧 Recover Noise Tracks", help="Expand single-frame tracks by finding similar faces"):
                 st.markdown("**Recovery Settings:**")
@@ -1503,15 +1233,274 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                             st.caption(f"**{time_str}**: ±{fw} frames, ≥{ms}%")
                             st.caption(f"  ↳ {expanded} tracks expanded, {merged} faces merged")
         with recovery_row[1]:
-            # Show last recovery timestamp if available
-            last_recovery = st.session_state.get(f"last_recovery:{ep_id}")
-            if last_recovery:
-                try:
-                    dt = datetime.datetime.fromisoformat(last_recovery)
-                    st.caption(f"🕐 Last run: {dt.strftime('%b %d, %H:%M')}")
-                except (ValueError, TypeError):
-                    pass
+            # Cluster Cleanup popover (moved from old location)
+            with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
+                st.info(
+                    "Cleanup focuses on **Needs Cast Assignment** items only: unassigned clusters, tracks, frames, and crops. "
+                    "It fixes noisy tracks, refreshes embeddings, and regroups unassigned clusters into draft people without touching named cast links."
+                )
+                # Show last cleanup timestamp if available
+                last_cleanup = st.session_state.get(f"last_cleanup:{ep_id}")
+                if last_cleanup:
+                    try:
+                        dt = datetime.datetime.fromisoformat(last_cleanup)
+                        st.caption(f"🕐 Last cleanup: {dt.strftime('%b %d, %H:%M')}")
+                    except (ValueError, TypeError):
+                        pass
 
+                # Enhancement #3: Show cleanup preview first
+                preview_resp = _safe_api_get(f"/episodes/{ep_id}/cleanup_preview")
+                if preview_resp and preview_resp.get("preview"):
+                    preview = preview_resp["preview"]
+                    warning_level = preview.get("warning_level", "low")
+                    warnings = preview.get("warnings", [])
+
+                    # Show warning banner based on level
+                    if warning_level == "high":
+                        st.error("⚠️ **High Impact Warning**")
+                    elif warning_level == "medium":
+                        st.warning("⚡ **Medium Impact Warning**")
+
+                    # Show preview stats
+                    st.caption(
+                        f"📊 {preview.get('total_clusters', 0)} clusters "
+                        f"({preview.get('assigned_clusters', 0)} assigned, "
+                        f"{preview.get('unassigned_clusters', 0)} unassigned)"
+                    )
+                    if preview.get("manual_assignments_count", 0) > 0:
+                        st.caption(f"🔒 {preview.get('manual_assignments_count')} manually assigned cluster(s)")
+                    if preview.get("potential_merges", 0) > 0:
+                        st.caption(f"🔄 {preview.get('potential_merges')} potential merge(s)")
+
+                    # Show warnings
+                    for warning in warnings:
+                        st.info(warning)
+
+                st.markdown("---")
+
+                # Quick Cleanup Presets
+                st.markdown("**Quick Presets:**")
+                preset_cols = st.columns(2)
+                with preset_cols[0]:
+                    if st.button("🚀 Quick Fix", key="preset_quick", help="Low risk: Just fix tracking issues"):
+                        st.session_state["cleanup_preset"] = "quick"
+                        st.rerun()
+                with preset_cols[1]:
+                    if st.button("⚡ Standard", key="preset_standard", help="Recommended: Fix + reembed + regroup unassigned"):
+                        st.session_state["cleanup_preset"] = "standard"
+                        st.rerun()
+
+                # Apply preset if set
+                active_preset = st.session_state.get("cleanup_preset", "standard")
+                preset_defaults = {
+                    "quick": {"split_tracks": True, "reembed": False, "group_clusters": False},
+                    "standard": {"split_tracks": True, "reembed": True, "group_clusters": True},
+                }
+                current_defaults = preset_defaults.get(active_preset, preset_defaults["standard"])
+
+                st.markdown("---")
+                st.markdown("**Select cleanup actions (unassigned-only):**")
+
+                # Define actions with risk levels (defaults come from preset)
+                cleanup_actions = {
+                    "split_tracks": {
+                        "label": "Fix tracking issues (split_tracks)",
+                        "help": "Use when: A track contains multiple different people (identity switch mid-track). Splits incorrectly merged tracks. Low risk - usually beneficial.",
+                        "default": current_defaults.get("split_tracks", True),
+                        "risk": "low",
+                        "est_time": "~30s",
+                    },
+                    "reembed": {
+                        "label": "Regenerate embeddings (reembed)",
+                        "help": "Use when: Face quality has changed or embeddings seem outdated. Recalculates face embeddings for unassigned clusters. Low risk - just regenerates vectors.",
+                        "default": current_defaults.get("reembed", True),
+                        "risk": "low",
+                        "est_time": "~1-2min",
+                    },
+                    "group_clusters": {
+                        "label": "Auto-group clusters (group_clusters)",
+                        "help": "Use when: You have unassigned clusters that need to be matched to people. Groups similar unassigned clusters into draft people (remains Needs Cast Assignment until named).",
+                        "default": current_defaults.get("group_clusters", True),
+                        "risk": "medium",
+                        "est_time": "~1min",
+                    },
+                }
+
+                selected_actions = []
+                for action_key, action_info in cleanup_actions.items():
+                    risk_badge = ""
+                    if action_info["risk"] == "high":
+                        risk_badge = " ⚠️"
+                    elif action_info["risk"] == "medium":
+                        risk_badge = " ⚡"
+
+                    est_time = action_info.get("est_time", "")
+                    time_badge = f" ({est_time})" if est_time else ""
+
+                    checked = st.checkbox(
+                        f"{action_info['label']}{risk_badge}{time_badge}",
+                        value=action_info["default"],
+                        key=f"cleanup_action_{action_key}",
+                        help=action_info["help"],
+                    )
+                    if checked:
+                        selected_actions.append(action_key)
+
+                # Show total estimated time
+                if selected_actions:
+                    time_map = {"split_tracks": 30, "reembed": 90, "group_clusters": 60}
+                    total_seconds = sum(time_map.get(a, 0) for a in selected_actions)
+                    if total_seconds >= 60:
+                        est_str = f"~{total_seconds // 60}min {total_seconds % 60}s" if total_seconds % 60 else f"~{total_seconds // 60}min"
+                    else:
+                        est_str = f"~{total_seconds}s"
+                    st.caption(f"⏱️ Estimated total time: {est_str}")
+
+                # Protection for recently-edited identities
+                recently_edited = st.session_state.get(f"recently_edited_identities:{ep_id}", {})
+                num_recent = len(recently_edited)
+                protect_recent = st.checkbox(
+                    f"🛡️ Protect recently-edited ({num_recent})",
+                    value=True if num_recent > 0 else False,
+                    key="protect_recent_edits",
+                    help="Skip identities you've manually edited during cleanup to preserve your work",
+                    disabled=num_recent == 0,
+                )
+                if num_recent > 0 and protect_recent:
+                    st.caption(f"  ↳ {num_recent} identitie(s) will be protected")
+
+                # Enhancement #7: Show backup/restore info
+                backups_resp = _safe_api_get(f"/episodes/{ep_id}/backups")
+                backups = backups_resp.get("backups", []) if backups_resp else []
+                if backups:
+                    latest = backups[0].get("backup_id", "")
+                    st.caption(f"💾 Last backup: {latest[-20:] if len(latest) > 20 else latest}")
+                    if st.button("↩️ Undo Last Cleanup", key="restore_backup_btn", help="Restore to previous state"):
+                        restore_resp = _api_post(f"/episodes/{ep_id}/restore/{latest}", {})
+                        if restore_resp and restore_resp.get("files_restored", 0) > 0:
+                            _invalidate_assignment_caches()  # Clear caches so UI reflects restored state
+                            st.success("✓ Restored from backup!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to restore from backup. Check API logs.")
+
+                # Show cleanup history
+                history = st.session_state.get(f"cleanup_history:{ep_id}", [])
+                if history:
+                    with st.expander(f"📜 Cleanup History ({len(history)})", expanded=False):
+                        for i, entry in enumerate(history[:5]):  # Show last 5
+                            try:
+                                dt = datetime.datetime.fromisoformat(entry["timestamp"])
+                                time_str = dt.strftime("%b %d, %H:%M")
+                            except (ValueError, TypeError, KeyError):
+                                time_str = "Unknown"
+                            actions_str = ", ".join(entry.get("actions", []))
+                            details_str = " · ".join(entry.get("details", []))
+                            st.caption(f"**{time_str}**: {actions_str}")
+                            if details_str:
+                                st.caption(f"  ↳ {details_str}")
+
+                st.markdown("---")
+
+                # Dry-run option
+                dry_run_cols = st.columns([1, 1])
+                with dry_run_cols[0]:
+                    if st.button("👁️ Preview Changes", key="cleanup_dry_run", help="Show what would change without making changes"):
+                        if not selected_actions:
+                            st.warning("No cleanup actions selected.")
+                        else:
+                            with st.spinner("Analyzing potential changes..."):
+                                # Get detailed preview
+                                preview_detail = _safe_api_get(f"/episodes/{ep_id}/cleanup_preview")
+                                if preview_detail and preview_detail.get("preview"):
+                                    p = preview_detail["preview"]
+                                    st.info("**Dry Run Results:**")
+                                    st.write(f"• Current clusters: {p.get('total_clusters', 0)}")
+                                    st.write(f"• Assigned: {p.get('assigned_clusters', 0)}")
+                                    st.write(f"• Unassigned: {p.get('unassigned_clusters', 0)}")
+                                    if "recluster" in selected_actions:
+                                        st.warning("⚠️ Recluster selected - all cluster assignments may be reset!")
+                                    if "split_tracks" in selected_actions:
+                                        st.write("• split_tracks: May fix tracks with multiple identities")
+                                    if "reembed" in selected_actions:
+                                        st.write("• reembed: Will regenerate all face embeddings")
+                                    if "group_clusters" in selected_actions:
+                                        merges = p.get("potential_merges", 0)
+                                        st.write(f"• group_clusters: ~{merges} potential cluster merge(s)")
+
+                with dry_run_cols[1]:
+                    pass  # Placeholder for layout
+
+                if st.button("Run Selected Cleanup", key="facebank_cleanup_button", type="primary"):
+                    if not selected_actions:
+                        st.warning("No cleanup actions selected.")
+                    else:
+                        # Enhancement #7: Auto-backup before cleanup
+                        backup_resp = _api_post(f"/episodes/{ep_id}/backup", {})
+                        if not backup_resp:
+                            st.error("Failed to create backup before cleanup. Aborting.")
+                        else:
+                            payload = helpers.default_cleanup_payload(ep_id)
+                            payload["actions"] = selected_actions
+                            # Add protected identity IDs if enabled
+                            if protect_recent and recently_edited:
+                                payload["protected_identity_ids"] = list(recently_edited.keys())
+                            with st.spinner(f"Running cleanup ({', '.join(selected_actions)})…"):
+                                summary, error_message = helpers.run_job_with_progress(
+                                    ep_id,
+                                    "/jobs/episode_cleanup_async",
+                                    payload,
+                                    requested_device=helpers.DEFAULT_DEVICE,
+                                    async_endpoint="/jobs/episode_cleanup_async",
+                                    requested_detector=helpers.DEFAULT_DETECTOR,
+                                    requested_tracker=helpers.DEFAULT_TRACKER,
+                                    use_async_only=True,
+                                )
+                            if error_message:
+                                st.error(error_message)
+                            else:
+                                report = summary or {}
+                                if isinstance(report.get("summary"), dict):
+                                    report = report["summary"]
+                                # Build summary of changes
+                                details: List[str] = []
+                                tb = helpers.coerce_int(report.get("tracks_before"))
+                                ta = helpers.coerce_int(report.get("tracks_after"))
+                                cbefore = helpers.coerce_int(report.get("clusters_before"))
+                                cafter = helpers.coerce_int(report.get("clusters_after"))
+                                faces_after = helpers.coerce_int(report.get("faces_after"))
+                                if tb is not None and ta is not None:
+                                    track_delta = ta - tb
+                                    delta_str = f"+{track_delta}" if track_delta > 0 else str(track_delta)
+                                    details.append(f"Tracks: {tb} → {ta} ({delta_str})")
+                                if cbefore is not None and cafter is not None:
+                                    cluster_delta = cafter - cbefore
+                                    delta_str = f"+{cluster_delta}" if cluster_delta > 0 else str(cluster_delta)
+                                    details.append(f"Clusters: {cbefore} → {cafter} ({delta_str})")
+                                if faces_after is not None:
+                                    details.append(f"Faces: {faces_after}")
+                                # Display success message with details
+                                _invalidate_assignment_caches()  # Clear caches so UI reflects changes
+                                # Track last cleanup timestamp and add to history
+                                now_iso = datetime.datetime.now().isoformat()
+                                st.session_state[f"last_cleanup:{ep_id}"] = now_iso
+                                # Add to cleanup history (keep last 10)
+                                history_key = f"cleanup_history:{ep_id}"
+                                history = st.session_state.get(history_key, [])
+                                history.insert(0, {
+                                    "timestamp": now_iso,
+                                    "actions": selected_actions,
+                                    "details": details,
+                                    "backup_id": backup_resp.get("backup_id") if backup_resp else None,
+                                })
+                                st.session_state[history_key] = history[:10]  # Keep last 10
+                                if details:
+                                    st.success(f"✓ Cleanup complete! {' · '.join(details)}")
+                                else:
+                                    st.success("✓ Cleanup complete!")
+                                st.rerun()
+
+    # Progress area below the buttons
     # Progress area below the buttons
     refresh_progress_area = st.empty()
     recovery_progress_area = st.empty()
@@ -1639,34 +1628,11 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                     status.update(label="❌ Refresh failed", state="error")
                     st.error("Failed to refresh similarity values. Check logs.")
                 else:
-                    auto_linked_count = 0
-                    log_entries = []
-
                     # Show refresh stats
                     tracks_processed = refresh_resp.get("tracks_processed", 0)
                     centroids_computed = refresh_resp.get("centroids_computed", 0)
                     st.write(f"✓ Processed {tracks_processed} tracks")
                     st.write(f"✓ Computed {centroids_computed} cluster centroids")
-                    log_entries.append(f"Tracks: {tracks_processed}, Centroids: {centroids_computed}")
-
-                    # Enhancement #8: Auto-link high confidence matches
-                    if auto_link_enabled:
-                        st.write("🔗 Auto-assigning high confidence matches...")
-                        auto_link_resp = _api_post(f"/episodes/{ep_id}/auto_link_cast", {})
-                        if auto_link_resp and auto_link_resp.get("auto_assigned", 0) > 0:
-                            auto_linked_count = auto_link_resp["auto_assigned"]
-                            assignments = auto_link_resp.get("assignments", [])
-                            st.write(f"✓ Auto-assigned {auto_linked_count} cluster(s)")
-                            for asn in assignments[:5]:  # Show first 5
-                                st.write(
-                                    f"  • {asn.get('cluster_id')} → "
-                                    f"{asn.get('cast_name')} ({int(asn.get('similarity', 0) * 100)}%)"
-                                )
-                            if len(assignments) > 5:
-                                st.write(f"  ... and {len(assignments) - 5} more")
-                            log_entries.append(f"Auto-assigned: {auto_linked_count}")
-                        else:
-                            st.write("✓ No high-confidence matches to auto-assign")
 
                     # Step 2: Refresh cluster suggestions based on new similarity values
                     st.write("📊 Refreshing cluster suggestions...")
@@ -1683,15 +1649,33 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                         }
                         num_suggestions = len(cast_suggestions_resp.get("suggestions", []))
                         st.write(f"✓ Found {num_suggestions} cluster(s) with cast suggestions")
-                        log_entries.append(f"Cast suggestions: {num_suggestions}")
 
                     # Update status
-                    if auto_linked_count > 0:
-                        status.update(label=f"✅ Refreshed & auto-assigned {auto_linked_count} cluster(s)", state="complete")
-                    else:
-                        status.update(label="✅ Refresh complete!", state="complete")
+                    status.update(label="✅ Refresh complete!", state="complete")
 
                     st.rerun()
+
+    if auto_assign_clicked:
+        with refresh_progress_area.container():
+            with st.status("Auto-assigning clusters to cast...", expanded=True) as status:
+                st.write("🔗 Finding high confidence matches...")
+                auto_link_resp = _api_post(f"/episodes/{ep_id}/auto_link_cast", {})
+                if auto_link_resp and auto_link_resp.get("auto_assigned", 0) > 0:
+                    auto_linked_count = auto_link_resp["auto_assigned"]
+                    assignments = auto_link_resp.get("assignments", [])
+                    st.write(f"✓ Auto-assigned {auto_linked_count} cluster(s)")
+                    for asn in assignments[:5]:  # Show first 5
+                        st.write(
+                            f"  • {asn.get('cluster_id')} → "
+                            f"{asn.get('cast_name')} ({int(asn.get('similarity', 0) * 100)}%)"
+                        )
+                    if len(assignments) > 5:
+                        st.write(f"  ... and {len(assignments) - 5} more")
+                    status.update(label=f"✅ Auto-assigned {auto_linked_count} cluster(s)", state="complete")
+                    st.rerun()
+                else:
+                    st.write("ℹ️ No high-confidence matches found to auto-assign")
+                    status.update(label="✅ No matches to auto-assign", state="complete")
 
     return detail
 
@@ -3861,29 +3845,8 @@ def _render_people_view(
 
     if assignment_queue:
         st.markdown("---")
-        header_col1, header_col2, header_col3 = st.columns([3, 1, 1])
-        with header_col1:
-            st.markdown(f"### 🔍 Needs Cast Assignment ({len(assignment_queue)})")
-            st.caption("Auto-people and unassigned clusters combined. Review suggestions and assign quickly.")
-        with header_col2:
-            if st.button(
-                "💾 Save Progress",
-                key=f"save_progress_{ep_id}",
-                help="Save all current assignments",
-            ):
-                with st.spinner("Saving progress..."):
-                    save_resp = _api_post(f"/episodes/{ep_id}/save_assignments", {})
-                    if save_resp and save_resp.get("status") == "success":
-                        st.success(f"✅ Saved {save_resp.get('saved_count', 0)} assignment(s)!")
-                    else:
-                        st.error("Failed to save progress. Check logs.")
-        with header_col3:
-            if st.button("🔄 Refresh Suggestions", key=f"refresh_suggestions_{ep_id}"):
-                with st.spinner("Refreshing suggestions..."):
-                    refreshed = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
-                    if refreshed:
-                        st.success("Suggestions refreshed!")
-                    st.rerun()
+        st.markdown(f"### 🔍 Needs Cast Assignment ({len(assignment_queue)})")
+        st.caption("Auto-people and unassigned clusters combined. Review suggestions and assign quickly.")
 
         for item in assignment_queue:
             if item.get("kind") == "person":
@@ -3990,7 +3953,7 @@ def _render_person_clusters(
         if st.button(
             f"🎭 View All {total_tracks} Tracks (Outlier Detection)",
             key=f"view_all_tracks_{person_id}",
-            help="Grid view with one crop per track. Sort by Cast Track Score to find misassigned tracks.",
+            help="Grid view with one crop per track. Sort by Person Cohesion to find misassigned tracks.",
         ):
             _set_view("cast_tracks", person_id=person_id)
             st.rerun()
@@ -4070,7 +4033,7 @@ def _render_person_clusters(
         st.markdown(f"**All {len(all_tracks)} Tracks**")
         if avg_cast_score is not None:
             st.caption(
-                f"Avg Cast Track Score {render_similarity_badge(avg_cast_score, SimilarityType.CAST_TRACK)}"
+                f"Avg Person Cohesion {render_similarity_badge(avg_cast_score, SimilarityType.PERSON_COHESION)}"
                 f" · Low (<55%): {low_cast_tracks}",
                 unsafe_allow_html=True,
             )
@@ -4269,7 +4232,7 @@ def _render_cast_all_tracks(
     """Render all tracks for a cast member/person as a grid with one crop per track.
 
     This view is optimized for outlier detection - shows one representative crop per track
-    with sorting by Cast Track Score and Track Similarity to find misassigned tracks.
+    with sorting by Person Cohesion and Track Similarity to find misassigned tracks.
     """
     _render_view_header("cast_tracks")
     st.button(
@@ -4391,7 +4354,7 @@ def _render_cast_all_tracks(
     st.markdown(f"**{len(all_tracks)} Tracks** · {total_faces} frames total")
     if avg_cast_score is not None:
         st.caption(
-            f"Avg Cast Track Score {render_similarity_badge(avg_cast_score, SimilarityType.CAST_TRACK)}"
+            f"Avg Person Cohesion {render_similarity_badge(avg_cast_score, SimilarityType.PERSON_COHESION)}"
             f" · Low (<55%): {low_cast_tracks}",
             unsafe_allow_html=True,
         )
@@ -4445,9 +4408,9 @@ def _render_cast_all_tracks(
                     track_num = track_id_str.replace("track_", "")
                 st.markdown(f"**Track {track_num}**")
 
-                # Badges - show both Track Similarity and Cast Track Score
+                # Badges - show both Track Similarity and Person Cohesion
                 track_badge = render_similarity_badge(track_sim, SimilarityType.TRACK)
-                cast_badge = render_similarity_badge(cast_track_score, SimilarityType.CAST_TRACK) if cast_track_score is not None else '<span style="color: #888;">N/A</span>'
+                cast_badge = render_similarity_badge(cast_track_score, SimilarityType.PERSON_COHESION) if cast_track_score is not None else '<span style="color: #888;">N/A</span>'
                 st.markdown(f"TRK {track_badge} · MATCH {cast_badge}", unsafe_allow_html=True)
 
                 st.caption(f"{frame_count} frames · `{cluster_id[:8]}...`")
@@ -5086,7 +5049,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                 )
             if cast_track_score is not None:
                 st.caption(
-                    f"Cast Track Score {render_similarity_badge(cast_track_score, SimilarityType.CAST_TRACK)}",
+                    f"Person Cohesion {render_similarity_badge(cast_track_score, SimilarityType.PERSON_COHESION)}",
                     unsafe_allow_html=True,
                 )
         with summary_cols[1]:
