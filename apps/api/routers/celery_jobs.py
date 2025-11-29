@@ -36,6 +36,7 @@ Override defaults by setting SCREENALYTICS_MAX_CPU_THREADS environment variable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -718,7 +719,10 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
     if execution_mode == "local":
         project_root = _find_project_root()
         command = _build_detect_track_command(req.ep_id, options, project_root)
-        result = _run_local_subprocess(command, req.ep_id, "detect_track", options)
+        # Run blocking subprocess in thread pool to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            _run_local_subprocess, command, req.ep_id, "detect_track", options
+        )
 
         if all_warnings:
             result["warnings"] = all_warnings
@@ -808,7 +812,10 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
     if execution_mode == "local":
         project_root = _find_project_root()
         command = _build_faces_embed_command(req.ep_id, options, project_root)
-        result = _run_local_subprocess(command, req.ep_id, "faces_embed", options)
+        # Run blocking subprocess in thread pool to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            _run_local_subprocess, command, req.ep_id, "faces_embed", options
+        )
 
         if all_warnings:
             result["warnings"] = all_warnings
@@ -896,7 +903,10 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
     if execution_mode == "local":
         project_root = _find_project_root()
         command = _build_cluster_command(req.ep_id, options, project_root)
-        result = _run_local_subprocess(command, req.ep_id, "cluster", options)
+        # Run blocking subprocess in thread pool to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            _run_local_subprocess, command, req.ep_id, "cluster", options
+        )
 
         if all_warnings:
             result["warnings"] = all_warnings
