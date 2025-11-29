@@ -167,7 +167,7 @@ except Exception:
 
 # Similarity Scores Color Key (native Streamlit layout to avoid raw HTML)
 with st.expander("📊 Similarity Scores Guide", expanded=False):
-    st.markdown("### Similarity Types")
+    st.markdown("### Core Similarity Types")
 
     def _render_similarity_card(color: str, title: str, description: str, details: List[str]) -> None:
         st.markdown(
@@ -212,7 +212,7 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             SIMILARITY_COLORS[SimilarityType.IDENTITY].strong,
             "Identity Similarity",
             "How similar clusters are for AUTO-GENERATED PEOPLE.",
-            ["≥ 75%: Strong match", "60–74%: Good match", "< 60%: Weak match"],
+            ["≥ 75%: Strong match", "70–74%: Good match", "< 70%: Needs review"],
         )
     with col2:
         _render_similarity_card(
@@ -222,7 +222,7 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             ["≥ 68%: Auto-assigns to cast", "50–67%: Requires review", "< 50%: Weak match"],
         )
 
-    # Row 2: Track Similarity (Orange) and Frame Similarity (Light Orange)
+    # Row 2: Track Similarity (Orange) and Cluster Cohesion (Green)
     try:
         col3, col4 = st.columns(2)
     except Exception:
@@ -231,53 +231,112 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
         _render_similarity_card(
             SIMILARITY_COLORS[SimilarityType.TRACK].strong,
             "Track Similarity",
-            "How similar FRAMES within a TRACK are to each other.",
-            ["≥ 85%: Strong consistency", "70–84%: Good consistency", "< 70%: Weak consistency"],
+            "How consistent FRAMES within a TRACK are. Shows excluded frames.",
+            ["≥ 85%: Strong consistency", "70–84%: Good consistency", "< 70%: Weak"],
         )
     with col4:
         _render_similarity_card(
-            SIMILARITY_COLORS[SimilarityType.FRAME].strong,
-            "Frame Similarity",
-            "How similar a specific frame is to rest of frames in track.",
-            ["≥ 80%: Strong match", "65–79%: Good match", "< 65%: Potential outlier"],
+            SIMILARITY_COLORS[SimilarityType.CLUSTER].strong,
+            "Cluster Cohesion",
+            "How cohesive tracks in a cluster are. Shows min-max range.",
+            ["≥ 80%: Tight cluster", "60–79%: Moderate", "< 60%: Loose cluster"],
         )
 
-    # Row 3: Cluster Similarity (Green) and Person Cohesion (Teal)
+    # Row 3: Person Cohesion (Teal) and Quality Score (Green)
     try:
         col5, col6 = st.columns(2)
     except Exception:
         col5 = col6 = st
     with col5:
         _render_similarity_card(
-            SIMILARITY_COLORS[SimilarityType.CLUSTER].strong,
-            "Cluster Cohesion",
-            "How cohesive/similar all tracks in a cluster are. Shows min-max range.",
-            ["≥ 80%: Tight cluster", "60–79%: Moderate cohesion", "< 60%: Loose cluster"],
+            SIMILARITY_COLORS[SimilarityType.PERSON_COHESION].strong,
+            "Person Cohesion",
+            "How well a track fits with other tracks of same person.",
+            ["≥ 70%: Strong fit", "50–69%: Good fit", "< 50%: Poor (review)"],
         )
     with col6:
         _render_similarity_card(
-            SIMILARITY_COLORS[SimilarityType.PERSON_COHESION].strong,
-            "Person Cohesion",
-            "How well a track fits with other tracks assigned to same person.",
-            ["≥ 70%: Strong fit", "50–69%: Good fit", "< 50%: Poor fit (review)"],
-        )
-
-    # Row 4: Quality Score (Green - separate from similarity)
-    try:
-        col7, col8 = st.columns(2)
-    except Exception:
-        col7 = col8 = st
-    with col7:
-        _render_similarity_card(
             "#4CAF50",
             "Quality Score",
-            "Detection confidence + sharpness + face area. Appears as `Q: XX%` badge.",
-            ["≥ 85%: High quality", "60–84%: Medium quality", "< 60%: Low quality"],
+            "Detection + sharpness + area. Hover for Det/Sharp/Area breakdown.",
+            ["≥ 85%: High (green)", "60–84%: Medium (amber)", "< 60%: Low (red)"],
         )
-    with col8:
-        st.empty()
+
+    # NEW METRICS SECTION (Nov 2024)
+    st.markdown("---")
+    st.markdown(
+        "### New Metrics "
+        '<span style="background:#E91E63;color:white;padding:2px 6px;border-radius:3px;'
+        'font-size:10px;font-weight:bold;margin-left:6px;">NOV 2024</span>',
+        unsafe_allow_html=True,
+    )
+
+    # Row 5: Temporal Consistency and Ambiguity Score
+    try:
+        col9, col10 = st.columns(2)
+    except Exception:
+        col9 = col10 = st
+    with col9:
+        _render_similarity_card(
+            SIMILARITY_COLORS[SimilarityType.TEMPORAL].strong,
+            "Temporal Consistency",
+            "How consistent a person looks across time in episode.",
+            ["≥ 80%: Consistent", "60–79%: Variable", "< 60%: Significant changes"],
+        )
+    with col10:
+        _render_similarity_card(
+            SIMILARITY_COLORS[SimilarityType.AMBIGUITY].weak,  # Red for risky
+            "Ambiguity Score",
+            "Gap between 1st and 2nd best match. LOW = risky.",
+            ["≥ 15%: Clear winner", "8–14%: OK", "< 8%: Risky (review!)"],
+        )
+
+    # Row 6: Cluster Isolation and Confidence Trend
+    try:
+        col11, col12 = st.columns(2)
+    except Exception:
+        col11 = col12 = st
+    with col11:
+        _render_similarity_card(
+            SIMILARITY_COLORS[SimilarityType.ISOLATION].strong,
+            "Cluster Isolation",
+            "Distance to nearest cluster. LOW = merge candidate.",
+            ["≥ 40%: Well isolated", "25–39%: Moderate", "< 25%: Close (merge?)"],
+        )
+    with col12:
+        _render_similarity_card(
+            SIMILARITY_COLORS[SimilarityType.CONFIDENCE_TREND].strong,
+            "Confidence Trend",
+            "Is assignment confidence improving or degrading?",
+            ["↑ Improving (green)", "→ Stable (gray)", "↓ Degrading (red)"],
+        )
 
     st.markdown("---")
+    st.markdown("### Enhanced Badge Features")
+    enhanced_df = {
+        "Badge": [
+            "CAST: 68% (#1 of 5)",
+            "CLU: 72% (58-89%)",
+            "TRK: 85% (3 excl)",
+            "Q: 82%",
+            "OUTLIER: 45% ⚠️",
+            "AMB: Risky (3%)",
+            "ISO: Close",
+            "↑ Improving",
+        ],
+        "Enhancement": [
+            "Shows rank among all cast suggestions",
+            "Shows min-max range for cluster cohesion",
+            "Shows frames excluded from centroid",
+            "Hover to see Det/Sharp/Area breakdown",
+            "Only shown on frames below threshold",
+            "Gap to 2nd best match - risky assignments",
+            "Merge candidate indicator",
+            "Confidence trend over time",
+        ],
+    }
+    st.table(enhanced_df)
+
     st.markdown("### Quality Indicators")
     quality_df = {
         "Badge": [
@@ -285,8 +344,8 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             "Q: 60-84%",
             "Q: < 60%",
             "ID: 75%+",
-            "ID: 60-74%",
-            "ID: < 60%",
+            "ID: 70-74%",
+            "ID: < 70%",
         ],
         "Meaning": [
             "High quality (sharp, complete face, good detection)",
@@ -294,7 +353,7 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
             "Low quality (partial face, blurry, or low confidence)",
             "Strong identity match to track",
             "Good identity match",
-            "Weak identity match (may be wrong person)",
+            "Needs review (threshold raised from 60%)",
         ],
     }
     st.table(quality_df)
@@ -305,6 +364,7 @@ with st.expander("📊 Similarity Scores Guide", expanded=False):
         - **★ BEST QUALITY (green)** – Complete face, high quality, good ID match
         - **⚠ BEST AVAILABLE (orange)** – Partial/low-quality, best available frame
         - **Partial (orange pill)** – Edge-clipped or incomplete face
+        - **OUTLIER: XX% ⚠️** – Frame differs significantly from track (only shown on outliers)
 
         📚 **Full guide:** `docs/similarity-scores-guide.md`
         """,
@@ -1143,110 +1203,108 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 help="Automatically assign clusters to cast members when facebank similarity ≥85%",
             )
 
-        # Recovery button row: RECOVER NOISE TRACKS and CLUSTER CLEANUP
-        recovery_row = st.columns([1, 1])
-        with recovery_row[0]:
-            with st.popover("🔧 Recover Noise Tracks", help="Expand single-frame tracks by finding similar faces"):
-                st.markdown("**Recovery Settings:**")
+        # Recovery controls
+        with st.popover("🔧 Recover Noise Tracks", help="Expand single-frame tracks by finding similar faces"):
+            st.markdown("**Recovery Settings:**")
 
-                # Show last recovery timestamp if available
-                last_recovery = st.session_state.get(f"last_recovery:{ep_id}")
-                if last_recovery:
-                    try:
-                        dt = datetime.datetime.fromisoformat(last_recovery)
-                        st.caption(f"🕐 Last run: {dt.strftime('%b %d, %H:%M')}")
-                    except (ValueError, TypeError):
-                        pass
+            # Show last recovery timestamp if available
+            last_recovery = st.session_state.get(f"last_recovery:{ep_id}")
+            if last_recovery:
+                try:
+                    dt = datetime.datetime.fromisoformat(last_recovery)
+                    st.caption(f"🕐 Last run: {dt.strftime('%b %d, %H:%M')}")
+                except (ValueError, TypeError):
+                    pass
 
-                # Configurable settings
-                frame_window = st.slider(
-                    "Frame Window (±)",
-                    min_value=1,
-                    max_value=30,
-                    value=st.session_state.get("recovery_frame_window", 8),
-                    key="recovery_frame_window_slider",
-                    help="Number of frames to search before/after each single-frame track",
+            # Configurable settings
+            frame_window = st.slider(
+                "Frame Window (±)",
+                min_value=1,
+                max_value=30,
+                value=st.session_state.get("recovery_frame_window", 8),
+                key="recovery_frame_window_slider",
+                help="Number of frames to search before/after each single-frame track",
+            )
+            st.session_state["recovery_frame_window"] = frame_window
+
+            min_similarity = st.slider(
+                "Min Similarity (%)",
+                min_value=50,
+                max_value=100,
+                value=st.session_state.get("recovery_min_similarity", 70),
+                key="recovery_min_similarity_slider",
+                help="Minimum face similarity to merge (higher = stricter matching)",
+            )
+            st.session_state["recovery_min_similarity"] = min_similarity
+
+            st.caption(f"Settings: ±{frame_window} frames, ≥{min_similarity}% similarity")
+
+            # Preview button
+            st.markdown("---")
+            if st.button("👁️ Preview", key="recovery_preview_btn", help="See what would be recovered"):
+                preview_resp = _safe_api_get(
+                    f"/episodes/{ep_id}/recover_noise_tracks/preview"
+                    f"?frame_window={frame_window}&min_similarity={min_similarity / 100:.2f}"
                 )
-                st.session_state["recovery_frame_window"] = frame_window
+                if preview_resp:
+                    st.info("**Preview:**")
+                    st.write(f"• Single-frame tracks: {preview_resp.get('single_frame_tracks', 0)}")
+                    st.write(f"• Multi-frame tracks: {preview_resp.get('multi_frame_tracks', 0)}")
+                    st.write(f"• Est. recoverable: ~{preview_resp.get('estimated_recoverable', 0)}")
 
-                min_similarity = st.slider(
-                    "Min Similarity (%)",
-                    min_value=50,
-                    max_value=100,
-                    value=st.session_state.get("recovery_min_similarity", 70),
-                    key="recovery_min_similarity_slider",
-                    help="Minimum face similarity to merge (higher = stricter matching)",
-                )
-                st.session_state["recovery_min_similarity"] = min_similarity
+            # Run button
+            recover_clicked = st.button(
+                "▶️ Run Recovery",
+                key="recover_noise_tracks",
+                type="primary",
+                help="Find and merge similar faces from adjacent frames",
+            )
 
-                st.caption(f"Settings: ±{frame_window} frames, ≥{min_similarity}% similarity")
-
-                # Preview button
+            # Undo last recovery
+            last_recovery_backup = st.session_state.get(f"last_recovery_backup:{ep_id}")
+            if last_recovery_backup:
                 st.markdown("---")
-                if st.button("👁️ Preview", key="recovery_preview_btn", help="See what would be recovered"):
-                    preview_resp = _safe_api_get(
-                        f"/episodes/{ep_id}/recover_noise_tracks/preview"
-                        f"?frame_window={frame_window}&min_similarity={min_similarity / 100:.2f}"
-                    )
-                    if preview_resp:
-                        st.info("**Preview:**")
-                        st.write(f"• Single-frame tracks: {preview_resp.get('single_frame_tracks', 0)}")
-                        st.write(f"• Multi-frame tracks: {preview_resp.get('multi_frame_tracks', 0)}")
-                        st.write(f"• Est. recoverable: ~{preview_resp.get('estimated_recoverable', 0)}")
+                if st.button("↩️ Undo Last Recovery", key="undo_recovery_btn", help="Restore to state before last recovery"):
+                    restore_resp = _api_post(f"/episodes/{ep_id}/restore/{last_recovery_backup}", {})
+                    if restore_resp and restore_resp.get("files_restored", 0) > 0:
+                        _invalidate_assignment_caches()
+                        st.session_state.pop(f"last_recovery_backup:{ep_id}", None)
+                        st.success("✓ Restored from recovery backup!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to restore from recovery backup.")
 
-                # Run button
-                recover_clicked = st.button(
-                    "▶️ Run Recovery",
-                    key="recover_noise_tracks",
-                    type="primary",
-                    help="Find and merge similar faces from adjacent frames",
-                )
+            # Show recovery history
+            history = st.session_state.get(f"recovery_history:{ep_id}", [])
+            if history:
+                with st.expander(f"📜 Recovery History ({len(history)})", expanded=False):
+                    for entry in history[:5]:
+                        try:
+                            dt = datetime.datetime.fromisoformat(entry["timestamp"])
+                            time_str = dt.strftime("%b %d, %H:%M")
+                        except (ValueError, TypeError, KeyError):
+                            time_str = "Unknown"
+                        fw = entry.get("frame_window", 8)
+                        ms = int(entry.get("min_similarity", 0.7) * 100)
+                        expanded = entry.get("tracks_expanded", 0)
+                        merged = entry.get("faces_merged", 0)
+                        st.caption(f"**{time_str}**: ±{fw} frames, ≥{ms}%")
+                        st.caption(f"  ↳ {expanded} tracks expanded, {merged} faces merged")
 
-                # Undo last recovery
-                last_recovery_backup = st.session_state.get(f"last_recovery_backup:{ep_id}")
-                if last_recovery_backup:
-                    st.markdown("---")
-                    if st.button("↩️ Undo Last Recovery", key="undo_recovery_btn", help="Restore to state before last recovery"):
-                        restore_resp = _api_post(f"/episodes/{ep_id}/restore/{last_recovery_backup}", {})
-                        if restore_resp and restore_resp.get("files_restored", 0) > 0:
-                            _invalidate_assignment_caches()
-                            st.session_state.pop(f"last_recovery_backup:{ep_id}", None)
-                            st.success("✓ Restored from recovery backup!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to restore from recovery backup.")
-
-                # Show recovery history
-                history = st.session_state.get(f"recovery_history:{ep_id}", [])
-                if history:
-                    with st.expander(f"📜 Recovery History ({len(history)})", expanded=False):
-                        for entry in history[:5]:
-                            try:
-                                dt = datetime.datetime.fromisoformat(entry["timestamp"])
-                                time_str = dt.strftime("%b %d, %H:%M")
-                            except (ValueError, TypeError, KeyError):
-                                time_str = "Unknown"
-                            fw = entry.get("frame_window", 8)
-                            ms = int(entry.get("min_similarity", 0.7) * 100)
-                            expanded = entry.get("tracks_expanded", 0)
-                            merged = entry.get("faces_merged", 0)
-                            st.caption(f"**{time_str}**: ±{fw} frames, ≥{ms}%")
-                            st.caption(f"  ↳ {expanded} tracks expanded, {merged} faces merged")
-        with recovery_row[1]:
-            # Cluster Cleanup popover (moved from old location)
-            with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
-                st.info(
-                    "Cleanup focuses on **Needs Cast Assignment** items only: unassigned clusters, tracks, frames, and crops. "
-                    "It fixes noisy tracks, refreshes embeddings, and regroups unassigned clusters into draft people without touching named cast links."
-                )
-                # Show last cleanup timestamp if available
-                last_cleanup = st.session_state.get(f"last_cleanup:{ep_id}")
-                if last_cleanup:
-                    try:
-                        dt = datetime.datetime.fromisoformat(last_cleanup)
-                        st.caption(f"🕐 Last cleanup: {dt.strftime('%b %d, %H:%M')}")
-                    except (ValueError, TypeError):
-                        pass
+        # Cluster Cleanup popover (flattened to avoid nested columns)
+        with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
+            st.info(
+                "Cleanup focuses on **Needs Cast Assignment** items only: unassigned clusters, tracks, frames, and crops. "
+                "It fixes noisy tracks, refreshes embeddings, and regroups unassigned clusters into draft people without touching named cast links."
+            )
+            # Show last cleanup timestamp if available
+            last_cleanup = st.session_state.get(f"last_cleanup:{ep_id}")
+            if last_cleanup:
+                try:
+                    dt = datetime.datetime.fromisoformat(last_cleanup)
+                    st.caption(f"🕐 Last cleanup: {dt.strftime('%b %d, %H:%M')}")
+                except (ValueError, TypeError):
+                    pass
 
                 # Enhancement #3: Show cleanup preview first
                 preview_resp = _safe_api_get(f"/episodes/{ep_id}/cleanup_preview")
@@ -1278,14 +1336,14 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
 
                 st.markdown("---")
 
-                # Quick Cleanup Presets
+                # Quick Cleanup Presets (two buttons in a single row to avoid deeper nesting)
                 st.markdown("**Quick Presets:**")
-                preset_cols = st.columns(2)
-                with preset_cols[0]:
+                preset_col_left, preset_col_right = st.columns(2)
+                with preset_col_left:
                     if st.button("🚀 Quick Fix", key="preset_quick", help="Low risk: Just fix tracking issues"):
                         st.session_state["cleanup_preset"] = "quick"
                         st.rerun()
-                with preset_cols[1]:
+                with preset_col_right:
                     if st.button("⚡ Standard", key="preset_standard", help="Recommended: Fix + reembed + regroup unassigned"):
                         st.session_state["cleanup_preset"] = "standard"
                         st.rerun()
@@ -2717,9 +2775,11 @@ def _render_unassigned_cluster_card(
                         track_internal_sim = track.get("internal_similarity")
                         # Prefer explicit track similarity, else internal similarity as fallback
                         track_sim_value = track_sim if track_sim is not None else track_internal_sim
+                        # Nov 2024: Enhanced with dropout indicator
                         track_badge = None
                         if track_sim_value is not None:
-                            track_badge = render_similarity_badge(track_sim_value, SimilarityType.TRACK)
+                            excluded_frames = track.get("excluded_frames", 0)
+                            track_badge = render_track_with_dropout(track_sim_value, excluded_frames, track_faces)
 
                         # Show track info with similarity score if available
                         caption = f"Track {track_id} · {track_faces} faces"
@@ -2767,7 +2827,9 @@ def _render_unassigned_cluster_card(
                 sugg_source = cast_sugg.get("source", "facebank")
                 faces_used = cast_sugg.get("faces_used")
 
-                sim_badge = render_similarity_badge(sugg_sim, SimilarityType.CAST, show_label=True)
+                # Nov 2024: Enhanced with rank context
+                total_suggs = min(len(cast_suggestions), 3)
+                sim_badge = render_cast_rank_badge(sugg_sim, rank=idx + 1, total_suggestions=total_suggs, cast_name=sugg_name)
                 # Confidence buckets aligned to cast thresholds (68/50)
                 conf_level = "high" if sugg_sim >= 0.68 else "medium" if sugg_sim >= 0.50 else "low"
                 confidence_colors = {
@@ -2821,7 +2883,8 @@ def _render_unassigned_cluster_card(
         if suggested_cast_id and suggested_cast_name:
             similarity_pct = int((1 - suggested_distance) * 100) if suggested_distance is not None else 0
             similarity_value = similarity_pct / 100.0 if similarity_pct else 0.0
-            cast_badge = render_similarity_badge(similarity_value, SimilarityType.CAST, show_label=True)
+            # Nov 2024: Enhanced with rank context (single suggestion = rank 1 of 1)
+            cast_badge = render_cast_rank_badge(similarity_value, rank=1, total_suggestions=1, cast_name=suggested_cast_name)
             # Confidence scoring aligned to cast thresholds (68/50)
             if similarity_value >= 0.68:
                 confidence = "HIGH"
@@ -3071,8 +3134,10 @@ def _render_auto_person_card(
                             )
                             st.markdown(thumb_markup, unsafe_allow_html=True)
 
-                        # Show cluster ID and cohesion badge
-                        cohesion_badge = render_similarity_badge(cohesion, SimilarityType.CLUSTER) if cohesion else ""
+                        # Show cluster ID and cohesion badge (Nov 2024: enhanced with range)
+                        min_sim = cluster.get("min_similarity")
+                        max_sim = cluster.get("max_similarity")
+                        cohesion_badge = render_cluster_range_badge(cohesion, min_sim, max_sim) if cohesion else ""
                         st.markdown(f"**{cluster_id}** {cohesion_badge}", unsafe_allow_html=True)
                         st.caption(f"{cluster.get('tracks', 0)} tracks · {cluster.get('faces', 0)} frames")
 
@@ -4146,7 +4211,9 @@ def _render_person_clusters(
                     else:
                         selected_track_ids.discard(track_id_int)
             with header_cols[1]:
-                badge_html = render_similarity_badge(similarity, SimilarityType.TRACK)
+                # Nov 2024: Enhanced with dropout indicator
+                excluded_frames = track.get("excluded_frames") or track_meta.get("excluded_frames", 0) if track_meta else 0
+                badge_html = render_track_with_dropout(similarity, excluded_frames, len(frames))
                 st.markdown(
                     f"**Track {track_num}** {badge_html} · Cluster `{cluster_id}` · {len(frames)} frames",
                     unsafe_allow_html=True,
@@ -4408,8 +4475,9 @@ def _render_cast_all_tracks(
                     track_num = track_id_str.replace("track_", "")
                 st.markdown(f"**Track {track_num}**")
 
-                # Badges - show both Track Similarity and Person Cohesion
-                track_badge = render_similarity_badge(track_sim, SimilarityType.TRACK)
+                # Badges - show both Track Similarity and Person Cohesion (Nov 2024: enhanced with dropout)
+                excluded_frames = track.get("excluded_frames", 0)
+                track_badge = render_track_with_dropout(track_sim, excluded_frames, frame_count)
                 cast_badge = render_similarity_badge(cast_track_score, SimilarityType.PERSON_COHESION) if cast_track_score is not None else '<span style="color: #888;">N/A</span>'
                 st.markdown(f"TRK {track_badge} · MATCH {cast_badge}", unsafe_allow_html=True)
 
@@ -4513,15 +4581,19 @@ def _render_cluster_tracks(
         else:
             st.caption(f"👤 Assigned to: `{cluster_person_id}`")
 
-    # Cohesion badge (with color) directly under the ID
+    # Cohesion badge (with color) directly under the ID (Nov 2024: enhanced with range)
     if cohesion is not None:
-        cohesion_badge = render_similarity_badge(cohesion, SimilarityType.CLUSTER)
+        min_sim = track_reps_data.get("min_similarity")
+        max_sim = track_reps_data.get("max_similarity")
+        cohesion_badge = render_cluster_range_badge(cohesion, min_sim, max_sim)
         st.markdown(f"**Cluster Cohesion:** {cohesion_badge}", unsafe_allow_html=True)
 
     if cast_suggestion:
         cast_sim = cast_suggestion.get("similarity") or 0.0
         cast_name = cast_suggestion.get("name") or cast_suggestion.get("cast_id") or "cast"
-        cast_badge = render_similarity_badge(cast_sim, SimilarityType.CAST, show_label=True)
+        # Nov 2024: Enhanced with rank context
+        total_suggs = len(cast_suggestions_for_cluster) if cast_suggestions_for_cluster else 1
+        cast_badge = render_cast_rank_badge(cast_sim, rank=1, total_suggestions=total_suggs, cast_name=cast_name)
         margin_html = f" · Δ {cast_margin_pct}%" if cast_margin_pct is not None else ""
         st.markdown(
             f"**Cast Similarity:** {cast_badge} · {cast_name}{margin_html}",
@@ -4752,8 +4824,10 @@ def _render_cluster_tracks(
                     else:
                         selected_tracks.discard(track_id_int)
 
-                # Display track ID and similarity badge
-                badge_html = render_similarity_badge(similarity, SimilarityType.TRACK)
+                # Display track ID and similarity badge (Nov 2024: enhanced with dropout)
+                excluded_frames = track_rep.get("excluded_frames", 0)
+                total_frames = track_rep.get("frame_count") or track_rep.get("faces", 0)
+                badge_html = render_track_with_dropout(similarity, excluded_frames, total_frames)
                 st.markdown(f"Track {track_num} {badge_html}", unsafe_allow_html=True)
 
                 # Actions
@@ -4990,6 +5064,8 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     # Track-level summary metrics
     track_similarity: float | None = None
     cast_track_score: float | None = None
+    track_excluded_frames: int = 0
+    track_total_frames: int = 0
     if current_identity:
         track_reps = _fetch_cluster_track_reps_cached(ep_id, current_identity)
         if track_reps and track_reps.get("tracks"):
@@ -4998,6 +5074,8 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                 if tr_id == track_id:
                     track_similarity = tr.get("similarity") or tr.get("internal_similarity")
                     cast_track_score = tr.get("cast_track_score")
+                    track_excluded_frames = tr.get("excluded_frames", 0)
+                    track_total_frames = tr.get("frame_count") or tr.get("faces", 0)
                     break
 
     frame_sim_values = [f.get("similarity") for f in frames if f.get("similarity") is not None]
@@ -5043,8 +5121,9 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         summary_cols = st.columns([1.1, 1.1, 1.2, 1.2])
         with summary_cols[0]:
             if track_similarity is not None:
+                # Nov 2024: Enhanced with dropout indicator
                 st.markdown(
-                    f"Track → Cluster {render_similarity_badge(track_similarity, SimilarityType.TRACK)}",
+                    f"Track → Cluster {render_track_with_dropout(track_similarity, track_excluded_frames, track_total_frames)}",
                     unsafe_allow_html=True,
                 )
             if cast_track_score is not None:
@@ -5288,30 +5367,29 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                             'border-radius: 3px; font-size: 0.8em; font-weight: bold;">★ BEST QUALITY</span>',
                             unsafe_allow_html=True,
                         )
-                    # Show similarity badge if available
+                    # Show quality score with breakdown (Nov 2024 enhanced)
+                    quality = best_face.get("quality") or frame_meta.get("quality")
+                    if quality and isinstance(quality, dict):
+                        quality_score_value = quality.get("score")
+                        if quality_score_value is not None:
+                            # Use new quality breakdown badge with components
+                            quality_badge = render_quality_breakdown_badge(
+                                quality_score_value,
+                                detection=quality.get("det_score") or quality.get("detection"),
+                                sharpness=quality.get("sharpness") or quality.get("std"),
+                                area=quality.get("area") or quality.get("face_area"),
+                            )
+                            st.markdown(quality_badge, unsafe_allow_html=True)
+
+                    # Show outlier badge ONLY if frame is an outlier (Nov 2024 - reduced noise)
                     similarity = best_face.get("similarity") if isinstance(best_face, dict) else None
                     if similarity is None:
                         similarity = frame_meta.get("similarity")
                     if similarity is not None:
-                        similarity_badge = render_similarity_badge(similarity, SimilarityType.FRAME)
-                        st.markdown(similarity_badge, unsafe_allow_html=True)
-                        # Show quality score if available
-                        quality = best_face.get("quality") or frame_meta.get("quality")
-                        if quality and isinstance(quality, dict):
-                            quality_score_value = quality.get("score")
-                            if quality_score_value is not None:
-                                quality_pct = int(quality_score_value * 100)
-                                if quality_score_value >= 0.85:
-                                    quality_color = "#2E7D32"
-                                elif quality_score_value >= 0.60:
-                                    quality_color = "#81C784"
-                                else:
-                                    quality_color = "#EF5350"
-                                st.markdown(
-                                    f'<span style="background-color: {quality_color}; color: white; padding: 2px 6px; '
-                                    f'border-radius: 3px; font-size: 0.75em;">Q: {quality_pct}%</span>',
-                                    unsafe_allow_html=True,
-                                )
+                        # Only show outlier badge if below threshold (50%)
+                        outlier_badge = render_outlier_severity_badge(similarity)
+                        if outlier_badge:
+                            st.markdown(outlier_badge, unsafe_allow_html=True)
                     if skip_reason:
                         st.markdown(f":red[⚠ invalid crop] {skip_reason}")
                     if frame_idx_int is None:
