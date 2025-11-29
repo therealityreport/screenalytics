@@ -292,6 +292,92 @@ class TestLocalModeErrorHandling:
         assert "timed out" in data.get("error", "").lower()
 
 
+class TestLocalModeSynchronousBehavior:
+    """Tests verifying local mode is truly synchronous with no job tracking."""
+
+    def test_local_mode_returns_logs_in_response(self, api_client, monkeypatch):
+        """Local mode should return logs directly in the response."""
+        import subprocess
+
+        def fake_run(command, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Loading models...\nProcessing frames...\nCompleted!",
+                stderr="",
+            )
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: "/tmp")
+
+        payload = {
+            "ep_id": "demo-s01e01",
+            "stride": 6,
+            "device": "cpu",
+            "execution_mode": "local",
+        }
+
+        resp = api_client.post("/celery_jobs/detect_track", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # Local mode returns logs directly - no polling needed
+        assert "logs" in data
+        assert isinstance(data["logs"], list)
+        assert len(data["logs"]) > 0
+        assert "Loading models..." in data["logs"]
+        assert "Processing frames..." in data["logs"]
+
+    def test_local_mode_returns_elapsed_time(self, api_client, monkeypatch):
+        """Local mode should return elapsed time in the response."""
+        import subprocess
+
+        def fake_run(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="Done", stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: "/tmp")
+
+        payload = {
+            "ep_id": "demo-s01e01",
+            "stride": 6,
+            "device": "cpu",
+            "execution_mode": "local",
+        }
+
+        resp = api_client.post("/celery_jobs/detect_track", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # Local mode includes elapsed time
+        assert "elapsed_seconds" in data
+        assert isinstance(data["elapsed_seconds"], (int, float))
+
+    def test_local_mode_no_job_id(self, api_client, monkeypatch):
+        """Local mode should not return a job_id - it's synchronous."""
+        import subprocess
+
+        def fake_run(command, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="Done", stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr("apps.api.routers.celery_jobs._find_project_root", lambda: "/tmp")
+
+        payload = {
+            "ep_id": "demo-s01e01",
+            "stride": 6,
+            "device": "cpu",
+            "execution_mode": "local",
+        }
+
+        resp = api_client.post("/celery_jobs/detect_track", json=payload)
+        data = resp.json()
+
+        # Local mode is synchronous - no job ID needed
+        assert "job_id" not in data
+        assert data.get("status") == "completed"
+        assert data.get("execution_mode") == "local"
+
+
 class TestProfileAndSafetyInLocalMode:
     """Tests that performance profiles and safety are honored in local mode."""
 

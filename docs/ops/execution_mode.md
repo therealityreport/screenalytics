@@ -6,9 +6,9 @@ This document describes the Execution Mode feature which allows switching betwee
 
 The Execution Mode toggle controls how pipeline operations are executed:
 
-- **Redis/Celery (queued)**: Default mode. Jobs are enqueued via Celery to Redis and processed by background workers. This allows the UI to remain responsive while jobs run asynchronously.
+- **Redis/Celery (queued)**: Jobs are enqueued via Celery to Redis and processed by background workers. The UI polls for status updates. Jobs continue running even if you refresh the page.
 
-- **Local Worker (direct)**: Jobs run synchronously in-process. The API request blocks until the job completes. Useful for debugging, testing, or when Redis/Celery workers are unavailable.
+- **Local Worker (direct)**: Jobs run **synchronously** in-process. The API request blocks until the job completes. No job ID, no polling, no background task. If you refresh the page, the job stops.
 
 ## UI Controls
 
@@ -72,12 +72,13 @@ Refresh Operations:
 ```json
 {
   "job_id": "abc-123-def",
-  "status": "queued",
+  "state": "queued",
   "ep_id": "show-s01e01",
-  "execution_mode": "redis"
+  "execution_mode": "redis",
+  "message": "Detect/track job queued via Celery"
 }
 ```
-Poll `/celery_jobs/{job_id}` to check job status.
+Poll `GET /celery_jobs/{job_id}` to check job status. The job runs in the background.
 
 **Local mode (execution_mode="local")**:
 ```json
@@ -85,10 +86,22 @@ Poll `/celery_jobs/{job_id}` to check job status.
   "status": "completed",
   "ep_id": "show-s01e01",
   "operation": "detect_track",
-  "execution_mode": "local"
+  "execution_mode": "local",
+  "elapsed_seconds": 66.3,
+  "logs": [
+    "Starting detect_track in local mode...",
+    "Loading RetinaFace on CoreML...",
+    "Processing 10249 frames...",
+    "detect_track completed successfully in 66.3s"
+  ]
 }
 ```
-No job_id returned; the job is complete when the response returns.
+
+Key differences in local mode:
+- **No `job_id`**: The job is synchronous, no polling needed
+- **`logs` array**: Execution logs returned directly in response
+- **`elapsed_seconds`**: How long the job took
+- **Blocking**: The HTTP request blocks until the job completes
 
 ## Performance and Safety
 
@@ -112,14 +125,28 @@ Local mode respects the same performance profiles and safety guardrails as Redis
 ### Use Redis/Celery (queued) when:
 - Running production workloads
 - Processing multiple episodes concurrently
-- You want the UI to remain responsive during long operations
+- You want jobs to continue if you navigate away or refresh the page
 - Redis and Celery workers are running
 
 ### Use Local Worker (direct) when:
-- Debugging pipeline issues
+- Debugging pipeline issues (logs returned directly)
 - Testing changes without starting workers
 - Running on a single machine without Redis
-- You want immediate feedback without polling
+- You want a simple, linear execution flow
+- You prefer the old pre-Celery behavior
+
+## Page Refresh Behavior
+
+**Redis/Celery mode**: If you start a job and refresh the page:
+- The job continues running in the background
+- When you return, you can check job status
+- Jobs are decoupled from the browser session
+
+**Local Worker mode**: If you start a job and refresh the page:
+- The job is tied to the HTTP request
+- Refreshing cancels the in-flight request
+- The subprocess may be orphaned (will complete but results are lost)
+- This is the expected behavior for synchronous execution
 
 ## Troubleshooting
 

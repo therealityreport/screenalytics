@@ -2293,7 +2293,7 @@ def run_pipeline_job_with_mode(
     """Run a pipeline job respecting the current execution mode for the episode.
 
     This function handles both local and redis execution modes:
-    - Local mode: Runs synchronously with a loading spinner
+    - Local mode: Runs synchronously - blocks until complete, no job ID, no polling
     - Redis mode: Queues via Celery and polls for completion
 
     Args:
@@ -2324,116 +2324,68 @@ def run_pipeline_job_with_mode(
         return None, f"Unknown operation: {operation}"
 
     if execution_mode == "local":
-        # Local mode now uses async job submission + polling (like Redis mode)
-        # This allows the UI to stay responsive and show progress updates
-        progress_bar = st.progress(0.0)
+        # Local mode: truly synchronous - blocks until complete
+        # No job ID, no polling, no background task
         status_placeholder = st.empty()
-        detail_placeholder = st.empty()
-        log_expander = st.expander("Detailed log", expanded=True)
-        with log_expander:
-            log_placeholder = st.empty()
-        log_lines: List[str] = []
+        log_expander = st.expander("Execution log", expanded=True)
 
-        def _append_log(entry: str) -> None:
-            log_lines.append(entry)
-            log_placeholder.code("\n".join(log_lines[-20:]), language="text")  # Keep last 20 lines
+        # Build context string for display
+        context_parts = [f"device={requested_device}"]
+        if requested_detector:
+            context_parts.append(f"detector={requested_detector}")
+        if requested_tracker:
+            context_parts.append(f"tracker={requested_tracker}")
+        context_str = ", ".join(context_parts)
 
-        _append_log(f"Starting {operation} in local mode (device={requested_device})...")
-        status_placeholder.info(f"⏳ Submitting {operation} job...")
+        status_placeholder.info(f"⏳ Running {operation} synchronously ({context_str})...")
 
         try:
-            # Submit job (returns immediately with job_id)
+            # Make a single blocking HTTP request - no polling
+            # The request blocks until the pipeline completes
             resp = requests.post(
                 f"{_api_base()}{endpoint}",
                 json=payload,
-                timeout=30,  # Quick timeout for job submission
+                timeout=timeout,  # Long timeout for synchronous execution
             )
-            resp.raise_for_status()
-            submit_result = resp.json()
 
-            job_id = submit_result.get("job_id")
-            if not job_id:
-                error_msg = "No job_id returned from API"
-                _append_log(f"Error: {error_msg}")
-                status_placeholder.error(f"❌ {error_msg}")
-                return None, error_msg
+            result = resp.json()
 
-            _append_log(f"Job submitted: {job_id}")
-            _append_log(f"Polling for status (this may take several minutes)...")
-            status_placeholder.info(f"⏳ Running {operation} in local mode...")
+            # Display logs from the response
+            logs = result.get("logs", [])
+            if logs:
+                with log_expander:
+                    st.code("\n".join(logs), language="text")
 
-            # Poll for completion
-            poll_interval = 2.0  # seconds
-            start_time = time.time()
-            last_message = ""
+            # Handle response based on status
+            if resp.status_code >= 400 or result.get("status") == "error":
+                error_msg = result.get("error", f"HTTP {resp.status_code}")
+                elapsed = result.get("elapsed_seconds", 0)
+                elapsed_str = f" ({elapsed:.1f}s)" if elapsed else ""
+                status_placeholder.error(f"❌ {operation} failed{elapsed_str}: {error_msg}")
+                return result, error_msg
 
-            while True:
-                elapsed = time.time() - start_time
-                if elapsed > timeout:
-                    error_msg = f"Job timed out after {int(elapsed)}s"
-                    _append_log(f"Timeout: {error_msg}")
-                    status_placeholder.error(f"❌ {error_msg}")
-                    return None, error_msg
+            # Success
+            elapsed = result.get("elapsed_seconds", 0)
+            elapsed_str = f" in {elapsed:.1f}s" if elapsed else ""
+            status_placeholder.success(f"✅ {operation} completed{elapsed_str} (local mode)")
+            return result, None
 
-                # Check job status
-                try:
-                    status_resp = requests.get(
-                        f"{_api_base()}/celery_jobs/{job_id}",
-                        timeout=10,
-                    )
-                    status_resp.raise_for_status()
-                    status_data = status_resp.json()
-                except requests.RequestException as e:
-                    _append_log(f"Status check failed: {e}, retrying...")
-                    time.sleep(poll_interval)
-                    continue
-
-                state = status_data.get("state", "unknown")
-                progress_info = status_data.get("progress", {})
-
-                # Update progress bar
-                progress_val = progress_info.get("progress", 0.0) if isinstance(progress_info, dict) else 0.0
-                progress_bar.progress(min(progress_val, 0.99))  # Cap at 99% until complete
-
-                # Log new messages
-                message = progress_info.get("message", "") if isinstance(progress_info, dict) else ""
-                if message and message != last_message:
-                    _append_log(message)
-                    last_message = message
-
-                # Check terminal states
-                if state == "success":
-                    progress_bar.progress(1.0)
-                    result = status_data.get("result", {})
-                    _append_log(f"Job completed successfully")
-                    status_placeholder.success(f"✅ {operation} completed successfully (local mode)")
-                    detail_placeholder.caption(f"Mode: local, Device: {requested_device}")
-                    return result, None
-                elif state == "failed":
-                    progress_bar.progress(1.0)
-                    error_msg = status_data.get("error", "Unknown error")
-                    _append_log(f"Job failed: {error_msg}")
-                    status_placeholder.error(f"❌ {operation} failed: {error_msg}")
-                    return status_data.get("result"), error_msg
-                elif state in ("queued", "in_progress"):
-                    # Still running, update status
-                    elapsed_min = int(elapsed // 60)
-                    elapsed_sec = int(elapsed % 60)
-                    status_placeholder.info(f"⏳ Running {operation}... ({elapsed_min}m {elapsed_sec}s)")
-                else:
-                    _append_log(f"Unknown state: {state}")
-
-                time.sleep(poll_interval)
+        except requests.exceptions.Timeout:
+            error_msg = f"Request timed out after {timeout}s"
+            status_placeholder.error(f"❌ {operation} timed out: {error_msg}")
+            with log_expander:
+                st.code(f"TIMEOUT: {error_msg}", language="text")
+            return None, error_msg
 
         except requests.RequestException as exc:
-            progress_bar.progress(1.0)
             error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
-            _append_log(f"Request error: {error_msg}")
             status_placeholder.error(f"❌ {operation} failed: {error_msg}")
+            with log_expander:
+                st.code(f"ERROR: {error_msg}", language="text")
             return None, error_msg
 
     else:
-        # Redis mode - use existing Celery job flow
+        # Redis mode - use existing Celery job flow with polling
         return run_celery_job_with_progress(
             ep_id,
             operation,
