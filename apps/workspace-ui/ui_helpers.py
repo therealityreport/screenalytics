@@ -446,7 +446,7 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
     st.session_state.setdefault("backend", backend)
     bucket = st.session_state.get("bucket") or (
-        _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "")
+        _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "screenalytics")
     )
     st.session_state.setdefault("bucket", bucket)
 
@@ -2324,15 +2324,25 @@ def run_pipeline_job_with_mode(
         return None, f"Unknown operation: {operation}"
 
     if execution_mode == "local":
-        # Run synchronously with loading spinner
+        # Run synchronously with loading spinner and log panel
         progress_bar = st.progress(0.0)
         status_placeholder = st.empty()
         detail_placeholder = st.empty()
+        log_expander = st.expander("Detailed log", expanded=True)
+        with log_expander:
+            log_placeholder = st.empty()
+        log_lines: List[str] = []
 
+        def _append_log(entry: str) -> None:
+            log_lines.append(entry)
+            log_placeholder.code("\n\n".join(log_lines), language="text")
+
+        _append_log(f"Starting {operation} in local mode (device={requested_device})...")
         status_placeholder.info(f"⏳ Running {operation} in local mode...")
 
         try:
             # Call the endpoint with a longer timeout for local execution
+            _append_log(f"Calling endpoint: {endpoint}")
             resp = requests.post(
                 f"{_api_base()}{endpoint}",
                 json=payload,
@@ -2344,28 +2354,35 @@ def run_pipeline_job_with_mode(
             status = result.get("status", "unknown")
             if status == "completed":
                 progress_bar.progress(1.0)
+                _append_log(f"Job completed successfully")
+                if result.get("stdout"):
+                    _append_log(f"Output: {result['stdout'][:500]}")
                 status_placeholder.success(f"✅ {operation} completed successfully (local mode)")
                 detail_placeholder.caption(f"Mode: local, Device: {requested_device}")
                 return result, None
             elif status == "error":
                 progress_bar.progress(1.0)
                 error_msg = result.get("error", "Unknown error")
+                _append_log(f"Job failed: {error_msg}")
                 status_placeholder.error(f"❌ {operation} failed: {error_msg}")
                 return result, error_msg
             else:
                 # Unexpected status
                 progress_bar.progress(1.0)
+                _append_log(f"Job returned status: {status}")
                 status_placeholder.warning(f"⚠️ {operation} returned status: {status}")
                 return result, None
 
         except requests.Timeout:
             progress_bar.progress(1.0)
             error_msg = f"Local {operation} timed out after {timeout}s"
+            _append_log(f"Timeout: {error_msg}")
             status_placeholder.error(f"❌ {error_msg}")
             return None, error_msg
         except requests.RequestException as exc:
             progress_bar.progress(1.0)
             error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+            _append_log(f"Request error: {error_msg}")
             status_placeholder.error(f"❌ {operation} failed: {error_msg}")
             return None, error_msg
 
