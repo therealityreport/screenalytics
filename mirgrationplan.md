@@ -48,3 +48,30 @@
 - Upload, Episode Detail, and Faces Review flows run via Next.js with equivalent guardrails and error handling as Streamlit.
 - Users can run locally (`uvicorn` + `next dev`) with clear `.env` configuration.
 - Automated tests (API contracts, UI mocks, Playwright smoke) pass and prevent regressions.
+
+## Detailed Next Steps (completed specs)
+
+### 1) Next.js Scaffold + Typed API Client
+- Keep Next.js App Router in `web/`; add providers for TanStack Query, Radix toast, and WS/SSE connectivity status in `web/app/layout.tsx`.
+- Generate `web/api/schema.ts` from FastAPI OpenAPI via `openapi-typescript`; wrap with `openapi-fetch` in `web/api/client.ts` for typed calls.
+- Rewrites in `next.config.mjs`: proxy `/api/:path*` to `http://localhost:8000/:path*`; configure `transpilePackages` only if needed.
+- Env: `.env.local.example` with `NEXT_PUBLIC_API_BASE`, `NEXT_PUBLIC_WS_BASE`, optional `NEXT_PUBLIC_MSW=1` to enable mocks.
+- Shared utilities: fetcher that normalizes errors to `{ code, message, details }`, attaches `AbortController`, and opts out of retries by default.
+
+### 2) Upload Page UI + State Machine (mockable)
+- State machine (`web/lib/state/uploadMachine.ts`):
+  - `idle -> preparing`: load shows/seasons or locked episode metadata when `ep_id` query exists.
+  - `preparing -> ready`: selections validated; replace mode locks selectors.
+  - `ready -> uploading`: request presign (or local-only flag), start PUT/POST with progress + abort support.
+  - `uploading -> verifying`: optional ETag/MD5 head check; cloud vs local-only branches.
+  - `verifying -> processing`: trigger detect/track job; start status polling + event stream subscription.
+  - `processing -> success`: detect+track ready; flag `tracks_only_fallback` if tracks exist without detections and disable harvest CTA.
+  - Any -> `error`: carry code/message, allow retry from ready.
+- UI (`web/app/upload/page.tsx`): drag/drop + picker, file metadata badge, progress with speed/ETA, cancel/retry, replace-mode banner, manifest-fallback warnings on return from processing.
+- Mocks: MSW handlers for presign, PUT (simulated), job trigger, status polling to enable `next dev` without backend.
+
+### 3) Episode Detail Polling/SSE Flow
+- Data model mirrors Streamlit guardrails: `tracks_only_fallback` disables harvest; `faces_manifest_fallback` shows “status stale, using manifest”; require detections + tracks for ready.
+- Fetch/poll: TanStack Query keyed by `episodeId`; staleTime short; refetch on focus/reconnect; revalidate when manifest mtime changes.
+- SSE/WS: subscribe to `/episodes/{id}/events` for phase updates (start, finish, error), metric deltas (cluster pre/post merge), manifest mtime tokens, and screentime job IDs. Push events into a log drawer and invalidate relevant queries.
+- UI (`web/app/episodes/[id]/page.tsx`): status cards per phase with rerun buttons, warnings for fallbacks, log drawer, screentime job chip keyed to `f"{id}::screentime_job"` to match Streamlit behavior.
