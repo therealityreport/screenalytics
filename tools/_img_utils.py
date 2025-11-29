@@ -91,7 +91,9 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
         size_bytes = out_path.stat().st_size
     except OSError:
         size_bytes = 0
-    if size_bytes < 1024:
+    # Lower threshold to 256 bytes - small face crops (20-30px) can be under 1KB
+    # but still valid. Only catch truly degenerate/corrupted writes.
+    if size_bytes < 256:
         try:
             out_path.unlink()
         except OSError:

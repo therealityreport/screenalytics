@@ -181,7 +181,7 @@ SCENE_DETECTOR_OPTIONS = [
 SCENE_DETECTOR_LABELS = [label for label, _ in SCENE_DETECTOR_OPTIONS]
 SCENE_DETECTOR_VALUE_MAP = {label: value for label, value in SCENE_DETECTOR_OPTIONS}
 SCENE_DETECTOR_LABEL_MAP = {value: label for label, value in SCENE_DETECTOR_OPTIONS}
-_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
+_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "off").strip().lower()
 SCENE_DETECTOR_DEFAULT = _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
@@ -2672,143 +2672,171 @@ def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | N
         Job info dict with progress if running, None otherwise.
         Dict includes: job_id, state, progress_pct, message, started_at
 
-    Checks multiple sources:
+    Checks multiple sources in parallel for faster response:
     1. Legacy /jobs API (subprocess jobs)
     2. /celery_jobs (active Celery tasks)
     3. /celery_jobs/local (local subprocess jobs)
     4. Session state for stored job_id
     """
+    import concurrent.futures
+
     running_states = {"running", "in_progress", "queued", "started", "pending"}
+    api_timeout = 3  # Reduced from 10s for local API calls
 
-    # 1. Check legacy /jobs API
-    try:
-        resp = requests.get(
-            f"{_api_base()}/jobs",
-            params={"ep_id": ep_id, "job_type": job_type, "limit": 1},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        jobs = resp.json().get("jobs", [])
+    def _check_legacy_jobs() -> Dict[str, Any] | None:
+        """Check legacy /jobs API."""
+        try:
+            resp = requests.get(
+                f"{_api_base()}/jobs",
+                params={"ep_id": ep_id, "job_type": job_type, "limit": 1},
+                timeout=api_timeout,
+            )
+            resp.raise_for_status()
+            jobs = resp.json().get("jobs", [])
 
-        for job in jobs:
-            state = str(job.get("state", "")).lower()
-            if state in running_states:
-                job_id = job.get("job_id")
-                result = {
-                    "job_id": job_id,
-                    "state": state,
-                    "started_at": job.get("started_at"),
-                    "job_type": job_type,
-                    "source": "legacy_jobs",
-                }
-
-                # Try to get progress from Celery if it's a Celery job
-                if job_id:
-                    celery_status = check_celery_job_status(job_id)
-                    if celery_status:
-                        progress = celery_status.get("progress", {})
-                        result["progress_pct"] = progress.get("progress", 0) * 100
-                        result["message"] = progress.get("message", "")
-
-                # Try to get progress from progress.json file
-                if "progress_pct" not in result:
-                    progress_data = get_episode_progress(ep_id)
-                    if progress_data:
-                        frames_done = progress_data.get("frames_done", 0)
-                        frames_total = progress_data.get("frames_total", 1)
-                        if frames_total > 0:
-                            result["progress_pct"] = (frames_done / frames_total) * 100
-                        result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
-                        result["frames_done"] = frames_done
-                        result["frames_total"] = frames_total
-
-                return result
-    except requests.RequestException:
-        pass  # Continue checking other sources
-
-    # 2. Check /celery_jobs/local for local subprocess jobs
-    try:
-        resp = requests.get(
-            f"{_api_base()}/celery_jobs/local",
-            params={"ep_id": ep_id},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        local_jobs = resp.json().get("jobs", [])
-
-        for job in local_jobs:
-            op = job.get("operation", "")
-            if op == job_type:
+            for job in jobs:
                 state = str(job.get("state", "")).lower()
                 if state in running_states:
+                    job_id = job.get("job_id")
+                    result = {
+                        "job_id": job_id,
+                        "state": state,
+                        "started_at": job.get("started_at"),
+                        "job_type": job_type,
+                        "source": "legacy_jobs",
+                    }
+
+                    # Try to get progress from Celery if it's a Celery job
+                    if job_id:
+                        celery_status = check_celery_job_status(job_id)
+                        if celery_status:
+                            progress = celery_status.get("progress", {})
+                            result["progress_pct"] = progress.get("progress", 0) * 100
+                            result["message"] = progress.get("message", "")
+
+                    # Try to get progress from progress.json file
+                    if "progress_pct" not in result:
+                        progress_data = get_episode_progress(ep_id)
+                        if progress_data:
+                            frames_done = progress_data.get("frames_done", 0)
+                            frames_total = progress_data.get("frames_total", 1)
+                            if frames_total > 0:
+                                result["progress_pct"] = (frames_done / frames_total) * 100
+                            result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                            result["frames_done"] = frames_done
+                            result["frames_total"] = frames_total
+
+                    return result
+        except requests.RequestException:
+            pass
+        return None
+
+    def _check_local_jobs() -> Dict[str, Any] | None:
+        """Check /celery_jobs/local for local subprocess jobs."""
+        try:
+            resp = requests.get(
+                f"{_api_base()}/celery_jobs/local",
+                params={"ep_id": ep_id},
+                timeout=api_timeout,
+            )
+            resp.raise_for_status()
+            local_jobs = resp.json().get("jobs", [])
+
+            for job in local_jobs:
+                op = job.get("operation", "")
+                if op == job_type:
+                    state = str(job.get("state", "")).lower()
+                    if state in running_states:
+                        result = {
+                            "job_id": job.get("job_id"),
+                            "state": state,
+                            "started_at": job.get("started_at"),
+                            "job_type": job_type,
+                            "source": "celery_local",
+                            "pid": job.get("pid"),
+                        }
+
+                        # Get progress from progress.json
+                        progress_data = get_episode_progress(ep_id)
+                        if progress_data:
+                            frames_done = progress_data.get("frames_done", 0)
+                            frames_total = progress_data.get("frames_total", 1)
+                            if frames_total > 0:
+                                result["progress_pct"] = (frames_done / frames_total) * 100
+                            result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                            result["frames_done"] = frames_done
+                            result["frames_total"] = frames_total
+
+                        return result
+        except requests.RequestException:
+            pass
+        return None
+
+    def _check_celery_jobs() -> Dict[str, Any] | None:
+        """Check /celery_jobs for active Celery tasks."""
+        try:
+            resp = requests.get(f"{_api_base()}/celery_jobs", timeout=api_timeout)
+            resp.raise_for_status()
+            celery_jobs = resp.json().get("jobs", [])
+
+            for job in celery_jobs:
+                job_ep_id = job.get("ep_id")
+                op = job.get("operation") or job.get("name", "").replace("local_", "")
+                state = str(job.get("state", "")).lower()
+
+                # Match by ep_id and operation
+                if job_ep_id == ep_id and op == job_type and state in running_states:
                     result = {
                         "job_id": job.get("job_id"),
                         "state": state,
                         "started_at": job.get("started_at"),
                         "job_type": job_type,
-                        "source": "celery_local",
-                        "pid": job.get("pid"),
+                        "source": "celery_active",
                     }
-
-                    # Get progress from progress.json
-                    progress_data = get_episode_progress(ep_id)
-                    if progress_data:
-                        frames_done = progress_data.get("frames_done", 0)
-                        frames_total = progress_data.get("frames_total", 1)
-                        if frames_total > 0:
-                            result["progress_pct"] = (frames_done / frames_total) * 100
-                        result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
-                        result["frames_done"] = frames_done
-                        result["frames_total"] = frames_total
-
                     return result
-    except requests.RequestException:
-        pass  # Continue checking other sources
+        except requests.RequestException:
+            pass
+        return None
 
-    # 3. Check /celery_jobs for active Celery tasks
-    try:
-        resp = requests.get(f"{_api_base()}/celery_jobs", timeout=10)
-        resp.raise_for_status()
-        celery_jobs = resp.json().get("jobs", [])
+    def _check_session_state() -> Dict[str, Any] | None:
+        """Check session state for stored job_id."""
+        stored_job_id = get_stored_celery_job_id(ep_id, job_type)
+        if stored_job_id:
+            celery_status = check_celery_job_status(stored_job_id)
+            if celery_status:
+                state = str(celery_status.get("state", "")).lower()
+                if state in running_states:
+                    progress = celery_status.get("progress", {})
+                    result = {
+                        "job_id": stored_job_id,
+                        "state": state,
+                        "job_type": job_type,
+                        "source": "session_state",
+                        "progress_pct": progress.get("progress", 0) * 100,
+                        "message": progress.get("message", ""),
+                    }
+                    return result
+                else:
+                    # Job is no longer running, clear from session state
+                    clear_celery_job_id(ep_id, job_type)
+        return None
 
-        for job in celery_jobs:
-            job_ep_id = job.get("ep_id")
-            op = job.get("operation") or job.get("name", "").replace("local_", "")
-            state = str(job.get("state", "")).lower()
+    # Check sources in priority order (most likely first for faster response)
+    # Local jobs are most common when using local execution mode
+    checkers = [
+        _check_local_jobs,   # Most likely for local mode
+        _check_celery_jobs,  # Active Celery tasks
+        _check_legacy_jobs,  # Legacy /jobs API
+        _check_session_state,  # Session state fallback
+    ]
 
-            # Match by ep_id and operation
-            if job_ep_id == ep_id and op == job_type and state in running_states:
-                result = {
-                    "job_id": job.get("job_id"),
-                    "state": state,
-                    "started_at": job.get("started_at"),
-                    "job_type": job_type,
-                    "source": "celery_active",
-                }
+    for checker in checkers:
+        try:
+            result = checker()
+            if result:
                 return result
-    except requests.RequestException:
-        pass  # Continue checking other sources
-
-    # 4. Check session state for stored job_id
-    stored_job_id = get_stored_celery_job_id(ep_id, job_type)
-    if stored_job_id:
-        celery_status = check_celery_job_status(stored_job_id)
-        if celery_status:
-            state = str(celery_status.get("state", "")).lower()
-            if state in running_states:
-                progress = celery_status.get("progress", {})
-                result = {
-                    "job_id": stored_job_id,
-                    "state": state,
-                    "job_type": job_type,
-                    "source": "session_state",
-                    "progress_pct": progress.get("progress", 0) * 100,
-                    "message": progress.get("message", ""),
-                }
-                return result
-            else:
-                # Job is no longer running, clear from session state
-                clear_celery_job_id(ep_id, job_type)
+        except Exception:
+            pass  # Continue checking other sources
 
     return None
 
@@ -2891,7 +2919,7 @@ def render_previous_logs(
     Uses cached logs from session state first (populated by hydrate_logs_for_episode
     on page load), falling back to API call if not cached.
 
-    Displays formatted (human-friendly) logs by default with a toggle to show raw logs.
+    Displays formatted (human-friendly) logs only - clean and copy/paste-able.
 
     Args:
         ep_id: Episode identifier
@@ -2917,7 +2945,6 @@ def render_previous_logs(
 
     status = data.get("status", "unknown")
     formatted_logs = data.get("logs", [])
-    raw_logs = data.get("raw_logs", formatted_logs)  # Fall back to formatted if no raw
     elapsed_seconds = data.get("elapsed_seconds", 0)
     updated_at = data.get("updated_at", "")
 
@@ -2951,33 +2978,12 @@ def render_previous_logs(
     expander_label = f"{icon} Previous {operation} run ({status}, {elapsed_str}){timestamp_str}"
 
     with st.expander(expander_label, expanded=expanded):
-        if not formatted_logs and not raw_logs:
+        if not formatted_logs:
             st.caption("No log lines recorded.")
             return True
 
-        # Add toggle between formatted and raw logs if they differ
-        has_raw_logs = raw_logs and raw_logs != formatted_logs
-        toggle_key = f"log_toggle_{ep_id}_{operation}"
-
-        if has_raw_logs:
-            col1, col2 = st.columns([3, 1])
-            with col2:
-                show_raw = st.checkbox(
-                    "Show raw log",
-                    key=toggle_key,
-                    help="Toggle between formatted (clean) and raw (full debug) logs",
-                )
-        else:
-            show_raw = False
-
-        # Display the appropriate logs
-        if show_raw and raw_logs:
-            st.caption(f"Raw log ({len(raw_logs)} lines) - for debugging/copy-paste")
-            st.code("\n".join(raw_logs), language="text")
-        elif formatted_logs:
-            st.code("\n".join(formatted_logs), language="text")
-        else:
-            st.caption("No log lines recorded.")
+        # Display formatted logs (no raw log toggle - cleaner UI)
+        st.code("\n".join(formatted_logs), language="text")
 
     return True
 
@@ -3034,6 +3040,14 @@ def run_pipeline_job_with_mode(
         # Local mode: streaming response with live log updates
         # The backend streams log lines as newline-delimited JSON
         status_placeholder = st.empty()
+
+        # Progress bar section - shows % complete and frame counts
+        progress_container = st.container()
+        with progress_container:
+            progress_bar = st.progress(0.0)
+            progress_text = st.empty()
+            progress_text.caption("Starting...")
+
         log_expander = st.expander("Detailed log", expanded=True)
         with log_expander:
             log_placeholder = st.empty()
@@ -3053,6 +3067,9 @@ def run_pipeline_job_with_mode(
             "Waiting for live logs...",
             language="text",
         )
+
+        # Track progress info for display
+        current_progress = {"frames_done": 0, "frames_total": 0, "phase": "starting", "pct": 0.0}
 
         try:
             # Streaming request - reads lines as they arrive
@@ -3084,6 +3101,52 @@ def run_pipeline_job_with_mode(
                         line = msg.get("line", "")
                         log_lines.append(line)
                         log_placeholder.code("\n".join(log_lines), language="text")
+
+                    elif msg_type == "progress":
+                        # Update progress bar with real-time data
+                        frames_done = msg.get("frames_done", 0)
+                        frames_total = msg.get("frames_total", 1)
+                        phase = msg.get("phase", "processing")
+                        fps_infer = msg.get("fps_infer")
+                        secs_done = msg.get("secs_done", 0)
+
+                        if frames_total > 0:
+                            pct = min((frames_done / frames_total), 1.0)
+                            progress_bar.progress(pct)
+
+                            # Build progress text with details
+                            parts = [f"**{pct*100:.1f}%** - {frames_done:,} / {frames_total:,} frames"]
+                            if fps_infer and fps_infer > 0:
+                                parts.append(f"({fps_infer:.1f} fps)")
+                            if secs_done > 0:
+                                elapsed_min = int(secs_done // 60)
+                                elapsed_sec = int(secs_done % 60)
+                                if elapsed_min > 0:
+                                    parts.append(f"- {elapsed_min}m {elapsed_sec}s elapsed")
+                                else:
+                                    parts.append(f"- {elapsed_sec}s elapsed")
+
+                                # Estimate remaining time
+                                if pct > 0.01 and pct < 1.0:
+                                    eta_secs = (secs_done / pct) * (1 - pct)
+                                    if eta_secs > 60:
+                                        eta_min = int(eta_secs // 60)
+                                        eta_sec = int(eta_secs % 60)
+                                        parts.append(f"(~{eta_min}m {eta_sec}s remaining)")
+                                    else:
+                                        parts.append(f"(~{int(eta_secs)}s remaining)")
+
+                            progress_text.caption(" ".join(parts))
+                        else:
+                            progress_text.caption(f"Phase: {phase}")
+
+                        # Store current progress
+                        current_progress.update({
+                            "frames_done": frames_done,
+                            "frames_total": frames_total,
+                            "phase": phase,
+                            "pct": pct if frames_total > 0 else 0,
+                        })
 
                     elif msg_type == "error":
                         # Initial error (e.g., job already running)
@@ -3121,12 +3184,17 @@ def run_pipeline_job_with_mode(
                 cache_logs(ep_id, operation, log_lines, status, elapsed_seconds)
 
                 if status == "completed":
+                    # Show 100% completion on progress bar
+                    progress_bar.progress(1.0)
+                    progress_text.caption(f"**100%** - Completed in {elapsed_str}")
                     status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed in {elapsed_str}")
                     return result, None
                 elif status == "error":
+                    progress_text.caption(f"❌ Failed after {elapsed_str}")
                     status_placeholder.error(f"❌ [LOCAL MODE] {operation} failed: {error_msg}")
                     return result, error_msg
                 elif status == "timeout":
+                    progress_text.caption(f"⏱️ Timed out after {elapsed_str}")
                     status_placeholder.error(f"❌ [LOCAL MODE] {operation} timed out after {elapsed_str}")
                     return result, f"Timed out after {elapsed_str}"
                 else:

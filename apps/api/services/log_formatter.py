@@ -4,19 +4,24 @@ This module provides log line classification and human-friendly formatting
 for the detect_track, faces_embed, and cluster pipelines.
 
 Key features:
-- Converts JSON progress blobs into readable summary lines
-- Suppresses repeated ONNX warnings (shows count after first occurrence)
-- Filters out debug noise (per-frame DEBUG lines, internal [job=...] lines)
+- Converts JSON progress blobs into readable summary lines (SCENE DETECT, DETECTION, TRACKING)
+- Throttles log line output to every ~8 seconds for a cleaner UI
+- Suppresses repeated ONNX warnings (shows single user-friendly message)
+- Filters out debug noise (per-frame DEBUG lines, internal [job=...] lines, warnings.warn)
 - Formats PhaseTracker summaries cleanly
-- Outputs canonical config blocks at run start
+- Outputs canonical config blocks at run start with cute formatting
 """
 
 from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
+
+# Throttle interval for log line updates (seconds)
+LOG_THROTTLE_INTERVAL = 8.0
 
 
 @dataclass
@@ -38,8 +43,15 @@ class LogFormatterState:
     current_phase: str = ""
     last_progress_update: Dict[str, Any] = field(default_factory=dict)
 
+    # Throttling - track last log time per phase
+    last_log_time: float = 0.0
+    last_log_phase: str = ""
+
     # Job info tracking (for [job=...] lines)
     job_debug_count: int = 0
+
+    # warnings.warn noise tracking
+    warnings_warn_count: int = 0
 
 
 class LogFormatter:
@@ -102,7 +114,19 @@ class LogFormatter:
         re.compile(r'^DEBUG:'),
         re.compile(r'^WARNING:onnx', re.IGNORECASE),
         re.compile(r'^[\d\-]+\s+[\d:]+'),  # Timestamp prefixes
+        re.compile(r'^warnings\.warn\('),  # warnings.warn( continuation lines
+        re.compile(r'^  "'),  # Continuation of warnings.warn
+        re.compile(r'^Applied providers:'),  # ONNX provider logs
+        re.compile(r'^\[LOCAL MODE\] detect_track config:', re.IGNORECASE),  # Duplicate config
+        re.compile(r'^device=\w+,\s*profile='),  # Duplicate config line
+        re.compile(r'^frame_stride=\d+'),  # Duplicate config line
+        re.compile(r'^detection_fps_limit='),  # Duplicate config line
+        re.compile(r'^VerifyOutputSizes'),  # ONNX internal warnings
+        re.compile(r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}'),  # Timestamped debug lines
     ]
+
+    # Pattern for warnings.warn( which appears as a standalone line
+    WARNINGS_WARN_PATTERN = re.compile(r'^warnings\.warn\(', re.IGNORECASE)
 
     def __init__(
         self,
@@ -210,95 +234,140 @@ class LogFormatter:
             return self._format_generic_progress(data)
 
     def _format_progress_update(self, data: Dict[str, Any]) -> str | None:
-        """Format a progress update (detect, track, faces_embed, etc.)."""
+        """Format a progress update (detect, track, faces_embed, etc.) with throttling.
+
+        Returns a friendly progress line like:
+            DETECTION: 432 / 2,868 frames (15.1%) • 00:01:23 elapsed • ~6.5 fps
+        """
         phase = data.get("phase", "unknown")
 
         # Extract common fields
-        current = data.get("current", data.get("frame", data.get("frames_processed")))
-        total = data.get("total", data.get("total_frames"))
-        stride = data.get("stride", data.get("frame_stride"))
+        current = data.get("current", data.get("frame", data.get("frames_done", data.get("frames_processed"))))
+        total = data.get("total", data.get("total_frames", data.get("frames_total")))
         fps = data.get("fps", data.get("fps_infer", data.get("inference_fps")))
-        video_time = data.get("video_time", data.get("video_seconds"))
-        video_total = data.get("video_total", data.get("video_duration"))
+        secs_done = data.get("secs_done", data.get("elapsed_seconds", 0))
+        cuts = data.get("cuts", data.get("scene_cuts"))
 
-        # Build progress line
-        parts = [f"[PROGRESS] phase={phase}"]
+        # Phase-specific data
+        clusters = data.get("clusters", data.get("identities_count"))
+        faces = data.get("faces", data.get("faces_count", data.get("faces_embedded")))
+        tracks = data.get("tracks", data.get("tracks_processed"))
 
-        if current is not None and total is not None:
-            parts.append(f"frames={current}/{total}")
-        elif current is not None:
-            parts.append(f"frames={current}")
+        # Map phase names to friendly labels
+        phase_labels = {
+            "scene_detect": "SCENE DETECT",
+            "detect": "DETECTION",
+            "track": "TRACKING",
+            "faces_embed": "FACES",
+            "cluster": "CLUSTER",
+        }
+        label = phase_labels.get(phase, phase.upper())
 
-        if stride is not None:
-            parts.append(f"stride={stride}")
+        # Check throttling - only emit log every ~8 seconds per phase
+        now = time.time()
+        is_phase_change = (phase != self.state.last_log_phase)
+        time_since_last = now - self.state.last_log_time
 
-        if video_time is not None and video_total is not None:
-            parts.append(f"video={video_time:.1f}/{video_total:.1f}s")
-        elif video_time is not None:
-            parts.append(f"video={video_time:.1f}s")
+        # Allow log if: phase changed, or 8+ seconds elapsed, or this is completion (100%)
+        is_complete = (current is not None and total is not None and
+                       total > 0 and current >= total)
 
-        if fps is not None:
-            parts.append(f"fps={fps:.1f}")
-
-        # Add phase-specific info
-        if phase == "cluster":
-            clusters = data.get("clusters", data.get("identities_count"))
-            if clusters is not None:
-                parts.append(f"clusters={clusters}")
-
-        if phase == "faces_embed":
-            faces = data.get("faces", data.get("faces_count", data.get("faces_embedded")))
-            tracks = data.get("tracks", data.get("tracks_processed"))
-            if faces is not None:
-                parts.append(f"faces={faces}")
-            if tracks is not None:
-                parts.append(f"tracks={tracks}")
-
-        result = " ".join(parts)
-
-        # Throttle identical progress updates
-        last = self.state.last_progress_update
-        if (last.get("phase") == phase and
-            last.get("current") == current and
-            last.get("total") == total):
+        if not is_phase_change and time_since_last < LOG_THROTTLE_INTERVAL and not is_complete:
+            # Throttled - update internal state but don't emit log line
+            self.state.last_progress_update = {
+                "phase": phase, "current": current, "total": total,
+            }
+            self.state.current_phase = phase
             return None
 
+        # Update throttle state
+        self.state.last_log_time = now
+        self.state.last_log_phase = phase
         self.state.last_progress_update = {
-            "phase": phase,
-            "current": current,
-            "total": total,
+            "phase": phase, "current": current, "total": total,
         }
         self.state.current_phase = phase
 
-        return result
+        # Build friendly progress line
+        parts = [f"{label}:"]
+
+        if current is not None and total is not None and total > 0:
+            pct = (current / total) * 100
+            parts.append(f"{current:,} / {total:,} frames ({pct:.1f}%)")
+        elif current is not None:
+            parts.append(f"{current:,} frames")
+
+        # Add scene cuts for scene_detect phase
+        if phase == "scene_detect" and cuts is not None:
+            parts.append(f"• {cuts} cuts")
+
+        # Add elapsed time
+        if secs_done and secs_done > 0:
+            mins = int(secs_done // 60)
+            secs = int(secs_done % 60)
+            if mins > 0:
+                parts.append(f"• {mins:02d}:{secs:02d} elapsed")
+            else:
+                parts.append(f"• {secs:.1f}s")
+
+        # Add FPS if available
+        if fps is not None and fps > 0:
+            parts.append(f"• ~{fps:.1f} fps")
+
+        # Add phase-specific counts
+        if phase == "cluster" and clusters is not None:
+            parts.append(f"• {clusters} identities")
+
+        if phase == "faces_embed":
+            if faces is not None:
+                parts.append(f"• {faces:,} faces")
+            if tracks is not None:
+                parts.append(f"• {tracks:,} tracks")
+
+        return " ".join(parts)
 
     def _format_done_summary(self, data: Dict[str, Any]) -> str:
-        """Format completion summary."""
+        """Format completion summary from JSON progress data."""
         summary = data.get("summary", {})
         runtime = summary.get("runtime_sec", data.get("elapsed_seconds"))
 
-        parts = ["[DONE]"]
+        # Map operation to friendly label
+        op_label = {
+            "detect_track": "Detect/Track",
+            "faces_embed": "Harvest Faces",
+            "cluster": "Cluster",
+        }.get(self.operation, self.operation)
 
+        # Format runtime
         if runtime is not None:
             if runtime >= 60:
                 mins = int(runtime // 60)
                 secs = int(runtime % 60)
-                parts.append(f"runtime={mins}m{secs}s")
+                runtime_str = f"{mins}m {secs}s"
             else:
-                parts.append(f"runtime={runtime:.1f}s")
+                runtime_str = f"{runtime:.1f}s"
+        else:
+            runtime_str = ""
 
-        # Add summary stats
+        # Build stats line
+        stat_parts = []
         for key in ("tracks", "faces", "clusters", "identities", "detections"):
             val = summary.get(key) or data.get(key)
             if val is not None:
-                parts.append(f"{key}={val}")
+                stat_parts.append(f"{key}: {val:,}" if isinstance(val, int) else f"{key}: {val}")
 
-        return " ".join(parts)
+        line = f"✅ {op_label} completed"
+        if runtime_str:
+            line += f" in {runtime_str}"
+        if stat_parts:
+            line += f" ({', '.join(stat_parts)})"
+
+        return line
 
     def _format_error_summary(self, data: Dict[str, Any]) -> str:
         """Format error summary."""
         error = data.get("error", data.get("message", "Unknown error"))
-        return f"[ERROR] {error}"
+        return f"❌ ERROR: {error}"
 
     def _format_generic_progress(self, data: Dict[str, Any]) -> str | None:
         """Format unknown progress data."""
@@ -327,12 +396,13 @@ class LogFormatter:
         return " ".join(parts)
 
     def _handle_onnx_warning(self, line: str) -> str | None:
-        """Handle ONNX runtime warnings - suppress repeats."""
+        """Handle ONNX runtime warnings - show single friendly message."""
         self.state.onnx_warning_count += 1
 
         if not self.state.onnx_warning_shown:
             self.state.onnx_warning_shown = True
-            formatted = "[WARN] ONNXRuntime fallback: using CPUExecutionProvider for some ops"
+            # Single user-friendly message instead of raw ONNX output
+            formatted = "[WARN] Some ops are falling back to CPU; this may be slower on your Mac."
             self._formatted_lines.append(formatted)
             return formatted
 
@@ -377,28 +447,20 @@ class LogFormatter:
         return line
 
     def finalize(self) -> str | None:
-        """Generate final suppression summary.
+        """Generate final summary if needed.
 
-        Call this after processing all lines to get summary of suppressed items.
+        Only generates output for significant suppressions (like repeated ONNX warnings).
+        Debug frame counts and job debug messages are silently suppressed for cleaner logs.
         """
-        parts = []
-
-        if self.state.onnx_warning_count > 1:
+        # Only show ONNX warning count if there were many suppressed
+        if self.state.onnx_warning_count > 5:
             count = self.state.onnx_warning_count - 1  # First one was shown
-            parts.append(f"[WARN] Suppressed {count} repeated ONNXRuntime warnings")
+            msg = f"(Suppressed {count} repeated ONNX warnings)"
+            self._formatted_lines.append(msg)
+            return msg
 
-        if self.state.debug_frame_count > 0:
-            parts.append(f"[INFO] Processed {self.state.debug_frame_count} frame debug events (hidden)")
-
-        if self.state.job_debug_count > 0:
-            parts.append(f"[INFO] Suppressed {self.state.job_debug_count} internal debug messages")
-
-        if not parts:
-            return None
-
-        result = "\n".join(parts)
-        self._formatted_lines.extend(parts)
-        return result
+        # Silently suppress debug counts - no need to clutter the log
+        return None
 
     def get_formatted_lines(self) -> List[str]:
         """Get all formatted lines processed so far."""
@@ -427,31 +489,33 @@ def format_config_block(
 
     Example output:
         [LOCAL MODE] Detect/Track started for rhoslc-s06e08
-          Device: coreml
-          Profile: balanced
-          Stride: 6
-          Total frames: 2,868 @ 23.98 fps
+          Device: COREML  •  Profile: Balanced  •  Stride: 6
+          Total: 2,868 frames @ 23.98 fps
           CPU threads: 2 (capped for thermal safety, cpulimit=200%)
     """
     op_label = {
         "detect_track": "Detect/Track",
-        "faces_embed": "Faces Embed",
+        "faces_embed": "Harvest Faces",
         "cluster": "Cluster",
     }.get(operation, operation)
 
     lines = [f"[LOCAL MODE] {op_label} started for {episode_id}"]
-    lines.append(f"  Device: {device}")
-    lines.append(f"  Profile: {profile}")
 
+    # Build compact config line with dots
+    config_parts = [f"Device: {device.upper()}"]
+    config_parts.append(f"Profile: {profile.title()}")
     if stride is not None:
-        lines.append(f"  Stride: {stride}")
+        config_parts.append(f"Stride: {stride}")
+    lines.append("  " + "  •  ".join(config_parts))
 
+    # Total frames line
     if total_frames is not None:
-        frame_info = f"  Total frames: {total_frames:,}"
+        frame_info = f"  Total: {total_frames:,} frames"
         if fps is not None:
             frame_info += f" @ {fps:.2f} fps"
         lines.append(frame_info)
 
+    # CPU threads line
     thread_info = f"  CPU threads: {cpu_threads}"
     if cpulimit_percent is not None and cpulimit_percent > 0:
         thread_info += f" (capped for thermal safety, cpulimit={cpulimit_percent}%)"
@@ -471,8 +535,15 @@ def format_completion_summary(
     """Generate a clean completion summary line.
 
     Example:
-        [LOCAL MODE] detect_track completed in 7m 23s (tracks=142, faces=2,341)
+        ✅ Detect/Track completed in 7m 23s (tracks: 142, faces: 2,341)
     """
+    # Map operation to friendly label
+    op_label = {
+        "detect_track": "Detect/Track",
+        "faces_embed": "Harvest Faces",
+        "cluster": "Cluster",
+    }.get(operation, operation)
+
     # Format elapsed time
     if elapsed_seconds >= 60:
         mins = int(elapsed_seconds // 60)
@@ -481,14 +552,16 @@ def format_completion_summary(
     else:
         elapsed_str = f"{elapsed_seconds:.1f}s"
 
-    status_word = {
-        "completed": "completed successfully",
-        "error": "FAILED",
-        "timeout": "timed out",
-        "cancelled": "was cancelled",
-    }.get(status, status)
+    # Status icon and word
+    status_map = {
+        "completed": ("✅", "completed"),
+        "error": ("❌", "FAILED"),
+        "timeout": ("⏱️", "timed out"),
+        "cancelled": ("⚠️", "cancelled"),
+    }
+    icon, status_word = status_map.get(status, ("ℹ️", status))
 
-    line = f"[LOCAL MODE] {operation} {status_word} in {elapsed_str}"
+    line = f"{icon} {op_label} {status_word} in {elapsed_str}"
 
     # Add stats if available
     if stats:
@@ -496,7 +569,7 @@ def format_completion_summary(
         for key in ("tracks", "faces", "clusters", "identities", "detections"):
             val = stats.get(key)
             if val is not None:
-                stat_parts.append(f"{key}={val:,}" if isinstance(val, int) else f"{key}={val}")
+                stat_parts.append(f"{key}: {val:,}" if isinstance(val, int) else f"{key}: {val}")
         if stat_parts:
             line += f" ({', '.join(stat_parts)})"
 

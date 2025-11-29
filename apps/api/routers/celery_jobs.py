@@ -179,12 +179,22 @@ def _register_local_job(ep_id: str, operation: str, pid: int, job_id: str | None
 
 
 def _unregister_local_job(ep_id: str, operation: str) -> None:
-    """Unregister a local job when it completes or is cancelled."""
+    """Unregister a local job when it completes or is cancelled.
+
+    Also releases the file-based lock to allow future jobs to run.
+    """
     key = f"{ep_id}::{operation}"
     with _running_local_jobs_lock:
         if key in _running_local_jobs:
             del _running_local_jobs[key]
             LOGGER.info(f"[{ep_id}] Unregistered local {operation} job")
+
+    # Also release file-based lock (defined later in this module)
+    # Use try/except since _release_job_lock may not be defined during module load
+    try:
+        _release_job_lock(ep_id, operation)
+    except NameError:
+        pass  # Lock functions not yet defined during module initialization
 
 
 def _list_local_jobs(ep_id: str | None = None) -> List[Dict[str, Any]]:
@@ -321,6 +331,133 @@ def get_all_running_jobs(ep_id: str | None = None) -> List[Dict[str, Any]]:
 
 
 # =============================================================================
+# File-Based Job Locking - Prevents duplicate jobs across API restarts
+# =============================================================================
+# Lock files are stored at: data/manifests/{episode_id}/.lock_{operation}
+# Each lock contains: {"pid": N, "started_at": "...", "hostname": "..."}
+
+
+def _get_lock_path(ep_id: str, operation: str) -> Path:
+    """Get the path for a job lock file."""
+    from py_screenalytics.artifacts import get_path
+
+    manifests_dir = get_path(ep_id, "detections").parent
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    return manifests_dir / f".lock_{operation}"
+
+
+def _is_process_running(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    import psutil
+
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+
+
+def _acquire_job_lock(ep_id: str, operation: str) -> tuple[bool, str | None]:
+    """Acquire file-based lock for a job.
+
+    Returns:
+        (success, error_message): True if lock acquired, False with message if already locked
+    """
+    import socket
+    from datetime import datetime
+
+    lock_path = _get_lock_path(ep_id, operation)
+
+    # Check if lock already exists
+    if lock_path.exists():
+        try:
+            lock_data = json.loads(lock_path.read_text())
+            existing_pid = lock_data.get("pid")
+            existing_host = lock_data.get("hostname", "unknown")
+
+            # Check if the locking process is still running (on same host)
+            if existing_pid and socket.gethostname() == existing_host:
+                if _is_process_running(existing_pid):
+                    started = lock_data.get("started_at", "unknown")
+                    return False, f"Job already running (PID {existing_pid}, started {started})"
+                # Stale lock from dead process - safe to remove
+                LOGGER.info(f"[{ep_id}] Removing stale lock for {operation} (PID {existing_pid} no longer running)")
+            else:
+                # Different host or can't verify - check lock age
+                started_str = lock_data.get("started_at")
+                if started_str:
+                    try:
+                        started = datetime.fromisoformat(started_str.replace("Z", "+00:00"))
+                        age_hours = (datetime.now(started.tzinfo) - started).total_seconds() / 3600
+                        if age_hours < 4:  # Assume job could still be running if < 4 hours old
+                            return False, f"Job may be running on {existing_host} (started {started_str})"
+                    except (ValueError, TypeError):
+                        pass
+                # Old lock or can't parse - assume stale
+                LOGGER.info(f"[{ep_id}] Removing potentially stale lock for {operation}")
+
+            lock_path.unlink(missing_ok=True)
+        except (json.JSONDecodeError, IOError) as e:
+            LOGGER.warning(f"[{ep_id}] Could not read lock file, removing: {e}")
+            lock_path.unlink(missing_ok=True)
+
+    # Create the lock file
+    try:
+        lock_data = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "started_at": datetime.utcnow().isoformat() + "Z",
+            "ep_id": ep_id,
+            "operation": operation,
+        }
+        lock_path.write_text(json.dumps(lock_data, indent=2))
+        LOGGER.info(f"[{ep_id}] Acquired lock for {operation}")
+        return True, None
+    except IOError as e:
+        return False, f"Failed to create lock: {e}"
+
+
+def _release_job_lock(ep_id: str, operation: str) -> None:
+    """Release file-based lock for a job."""
+    lock_path = _get_lock_path(ep_id, operation)
+    try:
+        lock_path.unlink(missing_ok=True)
+        LOGGER.info(f"[{ep_id}] Released lock for {operation}")
+    except IOError as e:
+        LOGGER.warning(f"[{ep_id}] Failed to release lock for {operation}: {e}")
+
+
+def _check_job_lock(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Check if a lock exists and return lock info if active.
+
+    Returns:
+        Lock info dict if active lock exists, None otherwise
+    """
+    import socket
+
+    lock_path = _get_lock_path(ep_id, operation)
+    if not lock_path.exists():
+        return None
+
+    try:
+        lock_data = json.loads(lock_path.read_text())
+        existing_pid = lock_data.get("pid")
+        existing_host = lock_data.get("hostname", "unknown")
+
+        # If same host, check if process is running
+        if socket.gethostname() == existing_host:
+            if existing_pid and _is_process_running(existing_pid):
+                return lock_data
+            # Process dead, lock is stale
+            return None
+
+        # Different host - can't verify, return lock data (caller decides)
+        return lock_data
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+# =============================================================================
 # Per-Episode Log Storage - Persist logs for UI display after completion
 # =============================================================================
 # Logs are stored at: data/manifests/{episode_id}/logs/{operation}_latest.json
@@ -452,7 +589,8 @@ DEVICE_DEFAULT_PROFILE = {
 CPU_BOUND_DEVICES = {"cpu", "coreml", "mps", "metal", "apple", "auto"}
 
 # Maximum safe CPU threads for laptops (can be overridden via env var)
-DEFAULT_LAPTOP_CPU_THREADS = int(os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "2"))
+# Default raised from 2→3 for better local mode performance while remaining thermal-safe
+DEFAULT_LAPTOP_CPU_THREADS = int(os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "3"))
 
 
 def _resolve_profile(device: str, profile: str | None) -> tuple[str, str | None]:
@@ -588,7 +726,7 @@ class FacesEmbedCeleryRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
     save_frames: bool = Field(False, description="Save sampled frames")
-    save_crops: bool = Field(True, description="Save face crops")
+    save_crops: bool = Field(False, description="Save face crops (enable explicitly to avoid storage bloat)")
     jpeg_quality: int = Field(72, ge=1, le=100, description="JPEG quality")
     min_frames_between_crops: int = Field(32, ge=1, description="Min frames between crops")
     thumb_size: int = Field(256, ge=64, le=512, description="Thumbnail size")
@@ -1073,7 +1211,9 @@ def _run_local_subprocess_blocking(
     # Set up environment with CPU thread limits
     # For local mode, we enforce a hard cap of 2 threads for thermal safety on laptops
     env = os.environ.copy()
-    local_max_threads = min(int(cpu_threads or 2), 2)  # Hard cap at 2 for local mode thermal safety
+    LOCAL_THREADS_CAP = int(os.environ.get("SCREENALYTICS_LOCAL_MAX_THREADS", "4"))
+    default_local_threads = int(os.environ.get("SCREENALYTICS_LOCAL_DEFAULT_THREADS", "2"))
+    local_max_threads = min(int(cpu_threads or default_local_threads), LOCAL_THREADS_CAP)
     env.update({
         "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
         "OMP_NUM_THREADS": str(local_max_threads),
@@ -1501,6 +1641,10 @@ def _build_detect_track_command(
     if options.get("allow_cpu_fallback"):
         command.append("--allow-cpu-fallback")
 
+    # Suppress noisy ONNX/model warnings by default for cleaner logs
+    if not options.get("verbose"):
+        command.append("--quiet")
+
     return command
 
 
@@ -1539,6 +1683,10 @@ def _build_faces_embed_command(
     if options.get("allow_cpu_fallback"):
         command.append("--allow-cpu-fallback")
 
+    # Suppress noisy ONNX/model warnings by default for cleaner logs
+    if not options.get("verbose"):
+        command.append("--quiet")
+
     return command
 
 
@@ -1571,6 +1719,10 @@ def _build_cluster_command(
         command += ["--min-identity-sim", str(options["min_identity_sim"])]
     if options.get("allow_cpu_fallback"):
         command.append("--allow-cpu-fallback")
+
+    # Suppress noisy ONNX/model warnings by default for cleaner logs
+    if not options.get("verbose"):
+        command.append("--quiet")
 
     return command
 
@@ -1606,13 +1758,31 @@ def _stream_local_subprocess(
     Yields:
         Newline-delimited JSON strings
     """
-    # Check for existing running job
+    # Check for existing running job (in-memory registry)
     existing_job = _get_running_local_job(episode_id, operation)
     if existing_job:
         existing_pid = existing_job.get("pid")
         yield json.dumps({
             "type": "error",
             "message": f"A {operation} job is already running for this episode (PID {existing_pid})"
+        }) + "\n"
+        return
+
+    # Check file-based lock (survives API restart)
+    lock_info = _check_job_lock(episode_id, operation)
+    if lock_info:
+        yield json.dumps({
+            "type": "error",
+            "message": f"A {operation} job may already be running (lock: PID {lock_info.get('pid')}, host {lock_info.get('hostname')})"
+        }) + "\n"
+        return
+
+    # Acquire file-based lock
+    lock_acquired, lock_error = _acquire_job_lock(episode_id, operation)
+    if not lock_acquired:
+        yield json.dumps({
+            "type": "error",
+            "message": f"Could not start {operation}: {lock_error}"
         }) + "\n"
         return
 
@@ -1644,7 +1814,9 @@ def _stream_local_subprocess(
 
     # Set up environment with CPU thread limits
     env = os.environ.copy()
-    local_max_threads = min(int(cpu_threads or 2), 2)
+    LOCAL_THREADS_CAP = int(os.environ.get("SCREENALYTICS_LOCAL_MAX_THREADS", "4"))
+    default_local_threads = int(os.environ.get("SCREENALYTICS_LOCAL_DEFAULT_THREADS", "2"))
+    local_max_threads = min(int(cpu_threads or default_local_threads), LOCAL_THREADS_CAP)
     env.update({
         "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
         "OMP_NUM_THREADS": str(local_max_threads),
@@ -1788,6 +1960,30 @@ def _stream_local_subprocess(
             stripped = raw_line.rstrip()
             if not stripped:
                 continue
+
+            # Check if this is a JSON progress line - send as separate message type
+            if stripped.startswith('{') and '"phase"' in stripped:
+                try:
+                    progress_data = json.loads(stripped)
+                    if isinstance(progress_data, dict) and "phase" in progress_data:
+                        # Send progress update to UI
+                        yield json.dumps({
+                            "type": "progress",
+                            "frames_done": progress_data.get("frames_done", 0),
+                            "frames_total": progress_data.get("frames_total", 0),
+                            "phase": progress_data.get("phase", ""),
+                            "fps_infer": progress_data.get("fps_infer"),
+                            "secs_done": progress_data.get("secs_done", 0),
+                        }) + "\n"
+                        # Also format and show in logs
+                        formatted_line = formatter.format_line(stripped)
+                        if formatted_line:
+                            yield _emit_formatted(formatted_line, stripped)
+                        else:
+                            _emit_raw_only(stripped)
+                        continue
+                except json.JSONDecodeError:
+                    pass  # Not valid JSON, process normally
 
             # Apply formatting
             formatted_line = formatter.format_line(stripped)

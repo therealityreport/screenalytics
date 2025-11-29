@@ -328,7 +328,8 @@ def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
         # Add manifest existence info even when marker exists
         faces_path = _faces_path(ep_id)
         result["manifest_exists"] = faces_path.exists()
-        result["last_run_at"] = _get_file_mtime_iso(faces_path)
+        # Prefer marker timestamp; fall back to manifest mtime if available
+        result["last_run_at"] = marker.get("finished_at") or _get_file_mtime_iso(faces_path)
         faces_count = result.get("faces") or 0
         result["zero_rows"] = result["manifest_exists"] and faces_count == 0
         return result
@@ -432,8 +433,8 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         result = _phase_status_from_marker("cluster", marker)
         # Add manifest existence info even when marker exists
         result["manifest_exists"] = identities_path.exists()
-        # Use max of identities.json and track_metrics.json mtimes for staleness
-        result["last_run_at"] = _max_mtime_iso(identities_path, track_metrics_path)
+        # Use marker finished_at first; fall back to max of identities/track_metrics mtimes
+        result["last_run_at"] = marker.get("finished_at") or _max_mtime_iso(identities_path, track_metrics_path)
         result["track_metrics_exists"] = track_metrics_path.exists()
         identities_count = result.get("identities") or 0
         result["zero_rows"] = result["manifest_exists"] and identities_count == 0
@@ -1602,6 +1603,8 @@ class PhaseStatus(BaseModel):
     manifest_exists: bool | None = None
     zero_rows: bool | None = None
     last_run_at: str | None = None  # ISO timestamp of manifest mtime
+    # Cluster-specific: indicates track_metrics.json exists (even if identities.json missing)
+    track_metrics_exists: bool | None = None
 
 
 class EpisodeStatusResponse(BaseModel):

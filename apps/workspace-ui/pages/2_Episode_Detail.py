@@ -1179,6 +1179,8 @@ with st.expander("Pipeline Status", expanded=False):
             runtime_label = cluster_runtime or "n/a"
             st.success(f"✅ **Cluster**: Complete (Runtime: {runtime_label})")
             st.caption(f"Identities: {identities_label}")
+            if identities_count_value == 0:
+                st.warning("Cluster finished but found 0 identities. Rerun after checking detect/track and faces outputs.")
         elif cluster_status_value == "running":
             st.info("⏳ **Cluster**: Running")
             started = _format_timestamp(cluster_phase_status.get("started_at"))

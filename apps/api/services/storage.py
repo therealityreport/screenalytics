@@ -96,12 +96,16 @@ def _normalize_cursor_key(track_prefix: str, raw_key: str | None) -> str | None:
 
 
 def _boto3():
+    if os.environ.get("SCREENALYTICS_DISABLE_BOTO3", "0") == "1":
+        LOGGER.warning("SCREENALYTICS_DISABLE_BOTO3=1; S3/MinIO clients disabled")
+        return None
     try:
         import boto3  # type: ignore
 
         return boto3
     except ImportError as exc:  # pragma: no cover - only triggered in misconfig
-        raise RuntimeError("boto3 is required when STORAGE_BACKEND is 's3' or 'minio'") from exc
+        LOGGER.warning("boto3 not installed; S3/MinIO disabled: %s", exc)
+        return None
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,9 @@ class StorageService:
 
     def __init__(self) -> None:
         self.backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
+        self.configured_backend = self.backend
+        self.init_error: str | None = None
+        self._backend_fallback_applied = False
         self.region = os.environ.get("AWS_DEFAULT_REGION", DEFAULT_REGION)
         self.prefix = os.environ.get("AWS_S3_PREFIX", "raw/")
         if self.prefix and not self.prefix.endswith("/"):
@@ -191,37 +198,47 @@ class StorageService:
 
         if self.backend == "s3":
             boto3_mod = _boto3()
-            from botocore.exceptions import ClientError  # type: ignore
+            if boto3_mod is None:
+                self._fallback_to_local(
+                    "boto3 unavailable for STORAGE_BACKEND=s3; install boto3 or set STORAGE_BACKEND=local"
+                )
+            else:
+                from botocore.exceptions import ClientError  # type: ignore
 
-            client_kwargs: Dict[str, object] = {"region_name": self.region}
-            custom_endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT")
-            if custom_endpoint:
-                client_kwargs["endpoint_url"] = custom_endpoint
-            self._client = boto3_mod.client("s3", **client_kwargs)
-            configured_bucket = os.environ.get("SCREENALYTICS_S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
-            self.bucket = configured_bucket or DEFAULT_BUCKET
-            self._client_error_cls = ClientError
-            self._ensure_s3_bucket(ClientError)
+                client_kwargs: Dict[str, object] = {"region_name": self.region}
+                custom_endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT")
+                if custom_endpoint:
+                    client_kwargs["endpoint_url"] = custom_endpoint
+                self._client = boto3_mod.client("s3", **client_kwargs)
+                configured_bucket = os.environ.get("SCREENALYTICS_S3_BUCKET") or os.environ.get("AWS_S3_BUCKET")
+                self.bucket = configured_bucket or DEFAULT_BUCKET
+                self._client_error_cls = ClientError
+                self._ensure_s3_bucket(ClientError)
         elif self.backend == "minio":
             boto3_mod = _boto3()
-            from botocore.client import Config  # type: ignore
-            from botocore.exceptions import ClientError  # type: ignore
+            if boto3_mod is None:
+                self._fallback_to_local(
+                    "boto3 unavailable for STORAGE_BACKEND=minio; install boto3 or set STORAGE_BACKEND=local"
+                )
+            else:
+                from botocore.client import Config  # type: ignore
+                from botocore.exceptions import ClientError  # type: ignore
 
-            endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT", "http://localhost:9000")
-            access_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY", "minio")
-            secret_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY", "miniosecret")
-            signature_version = os.environ.get("SCREENALYTICS_OBJECT_STORE_SIGNATURE", "s3v4")
-            minio_region = os.environ.get("SCREENALYTICS_OBJECT_STORE_REGION", DEFAULT_REGION)
-            self.bucket = os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET", DEFAULT_BUCKET)
-            self._client = boto3_mod.client(
-                "s3",
-                endpoint_url=endpoint,
-                region_name=minio_region,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                config=Config(signature_version=signature_version),
-            )
-            self._client_error_cls = ClientError
+                endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT", "http://localhost:9000")
+                access_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY", "minio")
+                secret_key = os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY", "miniosecret")
+                signature_version = os.environ.get("SCREENALYTICS_OBJECT_STORE_SIGNATURE", "s3v4")
+                minio_region = os.environ.get("SCREENALYTICS_OBJECT_STORE_REGION", DEFAULT_REGION)
+                self.bucket = os.environ.get("SCREENALYTICS_OBJECT_STORE_BUCKET", DEFAULT_BUCKET)
+                self._client = boto3_mod.client(
+                    "s3",
+                    endpoint_url=endpoint,
+                    region_name=minio_region,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    config=Config(signature_version=signature_version),
+                )
+                self._client_error_cls = ClientError
         elif self.backend == "local":
             self.bucket = "local"
         else:
@@ -233,6 +250,19 @@ class StorageService:
             default_enabled = flag.lower() in {"1", "true", "yes"}
         self.write_enabled = default_enabled and self.backend in {"s3", "minio"} and self._client is not None
         self._init_facebank_storage()
+
+    def _fallback_to_local(self, reason: str) -> None:
+        """Downgrade to local storage when optional deps are missing."""
+
+        if self._backend_fallback_applied:
+            return
+        self.init_error = reason
+        LOGGER.warning("[storage] %s", reason)
+        self.backend = "local"
+        self.bucket = "local"
+        self._client = None
+        self._client_error_cls = None
+        self._backend_fallback_applied = True
 
     def _init_facebank_storage(self) -> None:
         """Initialise optional S3 client for facebank seeds.
@@ -263,9 +293,9 @@ class StorageService:
         secret_key = os.environ.get("FACEBANK_S3_SECRET_KEY") or os.environ.get("SCREENALYTICS_OBJECT_STORE_SECRET_KEY")
         signature_version = os.environ.get("FACEBANK_S3_SIGNATURE", "s3v4")
 
-        try:
-            boto3_mod = _boto3()
-        except RuntimeError:
+        boto3_mod = _boto3()
+        if boto3_mod is None:
+            LOGGER.warning("FACEBANK_S3_* configured but boto3 unavailable; skipping facebank mirror")
             return
 
         client_kwargs: Dict[str, Any] = {"region_name": region}

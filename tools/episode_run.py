@@ -74,7 +74,8 @@ PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11"
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
-PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
+PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 10))  # Smoother progress (was 25)
+PROGRESS_TIME_INTERVAL = float(os.environ.get("SCREENALYTICS_PROGRESS_TIME_INTERVAL", 2.0))  # Emit at least every N seconds
 TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1)
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -2056,6 +2057,7 @@ class ProgressEmitter:
         self._last_frames = 0
         self._last_phase: str | None = None
         self._last_step: str | None = None
+        self._last_emit_time: float = 0.0  # Time of last emission for time-based fallback
         self._device: str | None = None
         self._detector: str | None = None
         self._tracker: str | None = None
@@ -2072,7 +2074,13 @@ class ProgressEmitter:
             return True
         if step != self._last_step:
             return True
-        return (frames_done - self._last_frames) >= self._frame_interval
+        # Frame-based check
+        if (frames_done - self._last_frames) >= self._frame_interval:
+            return True
+        # Time-based fallback: emit at least every PROGRESS_TIME_INTERVAL seconds
+        if (time.time() - self._last_emit_time) >= PROGRESS_TIME_INTERVAL:
+            return True
+        return False
 
     def _compose_payload(
         self,
@@ -2217,6 +2225,7 @@ class ProgressEmitter:
         self._last_frames = frames_done
         self._last_phase = phase
         self._last_step = step
+        self._last_emit_time = time.time()
 
     def complete(
         self,
@@ -2504,6 +2513,22 @@ class FrameExporter:
                     {
                         "save_ok": False,
                         "save_err": crop_err or "no_crop",
+                        "ms": int((time.time() - start) * 1000),
+                    }
+                )
+                self._emit_debug(debug_payload)
+            return False
+
+        # Skip saving crops smaller than 16x16 pixels - too small for useful face recognition
+        min_dim = min(crop.shape[0], crop.shape[1]) if crop.ndim >= 2 else 0
+        if min_dim < 16:
+            self._register_crop_attempt("too_small")
+            if debug_payload is not None:
+                debug_payload.update(
+                    {
+                        "shape": tuple(int(x) for x in crop.shape),
+                        "save_ok": False,
+                        "save_err": "too_small",
                         "ms": int((time.time() - start) * 1000),
                     }
                 )
@@ -2990,6 +3015,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Preserve clusters that are assigned to cast members (don't recluster their tracks)",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress verbose ONNX/model warnings (cleaner logs)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show all debug output including ONNX/model warnings",
+    )
     gate_group = parser.add_argument_group("Appearance gate")
     gate_group.add_argument(
         "--gate-appear-hard",
@@ -3030,8 +3065,30 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _configure_logging(quiet: bool, verbose: bool) -> None:
+    """Configure logging levels based on --quiet/--verbose flags."""
+    if quiet and not verbose:
+        # Suppress noisy model/runtime warnings
+        logging.getLogger("onnxruntime").setLevel(logging.ERROR)
+        logging.getLogger("tensorflow").setLevel(logging.ERROR)
+        logging.getLogger("insightface").setLevel(logging.ERROR)
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        # Also suppress warnings module for common ONNX/TF deprecation warnings
+        import warnings
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        warnings.filterwarnings("ignore", message=".*onnx.*", category=UserWarning)
+    elif verbose:
+        # Enable debug output
+        logging.getLogger("episode_run").setLevel(logging.DEBUG)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Configure logging based on --quiet/--verbose flags
+    _configure_logging(getattr(args, "quiet", False), getattr(args, "verbose", False))
+
     coreml_size_arg = getattr(args, "coreml_det_size", None)
     if coreml_size_arg:
         args.coreml_det_size = _parse_retinaface_det_size(coreml_size_arg)
@@ -4604,10 +4661,14 @@ def _run_faces_embed_stage(
     # Determine CPU fallback policy from CLI flags
     # --allow-cpu-fallback OR --no-coreml-only enables CPU fallback
     allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
+
+    # Emit progress during model loading (can take time for CoreML compilation)
+    print(f"[INIT] Loading ArcFace embedder (device={device})...", flush=True)
     embedder = ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
+    print(f"[INIT] ArcFace embedder ready (resolved_device={embed_device})", flush=True)
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
@@ -4653,12 +4714,16 @@ def _run_faces_embed_stage(
                     len(samples), len(samples_by_frame), len(samples) / max(len(samples_by_frame), 1))
         
         # Process all faces from each frame together in a single batch
+        frames_processed = 0
+        total_frames = len(samples_by_frame)
         for frame_idx, frame_samples in samples_by_frame:
             # Decode frame ONCE for all faces in this frame
             if not video_path.exists():
                 raise FileNotFoundError("Local video not found for crop export")
             if frame_decoder is None:
+                print(f"[INIT] Opening video decoder for {video_path.name}...", flush=True)
                 frame_decoder = FrameDecoder(video_path)
+                print(f"[INIT] Video decoder ready", flush=True)
 
             # Wrap decode in try/except to handle corrupted frames gracefully
             image = None
@@ -4846,7 +4911,15 @@ def _run_faces_embed_stage(
             # BATCH EMBEDDING: Process all valid crops from this frame in ONE CoreML call
             # This reduces CPU by 60% - from 24,061 calls → ~800 calls (96.7% reduction)
             if batch_crops:
+                # Log first few frames for debugging slow starts
+                if frames_processed < 3:
+                    print(f"[EMBED] Frame {frame_idx}: embedding {len(batch_crops)} faces...", flush=True)
+                embed_start = time.time()
                 embeddings = embedder.encode(batch_crops)
+                embed_time = time.time() - embed_start
+                if frames_processed < 3:
+                    print(f"[EMBED] Frame {frame_idx}: done in {embed_time:.2f}s", flush=True)
+                frames_processed += 1
                 
                 for embedding_vec, meta in zip(embeddings, batch_metadata):
                     track_id = meta["track_id"]
