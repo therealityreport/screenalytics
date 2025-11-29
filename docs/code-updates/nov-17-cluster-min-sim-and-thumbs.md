@@ -16,6 +16,11 @@
 
 Implemented minimum identity similarity enforcement and thumbnail similarity gating to prevent mixed identities (e.g., Rinna + Kyle in the same cluster) and weak/partial thumbnails from being selected. Tracks with low similarity to their identity centroid are now split out into separate identities, and thumbnail selection now filters by both quality AND similarity to the track/identity centroid.
 
+**Thresholds (aligned with UI badges):**
+- Identity/cluster cohesion: ≥0.75 strong, ≥0.60 good (flagged when below 0.60)
+- Track consistency: ≥0.85 strong, ≥0.70 good
+- Frame similarity: ≥0.80 strong, ≥0.65 good
+
 ## Problem Statement
 
 The clustering pass was producing mixed identities where visually distinct cast members (e.g., Rinna + Kyle) were incorrectly merged into the same cluster. Additionally, thumbnail selection sometimes picked weak or partial face frames even though quality-based selection was in place. These issues occurred because:
@@ -30,7 +35,7 @@ The clustering pass was producing mixed identities where visually distinct cast 
 #### Configuration
 
 Added new environment variable and parameter:
-- **`SCREENALYTICS_MIN_IDENTITY_SIM`** (default: `0.50`)
+- **`SCREENALYTICS_MIN_IDENTITY_SIM`** (recommended: ≥0.75 to match UI “strong” badge; remains configurable)
 - CLI flag: `--min-identity-sim`
 - API field: `min_identity_sim` in `ClusterRequest` and `CleanupJobRequest`
 
@@ -105,7 +110,7 @@ Updated `identities.json` payload to include:
 
 **New Environment Variable (line 22):**
 ```python
-REP_MIN_SIM_TO_CENTROID = float(os.getenv("REP_MIN_SIM_TO_CENTROID", "0.50"))
+REP_MIN_SIM_TO_CENTROID = float(os.getenv("REP_MIN_SIM_TO_CENTROID", "0.50"))  # Recommend ≥0.70 (good) / 0.85 (strong)
 ```
 
 #### Implementation

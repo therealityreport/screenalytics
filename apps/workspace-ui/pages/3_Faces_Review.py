@@ -1089,12 +1089,13 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
             if _api_post(f"/episodes/{ep_id}/mirror"):
                 st.success("Mirror complete.")
                 st.rerun()
-    action_cols = st.columns([1, 1, 1])
+    action_cols = st.columns([1, 2])
     action_cols[0].button(
         "Open Episode Detail",
         key="facebank_open_detail",
         on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
     )
+    # Store Cluster Cleanup variables for use in recovery_row later
     with action_cols[1]:
         # Enhancement #4: Selective Cleanup Actions + Enhancement #3: Preview
         with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
@@ -2598,10 +2599,12 @@ def _render_unassigned_cluster_card(
             # Show similarity badge - use cluster cohesion for multi-track, internal similarity for single-track
             similarity_value = None
             similarity_label = None
+            similarity_type = None
             if tracks_count > 1 and cluster_cohesion is not None:
                 # Multi-track cluster: show cluster cohesion (how similar tracks are to each other)
                 similarity_value = cluster_cohesion
                 similarity_label = "Cluster Similarity"
+                similarity_type = SimilarityType.CLUSTER
             elif track_list:
                 # Single/few-track cluster: show track internal similarity (frame consistency within track)
                 # Try internal_similarity first (how similar rep frame is to track centroid)
@@ -2610,20 +2613,17 @@ def _render_unassigned_cluster_card(
                 if internal_sim is not None:
                     similarity_value = internal_sim
                     similarity_label = "Track Consistency"
+                    similarity_type = SimilarityType.TRACK
                 else:
                     # Fallback to track-to-cluster similarity if available
                     track_sim = track.get("similarity")
                     if track_sim is not None:
                         similarity_value = track_sim
                         similarity_label = "Track Similarity"
-            if similarity_value is not None and similarity_label:
-                sim_pct = int(similarity_value * 100)
-                sim_color = "#4CAF50" if similarity_value >= 0.7 else "#FF9800" if similarity_value >= 0.5 else "#F44336"
-                st.markdown(
-                    f'<span style="background-color: {sim_color}; color: white; '
-                    f'padding: 2px 6px; border-radius: 3px; font-size: 0.75em;">{similarity_label}: {sim_pct}%</span>',
-                    unsafe_allow_html=True
-                )
+                        similarity_type = SimilarityType.TRACK
+            if similarity_value is not None and similarity_label and similarity_type:
+                badge = render_similarity_badge(similarity_value, similarity_type, show_label=True, custom_label=similarity_label)
+                st.markdown(badge, unsafe_allow_html=True)
             # Low-confidence badge for single-frame single-track clusters
             if is_single_track_cluster and has_single_frame_track:
                 st.markdown(
@@ -2770,6 +2770,11 @@ def _render_unassigned_cluster_card(
         # Show cast suggestions (Enhancement #1) if available
         if cast_suggestions:
             st.markdown("**🎯 Cast Suggestions:**")
+            margin_pct = None
+            if len(cast_suggestions) > 1:
+                top = cast_suggestions[0].get("similarity") or 0
+                runner_up = cast_suggestions[1].get("similarity") or 0
+                margin_pct = int((max(top - runner_up, 0)) * 100)
             for idx, cast_sugg in enumerate(cast_suggestions[:3]):
                 sugg_cast_id = cast_sugg.get("cast_id")
                 sugg_name = cast_sugg.get("name", sugg_cast_id)
@@ -2778,14 +2783,15 @@ def _render_unassigned_cluster_card(
                 sugg_source = cast_sugg.get("source", "facebank")
                 faces_used = cast_sugg.get("faces_used")
 
-                # Confidence badge colors
+                sim_badge = render_similarity_badge(sugg_sim, SimilarityType.CAST, show_label=True)
+                # Confidence buckets aligned to cast thresholds (68/50)
+                conf_level = "high" if sugg_sim >= 0.68 else "medium" if sugg_sim >= 0.50 else "low"
                 confidence_colors = {
                     "high": "#4CAF50",  # Green
                     "medium": "#FF9800",  # Orange
                     "low": "#F44336",  # Red
                 }
-                badge_color = confidence_colors.get(sugg_confidence, "#9E9E9E")
-                sim_pct = int(sugg_sim * 100)
+                badge_color = confidence_colors.get(conf_level, "#9E9E9E")
 
                 # Source label with extra info
                 source_label = sugg_source
@@ -2797,8 +2803,9 @@ def _render_unassigned_cluster_card(
                     st.markdown(
                         f'<span style="background-color: {badge_color}; color: white; padding: 2px 8px; '
                         f'border-radius: 4px; font-size: 0.85em; font-weight: bold; margin-right: 8px;">'
-                        f'{sugg_confidence.upper()}</span> **{sugg_name}** ({sim_pct}%) '
-                        f'<span style="font-size: 0.75em; color: #888;">via {source_label}</span>',
+                        f'{conf_level.upper()}</span> {sim_badge} **{sugg_name}** '
+                        f'<span style="font-size: 0.75em; color: #888;">via {source_label}</span>'
+                        + (f" · Δ {margin_pct}%" if idx == 0 and margin_pct is not None else ""),
                         unsafe_allow_html=True,
                     )
                 with sugg_col2:
@@ -2829,11 +2836,13 @@ def _render_unassigned_cluster_card(
         # Show person-based suggestion if available (existing logic)
         if suggested_cast_id and suggested_cast_name:
             similarity_pct = int((1 - suggested_distance) * 100) if suggested_distance is not None else 0
-            # Enhancement #5: Confidence scoring
-            if similarity_pct >= 80:
+            similarity_value = similarity_pct / 100.0 if similarity_pct else 0.0
+            cast_badge = render_similarity_badge(similarity_value, SimilarityType.CAST, show_label=True)
+            # Confidence scoring aligned to cast thresholds (68/50)
+            if similarity_value >= 0.68:
                 confidence = "HIGH"
                 badge_color = "#4CAF50"  # Green
-            elif similarity_pct >= 65:
+            elif similarity_value >= 0.50:
                 confidence = "MEDIUM"
                 badge_color = "#FF9800"  # Orange
             else:
@@ -2845,8 +2854,7 @@ def _render_unassigned_cluster_card(
                 st.markdown(
                     f'✨ <span style="background-color: {badge_color}; color: white; padding: 2px 8px; '
                     f'border-radius: 4px; font-size: 0.85em; font-weight: bold; margin-right: 8px;">'
-                    f'{confidence}</span> Suggested (from assigned clusters): **{suggested_cast_name}** '
-                    f'({similarity_pct}% similarity)',
+                    f'{confidence}</span> Suggested (from assigned clusters): {cast_badge} **{suggested_cast_name}**',
                     unsafe_allow_html=True,
                 )
             with sugg_col2:
@@ -3989,6 +3997,38 @@ def _render_person_clusters(
                 track_meta_map[track_int] = meta
         return meta or {}
 
+    # Compute cast track scores (similarity of each track to others for this person)
+    embeddings: list[np.ndarray] = []
+    track_to_embedding_idx: dict[int, int] = {}
+    for idx, track in enumerate(all_tracks):
+        embedding = track.get("embedding")
+        if embedding is None:
+            meta = _track_meta(track.get("track_int"))
+            embedding = meta.get("embedding") if isinstance(meta, dict) else None
+        if embedding:
+            try:
+                embeddings.append(np.array(embedding))
+                track_to_embedding_idx[idx] = len(embeddings) - 1
+            except Exception:
+                continue
+
+    if len(embeddings) > 1:
+        try:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            normalized = embeddings / (norms + 1e-10)
+            similarity_matrix = normalized @ normalized.T
+            for track_idx, emb_idx in track_to_embedding_idx.items():
+                row = similarity_matrix[emb_idx]
+                other_sims = [row[j] for j in range(len(row)) if j != emb_idx]
+                if other_sims:
+                    all_tracks[track_idx]["cast_track_score"] = float(np.mean(other_sims))
+        except Exception:
+            pass
+
+    cast_scores = [t.get("cast_track_score") for t in all_tracks if t.get("cast_track_score") is not None]
+    avg_cast_score = float(np.mean(cast_scores)) if cast_scores else None
+    low_cast_tracks = len([s for s in cast_scores if s is not None and s < 0.55])
+
     # --- Bulk Track Selection State ---
     bulk_sel_key = f"bulk_track_sel::person::{person_id}"
     if bulk_sel_key not in st.session_state:
@@ -3999,6 +4039,12 @@ def _render_person_clusters(
     sort_cols = st.columns([2, 1, 1])
     with sort_cols[0]:
         st.markdown(f"**All {len(all_tracks)} Tracks**")
+        if avg_cast_score is not None:
+            st.caption(
+                f"Avg Cast Track Score {render_similarity_badge(avg_cast_score, SimilarityType.CAST_TRACK)}"
+                f" · Low (<55%): {low_cast_tracks}",
+                unsafe_allow_html=True,
+            )
     with sort_cols[1]:
         # Select all / Deselect all
         all_track_ids_set = {t.get("track_int") for t in all_tracks if t.get("track_int") is not None}
@@ -4308,8 +4354,18 @@ def _render_cast_all_tracks(
         frame_count = meta.get("faces_count") or meta.get("frames_count") or len(meta.get("frames", []) or [])
         track["_frame_count"] = int(frame_count) if frame_count else 0
 
+    cast_scores = [t.get("cast_track_score") for t in all_tracks if t.get("cast_track_score") is not None]
+    avg_cast_score = float(np.mean(cast_scores)) if cast_scores else None
+    low_cast_tracks = len([s for s in cast_scores if s is not None and s < 0.55])
+
     # Sort controls
     st.markdown(f"**{len(all_tracks)} Tracks** · {total_faces} frames total")
+    if avg_cast_score is not None:
+        st.caption(
+            f"Avg Cast Track Score {render_similarity_badge(avg_cast_score, SimilarityType.CAST_TRACK)}"
+            f" · Low (<55%): {low_cast_tracks}",
+            unsafe_allow_html=True,
+        )
 
     sort_cols = st.columns([2, 2, 1])
     with sort_cols[0]:
@@ -4401,6 +4457,29 @@ def _render_cluster_tracks(
         st.error("Failed to load track representatives.")
         return
 
+    # Fetch cast suggestions once to show cast similarity + ambiguity margin
+    cast_suggestion = None
+    cast_margin_pct: int | None = None
+    suggestions_cache_key = f"cast_suggestions:{ep_id}"
+    suggestions_map = st.session_state.get(suggestions_cache_key)
+    if suggestions_map is None:
+        suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions")
+        suggestions_map = {}
+        if suggestions_resp:
+            for entry in suggestions_resp.get("suggestions", []):
+                cid = entry.get("cluster_id")
+                if not cid:
+                    continue
+                suggestions_map[cid] = entry.get("cast_suggestions", []) or []
+        st.session_state[suggestions_cache_key] = suggestions_map
+    cast_suggestions_for_cluster = suggestions_map.get(identity_id) if suggestions_map else []
+    if cast_suggestions_for_cluster:
+        cast_suggestion = cast_suggestions_for_cluster[0]
+        if len(cast_suggestions_for_cluster) > 1:
+            top = cast_suggestions_for_cluster[0].get("similarity") or 0
+            runner = cast_suggestions_for_cluster[1].get("similarity") or 0
+            cast_margin_pct = int(max(top - runner, 0) * 100)
+
     # Prefetch adjacent clusters for faster navigation
     person_cluster_ids = [
         ident_id
@@ -4446,6 +4525,16 @@ def _render_cluster_tracks(
     if cohesion is not None:
         cohesion_badge = render_similarity_badge(cohesion, SimilarityType.CLUSTER)
         st.markdown(f"**Cluster Cohesion:** {cohesion_badge}", unsafe_allow_html=True)
+
+    if cast_suggestion:
+        cast_sim = cast_suggestion.get("similarity") or 0.0
+        cast_name = cast_suggestion.get("name") or cast_suggestion.get("cast_id") or "cast"
+        cast_badge = render_similarity_badge(cast_sim, SimilarityType.CAST, show_label=True)
+        margin_html = f" · Δ {cast_margin_pct}%" if cast_margin_pct is not None else ""
+        st.markdown(
+            f"**Cast Similarity:** {cast_badge} · {cast_name}{margin_html}",
+            unsafe_allow_html=True,
+        )
 
     # Tracks count
     st.caption(f"**{tracks_count}** track(s)")
@@ -4905,6 +4994,95 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
     if page > max_page:
         st.session_state[page_key] = max_page
         st.rerun()
+
+    # Track-level summary metrics
+    track_similarity: float | None = None
+    cast_track_score: float | None = None
+    if current_identity:
+        track_reps = _fetch_cluster_track_reps_cached(ep_id, current_identity)
+        if track_reps and track_reps.get("tracks"):
+            for tr in track_reps.get("tracks", []):
+                tr_id = coerce_int(tr.get("track_id") or tr.get("track_int"))
+                if tr_id == track_id:
+                    track_similarity = tr.get("similarity") or tr.get("internal_similarity")
+                    cast_track_score = tr.get("cast_track_score")
+                    break
+
+    frame_sim_values = [f.get("similarity") for f in frames if f.get("similarity") is not None]
+    avg_frame_sim = float(np.mean(frame_sim_values)) if frame_sim_values else None
+    min_frame_sim = float(np.min(frame_sim_values)) if frame_sim_values else None
+    max_frame_sim = float(np.max(frame_sim_values)) if frame_sim_values else None
+    outlier_frames = len([s for s in frame_sim_values if s is not None and s < 0.65])
+    drift = None
+    if min_frame_sim is not None and max_frame_sim is not None:
+        drift = max_frame_sim - min_frame_sim
+
+    quality_scores: list[float] = []
+    for frame_meta in frames:
+        quality = frame_meta.get("quality")
+        if isinstance(quality, dict) and quality.get("score") is not None:
+            try:
+                quality_scores.append(float(quality.get("score")))
+            except (TypeError, ValueError):
+                continue
+    avg_quality = float(np.mean(quality_scores)) if quality_scores else None
+
+    quality_weighted_sim = None
+    if frame_sim_values and quality_scores:
+        quality_weighted_sim = float(np.mean([s * q for s, q in zip(frame_sim_values, quality_scores)]))
+
+    def _quality_badge(score: float | None) -> str:
+        if score is None:
+            return ""
+        pct = int(score * 100)
+        if score >= 0.85:
+            color = "#2E7D32"
+        elif score >= 0.60:
+            color = "#81C784"
+        else:
+            color = "#EF5350"
+        return (
+            f'<span style="background-color: {color}; color: white; padding: 2px 6px; '
+            f'border-radius: 3px; font-size: 0.8em; font-weight: bold;">Q: {pct}%</span>'
+        )
+
+    with st.container(border=True):
+        st.markdown("**Track Health**")
+        summary_cols = st.columns([1.1, 1.1, 1.2, 1.2])
+        with summary_cols[0]:
+            if track_similarity is not None:
+                st.markdown(
+                    f"Track → Cluster {render_similarity_badge(track_similarity, SimilarityType.TRACK)}",
+                    unsafe_allow_html=True,
+                )
+            if cast_track_score is not None:
+                st.caption(
+                    f"Cast Track Score {render_similarity_badge(cast_track_score, SimilarityType.CAST_TRACK)}",
+                    unsafe_allow_html=True,
+                )
+        with summary_cols[1]:
+            if avg_frame_sim is not None:
+                st.markdown(
+                    f"Avg Frame {render_similarity_badge(avg_frame_sim, SimilarityType.FRAME)}",
+                    unsafe_allow_html=True,
+                )
+            if min_frame_sim is not None:
+                st.caption(
+                    f"Min Frame {render_similarity_badge(min_frame_sim, SimilarityType.FRAME)}",
+                    unsafe_allow_html=True,
+                )
+        with summary_cols[2]:
+            if avg_quality is not None:
+                st.markdown(_quality_badge(avg_quality), unsafe_allow_html=True)
+            st.caption(f"Outliers <65%: {outlier_frames}")
+        with summary_cols[3]:
+            if quality_weighted_sim is not None:
+                st.markdown(
+                    f"Quality × Sim {render_similarity_badge(quality_weighted_sim, SimilarityType.FRAME)}",
+                    unsafe_allow_html=True,
+                )
+            if drift is not None:
+                st.caption(f"Drift (max-min): {drift:.0%}")
 
     # Reorder frames to show best-quality frame first (if present in current page)
     if best_frame_idx is not None and frames:

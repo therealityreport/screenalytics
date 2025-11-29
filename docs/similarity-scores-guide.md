@@ -17,40 +17,49 @@ The system uses **cosine similarity** (0.0-1.0 scale) to compare face embeddings
 **When:** During identity assignment and cast linking
 **Range:** 0.0 - 1.0
 **Thresholds:**
-- ≥ 0.68: Strong match, can auto-assign
+- ≥ 0.68: Strong match (auto-assign safe)
 - 0.50 - 0.67: Possible match, needs review
-- < 0.50: Weak match, likely different person
+- < 0.50: Weak match
 
 ### 🔵 Identity Similarity (Blue #2196F3)
-**What:** Similarity between a single frame and its track's identity centroid
-**When:** During track representative selection and quality scoring
+**What:** How similar auto-generated people/clusters are to their centroid (person-level cohesion)
+**When:** Cluster/people review, cohesion checks
 **Range:** 0.0 - 1.0
 **Thresholds:**
-- ≥ 0.75: Excellent identity match
+- ≥ 0.75: Strong match
 - 0.60 - 0.74: Good match
-- < 0.60: Poor match, may not be same person
+- < 0.60: Weak match
 
 ### 🟢 Cluster Similarity (Green #4CAF50)
-**What:** Similarity between cluster centroids during clustering
-**When:** DBSCAN clustering phase, merging similar faces
+**What:** Cohesion of tracks inside a cluster (track-to-centroid similarity)
+**When:** Cluster review/merge decisions
 **Range:** 0.0 - 1.0
 **Thresholds:**
-- ≥ 0.35: Same cluster (default CLUSTER_MIN_SIM)
-- < 0.35: Different clusters
+- ≥ 0.80: Tight cluster
+- 0.60 - 0.79: Moderate cohesion
+- < 0.60: Loose cluster
 
 ### 🟠 Track Similarity (Orange #FF9800)
-**What:** Similarity between consecutive frames in a track (appearance gate)
-**When:** Real-time during detect/track, frame-by-frame identity verification
+**What:** Consistency of frames within a track (frame-to-track centroid)
+**When:** Track review/outlier detection
 **Range:** 0.0 - 1.0
 **Thresholds:**
-- ≥ 0.82: Continue track (soft threshold)
-- 0.75 - 0.81: Low similarity streak, may split
-- < 0.75: Force split track (hard threshold)
+- ≥ 0.85: Strong consistency
+- 0.70 - 0.84: Good consistency
+- < 0.70: Weak consistency
 
-### 🔴 Assignment Confidence (Red-Amber Spectrum)
-**What:** Meta-score combining similarity + ambiguity margin for auto-assignment
-**When:** Auto-assigning clusters to people/cast
-**Colors:**
-- 🟢 **Strong** (#4CAF50): sim ≥ 0.68 AND margin ≥ 0.10 → Auto-assign
-- 🟡 **Ambiguous** (#FFC107): sim ≥ 0.68 BUT margin < 0.10 → Manual review
-- 🔴 **Weak** (#F44336): sim < 0.68 → Do not assign
+### 🟠 Frame Similarity (Light Orange #FFA726)
+**What:** How similar a specific frame is to the rest of the track
+**When:** Frame-level outlier checks
+**Range:** 0.0 - 1.0
+**Thresholds:**
+- ≥ 0.80: Strong match
+- 0.65 - 0.79: Good match
+- < 0.65: Potential outlier
+
+### 🟢 Quality Score (Green)
+**What:** Detection confidence + sharpness + face area (displayed as `Q: XX%`)
+**Thresholds:**
+- ≥ 0.85: High quality
+- 0.60 - 0.84: Medium quality
+- < 0.60: Low quality

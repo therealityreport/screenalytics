@@ -22,6 +22,7 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+from similarity_badges import SimilarityType, render_similarity_badge  # noqa: E402
 
 cfg = helpers.init_page("Smart Suggestions")
 st.title("Smart Suggestions")
@@ -413,18 +414,15 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
     if source == "frame" and faces_used:
         source_label = f"frame ({faces_used} face{'s' if faces_used > 1 else ''})"
 
-    # Colors
-    conf_colors = {"high": "#4CAF50", "medium": "#FF9800", "low": "#F44336"}
-    conf_color = conf_colors.get(confidence, "#9E9E9E")
-    sim_pct = int(similarity * 100)
-
     # Determine which similarity to show: cluster cohesion for multi-track, internal similarity for single-track
     similarity_value = None
     similarity_label = None
+    similarity_type = None
     if tracks > 1 and cohesion is not None:
         # Multi-track cluster: show cluster cohesion
         similarity_value = cohesion
         similarity_label = "Cluster Similarity"
+        similarity_type = SimilarityType.CLUSTER
     elif track_list:
         # Single/few-track cluster: show track internal similarity (frame consistency within track)
         # Try internal_similarity first (how similar rep frame is to track centroid)
@@ -433,14 +431,14 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
         if internal_sim is not None:
             similarity_value = internal_sim
             similarity_label = "Track Consistency"
+            similarity_type = SimilarityType.TRACK
         else:
             # Fallback to track-to-cluster similarity if available
             track_sim = track.get("similarity")
             if track_sim is not None:
                 similarity_value = track_sim
                 similarity_label = "Track Similarity"
-    sim_badge_pct = int(similarity_value * 100) if similarity_value is not None else None
-    sim_badge_color = "#4CAF50" if similarity_value and similarity_value >= 0.7 else "#FF9800" if similarity_value and similarity_value >= 0.5 else "#F44336"
+                similarity_type = SimilarityType.TRACK
 
     with st.container(border=True):
         # Row layout: thumbnails on left (fixed 147x184px each, max 5), info on right
@@ -462,22 +460,32 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
             st.markdown(f"**Cluster `{cluster_id}`**")
             st.caption(f"{faces} faces · {tracks} tracks")
 
-            if sim_badge_pct is not None and similarity_label:
-                st.markdown(
-                    f'<span style="background-color: {sim_badge_color}; color: white; '
-                    f'padding: 2px 6px; border-radius: 3px; font-size: 0.75em;">{similarity_label}: {sim_badge_pct}%</span>',
-                    unsafe_allow_html=True
-                )
+            if similarity_value is not None and similarity_label and similarity_type:
+                sim_badge = render_similarity_badge(similarity_value, similarity_type, show_label=True, custom_label=similarity_label)
+                st.markdown(sim_badge, unsafe_allow_html=True)
 
             st.markdown("")  # Spacer
 
-            # Suggestion with confidence
+            # Suggestion with confidence aligned to cast thresholds (68/50)
+            cast_badge = render_similarity_badge(similarity, SimilarityType.CAST, show_label=True)
+            conf_level = "high" if similarity >= 0.68 else "medium" if similarity >= 0.50 else "low"
+            conf_colors = {"high": "#4CAF50", "medium": "#FF9800", "low": "#F44336"}
+            conf_color = conf_colors.get(conf_level, "#9E9E9E")
+
+            # Ambiguity margin (top1 vs top2)
+            margin_pct = None
+            all_suggestions = entry.get("all_suggestions") or []
+            if len(all_suggestions) > 1:
+                runner_up = all_suggestions[1].get("similarity", 0) or 0
+                margin_pct = int(max(similarity - runner_up, 0) * 100)
+
+            margin_html = f" · Δ {margin_pct}%" if margin_pct is not None else ""
             st.markdown(
                 f'<span style="background-color: {conf_color}; color: white; '
                 f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
-                f'{sim_pct}%</span> → **{cast_name}** '
-                f'<span style="font-size: 0.75em; color: #888;">({source_label})</span>',
-                unsafe_allow_html=True
+                f'{conf_level.upper()}</span> {cast_badge} → **{cast_name}** '
+                f'<span style="font-size: 0.75em; color: #888;">({source_label}){margin_html}</span>',
+                unsafe_allow_html=True,
             )
 
             # Alternative suggestions
@@ -576,19 +584,24 @@ if suggestion_entries or person_suggestion_entries:
                     cast_id = best_suggestion.get("cast_id")
                     cast_name = best_suggestion.get("name") or cast_options.get(cast_id, cast_id)
                     similarity = best_suggestion.get("similarity", 0)
-                    confidence = best_suggestion.get("confidence", "low")
                     source = best_suggestion.get("source", "facebank")
 
+                    cast_badge = render_similarity_badge(similarity, SimilarityType.CAST, show_label=True)
+                    conf_level = "high" if similarity >= 0.68 else "medium" if similarity >= 0.50 else "low"
                     conf_colors = {"high": "#4CAF50", "medium": "#FF9800", "low": "#F44336"}
-                    conf_color = conf_colors.get(confidence, "#9E9E9E")
-                    sim_pct = int(similarity * 100)
+                    conf_color = conf_colors.get(conf_level, "#9E9E9E")
+                    margin_pct = None
+                    if len(all_suggestions) > 1:
+                        runner_up = all_suggestions[1].get("similarity", 0) or 0
+                        margin_pct = int(max(similarity - runner_up, 0) * 100)
 
                     st.markdown(
                         f'<span style="background-color: {conf_color}; color: white; '
                         f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
-                        f'{sim_pct}%</span> → **{cast_name}** '
-                        f'<span style="font-size: 0.75em; color: #888;">({source})</span>',
-                        unsafe_allow_html=True
+                        f'{conf_level.upper()}</span> {cast_badge} → **{cast_name}** '
+                        f'<span style="font-size: 0.75em; color: #888;">({source})'
+                        f"{' · Δ ' + str(margin_pct) + '%' if margin_pct is not None else ''}</span>",
+                        unsafe_allow_html=True,
                     )
 
                     alt_suggestions = all_suggestions[1:3]
