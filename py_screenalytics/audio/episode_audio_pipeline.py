@@ -1,0 +1,512 @@
+"""Episode Audio Pipeline Orchestrator.
+
+Main entry point for running the complete audio pipeline:
+1. Extract original audio
+2. Separation (MDX-Extra)
+3. Enhance (Resemble)
+4. Diarization
+5. Voice embeddings + clustering + voice-bank mapping
+6. ASR (OpenAI Whisper or Gemini)
+7. Fuse diarization + ASR + voice-bank mapping into transcript
+8. QC
+9. Final export
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+import yaml
+
+from .models import (
+    AudioArtifacts,
+    AudioPipelineConfig,
+    AudioPipelineResult,
+    ManifestArtifacts,
+    QCStatus,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _load_config(config_path: Optional[Path] = None) -> AudioPipelineConfig:
+    """Load audio pipeline configuration from YAML."""
+    if config_path is None:
+        # Find config relative to project root
+        # Try common locations
+        candidates = [
+            Path("config/pipeline/audio.yaml"),
+            Path(__file__).parents[3] / "config" / "pipeline" / "audio.yaml",
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                config_path = candidate
+                break
+
+    if config_path is None or not config_path.exists():
+        LOGGER.warning("Audio config not found, using defaults")
+        return AudioPipelineConfig()
+
+    with config_path.open("r", encoding="utf-8") as f:
+        yaml_data = yaml.safe_load(f)
+
+    return AudioPipelineConfig.from_yaml(yaml_data)
+
+
+def _get_audio_paths(ep_id: str, data_root: Optional[Path] = None) -> dict:
+    """Get paths for audio artifacts."""
+    if data_root is None:
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+
+    audio_dir = data_root / "audio" / ep_id
+    manifests_dir = data_root / "manifests" / ep_id
+    video_dir = data_root / "videos" / ep_id
+
+    return {
+        "video": video_dir / "episode.mp4",
+        "audio_dir": audio_dir,
+        "manifests_dir": manifests_dir,
+        "original": audio_dir / "episode_original.wav",
+        "vocals": audio_dir / "episode_vocals.wav",
+        "vocals_enhanced": audio_dir / "episode_vocals_enhanced.wav",
+        "final_voice_only": audio_dir / "episode_final_voice_only.wav",
+        "diarization": manifests_dir / "audio_diarization.jsonl",
+        "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
+        "voice_clusters": manifests_dir / "audio_voice_clusters.json",
+        "voice_mapping": manifests_dir / "audio_voice_mapping.json",
+        "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
+        "transcript_vtt": manifests_dir / "episode_transcript.vtt",
+        "qc": manifests_dir / "audio_qc.json",
+    }
+
+
+def _get_show_id(ep_id: str) -> str:
+    """Extract show ID from episode ID."""
+    # ep_id format: show-sXXeYY (e.g., rhoslc-s06e02)
+    parts = ep_id.split("-")
+    if parts:
+        return parts[0].upper()
+    return ep_id.upper()
+
+
+def run_episode_audio_pipeline(
+    ep_id: str,
+    overwrite: bool = False,
+    asr_provider: Optional[str] = None,
+    config_path: Optional[Path] = None,
+    data_root: Optional[Path] = None,
+    progress_callback: Optional[callable] = None,
+) -> AudioPipelineResult:
+    """Run the complete audio pipeline for an episode.
+
+    Args:
+        ep_id: Episode identifier
+        overwrite: Whether to overwrite existing artifacts
+        asr_provider: Override ASR provider (openai_whisper or gemini_3)
+        config_path: Optional path to config file
+        data_root: Optional data root directory
+        progress_callback: Optional callback for progress updates
+            Signature: callback(step: str, progress: float, message: str)
+
+    Returns:
+        AudioPipelineResult with all paths and metrics
+    """
+    LOGGER.info(f"Starting audio pipeline for episode: {ep_id}")
+
+    # Load configuration
+    config = _load_config(config_path)
+
+    # Override ASR provider if specified
+    if asr_provider:
+        config.asr.provider = asr_provider
+
+    # Get paths
+    paths = _get_audio_paths(ep_id, data_root)
+    show_id = _get_show_id(ep_id)
+
+    # Ensure directories exist
+    paths["audio_dir"].mkdir(parents=True, exist_ok=True)
+    paths["manifests_dir"].mkdir(parents=True, exist_ok=True)
+
+    # Initialize result
+    result = AudioPipelineResult(
+        ep_id=ep_id,
+        audio_artifacts=AudioArtifacts(),
+        manifest_artifacts=ManifestArtifacts(),
+    )
+
+    def _update_progress(step: str, progress: float, message: str):
+        LOGGER.info(f"[{step}] {progress*100:.0f}% - {message}")
+        if progress_callback:
+            progress_callback(step, progress, message)
+
+    try:
+        # Step 1: Extract original audio
+        _update_progress("extract", 0.0, "Extracting audio from video...")
+
+        from .io import extract_audio_from_video
+
+        if not paths["video"].exists():
+            raise FileNotFoundError(f"Video not found: {paths['video']}")
+
+        original_path, original_stats = extract_audio_from_video(
+            paths["video"],
+            paths["original"],
+            sample_rate=config.export.sample_rate,
+            bit_depth=config.export.bit_depth,
+            overwrite=overwrite,
+        )
+        result.audio_artifacts.original = original_path
+        result.duration_original_s = original_stats.duration_seconds
+
+        _update_progress("extract", 1.0, f"Audio extracted: {original_stats.duration_seconds:.1f}s")
+
+        # Step 2: Separation (MDX-Extra)
+        _update_progress("separate", 0.0, "Separating vocals from accompaniment...")
+
+        from .separation_mdx import separate_vocals
+
+        vocals_path, _ = separate_vocals(
+            original_path,
+            paths["audio_dir"],
+            config.separation,
+            overwrite=overwrite,
+        )
+        result.audio_artifacts.vocals = vocals_path
+
+        _update_progress("separate", 1.0, "Vocal separation complete")
+
+        # Step 3: Enhance (Resemble)
+        _update_progress("enhance", 0.0, "Enhancing vocals...")
+
+        try:
+            from .enhance_resemble import enhance_audio_resemble, check_api_available
+
+            if check_api_available():
+                enhanced_path = enhance_audio_resemble(
+                    vocals_path,
+                    paths["vocals_enhanced"],
+                    config.enhance,
+                    overwrite=overwrite,
+                )
+            else:
+                LOGGER.warning("Resemble API not available, using local enhancement")
+                from .enhance_resemble import enhance_audio_local
+                enhanced_path = enhance_audio_local(
+                    vocals_path,
+                    paths["vocals_enhanced"],
+                    overwrite=overwrite,
+                )
+        except Exception as e:
+            LOGGER.warning(f"Enhancement failed, using vocals directly: {e}")
+            enhanced_path = vocals_path
+
+        result.audio_artifacts.vocals_enhanced = enhanced_path
+
+        _update_progress("enhance", 1.0, "Enhancement complete")
+
+        # Step 4: Diarization
+        _update_progress("diarize", 0.0, "Running speaker diarization...")
+
+        from .diarization_pyannote import run_diarization
+
+        diarization_segments = run_diarization(
+            enhanced_path,
+            paths["diarization"],
+            config.diarization,
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.diarization = paths["diarization"]
+
+        _update_progress("diarize", 1.0, f"Diarization complete: {len(diarization_segments)} segments")
+
+        # Step 5: Voice clustering + voice bank mapping
+        _update_progress("voices", 0.0, "Clustering voices...")
+
+        from .voice_clusters import cluster_episode_voices
+        from .voice_bank import match_voice_clusters_to_bank
+
+        voice_clusters = cluster_episode_voices(
+            enhanced_path,
+            diarization_segments,
+            paths["voice_clusters"],
+            config.voice_clustering,
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.voice_clusters = paths["voice_clusters"]
+
+        _update_progress("voices", 0.5, f"Found {len(voice_clusters)} voice clusters")
+
+        voice_mapping = match_voice_clusters_to_bank(
+            show_id,
+            voice_clusters,
+            paths["voice_mapping"],
+            config.voice_bank,
+            config.voice_clustering.similarity_threshold,
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.voice_mapping = paths["voice_mapping"]
+
+        result.voice_cluster_count = len(voice_clusters)
+        result.labeled_voices = sum(1 for m in voice_mapping if m.similarity is not None)
+        result.unlabeled_voices = len(voice_mapping) - result.labeled_voices
+
+        _update_progress("voices", 1.0, f"Voice mapping complete: {result.labeled_voices} labeled, {result.unlabeled_voices} unlabeled")
+
+        # Step 6: ASR
+        _update_progress("transcribe", 0.0, f"Transcribing with {config.asr.provider}...")
+
+        if config.asr.provider == "gemini_3":
+            from .asr_gemini import transcribe_audio
+        else:
+            from .asr_openai import transcribe_audio
+
+        asr_segments = transcribe_audio(
+            enhanced_path,
+            paths["asr_raw"],
+            config.asr,
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.asr_raw = paths["asr_raw"]
+
+        _update_progress("transcribe", 1.0, f"Transcription complete: {len(asr_segments)} segments")
+
+        # Step 7: Fuse diarization + ASR + voice mapping
+        _update_progress("fuse", 0.0, "Generating final transcript...")
+
+        from .fuse_diarization_asr import fuse_transcript
+
+        transcript_rows = fuse_transcript(
+            diarization_segments,
+            asr_segments,
+            voice_clusters,
+            voice_mapping,
+            paths["transcript_jsonl"],
+            paths["transcript_vtt"],
+            config.export.vtt_include_speaker_notes,
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.transcript_jsonl = paths["transcript_jsonl"]
+        result.manifest_artifacts.transcript_vtt = paths["transcript_vtt"]
+        result.transcript_row_count = len(transcript_rows)
+
+        _update_progress("fuse", 1.0, f"Transcript generated: {len(transcript_rows)} rows")
+
+        # Step 8: Final export
+        _update_progress("export", 0.0, "Exporting final audio...")
+
+        from .export import export_final_audio
+
+        final_path = export_final_audio(
+            enhanced_path,
+            paths["final_voice_only"],
+            config.export,
+            overwrite=overwrite,
+        )
+        result.audio_artifacts.final_voice_only = final_path
+
+        from .io import get_audio_duration
+        result.duration_final_s = get_audio_duration(final_path)
+
+        _update_progress("export", 1.0, "Final audio exported")
+
+        # Step 9: QC
+        _update_progress("qc", 0.0, "Running quality checks...")
+
+        from .io import compute_snr
+        from .qc import run_qc_checks
+
+        snr_db = None
+        try:
+            snr_db = compute_snr(enhanced_path)
+        except Exception as e:
+            LOGGER.warning(f"SNR calculation failed: {e}")
+
+        qc_report = run_qc_checks(
+            ep_id,
+            config.qc,
+            result.duration_original_s,
+            result.duration_final_s,
+            snr_db,
+            diarization_segments,
+            asr_segments,
+            voice_clusters,
+            voice_mapping,
+            transcript_rows,
+            paths["qc"],
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.qc = paths["qc"]
+        result.qc_status = qc_report.status
+
+        result.metrics = {
+            "snr_db": snr_db,
+            "diarization_segments": len(diarization_segments),
+            "asr_segments": len(asr_segments),
+            "voice_clusters": len(voice_clusters),
+            "labeled_voices": result.labeled_voices,
+            "unlabeled_voices": result.unlabeled_voices,
+            "transcript_rows": len(transcript_rows),
+            "qc_warnings": len(qc_report.warnings),
+            "qc_errors": len(qc_report.errors),
+        }
+
+        result.status = "succeeded"
+        _update_progress("qc", 1.0, f"Pipeline complete: QC status = {qc_report.status.value}")
+
+        LOGGER.info(f"Audio pipeline complete for {ep_id}: {result.status}")
+
+    except Exception as e:
+        LOGGER.exception(f"Audio pipeline failed for {ep_id}: {e}")
+        result.status = "failed"
+        result.qc_status = QCStatus.FAILED
+        result.error = str(e)
+
+    return result
+
+
+def check_pipeline_prerequisites() -> dict:
+    """Check if all required dependencies and API keys are available.
+
+    Returns:
+        Dict with status of each dependency
+    """
+    status = {
+        "ffmpeg": False,
+        "soundfile": False,
+        "demucs": False,
+        "pyannote": False,
+        "openai": False,
+        "gemini": False,
+        "resemble": False,
+    }
+
+    # Check ffmpeg
+    import subprocess
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        status["ffmpeg"] = True
+    except Exception:
+        pass
+
+    # Check Python packages
+    try:
+        import soundfile
+        status["soundfile"] = True
+    except ImportError:
+        pass
+
+    try:
+        import demucs
+        status["demucs"] = True
+    except ImportError:
+        pass
+
+    try:
+        import pyannote.audio
+        status["pyannote"] = True
+    except ImportError:
+        pass
+
+    # Check API keys
+    if os.environ.get("OPENAI_API_KEY"):
+        status["openai"] = True
+
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        status["gemini"] = True
+
+    if os.environ.get("RESEMBLE_API_KEY"):
+        status["resemble"] = True
+
+    return status
+
+
+def sync_audio_artifacts_to_s3(
+    ep_id: str,
+    result: AudioPipelineResult,
+    data_root: Optional[Path] = None,
+) -> dict:
+    """Sync audio pipeline artifacts to S3.
+
+    Args:
+        ep_id: Episode identifier
+        result: Audio pipeline result with artifact paths
+        data_root: Optional data root directory
+
+    Returns:
+        Dict with upload status for each artifact type
+    """
+    try:
+        from apps.api.services.storage import (
+            STORAGE,
+            episode_context_from_id,
+        )
+    except ImportError:
+        LOGGER.warning("Storage service not available, skipping S3 sync")
+        return {"status": "unavailable"}
+
+    if not STORAGE.write_enabled:
+        LOGGER.debug("S3 write not enabled, skipping sync")
+        return {"status": "disabled"}
+
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+    except ValueError as e:
+        LOGGER.warning(f"Failed to parse episode ID for S3 sync: {e}")
+        return {"status": "error", "error": str(e)}
+
+    show = ep_ctx.show_slug
+    season = ep_ctx.season_number
+    episode = ep_ctx.episode_number
+    base_name = f"{show}_s{season:02d}e{episode:02d}"
+
+    upload_status = {
+        "audio": {},
+        "transcripts": {},
+        "qc": {},
+    }
+
+    # Upload audio files
+    audio_files = [
+        ("original", result.audio_artifacts.original, f"{base_name}_original.wav"),
+        ("vocals", result.audio_artifacts.vocals, f"{base_name}_vocals.wav"),
+        ("vocals_enhanced", result.audio_artifacts.vocals_enhanced, f"{base_name}_vocals_enhanced.wav"),
+        ("final_voice_only", result.audio_artifacts.final_voice_only, f"{base_name}_final_voice_only.wav"),
+    ]
+
+    for key, path, s3_name in audio_files:
+        if path and path.exists():
+            ok = STORAGE.put_artifact(ep_ctx, "audio", path, s3_name)
+            upload_status["audio"][key] = ok
+
+    # Upload transcripts
+    transcript_files = [
+        ("jsonl", result.manifest_artifacts.transcript_jsonl, f"{base_name}_transcript.jsonl"),
+        ("vtt", result.manifest_artifacts.transcript_vtt, f"{base_name}_transcript.vtt"),
+    ]
+
+    for key, path, s3_name in transcript_files:
+        if path and path.exists():
+            ok = STORAGE.put_artifact(ep_ctx, "audio_transcripts", path, s3_name)
+            upload_status["transcripts"][key] = ok
+
+    # Upload QC and voice manifests
+    qc_files = [
+        ("qc", result.manifest_artifacts.qc, f"{base_name}_audio_qc.json"),
+        ("voice_clusters", result.manifest_artifacts.voice_clusters, f"{base_name}_audio_voice_clusters.json"),
+        ("voice_mapping", result.manifest_artifacts.voice_mapping, f"{base_name}_audio_voice_mapping.json"),
+    ]
+
+    for key, path, s3_name in qc_files:
+        if path and path.exists():
+            ok = STORAGE.put_artifact(ep_ctx, "audio_qc", path, s3_name)
+            upload_status["qc"][key] = ok
+
+    LOGGER.info(f"S3 sync complete for {ep_id}: {upload_status}")
+    upload_status["status"] = "ok"
+
+    return upload_status
