@@ -4,9 +4,14 @@ This module provides consistent color-coded badges for all similarity metrics:
 - IDENTITY (Blue): How similar clusters are for AUTO-GENERATED PEOPLE
 - CAST (Purple): How similar clusters are for CAST MEMBERS (facebank)
 - TRACK (Orange): How similar FRAMES within a TRACK are to each other
-- FRAME (Light Orange): How similar a specific frame is to rest of frames in track
-- CAST_TRACK (Teal): How similar a track is to other tracks assigned to same cast/identity
+- PERSON_COHESION (Teal): How similar a track is to other tracks assigned to same cast/identity
 - CLUSTER (Green): How cohesive/similar all tracks in a cluster are
+
+NEW METRICS (Nov 2024):
+- TEMPORAL (Cyan): Consistency of appearance over time within episode
+- AMBIGUITY (Red): How close 2nd-best match is to 1st (lower = risky)
+- ISOLATION (Indigo): How far apart from nearest cluster (merge candidates)
+- CONFIDENCE_TREND (Gray): Is confidence improving or degrading over time
 """
 
 from __future__ import annotations
@@ -21,9 +26,17 @@ class SimilarityType(str, Enum):
     IDENTITY = "identity"  # Blue - auto-generated people's clusters
     CAST = "cast"  # Purple - cast member clusters
     TRACK = "track"  # Orange - track internal consistency (frames within track)
-    FRAME = "frame"  # Light Orange - individual frame vs track centroid
-    CAST_TRACK = "cast_track"  # Teal - track vs other tracks in same person
+    PERSON_COHESION = "person_cohesion"  # Teal - track vs other tracks in same person (renamed from CAST_TRACK)
     CLUSTER = "cluster"  # Green - cluster cohesion (tracks within cluster)
+    # NEW METRICS
+    TEMPORAL = "temporal"  # Cyan - consistency over time within episode
+    AMBIGUITY = "ambiguity"  # Red - margin between 1st and 2nd best match
+    ISOLATION = "isolation"  # Indigo - distance to nearest cluster
+    CONFIDENCE_TREND = "confidence_trend"  # Gray - trend of confidence over time
+
+    # DEPRECATED - kept for backwards compatibility, only shown on outliers
+    FRAME = "frame"  # Light Orange - individual frame vs track centroid (DEPRECATED)
+    CAST_TRACK = "cast_track"  # DEPRECATED alias for PERSON_COHESION
 
 
 class ColorScheme(NamedTuple):
@@ -36,21 +49,24 @@ class ColorScheme(NamedTuple):
     good_threshold: float  # Value >= this gets good color (else weak)
 
 
-# Master color definitions matching plan
+# Standardized weak threshold: 50% across all types for consistency
+# Strong/Good thresholds vary by metric type based on empirical observations
+
 SIMILARITY_COLORS: dict[SimilarityType, ColorScheme] = {
+    # CORE METRICS
     SimilarityType.IDENTITY: ColorScheme(
         strong="#2196F3",  # Blue
         good="#64B5F6",  # Light Blue
         weak="#BBDEFB",  # Very Light Blue
         strong_threshold=0.75,
-        good_threshold=0.60,
+        good_threshold=0.70,  # RAISED from 0.60 - 60-70% often has errors
     ),
     SimilarityType.CAST: ColorScheme(
         strong="#9C27B0",  # Purple
         good="#CE93D8",  # Light Purple
         weak="#F3E5F5",  # Very Light Purple
         strong_threshold=0.68,
-        good_threshold=0.50,
+        good_threshold=0.50,  # Standardized
     ),
     SimilarityType.TRACK: ColorScheme(
         strong="#FF9800",  # Orange
@@ -59,19 +75,12 @@ SIMILARITY_COLORS: dict[SimilarityType, ColorScheme] = {
         strong_threshold=0.85,
         good_threshold=0.70,
     ),
-    SimilarityType.FRAME: ColorScheme(
-        strong="#FFA726",  # Light Orange (distinct from Track)
-        good="#FFCC80",  # Lighter Orange
-        weak="#FFE0B2",  # Very Light Orange
-        strong_threshold=0.80,
-        good_threshold=0.65,
-    ),
-    SimilarityType.CAST_TRACK: ColorScheme(
+    SimilarityType.PERSON_COHESION: ColorScheme(  # Renamed from CAST_TRACK
         strong="#00ACC1",  # Teal
         good="#4DD0E1",  # Light Teal
         weak="#B2EBF2",  # Very Light Teal
         strong_threshold=0.70,
-        good_threshold=0.55,
+        good_threshold=0.50,  # Standardized from 0.55
     ),
     SimilarityType.CLUSTER: ColorScheme(
         strong="#8BC34A",  # Green
@@ -80,20 +89,76 @@ SIMILARITY_COLORS: dict[SimilarityType, ColorScheme] = {
         strong_threshold=0.80,
         good_threshold=0.60,
     ),
+    # NEW METRICS (Nov 2024)
+    SimilarityType.TEMPORAL: ColorScheme(
+        strong="#00BCD4",  # Cyan
+        good="#4DD0E1",  # Light Cyan
+        weak="#B2EBF2",  # Very Light Cyan
+        strong_threshold=0.80,  # Appearance consistent over time
+        good_threshold=0.60,
+    ),
+    SimilarityType.AMBIGUITY: ColorScheme(
+        strong="#4CAF50",  # Green (HIGH margin = GOOD = green)
+        good="#FFC107",  # Amber (medium margin = caution)
+        weak="#F44336",  # Red (LOW margin = ambiguous = danger)
+        strong_threshold=0.15,  # Margin >= 15% = clear winner
+        good_threshold=0.08,  # Margin >= 8% = acceptable
+    ),
+    SimilarityType.ISOLATION: ColorScheme(
+        strong="#3F51B5",  # Indigo (well separated)
+        good="#7986CB",  # Light Indigo
+        weak="#C5CAE9",  # Very Light Indigo (too close, merge candidate)
+        strong_threshold=0.40,  # Distance >= 0.40 = well isolated
+        good_threshold=0.25,  # Distance >= 0.25 = moderately isolated
+    ),
+    SimilarityType.CONFIDENCE_TREND: ColorScheme(
+        strong="#4CAF50",  # Green (improving)
+        good="#607D8B",  # Gray (stable)
+        weak="#F44336",  # Red (degrading)
+        strong_threshold=0.02,  # Trend >= +2% = improving
+        good_threshold=-0.02,  # Trend >= -2% = stable
+    ),
+    # DEPRECATED - kept for backwards compatibility
+    SimilarityType.FRAME: ColorScheme(
+        strong="#FFA726",  # Light Orange (distinct from Track)
+        good="#FFCC80",  # Lighter Orange
+        weak="#FFE0B2",  # Very Light Orange
+        strong_threshold=0.80,
+        good_threshold=0.50,  # Standardized from 0.65
+    ),
+    SimilarityType.CAST_TRACK: ColorScheme(  # DEPRECATED alias
+        strong="#00ACC1",  # Teal
+        good="#4DD0E1",  # Light Teal
+        weak="#B2EBF2",  # Very Light Teal
+        strong_threshold=0.70,
+        good_threshold=0.50,
+    ),
 }
 
 # Badge label abbreviations for compact display
 SIMILARITY_LABELS: dict[SimilarityType, str] = {
+    # Core metrics
     SimilarityType.IDENTITY: "ID",
     SimilarityType.CAST: "CAST",
     SimilarityType.TRACK: "TRK",
-    SimilarityType.FRAME: "FRM",
-    SimilarityType.CAST_TRACK: "MATCH",
+    SimilarityType.PERSON_COHESION: "FIT",  # Renamed from CAST_TRACK/MATCH
     SimilarityType.CLUSTER: "CLU",
+    # New metrics (Nov 2024)
+    SimilarityType.TEMPORAL: "TIME",
+    SimilarityType.AMBIGUITY: "AMB",
+    SimilarityType.ISOLATION: "ISO",
+    SimilarityType.CONFIDENCE_TREND: "TREND",
+    # Deprecated
+    SimilarityType.FRAME: "FRM",
+    SimilarityType.CAST_TRACK: "MATCH",  # Deprecated alias
 }
 
 # Colors that need dark text instead of white for readability
-_LIGHT_COLORS = {"#E0E0E0", "#F3E5F5", "#BBDEFB", "#FFE0B2", "#C5E1A5", "#B2EBF2", "#FFCC80"}
+_LIGHT_COLORS = {
+    "#E0E0E0", "#F3E5F5", "#BBDEFB", "#FFE0B2", "#C5E1A5", "#B2EBF2", "#FFCC80",
+    "#C5CAE9",  # Very Light Indigo (ISOLATION weak)
+    "#FFC107",  # Amber (AMBIGUITY good) - needs dark text
+}
 
 
 def get_badge_color(value: float, similarity_type: SimilarityType) -> str:
@@ -213,62 +278,116 @@ def inject_similarity_badge_css() -> None:
     st.markdown(css, unsafe_allow_html=True)
 
 
-def get_similarity_key_data() -> list[dict]:
+def get_similarity_key_data(include_deprecated: bool = False) -> list[dict]:
     """Return data for rendering the similarity scores legend/key.
 
+    Args:
+        include_deprecated: If True, include deprecated metrics like FRAME
+
     Returns:
-        List of dicts with keys: type, color, label, description
+        List of dicts with keys: type, color, label, description, thresholds
     """
-    return [
+    core_metrics = [
         {
             "type": SimilarityType.IDENTITY,
             "color": SIMILARITY_COLORS[SimilarityType.IDENTITY].strong,
             "label": "Identity Similarity",
+            "emoji": "🔵",
             "description": "How similar clusters are for AUTO-GENERATED PEOPLE",
-            "thresholds": f">={int(SIMILARITY_COLORS[SimilarityType.IDENTITY].strong_threshold*100)}%: Strong, "
-            f">={int(SIMILARITY_COLORS[SimilarityType.IDENTITY].good_threshold*100)}%: Good",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.IDENTITY].strong_threshold*100)}%: Strong, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.IDENTITY].good_threshold*100)}%: Good, "
+            f"<{int(SIMILARITY_COLORS[SimilarityType.IDENTITY].good_threshold*100)}%: Review",
         },
         {
             "type": SimilarityType.CAST,
             "color": SIMILARITY_COLORS[SimilarityType.CAST].strong,
             "label": "Cast Similarity",
-            "description": "How similar clusters are for CAST MEMBERS (facebank)",
-            "thresholds": f">={int(SIMILARITY_COLORS[SimilarityType.CAST].strong_threshold*100)}%: Strong, "
-            f">={int(SIMILARITY_COLORS[SimilarityType.CAST].good_threshold*100)}%: Good",
+            "emoji": "🟣",
+            "description": "How similar clusters are for CAST MEMBERS (facebank). Shows rank: #1 of N",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.CAST].strong_threshold*100)}%: Strong, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.CAST].good_threshold*100)}%: Good",
         },
         {
             "type": SimilarityType.TRACK,
             "color": SIMILARITY_COLORS[SimilarityType.TRACK].strong,
             "label": "Track Similarity",
-            "description": "How similar FRAMES within a TRACK are to each other",
-            "thresholds": f">={int(SIMILARITY_COLORS[SimilarityType.TRACK].strong_threshold*100)}%: Strong, "
-            f">={int(SIMILARITY_COLORS[SimilarityType.TRACK].good_threshold*100)}%: Good",
+            "emoji": "🟠",
+            "description": "How consistent FRAMES within a TRACK are. Shows excluded frames count",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.TRACK].strong_threshold*100)}%: Strong, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.TRACK].good_threshold*100)}%: Good",
         },
         {
-            "type": SimilarityType.FRAME,
-            "color": SIMILARITY_COLORS[SimilarityType.FRAME].strong,
-            "label": "Frame Similarity",
-            "description": "How similar a specific frame is to rest of frames in track",
-            "thresholds": f">={int(SIMILARITY_COLORS[SimilarityType.FRAME].strong_threshold*100)}%: Strong, "
-            f">={int(SIMILARITY_COLORS[SimilarityType.FRAME].good_threshold*100)}%: Good",
-        },
-        {
-            "type": SimilarityType.CAST_TRACK,
-            "color": SIMILARITY_COLORS[SimilarityType.CAST_TRACK].strong,
-            "label": "Cast Track Score",
-            "description": "How similar a track is to other tracks assigned to same cast/identity",
-            "thresholds": f">={int(SIMILARITY_COLORS[SimilarityType.CAST_TRACK].strong_threshold*100)}%: Strong, "
-            f">={int(SIMILARITY_COLORS[SimilarityType.CAST_TRACK].good_threshold*100)}%: Good",
+            "type": SimilarityType.PERSON_COHESION,
+            "color": SIMILARITY_COLORS[SimilarityType.PERSON_COHESION].strong,
+            "label": "Person Cohesion",
+            "emoji": "🔷",
+            "description": "How well a track fits with other tracks assigned to the same person",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.PERSON_COHESION].strong_threshold*100)}%: Strong, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.PERSON_COHESION].good_threshold*100)}%: Good",
         },
         {
             "type": SimilarityType.CLUSTER,
             "color": SIMILARITY_COLORS[SimilarityType.CLUSTER].strong,
-            "label": "Cluster Similarity",
-            "description": "How cohesive/similar all tracks in a cluster are",
-            "thresholds": f">={int(SIMILARITY_COLORS[SimilarityType.CLUSTER].strong_threshold*100)}%: Strong, "
-            f">={int(SIMILARITY_COLORS[SimilarityType.CLUSTER].good_threshold*100)}%: Good",
+            "label": "Cluster Cohesion",
+            "emoji": "🟢",
+            "description": "How cohesive/similar all tracks in a cluster are. Shows min-max range",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.CLUSTER].strong_threshold*100)}%: Strong, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.CLUSTER].good_threshold*100)}%: Good",
         },
     ]
+
+    new_metrics = [
+        {
+            "type": SimilarityType.TEMPORAL,
+            "color": SIMILARITY_COLORS[SimilarityType.TEMPORAL].strong,
+            "label": "Temporal Consistency",
+            "emoji": "🔹",
+            "description": "How consistent person's appearance is across time within episode",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.TEMPORAL].strong_threshold*100)}%: Consistent, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.TEMPORAL].good_threshold*100)}%: Variable",
+        },
+        {
+            "type": SimilarityType.AMBIGUITY,
+            "color": SIMILARITY_COLORS[SimilarityType.AMBIGUITY].strong,
+            "label": "Ambiguity Score",
+            "emoji": "⚠️",
+            "description": "Gap between 1st and 2nd best match. LOW = risky, HIGH = clear winner",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.AMBIGUITY].strong_threshold*100)}%: Clear, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.AMBIGUITY].good_threshold*100)}%: OK, "
+            f"<{int(SIMILARITY_COLORS[SimilarityType.AMBIGUITY].good_threshold*100)}%: Risky",
+        },
+        {
+            "type": SimilarityType.ISOLATION,
+            "color": SIMILARITY_COLORS[SimilarityType.ISOLATION].strong,
+            "label": "Cluster Isolation",
+            "emoji": "🔮",
+            "description": "Distance to nearest cluster. LOW = merge candidate, HIGH = distinct",
+            "thresholds": f"≥{int(SIMILARITY_COLORS[SimilarityType.ISOLATION].strong_threshold*100)}%: Isolated, "
+            f"≥{int(SIMILARITY_COLORS[SimilarityType.ISOLATION].good_threshold*100)}%: Moderate",
+        },
+        {
+            "type": SimilarityType.CONFIDENCE_TREND,
+            "color": SIMILARITY_COLORS[SimilarityType.CONFIDENCE_TREND].strong,
+            "label": "Confidence Trend",
+            "emoji": "📈",
+            "description": "Is assignment confidence improving (↑), stable (→), or degrading (↓)?",
+            "thresholds": "↑ Improving, → Stable, ↓ Degrading",
+        },
+    ]
+
+    result = core_metrics + new_metrics
+
+    if include_deprecated:
+        result.append({
+            "type": SimilarityType.FRAME,
+            "color": SIMILARITY_COLORS[SimilarityType.FRAME].strong,
+            "label": "Frame Outlier (Deprecated)",
+            "emoji": "🟠",
+            "description": "Only shown on outlier frames that differ significantly from track",
+            "thresholds": f"Shown when <{int(SIMILARITY_COLORS[SimilarityType.FRAME].good_threshold*100)}% (outlier)",
+        })
+
+    return result
 
 
 # ============================================================================
@@ -332,8 +451,8 @@ PERSON_SORT_OPTIONS = [
 
 # Cast member all-tracks sort options (for outlier detection)
 CAST_TRACKS_SORT_OPTIONS = [
-    "Cast Track Score (Low to High)",  # Outliers first
-    "Cast Track Score (High to Low)",
+    "Person Cohesion (Low to High)",  # Renamed from Cast Track Score - outliers first
+    "Person Cohesion (High to Low)",
     "Track Similarity (Low to High)",  # Outliers first
     "Track Similarity (High to Low)",
     "Frame Count (Low to High)",
@@ -414,14 +533,22 @@ def sort_tracks(
             ),
             reverse=True,
         )
-    elif sort_option == "Cast Track Score (Low to High)":
-        # Sort by cast_track_score - how similar track is to other tracks of the same person
+    elif sort_option in ("Person Cohesion (Low to High)", "Cast Track Score (Low to High)"):
+        # Sort by person_cohesion/cast_track_score - how similar track is to other tracks of same person
         tracks.sort(
-            key=lambda t: (t.get("cast_track_score") if t.get("cast_track_score") is not None else 999.0)
+            key=lambda t: (
+                t.get("person_cohesion") or t.get("cast_track_score")
+                if (t.get("person_cohesion") or t.get("cast_track_score")) is not None
+                else 999.0
+            )
         )
-    elif sort_option == "Cast Track Score (High to Low)":
+    elif sort_option in ("Person Cohesion (High to Low)", "Cast Track Score (High to Low)"):
         tracks.sort(
-            key=lambda t: (t.get("cast_track_score") if t.get("cast_track_score") is not None else -999.0),
+            key=lambda t: (
+                t.get("person_cohesion") or t.get("cast_track_score")
+                if (t.get("person_cohesion") or t.get("cast_track_score")) is not None
+                else -999.0
+            ),
             reverse=True,
         )
     elif sort_option == "Cluster ID (A-Z)":
@@ -779,3 +906,396 @@ def render_cluster_quality_badges(
         for ind in sorted_indicators
     ]
     return " ".join(badges)
+
+
+# ============================================================================
+# ENHANCED RENDERING FUNCTIONS (Nov 2024)
+# ============================================================================
+
+
+def render_cluster_range_badge(
+    cohesion: float | None,
+    min_sim: float | None = None,
+    max_sim: float | None = None,
+) -> str:
+    """Render cluster cohesion with min-max range.
+
+    Example output: "72% (58-89%)" showing cohesion with range
+
+    Args:
+        cohesion: Average cohesion value (0-1)
+        min_sim: Minimum similarity in cluster
+        max_sim: Maximum similarity in cluster
+
+    Returns:
+        HTML badge showing cohesion with optional range
+    """
+    if cohesion is None:
+        return ""
+
+    pct = int(round(cohesion * 100))
+    color = get_badge_color(cohesion, SimilarityType.CLUSTER)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    # Build range text
+    range_text = ""
+    if min_sim is not None and max_sim is not None:
+        min_pct = int(round(min_sim * 100))
+        max_pct = int(round(max_sim * 100))
+        range_text = f" ({min_pct}-{max_pct}%)"
+
+    return (
+        f'<span class="sim-badge sim-badge-cluster-range" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold;" '
+        f'title="Cluster cohesion with min-max range">'
+        f"CLU: {pct}%{range_text}</span>"
+    )
+
+
+def render_quality_breakdown_badge(
+    quality: float | None,
+    detection: float | None = None,
+    sharpness: float | None = None,
+    area: float | None = None,
+) -> str:
+    """Render quality score with component breakdown on hover.
+
+    Example: "Q: 82%" with tooltip "Det: 95%, Sharp: 78%, Area: 74%"
+
+    Args:
+        quality: Composite quality score (0-1)
+        detection: Detection confidence component
+        sharpness: Sharpness component
+        area: Face area component
+
+    Returns:
+        HTML badge with quality and tooltip breakdown
+    """
+    if quality is None:
+        return ""
+
+    pct = int(round(quality * 100))
+
+    # Determine color based on quality
+    if pct >= 85:
+        color = "#4CAF50"  # Green
+    elif pct >= 60:
+        color = "#FFC107"  # Amber
+    else:
+        color = "#F44336"  # Red
+
+    text_color = "#333333" if color == "#FFC107" else "#FFFFFF"
+
+    # Build tooltip with breakdown
+    breakdown_parts = []
+    if detection is not None:
+        breakdown_parts.append(f"Det: {int(round(detection * 100))}%")
+    if sharpness is not None:
+        breakdown_parts.append(f"Sharp: {int(round(sharpness * 100))}%")
+    if area is not None:
+        breakdown_parts.append(f"Area: {int(round(area * 100))}%")
+
+    tooltip = ", ".join(breakdown_parts) if breakdown_parts else "Quality score"
+
+    return (
+        f'<span class="sim-badge sim-badge-quality" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"Q: {pct}%</span>"
+    )
+
+
+def render_cast_rank_badge(
+    similarity: float | None,
+    rank: int = 1,
+    total_suggestions: int = 1,
+    cast_name: str | None = None,
+) -> str:
+    """Render cast similarity with rank context.
+
+    Example: "68% (#1 of 5)" showing this is the top suggestion
+
+    Args:
+        similarity: Similarity to cast member (0-1)
+        rank: This suggestion's rank (1 = best match)
+        total_suggestions: Total number of cast suggestions
+        cast_name: Optional cast member name for tooltip
+
+    Returns:
+        HTML badge showing similarity with rank
+    """
+    if similarity is None:
+        return ""
+
+    pct = int(round(similarity * 100))
+    color = get_badge_color(similarity, SimilarityType.CAST)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    rank_text = f" (#{rank}" if total_suggestions > 1 else ""
+    if total_suggestions > 1:
+        rank_text += f" of {total_suggestions})"
+
+    tooltip = f"Match to {cast_name}" if cast_name else "Cast match similarity"
+    if rank == 1 and total_suggestions > 1:
+        tooltip += " - Best match"
+
+    return (
+        f'<span class="sim-badge sim-badge-cast-rank" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"CAST: {pct}%{rank_text}</span>"
+    )
+
+
+def render_track_with_dropout(
+    similarity: float | None,
+    excluded_frames: int = 0,
+    total_frames: int = 0,
+) -> str:
+    """Render track similarity with frame dropout indicator.
+
+    Example: "TRK: 85% (3 excluded)" showing frames excluded from centroid
+
+    Args:
+        similarity: Track similarity (0-1)
+        excluded_frames: Number of frames excluded from centroid calculation
+        total_frames: Total frames in track (for context)
+
+    Returns:
+        HTML badge showing similarity with exclusion count
+    """
+    if similarity is None:
+        return ""
+
+    pct = int(round(similarity * 100))
+    color = get_badge_color(similarity, SimilarityType.TRACK)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    exclusion_text = ""
+    if excluded_frames > 0:
+        exclusion_text = f" ({excluded_frames} excl)"
+
+    tooltip = f"Track consistency"
+    if excluded_frames > 0:
+        tooltip += f" - {excluded_frames} frame(s) excluded due to quality"
+
+    return (
+        f'<span class="sim-badge sim-badge-track-dropout" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"TRK: {pct}%{exclusion_text}</span>"
+    )
+
+
+def render_outlier_severity_badge(
+    similarity: float | None,
+    track_mean: float | None = None,
+    track_std: float | None = None,
+) -> str:
+    """Render frame outlier with severity indicator.
+
+    Only shown when frame is an outlier (below threshold). Shows how many
+    standard deviations from mean.
+
+    Args:
+        similarity: Frame similarity to track centroid (0-1)
+        track_mean: Mean similarity of frames in track
+        track_std: Standard deviation of frame similarities
+
+    Returns:
+        HTML badge showing outlier severity, or empty if not an outlier
+    """
+    if similarity is None:
+        return ""
+
+    # Check if this is actually an outlier
+    outlier_threshold = SIMILARITY_COLORS[SimilarityType.FRAME].good_threshold
+    if similarity >= outlier_threshold:
+        return ""  # Not an outlier, don't show
+
+    pct = int(round(similarity * 100))
+    color = get_badge_color(similarity, SimilarityType.FRAME)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    # Calculate severity if stats available
+    severity_text = ""
+    if track_mean is not None and track_std is not None and track_std > 0:
+        z_score = abs(track_mean - similarity) / track_std
+        if z_score >= 3:
+            severity_text = " ⚠️⚠️⚠️"  # Severe
+        elif z_score >= 2:
+            severity_text = " ⚠️⚠️"  # Moderate
+        else:
+            severity_text = " ⚠️"  # Mild
+
+    tooltip = f"Frame differs from track - potential outlier"
+    if track_mean is not None and track_std is not None and track_std > 0:
+        z_score = abs(track_mean - similarity) / track_std
+        tooltip += f" ({z_score:.1f}σ from mean)"
+
+    return (
+        f'<span class="sim-badge sim-badge-outlier" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"OUTLIER: {pct}%{severity_text}</span>"
+    )
+
+
+def render_ambiguity_badge(
+    margin: float | None,
+    first_match_name: str | None = None,
+    second_match_name: str | None = None,
+) -> str:
+    """Render ambiguity score (gap between 1st and 2nd best match).
+
+    LOW margin = risky (red), HIGH margin = clear winner (green)
+
+    Args:
+        margin: Gap between 1st and 2nd best similarity (0-1)
+        first_match_name: Name of best match for tooltip
+        second_match_name: Name of 2nd best match for tooltip
+
+    Returns:
+        HTML badge showing ambiguity level
+    """
+    if margin is None:
+        return ""
+
+    pct = int(round(margin * 100))
+    color = get_badge_color(margin, SimilarityType.AMBIGUITY)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    # Determine status text
+    if margin >= 0.15:
+        status = "Clear"
+    elif margin >= 0.08:
+        status = "OK"
+    else:
+        status = "Risky"
+
+    tooltip = f"Gap between 1st and 2nd match: {pct}%"
+    if first_match_name and second_match_name:
+        tooltip += f" ({first_match_name} vs {second_match_name})"
+
+    return (
+        f'<span class="sim-badge sim-badge-ambiguity" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"AMB: {status} ({pct}%)</span>"
+    )
+
+
+def render_isolation_badge(distance: float | None) -> str:
+    """Render cluster isolation score (distance to nearest cluster).
+
+    LOW = merge candidate, HIGH = well isolated
+
+    Args:
+        distance: Distance to nearest cluster centroid (0-1)
+
+    Returns:
+        HTML badge showing isolation level
+    """
+    if distance is None:
+        return ""
+
+    pct = int(round(distance * 100))
+    color = get_badge_color(distance, SimilarityType.ISOLATION)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    # Determine status
+    if distance >= 0.40:
+        status = "Isolated"
+    elif distance >= 0.25:
+        status = "Moderate"
+    else:
+        status = "Close"
+
+    tooltip = f"Distance to nearest cluster: {pct}%"
+    if distance < 0.25:
+        tooltip += " - Consider merging"
+
+    return (
+        f'<span class="sim-badge sim-badge-isolation" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"ISO: {status}</span>"
+    )
+
+
+def render_confidence_trend_badge(trend: float | None) -> str:
+    """Render confidence trend indicator.
+
+    Shows if assignment confidence is improving, stable, or degrading.
+
+    Args:
+        trend: Trend value (+ve = improving, -ve = degrading)
+
+    Returns:
+        HTML badge showing trend direction
+    """
+    if trend is None:
+        return ""
+
+    color = get_badge_color(trend, SimilarityType.CONFIDENCE_TREND)
+    text_color = "#FFFFFF"
+
+    # Determine arrow and status
+    if trend >= 0.02:
+        arrow = "↑"
+        status = "Improving"
+    elif trend <= -0.02:
+        arrow = "↓"
+        status = "Degrading"
+    else:
+        arrow = "→"
+        status = "Stable"
+
+    pct = int(round(abs(trend) * 100))
+    tooltip = f"Confidence trend: {status} ({'+' if trend > 0 else ''}{pct}%)"
+
+    return (
+        f'<span class="sim-badge sim-badge-trend" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"{arrow} {status}</span>"
+    )
+
+
+def render_temporal_badge(consistency: float | None) -> str:
+    """Render temporal consistency badge.
+
+    Shows how consistent a person's appearance is across time in episode.
+
+    Args:
+        consistency: Temporal consistency score (0-1)
+
+    Returns:
+        HTML badge showing temporal consistency
+    """
+    if consistency is None:
+        return ""
+
+    pct = int(round(consistency * 100))
+    color = get_badge_color(consistency, SimilarityType.TEMPORAL)
+    text_color = "#333333" if color in _LIGHT_COLORS else "#FFFFFF"
+
+    tooltip = f"Appearance consistency over time: {pct}%"
+    if consistency < 0.60:
+        tooltip += " - Appearance varies significantly (lighting, costume, angle changes?)"
+
+    return (
+        f'<span class="sim-badge sim-badge-temporal" '
+        f'style="background-color: {color}; color: {text_color}; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"TIME: {pct}%</span>"
+    )

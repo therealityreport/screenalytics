@@ -1089,7 +1089,7 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
             if _api_post(f"/episodes/{ep_id}/mirror"):
                 st.success("Mirror complete.")
                 st.rerun()
-    action_cols = st.columns([1, 2])
+    action_cols = st.columns([1, 2, 2])
     action_cols[0].button(
         "Open Episode Detail",
         key="facebank_open_detail",
@@ -3354,15 +3354,44 @@ def _bulk_assign_clusters(
         people_resp = _fetch_people_cached(show_id)
         people = people_resp.get("people", []) if people_resp else []
         target_person = next((p for p in people if p.get("cast_id") == target_cast_id), None)
+
+        # Check if source person actually exists in people.json
+        source_person = next((p for p in people if p.get("person_id") == source_person_id), None)
+        source_exists = source_person is not None
+
         _debug(
-            "resolved target person",
+            "resolved persons",
             {
-                "existing": bool(target_person),
+                "target_existing": bool(target_person),
                 "source_person_id": source_person_id,
+                "source_exists": source_exists,
                 "cluster_ids": cluster_ids,
                 "cast_id": target_cast_id,
             },
         )
+
+        # If source person doesn't exist (stale reference), use direct cluster assignment
+        if not source_exists:
+            _debug("source person not found, using direct cluster assignment")
+            # Clear stale cache and use direct cluster assignment
+            _invalidate_assignment_caches()
+
+            # Assign clusters directly to target cast member
+            payload = {
+                "strategy": "manual",
+                "cluster_ids": cluster_ids,
+                "target_person_id": target_person["person_id"] if target_person else None,
+                "cast_id": target_cast_id,
+            }
+            _debug("direct assign payload", payload)
+            resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+            _debug("direct assign response", resp)
+
+            if resp and resp.get("status") == "success":
+                _invalidate_assignment_caches()
+                return True
+            st.error("Failed to assign clusters. Check logs for details.")
+            return False
 
         if not target_person:
             # Fetch cast member details to get the name
