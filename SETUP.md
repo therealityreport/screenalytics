@@ -4,11 +4,11 @@
 
 ## 1️⃣ Prerequisites
 - Python 3.11+
-- Node 20+ and pnpm
 - Docker + Docker Compose
 - ffmpeg installed
 - (Optional GPU) CUDA 12+ for PyTorch
 - GitHub CLI or SSH key configured
+- Node 20+ (only if you want to run the optional Next.js app under `web/`)
 
 ---
 
@@ -42,15 +42,11 @@ pip install -U pip wheel setuptools
 pip install -r requirements.txt
 ```
 
-### Node deps
+### Node deps (optional Next.js app)
 ```bash
-pnpm install --filter workspace-ui
-```
-
-### Install Codex CLI
-```bash
-npm i -g @openai/codex   # or: brew install --cask codex
-codex                    # sign in with your ChatGPT plan
+cd web
+npm install
+cd -
 ```
 
 ### Environment file
@@ -78,9 +74,10 @@ Starts Postgres, Redis, and MinIO.
 ## 4️⃣ Run core components
 | Component | Command |
 | ----------- | -------------------------------- |
-| **API** | `uv run apps/api/main.py` |
-| **Workers** | `uv run workers/orchestrator.py` |
-| **UI** | `pnpm --filter workspace-ui dev` |
+| **API** | `python -m uvicorn apps.api.main:app --reload` |
+| **Workers (Celery)** | `celery -A apps.api.celery_app:celery_app worker -l info` |
+| **Streamlit UI** | `streamlit run apps/workspace-ui/Upload_Video.py` |
+| **Optional Next.js** | `cd web && npm run dev` |
 | **Tests** | `pytest -q` |
 
 ---
@@ -93,40 +90,26 @@ psql "$DB_URL" -f db/migrations/0001_init_core.sql
 ---
 
 ## 6️⃣ Verify install
-Visit [http://localhost:3000](http://localhost:3000) → Upload tab should appear.
+Visit Streamlit at [http://localhost:8501](http://localhost:8501) → Upload tab should appear.
 API health check: [http://localhost:8000/health](http://localhost:8000/health) returns `{"status":"ok"}`.
+Next.js (optional) runs at [http://localhost:3000](http://localhost:3000).
 
 ---
 
 ## 7️⃣ Hardware Requirements & Performance
 
-### CPU vs GPU
+`tools/episode_run.py` does **not** accept `--profile`; pass explicit stride/FPS to mirror the presets.
 
 **CPU-only (Apple Silicon M1/M2/M3):**
 - ✅ Suitable for development and testing
-- ⚠️ Use `--profile fast_cpu` to avoid thermal throttling
-- Expected runtime: ~10-15 min for 24-minute episode (stride=10)
+- ✅ Use `--stride 5-8 --fps 8-24 --device auto` to avoid thermal throttling
+- ✅ Limit threads if needed: `SCREENALYTICS_MAX_CPU_THREADS=2`
 - **Avoid:** `--stride 1` + `--save-frames` on fanless laptops
 
 **GPU (CUDA):**
 - ✅ Recommended for production and high-accuracy work
-- Use `--profile high_accuracy --device cuda`
+- Use `--device cuda --stride 1 --fps 30`
 - Expected runtime: ~3-5 min for 24-minute episode (stride=1)
-
-### Performance Profiles
-
-See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for full details. Quick reference:
-
-```bash
-# Fanless devices (MacBook Air, low-power)
-python tools/episode_run.py --ep-id demo --video test.mp4 --profile fast_cpu
-
-# Standard local dev (balanced recall/speed)
-python tools/episode_run.py --ep-id demo --video test.mp4 --profile balanced
-
-# GPU production (maximum accuracy)
-python tools/episode_run.py --ep-id demo --video test.mp4 --profile high_accuracy --device cuda
-```
 
 **For detailed performance tuning**, see:
 - [docs/ops/performance_tuning_faces_pipeline.md](docs/ops/performance_tuning_faces_pipeline.md)
@@ -145,17 +128,17 @@ detect/track → faces_embed → cluster → cleanup
 ### Pipeline Stages & Outputs
 
 **Stage 1: Detection & Tracking**
-- `data/detections/{ep_id}/detections.jsonl` – Raw face detections per frame
-- `data/tracks/{ep_id}/tracks.jsonl` – Temporal face tracks with metadata
-- `data/tracks/{ep_id}/track_metrics.json` – Derived metrics (tracks_per_minute, short_track_fraction, etc.)
+- `data/manifests/{ep_id}/detections.jsonl` – Raw face detections per frame
+- `data/manifests/{ep_id}/tracks.jsonl` – Temporal face tracks with metadata
+- `data/manifests/{ep_id}/track_metrics.json` – Derived metrics (tracks_per_minute, short_track_fraction, etc.)
 
 **Stage 2: Face Embedding & Sampling**
-- `data/faces/{ep_id}/faces.jsonl` – Quality-gated face crops with embeddings
-- `data/faces/{ep_id}/faces.npy` – Face embeddings as NumPy array
+- `data/manifests/{ep_id}/faces.jsonl` – Quality-gated face crops with embeddings
+- `data/embeds/{ep_id}/faces.npy` – Face embeddings as NumPy array
 - `data/embeds/{ep_id}/tracks.npy` – Track-level pooled embeddings (used for clustering)
 
 **Stage 3: Clustering**
-- `data/identities/{ep_id}/identities.json` – Cluster assignments mapping `track_id` → `identity_id`
+- `data/manifests/{ep_id}/identities.json` – Cluster assignments mapping `track_id` → `identity_id`
 - Includes cluster metrics: `singleton_fraction`, `largest_cluster_fraction`, `cluster_count`
 
 **Stage 4: Cleanup (Optional)**

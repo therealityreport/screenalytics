@@ -338,7 +338,7 @@ See [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_con
 ## 11. Agents & Automation Hooks
 
 ### 11.1 Triggers
-- **File changes:** Any `add`, `delete`, `rename` under `apps/`, `workers/`, `packages/`, `db/`, `config/`, `FEATURES/`, `agents/`, `mcps/`, `docs/`, `infra/`, `tests/`, `tools/`
+- **File changes:** Any `add`, `delete`, `rename` under `apps/`, `web/`, `packages/`, `db/`, `config/`, `FEATURES/`, `agents/`, `mcps/`, `docs/`, `infra/`, `tests/`, `tools/`
 
 ### 11.2 Actions
 - **Playbook:** `agents/playbooks/update-docs-on-change.yaml`

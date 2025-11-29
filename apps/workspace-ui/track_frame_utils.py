@@ -56,9 +56,11 @@ def scope_track_frames(frames: List[Dict[str, Any]], track_id: int) -> Tuple[Lis
 
         if not faces_for_track:
             try:
-                missing.append(int(frame_idx))
+                if frame_idx is not None:
+                    missing.append(int(frame_idx))
+                # Skip appending if frame_idx is None - no valid index to report
             except (TypeError, ValueError):
-                missing.append(frame_idx if frame_idx is not None else -1)
+                pass  # Skip invalid frame indices rather than using sentinel value
             continue
 
         # Prefer higher quality within the track for rendering

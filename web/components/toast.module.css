@@ -1,0 +1,43 @@
+.toastRoot {
+  background: #0f172a;
+  color: #fff;
+  border-radius: 10px;
+  padding: 12px 14px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.2);
+  display: grid;
+  gap: 4px;
+  min-width: 260px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.error {
+  background: #fee2e2;
+  color: #7f1d1d;
+  border-color: #fecdd3;
+}
+
+.title {
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.desc {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.error .desc {
+  color: #7f1d1d;
+}
+
+.toastViewport {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 340px;
+  max-width: 100%;
+  z-index: 50;
+}

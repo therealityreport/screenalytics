@@ -17,29 +17,26 @@ All pipeline behavior is **config-driven** (no hardcoded thresholds). Configs li
 | **detection.yaml** | RetinaFace detection | `min_size`, `confidence_th`, `iou_th`, `nms_mode` |
 | **tracking.yaml** | ByteTrack association | `track_thresh`, `match_thresh`, `track_buffer`, `gate_enabled` |
 | **faces_embed_sampling.yaml** | Face quality gating | `min_quality`, `max_crops_per_track`, `sampling_mode` |
-| **performance_profiles.yaml** | Device-aware profiles | `fast_cpu`, `low_power`, `balanced`, `high_accuracy` |
+| **performance_profiles.yaml** | Device-aware profiles | `low_power`, `balanced`, `high_accuracy` |
 | **screen_time_v2.yaml** | Screentime aggregation | `quality_min`, `gap_tolerance_s`, `track_coverage_min` |
 
 ---
 
 ## Performance Profiles
 
-Pre-configured profiles for common hardware:
+Pre-configured profiles for common hardware (used by the API to choose defaults). `tools/episode_run.py`
+does **not** accept `--profile`; pass explicit `--stride`/`--fps` or call the API with `profile`
+to apply these presets.
 
 ```yaml
 # config/pipeline/performance_profiles.yaml
 
-fast_cpu:
-  # For fanless devices (MacBook Air, low-power)
-  frame_stride: 10
-  detection_fps_limit: 15
-  min_size: 120
-
 low_power:
-  # Background-safe profile
-  frame_stride: 12
-  detection_fps_limit: 12
-  min_size: 140
+  # For fanless devices (MacBook Air, low-power)
+  frame_stride: 8
+  detection_fps_limit: 8
+  min_size: 120
+  cpu_threads: 2
 
 balanced:
   # Standard local dev
@@ -52,11 +49,17 @@ high_accuracy:
   frame_stride: 1
   detection_fps_limit: 30
   min_size: 64
+
+# Compatibility: API maps profile="fast_cpu" to low_power for legacy clients.
 ```
 
 **Usage:**
 ```bash
-python tools/episode_run.py --ep-id <ep_id> --video <path> --profile fast_cpu
+# CLI: pass explicit stride/FPS (mirrors "balanced")
+python tools/episode_run.py --ep-id <ep_id> --video <path> --stride 5 --fps 24
+
+# API: include a profile name to apply defaults server-side
+POST /jobs/detect_track { "ep_id": "...", "profile": "balanced" }
 ```
 
 ---

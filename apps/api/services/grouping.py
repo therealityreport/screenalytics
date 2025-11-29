@@ -50,7 +50,8 @@ FACEBANK_MATCH_SIMILARITY = float(os.getenv("FACEBANK_MATCH_SIMILARITY", "0.68")
 PROTECT_MANUAL_DEFAULT = os.getenv("PROTECT_MANUAL_DEFAULT", "1").lower() in ("1", "true", "yes")
 
 # Enhancement: Minimum cluster size for reliable matching
-MIN_FACES_FOR_RELIABLE_MATCH = int(os.getenv("MIN_FACES_FOR_RELIABLE_MATCH", "3"))
+# Minimum value of 2 to avoid division by zero in _compute_size_penalty
+MIN_FACES_FOR_RELIABLE_MATCH = max(2, int(os.getenv("MIN_FACES_FOR_RELIABLE_MATCH", "3")))
 SMALL_CLUSTER_DISTANCE_PENALTY = float(os.getenv("SMALL_CLUSTER_DISTANCE_PENALTY", "0.05"))
 
 DEFAULT_DATA_ROOT = Path("data").expanduser()
@@ -276,8 +277,8 @@ class GroupingService:
             shutil.copy2(centroids_path, backup_path)
             backed_up_files.append(str(backup_path))
 
-        # Backup people.json
-        people_path = self.data_root / "shows" / show_id.lower() / "people.json"
+        # Backup people.json (use uppercase to match PeopleService normalization)
+        people_path = self.data_root / "shows" / show_id.upper() / "people.json"
         if people_path.exists():
             backup_path = backup_dir / "people.json"
             shutil.copy2(people_path, backup_path)
@@ -329,10 +330,10 @@ class GroupingService:
             shutil.copy2(backup_centroids, target)
             restored_files.append(str(target))
 
-        # Restore people.json
+        # Restore people.json (use uppercase to match PeopleService normalization)
         backup_people = backup_dir / "people.json"
         if backup_people.exists():
-            target = self.data_root / "shows" / show_id.lower() / "people.json"
+            target = self.data_root / "shows" / show_id.upper() / "people.json"
             shutil.copy2(backup_people, target)
             restored_files.append(str(target))
 
@@ -688,8 +689,9 @@ class GroupingService:
                     cluster_to_person[cid] = pid
 
         # Extract cluster IDs, centroid vectors, and metadata for smart distance calculation
-        cluster_ids = list(centroids_map.keys())
-        vectors = np.array([centroids_map[cid]["centroid"] for cid in cluster_ids], dtype=np.float32)
+        # Filter out clusters without valid centroids
+        cluster_ids = [cid for cid in centroids_map.keys() if centroids_map[cid].get("centroid") is not None]
+        vectors = np.array([centroids_map[cid].get("centroid") for cid in cluster_ids], dtype=np.float32)
         seed_cast_ids = [centroids_map[cid].get("seed_cast_id") for cid in cluster_ids]
         cohesions = [centroids_map[cid].get("cohesion") for cid in cluster_ids]
         num_faces_list = [centroids_map[cid].get("num_faces") for cid in cluster_ids]
@@ -1030,11 +1032,11 @@ class GroupingService:
         identities = data.get("identities", [])
 
         # Build assignment map
-        assignment_map = {a["cluster_id"]: a["person_id"] for a in assignments}
+        assignment_map = {a.get("cluster_id"): a.get("person_id") for a in assignments if a.get("cluster_id")}
 
         # Update identities
         for identity in identities:
-            cluster_id = identity["identity_id"]
+            cluster_id = identity.get("identity_id")
             if cluster_id in assignment_map:
                 identity["person_id"] = assignment_map[cluster_id]
 

@@ -161,7 +161,7 @@ Run detect/track synchronously (SSE streaming).
 
 **Request Parameters:**
 - `ep_id` (string, required): Episode identifier
-- `profile` (enum, optional): Performance profile (`fast_cpu`, `low_power`, `balanced`, `high_accuracy`)
+- `profile` (enum, optional): Performance profile (`fast_cpu` alias for `low_power`, `balanced`, `high_accuracy`)
   - Overrides default values for `stride`, `fps`, and detection parameters
   - See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for profile details
 - `stride` (int, default: 6): Frame sampling stride (every Nth frame)
@@ -403,7 +403,7 @@ Run face embedding asynchronously (requires existing tracks).
 
 **Request Parameters:**
 - `ep_id` (string, required): Episode identifier (must have tracks.jsonl)
-- `profile` (enum, optional): Performance profile (`fast_cpu`, `low_power`, `balanced`, `high_accuracy`)
+- `profile` (enum, optional): Performance profile (`fast_cpu` alias for `low_power`, `balanced`, `high_accuracy`)
   - Controls quality gating thresholds and sampling strategy
 - `device` (enum, optional): Execution device (default: "auto")
 - `save_frames` (bool, default: false): Export sampled frames alongside crops
@@ -442,7 +442,7 @@ Run identity clustering asynchronously (requires faces.jsonl and faces.npy).
 
 **Request Parameters:**
 - `ep_id` (string, required): Episode identifier (must have faces.jsonl and faces.npy)
-- `profile` (enum, optional): Performance profile (`fast_cpu`, `low_power`, `balanced`, `high_accuracy`)
+- `profile` (enum, optional): Performance profile (`fast_cpu` alias for `low_power`, `balanced`, `high_accuracy`)
   - Controls clustering threshold and similarity parameters
 - `device` (enum, optional): Execution device (default: "auto")
 - `cluster_thresh` (float, default: 0.58): Cosine similarity threshold for clustering (0.2-0.99)
@@ -497,7 +497,7 @@ Run episode cleanup workflow (outlier removal, re-embedding, re-clustering).
 
 **Request Parameters:**
 - `ep_id` (string, required): Episode identifier
-- `profile` (enum, optional): Performance profile (applies to all cleanup stages)
+- `profile` (enum, optional): Performance profile (`fast_cpu` alias for `low_power`, `balanced`, `high_accuracy`; applies to all cleanup stages)
 - `actions` (array, default: all): Cleanup phases to run
   - `split_tracks`: Split long tracks at scene boundaries
   - `reembed`: Re-extract face embeddings for outlier tracks

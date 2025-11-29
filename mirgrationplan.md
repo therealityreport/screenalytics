@@ -75,3 +75,9 @@
 - Fetch/poll: TanStack Query keyed by `episodeId`; staleTime short; refetch on focus/reconnect; revalidate when manifest mtime changes.
 - SSE/WS: subscribe to `/episodes/{id}/events` for phase updates (start, finish, error), metric deltas (cluster pre/post merge), manifest mtime tokens, and screentime job IDs. Push events into a log drawer and invalidate relevant queries.
 - UI (`web/app/episodes/[id]/page.tsx`): status cards per phase with rerun buttons, warnings for fallbacks, log drawer, screentime job chip keyed to `f"{id}::screentime_job"` to match Streamlit behavior.
+
+## Phase 1 Plan (in progress)
+- **Foundation**: lock CSS approach to CSS modules + minimal globals; scaffold providers (QueryClient, toasts, WS connectivity) and env/proxy wiring.
+- **API Contracts**: add OpenAPI generation scripts, typed fetcher, and client hooks for upload/status/job triggers; include error envelope normalization.
+- **Upload Flow**: implement client-side state machine with mock API (MSW) for `next dev`; handle replace-mode, presign+PUT, verification, and detect/track kick-off.
+- **Episode Detail Hooks**: stub polling + SSE subscription API surfaces and logging so UI wiring can follow quickly.

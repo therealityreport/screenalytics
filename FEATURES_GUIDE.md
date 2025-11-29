@@ -26,7 +26,7 @@ FEATURES/<feature-name>/
 ## Rules
 
 1. **TTL: 30 days** from creation
-2. **No production imports:** Code in `apps/`, `workers/`, `packages/` **cannot** import from `FEATURES/**` (CI enforced)
+2. **No production imports:** Code in `apps/`, `web/`, `packages/` **cannot** import from `FEATURES/**` (CI enforced)
 3. **Promotion requirements:**
    - ✅ Tests present and passing
    - ✅ Docs written (what it does, config keys, metrics)

@@ -48,28 +48,14 @@ The **Episode Cleanup** workflow refines initial detect/track/embed/cluster resu
 python tools/episode_cleanup.py \
   --ep-id rhobh-s05e02 \
   --video data/videos/rhobh-s05e02/episode.mp4 \
-  --profile balanced \
+  --stride 5 --fps 24 \
   --actions split_tracks reembed recluster group_clusters \
   --write-back
 ```
 
-**Profile Support:**
-
-Cleanup now supports performance profiles (same as detect/track/faces/cluster):
-- `--profile fast_cpu` (or `low_power`) - Lower quality, faster processing
-- `--profile balanced` - Default balanced settings
-- `--profile high_accuracy` - Slower, higher quality
-
-Profiles set defaults for `stride`, `fps`, and clustering thresholds. Explicit CLI parameters override profile defaults.
-
-**Example with Profile:**
-```bash
-python tools/episode_cleanup.py \
-  --ep-id rhobh-s05e02 \
-  --profile high_accuracy \
-  --stride 2 \  # Override profile default
-  --write-back
-```
+**Performance presets:**
+- `tools/episode_run.py` does not accept `--profile`. Use explicit stride/FPS flags when invoking cleanup.
+- To mirror presets, choose values similar to `config/pipeline/performance_profiles.yaml` (e.g., `--stride 8 --fps 8` for low-power, `--stride 5 --fps 24` for balanced, `--stride 1 --fps 30 --device cuda` for high-accuracy).
 
 **API:**
 ```bash
@@ -89,7 +75,7 @@ POST /jobs/episode_cleanup_async
 Cleanup reuses configs from detect, track, embed, cluster stages to ensure consistency:
 
 **Performance Profiles:**
-- `config/pipeline/performance_profiles.yaml` - Hardware-aware presets (fast_cpu, low_power, balanced, high_accuracy)
+- `config/pipeline/performance_profiles.yaml` - Hardware-aware presets (low_power, balanced, high_accuracy)
 
 **Stage Configs:**
 - `config/pipeline/detection.yaml`

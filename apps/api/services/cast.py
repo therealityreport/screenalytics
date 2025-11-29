@@ -196,7 +196,7 @@ class CastService:
         """Get a specific cast member."""
         cast_members = self.list_cast(show_id)
         for member in cast_members:
-            if member["cast_id"] == cast_id:
+            if member.get("cast_id") == cast_id:
                 return member
         return None
 
@@ -257,7 +257,7 @@ class CastService:
         cast_members = data.get("cast", [])
 
         for member in cast_members:
-            if member["cast_id"] == cast_id:
+            if member.get("cast_id") == cast_id:
                 if name is not None:
                     member["name"] = name
                 if role is not None:

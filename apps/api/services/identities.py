@@ -637,9 +637,14 @@ def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dic
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
     sync_manifests(ep_id, identities_path)
+
+    # Automatically clean up any empty clusters (source may now be empty)
+    cleanup_result = cleanup_empty_clusters(ep_id)
+
     return {
         "identity_id": target_identity_id,
         "track_ids": target_identity["track_ids"] if target_identity else [],
+        "empty_clusters_removed": len(cleanup_result.get("removed_clusters", [])),
     }
 
 
@@ -658,7 +663,14 @@ def drop_track(ep_id: str, track_id: int) -> Dict[str, Any]:
     update_identity_stats(ep_id, identities)
     identities_path = write_identities(ep_id, identities)
     sync_manifests(ep_id, tracks_path, identities_path)
-    return {"track_id": track_id, "remaining_tracks": len(kept_tracks)}
+
+    # Automatically clean up any empty clusters
+    cleanup_result = cleanup_empty_clusters(ep_id)
+    return {
+        "track_id": track_id,
+        "remaining_tracks": len(kept_tracks),
+        "empty_clusters_removed": len(cleanup_result.get("removed_clusters", [])),
+    }
 
 
 def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = False) -> Dict[str, Any]:
@@ -695,6 +707,93 @@ def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = 
     identities_path = write_identities(ep_id, identities)
     sync_manifests(ep_id, faces_path, identities_path)
     return {"track_id": track_id, "frame_idx": frame_idx, "removed": len(removed)}
+
+
+def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, Any]:
+    """Remove clusters with no tracks and update people.json accordingly.
+
+    This should be called after any operation that might leave clusters empty:
+    - drop_track()
+    - move_track()
+    - Merge operations
+
+    Args:
+        ep_id: Episode identifier
+        show_id: Show identifier (extracted from ep_id if not provided)
+
+    Returns:
+        {
+            "removed_clusters": List of identity_ids that were removed,
+            "people_updated": List of person_ids that had clusters removed,
+            "identities_before": Count before cleanup,
+            "identities_after": Count after cleanup,
+        }
+    """
+    from apps.api.services.people import PeopleService
+
+    identities = load_identities(ep_id)
+    all_identities = identities.get("identities", [])
+    identities_before = len(all_identities)
+
+    # Find empty clusters (no track_ids)
+    empty_cluster_ids = []
+    kept_identities = []
+    for identity in all_identities:
+        track_ids = identity.get("track_ids", []) or []
+        if not track_ids:
+            empty_cluster_ids.append(identity.get("identity_id"))
+            LOGGER.info(
+                "Removing empty cluster %s from episode %s",
+                identity.get("identity_id"),
+                ep_id,
+            )
+        else:
+            kept_identities.append(identity)
+
+    if not empty_cluster_ids:
+        return {
+            "removed_clusters": [],
+            "people_updated": [],
+            "identities_before": identities_before,
+            "identities_after": identities_before,
+        }
+
+    # Update identities.json
+    identities["identities"] = kept_identities
+    update_identity_stats(ep_id, identities)
+    identities_path = write_identities(ep_id, identities)
+    sync_manifests(ep_id, identities_path)
+
+    # Remove from people.json
+    people_updated = []
+    if show_id is None:
+        try:
+            ctx = episode_context_from_id(ep_id)
+            show_id = ctx.show_slug
+        except Exception:
+            LOGGER.warning("Could not extract show_id from ep_id %s", ep_id)
+
+    if show_id:
+        people_service = PeopleService()
+        for cluster_id in empty_cluster_ids:
+            # Full cluster ID format: ep_id:identity_id
+            full_cluster_id = f"{ep_id}:{cluster_id}"
+            modified = people_service.remove_cluster_from_all_people(show_id, full_cluster_id)
+            people_updated.extend(modified)
+
+    LOGGER.info(
+        "Cleaned up %d empty clusters from episode %s, updated %d people",
+        len(empty_cluster_ids),
+        ep_id,
+        len(set(people_updated)),
+    )
+
+    return {
+        "removed_clusters": empty_cluster_ids,
+        "people_updated": list(set(people_updated)),
+        "identities_before": identities_before,
+        "identities_after": len(kept_identities),
+    }
 
 
 def _persist_identity_name(

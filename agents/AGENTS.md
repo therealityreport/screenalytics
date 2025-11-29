@@ -21,7 +21,7 @@ Screenalytics uses **Codex SDK** and **Claude API** agents for autonomous docume
 
 **Trigger:** Any `add`, `delete`, or `rename` event under:
 - `/apps/**`
-- `/workers/**`
+- `/web/**`
 - `/packages/**`
 - `/db/**`
 - `/config/**`
@@ -184,7 +184,7 @@ trigger:
   - file_rename
 scope:
   - apps/**
-  - workers/**
+  - web/**
   - packages/**
   - config/**
   - FEATURES/**

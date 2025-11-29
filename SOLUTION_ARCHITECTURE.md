@@ -68,8 +68,8 @@ Screenalytics transforms raw video episodes into structured, per-person screenti
 - Exporters: Frames + Crops
 - Expected runtime (1hr episode): ~5–10 minutes
 
-**⚠️ Warning:** Aggressive settings (stride=1, high FPS, exporters ON) on CPU will be slow and hot. Use performance profiles:
-- `fast_cpu` — Fanless devices, exploratory
+**⚠️ Warning:** Aggressive settings (stride=1, high FPS, exporters ON) on CPU will be slow and hot. Use performance presets:
+- `low_power` (accepts legacy `fast_cpu`) — Fanless devices, exploratory
 - `balanced` — Standard local dev
 - `high_accuracy` — GPU, production
 

@@ -139,15 +139,16 @@ Set via `SCREENALYTICS_GMC_METHOD` environment variable:
 
 ### 4.1 Profiles
 ```yaml
-fast_cpu:
+low_power:
   description: "Optimized for fanless/low-power devices"
   coreml_input_size: 384
-  detection_fps_limit: 15
-  frame_stride: 10
+  detection_fps_limit: 8
+  frame_stride: 8
   min_size: 120
   adaptive_confidence: true
   nms_mode: hard
   check_pose_quality: false
+  cpu_threads: 2
 
 balanced:
   description: "Balanced performance and quality"
@@ -173,9 +174,11 @@ high_accuracy:
 
 | Profile | Device | Stride | FPS | Use Case |
 |---------|--------|--------|-----|----------|
-| `fast_cpu` | CPU (fanless) | 10 | 15 | Exploratory, thermal-constrained |
+| `low_power` | CPU/CoreML | 8 | 8 | Exploratory, thermal-constrained |
 | `balanced` | CPU/MPS | 5 | 24 | Standard local dev |
 | `high_accuracy` | GPU (CUDA) | 1 | 30 | Production, max recall |
+
+**Compatibility:** The API treats `fast_cpu` as an alias for `low_power` for legacy clients.
 
 ---
 
@@ -305,14 +308,14 @@ screen_time_presets:
 
 1. **CLI args** (highest priority): `--stride 3 --device cuda`
 2. **Environment variables**: `TRACK_THRESH=0.75`
-3. **Profile-specific config**: `performance_profiles.yaml:balanced`
+3. **Profile-specific config**: `performance_profiles.yaml:balanced` (applied by API/job layer; CLI must pass equivalent flags)
 4. **Stage-specific config**: `tracking.yaml`, `detection.yaml`
 5. **Default values** (lowest priority): Hardcoded in code
 
 **Example:**
 ```bash
 export TRACK_THRESH=0.75
-python tools/episode_run.py --profile balanced --stride 5
+python tools/episode_run.py --ep-id <ep_id> --video <path> --stride 5 --fps 24
 ```
 Effective config:
 - `stride: 5` (CLI overrides profile)

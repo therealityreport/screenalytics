@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Set
 
 import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -1878,6 +1880,57 @@ def _parse_iso_timestamp(ts: str | None) -> datetime | None:
         return None
 
 
+def _phase_progress_value(status: str | None) -> float | None:
+    """Map phase status to a coarse progress value for SSE clients."""
+    if not status:
+        return None
+    status_lower = status.lower()
+    mapping = {
+        "success": 1.0,
+        "stale": 0.9,
+        "running": 0.6,
+        "partial": 0.5,
+        "invalid": 0.2,
+        "missing": 0.0,
+    }
+    return mapping.get(status_lower, None)
+
+
+def _status_to_events(ep_id: str, status: EpisodeStatusResponse) -> List[Dict[str, Any]]:
+    flags = {
+        "tracks_only_fallback": status.tracks_only_fallback,
+        "faces_manifest_fallback": status.faces_manifest_fallback,
+    }
+    events: List[Dict[str, Any]] = []
+    for phase_name, phase_status in (
+        ("detect_track", status.detect_track),
+        ("faces", status.faces_embed),
+        ("cluster", status.cluster),
+    ):
+        if not phase_status:
+            continue
+        payload: Dict[str, Any] = {
+            "episode_id": ep_id,
+            "phase": phase_name,
+            "event": "progress",
+            "message": phase_status.status,
+            "progress": _phase_progress_value(getattr(phase_status, "status", None)),
+            "flags": flags,
+            "manifest_mtime": getattr(phase_status, "last_run_at", None),
+        }
+        if phase_name == "cluster":
+            payload["metrics"] = {
+                "singleton_fraction_before": phase_status.singleton_fraction_before,
+                "singleton_fraction_after": phase_status.singleton_fraction_after,
+            }
+        events.append(payload)
+    return events
+
+
+async def _status_snapshot(ep_id: str) -> EpisodeStatusResponse:
+    return await asyncio.to_thread(episode_run_status, ep_id)
+
+
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     tracks_path = get_path(ep_id, "tracks")
@@ -1962,6 +2015,45 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         faces_manifest_fallback=faces_manifest_fallback,
         tracks_only_fallback=tracks_only_fallback,
     )
+
+
+@router.get(
+    "/episodes/{ep_id}/events",
+    tags=["episodes"],
+    response_class=StreamingResponse,
+)
+async def episode_events(
+    ep_id: str,
+    poll_ms: int = Query(1500, ge=200, le=10000),
+    max_events: int = Query(250, ge=1, le=2000),
+):
+    ep_id_normalized = normalize_ep_id(ep_id)
+
+    async def event_stream():
+        # SSE stream keeps the web UI in sync without aggressive polling.
+        sent = 0
+        while sent < max_events:
+            try:
+                status = await _status_snapshot(ep_id_normalized)
+            except HTTPException as exc:
+                payload = {
+                    "episode_id": ep_id_normalized,
+                    "phase": "detect_track",
+                    "event": "error",
+                    "message": str(exc.detail),
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+                break
+
+            for payload in _status_to_events(ep_id_normalized, status):
+                yield f"data: {json.dumps(payload)}\n\n"
+                sent += 1
+                if sent >= max_events:
+                    break
+
+            await asyncio.sleep(poll_ms / 1000)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/episodes", response_model=EpisodeCreateResponse, tags=["episodes"])
@@ -2612,7 +2704,7 @@ def recover_noise_tracks(
 
         # After recovery, refresh similarity indexes and recompute centroids for affected clusters
         if result.get("tracks_expanded", 0) > 0:
-            affected_track_ids = [d["track_id"] for d in result.get("details", [])]
+            affected_track_ids = [d.get("track_id") for d in result.get("details", []) if d.get("track_id") is not None]
             _refresh_similarity_indexes(ep_id, track_ids=affected_track_ids)
 
             # Recompute cluster centroids since track assignments have changed
@@ -2627,6 +2719,38 @@ def recover_noise_tracks(
         return result
     except Exception as e:
         LOGGER.exception(f"[{ep_id}] Failed to recover noise tracks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/cleanup_empty_clusters", tags=["episodes"])
+def cleanup_empty_clusters_endpoint(ep_id: str) -> dict:
+    """Remove clusters that have no tracks/frames.
+
+    Clusters can become empty when:
+    - All tracks are dropped from a cluster
+    - All tracks are moved to another cluster
+    - Merge operations leave source clusters empty
+
+    This endpoint removes empty clusters from identities.json and updates
+    people.json to remove references to the deleted clusters.
+
+    Returns:
+        removed_clusters: List of identity_ids that were removed
+        people_updated: List of person_ids that had clusters removed
+        identities_before: Count before cleanup
+        identities_after: Count after cleanup
+    """
+    from apps.api.services.identities import cleanup_empty_clusters
+
+    try:
+        result = cleanup_empty_clusters(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to cleanup empty clusters: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

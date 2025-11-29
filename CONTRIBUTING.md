@@ -41,7 +41,7 @@ pytest tests/unit/ -v
 These tests validate:
 - Profile resolution order (explicit > env > profile > config > default)
 - Pydantic validation for profile/device enums
-- CLI command building with `--profile` flag
+- CLI command building for detect/track arguments (explicit stride/FPS)
 - Documentation cross-references
 
 #### ML Integration Tests (Slow)
@@ -175,7 +175,7 @@ If legitimate changes require adjusting metric thresholds:
 
 **Timeout Errors:**
 - ML tests have generous timeouts (180-900s depending on test)
-- If tests timeout on slow hardware, consider using `--profile fast_cpu` in fixtures
+- If tests timeout on slow hardware, consider increasing `--stride`/lowering `--fps` in fixtures (e.g., `--stride 8 --fps 8`)
 
 **Import Errors:**
 - Ensure `opencv-python-headless` (not `opencv-python`) is installed to avoid GUI dependencies

@@ -24,7 +24,7 @@ This guide provides hardware recommendations for different Screenalytics deploym
 - **Disk:** 50 GB SSD
 - **OS:** macOS, Linux, Windows (WSL2)
 
-**Performance Profile:** `fast_cpu` or `balanced`
+**Performance Profile:** `low_power` (or legacy `fast_cpu`) or `balanced`
 
 **Expected Runtime:**
 - 5-minute clip: ~30 seconds (CPU) or ~10 seconds (GPU)

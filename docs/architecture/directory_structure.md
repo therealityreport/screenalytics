@@ -16,19 +16,11 @@ screenalytics/
 │   │   ├── routers/             # Endpoint modules (episodes, jobs, identities, facebank)
 │   │   ├── services/            # Business logic (jobs, track_reps, facebank)
 │   │   └── models/              # Pydantic schemas
-│   └── workspace-ui/            # Next.js workspace UI
-│       ├── pages/               # Next.js pages (SHOWS, PEOPLE, Episode Workspace)
-│       └── components/          # Reusable UI components
+│   └── workspace-ui/            # Streamlit workspace UI (Upload/Episode Detail/Faces Review)
+│       ├── Upload_Video.py      # Streamlit entrypoint
+│       └── pages/               # Streamlit subpages
 │
-├── workers/                     # ML pipeline stages (STABLE)
-│   ├── orchestrator.py          # Redis queue worker coordinator
-│   ├── detect/                  # Detection stage (RetinaFace)
-│   ├── track/                   # Tracking stage (ByteTrack)
-│   ├── embed/                   # Embedding stage (ArcFace)
-│   ├── cluster/                 # Clustering stage (Agglomerative)
-│   ├── audio/                   # Audio diarization (Pyannote + Whisper)
-│   ├── fusion/                  # A/V fusion
-│   └── aggregate/               # Screentime aggregation
+├── web/                         # Next.js prototype app (events/divisions/agents)
 │
 ├── packages/                    # Shared libraries (STABLE)
 │   ├── py-screenalytics/        # Python SDK (artifacts, config, storage)
@@ -111,7 +103,6 @@ screenalytics/
 ├── tests/                       # Integration/unit/e2e tests (REQUIRED)
 │   ├── api/                     # API endpoint tests
 │   ├── ml/                      # ML pipeline tests (detect, track, embed, cluster)
-│   ├── workers/                 # Worker stage tests
 │   └── integration/             # End-to-end integration tests
 │
 ├── tools/                       # Helper scripts (SUPPORT)
@@ -150,8 +141,8 @@ screenalytics/
 
 | Folder | Purpose | Stability | Import Policy |
 |--------|---------|-----------|---------------|
-| **apps/** | Frontend (Next.js) + API (FastAPI) | STABLE | ✅ Production imports allowed |
-| **workers/** | ML & analytics pipeline stages | STABLE | ✅ Production imports allowed |
+| **apps/** | FastAPI backend + Streamlit workspace UI | STABLE | ✅ Production imports allowed |
+| **web/** | Next.js prototype app | STABLE | ✅ Production imports allowed |
 | **packages/** | Shared Python & TypeScript libs | STABLE | ✅ Production imports allowed |
 | **db/** | Migrations, views, seeds | VERSIONED | ✅ Production imports allowed |
 | **config/** | All YAML/TOML configs, policies | VERSIONED | ✅ Production reads allowed |
@@ -179,7 +170,7 @@ FEATURES/<feature>/
 
 ### 3.2 Rules
 - **Time-to-live:** 30 days from creation
-- **Import policy:** Imports from `FEATURES/**` are **forbidden** in production code (`apps/`, `workers/`, `packages/`)
+- **Import policy:** Imports from `FEATURES/**` are **forbidden** in production code (`apps/`, `web/`, `packages/`)
 - **Promotion requirements:**
   - ✅ Tests present and passing
   - ✅ Docs written (explain what it does, config keys, metrics)
@@ -188,7 +179,7 @@ FEATURES/<feature>/
   - ✅ Row in `ACCEPTANCE_MATRIX.md` marked ✅ Accepted
 - **Promotion process:**
   1. Run `tools/promote-feature.py <feature-name> --dest <final-path>`
-  2. Code moves from `FEATURES/<feature>/src/` to target path (e.g., `apps/`, `workers/`, `packages/`)
+  2. Code moves from `FEATURES/<feature>/src/` to target path (e.g., `apps/`, `web/`, `packages/`)
   3. Tests move to `tests/`
   4. Docs move to `docs/` (or merged into existing docs)
   5. `TODO.md` status → `PROMOTED`
@@ -227,7 +218,7 @@ FEATURES/<feature>/
 ┌─────────────────────────────────────────────────────────────────┐
 │ 3. Run Promotion                                                 │
 │    $ tools/promote-feature.py <name> --dest <path>              │
-│    - Move src/ → target path (apps/, workers/, packages/)       │
+│    - Move src/ → target path (apps/, web/, packages/)           │
 │    - Move tests/ → tests/<category>/                            │
 │    - Merge docs/ → docs/<category>/                             │
 │    - Update TODO.md status → PROMOTED                           │
@@ -260,7 +251,7 @@ FEATURES/<feature>/
 
 | Zone | Status | Write Policy | Import Policy |
 |------|--------|--------------|---------------|
-| `/apps`, `/workers`, `/packages`, `/db`, `/config`, `/docs` | **STABLE** | Protected (PR review required) | ✅ Production imports allowed |
+| `/apps`, `/web`, `/packages`, `/db`, `/config`, `/docs` | **STABLE** | Protected (PR review required) | ✅ Production imports allowed |
 | `/FEATURES` | **EXPERIMENTAL** | TTL + CI gating | ❌ NO production imports |
 | `/agents`, `/mcps` | **CONTROLLED** | Schema-locked (versioned) | ⚠️ MCP protocol only |
 | `/infra`, `/tools` | **SUPPORT** | Low churn (utility scripts) | ✅ CLI-only |
@@ -273,7 +264,7 @@ FEATURES/<feature>/
 ### 6.1 Trigger
 Any file `add`, `delete`, or `rename` event under:
 - `/apps/**`
-- `/workers/**`
+- `/web/**`
 - `/packages/**`
 - `/db/**`
 - `/config/**`
@@ -310,7 +301,7 @@ Any file `add`, `delete`, or `rename` event under:
 
 ### 7.1 "STABLE" Paths
 - **Definition:** Production-ready code that has passed promotion gates
-- **Examples:** `apps/api/`, `workers/detect/`, `packages/py-screenalytics/`
+- **Examples:** `apps/api/`, `apps/workspace-ui/`, `web/app/`, `packages/py-screenalytics/`
 - **Policy:** Changes require PR review, tests, and docs
 
 ### 7.2 "FEATURES" Sandboxes
@@ -335,8 +326,8 @@ Any file `add`, `delete`, or `rename` event under:
 ### ✅ **ALLOWED** Production Imports
 ```python
 from apps.api.models import Episode
-from workers.detect import RetinaFaceDetector
-from packages.py_screenalytics.artifacts import ArtifactPaths
+from py_screenalytics import artifacts
+from apps.common.cpu_limits import apply_global_cpu_limits
 ```
 
 ### ❌ **FORBIDDEN** Production Imports

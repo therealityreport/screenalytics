@@ -10,8 +10,8 @@
 screenalytics/
 ├── apps/                        # Frontend + API (STABLE)
 │   ├── api/                     # FastAPI backend
-│   └── workspace-ui/            # Next.js workspace
-├── workers/                     # ML pipeline stages (STABLE)
+│   └── workspace-ui/            # Streamlit workspace UI
+├── web/                         # Next.js prototype (event/division admin)
 ├── packages/                    # Shared Python/TS libs (STABLE)
 ├── db/                          # Migrations, views, seeds (VERSIONED)
 ├── config/                      # All YAML/TOML configs (VERSIONED)
@@ -35,7 +35,7 @@ screenalytics/
 
 ### STABLE Paths
 Production-ready code that has passed promotion gates. Changes require PR review, tests, and docs.
-- `apps/`, `workers/`, `packages/`, `db/`, `config/`, `docs/`
+- `apps/`, `web/`, `packages/`, `db/`, `config/`, `docs/`
 
 ### FEATURES Sandboxes
 Temporary experimental code (30-day TTL). **No production imports allowed.**
@@ -43,7 +43,7 @@ Temporary experimental code (30-day TTL). **No production imports allowed.**
 - Promotion: `tools/promote-feature.py <name>`
 
 ### Import Policy
-✅ **ALLOWED:** Production imports from `apps/`, `workers/`, `packages/`
+✅ **ALLOWED:** Production imports from `apps/`, `web/`, `packages/`
 ❌ **FORBIDDEN:** Production imports from `FEATURES/**` (CI enforced)
 
 ---

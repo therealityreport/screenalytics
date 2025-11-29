@@ -91,22 +91,24 @@ python tools/episode_run.py \
   --device auto
 ```
 
-### 3.2 With Performance Profile (Recommended)
+### 3.2 Presets (explicit flags)
 ```bash
 # CPU-safe (fanless devices, exploratory)
 python tools/episode_run.py \
   --ep-id <ep_id> --video <path> \
-  --profile fast_cpu
+  --stride 8 --fps 8 \
+  --device auto --coreml-only
 
 # Balanced (standard local dev)
 python tools/episode_run.py \
   --ep-id <ep_id> --video <path> \
-  --profile balanced
+  --stride 5 --fps 24 \
+  --device auto
 
 # High accuracy (GPU, max recall)
 python tools/episode_run.py \
   --ep-id <ep_id> --video <path> \
-  --profile high_accuracy \
+  --stride 1 --fps 30 \
   --device cuda
 ```
 
@@ -245,15 +247,16 @@ gate_enabled: true
 
 ### 5.3 Performance Profiles (`config/pipeline/performance_profiles.yaml`)
 ```yaml
-fast_cpu:
+low_power:
   description: "Optimized for fanless/low-power devices"
   coreml_input_size: 384
-  detection_fps_limit: 15
-  frame_stride: 10
+  detection_fps_limit: 8
+  frame_stride: 8
   min_size: 120
   adaptive_confidence: true
   nms_mode: hard
   check_pose_quality: false
+  cpu_threads: 2
 
 balanced:
   description: "Balanced performance and quality"
@@ -497,12 +500,12 @@ The pipeline emits **warnings** if:
 **Symptom:** CPU thermal throttling, fans at max, processing < 1 FPS
 
 **Causes:**
-- Profile too aggressive for hardware (e.g., `high_accuracy` on fanless MacBook Air)
+- Stride/FPS too aggressive for hardware (e.g., stride=1 + FPS=30 on fanless MacBook Air)
 - Too many concurrent threads (PyTorch, ONNX, OpenCV all using default thread counts)
 - Exporters enabled (writing thousands of frames/crops to disk)
 
 **Fixes:**
-1. Use `--profile fast_cpu` for thermally constrained devices
+1. Use CPU-safe flags: `--stride 8 --fps 8 --device auto --coreml-only`
 2. Limit threading:
    ```bash
    export OMP_NUM_THREADS=2

@@ -87,7 +87,7 @@ class PeopleService:
         """Get a specific person."""
         people = self.list_people(show_id)
         for person in people:
-            if person["person_id"] == person_id:
+            if person.get("person_id") == person_id:
                 return person
         return None
 
@@ -108,7 +108,7 @@ class PeopleService:
 
         # Generate person_id
         next_id = 1
-        existing_ids = {p["person_id"] for p in people}
+        existing_ids = {p.get("person_id") for p in people if p.get("person_id")}
         while f"p_{next_id:04d}" in existing_ids:
             next_id += 1
         person_id = f"p_{next_id:04d}"
@@ -153,7 +153,7 @@ class PeopleService:
         people = data.get("people", [])
 
         for person in people:
-            if person["person_id"] == person_id:
+            if person.get("person_id") == person_id:
                 # Log what we're updating
                 updates = []
                 if name is not None:
@@ -191,7 +191,7 @@ class PeopleService:
 
                 # Verify the save worked by reloading
                 verify_data = self._load_people(show_id)
-                verify_person = next((p for p in verify_data.get("people", []) if p["person_id"] == person_id), None)
+                verify_person = next((p for p in verify_data.get("people", []) if p.get("person_id") == person_id), None)
                 if verify_person and cluster_ids is not None:
                     verify_cluster_count = len(verify_person.get("cluster_ids", []))
                     if verify_cluster_count != new_cluster_count:

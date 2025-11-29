@@ -195,19 +195,21 @@ tracks.jsonl + speech_segments.jsonl
 
 ## 5. Performance Profiles
 
-To prevent CPU overheating and manage resource usage, the pipeline supports device-aware **performance profiles**:
+To prevent CPU overheating and manage resource usage, the pipeline supports device-aware **performance profiles**.
+The API applies these presets to choose stride/FPS defaults; `tools/episode_run.py` expects explicit flags (no
+`--profile` switch).
 
 | Profile | Device | Stride | FPS | Batch Size | Exporters | Use Case |
 |---------|--------|--------|-----|------------|-----------|----------|
-| **fast_cpu** | CPU | 10 | ≤ 4 | 1 | Off | Fanless devices, exploratory passes |
-| **balanced** | CPU/MPS | 5 | 8 | 2 | Frames only | Standard local dev |
-| **high_accuracy** | GPU (CUDA) | 1 | 30 | 8 | Frames + Crops | Production, full recall |
+| **low_power** | CPU/CoreML | 8 | ≤ 8 | 1 | Off | Fanless devices, exploratory passes |
+| **balanced** | CPU/MPS | 5 | ≤ 24 | 2 | Frames only | Standard local dev |
+| **high_accuracy** | GPU (CUDA) | 1 | 30 | 4 | Frames + Crops | Production, full recall |
 
 **Config:** `config/pipeline/performance_profiles.yaml`
 
 **CLI Usage:**
 ```bash
-python tools/episode_run.py --ep-id <ep_id> --video <path> --profile fast_cpu
+python tools/episode_run.py --ep-id <ep_id> --video <path> --stride 8 --fps 8 --device auto --coreml-only
 ```
 
 **API Usage:**
@@ -355,7 +357,9 @@ See [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) for acceptance thresholds
 python tools/episode_run.py \
   --ep-id rhobh-s05e02 \
   --video data/videos/rhobh-s05e02/episode.mp4 \
-  --profile fast_cpu
+  --stride 8 --fps 8 \
+  --device auto --coreml-only \
+  --no-save-frames --no-save-crops
 
 # Embed faces
 python tools/episode_run.py --ep-id rhobh-s05e02 --faces-embed --save-crops
@@ -369,7 +373,7 @@ python tools/episode_run.py --ep-id rhobh-s05e02 --cluster
 python tools/episode_run.py \
   --ep-id rhobh-s05e02 \
   --video data/videos/rhobh-s05e02/episode.mp4 \
-  --profile high_accuracy \
+  --stride 1 --fps 30 \
   --device cuda \
   --save-frames --save-crops
 ```

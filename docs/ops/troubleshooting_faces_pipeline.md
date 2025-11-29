@@ -26,7 +26,10 @@ This guide provides **symptom → cause → fix** tables for common issues in th
 ```bash
 python tools/episode_run.py \
   --ep-id <ep_id> --video <path> \
-  --profile balanced  # Uses saner defaults
+  --stride 5 --fps 24 \
+  --track-high-thresh 0.75 \
+  --new-track-thresh 0.85 \
+  --min-box-area 400
 ```
 
 ---
@@ -43,10 +46,10 @@ python tools/episode_run.py \
 **Quick Fix:**
 ```bash
 python tools/episode_run.py \
+  --ep-id <ep_id> --video <path> \
   --stride 1 \
-  --min-face-size 64 \
-  --min-face-conf 0.6 \
-  --profile high_accuracy
+  --min-box-area 64 \
+  --det-thresh 0.6
 ```
 
 ---
@@ -74,7 +77,7 @@ python tools/episode_run.py ...
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | CPU thermal throttling, fans at max | Too many threads | Limit: `export OMP_NUM_THREADS=2` |
-| Processing < 1 FPS on CPU | Profile too aggressive | Use `--profile fast_cpu` |
+| Processing < 1 FPS on CPU | Settings too aggressive | Use `--stride 8 --fps 8 --device auto --coreml-only` |
 | Disk I/O bottleneck | Exporters writing thousands of files | Disable: `--no-save-frames --no-save-crops` |
 | GPU not utilized | Wrong device selected | Force: `--device cuda` |
 
@@ -82,7 +85,8 @@ python tools/episode_run.py ...
 ```bash
 export OMP_NUM_THREADS=2
 python tools/episode_run.py \
-  --profile fast_cpu \
+  --ep-id <ep_id> --video <path> \
+  --stride 8 --fps 8 \
   --no-save-frames --no-save-crops
 ```
 

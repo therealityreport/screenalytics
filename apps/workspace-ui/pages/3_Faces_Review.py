@@ -1419,13 +1419,13 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 num_recent = len(recently_edited)
                 protect_recent = st.checkbox(
                     f"🛡️ Protect recently-edited ({num_recent})",
-                    value=True if num_recent > 0 else False,
+                    value=num_recent > 0,
                     key="protect_recent_edits",
                     help="Skip identities you've manually edited during cleanup to preserve your work",
                     disabled=num_recent == 0,
                 )
                 if num_recent > 0 and protect_recent:
-                    st.caption(f"  ↳ {num_recent} identitie(s) will be protected")
+                    st.caption(f"  ↳ {num_recent} {'identity' if num_recent == 1 else 'identities'} will be protected")
 
                 # Enhancement #7: Show backup/restore info
                 backups_resp = _safe_api_get(f"/episodes/{ep_id}/backups")
@@ -2395,7 +2395,7 @@ def _render_cast_carousel(
         person = people_by_cast_id.get(cast_id)
         if person:
             episode_clusters = _episode_cluster_ids(person, ep_id)
-            if len(episode_clusters) > 0:
+            if episode_clusters:
                 cast_with_clusters.append((cast, person, episode_clusters))
 
     # Don't show carousel if no cast members have clusters in this episode
@@ -4269,14 +4269,15 @@ def _render_person_clusters(
                                 key=reassign_key,
                                 label_visibility="collapsed",
                             )
-                            if selected_cast_id and st.button(
-                                f"Assign to {cast_options.get(selected_cast_id)}",
+                            cast_name = cast_options.get(selected_cast_id)
+                            if selected_cast_id and cast_name and st.button(
+                                f"Assign to {cast_name}",
                                 key=f"reassign_btn_{person_id}_{track_id_int}",
                                 type="primary",
                                 use_container_width=True,
                             ):
                                 # Re-assign via API
-                                _assign_track_name(ep_id, track_id_int, cast_options.get(selected_cast_id), show_slug, selected_cast_id)
+                                _assign_track_name(ep_id, track_id_int, cast_name, show_slug, selected_cast_id)
                         else:
                             st.caption("No other cast members available")
             with col3:
@@ -5266,7 +5267,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
         )
     action_cols = st.columns([1.0, 1.0, 1.0])
     with action_cols[0]:
-        targets = [ident["identity_id"] for ident in identities if ident["identity_id"] != current_identity]
+        targets = [ident.get("identity_id") for ident in identities if ident.get("identity_id") and ident.get("identity_id") != current_identity]
         if targets:
             move_select_key = f"track_view_move_{ep_id}_{track_id}_{current_identity or 'none'}"
             target_choice = st.selectbox(
@@ -5430,10 +5431,10 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             st.info("No frames recorded for this track yet.")
 
     if selected_frames:
-        identity_values = [None] + [ident["identity_id"] for ident in identities]
+        identity_values = [None] + [ident.get("identity_id") for ident in identities if ident.get("identity_id")]
         identity_labels = ["Create new identity"] + [
-            f"{ident['identity_id']} · {(ident.get('name') or ident.get('label') or ident['identity_id'])}"
-            for ident in identities
+            f"{ident.get('identity_id')} · {(ident.get('name') or ident.get('label') or ident.get('identity_id', 'unknown'))}"
+            for ident in identities if ident.get("identity_id")
         ]
         identity_idx = st.selectbox(
             "Send selected frames to identity",

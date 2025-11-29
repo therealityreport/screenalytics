@@ -78,10 +78,10 @@ UI stubs:
 
 ### Prerequisites
 - Python 3.11+
-- Node 20+ and pnpm
 - Docker + Docker Compose
 - ffmpeg on PATH
 - GPU optional (recommended for speed)
+- Node 20+ (optional, for the Next.js app in `web/`)
 
 ### Bootstrap (Local)
 
@@ -92,10 +92,13 @@ cd screenalytics
 # Bring up infra (Postgres, Redis, MinIO)
 docker compose -f infra/docker/compose.yaml up -d
 
-# Python deps (uv) and UI deps
-uv sync
+# Python deps
+python -m venv .venv
 source .venv/bin/activate
-pnpm install
+pip install -r requirements.txt
+
+# Optional Next.js web app
+cd web && npm install && cd -
 
 # Seed env
 cp .env.example .env
@@ -104,9 +107,11 @@ cp .env.example .env
 source ./tools/dev-up.sh
 
 # Run services
-python -m uvicorn apps.api.main:app --reload  # API
-uv run workers/orchestrator.py               # Workers
-pnpm --filter workspace-ui dev               # UI
+python -m uvicorn apps.api.main:app --reload        # API
+celery -A apps.api.celery_app:celery_app worker -l info  # Background jobs (optional)
+streamlit run apps/workspace-ui/Upload_Video.py     # Streamlit workspace UI
+# Next.js playground (optional)
+cd web && npm run dev
 ```
 
 ### Minimal Episode Run
@@ -115,7 +120,7 @@ pnpm --filter workspace-ui dev               # UI
 source .venv/bin/activate
 ./tools/dev-up.sh
 
-# Detect + track faces (default: balanced profile)
+# Detect + track faces (stride=3, fps from source video)
 python tools/episode_run.py --ep-id ep_demo --video samples/demo.mp4 --stride 3
 
 # Harvest faces and embed
@@ -140,46 +145,33 @@ See [SETUP.md](SETUP.md) for complete installation and artifact details.
 
 ## Performance Profiles & Limits
 
-Screenalytics provides **hardware-aware performance profiles** to prevent overheating and optimize for your device:
+Screenalytics provides **hardware-aware performance presets** in `config/pipeline/performance_profiles.yaml`.
+The API uses them to choose safe defaults, but `tools/episode_run.py` does **not** accept `--profile`; pass
+explicit `--stride`/`--fps` values instead. These recipes mirror the presets:
 
 ### Profiles
 
-Use `--profile` to select a preset:
-
-```bash
-# For fanless devices (MacBook Air, low-power laptops)
-python tools/episode_run.py --ep-id demo --video test.mp4 --profile fast_cpu
-
-# Standard local dev (balanced recall/speed)
-python tools/episode_run.py --ep-id demo --video test.mp4 --profile balanced
-
-# GPU production (maximum accuracy)
-python tools/episode_run.py --ep-id demo --video test.mp4 --profile high_accuracy --device cuda
-```
-
-### Profile Defaults
-
-| Profile | frame_stride | detection_fps_limit | min_size | Use Case |
-|---------|--------------|---------------------|----------|----------|
-| **fast_cpu** | 10 | 15 FPS | 120px | Fanless devices (Air, low-power) |
-| **balanced** | 5 | 24 FPS | 90px | Standard local dev |
-| **high_accuracy** | 1 | 30 FPS | 64px | GPU production |
+| Preset (approx) | CLI example |
+|-----------------|-------------|
+| **Low power** (fanless/quiet) | `python tools/episode_run.py --ep-id demo --video test.mp4 --stride 8 --fps 8 --device auto --coreml-only` |
+| **Balanced** (default) | `python tools/episode_run.py --ep-id demo --video test.mp4 --stride 5 --fps 24 --device auto` |
+| **High accuracy** (GPU) | `python tools/episode_run.py --ep-id demo --video test.mp4 --stride 1 --fps 30 --device cuda` |
 
 ### ⚠️ Thermal Warnings
 
 **Avoid these combinations on CPU-only laptops (especially fanless):**
 
-- ❌ `--stride 1` + `--fps 30` + `--save-frames --save-crops` (will overheat)
-- ❌ `--profile high_accuracy` without `--device cuda` (CPU will thermal throttle)
+- ❌ `--stride 1` + `--fps 30` + `--save-frames --save-crops` (will overheat CPUs)
+- ❌ Running high-accuracy settings without `--device cuda` (CPU will thermal throttle)
 - ❌ Exporting frames+crops on CPU for 1-hour episodes (disk I/O bottleneck)
 
 **Safe CPU defaults:**
-- ✅ Use `--profile fast_cpu` or `--profile balanced`
+- ✅ Use `--stride 5-8`, `--fps 8-24`, and keep `--device auto` on laptops
 - ✅ Limit thread count: `export SCREENALYTICS_MAX_CPU_THREADS=2`
 - ✅ Disable exporters when not needed: `--no-save-frames --no-save-crops`
 
 **GPU recommendations:**
-- ✅ Use `--profile high_accuracy --device cuda` for production runs
+- ✅ Use `--device cuda` with the high-accuracy recipe (`--stride 1 --fps 30`)
 - ✅ RTX 3080 or better for 1-hour episodes (~5-10 minutes)
 - ✅ T4 (AWS g4dn.2xlarge) for cloud workloads
 

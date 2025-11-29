@@ -740,7 +740,7 @@ async def upload_seeds(
             show_id,
             cast_id,
             "upload",
-            [seed["fb_id"] for seed in uploaded_seeds],
+            [seed.get("fb_id") for seed in uploaded_seeds if seed.get("fb_id")],
         )
 
     response_payload = {

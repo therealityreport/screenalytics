@@ -12,7 +12,7 @@ This guide explains how to tune the Screenalytics pipeline for **speed vs accura
 **Key Principles:**
 - **CPU-only:** Conservative defaults to prevent overheating and thermal throttling
 - **GPU:** Aggressive settings for maximum throughput
-- **Profiles:** Pre-configured performance profiles for common use cases
+- **Profiles:** Pre-configured performance profiles for common use cases (applied server-side; `tools/episode_run.py` has no `--profile` flag—use explicit `--stride`/`--fps`)
 
 ---
 
@@ -22,16 +22,16 @@ This guide explains how to tune the Screenalytics pipeline for **speed vs accura
 
 | Profile | Device | Stride | FPS | Batch | Exporters | Use Case | Expected Runtime (1hr episode) |
 |---------|--------|--------|-----|-------|-----------|----------|--------------------------------|
-| **fast_cpu** | CPU (fanless) | 10 | ≤4 | 1 | Off | Exploratory, thermal-constrained | ~5× realtime (~5 hours) |
-| **balanced** | CPU/MPS | 5 | 8 | 2 | Frames only | Standard local dev | ~3× realtime (~3 hours) |
-| **high_accuracy** | GPU (CUDA) | 1 | 30 | 8 | Frames + Crops | Production, max recall | ≤10 minutes |
+| **low_power** | CPU/CoreML | 8 | ≤8 | 1 | Off | Fanless, thermally constrained | ~5× realtime (~5 hours) |
+| **balanced** | CPU/MPS | 5 | ≤24 | 2 | Frames only | Standard local dev | ~3× realtime (~3 hours) |
+| **high_accuracy** | GPU (CUDA) | 1 | 30 | 4 | Frames + Crops | Production, max recall | ≤10 minutes |
 
 ### 2.2 Using Profiles
 ```bash
-# CLI
-python tools/episode_run.py --ep-id <ep_id> --video <path> --profile fast_cpu
+# CLI (explicit flags; mirrors low_power/balanced/high_accuracy)
+python tools/episode_run.py --ep-id <ep_id> --video <path> --stride 8 --fps 8 --device auto --coreml-only
 
-# API
+# API (applies profile defaults server-side)
 POST /jobs/detect_track_async
 {
   "ep_id": "rhobh-s05e02",
@@ -208,14 +208,13 @@ max_crops_per_track: 50  # Lower = faster (e.g., 20)
 ## 6. Hardware-Specific Recommendations
 
 ### 6.1 MacBook Air M1/M2 (Fanless)
-**Profile:** `fast_cpu`
-
 **Settings:**
 ```bash
 export OMP_NUM_THREADS=2
 python tools/episode_run.py \
-  --profile fast_cpu \
-  --device mps \
+  --ep-id <ep_id> --video <path> \
+  --stride 8 --fps 8 \
+  --device auto --coreml-only \
   --coreml-det-size 384 \
   --no-save-frames --no-save-crops
 ```
@@ -223,13 +222,12 @@ python tools/episode_run.py \
 **Expected runtime (1hr episode):** ~4–6 hours
 
 ### 6.2 MacBook Pro M1/M2/M3 (Active Cooling)
-**Profile:** `balanced`
-
 **Settings:**
 ```bash
 export OMP_NUM_THREADS=4
 python tools/episode_run.py \
-  --profile balanced \
+  --ep-id <ep_id> --video <path> \
+  --stride 5 --fps 24 \
   --device mps \
   --save-frames
 ```
@@ -237,13 +235,12 @@ python tools/episode_run.py \
 **Expected runtime (1hr episode):** ~2–3 hours
 
 ### 6.3 Desktop CPU (8+ cores)
-**Profile:** `balanced`
-
 **Settings:**
 ```bash
 export OMP_NUM_THREADS=8
 python tools/episode_run.py \
-  --profile balanced \
+  --ep-id <ep_id> --video <path> \
+  --stride 3 --fps 24 \
   --device cpu \
   --save-frames --save-crops
 ```
@@ -251,15 +248,13 @@ python tools/episode_run.py \
 **Expected runtime (1hr episode):** ~2–3 hours
 
 ### 6.4 GPU Server (CUDA)
-**Profile:** `high_accuracy`
-
 **Settings:**
 ```bash
 python tools/episode_run.py \
-  --profile high_accuracy \
+  --ep-id <ep_id> --video <path> \
+  --stride 1 --fps 30 \
   --device cuda \
-  --save-frames --save-crops \
-  --embed-batch-size 8
+  --save-frames --save-crops
 ```
 
 **Expected runtime (1hr episode):** ~5–10 minutes
@@ -333,7 +328,7 @@ watch -n 1 cat data/manifests/{ep_id}/progress.json
 - [ ] Increase `max_crops_per_track` (`50` or `100`)
 
 ### 8.3 For Thermal Management (CPU)
-- [ ] Use `fast_cpu` profile
+- [ ] Use low-power settings (`--stride 8 --fps 8 --device auto --coreml-only`)
 - [ ] Limit threads (`export OMP_NUM_THREADS=2`)
 - [ ] Increase stride (`--stride 10`)
 - [ ] Disable exporters

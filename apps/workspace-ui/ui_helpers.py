@@ -894,7 +894,7 @@ def render_sidebar_episode_selector() -> str | None:
     episodes = sorted(episodes, key=sort_key, reverse=True)
 
     # Determine current ep_id with lock support
-    ep_ids = [ep["ep_id"] for ep in episodes]
+    ep_ids = [ep.get("ep_id") for ep in episodes if ep.get("ep_id")]
     locked = bool(st.session_state.get("ep_locked", True))
     locked_ep_id = st.session_state.get("locked_ep_id", "")
     current_ep_id = st.session_state.get("ep_id", "")
@@ -903,9 +903,9 @@ def render_sidebar_episode_selector() -> str | None:
         current_ep_id = locked_ep_id
     else:
         # If current ep_id doesn't exist in list, fallback to most recent
-        if current_ep_id and current_ep_id not in ep_ids:
+        if current_ep_id and current_ep_id not in ep_ids and ep_ids:
             current_ep_id = ep_ids[0]  # Most recent episode
-        elif not current_ep_id:
+        elif not current_ep_id and ep_ids:
             current_ep_id = ep_ids[0]  # Default to most recent
 
     # Build labels for selectbox
@@ -2832,7 +2832,7 @@ def run_job_with_progress(
                     job_started=job_started,
                     async_endpoint=async_endpoint,
                 )
-                if fallback_summary is not None or fallback_error is None:
+                if fallback_summary is not None or fallback_error is not None:
                     summary = fallback_summary
                     error_message = fallback_error
                 if fallback_error:
