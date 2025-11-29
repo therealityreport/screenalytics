@@ -1,3 +1,34 @@
+## Branching Strategy
+
+**Effective 2025-11-29:** `main` is the canonical branch, aligned with `local-truth-baseline-2025-11-29`.
+
+### Branch Naming Convention
+
+| Prefix | Purpose | Example |
+|--------|---------|---------|
+| `feature/` | New features | `feature/dark-mode` |
+| `bugfix/` | Bug fixes | `bugfix/track-id-overflow` |
+| `chore/` | Maintenance, refactoring | `chore/upgrade-deps` |
+| `docs/` | Documentation only | `docs/api-reference` |
+
+### Workflow
+
+1. **Start from main:** `git checkout main && git pull`
+2. **Create topic branch:** `git checkout -b feature/my-feature`
+3. **Commit, push:** `git push -u origin feature/my-feature`
+4. **Open PR**, get review, merge to main
+5. **Delete branch** after merge
+
+### Deprecated
+
+- **Date-based branches (`nov-*`)** are deprecated and must not be used.
+- All such branches were deleted on 2025-11-29.
+- The rescue snapshot is preserved at `rescue/local-sync-2025-11-29` for reference.
+
+---
+
+## General Guidelines
+
 - Use `FEATURES/<name>` for all new work until promotion.
 - Include tests and documentation before promoting any module.
 - Follow `SETUP.md` to bootstrap your environment and run services locally.
