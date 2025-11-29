@@ -4,12 +4,45 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("STORAGE_BACKEND", "local")
+
+
+# ============================================================================
+# Celery Eager Mode Configuration for Tests
+# ============================================================================
+# When running tests, execute Celery tasks synchronously without requiring
+# a live Redis/worker setup. This makes tests faster and more reliable.
+
+
+@pytest.fixture(scope="session", autouse=True)
+def configure_celery_eager():
+    """Configure Celery to run tasks synchronously in tests."""
+    try:
+        from apps.api.celery_app import celery_app
+
+        # Configure Celery for synchronous execution in tests
+        celery_app.conf.update(
+            task_always_eager=True,
+            task_eager_propagates=True,
+            result_backend="cache+memory://",
+            broker_url="memory://",
+        )
+        yield celery_app
+    except ImportError:
+        # Celery not available, skip configuration
+        yield None
+
+
+@pytest.fixture
+def celery_eager_app(configure_celery_eager):
+    """Provide the Celery app configured for eager execution."""
+    return configure_celery_eager
 
 # Provide a lightweight cv2 stub when OpenCV is unavailable (CI/unit tests).
 try:  # pragma: no cover - exercised only when cv2 is missing

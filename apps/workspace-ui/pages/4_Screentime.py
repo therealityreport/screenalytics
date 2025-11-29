@@ -166,13 +166,13 @@ if current_job_id:
 
             # Clear the current job from session state
             if st.button("Clear Job Status"):
-                del st.session_state["current_screentime_job"]
+                st.session_state.pop("current_screentime_job", None)
                 st.rerun()
 
     except requests.RequestException:
         # Job not found or API error - clear from session
         if st.button("Clear Job Status"):
-            del st.session_state["current_screentime_job"]
+            st.session_state.pop("current_screentime_job", None)
             st.rerun()
 
 st.divider()

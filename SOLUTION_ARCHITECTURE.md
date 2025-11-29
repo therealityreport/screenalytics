@@ -1,138 +1,90 @@
-# SOLUTION_ARCHITECTURE.md — Screenalytics
+# Solution Architecture — Screenalytics
 
-Version: 1.1 (Enhanced)
-Status: Planning
-
----
-
-## 1. Purpose
-Screenalytics transforms raw video and audio into structured cast-level analytics. It quantifies screen presence, speaking time, and visual engagement for every episode, powering TRR’s analytics, design, and merch systems.
+**Quick Reference** | [Full Documentation →](docs/architecture/solution_architecture.md)
 
 ---
 
-## 2. Architecture Overview
-```
+## Overview
 
-[Workspace UI (Next.js)]
-│
-▼
-[API (FastAPI)] ──► [Redis Queue] ──► [Workers (Python)]
-│                               │
-│                               ├─► Object Storage (S3/R2/GCS)
-│                               └─► Postgres + pgvector
-│
-├─► MCP Servers (screenalytics / storage / postgres)
-│        ▲
-│        └─ Codex + Claude Agents
-└─► Webhooks (Zapier/n8n) → Exports, Alerts
+Screenalytics transforms raw video episodes into structured, per-person screentime analytics through an automated ML pipeline.
+
+**Pipeline:** Detect → Track → Embed → Cluster → Cleanup → Audio Diarize → A/V Fusion → Aggregate → Export
+
+---
+
+## High-Level Architecture
 
 ```
-
----
-
-## 3. Core Components
-| Component | Function | Key Tech |
-|------------|-----------|----------|
-| **UI** | Upload, workspace, SHOWS/PEOPLE catalog | Next.js, TypeScript |
-| **API** | CRUD, orchestration, signed URLs | FastAPI |
-| **Workers** | Pipeline stages (Detect → Track → ID → Fuse → Aggregate) | Python (uv), Redis |
-| **Storage** | Object storage for frames, chips, reports | S3/R2/GCS |
-| **Database** | Structured + vector data | Postgres + pgvector |
-| **Agents** | Autonomous updates + documentation | Codex + Claude via MCP |
-| **Automation** | Notifications and exports | Zapier / n8n |
-
----
-
-## 4. Pipeline
-| Stage | Input | Output | Tools |
-|--------|--------|---------|-------|
-| **Ingest** | MP4 | frames/, audio.wav | FFmpeg, OpenCV |
-| **Shot Split** | video | shots.csv | PySceneDetect |
-| **Detect** | frames | detections.jsonl | RetinaFace |
-| **Align / Quality** | faces | chips/, manifest | InsightFace, MagFace |
-| **Track** | detections | tracks.jsonl | ByteTrack |
-| **Embed / ID** | chips | embeddings.parquet, assignments | ArcFace ONNX, pgvector |
-| **Audio Fuse** | audio.wav | speech_segments, transcripts | Pyannote, Faster-Whisper |
-| **Aggregate** | assignments + speech | screen_time.csv/json | pandas |
-| **QA / Review** | artifacts | overrides + history | Streamlit / Next.js UI |
-
----
-
-## 5. Data Model (Simplified)
+┌─────────────────────────────────────────────────────────────────┐
+│                      WORKSPACE UI (Next.js)                      │
+│  SHOWS Directory | PEOPLE Directory | Episode Workspace | Facebank│
+└────────────────────────┬────────────────────────────────────────┘
+                         │ HTTP/REST + SSE
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        API (FastAPI)                             │
+│  Episodes CRUD | Jobs Orchestrator | Identities | Facebank      │
+└────┬───────────────┬──────────────────────────────┬─────────────┘
+     │               │                              │
+     ▼               ▼                              ▼
+┌─────────┐   ┌──────────────┐    ┌────────────────────────┐
+│ Redis   │   │ Postgres     │    │ Object Storage         │
+│ Queue   │   │ + pgvector   │    │ (S3/R2/GCS/MinIO)      │
+└────┬────┘   └──────────────┘    └────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    WORKERS (Pipeline Stages)                     │
+│  Detect | Track | Embed | Cluster | Cleanup | Audio | Aggregate │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-show → season → episode → track → embedding → assignment → screen_time
-person → cast_membership → facebank → featured_thumbnail
-speech_segment → av_link (track_id + seg_id)
+---
 
-```
-Stored in Postgres, with vectors indexed via HNSW in pgvector.
+## Core Components
+
+| Component | Purpose | Technology |
+|-----------|---------|------------|
+| **UI** | Upload episodes, run jobs, moderate identities | Next.js, TypeScript |
+| **API** | CRUD operations, job orchestration, signed URLs | FastAPI, Python 3.11+ |
+| **Workers** | ML pipeline stages (detect/track/embed/cluster) | RetinaFace, ByteTrack, ArcFace ONNX |
+| **Storage** | Video, frames, crops, manifests, analytics | S3-compatible (AWS S3, R2, GCS, MinIO) |
+| **Database** | Metadata, embeddings (pgvector), audit trails | Postgres 15+ with pgvector |
+| **Agents** | Auto-documentation, low-confidence relabeling | Codex SDK, Claude API, MCP |
 
 ---
 
-## 6. Storage Layout
-```
+## Performance & Limits
 
-videos/{show}/{SxxEyy}/episode.mp4
-audio/{show}/{SxxEyy}/episode.wav
-frames/{show}/{SxxEyy}/{shot}/{ts}.jpg
-chips/{show}/{SxxEyy}/{track}/{n}.jpg
-facebank/{person}/ref_{hash}.jpg
-reports/{show}/{SxxEyy}/screen_time.csv
+**Safe Defaults (CPU-only):**
+- Stride: 3–10 (process every Nth frame)
+- Analyzed FPS: 4–8
+- Exporters: Off by default (frames/crops optional)
+- Threading: Limited (`OMP_NUM_THREADS=2` for fanless devices)
 
-```
+**GPU Recommendations:**
+- Stride: 1 (max recall)
+- Analyzed FPS: 24–30
+- Exporters: Frames + Crops
+- Expected runtime (1hr episode): ~5–10 minutes
 
-Lifecycle rules:
-- Expire `frames/` after N days
-- Retain `chips/`, `facebank/`, `reports/`
-
----
-
-## 7. Configuration Layers
-- **Pipeline configs** (`config/pipeline/*.yaml`): thresholds, model IDs, stage toggles
-- **Service configs** (`config/services.yaml`): timeouts, endpoints
-- **Storage** (`config/storage.yaml`): bucket names, lifecycle
-- **Agents** (`config/codex.config.toml`, `config/claude.policies.yaml`): write rules and MCP servers
+**⚠️ Warning:** Aggressive settings (stride=1, high FPS, exporters ON) on CPU will be slow and hot. Use performance presets:
+- `low_power` (accepts legacy `fast_cpu`) — Fanless devices, exploratory
+- `balanced` — Standard local dev
+- `high_accuracy` — GPU, production
 
 ---
 
-## 8. Observability
-- Structured logs → stdout (JSON)
-- Progress events → Redis PubSub
-- Metrics: throughput, error count, avg runtime per stage
-- QA view: aggregated low-confidence tracks
+## Documentation
+
+**For complete details, see:**
+
+- **[Full Solution Architecture](docs/architecture/solution_architecture.md)** — System design, data model, configuration layers
+- **[Directory Structure](docs/architecture/directory_structure.md)** — Repo layout, promotion policy
+- **[Pipeline Overview](docs/pipeline/overview.md)** — Stage-by-stage pipeline guide
+- **[Performance Tuning](docs/ops/performance_tuning_faces_pipeline.md)** — Speed vs accuracy tuning
+- **[Troubleshooting](docs/ops/troubleshooting_faces_pipeline.md)** — Common issues and fixes
 
 ---
 
-## 9. Security
-- Signed URLs (temporary)
-- RLS by show
-- Audit trail via `assignment_history`
-- No PII; embeddings only
-
----
-
-## 10. Performance Targets
-- 1-hour episode ≤ 10 min on single GPU
-- ID accuracy ≥ 90%
-- Speaking match ≥ 85%
-- CI integration test: ≤ 15 min full pipeline run
-
----
-
-## 11. Promotion & CI Flow
-1. Build feature in `FEATURES/<name>/`
-2. Test, document, and config-drive it
-3. Promote via PR → CI verifies
-4. Agents update docs automatically (see configuration below)
-
----
-
-## 12. Agents & Automation Hooks
-- **Trigger:** when files are added or removed
-- **Action:** Codex & Claude agents update
-  - `SOLUTION_ARCHITECTURE.md`
-  - `DIRECTORY_STRUCTURE.md`
-  - `PRD.md`
-  - `README.md`
-- **Location:** `/agents/playbooks/update-docs-on-change.yaml`
+**Maintained by:** Screenalytics Engineering

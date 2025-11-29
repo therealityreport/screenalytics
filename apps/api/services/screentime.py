@@ -8,7 +8,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -104,9 +104,19 @@ class ScreenTimeAnalyzer:
         person_to_cast = self._build_person_to_cast_map(people)
         person_to_name = self._build_person_to_name_map(people)
         identity_to_person = self._build_identity_to_person_map(ep_id, people)
+        tracks_by_id = self._index_tracks(tracks)
 
         diagnostics["tracks_mapped_to_identity"] = len(track_to_identity)
         diagnostics["people_with_cast_id"] = len(person_to_cast)
+
+        stale_track_ids = [tid for tid in track_to_identity if tid not in tracks_by_id]
+        if stale_track_ids:
+            for tid in stale_track_ids:
+                track_to_identity.pop(tid, None)
+            LOGGER.info(
+                "[screentime] Dropped %d stale track->identity mappings missing from tracks.jsonl",
+                len(stale_track_ids),
+            )
 
         LOGGER.info(
             f"[screentime] Built mappings: {len(track_to_identity)} track->identity, "
@@ -126,7 +136,6 @@ class ScreenTimeAnalyzer:
 
         # Group artifacts for fast lookup
         faces_by_track = self._group_faces_by_track(faces)
-        tracks_by_id = self._index_tracks(tracks)
 
         # Analyze each cast member
         cast_metrics_map: Dict[str, CastMetrics] = {}
@@ -244,7 +253,7 @@ class ScreenTimeAnalyzer:
         # Convert to output format
         return {
             "episode_id": ep_id,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "diagnostics": diagnostics,
             "metrics": [
                 {

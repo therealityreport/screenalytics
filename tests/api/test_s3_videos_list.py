@@ -11,6 +11,7 @@ from apps.api.routers import episodes as episodes_router
 class _FakeStorage:
     def __init__(self, items: Iterable[Dict[str, object]]) -> None:
         self._items = list(items)
+        self.bucket = "screenalytics"
 
     def list_episode_videos_s3(self, limit: int = 1000, **_) -> list[Dict[str, object]]:
         return self._items[:limit]

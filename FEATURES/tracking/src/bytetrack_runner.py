@@ -98,8 +98,11 @@ class Track:
 
     def to_record(self) -> Dict[str, object]:
         avg_conf = self.conf_sum / self.hits if self.hits else 0.0
+        track_num = int(self.track_id)
         return {
-            "track_id": self.track_id,  # Numeric ID for downstream int() parsing
+            "track_id": track_num,
+            "track_idx": track_num,
+            "track_label": f"track_{track_num:04d}",
             "ep_id": self.ep_id,
             "start_s": self.start_s,
             "end_s": self.end_s,

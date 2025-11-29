@@ -8,7 +8,9 @@ import math
 import mimetypes
 import numbers
 import os
+import platform
 import re
+import threading
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -18,16 +20,30 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner.script_run_context import (
+    add_script_run_ctx,
+    get_script_run_ctx,
+)
+from streamlit.runtime.scriptrunner.script_requests import RerunData
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-DEFAULT_STRIDE = 3
+DEFAULT_STRIDE = 6  # Every 6th frame - balances accuracy vs false positives
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
-DEFAULT_DEVICE = "auto"
-DEFAULT_DEVICE_LABEL = "Auto"
-DEFAULT_DET_THRESH = 0.5
-DEFAULT_MAX_GAP = 30
+
+# Platform-aware device defaults
+# On macOS Apple Silicon: prefer CoreML for quiet, thermal-safe operation
+# On other platforms: use "auto" which will pick CUDA > CPU
+_IS_MACOS_APPLE_SILICON = (
+    platform.system().lower() == "darwin" and
+    platform.machine().lower().startswith(("arm", "aarch64"))
+)
+DEFAULT_DEVICE = "coreml" if _IS_MACOS_APPLE_SILICON else "auto"
+DEFAULT_DEVICE_LABEL = "CoreML (Apple Silicon)" if _IS_MACOS_APPLE_SILICON else "Auto"
+
+DEFAULT_DET_THRESH = 0.65  # Raised from 0.5 to reduce false positive face detections
+DEFAULT_MAX_GAP = 60
 DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
 
@@ -63,18 +79,18 @@ def _env_int(name: str, default: int) -> int:
 
 TRACK_HIGH_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_TRACK_HIGH_THRESH",
-    _env_float("BYTE_TRACK_HIGH_THRESH", 0.5),
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.55),  # Raised from 0.45 - stricter track continuation
 )
 TRACK_NEW_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_NEW_TRACK_THRESH",
-    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.5),
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.75),  # Raised from 0.60 - much stricter new track creation
 )
 TRACK_BUFFER_BASE_DEFAULT = max(
     _env_int("SCREENALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 30)),
     1,
 )
 MIN_BOX_AREA_DEFAULT = max(
-    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 100.0)),  # Raised from 20 - filter tiny false detections
     0.0,
 )
 
@@ -82,15 +98,23 @@ MIN_BOX_AREA_DEFAULT = max(
 # Thumbnail constants
 THUMB_W, THUMB_H = 200, 250
 _PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
+_THUMB_CACHE_STATE_KEY = "_thumb_async_cache"
+_THUMB_JOB_STATE_KEY = "_thumb_async_jobs"
+_MAX_ASYNC_THUMB_WORKERS = 8
 
 LABEL = {
     DEFAULT_DETECTOR: "RetinaFace (recommended)",
     DEFAULT_TRACKER: "ByteTrack (default)",
     "strongsort": "StrongSORT (ReID)",
 }
-DEVICE_LABELS = ["Auto", "CPU", "MPS", "CUDA"]
-DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CUDA": "cuda"}
+DEVICE_LABELS = ["Auto", "CPU", "MPS", "CoreML", "CUDA"]
+DEVICE_VALUE_MAP = {"Auto": "auto", "CPU": "cpu", "MPS": "mps", "CoreML": "coreml", "CUDA": "cuda"}
 DEVICE_VALUE_TO_LABEL = {value.lower(): label for label, value in DEVICE_VALUE_MAP.items()}
+DEVICE_VALUE_TO_LABEL["metal"] = "CoreML"
+DEVICE_VALUE_TO_LABEL["apple"] = "CoreML"
+DEVICE_VALUE_TO_LABEL.setdefault("coreml", "CoreML")
+DEVICE_VALUE_TO_LABEL.setdefault("metal", "CoreML")
+DEVICE_VALUE_TO_LABEL.setdefault("apple", "CoreML")
 DETECTOR_OPTIONS = [
     ("RetinaFace (recommended)", DEFAULT_DETECTOR),
 ]
@@ -105,6 +129,50 @@ TRACKER_OPTIONS = [
 TRACKER_LABELS = [label for label, _ in TRACKER_OPTIONS]
 TRACKER_VALUE_MAP = {label: value for label, value in TRACKER_OPTIONS}
 TRACKER_LABEL_MAP = {value: label for label, value in TRACKER_OPTIONS}
+
+# Performance profile settings
+# Higher strides = fewer frames = fewer false detections
+PROFILE_LABELS = ["Low Power", "Balanced", "Performance"]
+PROFILE_VALUE_MAP = {"Low Power": "low_power", "Balanced": "balanced", "Performance": "performance"}
+PROFILE_LABEL_MAP = {v: k for k, v in PROFILE_VALUE_MAP.items()}
+PROFILE_DEFAULTS = {
+    "low_power": {
+        "stride": 12,  # Every 12th frame - fast, fewer false positives
+        "fps": 15.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 2,
+    },
+    "balanced": {
+        "stride": 6,  # Every 6th frame - good balance
+        "fps": 24.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 4,
+    },
+    "performance": {
+        "stride": 4,  # Every 4th frame - thorough
+        "fps": 30.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 8,
+    },
+}
+# Default profile per device type
+# On macOS Apple Silicon: low_power profile for thermal safety
+# On other platforms: balanced for better throughput
+DEVICE_DEFAULT_PROFILE = {
+    "coreml": "low_power",  # CoreML: use higher stride to reduce false detections
+    "mps": "low_power",
+    "cpu": "low_power",
+    "cuda": "balanced",  # CUDA can handle more frames
+    "auto": "low_power" if _IS_MACOS_APPLE_SILICON else "balanced",
+}
+
+SUPPORTED_PIPELINE_COMBOS = {
+    "harvest": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
+    "cluster": {(DEFAULT_DETECTOR, DEFAULT_TRACKER)},
+}
 SCENE_DETECTOR_OPTIONS = [
     ("PySceneDetect (recommended)", "pyscenedetect"),
     ("HSV histogram (fallback)", "internal"),
@@ -113,10 +181,421 @@ SCENE_DETECTOR_OPTIONS = [
 SCENE_DETECTOR_LABELS = [label for label, _ in SCENE_DETECTOR_OPTIONS]
 SCENE_DETECTOR_VALUE_MAP = {label: value for label, value in SCENE_DETECTOR_OPTIONS}
 SCENE_DETECTOR_LABEL_MAP = {value: label for label, value in SCENE_DETECTOR_OPTIONS}
-_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
+_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "off").strip().lower()
 SCENE_DETECTOR_DEFAULT = _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
+
+# =============================================================================
+# Execution Mode (Local vs Redis/Celery)
+# =============================================================================
+# This controls whether jobs run synchronously in-process ("local") or are
+# queued via Redis/Celery ("redis"). The mode is stored per-episode in session
+# state and persisted to localStorage for the browser.
+#
+# IMPORTANT: We prefer Redis when available because:
+# - Background processing doesn't block the UI
+# - Better progress tracking and cancellation
+# - Worker concurrency is properly managed
+#
+# Local mode is a fallback for laptops without Redis, with explicit warnings
+# about thermal impact for long/heavy episodes.
+
+EXECUTION_MODE_SESSION_KEY = "_execution_mode"
+EXECUTION_MODE_OPTIONS = [
+    ("Redis/Celery (queued)", "redis"),
+    ("Local (CPU/CoreML on this machine)", "local"),
+]
+EXECUTION_MODE_LABELS = [label for label, _ in EXECUTION_MODE_OPTIONS]
+EXECUTION_MODE_VALUE_MAP = {label: value for label, value in EXECUTION_MODE_OPTIONS}
+EXECUTION_MODE_LABEL_MAP = {value: label for label, value in EXECUTION_MODE_OPTIONS}
+
+# Cache for Redis availability check
+_REDIS_AVAILABLE_CACHE: Dict[str, Any] = {"checked": False, "available": False, "last_check": 0}
+_REDIS_CHECK_INTERVAL_SEC = 60  # Re-check every 60 seconds
+
+
+def _check_redis_available() -> bool:
+    """Check if Redis/Celery is available and healthy.
+
+    Returns True if we can connect to the Celery workers via the API.
+    Caches result to avoid repeated checks.
+    """
+    import time
+    now = time.time()
+
+    # Use cached result if recent
+    if _REDIS_AVAILABLE_CACHE["checked"] and (now - _REDIS_AVAILABLE_CACHE["last_check"]) < _REDIS_CHECK_INTERVAL_SEC:
+        return _REDIS_AVAILABLE_CACHE["available"]
+
+    try:
+        base = st.session_state.get("api_base")
+        if not base:
+            base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+        resp = requests.get(f"{base}/celery_jobs", timeout=3)
+        resp.raise_for_status()
+        # If we got a response, Redis is available
+        _REDIS_AVAILABLE_CACHE["available"] = True
+    except requests.RequestException:
+        _REDIS_AVAILABLE_CACHE["available"] = False
+
+    _REDIS_AVAILABLE_CACHE["checked"] = True
+    _REDIS_AVAILABLE_CACHE["last_check"] = now
+    return _REDIS_AVAILABLE_CACHE["available"]
+
+
+def _get_execution_mode_default() -> str:
+    """Determine the default execution mode.
+
+    - If Redis is available and healthy: default to 'redis'
+    - Otherwise: default to 'local' with warnings
+    """
+    if _check_redis_available():
+        return "redis"
+    return "local"
+
+
+def _execution_mode_key(ep_id: str) -> str:
+    """Return session state key for execution mode per episode."""
+    return f"{EXECUTION_MODE_SESSION_KEY}::{ep_id}"
+
+
+def get_execution_mode(ep_id: str) -> str:
+    """Get the current execution mode for an episode.
+
+    If no mode is explicitly set, returns:
+    - "redis" if Redis is available
+    - "local" otherwise
+    """
+    if not ep_id:
+        return _get_execution_mode_default()
+    key = _execution_mode_key(ep_id)
+    mode = st.session_state.get(key)
+    if mode in ("redis", "local"):
+        return mode
+    return _get_execution_mode_default()
+
+
+def set_execution_mode(ep_id: str, mode: str) -> None:
+    """Set the execution mode for an episode.
+
+    Args:
+        ep_id: Episode identifier
+        mode: "redis" or "local"
+    """
+    if not ep_id:
+        return
+    if mode not in ("redis", "local"):
+        mode = _get_execution_mode_default()
+    key = _execution_mode_key(ep_id)
+    st.session_state[key] = mode
+
+
+def execution_mode_label(mode: str) -> str:
+    """Convert execution mode value to display label."""
+    return EXECUTION_MODE_LABEL_MAP.get(mode, EXECUTION_MODE_LABELS[0])
+
+
+def execution_mode_index(mode: str) -> int:
+    """Get the index of an execution mode in the options list."""
+    try:
+        values = [v for _, v in EXECUTION_MODE_OPTIONS]
+        return values.index(mode)
+    except ValueError:
+        return 0
+
+
+def is_redis_available() -> bool:
+    """Check if Redis/Celery backend is available."""
+    return _check_redis_available()
+
+
+def render_execution_mode_selector(
+    ep_id: str,
+    key_suffix: str = "",
+    *,
+    frame_count: int | None = None,
+    duration_seconds: float | None = None,
+) -> str:
+    """Render an execution mode dropdown and return the current mode.
+
+    This component allows switching between local (direct) and redis (queued)
+    execution modes. The selection is stored in session state per episode.
+
+    Args:
+        ep_id: Episode identifier
+        key_suffix: Optional suffix for the selectbox key to avoid conflicts
+        frame_count: Optional total frame count for heavy episode warnings
+        duration_seconds: Optional video duration for heavy episode warnings
+
+    Returns:
+        Current execution mode ("redis" or "local")
+    """
+    if not ep_id:
+        return _get_execution_mode_default()
+
+    redis_available = is_redis_available()
+    current_mode = get_execution_mode(ep_id)
+    current_index = execution_mode_index(current_mode)
+
+    widget_key = f"execution_mode_selector::{ep_id}::{key_suffix}"
+
+    # Customize help text based on Redis availability
+    if redis_available:
+        help_text = "Redis/Celery queues jobs for background workers. Local runs on this machine synchronously."
+    else:
+        help_text = (
+            "⚠️ Redis/Celery not available. "
+            "Local runs on this machine (may be slow/hot for long episodes). "
+            "Start Redis to enable background processing."
+        )
+
+    selected_label = st.selectbox(
+        "Execution Mode",
+        EXECUTION_MODE_LABELS,
+        index=current_index,
+        key=widget_key,
+        help=help_text,
+    )
+
+    selected_mode = EXECUTION_MODE_VALUE_MAP.get(selected_label, _get_execution_mode_default())
+
+    # Update state if changed
+    if selected_mode != current_mode:
+        set_execution_mode(ep_id, selected_mode)
+
+    # Show warning for Local mode on heavy episodes
+    if selected_mode == "local":
+        is_heavy = False
+        warning_parts = []
+
+        if frame_count and frame_count > 5000:
+            is_heavy = True
+            warning_parts.append(f"{frame_count:,} frames")
+
+        if duration_seconds and duration_seconds > 600:  # > 10 minutes
+            is_heavy = True
+            mins = int(duration_seconds // 60)
+            warning_parts.append(f"{mins}+ min video")
+
+        if is_heavy:
+            warning_msg = f"⚠️ Local mode on heavy episode ({', '.join(warning_parts)}) may cause thermal throttling."
+            if redis_available:
+                warning_msg += " Consider using Redis/Celery for background processing."
+            else:
+                warning_msg += " Consider using low_power profile or high stride."
+            st.warning(warning_msg)
+
+    return selected_mode
+
+
+def is_local_mode(ep_id: str) -> bool:
+    """Check if the current execution mode is 'local' for an episode."""
+    return get_execution_mode(ep_id) == "local"
+
+
+def is_redis_mode(ep_id: str) -> bool:
+    """Check if the current execution mode is 'redis' for an episode."""
+    return get_execution_mode(ep_id) == "redis"
+
+
+# =============================================================================
+# Local Mode Log Persistence and Hydration
+# =============================================================================
+# These helpers fetch persisted logs from the backend and cache them in session
+# state so they can be displayed on page load without re-running jobs.
+
+_LOCAL_LOGS_SESSION_KEY = "_local_logs_cache"
+_VALID_OPERATIONS = {"detect_track", "faces_embed", "cluster"}
+
+
+def _get_logs_cache() -> Dict[str, Dict[str, Any]]:
+    """Get the logs cache dict from session state."""
+    return st.session_state.setdefault(_LOCAL_LOGS_SESSION_KEY, {})
+
+
+def _logs_cache_key(ep_id: str, operation: str) -> str:
+    """Generate a cache key for an episode/operation."""
+    return f"{ep_id}::{operation}"
+
+
+def fetch_operation_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Fetch persisted logs for an operation from the backend API.
+
+    Args:
+        ep_id: Episode identifier
+        operation: One of 'detect_track', 'faces_embed', 'cluster'
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if not available
+    """
+    if operation not in _VALID_OPERATIONS:
+        LOGGER.warning(f"Invalid operation for log fetch: {operation}")
+        return None
+
+    try:
+        base = st.session_state.get("api_base")
+        if not base:
+            base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+        url = f"{base}/celery_jobs/logs/{ep_id}/{operation}"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "none":
+            return None
+        return data
+    except requests.RequestException as exc:
+        LOGGER.debug(f"Failed to fetch logs for {ep_id}/{operation}: {exc}")
+        return None
+
+
+def get_cached_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Get cached logs from session state for an episode/operation.
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if not cached
+    """
+    cache = _get_logs_cache()
+    key = _logs_cache_key(ep_id, operation)
+    return cache.get(key)
+
+
+def cache_logs(
+    ep_id: str,
+    operation: str,
+    logs: List[str],
+    status: str,
+    elapsed_seconds: float,
+    raw_logs: List[str] | None = None,
+    extra: Dict[str, Any] | None = None,
+) -> None:
+    """Cache logs in session state for an episode/operation.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name
+        logs: List of formatted log lines
+        status: Final status (completed, error, cancelled, timeout)
+        elapsed_seconds: Total runtime in seconds
+        raw_logs: Optional list of raw unprocessed log lines
+        extra: Additional metadata to store
+    """
+    cache = _get_logs_cache()
+    key = _logs_cache_key(ep_id, operation)
+    cache[key] = {
+        "episode_id": ep_id,
+        "operation": operation,
+        "logs": logs,
+        "raw_logs": raw_logs or logs,
+        "status": status,
+        "elapsed_seconds": elapsed_seconds,
+        **(extra or {}),
+    }
+
+
+def hydrate_logs_for_episode(ep_id: str, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Fetch and cache persisted logs for all operations for an episode.
+
+    This should be called on page load to populate the log cache with
+    any previously saved logs. Only fetches if not already cached unless
+    force=True.
+
+    Args:
+        ep_id: Episode identifier
+        force: If True, always fetch from backend even if cached
+
+    Returns:
+        Dict mapping operation name to log data
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    cache = _get_logs_cache()
+
+    for operation in _VALID_OPERATIONS:
+        key = _logs_cache_key(ep_id, operation)
+
+        # Skip if already cached and not forcing refresh
+        if not force and key in cache:
+            if cache[key]:
+                result[operation] = cache[key]
+            continue
+
+        # Fetch from backend
+        data = fetch_operation_logs(ep_id, operation)
+        if data:
+            cache[key] = data
+            result[operation] = data
+        else:
+            # Mark as fetched but empty so we don't keep retrying
+            cache[key] = {}
+
+    return result
+
+
+def render_cached_logs(ep_id: str, operation: str) -> bool:
+    """Render cached logs for an operation if available.
+
+    Should be called to display "Last run" logs on page load.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name
+
+    Returns:
+        True if logs were rendered, False if no logs available
+    """
+    cached = get_cached_logs(ep_id, operation)
+    if not cached or not cached.get("logs"):
+        return False
+
+    logs = cached.get("logs", [])
+    status = cached.get("status", "unknown")
+    elapsed = cached.get("elapsed_seconds", 0)
+    updated_at = cached.get("updated_at")
+
+    # Format elapsed time
+    if elapsed >= 60:
+        elapsed_min = int(elapsed // 60)
+        elapsed_sec = int(elapsed % 60)
+        elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+    else:
+        elapsed_str = f"{elapsed:.1f}s"
+
+    # Status indicator
+    if status == "completed":
+        status_icon = "completed"
+        status_label = "Last run completed"
+    elif status == "error":
+        status_icon = "error"
+        status_label = "Last run failed"
+    elif status == "cancelled":
+        status_icon = "cancelled"
+        status_label = "Last run cancelled"
+    elif status == "timeout":
+        status_icon = "timeout"
+        status_label = "Last run timed out"
+    else:
+        status_icon = "unknown"
+        status_label = f"Last run: {status}"
+
+    # Build header with timestamp if available
+    header_parts = [status_label]
+    if elapsed > 0:
+        header_parts.append(f"({elapsed_str})")
+    if updated_at:
+        # Parse and format timestamp
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
+            header_parts.append(f"at {formatted}")
+        except Exception:
+            pass
+
+    # Render in an expander
+    with st.expander(f"Last run log - {' '.join(header_parts)}", expanded=False):
+        st.code("\n".join(logs), language="text")
+
+    return True
 
 
 def _env(key: str, default: str = "") -> str:
@@ -136,13 +615,19 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def known_shows(include_session: bool = True) -> List[str]:
-    """Return a sorted list of known show identifiers from episodes + S3 (plus session state)."""
+    """Return a sorted list of known show identifiers from episodes + S3 (plus session state).
+
+    All show codes are normalized to UPPERCASE and deduplicated case-insensitively.
+    This ensures 'rhoslc', 'RHOSLC', and 'RhoSlc' all resolve to a single 'RHOSLC' entry.
+    """
+    # Use uppercase keys for deduplication
     shows: set[str] = set()
 
     def _remember(show_value: Any) -> None:
         if not show_value or not isinstance(show_value, str):
             return
-        cleaned = show_value.strip()
+        # Normalize to uppercase for consistent display and deduplication
+        cleaned = show_value.strip().upper()
         if cleaned:
             shows.add(cleaned)
 
@@ -175,16 +660,26 @@ def known_shows(include_session: bool = True) -> List[str]:
         for entry in st.session_state.get(_CUSTOM_SHOWS_SESSION_KEY, []):
             _remember(entry)
 
-    return sorted(shows, key=lambda value: value.lower())
+    # Return sorted uppercase codes
+    return sorted(shows)
 
 
 def remember_custom_show(show_id: str) -> None:
-    """Persist a show identifier in session state so dropdowns include it immediately."""
-    cleaned = (show_id or "").strip()
+    """Persist a show identifier in session state so dropdowns include it immediately.
+
+    The show_id is normalized to UPPERCASE for consistency.
+    Case-insensitive deduplication ensures 'rhoslc' and 'RHOSLC' don't create duplicates.
+    """
+    if not show_id or not isinstance(show_id, str):
+        return
+    # Normalize to uppercase
+    cleaned = show_id.strip().upper()
     if not cleaned:
         return
     custom: List[str] = st.session_state.setdefault(_CUSTOM_SHOWS_SESSION_KEY, [])
-    if cleaned not in custom:
+    # Check case-insensitively to avoid duplicates
+    existing_upper = {s.upper() for s in custom}
+    if cleaned not in existing_upper:
         custom.append(cleaned)
 
 
@@ -259,14 +754,25 @@ def _api_base() -> str:
     return base
 
 
-def init_page(title: str = DEFAULT_TITLE, skip_episode_selector: bool = False) -> Dict[str, str]:
-    st.set_page_config(page_title=title, layout="wide")
+def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
+    # Set page config with wide layout - use try/except to handle multi-page navigation
+    # where set_page_config may have already been called
+    try:
+        st.set_page_config(page_title=title, layout="wide")
+    except st.errors.StreamlitAPIException:
+        pass  # Already configured, ignore
+
+    # Clear render flags at the start of each page run to allow widgets to be rendered fresh
+    st.session_state.pop("_episode_selector_rendered", None)
+
+    inject_custom_fonts()
+
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
     st.session_state.setdefault("api_base", api_base)
-    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "local").lower()
+    backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
     st.session_state.setdefault("backend", backend)
     bucket = st.session_state.get("bucket") or (
-        _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "")
+        _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "screenalytics")
     )
     st.session_state.setdefault("bucket", bucket)
 
@@ -288,6 +794,10 @@ def init_page(title: str = DEFAULT_TITLE, skip_episode_selector: bool = False) -
     st.session_state.setdefault("scene_detector_choice", SCENE_DETECTOR_DEFAULT)
 
     sidebar = st.sidebar
+    # Episode selector at top of sidebar (with lock)
+    render_sidebar_episode_selector()
+
+    render_workspace_nav()
     sidebar.header("API")
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
@@ -299,10 +809,9 @@ def init_page(title: str = DEFAULT_TITLE, skip_episode_selector: bool = False) -
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
 
-    # Render locked episode selector in sidebar (skip only for Upload Video)
-    if not skip_episode_selector:
-        sidebar.divider()
-        render_sidebar_episode_selector()
+    # Render global episode selector in sidebar
+    sidebar.divider()
+    render_sidebar_episode_selector()
 
     return {
         "api_base": api_base,
@@ -333,136 +842,156 @@ def get_ep_id() -> str:
     return st.session_state.get("ep_id", "")
 
 
+def get_ep_id_from_query_params() -> str:
+    """Get ep_id from query params, falling back to session state.
+
+    Returns:
+        The ep_id from query params if present, otherwise from session state,
+        or empty string if neither is set.
+    """
+    query_ep_id = st.query_params.get("ep_id", "")
+    if query_ep_id:
+        return query_ep_id
+    return st.session_state.get("ep_id", "")
+
+
 def render_sidebar_episode_selector() -> str | None:
-    """Render locked episode selector with unlock mechanism in sidebar.
+    """Render a global episode selector in the sidebar.
 
     Returns the selected ep_id, or None if no episodes exist.
 
     Behavior:
-    - Shows locked episode by default with unlock button
-    - When unlocked, shows full selector with tracked episodes and S3 browser
-    - Episode only changes when explicitly confirmed via Load button
+    - Defaults to most recently uploaded episode when no ep_id is set
+    - Persists selection in st.session_state across page changes
+    - Falls back to newest episode if previously selected ep_id no longer exists
+    - Only renders the widget once per page run to avoid duplicate key errors
     """
-    st.sidebar.markdown("### Episode")
+    # Guard: only render the selector widget once per page run
+    # This prevents DuplicateWidgetID errors if init_page() is called multiple times
+    _rendered_key = "_episode_selector_rendered"
+    if st.session_state.get(_rendered_key):
+        return st.session_state.get("ep_id")
+    st.session_state[_rendered_key] = True
 
-    current = st.session_state.get("ep_id", "")
+    try:
+        episodes_payload = api_get("/episodes")
+    except requests.RequestException:
+        st.sidebar.info("API unavailable")
+        return None
 
-    # Check if selector is locked (default is locked)
-    is_locked = not st.session_state.get("episode_selector_unlocked", False)
+    episodes = episodes_payload.get("episodes", [])
 
-    if current and is_locked:
-        # Show locked state - just display current episode
-        ep_meta = parse_ep_id(current) or {}
-        show = ep_meta.get("show", "").upper()
-        season = ep_meta.get("season", 0)
-        episode = ep_meta.get("episode", 0)
-        display_text = f"{show} S{season:02d}E{episode:02d}" if show and season and episode else current
+    if not episodes:
+        st.sidebar.info("No episodes yet — upload one to get started.")
+        return None
 
-        st.sidebar.info(f"🔒 **{display_text}**")
+    # Sort by created_at descending (most recent first)
+    # Fallback to ep_id sorting if created_at is missing
+    def sort_key(ep: Dict[str, Any]) -> tuple:
+        created_at = ep.get("created_at", "")
+        return (created_at, ep.get("ep_id", ""))
 
-        if st.sidebar.button(
-            "🔓 Change Episode",
-            key="unlock_episode_selector",
-            use_container_width=True,
-        ):
-            st.session_state["episode_selector_unlocked"] = True
-            st.rerun()
+    episodes = sorted(episodes, key=sort_key, reverse=True)
 
-        return current
+    # Determine current ep_id with lock support
+    ep_ids = [ep.get("ep_id") for ep in episodes if ep.get("ep_id")]
+    locked = bool(st.session_state.get("ep_locked", True))
+    locked_ep_id = st.session_state.get("locked_ep_id", "")
+    current_ep_id = st.session_state.get("ep_id", "")
 
-    # Show unlocked state - full selector
-    st.session_state["episode_selector_unlocked"] = True
+    if locked and locked_ep_id in ep_ids:
+        current_ep_id = locked_ep_id
+    else:
+        # If current ep_id doesn't exist in list, fallback to most recent
+        if current_ep_id and current_ep_id not in ep_ids and ep_ids:
+            current_ep_id = ep_ids[0]  # Most recent episode
+        elif not current_ep_id and ep_ids:
+            current_ep_id = ep_ids[0]  # Default to most recent
 
-    tracked_tab, s3_tab = st.sidebar.tabs(["Tracked", "Browse S3"])
+    # Build labels for selectbox
+    def format_label(ep: Dict[str, Any]) -> str:
+        ep_id = ep["ep_id"]
+        parsed = parse_ep_id(ep_id)
+        if parsed:
+            show = parsed["show"].upper()
+            season = parsed["season"]
+            episode = parsed["episode"]
+            return f"{show} S{season:02d}E{episode:02d}"
+        return ep_id
 
-    with tracked_tab:
-        try:
-            episodes_payload = api_get("/episodes")
-        except Exception:
-            st.sidebar.info("API unavailable")
-            return current
-            
-        options = episodes_payload.get("episodes", []) if episodes_payload else []
-        if options:
-            ep_ids = [item["ep_id"] for item in options]
-            default_idx = ep_ids.index(current) if current in ep_ids else 0
+    labels = {ep["ep_id"]: format_label(ep) for ep in episodes}
 
-            selection = st.sidebar.selectbox(
-                "Select episode",
-                ep_ids,
-                format_func=lambda eid: f"{eid} ({options[ep_ids.index(eid)]['show_slug']})",
-                index=default_idx if ep_ids else 0,
-                key="global_tracked_select",
-            )
+    # Determine index for selectbox
+    try:
+        current_index = ep_ids.index(current_ep_id)
+    except ValueError:
+        current_index = 0
 
-            col1, col2 = st.sidebar.columns(2)
-            with col1:
-                if col1.button(
-                    "✓ Load",
-                    key="global_load_tracked",
-                    use_container_width=True,
-                    type="primary",
-                ):
-                    st.session_state["episode_selector_unlocked"] = False
-                    set_ep_id(selection)
-            with col2:
-                if col2.button(
-                    "✗ Cancel",
-                    key="cancel_episode_change",
-                    use_container_width=True,
-                ):
-                    st.session_state["episode_selector_unlocked"] = False
-                    st.rerun()
+    # Header + lock toggle
+    header_cols = st.sidebar.columns([4, 1])
+    header_cols[0].markdown("**Episode**")
+    lock_label = "🔒" if locked else "💾"
+    lock_help = "Unlock to change episode" if locked else "Lock selection across page reloads"
+    toggle = header_cols[1].button(lock_label, key="ep_lock_toggle", help=lock_help)
+    if toggle:
+        if locked:
+            st.session_state["ep_locked"] = False
+            st.session_state["locked_ep_id"] = ""
+            locked = False
+            locked_ep_id = ""
         else:
-            st.sidebar.info("No tracked episodes yet.")
+            st.session_state["ep_locked"] = True
+            st.session_state["locked_ep_id"] = current_ep_id
+            locked = True
+            locked_ep_id = current_ep_id
 
-    with s3_tab:
+    # Render selectbox in sidebar
+    selected_ep_id = st.sidebar.selectbox(
+        f"Episode {'🔒' if locked else '🔓'}",
+        options=ep_ids,
+        format_func=lambda eid: labels.get(eid, eid),
+        index=current_index,
+        key="global_episode_selector",
+        disabled=locked,
+    )
+
+    # Update session state if selection changed (and not locked)
+    if not locked and selected_ep_id != current_ep_id:
+        set_ep_id(selected_ep_id, rerun=False)
+        current_ep_id = selected_ep_id
+
+    # Keep locked ep_id consistent
+    if locked:
+        st.session_state["locked_ep_id"] = current_ep_id
+        set_ep_id(current_ep_id, rerun=False)
+
+    # Cache clear button
+    st.sidebar.divider()
+    if st.sidebar.button("🗑️ Clear Python Cache", help="Clear .pyc files and __pycache__ directories"):
+        import shutil
+        from pathlib import Path
+
         try:
-            s3_payload = api_get("/episodes/s3_videos")
-        except Exception:
-            st.sidebar.info("API unavailable")
-            return current
-            
-        items = s3_payload.get("items", []) if s3_payload else []
-        if items:
-            labels = [f"{item['ep_id']} · {item.get('last_modified') or 'unknown'}" for item in items]
-            idx = st.sidebar.selectbox(
-                "S3 videos",
-                list(range(len(items))),
-                format_func=lambda i: labels[i],
-                key="global_s3_select",
-            )
-            selected_item = items[idx]
-            if st.sidebar.button("Create & Load", key="global_track_s3", use_container_width=True):
-                st.session_state["episode_selector_unlocked"] = False
-                # Track episode from S3
-                ep_id = str(selected_item.get("ep_id", "")).lower()
-                ep_meta_s3 = parse_ep_id(ep_id) or {}
-                show_slug = selected_item.get("show") or ep_meta_s3.get("show")
-                season = selected_item.get("season") or ep_meta_s3.get("season")
-                episode = selected_item.get("episode") or ep_meta_s3.get("episode")
-                
-                if ep_id and show_slug and season is not None and episode is not None:
-                    payload = {
-                        "ep_id": ep_id,
-                        "show_slug": str(show_slug),
-                        "season": int(season),
-                        "episode": int(episode),
-                    }
-                    try:
-                        resp = api_post("/episodes/upsert_by_id", payload)
-                        set_ep_id(resp["ep_id"])
-                        st.rerun()
-                    except Exception as exc:
-                        st.sidebar.error(f"Failed to track episode: {exc}")
-        else:
-            st.sidebar.info("No S3 videos exposed by the API.")
+            # Get the project root (3 levels up from ui_helpers.py)
+            project_root = Path(__file__).resolve().parents[2]
 
-    if not current:
-        st.sidebar.warning("Choose an episode to continue.")
-        
-    return current
+            # Clear __pycache__ directories
+            pycache_count = 0
+            for pycache_dir in project_root.rglob("__pycache__"):
+                shutil.rmtree(pycache_dir, ignore_errors=True)
+                pycache_count += 1
 
+            # Clear .pyc files
+            pyc_count = 0
+            for pyc_file in project_root.rglob("*.pyc"):
+                pyc_file.unlink(missing_ok=True)
+                pyc_count += 1
+
+            st.sidebar.success(f"✅ Cleared {pycache_count} cache dirs, {pyc_count} .pyc files")
+        except Exception as exc:
+            st.sidebar.error(f"Cache clear failed: {exc}")
+
+    return selected_ep_id
 
 
 def api_get(path: str, **kwargs) -> Dict[str, Any]:
@@ -493,6 +1022,585 @@ def api_delete(path: str, **kwargs) -> Dict[str, Any]:
     resp = requests.delete(f"{base}{path}", timeout=timeout, **kwargs)
     resp.raise_for_status()
     return resp.json()
+
+
+# ============================================================================
+# Async Job Helpers (Celery/Redis background jobs)
+# ============================================================================
+
+ASYNC_JOB_KEY = "_async_job"
+
+
+def _run_local_job_with_progress(
+    base: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+    episode_id: str,
+    progress_endpoint: str,
+) -> Optional[Dict[str, Any]]:
+    """Run a local-mode job with real-time progress polling.
+
+    Uses a background thread to make the HTTP request while the main thread
+    polls for progress updates and displays them in a Streamlit status container.
+
+    Args:
+        base: API base URL
+        endpoint: API endpoint for the job
+        payload: Request payload
+        operation: Operation name for display
+        episode_id: Episode ID
+        progress_endpoint: Endpoint to poll for progress
+
+    Returns:
+        Response dict from the API, or None if failed
+    """
+    import queue
+
+    # Shared state between threads
+    result_queue: queue.Queue = queue.Queue()
+
+    def _run_request():
+        """Background thread to run the HTTP request."""
+        try:
+            resp = requests.post(f"{base}{endpoint}", json=payload, timeout=600)
+            resp.raise_for_status()
+            result_queue.put(("success", resp.json()))
+        except requests.RequestException as e:
+            result_queue.put(("error", str(e)))
+        except Exception as e:
+            result_queue.put(("error", str(e)))
+
+    # Start the request in a background thread
+    worker = threading.Thread(target=_run_request, daemon=True)
+    worker.start()
+
+    # Use st.status for expandable progress display
+    with st.status(f"Running {operation} (local mode)...", expanded=True) as status:
+        last_step = ""
+        last_progress = 0.0
+        poll_count = 0
+        max_polls = 1200  # 10 minutes at 0.5s intervals
+
+        while worker.is_alive() and poll_count < max_polls:
+            poll_count += 1
+
+            # Check if we have a result
+            try:
+                result_type, result_data = result_queue.get_nowait()
+                break
+            except queue.Empty:
+                pass
+
+            # Poll for progress
+            try:
+                progress_resp = requests.get(f"{base}{progress_endpoint}", timeout=5)
+                if progress_resp.status_code == 200:
+                    progress_data = progress_resp.json()
+                    entries = progress_data.get("entries", [])
+
+                    if entries:
+                        latest = entries[-1]
+                        step = latest.get("step", "")
+                        progress = latest.get("progress", 0)
+                        message = latest.get("message", "")
+
+                        # Update status display
+                        if step != last_step or progress != last_progress:
+                            pct = int(progress * 100)
+                            status.update(label=f"{operation}: {step} ({pct}%)")
+                            st.write(f"**{step}**: {message}")
+                            last_step = step
+                            last_progress = progress
+
+                    # Check if finished
+                    if progress_data.get("finished"):
+                        if progress_data.get("error"):
+                            status.update(label=f"{operation} failed", state="error")
+                            st.error(f"Error: {progress_data.get('error')}")
+                        break
+            except requests.RequestException:
+                pass  # Progress polling failed, continue waiting
+
+            time.sleep(0.5)
+
+        # Wait for thread to finish if still running
+        worker.join(timeout=5)
+
+        # Get final result
+        try:
+            result_type, result_data = result_queue.get(timeout=1)
+        except queue.Empty:
+            status.update(label=f"{operation} timed out", state="error")
+            st.error(f"Job timed out after {max_polls * 0.5:.0f} seconds")
+            return None
+
+        if result_type == "error":
+            status.update(label=f"{operation} failed", state="error")
+            st.error(f"Failed: {result_data}")
+            return None
+
+        # Success - show detailed results
+        data = result_data
+        job_status = data.get("status", "")
+        result = data.get("result", {})
+
+        if job_status in ("completed", "success"):
+            status.update(label=f"✅ {operation} complete!", state="complete", expanded=True)
+
+            # Show summary stats
+            if result:
+                summary = result.get("summary", result)
+                clusters = summary.get("clusters", summary.get("total_clusters", 0))
+                identities = summary.get("identities", 0)
+                assigned = summary.get("assignments_count", summary.get("assigned_clusters", 0))
+                new_people = summary.get("new_people_count", 0)
+
+                cols = st.columns(4)
+                cols[0].metric("Clusters", clusters)
+                cols[1].metric("Assigned", assigned)
+                cols[2].metric("New People", new_people)
+                cols[3].metric("Identities", identities)
+
+            # Show detailed log if available
+            progress_log = data.get("progress_log", [])
+            log_data = result.get("log", {})
+
+            if log_data and log_data.get("steps"):
+                with st.expander("📋 Detailed Log", expanded=False):
+                    log_lines = []
+                    for step_info in log_data.get("steps", []):
+                        step_name = step_info.get("step", "")
+                        step_status = step_info.get("status", "")
+                        duration_ms = step_info.get("duration_ms", 0)
+                        icon = "✓" if step_status == "success" else ("⊘" if step_status == "skipped" else "✗")
+                        log_lines.append(f"[{icon}] {step_name}: {step_status} ({duration_ms}ms)")
+                        for detail in step_info.get("details", []):
+                            log_lines.append(f"    • {detail}")
+                    st.code("\n".join(log_lines), language=None)
+            elif progress_log:
+                with st.expander("📋 Progress Log", expanded=False):
+                    for entry in progress_log:
+                        pct = int(entry.get("progress", 0) * 100)
+                        st.write(f"[{pct}%] **{entry.get('step', '')}**: {entry.get('message', '')}")
+
+        elif job_status == "error":
+            status.update(label=f"❌ {operation} failed", state="error")
+            st.error(f"Error: {data.get('error', 'Unknown error')}")
+        else:
+            status.update(label=f"✅ {operation} complete", state="complete")
+
+        return data
+
+
+def submit_async_job(
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+    episode_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Submit an async job to the API and store in session state.
+
+    Respects the execution mode setting for the episode:
+    - Redis mode: Queues job via Celery, stores job_id for polling
+    - Local mode: Runs job synchronously and returns result directly
+
+    Args:
+        endpoint: API endpoint (e.g., /episodes/{ep_id}/clusters/group_async)
+        payload: Request payload
+        operation: Operation name for display (e.g., "Auto Group")
+        episode_id: Episode ID
+
+    Returns:
+        Response dict if submitted, None if failed or sync fallback occurred
+    """
+    base = st.session_state.get("api_base")
+    if not base:
+        st.error("API not initialized")
+        return None
+
+    # Get execution mode for this episode and add to payload
+    execution_mode = get_execution_mode(episode_id)
+    payload = {**payload, "execution_mode": execution_mode}
+
+    # For local mode, use threading + progress polling for real-time updates
+    if execution_mode == "local":
+        # Determine progress endpoint based on the job type
+        progress_endpoint = None
+        if "clusters/group" in endpoint:
+            progress_endpoint = f"/episodes/{episode_id}/clusters/group/progress"
+
+        if progress_endpoint:
+            # Use threading + polling for operations that support progress
+            return _run_local_job_with_progress(
+                base=base,
+                endpoint=endpoint,
+                payload=payload,
+                operation=operation,
+                episode_id=episode_id,
+                progress_endpoint=progress_endpoint,
+            )
+        else:
+            # Fallback to simple spinner for operations without progress endpoints
+            with st.spinner(f"Running {operation} in local mode..."):
+                try:
+                    resp = requests.post(f"{base}{endpoint}", json=payload, timeout=600)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    status = data.get("status", "")
+                    if status in ("completed", "success"):
+                        st.success(f"✅ {operation} completed (local mode)")
+                    elif status == "error":
+                        st.error(f"❌ {operation} failed: {data.get('error', 'Unknown error')}")
+                    else:
+                        if data.get("async") is False:
+                            st.info(f"{operation} completed (sync fallback)")
+                    return data
+                except requests.RequestException as e:
+                    st.error(f"Failed to run {operation}: {describe_error(f'{base}{endpoint}', e)}")
+                    return None
+
+    # Redis mode - check if a job is already running
+    existing = st.session_state.get(ASYNC_JOB_KEY)
+    if existing:
+        st.warning(f"⏳ A job is already running: {existing.get('operation')} ({existing.get('job_id', '')[:8]}...)")
+        return None
+
+    try:
+        resp = requests.post(f"{base}{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("async", False) and data.get("job_id"):
+            # Store job in session state for polling
+            st.session_state[ASYNC_JOB_KEY] = {
+                "job_id": data["job_id"],
+                "operation": operation,
+                "episode_id": episode_id,
+                "created_at": time.time(),
+            }
+            st.info(f"⏳ {operation} started... (job {data['job_id'][:8]}...)")
+            return data
+        else:
+            # Synchronous fallback - return result directly
+            return data
+    except requests.RequestException as e:
+        st.error(f"Failed to submit {operation}: {describe_error(f'{base}{endpoint}', e)}")
+        return None
+
+
+def get_active_async_job() -> Optional[Dict[str, Any]]:
+    """Get the currently active async job, if any."""
+    return st.session_state.get(ASYNC_JOB_KEY)
+
+
+def clear_async_job() -> None:
+    """Clear the active async job and related tracking state from session state."""
+    st.session_state.pop(ASYNC_JOB_KEY, None)
+    st.session_state.pop("_async_job_state_tracking", None)
+    st.session_state.pop("_async_job_poll_failures", None)
+    st.session_state.pop("_async_job_retry_count", None)
+
+
+def poll_async_job() -> Optional[Dict[str, Any]]:
+    """Poll the active async job status.
+
+    Returns:
+        Job status dict with 'state', 'result', 'progress', etc., or None if no job/error
+    """
+    job = st.session_state.get(ASYNC_JOB_KEY)
+    if not job:
+        return None
+
+    base = st.session_state.get("api_base")
+    if not base:
+        return None
+
+    try:
+        resp = requests.get(f"{base}/celery_jobs/{job['job_id']}", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+def render_async_job_status() -> bool:
+    """Render active job status banner if a job is running.
+
+    Returns:
+        True if job is still running (caller should schedule refresh),
+        False if no job or job is complete
+    """
+    job = st.session_state.get(ASYNC_JOB_KEY)
+    if not job:
+        return False
+
+    # Timeouts for stale job detection
+    STALE_JOB_TIMEOUT = 15 * 60  # 15 minutes max total job time
+    QUEUED_TIMEOUT = 2 * 60  # 2 minutes stuck in queued
+    NO_PROGRESS_TIMEOUT = 5 * 60  # 5 minutes without progress update
+
+    created_at = job.get("created_at", 0)
+    now = time.time()
+
+    # Overall job timeout
+    if now - created_at > STALE_JOB_TIMEOUT:
+        st.warning(f"Job timed out after 15 minutes: {job.get('operation', 'unknown')}")
+        clear_async_job()
+        return False
+
+    # Track consecutive poll failures
+    poll_fail_key = "_async_job_poll_failures"
+    max_poll_failures = 5  # Clear job after 5 consecutive failures
+
+    status = poll_async_job()
+    if not status:
+        failures = st.session_state.get(poll_fail_key, 0) + 1
+        st.session_state[poll_fail_key] = failures
+        if failures >= max_poll_failures:
+            st.warning(f"Unable to check job status after {failures} attempts. Clearing stale job.")
+            clear_async_job()
+            st.session_state.pop(poll_fail_key, None)
+            return False
+        st.warning(f"Unable to check job status: {job['job_id'][:8]}... (attempt {failures}/{max_poll_failures})")
+        return False
+
+    # Reset poll failure counter on success
+    st.session_state.pop(poll_fail_key, None)
+
+    state = status.get("state", "unknown")
+    operation = job.get("operation", "Operation")
+    job_id_short = job["job_id"][:8]
+
+    # Track state transitions and progress to detect stuck jobs
+    state_key = "_async_job_state_tracking"
+    state_tracking = st.session_state.get(state_key, {})
+    prev_state = state_tracking.get("state")
+    prev_progress = state_tracking.get("progress_pct", 0)
+
+    # Get current progress percentage
+    progress = status.get("progress", {})
+    current_progress_pct = progress.get("progress", 0) if progress else 0
+
+    # Detect if state or progress changed
+    state_changed = prev_state != state
+    progress_changed = current_progress_pct != prev_progress
+
+    if state_changed or progress_changed:
+        # Update tracking with current state and time
+        st.session_state[state_key] = {
+            "state": state,
+            "progress_pct": current_progress_pct,
+            "last_update": now,
+        }
+    else:
+        # Check for stuck job
+        last_update = state_tracking.get("last_update", created_at)
+
+        # Jobs stuck in 'queued' for too long (worker likely not running)
+        if state == "queued" and (now - last_update) > QUEUED_TIMEOUT:
+            st.warning(
+                f"Job stuck in queue for over 2 minutes. Celery worker may not be running. "
+                f"Clearing job: {job.get('operation', 'unknown')}"
+            )
+            clear_async_job()
+            st.session_state.pop(state_key, None)
+            return False
+
+        # Jobs without progress update for too long
+        if state == "in_progress" and (now - last_update) > NO_PROGRESS_TIMEOUT:
+            st.warning(
+                f"Job has not reported progress for 5 minutes. "
+                f"Clearing stale job: {job.get('operation', 'unknown')}"
+            )
+            clear_async_job()
+            st.session_state.pop(state_key, None)
+            return False
+
+    # Handle unexpected states
+    if state in ("retrying", "unknown"):
+        retry_count_key = "_async_job_retry_count"
+        retry_count = st.session_state.get(retry_count_key, 0) + 1
+        st.session_state[retry_count_key] = retry_count
+        if retry_count >= 3:
+            st.warning(f"Job in unexpected state '{state}' after {retry_count} checks. Clearing.")
+            clear_async_job()
+            st.session_state.pop(retry_count_key, None)
+            st.session_state.pop(state_key, None)
+            return False
+        st.info(f"⏳ **{operation}** {state}... ({job_id_short}...)")
+        return True
+
+    if state in ("queued", "in_progress"):
+        # Show progress with visual progress bar
+        progress = status.get("progress", {})
+        step = progress.get("step", "")
+        message = progress.get("message", "Working...")
+        progress_pct = progress.get("progress", 0)  # 0.0-1.0
+        current = progress.get("current", 0)
+        total = progress.get("total", 0)
+
+        # Build info message
+        if step:
+            st.info(f"⏳ **{operation}** in progress ({job_id_short}...)\n\n**{step}**: {message}")
+        else:
+            st.info(f"⏳ **{operation}** in progress ({job_id_short}...)")
+
+        # Show visual progress bar
+        if progress_pct > 0:
+            st.progress(min(progress_pct, 1.0))
+            if current and total:
+                st.caption(f"Progress: {current:,} / {total:,} ({progress_pct * 100:.1f}%)")
+            else:
+                st.caption(f"Progress: {progress_pct * 100:.1f}%")
+        elif state == "queued":
+            st.caption("Waiting in queue...")
+        else:
+            st.caption("Starting...")
+
+        return True
+
+    elif state == "success":
+        result = status.get("result", {})
+        log_data = result.get("log", {})
+        summary = result.get("summary", result)  # Fallback to result if no summary
+
+        # Build detailed log lines
+        log_lines = []
+        has_log = False
+
+        if log_data and log_data.get("steps"):
+            has_log = True
+            log_lines.append("=" * 50)
+            log_lines.append(f"{operation.upper()} - DETAILED LOG")
+            log_lines.append("=" * 50)
+
+            for step_info in log_data.get("steps", []):
+                step_name = step_info.get("step", "")
+                step_status = step_info.get("status", "")
+                duration_ms = step_info.get("duration_ms", 0)
+                details = step_info.get("details", [])
+
+                status_icon = "✓" if step_status == "success" else ("⊘" if step_status == "skipped" else "✗")
+                step_display = step_name.replace("_", " ").title()
+
+                log_lines.append("")
+                log_lines.append(f"[{status_icon}] {step_display}")
+                log_lines.append(f"    Duration: {duration_ms}ms")
+
+                for detail in details:
+                    log_lines.append(f"    • {detail}")
+
+                if step_info.get("error"):
+                    log_lines.append(f"    ⚠️ ERROR: {step_info.get('error')}")
+
+            total_duration = log_data.get("total_duration_ms", 0)
+            log_lines.append("")
+            log_lines.append("=" * 50)
+            log_lines.append(f"Total Duration: {total_duration}ms")
+            log_lines.append("=" * 50)
+
+        # Format success message based on operation type
+        if "auto" in operation.lower() or "group" in operation.lower():
+            assigned = summary.get("assignments_count", summary.get("succeeded", 0))
+            new_people = summary.get("new_people_count", 0)
+            facebank = summary.get("facebank_assigned", 0)
+            clusters = summary.get("clusters", 0)
+            identities = summary.get("identities", 0)
+
+            msg_parts = [f"✅ **{operation}** complete!"]
+            if clusters:
+                msg_parts.append(f"\n• **Clusters:** {clusters}")
+            if assigned:
+                msg_parts.append(f"\n• **Processed:** {assigned}")
+            if new_people:
+                msg_parts.append(f"\n• **New people:** {new_people}")
+            if facebank:
+                msg_parts.append(f"\n• **Facebank matches:** {facebank}")
+            if identities:
+                msg_parts.append(f"\n• **Identities:** {identities}")
+
+            st.success("".join(msg_parts))
+
+        elif "assign" in operation.lower():
+            succeeded = summary.get("succeeded", 0)
+            failed = summary.get("failed", 0)
+            st.success(f"✅ **{operation}** complete!\n\n• **Succeeded:** {succeeded}\n• **Failed:** {failed}")
+        elif "cleanup" in operation.lower():
+            tracks_before = summary.get("tracks_before", 0)
+            tracks_after = summary.get("tracks_after", 0)
+            clusters_before = summary.get("clusters_before", 0)
+            clusters_after = summary.get("clusters_after", 0)
+            st.success(
+                f"✅ **{operation}** complete!\n\n"
+                f"• **Tracks:** {tracks_before:,} → {tracks_after:,}\n"
+                f"• **Clusters:** {clusters_before:,} → {clusters_after:,}"
+            )
+        else:
+            st.success(f"✅ **{operation}** complete!")
+
+        # Show detailed log if available
+        if has_log:
+            with st.expander("📋 Detailed Log", expanded=False):
+                st.code("\n".join(log_lines), language=None)
+
+        clear_async_job()
+        return False
+
+    elif state == "failed":
+        error = status.get("error", status.get("result", "Unknown error"))
+        st.error(f"❌ **{operation}** failed: {error}")
+        clear_async_job()
+        return False
+
+    elif state == "cancelled":
+        st.warning(f"🚫 **{operation}** was cancelled")
+        clear_async_job()
+        return False
+
+    return False
+
+
+def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
+    """Fetch TRR canonical metadata for a show from the Postgres backend.
+
+    Args:
+        show_slug: Show identifier (e.g., 'RHOBH', 'RHOSLC')
+
+    Returns:
+        Dict containing:
+        - show: Show metadata object
+        - seasons: List of season objects
+        - episodes: List of episode objects
+        - cast: List of cast member objects
+
+    Raises:
+        RuntimeError: If API base not initialized
+        requests.HTTPError: If API calls fail
+    """
+    # Fetch show metadata first to validate the show exists
+    show = api_get(f"/metadata/shows/{show_slug}")
+
+    # Fetch related data
+    seasons_resp = api_get(f"/metadata/shows/{show_slug}/seasons")
+    episodes_resp = api_get(f"/metadata/shows/{show_slug}/episodes")
+
+    # Cast may not exist yet for all shows; handle 404 gracefully
+    cast_rows = []
+    try:
+        cast_rows = api_get(f"/metadata/shows/{show_slug}/cast")
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code != 404:
+            raise
+
+    return {
+        "show": show,
+        "seasons": seasons_resp.get("seasons", []),
+        "episodes": episodes_resp.get("episodes", []),
+        "cast": cast_rows,
+    }
 
 
 def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
@@ -608,9 +1716,18 @@ def device_label_index(label: str) -> int:
 def device_label_from_value(value: str | None) -> str:
     if not value:
         return device_default_label()
-    label = DEVICE_VALUE_TO_LABEL.get(value.lower())
+    normalized = str(value).strip().lower()
+    label = DEVICE_VALUE_TO_LABEL.get(normalized)
     if label:
         return label
+    if normalized in {"0", "cuda", "cudaexecutionprovider", "gpu"}:
+        return "CUDA"
+    if normalized in {"coreml", "coremlexecutionprovider", "metal", "apple"}:
+        return "CoreML"
+    if normalized == "mps":
+        return "MPS"
+    if normalized == "auto":
+        return "Auto"
     return device_default_label()
 
 
@@ -663,6 +1780,56 @@ def remember_tracker(value: str | None) -> None:
         st.session_state["tracker_choice"] = key
 
 
+# ─── Profile helper functions ───────────────────────────────────────────────
+
+
+def default_profile_for_device(device: str | None) -> str:
+    """Return the default performance profile for a given device type."""
+    if not device:
+        return "balanced"
+    normalized = str(device).strip().lower()
+    return DEVICE_DEFAULT_PROFILE.get(normalized, "balanced")
+
+
+def profile_value_from_state(state_value: str | None) -> str:
+    """Normalize profile value from session state."""
+    if not state_value:
+        return "balanced"
+    normalized = str(state_value).strip().lower()
+    # Handle both value format ("low_power") and label format ("Low Power")
+    if normalized in PROFILE_DEFAULTS:
+        return normalized
+    # Try to map from label
+    return PROFILE_VALUE_MAP.get(state_value, "balanced")
+
+
+def profile_label_index(value: str | None) -> int:
+    """Get the index of a profile value in PROFILE_LABELS."""
+    if not value:
+        return 1  # Default to "Balanced"
+    normalized = str(value).strip().lower()
+    label = PROFILE_LABEL_MAP.get(normalized)
+    if label and label in PROFILE_LABELS:
+        return PROFILE_LABELS.index(label)
+    return 1  # Default to "Balanced"
+
+
+def profile_defaults(profile_value: str | None) -> dict:
+    """Get default settings for a performance profile."""
+    if not profile_value:
+        return PROFILE_DEFAULTS.get("balanced", {})
+    normalized = str(profile_value).strip().lower()
+    return PROFILE_DEFAULTS.get(normalized, PROFILE_DEFAULTS.get("balanced", {}))
+
+
+def profile_label_from_value(value: str | None) -> str:
+    """Convert profile value to display label."""
+    if not value:
+        return "Balanced"
+    normalized = str(value).strip().lower()
+    return PROFILE_LABEL_MAP.get(normalized, "Balanced")
+
+
 def scene_detector_label_index(value: str | None = None) -> int:
     effective = (value or SCENE_DETECTOR_DEFAULT).lower()
     label = SCENE_DETECTOR_LABEL_MAP.get(effective, SCENE_DETECTOR_LABELS[0])
@@ -690,6 +1857,15 @@ def default_detect_track_payload(
     device: str | None = None,
     det_thresh: float | None = None,
 ) -> Dict[str, Any]:
+    """Build default payload for detect/track pipeline.
+
+    IMPORTANT: Defaults are optimized for minimal resource usage:
+    - save_frames=False (explicitly enable to save sampled frames)
+    - save_crops=False (explicitly enable to save face crops)
+    - jpeg_quality=72 (lower quality for smaller files when enabled)
+
+    This ensures default runs are fast and don't generate unnecessary I/O.
+    """
     payload: Dict[str, Any] = {
         "ep_id": ep_id,
         "stride": int(stride if stride is not None else DEFAULT_STRIDE),
@@ -697,9 +1873,9 @@ def default_detect_track_payload(
         "detector": DEFAULT_DETECTOR,
         "tracker": DEFAULT_TRACKER,
         "det_thresh": float(det_thresh if det_thresh is not None else DEFAULT_DET_THRESH),
-        "save_frames": True,
-        "save_crops": True,
-        "jpeg_quality": 85,
+        "save_frames": False,  # CHANGED: off by default for minimal I/O
+        "save_crops": False,   # CHANGED: off by default for minimal I/O
+        "jpeg_quality": 72,    # CHANGED: lower quality (was 85) when enabled
         "scene_detector": SCENE_DETECTOR_DEFAULT,
         "scene_threshold": SCENE_THRESHOLD_DEFAULT,
         "scene_min_len": SCENE_MIN_LEN_DEFAULT,
@@ -730,17 +1906,45 @@ def default_cleanup_payload(ep_id: str) -> Dict[str, Any]:
         "cluster_thresh": DEFAULT_CLUSTER_SIMILARITY,
         "min_cluster_size": 2,
         "thumb_size": 256,
-        "actions": ["split_tracks", "reembed", "recluster", "group_clusters"],
+        # Focus cleanup on unassigned identities/clusters; avoid full recluster by default.
+        "actions": ["split_tracks", "reembed", "group_clusters"],
         "write_back": True,
     }
 
 
+@lru_cache(maxsize=1)
+def _onnx_provider_names() -> set[str]:
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        return {provider.lower() for provider in ort.get_available_providers()}
+    except Exception:  # pragma: no cover - onnxruntime optional
+        return set()
+
+
+def _coreml_provider_present() -> bool:
+    return any(name.startswith("coreml") for name in _onnx_provider_names())
+
+
+def _cuda_provider_present() -> bool:
+    return any(name.startswith("cuda") for name in _onnx_provider_names())
+
+
+@lru_cache(maxsize=1)
+def is_apple_silicon() -> bool:
+    return platform.system().lower() == "darwin" and platform.machine().lower().startswith(("arm", "aarch64"))
+
+
 def _guess_device_label() -> str:
+    if _cuda_provider_present():
+        return "CUDA"
+    if _coreml_provider_present():
+        return "CoreML"
     try:
         import torch  # type: ignore
 
         if torch.cuda.is_available():  # pragma: no cover
-            return "Auto"
+            return "CUDA"
         mps_backend = getattr(torch.backends, "mps", None)
         if mps_backend is not None and mps_backend.is_available():  # pragma: no cover
             return "MPS"
@@ -810,11 +2014,49 @@ def tracks_tracker_value(ep_id: str) -> str | None:
     return None
 
 
-def detector_is_face_only(ep_id: str) -> bool:
+def detect_tracker_combo(ep_id: str, detect_status: Dict[str, Any] | None = None) -> tuple[str | None, str | None]:
     detector = tracks_detector_value(ep_id)
-    if detector is None:
+    tracker = tracks_tracker_value(ep_id)
+    if not detector and detect_status:
+        detector = detect_status.get("detector")
+    if not tracker and detect_status:
+        tracker = detect_status.get("tracker")
+    det_value = str(detector).lower() if detector else None
+    tracker_value = str(tracker).lower() if tracker else None
+    return det_value, tracker_value
+
+
+def pipeline_combo_supported(stage: str, detector: str | None, tracker: str | None) -> bool:
+    det_value = str(detector).lower() if detector else None
+    tracker_value = str(tracker).lower() if tracker else None
+    if not det_value or not tracker_value:
         return False
-    return detector.lower() in FACE_ONLY_DETECTORS
+    combos = SUPPORTED_PIPELINE_COMBOS.get(stage.lower())
+    if not combos:
+        return True
+    return (det_value, tracker_value) in combos
+
+
+def detector_is_face_only(ep_id: str, detect_status: Dict[str, Any] | None = None) -> bool:
+    detector = tracks_detector_value(ep_id)
+    if detector:
+        return detector.lower() in FACE_ONLY_DETECTORS
+    status_detector = None
+    if detect_status and isinstance(detect_status, dict):
+        status_detector = detect_status.get("detector")
+    if status_detector:
+        return str(status_detector).lower() in FACE_ONLY_DETECTORS
+    manifest_path = _manifest_path(ep_id, "tracks.jsonl")
+    if not manifest_path.exists():
+        return False
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def tracks_detector_label(ep_id: str) -> str:
@@ -826,10 +2068,95 @@ def tracks_tracker_label(ep_id: str) -> str:
 
 
 def try_switch_page(page_path: str) -> None:
+    """Switch pages without surfacing the sidebar warning fallback."""
     try:
         st.switch_page(page_path)
     except Exception:
-        st.info("Use the sidebar navigation to open the target page.")
+        # Fallback: set query param so sidebar nav picks up the target page
+        params = st.query_params
+        params["page"] = page_path
+        st.query_params = params
+        st.rerun()
+
+
+def inject_custom_fonts() -> None:
+    """Inject custom font faces and set defaults for body/headings."""
+    font_base = Path(__file__).resolve().parent / "assets" / "fonts"
+
+    # Remote font hosting (Vercel) for easier loading in Streamlit
+    remote_base = "https://trr-app.vercel.app/admin/fonts"
+    remote_plymouth = f"{remote_base}/PlymouthSerial-ExtraBold.otf"
+    remote_rude = f"{remote_base}/RudeSlabCondensedCondensedBold.otf"
+
+    # Local fallbacks (copied into repo)
+    local_plymouth = (font_base / "Plymouth Serial" / "PlymouthSerialExtraBold-10035290.otf").as_posix()
+    local_rude = (font_base / "Rude Slab Condensed" / "RudeSlabCondensedCondensedBold-930861866.otf").as_posix()
+
+    plymouth_src = remote_plymouth if remote_plymouth else local_plymouth
+    rude_src = remote_rude if remote_rude else local_rude
+
+    css = f"""
+    <style>
+    @font-face {{
+        font-family: 'PlymouthSerialExtraBold';
+        src: url('{plymouth_src}') format('opentype'),
+             url('{local_plymouth}') format('opentype');
+        font-weight: 800;
+    }}
+    @font-face {{
+        font-family: 'RudeSlabCondensedBold';
+        src: url('{rude_src}') format('opentype'),
+             url('{local_rude}') format('opentype');
+        font-weight: 700;
+    }}
+    html, body, div, button, input, textarea {{
+        font-family: 'PlymouthSerialExtraBold', 'Inter', 'Helvetica', sans-serif;
+        font-weight: 800;
+    }}
+    h1, h2, h3, h4, h5, h6 {{
+        font-family: 'RudeSlabCondensedBold', 'PlymouthSerialExtraBold', 'Inter', 'Helvetica', sans-serif;
+        font-weight: 700;
+    }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def _nav_to_faces(view: str | None = None) -> None:
+    """Helper to jump to Faces Review with a preset view."""
+    if view:
+        st.session_state["facebank_view"] = view
+        st.session_state.pop("selected_person", None)
+        st.session_state.pop("selected_identity", None)
+        st.session_state.pop("selected_track", None)
+    try_switch_page("pages/3_Faces_Review.py")
+
+
+def render_workspace_nav() -> None:
+    """Render grouped navigation with Faces Review sub-pages."""
+    with st.sidebar:
+        st.markdown("### Workspace")
+        if hasattr(st, "page_link"):
+            st.page_link("streamlit_app.py", label="Home")
+            st.page_link("pages/0_Upload_Video.py", label="Upload Video")
+            st.page_link("pages/1_Episodes.py", label="Episodes")
+            st.page_link("pages/2_Episode_Detail.py", label="Episode Detail")
+            st.page_link("pages/4_Cast.py", label="Cast Management")
+            # Faces Review with visible sub-pages (indented, no emojis)
+            st.page_link("pages/3_Faces_Review.py", label="Faces Review")
+            st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;Cast Members (12)", unsafe_allow_html=True)
+            st.page_link("pages/3_Smart_Suggestions.py", label="    Smart Suggestions")
+            st.page_link("pages/4_Screentime.py", label="Screentime & Health")
+        else:
+            st.button("Home", key="nav_home", on_click=lambda: try_switch_page("streamlit_app.py"))
+            st.button("Upload Video", key="nav_upload", on_click=lambda: try_switch_page("pages/0_Upload_Video.py"))
+            st.button("Episodes", key="nav_episodes", on_click=lambda: try_switch_page("pages/1_Episodes.py"))
+            st.button("Episode Detail", key="nav_ep_detail", on_click=lambda: try_switch_page("pages/2_Episode_Detail.py"))
+            st.button("Cast Management", key="nav_cast", on_click=lambda: try_switch_page("pages/4_Cast.py"))
+            st.button("Faces Review", key="nav_faces_overview", on_click=lambda: try_switch_page("pages/3_Faces_Review.py"))
+            st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;Cast Members (12)", unsafe_allow_html=True)
+            st.button("    Smart Suggestions", key="nav_suggestions", on_click=lambda: try_switch_page("pages/3_Smart_Suggestions.py"))
+            st.button("Screentime & Health", key="nav_screentime", on_click=lambda: try_switch_page("pages/4_Screentime.py"))
 
 
 def format_mmss(seconds: float | int | None) -> str:
@@ -1505,7 +2832,7 @@ def run_job_with_progress(
                     job_started=job_started,
                     async_endpoint=async_endpoint,
                 )
-                if fallback_summary is not None or fallback_error is None:
+                if fallback_summary is not None or fallback_error is not None:
                     summary = fallback_summary
                     error_message = fallback_error
                 if fallback_error:
@@ -1525,6 +2852,1143 @@ def run_job_with_progress(
     finally:
         st.session_state.pop(dedupe_key, None)
         st.session_state.pop(run_id_key, None)
+
+
+# =============================================================================
+# Celery Job Polling (for async pipeline jobs via Redis queue)
+# =============================================================================
+
+
+def run_celery_job_with_progress(
+    ep_id: str,
+    operation: str,
+    payload: Dict[str, Any],
+    *,
+    requested_device: str = "auto",
+    requested_detector: str | None = None,
+    requested_tracker: str | None = None,
+):
+    """Run a job via Celery and poll for completion.
+
+    Uses the /celery_jobs/* endpoints for true async execution via Redis.
+
+    Args:
+        ep_id: Episode ID
+        operation: One of "detect_track", "faces_embed", "cluster"
+        payload: Request payload for the job
+        requested_device: Device string for context display
+        requested_detector: Detector string for context display
+        requested_tracker: Tracker string for context display
+
+    Returns:
+        Tuple of (summary_dict, error_message)
+    """
+    progress_bar = st.progress(0.0)
+    status_placeholder = st.empty()
+    detail_placeholder = st.empty()
+    log_expander = st.expander("Detailed log", expanded=False)
+    with log_expander:
+        log_placeholder = st.empty()
+    log_lines: List[str] = []
+    max_log_lines = 25
+
+    def _mode_context() -> str:
+        parts: List[str] = []
+        if requested_detector:
+            parts.append(f"detector={requested_detector}")
+        if requested_tracker:
+            parts.append(f"tracker={requested_tracker}")
+        if requested_device:
+            parts.append(f"device={requested_device}")
+        return ", ".join(parts) if parts else f"device={requested_device}"
+
+    def _append_log(entry: str) -> None:
+        log_lines.append(entry)
+        if len(log_lines) > max_log_lines:
+            del log_lines[0 : len(log_lines) - max_log_lines]
+        log_placeholder.code("\n\n".join(log_lines), language="text")
+
+    # Map operation to endpoint
+    endpoint_map = {
+        "detect_track": "/celery_jobs/detect_track",
+        "faces_embed": "/celery_jobs/faces_embed",
+        "cluster": "/celery_jobs/cluster",
+    }
+    endpoint = endpoint_map.get(operation)
+    if not endpoint:
+        return None, f"Unknown operation: {operation}"
+
+    _append_log(f"Starting {operation} via Celery ({_mode_context()})...")
+
+    # Start the Celery job
+    try:
+        resp = requests.post(f"{_api_base()}{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        start_result = resp.json()
+    except requests.RequestException as exc:
+        error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+        _append_log(f"Failed to start job: {error_msg}")
+        return None, error_msg
+
+    job_id = start_result.get("job_id")
+    if not job_id:
+        _append_log("Error: No job_id returned from Celery endpoint")
+        return None, "No job_id returned"
+
+    # Store job_id in session state for running job detection
+    store_celery_job_id(ep_id, operation, job_id)
+
+    if start_result.get("state") == "already_running":
+        _append_log(f"Job {job_id} is already running for this episode")
+        status_placeholder.info(f"⏳ {operation} job is already running...")
+        # Fall through to poll for completion
+
+    _append_log(f"Job {job_id} queued. Polling for progress...")
+    status_placeholder.info(f"⏳ {operation} job queued via Celery...")
+
+    # Poll for completion
+    poll_url = f"{_api_base()}/celery_jobs/{job_id}"
+    poll_interval = 2.0  # seconds
+    max_poll_time = 3600  # 1 hour max
+    elapsed = 0.0
+    queued_since: float | None = None
+    last_log_message: str | None = None  # Track last logged message to avoid duplicates
+
+    while elapsed < max_poll_time:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        try:
+            poll_resp = requests.get(poll_url, timeout=10)
+            poll_resp.raise_for_status()
+            status_data = poll_resp.json()
+        except requests.RequestException as exc:
+            _append_log(f"Poll error: {exc}")
+            continue
+
+        state = status_data.get("state", "unknown")
+        raw_state = status_data.get("raw_state", "")
+        progress_info = status_data.get("progress") or {}
+
+        if state == "success":
+            progress_bar.progress(1.0)
+            result = status_data.get("result", {})
+            result_status = result.get("status", "success")
+            _append_log(f"Job completed: {result_status}")
+            detail_placeholder.caption(f"Completed in {elapsed:.1f}s")
+            # Clear job_id from session state - job is done
+            clear_celery_job_id(ep_id, operation)
+
+            # Check if the subprocess actually succeeded
+            if result_status == "error":
+                error_msg = result.get("error", "Subprocess failed")
+                status_placeholder.error(f"❌ {operation} failed: {error_msg}")
+                _append_log(f"Subprocess error: {error_msg}")
+                # Include any stdout/stderr for debugging
+                stdout = result.get("stdout")
+                if stdout:
+                    _append_log(f"Output: {stdout[:500]}")
+                return result.get("progress"), error_msg
+
+            status_placeholder.success(f"✅ {operation} completed successfully")
+
+            # Read progress file for detailed results
+            progress_data = result.get("progress")
+            if progress_data:
+                _append_log(f"Progress data: {progress_data.get('phase', 'done')}")
+                return progress_data, None
+
+            return result, None
+
+        elif state == "failed":
+            progress_bar.progress(1.0)
+            error = status_data.get("error", "Unknown error")
+            status_placeholder.error(f"❌ {operation} failed: {error}")
+            _append_log(f"Job failed: {error}")
+            # Clear job_id from session state - job is done
+            clear_celery_job_id(ep_id, operation)
+            return None, error
+
+        elif state == "cancelled":
+            progress_bar.progress(1.0)
+            status_placeholder.warning(f"⚠️ {operation} was cancelled")
+            _append_log("Job was cancelled")
+            # Clear job_id from session state - job is done
+            clear_celery_job_id(ep_id, operation)
+            return None, "Job cancelled"
+
+        elif state == "in_progress":
+            # Update progress display
+            progress_pct = progress_info.get("progress", 0.0)
+            message = progress_info.get("message", f"Running {operation}...")
+            step = progress_info.get("step", operation)
+
+            progress_bar.progress(min(progress_pct, 1.0))
+            status_placeholder.info(f"⏳ {step}: {message}")
+            # Only log when progress actually changes
+            log_msg = f"Progress: {progress_pct*100:.1f}% - {message}"
+            if log_msg != last_log_message:
+                _append_log(log_msg)
+                last_log_message = log_msg
+
+        else:
+            # queued, retrying, or unknown
+            status_placeholder.info(f"⏳ {operation}: {state} ({raw_state})")
+            default_msg = (
+                progress_info.get("message")
+                or status_data.get("message")
+                or f"Starting {operation} pipeline..."
+            )
+            # Only log when message changes
+            log_msg = f"Progress: 0.0% - {default_msg}"
+            if log_msg != last_log_message:
+                _append_log(log_msg)
+                last_log_message = log_msg
+            # Detect stuck queued jobs (common when Celery worker or Redis is down)
+            if state in {"queued", "unknown"}:
+                queued_since = queued_since or time.time()
+                if time.time() - queued_since > 15:
+                    error_msg = (
+                        f"{operation} has been queued for over 15s without starting. "
+                        "Check that the Celery worker and Redis are running. "
+                        "Run 'scripts/dev_auto.sh' or start Redis/Celery manually."
+                    )
+                    status_placeholder.error(f"⚠️ {error_msg}")
+                    _append_log(error_msg)
+                    return None, error_msg
+
+    # Timeout - clear job_id from session state
+    clear_celery_job_id(ep_id, operation)
+    _append_log(f"Job timed out after {max_poll_time}s")
+    return None, f"Job timed out after {max_poll_time}s"
+
+
+def start_celery_job_async(
+    operation: str,
+    payload: Dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Start a Celery job without waiting for completion.
+
+    Returns (job_id, error_message).
+    """
+    endpoint_map = {
+        "detect_track": "/celery_jobs/detect_track",
+        "faces_embed": "/celery_jobs/faces_embed",
+        "cluster": "/celery_jobs/cluster",
+    }
+    endpoint = endpoint_map.get(operation)
+    if not endpoint:
+        return None, f"Unknown operation: {operation}"
+
+    try:
+        resp = requests.post(f"{_api_base()}{endpoint}", json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        return result.get("job_id"), None
+    except requests.RequestException as exc:
+        return None, describe_error(f"{_api_base()}{endpoint}", exc)
+
+
+def check_celery_job_status(job_id: str) -> Dict[str, Any] | None:
+    """Check the status of a Celery job.
+
+    Returns status dict or None if error.
+    """
+    try:
+        resp = requests.get(f"{_api_base()}/celery_jobs/{job_id}", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException:
+        return None
+
+
+def _celery_job_session_key(ep_id: str, job_type: str) -> str:
+    """Get session state key for tracking a Celery job."""
+    return f"{ep_id}::celery_job::{job_type}"
+
+
+def store_celery_job_id(ep_id: str, job_type: str, job_id: str) -> None:
+    """Store a Celery job_id in session state for tracking."""
+    import streamlit as st
+
+    key = _celery_job_session_key(ep_id, job_type)
+    st.session_state[key] = job_id
+
+
+def clear_celery_job_id(ep_id: str, job_type: str) -> None:
+    """Clear a stored Celery job_id from session state."""
+    import streamlit as st
+
+    key = _celery_job_session_key(ep_id, job_type)
+    if key in st.session_state:
+        del st.session_state[key]
+
+
+def get_stored_celery_job_id(ep_id: str, job_type: str) -> str | None:
+    """Get a stored Celery job_id from session state."""
+    import streamlit as st
+
+    key = _celery_job_session_key(ep_id, job_type)
+    return st.session_state.get(key)
+
+
+def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | None:
+    """Check if there's a running job of a specific type for an episode.
+
+    Args:
+        ep_id: Episode identifier
+        job_type: One of "detect_track", "faces_embed", "cluster"
+
+    Returns:
+        Job info dict with progress if running, None otherwise.
+        Dict includes: job_id, state, progress_pct, message, started_at
+
+    Checks multiple sources in parallel for faster response:
+    1. Legacy /jobs API (subprocess jobs)
+    2. /celery_jobs (active Celery tasks)
+    3. /celery_jobs/local (local subprocess jobs)
+    4. Session state for stored job_id
+    """
+    import concurrent.futures
+
+    running_states = {"running", "in_progress", "queued", "started", "pending"}
+    api_timeout = 3  # Reduced from 10s for local API calls
+
+    def _check_legacy_jobs() -> Dict[str, Any] | None:
+        """Check legacy /jobs API."""
+        try:
+            resp = requests.get(
+                f"{_api_base()}/jobs",
+                params={"ep_id": ep_id, "job_type": job_type, "limit": 1},
+                timeout=api_timeout,
+            )
+            resp.raise_for_status()
+            jobs = resp.json().get("jobs", [])
+
+            for job in jobs:
+                state = str(job.get("state", "")).lower()
+                if state in running_states:
+                    job_id = job.get("job_id")
+                    result = {
+                        "job_id": job_id,
+                        "state": state,
+                        "started_at": job.get("started_at"),
+                        "job_type": job_type,
+                        "source": "legacy_jobs",
+                    }
+
+                    # Try to get progress from Celery if it's a Celery job
+                    if job_id:
+                        celery_status = check_celery_job_status(job_id)
+                        if celery_status:
+                            progress = celery_status.get("progress", {})
+                            result["progress_pct"] = progress.get("progress", 0) * 100
+                            result["message"] = progress.get("message", "")
+
+                    # Try to get progress from progress.json file
+                    if "progress_pct" not in result:
+                        progress_data = get_episode_progress(ep_id)
+                        if progress_data:
+                            frames_done = progress_data.get("frames_done", 0)
+                            frames_total = progress_data.get("frames_total", 1)
+                            if frames_total > 0:
+                                result["progress_pct"] = (frames_done / frames_total) * 100
+                            result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                            result["frames_done"] = frames_done
+                            result["frames_total"] = frames_total
+
+                    return result
+        except requests.RequestException:
+            pass
+        return None
+
+    def _check_local_jobs() -> Dict[str, Any] | None:
+        """Check /celery_jobs/local for local subprocess jobs."""
+        try:
+            resp = requests.get(
+                f"{_api_base()}/celery_jobs/local",
+                params={"ep_id": ep_id},
+                timeout=api_timeout,
+            )
+            resp.raise_for_status()
+            local_jobs = resp.json().get("jobs", [])
+
+            for job in local_jobs:
+                op = job.get("operation", "")
+                if op == job_type:
+                    state = str(job.get("state", "")).lower()
+                    if state in running_states:
+                        result = {
+                            "job_id": job.get("job_id"),
+                            "state": state,
+                            "started_at": job.get("started_at"),
+                            "job_type": job_type,
+                            "source": "celery_local",
+                            "pid": job.get("pid"),
+                        }
+
+                        # Get progress from progress.json
+                        progress_data = get_episode_progress(ep_id)
+                        if progress_data:
+                            frames_done = progress_data.get("frames_done", 0)
+                            frames_total = progress_data.get("frames_total", 1)
+                            if frames_total > 0:
+                                result["progress_pct"] = (frames_done / frames_total) * 100
+                            result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                            result["frames_done"] = frames_done
+                            result["frames_total"] = frames_total
+
+                        return result
+        except requests.RequestException:
+            pass
+        return None
+
+    def _check_celery_jobs() -> Dict[str, Any] | None:
+        """Check /celery_jobs for active Celery tasks."""
+        try:
+            resp = requests.get(f"{_api_base()}/celery_jobs", timeout=api_timeout)
+            resp.raise_for_status()
+            celery_jobs = resp.json().get("jobs", [])
+
+            for job in celery_jobs:
+                job_ep_id = job.get("ep_id")
+                op = job.get("operation") or job.get("name", "").replace("local_", "")
+                state = str(job.get("state", "")).lower()
+
+                # Match by ep_id and operation
+                if job_ep_id == ep_id and op == job_type and state in running_states:
+                    result = {
+                        "job_id": job.get("job_id"),
+                        "state": state,
+                        "started_at": job.get("started_at"),
+                        "job_type": job_type,
+                        "source": "celery_active",
+                    }
+                    return result
+        except requests.RequestException:
+            pass
+        return None
+
+    def _check_session_state() -> Dict[str, Any] | None:
+        """Check session state for stored job_id."""
+        stored_job_id = get_stored_celery_job_id(ep_id, job_type)
+        if stored_job_id:
+            celery_status = check_celery_job_status(stored_job_id)
+            if celery_status:
+                state = str(celery_status.get("state", "")).lower()
+                if state in running_states:
+                    progress = celery_status.get("progress", {})
+                    result = {
+                        "job_id": stored_job_id,
+                        "state": state,
+                        "job_type": job_type,
+                        "source": "session_state",
+                        "progress_pct": progress.get("progress", 0) * 100,
+                        "message": progress.get("message", ""),
+                    }
+                    return result
+                else:
+                    # Job is no longer running, clear from session state
+                    clear_celery_job_id(ep_id, job_type)
+        return None
+
+    # Check sources in priority order (most likely first for faster response)
+    # Local jobs are most common when using local execution mode
+    checkers = [
+        _check_local_jobs,   # Most likely for local mode
+        _check_celery_jobs,  # Active Celery tasks
+        _check_legacy_jobs,  # Legacy /jobs API
+        _check_session_state,  # Session state fallback
+    ]
+
+    for checker in checkers:
+        try:
+            result = checker()
+            if result:
+                return result
+        except Exception:
+            pass  # Continue checking other sources
+
+    return None
+
+
+def get_episode_progress(ep_id: str) -> Dict[str, Any] | None:
+    """Read progress.json for an episode to get current job progress.
+
+    Returns progress dict or None if not found/error.
+    """
+    try:
+        progress_path = DATA_ROOT / "manifests" / ep_id / "progress.json"
+        if not progress_path.exists():
+            return None
+
+        with open(progress_path, "r") as f:
+            import json
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def cancel_running_job(job_id: str) -> tuple[bool, str]:
+    """Cancel a running Celery job.
+
+    Returns (success, message).
+    """
+    try:
+        resp = requests.post(f"{_api_base()}/celery_jobs/{job_id}/cancel", timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        status = result.get("status", "unknown")
+        if status in ("cancelled", "already_finished"):
+            return True, f"Job {job_id[:8]}... {status}"
+        return False, f"Unexpected status: {status}"
+    except requests.RequestException as exc:
+        return False, describe_error(f"Cancel job {job_id}", exc)
+
+
+def load_operation_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Load the most recent logs for an operation from the API.
+
+    This fetches persisted logs that were saved when a local mode job completed.
+    Used to display previous run logs on page load.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name (detect_track, faces_embed, cluster)
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if no logs exist
+    """
+    try:
+        resp = requests.get(
+            f"{_api_base()}/celery_jobs/logs/{ep_id}/{operation}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Return None if no logs exist
+        if data.get("status") == "none":
+            return None
+
+        return data
+
+    except requests.RequestException as exc:
+        logging.debug(f"Failed to load logs for {ep_id}/{operation}: {exc}")
+        return None
+
+
+def render_previous_logs(
+    ep_id: str,
+    operation: str,
+    *,
+    expanded: bool = False,
+    show_if_none: bool = False,
+) -> bool:
+    """Render the most recent logs for an operation in a Streamlit expander.
+
+    Uses cached logs from session state first (populated by hydrate_logs_for_episode
+    on page load), falling back to API call if not cached.
+
+    Displays formatted (human-friendly) logs only - clean and copy/paste-able.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name (detect_track, faces_embed, cluster)
+        expanded: Whether to expand the log expander by default
+        show_if_none: Whether to show a placeholder when no logs exist
+
+    Returns:
+        True if logs were found and rendered, False otherwise
+    """
+    # Try cached logs first (from hydrate_logs_for_episode on page load)
+    data = get_cached_logs(ep_id, operation)
+
+    # Fall back to API call if not cached
+    if not data or not data.get("logs"):
+        data = load_operation_logs(ep_id, operation)
+
+    if data is None:
+        if show_if_none:
+            with st.expander("Previous run logs", expanded=False):
+                st.caption("No previous logs available for this operation.")
+        return False
+
+    status = data.get("status", "unknown")
+    formatted_logs = data.get("logs", [])
+    elapsed_seconds = data.get("elapsed_seconds", 0)
+    updated_at = data.get("updated_at", "")
+
+    # Format elapsed time
+    if elapsed_seconds >= 60:
+        elapsed_min = int(elapsed_seconds // 60)
+        elapsed_sec = int(elapsed_seconds % 60)
+        elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+    else:
+        elapsed_str = f"{elapsed_seconds:.1f}s"
+
+    # Format status icon
+    status_icons = {
+        "completed": "✅",
+        "error": "❌",
+        "cancelled": "⚠️",
+        "timeout": "⏱️",
+    }
+    icon = status_icons.get(status, "ℹ️")
+
+    # Format timestamp for display
+    timestamp_str = ""
+    if updated_at:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            timestamp_str = dt.strftime(" (%Y-%m-%d %H:%M)")
+        except (ValueError, TypeError):
+            pass
+
+    expander_label = f"{icon} Previous {operation} run ({status}, {elapsed_str}){timestamp_str}"
+
+    with st.expander(expander_label, expanded=expanded):
+        if not formatted_logs:
+            st.caption("No log lines recorded.")
+            return True
+
+        # Display formatted logs (no raw log toggle - cleaner UI)
+        st.code("\n".join(formatted_logs), language="text")
+
+    return True
+
+
+# =============================================================================
+# Execution Mode Job Helpers
+# =============================================================================
+
+
+def run_pipeline_job_with_mode(
+    ep_id: str,
+    operation: str,
+    payload: Dict[str, Any],
+    *,
+    requested_device: str = "auto",
+    requested_detector: str | None = None,
+    requested_tracker: str | None = None,
+    timeout: int = 3600,
+):
+    """Run a pipeline job respecting the current execution mode for the episode.
+
+    This function handles both local and redis execution modes:
+    - Local mode: Runs synchronously - blocks until complete, no job ID, no polling
+    - Redis mode: Queues via Celery and polls for completion
+
+    Args:
+        ep_id: Episode identifier
+        operation: One of "detect_track", "faces_embed", "cluster"
+        payload: Request payload for the job (execution_mode will be added)
+        requested_device: Device string for context display
+        requested_detector: Detector string for context display
+        requested_tracker: Tracker string for context display
+        timeout: Timeout in seconds for local mode (default 3600 = 1 hour)
+
+    Returns:
+        Tuple of (summary_dict, error_message)
+    """
+    execution_mode = get_execution_mode(ep_id)
+
+    # Add execution_mode to payload
+    payload = {**payload, "execution_mode": execution_mode}
+
+    # Map operation to endpoint
+    endpoint_map = {
+        "detect_track": "/celery_jobs/detect_track",
+        "faces_embed": "/celery_jobs/faces_embed",
+        "cluster": "/celery_jobs/cluster",
+    }
+    endpoint = endpoint_map.get(operation)
+    if not endpoint:
+        return None, f"Unknown operation: {operation}"
+
+    if execution_mode == "local":
+        # Local mode: streaming response with live log updates
+        # The backend streams log lines as newline-delimited JSON
+        status_placeholder = st.empty()
+
+        # Progress bar section - shows % complete and frame counts
+        progress_container = st.container()
+        with progress_container:
+            progress_bar = st.progress(0.0)
+            progress_text = st.empty()
+            progress_text.caption("Starting...")
+
+        log_expander = st.expander("Detailed log", expanded=True)
+        with log_expander:
+            log_placeholder = st.empty()
+
+        # Build context string for display
+        context_parts = [f"device={requested_device}"]
+        if requested_detector:
+            context_parts.append(f"detector={requested_detector}")
+        if requested_tracker:
+            context_parts.append(f"tracker={requested_tracker}")
+        context_str = ", ".join(context_parts)
+
+        status_placeholder.info(f"⏳ [LOCAL MODE] Running {operation} ({context_str})...")
+        log_lines: List[str] = []
+        log_placeholder.code(
+            f"[LOCAL MODE] Starting {operation} ({context_str})...\n"
+            "Waiting for live logs...",
+            language="text",
+        )
+
+        # Track progress info for display
+        current_progress = {"frames_done": 0, "frames_total": 0, "phase": "starting", "pct": 0.0}
+
+        try:
+            # Streaming request - reads lines as they arrive
+            with requests.post(
+                f"{_api_base()}{endpoint}",
+                json=payload,
+                stream=True,
+                timeout=None,  # No timeout - stream can run for hours
+            ) as resp:
+                resp.raise_for_status()
+
+                summary: Dict[str, Any] = {}
+
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+
+                    try:
+                        msg = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        # Treat non-JSON lines as plain log lines
+                        log_lines.append(raw_line)
+                        log_placeholder.code("\n".join(log_lines), language="text")
+                        continue
+
+                    msg_type = msg.get("type", "")
+
+                    if msg_type == "log":
+                        line = msg.get("line", "")
+                        log_lines.append(line)
+                        log_placeholder.code("\n".join(log_lines), language="text")
+
+                    elif msg_type == "progress":
+                        # Update progress bar with real-time data
+                        frames_done = msg.get("frames_done", 0)
+                        frames_total = msg.get("frames_total", 1)
+                        phase = msg.get("phase", "processing")
+                        fps_infer = msg.get("fps_infer")
+                        secs_done = msg.get("secs_done", 0)
+
+                        if frames_total > 0:
+                            pct = min((frames_done / frames_total), 1.0)
+                            progress_bar.progress(pct)
+
+                            # Build progress text with details
+                            parts = [f"**{pct*100:.1f}%** - {frames_done:,} / {frames_total:,} frames"]
+                            if fps_infer and fps_infer > 0:
+                                parts.append(f"({fps_infer:.1f} fps)")
+                            if secs_done > 0:
+                                elapsed_min = int(secs_done // 60)
+                                elapsed_sec = int(secs_done % 60)
+                                if elapsed_min > 0:
+                                    parts.append(f"- {elapsed_min}m {elapsed_sec}s elapsed")
+                                else:
+                                    parts.append(f"- {elapsed_sec}s elapsed")
+
+                                # Estimate remaining time
+                                if pct > 0.01 and pct < 1.0:
+                                    eta_secs = (secs_done / pct) * (1 - pct)
+                                    if eta_secs > 60:
+                                        eta_min = int(eta_secs // 60)
+                                        eta_sec = int(eta_secs % 60)
+                                        parts.append(f"(~{eta_min}m {eta_sec}s remaining)")
+                                    else:
+                                        parts.append(f"(~{int(eta_secs)}s remaining)")
+
+                            progress_text.caption(" ".join(parts))
+                        else:
+                            progress_text.caption(f"Phase: {phase}")
+
+                        # Store current progress
+                        current_progress.update({
+                            "frames_done": frames_done,
+                            "frames_total": frames_total,
+                            "phase": phase,
+                            "pct": pct if frames_total > 0 else 0,
+                        })
+
+                    elif msg_type == "error":
+                        # Initial error (e.g., job already running)
+                        error_msg = msg.get("message", "Unknown error")
+                        log_lines.append(f"ERROR: {error_msg}")
+                        log_placeholder.code("\n".join(log_lines), language="text")
+                        status_placeholder.error(f"❌ [LOCAL MODE] {operation} failed: {error_msg}")
+                        return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
+
+                    elif msg_type == "summary":
+                        summary = msg
+                        break
+
+                # Process summary
+                status = summary.get("status", "unknown")
+                elapsed_seconds = summary.get("elapsed_seconds", 0)
+                error_msg = summary.get("error")
+
+                # Format elapsed time
+                if elapsed_seconds >= 60:
+                    elapsed_min = int(elapsed_seconds // 60)
+                    elapsed_sec = int(elapsed_seconds % 60)
+                    elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+                else:
+                    elapsed_str = f"{elapsed_seconds:.1f}s"
+
+                result = {
+                    "status": status,
+                    "logs": log_lines,
+                    "elapsed_seconds": elapsed_seconds,
+                    **summary,
+                }
+
+                # Cache logs in session state for display on page reload
+                cache_logs(ep_id, operation, log_lines, status, elapsed_seconds)
+
+                if status == "completed":
+                    # Show 100% completion on progress bar
+                    progress_bar.progress(1.0)
+                    progress_text.caption(f"**100%** - Completed in {elapsed_str}")
+                    status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed in {elapsed_str}")
+                    return result, None
+                elif status == "error":
+                    progress_text.caption(f"❌ Failed after {elapsed_str}")
+                    status_placeholder.error(f"❌ [LOCAL MODE] {operation} failed: {error_msg}")
+                    return result, error_msg
+                elif status == "timeout":
+                    progress_text.caption(f"⏱️ Timed out after {elapsed_str}")
+                    status_placeholder.error(f"❌ [LOCAL MODE] {operation} timed out after {elapsed_str}")
+                    return result, f"Timed out after {elapsed_str}"
+                else:
+                    # Unknown status
+                    status_placeholder.warning(f"⚠️ [LOCAL MODE] {operation} finished with status: {status}")
+                    return result, None
+
+        except requests.exceptions.Timeout:
+            error_msg = f"Request timed out after {timeout}s"
+            status_placeholder.error(f"❌ {error_msg}")
+            return None, error_msg
+
+        except requests.RequestException as exc:
+            error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+            status_placeholder.error(f"❌ {error_msg}")
+            return None, error_msg
+
+    else:
+        # Redis mode - use existing Celery job flow with polling
+        return run_celery_job_with_progress(
+            ep_id,
+            operation,
+            payload,
+            requested_device=requested_device,
+            requested_detector=requested_detector,
+            requested_tracker=requested_tracker,
+        )
+
+
+def run_async_job_with_mode(
+    ep_id: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any] | None:
+    """Run an async job respecting the current execution mode for the episode.
+
+    This function handles async jobs (like refresh_similarity, batch_assign, group_async):
+    - Local mode: Runs synchronously and returns result directly
+    - Redis mode: Queues via Celery and returns job info for polling
+
+    Args:
+        ep_id: Episode identifier
+        endpoint: API endpoint to call (e.g., /episodes/{ep_id}/refresh_similarity_async)
+        payload: Request payload for the job (execution_mode will be added)
+        operation: Operation name for display purposes
+
+    Returns:
+        Response dict from the API, or None if failed
+    """
+    execution_mode = get_execution_mode(ep_id)
+
+    # Add execution_mode to payload
+    payload = {**payload, "execution_mode": execution_mode}
+
+    if execution_mode == "local":
+        # Run synchronously with loading spinner
+        with st.spinner(f"Running {operation} in local mode..."):
+            try:
+                resp = requests.post(
+                    f"{_api_base()}{endpoint}",
+                    json=payload,
+                    timeout=600,  # 10 minute timeout for local mode
+                )
+                resp.raise_for_status()
+                result = resp.json()
+
+                status = result.get("status", "unknown")
+                if status in ("completed", "success"):
+                    st.success(f"✅ {operation} completed successfully (local mode)")
+                elif status == "error":
+                    st.error(f"❌ {operation} failed: {result.get('error', 'Unknown error')}")
+                else:
+                    st.info(f"{operation} returned: {status}")
+
+                return result
+
+            except requests.RequestException as exc:
+                st.error(f"❌ {operation} failed: {describe_error(f'{_api_base()}{endpoint}', exc)}")
+                return None
+    else:
+        # Redis mode - use existing async job submission
+        return submit_async_job(
+            endpoint=endpoint,
+            payload=payload,
+            operation=operation,
+            episode_id=ep_id,
+        )
+
+
+def track_skeleton_html(num_frames: int = 12, thumb_width: int = 120) -> str:
+    """Generate skeleton HTML for track detail loading state.
+
+    Shows animated placeholder frames in a carousel-style layout while track data is being loaded.
+    Uses the same 4:5 aspect ratio as the actual carousel.
+    """
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio
+    frames = "".join([
+        f'<div class="skeleton-frame" style="width:{thumb_width}px;height:{thumb_height}px;"></div>'
+        for _ in range(num_frames)
+    ])
+    return f'''
+    <style>
+        .skeleton-carousel {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 16px 0;
+        }}
+        .skeleton-arrow {{
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.1);
+            flex-shrink: 0;
+        }}
+        .skeleton-track {{
+            display: flex;
+            gap: 8px;
+            overflow: hidden;
+            flex: 1;
+        }}
+        .skeleton-frame {{
+            flex-shrink: 0;
+            border-radius: 6px;
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: skeleton-shimmer 1.5s infinite;
+        }}
+        @keyframes skeleton-shimmer {{
+            0% {{ background-position: 200% 0; }}
+            100% {{ background-position: -200% 0; }}
+        }}
+    </style>
+    <div class="skeleton-carousel">
+        <div class="skeleton-arrow"></div>
+        <div class="skeleton-track">{frames}</div>
+        <div class="skeleton-arrow"></div>
+    </div>
+    '''
+
+
+def track_carousel_html(
+    track_id: int,
+    frames: List[Dict[str, Any]],
+    *,
+    thumb_width: int = 120,
+    visible_count: int = 8,
+) -> str:
+    """Generate a carousel-style frame viewer with navigation arrows.
+
+    Args:
+        track_id: Track ID for unique element IDs
+        frames: List of frame dicts with 'crop_url' or 'url' and 'frame_idx'
+        thumb_width: Width of each thumbnail in pixels
+        visible_count: Number of frames visible at once
+
+    Returns:
+        HTML string for the carousel with CSS and JavaScript
+    """
+    if not frames:
+        return '<div class="track-carousel empty"><span>No frames available</span></div>'
+
+    carousel_id = f"carousel_{track_id}"
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio
+
+    # Build frame thumbnails
+    frame_items = []
+    for i, frame in enumerate(frames):
+        url = frame.get("crop_url") or frame.get("url") or frame.get("thumbnail_url")
+        frame_idx = frame.get("frame_idx", i)
+        similarity = frame.get("similarity")
+
+        if url:
+            src = html.escape(str(url))
+            alt = html.escape(f"Frame {frame_idx}")
+
+            # Add similarity badge if available
+            badge = ""
+            if similarity is not None:
+                pct = int(similarity * 100)
+                badge = f'<span class="frame-badge">{pct}%</span>'
+
+            frame_items.append(f'''
+                <div class="carousel-frame" data-idx="{frame_idx}">
+                    <img src="{src}" alt="{alt}" loading="lazy" />
+                    {badge}
+                    <span class="frame-label">#{frame_idx}</span>
+                </div>
+            ''')
+
+    frames_html = "".join(frame_items)
+    total_frames = len(frame_items)
+
+    return f'''
+    <style>
+        .track-carousel {{
+            position: relative;
+            width: 100%;
+            margin: 16px 0;
+        }}
+        .track-carousel.empty {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100px;
+            color: #666;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }}
+        .carousel-container {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .carousel-arrow {{
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            font-size: 18px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: background 0.2s, transform 0.1s;
+            z-index: 10;
+        }}
+        .carousel-arrow:hover {{
+            background: rgba(0,0,0,0.8);
+            transform: scale(1.1);
+        }}
+        .carousel-arrow:disabled {{
+            background: rgba(0,0,0,0.2);
+            cursor: not-allowed;
+            transform: none;
+        }}
+        .carousel-track {{
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            scroll-behavior: smooth;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+            padding: 4px 0;
+            flex: 1;
+        }}
+        .carousel-track::-webkit-scrollbar {{
+            display: none;
+        }}
+        .carousel-frame {{
+            position: relative;
+            flex-shrink: 0;
+            width: {thumb_width}px;
+            height: {thumb_height}px;
+            border-radius: 6px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            background: #f0f0f0;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }}
+        .carousel-frame:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+        }}
+        .carousel-frame img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }}
+        .carousel-frame .frame-badge {{
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            background: rgba(33, 150, 243, 0.9);
+            color: white;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }}
+        .carousel-frame .frame-label {{
+            position: absolute;
+            bottom: 4px;
+            left: 4px;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            font-size: 10px;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }}
+        .carousel-info {{
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+        }}
+    </style>
+
+    <div class="track-carousel" id="{carousel_id}">
+        <div class="carousel-container">
+            <button class="carousel-arrow carousel-prev" onclick="scrollCarousel('{carousel_id}', -1)">◀</button>
+            <div class="carousel-track">
+                {frames_html}
+            </div>
+            <button class="carousel-arrow carousel-next" onclick="scrollCarousel('{carousel_id}', 1)">▶</button>
+        </div>
+        <div class="carousel-info">{total_frames} frames · Scroll or use arrows to navigate</div>
+    </div>
+
+    <script>
+        function scrollCarousel(carouselId, direction) {{
+            const carousel = document.getElementById(carouselId);
+            const track = carousel.querySelector('.carousel-track');
+            const frameWidth = {thumb_width} + 8; // width + gap
+            const scrollAmount = frameWidth * 4; // scroll 4 frames at a time
+            track.scrollBy({{ left: direction * scrollAmount, behavior: 'smooth' }});
+        }}
+    </script>
+    '''
 
 
 def track_row_html(track_id: int, items: List[Dict[str, Any]], thumb_width: int = 200) -> str:
@@ -1635,6 +4099,148 @@ def inject_thumb_css() -> None:
     )
 
 
+def inject_log_container_css() -> None:
+    """Inject CSS to limit log container height and make scrollable.
+
+    Prevents logs from extending the page indefinitely by adding max-height
+    with overflow-y scroll to code blocks used for log display.
+    """
+    st.markdown(
+        """
+    <style>
+        /* Limit log height and make scrollable */
+        [data-testid="stCodeBlock"] {
+            max-height: 400px;
+            overflow-y: auto !important;
+        }
+        /* Ensure the pre inside also scrolls properly */
+        [data-testid="stCodeBlock"] pre {
+            max-height: 380px;
+            overflow-y: auto !important;
+        }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+
+
+def _thumb_async_cache() -> Dict[str, Dict[str, Any]]:
+    cache = st.session_state.setdefault(_THUMB_CACHE_STATE_KEY, {})
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state[_THUMB_CACHE_STATE_KEY] = cache
+    return cache
+
+
+def _thumb_job_state() -> Dict[str, str]:
+    jobs = st.session_state.setdefault(_THUMB_JOB_STATE_KEY, {})
+    if not isinstance(jobs, dict):
+        jobs = {}
+        st.session_state[_THUMB_JOB_STATE_KEY] = jobs
+    return jobs
+
+
+def thumb_is_pending(src: str | None) -> bool:
+    if not src:
+        return False
+    entry = _thumb_async_cache().get(src)
+    return bool(entry and entry.get("status") == "pending")
+
+
+def _store_thumb_result(src: str, url: str | None, *, error: str | None = None) -> None:
+    cache = _thumb_async_cache()
+    cache[src] = {
+        "status": "ready" if url else "error",
+        "url": url,
+        "error": error,
+        "updated": time.time(),
+    }
+    jobs = _thumb_job_state()
+    jobs.pop(src, None)
+
+
+def _blocking_thumb_fetch(src: str, api_base: str, ttl: int = 3600) -> str | None:
+    params = {"key": src, "ttl": ttl}
+    inferred_mime = _infer_mime(src)
+    response = requests.get(f"{api_base}/files/presign", params=params, timeout=3)
+    response.raise_for_status()
+    data = response.json()
+    presigned_url = data.get("url")
+    resolved_mime = data.get("content_type") or inferred_mime
+    if not presigned_url:
+        return None
+    if presigned_url.startswith("https://"):
+        return presigned_url
+    img_response = requests.get(presigned_url, timeout=5)
+    img_response.raise_for_status()
+    encoded = base64.b64encode(img_response.content).decode("ascii")
+    content_type = img_response.headers.get("content-type") or resolved_mime or "image/jpeg"
+    return f"data:{content_type};base64,{encoded}"
+
+
+def _thumb_worker_runner(src: str, api_base: str, ttl: int) -> None:
+    ctx = get_script_run_ctx()
+    if ctx is None:
+        return
+    error: str | None = None
+    url: str | None = None
+    try:
+        url = _blocking_thumb_fetch(src, api_base, ttl=ttl)
+    except requests.RequestException as exc:  # pragma: no cover - network errors
+        error = str(exc)
+        _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=error)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        error = str(exc)
+        _diag("UI_RESOLVE_FAIL", src=src, reason="thumb_worker_error", error=error)
+    _store_thumb_result(src, url, error=error)
+    if ctx.script_requests:
+        ctx.script_requests.request_rerun(
+            RerunData(query_string=ctx.query_string, page_script_hash=ctx.page_script_hash)
+        )
+
+
+def _start_thumb_worker(src: str, api_base: str, ttl: int = 3600) -> None:
+    jobs = _thumb_job_state()
+    status = jobs.get(src)
+    if status == "running":
+        return
+    running_now = sum(1 for value in jobs.values() if value == "running")
+    if running_now >= _MAX_ASYNC_THUMB_WORKERS:
+        jobs[src] = "queued"
+        return
+    ctx = get_script_run_ctx()
+    if ctx is None or ctx.script_requests is None:
+        err: str | None = None
+        try:
+            url = _blocking_thumb_fetch(src, api_base, ttl=ttl)
+        except Exception as exc:  # pragma: no cover
+            err = str(exc)
+            _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=err)
+            url = None
+        _store_thumb_result(src, url, error=err or (None if url else "presign_failed"))
+        return
+    jobs[src] = "running"
+    worker = threading.Thread(target=_thumb_worker_runner, args=(src, api_base, ttl), daemon=True)
+    add_script_run_ctx(worker, ctx)
+    worker.start()
+
+
+def _resolve_thumb_async(src: str, api_base: str) -> str | None:
+    cache = _thumb_async_cache()
+    entry = cache.get(src)
+    if entry:
+        status = entry.get("status")
+        if status == "ready":
+            return entry.get("url")
+        if status == "error":
+            cache.pop(src, None)
+            entry = None
+    if not entry:
+        cache[src] = {"status": "pending", "url": None, "error": None, "updated": time.time()}
+    _start_thumb_worker(src, api_base)
+    return None
+
+
 def resolve_thumb(src: str | None) -> str | None:
     """Resolve thumbnail source to a browser-safe URL or None for placeholder.
 
@@ -1643,22 +4249,17 @@ def resolve_thumb(src: str | None) -> str | None:
     2. HTTPS URL (S3 presigned) → return as-is (CORS-safe)
     3. HTTP localhost API URL → fetch and convert to data URL
     4. Local file path exists → convert to data URL
-    5. S3 key (artifacts/**) → presign via API → fetch and convert to data URL
+    5. S3 key (artifacts/**) → presign via API asynchronously
     6. None → return None for placeholder
     """
     if not src:
         return None
 
-    # Already a data URL? Return as-is
     if isinstance(src, str) and src.startswith("data:"):
         return src
-
-    # HTTPS URLs (S3 presigned) can be loaded directly - return as-is
     if isinstance(src, str) and src.startswith("https://"):
         return src
 
-    # HTTP localhost API URLs need to be fetched and converted to data URLs
-    # (Streamlit at :8501 can't load images from :8000 without CORS)
     if isinstance(src, str) and src.startswith("http://localhost:"):
         try:
             response = requests.get(src, timeout=2)
@@ -1667,14 +4268,8 @@ def resolve_thumb(src: str | None) -> str | None:
                 content_type = response.headers.get("content-type") or _infer_mime(src) or "image/jpeg"
                 return f"data:{content_type};base64,{encoded}"
         except Exception as exc:
-            _diag(
-                "UI_RESOLVE_FAIL",
-                src=src,
-                reason="localhost_fetch_error",
-                error=str(exc),
-            )
+            _diag("UI_RESOLVE_FAIL", src=src, reason="localhost_fetch_error", error=str(exc))
 
-    # Try as local file path
     try:
         path = Path(src)
         if path.exists() and path.is_file():
@@ -1684,33 +4279,13 @@ def resolve_thumb(src: str | None) -> str | None:
     except (OSError, ValueError) as exc:
         _diag("UI_RESOLVE_FAIL", src=src, reason="local_file_error", error=str(exc))
 
-    # Try as S3 key - call presign endpoint and then fetch
     if isinstance(src, str) and (
         src.startswith("artifacts/")
         or src.startswith("raw/")
         or ("/" in src and not src.startswith("/") and not src.startswith("http"))
     ):
-        try:
-            api_base = st.session_state.get("api_base") or "http://localhost:8000"
-            params = {"key": src, "ttl": 3600}
-            inferred_mime = _infer_mime(src)
-            response = requests.get(f"{api_base}/files/presign", params=params, timeout=2)
-            if response.ok:
-                data = response.json()
-                presigned_url = data.get("url")
-                resolved_mime = data.get("content_type") or inferred_mime
-                if presigned_url:
-                    # For HTTPS presigned URLs, return directly
-                    if presigned_url.startswith("https://"):
-                        return presigned_url
-                    # For HTTP URLs, fetch and convert to data URL
-                    img_response = requests.get(presigned_url, timeout=5)
-                    if img_response.ok and img_response.content:
-                        encoded = base64.b64encode(img_response.content).decode("ascii")
-                        content_type = img_response.headers.get("content-type") or resolved_mime or "image/jpeg"
-                        return f"data:{content_type};base64,{encoded}"
-        except Exception as exc:
-            _diag("UI_RESOLVE_FAIL", src=src, reason="s3_presign_error", error=str(exc))
+        api_base = st.session_state.get("api_base") or _api_base()
+        return _resolve_thumb_async(src, api_base)
 
     _diag("UI_RESOLVE_FAIL", src=src, reason="all_methods_failed")
     return None
@@ -1754,6 +4329,7 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
     """
     placeholder = _placeholder_thumb_url()
     img = resolve_thumb(src)
+    pending = thumb_is_pending(src)
     if not img:
         if hide_if_missing:
             return ""
@@ -1765,9 +4341,12 @@ def thumb_html(src: str | None, alt: str = "thumb", *, hide_if_missing: bool = F
     else:
         escaped_placeholder = placeholder.replace("'", "\\'")
         onerror_handler = f"this.onerror=null;this.src='{escaped_placeholder}';"
+    wrapper_class = "thumb"
+    if pending and img == placeholder:
+        wrapper_class = "thumb thumb-skeleton"
 
     return (
-        '<div class="thumb">'
+        f'<div class="{wrapper_class}">'
         f'<img src="{img}" alt="{escaped_alt}" loading="lazy" decoding="async" onerror="{onerror_handler}"/>'
         "</div>"
     )

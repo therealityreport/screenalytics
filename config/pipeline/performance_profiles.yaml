@@ -1,0 +1,42 @@
+# D6: Performance profiles for thermal management
+# Optimizes detection parameters based on hardware capabilities
+
+low_power:
+  # For thermally constrained devices (MacBook Air, fanless systems)
+  # Minimizes CPU/GPU load and thermal output
+  description: "Optimized for fanless/low-power devices"
+  coreml_input_size: 384        # Reduced from 640x640
+  detection_fps_limit: 8        # Cap detection rate to ease thermals
+  frame_stride: 8               # Sample every 8th frame (≈5× reduction)
+  min_size: 120                 # Larger faces only (faster processing)
+  adaptive_confidence: true     # Enable to catch faces in varied lighting
+  nms_mode: hard                # Faster than soft-NMS
+  check_pose_quality: false     # Skip extra computation
+  cpu_threads: 2                # Limit CPU load alongside MPS/CoreML
+  save_frames: false            # Avoid extra JPEG work during detect/track
+  save_crops: false             # Skip detect/track crop exports (use faces_embed)
+
+balanced:
+  # Default profile - good balance of performance and quality
+  # Works well on most modern hardware
+  description: "Balanced performance and quality"
+  coreml_input_size: 480  # Standard CoreML size
+  detection_fps_limit: 24  # Standard video processing rate
+  frame_stride: 5  # Moderate sampling
+  min_size: 90  # Default face size
+  adaptive_confidence: false  # Optional quality improvement
+  nms_mode: hard  # Standard NMS
+  check_pose_quality: true  # Enable pose filtering
+
+high_accuracy:
+  # For powerful desktop systems with good cooling
+  # Maximizes detection quality at cost of performance
+  description: "Maximum quality for powerful systems"
+  coreml_input_size: 640  # Full resolution detection
+  detection_fps_limit: 30  # Process all frames
+  frame_stride: 1  # No frame skipping
+  min_size: 64  # Detect smaller faces
+  adaptive_confidence: true  # Best quality in all conditions
+  nms_mode: soft  # Better for overlapping faces
+  soft_nms_sigma: 0.5
+  check_pose_quality: true  # Full quality checks

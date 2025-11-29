@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -84,7 +84,7 @@ class EpisodeStore:
     ) -> EpisodeRecord:
         ep_id = self.make_ep_id(show_ref, season_number, episode_number)
         content = self._read()
-        now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         record = content.get(ep_id, {}).copy()
 
         created_at = record.get("created_at") if record else now
@@ -102,6 +102,14 @@ class EpisodeStore:
         self._write(content)
         return EpisodeRecord(**stored)  # type: ignore[arg-type]
 
+    @staticmethod
+    def normalize_ep_id(ep_id: str) -> str:
+        """Normalize ep_id to lowercase for case-insensitive handling.
+
+        This ensures that 'RHOSLC-s06e02' and 'rhoslc-s06e02' are treated as the same episode.
+        """
+        return ep_id.strip().lower()
+
     def upsert_ep_id(
         self,
         *,
@@ -112,11 +120,12 @@ class EpisodeStore:
         title: Optional[str] = None,
         air_date: Optional[date | str] = None,
     ) -> tuple[EpisodeRecord, bool]:
-        ep_id = ep_id.strip()
+        # Normalize ep_id to lowercase for case-insensitive handling
+        ep_id = self.normalize_ep_id(ep_id)
         if not ep_id:
             raise ValueError("ep_id is required")
         expected = self.make_ep_id(show_slug, season, episode)
-        if ep_id.lower() != expected.lower():
+        if ep_id != expected:
             raise ValueError(f"ep_id '{ep_id}' does not match show/season/episode ({expected})")
 
         content = self._read()
@@ -124,10 +133,10 @@ class EpisodeStore:
         if existing:
             return EpisodeRecord(**existing), False  # type: ignore[arg-type]
 
-        now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         stored = {
             "ep_id": ep_id,
-            "show_ref": show_slug,
+            "show_ref": show_slug.lower(),  # Also normalize show_slug
             "season_number": season,
             "episode_number": episode,
             "title": title,
@@ -140,6 +149,7 @@ class EpisodeStore:
         return EpisodeRecord(**stored), True  # type: ignore[arg-type]
 
     def get(self, ep_id: str) -> Optional[EpisodeRecord]:
+        ep_id = self.normalize_ep_id(ep_id)
         content = self._read()
         data = content.get(ep_id)
         if not data:
@@ -147,6 +157,7 @@ class EpisodeStore:
         return EpisodeRecord(**data)  # type: ignore[arg-type]
 
     def exists(self, ep_id: str) -> bool:
+        ep_id = self.normalize_ep_id(ep_id)
         return ep_id in self._read()
 
     def list(self) -> list[EpisodeRecord]:
@@ -155,6 +166,7 @@ class EpisodeStore:
         return sorted(records, key=lambda record: record.updated_at, reverse=True)
 
     def delete(self, ep_id: str) -> bool:
+        ep_id = self.normalize_ep_id(ep_id)
         content = self._read()
         if ep_id not in content:
             return False

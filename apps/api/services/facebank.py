@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +19,7 @@ SEED_CLUSTER_DELTA = float(os.getenv("SEED_CLUSTER_DELTA", "0.05"))
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -89,15 +89,25 @@ class FacebankService:
         self.facebank_dir = self.data_root / "facebank"
         self.facebank_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _normalize_show_id(show_id: str) -> str:
+        """Normalize show_id to uppercase for consistent directory structure.
+
+        Matches PeopleService and CastService normalize methods.
+        """
+        return show_id.strip().upper() if show_id else ""
+
     def _facebank_path(self, show_id: str, cast_id: str) -> Path:
         """Get path to facebank.json for a cast member."""
-        cast_dir = self.facebank_dir / show_id / cast_id
+        normalized_show = self._normalize_show_id(show_id)
+        cast_dir = self.facebank_dir / normalized_show / cast_id
         cast_dir.mkdir(parents=True, exist_ok=True)
         return cast_dir / "facebank.json"
 
     def _seeds_dir(self, show_id: str, cast_id: str) -> Path:
         """Get directory for seed images."""
-        seeds_dir = self.facebank_dir / show_id / cast_id / "seeds"
+        normalized_show = self._normalize_show_id(show_id)
+        seeds_dir = self.facebank_dir / normalized_show / cast_id / "seeds"
         seeds_dir.mkdir(parents=True, exist_ok=True)
         return seeds_dir
 
@@ -289,7 +299,8 @@ class FacebankService:
 
     def get_all_seeds_for_show(self, show_id: str) -> List[Dict[str, Any]]:
         """Get all seed embeddings for a show (for detection boosting)."""
-        show_dir = self.facebank_dir / show_id
+        normalized_show = self._normalize_show_id(show_id)
+        show_dir = self.facebank_dir / normalized_show
         if not show_dir.exists():
             return []
 
@@ -297,7 +308,7 @@ class FacebankService:
         for cast_dir in show_dir.iterdir():
             if cast_dir.is_dir():
                 cast_id = cast_dir.name
-                data = self._load_facebank(show_id, cast_id)
+                data = self._load_facebank(normalized_show, cast_id)
                 seeds = data.get("seeds", [])
                 for seed in seeds:
                     seed["cast_id"] = cast_id

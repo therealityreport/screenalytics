@@ -2,16 +2,71 @@
 # This controls how many samples per track get embedded/exported,
 # independent of detection/tracking which runs on every frame.
 
+# Quality gating thresholds
+# These control which faces are accepted for embedding based on quality metrics
+quality_gating:
+  # Combined quality score threshold (0.0-10.0, higher = stricter)
+  # Quality score combines: blur + contrast + face size
+  min_quality_score: 3.0
+
+  # Individual component thresholds
+  min_confidence: 0.60      # Detection confidence (0.0-1.0)
+  min_blur_score: 35.0      # Laplacian variance (higher = sharper)
+  min_std: 1.0              # Image standard deviation (contrast)
+
+  # Pose filtering (degrees)
+  max_yaw_angle: 45.0       # Maximum head rotation (left/right)
+  max_pitch_angle: 30.0     # Maximum head tilt (up/down)
+
+  # Expression filtering (list of allowed expressions, or empty for all)
+  allowed_expressions:
+    - neutral
+    - smile
+    - happy
+    - unknown
+
+  # Sampling strategy: "uniform", "quality_weighted", "stratified"
+  sampling_mode: "quality_weighted"
+
+limits:
+  default:
+    max_samples_per_track: 5
+    min_samples_per_track: 3
+    sample_every_n_frames: 4
+    min_frames_between_crops: 32
+    max_faces_per_episode: 10000
+  profiles:
+    fast_cpu:
+      max_samples_per_track: 3
+      min_samples_per_track: 2
+      min_frames_between_crops: 48
+      max_faces_per_episode: 6000
+    low_power:
+      max_samples_per_track: 3
+      min_samples_per_track: 2
+      min_frames_between_crops: 48
+      max_faces_per_episode: 6000
+    balanced:
+      max_samples_per_track: 3
+      min_samples_per_track: 2
+      min_frames_between_crops: 32
+      max_faces_per_episode: 8000
+    high_accuracy:
+      max_samples_per_track: 8
+      min_samples_per_track: 4
+      min_frames_between_crops: 24
+      max_faces_per_episode: 20000
+
 detect_track_presets:
   bravo_24fps_default:
-    # Detection/tracking runs every 4 frames (stride=4)
-    detector_frame_stride: 4
+    # Detection/tracking runs on EVERY frame (stride=1)
+    detector_frame_stride: 1
 
     # Per-track sampling for embedding/export
     faces_embed_sampling:
-      max_samples_per_track: 12  # Hard cap per track
-      min_samples_per_track: 6   # Minimum if track is long enough
-      sample_every_n_frames: 8   # Fallback interval for uniform sampling
+      max_samples_per_track: 16  # Hard cap per track
+      min_samples_per_track: 4   # Minimum if track is long enough
+      sample_every_n_frames: 4   # Fallback interval for uniform sampling
 
       # Export controls
       save_frames: false          # Don't export full frames by default

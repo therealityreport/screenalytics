@@ -34,12 +34,15 @@ def test_loose_cluster_low_cohesion():
     from apps.api.services.track_reps import cosine_similarity, l2_normalize
 
     # Create 5 very different embeddings (orthogonal directions)
-    np.random.seed(123)
     embeddings = []
-    for i in range(5):
-        vec = np.random.randn(512)
-        # Make them more different by scaling different dimensions
-        vec[i * 100 : (i + 1) * 100] *= 10.0
+    vectors = [
+        np.array([1.0] + [0.0] * 511),
+        np.array([-1.0] + [0.0] * 511),
+        np.array([0.0, 1.0] + [0.0] * 510),
+        np.array([0.0, -1.0] + [0.0] * 510),
+        np.array([0.0, 0.0, 1.0] + [0.0] * 509),
+    ]
+    for vec in vectors:
         embeddings.append(l2_normalize(vec))
 
     # Compute cluster centroid

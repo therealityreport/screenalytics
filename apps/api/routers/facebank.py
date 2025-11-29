@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
+import json
+import math
 from io import BytesIO
 from pathlib import Path
 from typing import List
@@ -58,6 +59,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int_nonnegative(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return max(default, 0)
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return max(default, 0)
+
+
 def _normalize_format(value: str | None, default: str) -> str:
     normalized = (value or default).strip().lower()
     if normalized in {"jpg", "jpeg"}:
@@ -74,7 +85,8 @@ SEED_DISPLAY_MAX = max(SEED_DISPLAY_MIN, _env_int("SEED_DISPLAY_MAX", 1024))
 SEED_DISPLAY_FORMAT = _normalize_format(os.getenv("SEED_DISPLAY_FORMAT"), "png")
 SEED_EMBED_FORMAT = _normalize_format(os.getenv("SEED_EMBED_FORMAT"), "png")
 SEED_FACE_MARGIN = _env_float("SEED_FACE_MARGIN", 0.35)
-SEED_MIN_FACE_FRAC = max(_env_float("SEED_MIN_FACE_FRAC", 0.10), 0.0)
+SEED_MIN_FACE_FRAC = max(_env_float("SEED_MIN_FACE_FRAC", 0.05), 0.0)
+SEED_MIN_FACE_PIXELS = max(_env_int_nonnegative("SEED_MIN_FACE_PIXELS", 128 * 128), 0)
 JPEG_QUALITY = int(os.getenv("SEED_JPEG_QUALITY", "92"))
 _FACEBANK_KEEP_ORIG_RAW = os.getenv("FACEBANK_KEEP_ORIG")
 FACEBANK_KEEP_ORIG = (_FACEBANK_KEEP_ORIG_RAW or "1").strip().lower() in {
@@ -122,6 +134,29 @@ def _letterbox_square(image: np.ndarray, size: int) -> np.ndarray:
     left = (size - new_w) // 2
     canvas.paste(resized, (left, top))
     return np.ascontiguousarray(np.asarray(canvas)[..., ::-1])
+
+
+def _select_primary_detection(detections: list, *, fallback_conf: float = 0.0):
+    """Pick the largest face (ties broken by confidence) to represent the seed."""
+    best = None
+    best_area = -1.0
+    for det in detections:
+        bbox = getattr(det, "bbox", None)
+        if bbox is None:
+            continue
+        try:
+            x1, y1, x2, y2 = bbox
+            face_w = max(float(x2) - float(x1), 0.0)
+            face_h = max(float(y2) - float(y1), 0.0)
+        except Exception:
+            continue
+        area = face_w * face_h
+        conf = float(getattr(det, "conf", fallback_conf) or fallback_conf)
+        better_conf = conf > float(getattr(best, "conf", fallback_conf) or fallback_conf) if best is not None else False
+        if area > best_area or (math.isclose(area, best_area) and better_conf):
+            best = det
+            best_area = area
+    return best
 
 
 def _resize_display_image(image_bgr: np.ndarray) -> tuple[np.ndarray, list[int], bool]:
@@ -201,10 +236,12 @@ def _prepare_display_crop(
     bbox: list[float],
     detector_mode: str,
 ) -> tuple[np.ndarray, list[int]]:
-    """Return full frame for display (cropping happens at render time)."""
+    """Crop around the detected face for display thumbnails."""
     h, w = image_bgr.shape[:2]
-    full_box = [0, 0, w, h]
-    return np.ascontiguousarray(image_bgr.copy()), full_box
+    crop_box = _expand_square_bbox(bbox, margin=0.15, width=w, height=h)
+    x1, y1, x2, y2 = crop_box
+    cropped = image_bgr[y1:y2, x1:x2]
+    return np.ascontiguousarray(cropped.copy()), crop_box
 
 
 def _save_derivative(image_bgr: np.ndarray, path: Path, fmt: str) -> None:
@@ -333,6 +370,29 @@ async def upload_seeds(
     embedder = ArcFaceEmbedder(device="cpu")
     embedder.ensure_ready()
 
+    class _SimulatedDetection:
+        """Minimal detection stub when RetinaFace is unavailable."""
+
+        def __init__(self, width: int, height: int) -> None:
+            # Use a generous box covering most of the image
+            margin_w = int(max(width * 0.05, 10))
+            margin_h = int(max(height * 0.05, 10))
+            self.bbox = [margin_w, margin_h, width - margin_w, height - margin_h]
+            # Rough landmark positions (fractions of the image)
+            self.landmarks = [
+                0.35,
+                0.35,  # left eye
+                0.65,
+                0.35,  # right eye
+                0.50,
+                0.50,  # nose
+                0.40,
+                0.70,  # left mouth
+                0.60,
+                0.70,  # right mouth
+            ]
+            self.conf = 0.5
+
     _diag(
         "SEED_INIT",
         detector_ready=detector_ready,
@@ -363,38 +423,80 @@ async def upload_seeds(
                 continue
             image = np.ascontiguousarray(image_rgb[..., ::-1])
 
-            detections = detector.detect(image)
+            try:
+                detections = detector.detect(image)
+            except Exception as exc:
+                if detector_mode == "simulated":
+                    detections = []
+                    LOGGER.warning("Falling back to simulated detection for %s: %s", file.filename, exc)
+                else:
+                    raise HTTPException(status_code=500, detail=f"Detector failed: {exc}") from exc
+
+            if detector_mode == "simulated" and len(detections) == 0:
+                h, w = image.shape[:2]
+                detections = [_SimulatedDetection(w, h)]
 
             if len(detections) == 0:
                 errors.append({"file": file.filename, "error": "No face detected"})
                 continue
-            if len(detections) > 1:
-                errors.append(
-                    {
-                        "file": file.filename,
-                        "error": f"{len(detections)} faces detected, expected 1",
-                    }
-                )
-                continue
 
-            detection = detections[0]
+            detection = _select_primary_detection(detections) or detections[0]
+            if len(detections) > 1:
+                LOGGER.debug(
+                    "Seed upload: %s faces detected, using primary bbox %s",
+                    len(detections),
+                    getattr(detection, "bbox", None),
+                )
             # DetectionSample has bbox as absolute coordinates already
-            bbox = detection.bbox  # [x1, y1, x2, y2] in pixels
+            bbox = [float(coord) for coord in getattr(detection, "bbox", [])]  # [x1, y1, x2, y2] in pixels
             landmarks_rel = detection.landmarks
             conf = detection.conf
 
             h, w = image.shape[:2]
 
-            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            bbox_ratio = bbox_area / (w * h)
+            face_w = max(bbox[2] - bbox[0], 0.0)
+            face_h = max(bbox[3] - bbox[1], 0.0)
+            bbox_area = face_w * face_h
+            image_area = float(w * h) if w > 0 and h > 0 else 0.0
+            bbox_ratio = bbox_area / image_area if image_area > 0 else 0.0
 
-            if detector_mode != "simulated" and bbox_ratio < SEED_MIN_FACE_FRAC:
-                pct = bbox_ratio * 100.0
-                min_pct = SEED_MIN_FACE_FRAC * 100.0
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Face too small ({pct:.1f}%). Minimum is {min_pct:.0f}% of the image",
-                )
+            too_small_fraction = bbox_ratio < SEED_MIN_FACE_FRAC
+            too_small_pixels = SEED_MIN_FACE_PIXELS > 0 and bbox_area < float(SEED_MIN_FACE_PIXELS)
+
+            LOGGER.debug(
+                "Seed face check file=%s image=%sx%s area=%.0f face=%sx%s area=%.0f frac=%.4f min_frac=%.4f min_px=%s mode=%s detections=%s",
+                file.filename,
+                w,
+                h,
+                image_area,
+                f"{face_w:.1f}",
+                f"{face_h:.1f}",
+                bbox_area,
+                bbox_ratio,
+                SEED_MIN_FACE_FRAC,
+                SEED_MIN_FACE_PIXELS,
+                detector_mode,
+                len(detections),
+            )
+
+            pct = bbox_ratio * 100.0
+            min_pct = SEED_MIN_FACE_FRAC * 100.0
+            min_side = int(round(math.sqrt(SEED_MIN_FACE_PIXELS))) if SEED_MIN_FACE_PIXELS > 0 else 0
+
+            if detector_mode != "simulated":
+                if too_small_fraction and (SEED_MIN_FACE_PIXELS <= 0 or too_small_pixels):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Face too small: {pct:.1f}% of image (min {min_pct:.1f}%) "
+                            f"and {face_w:.0f}x{face_h:.0f}px (min {min_side}x{min_side}px)"
+                        ),
+                    )
+                if not too_small_fraction and too_small_pixels:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Face resolution too low: {face_w:.0f}x{face_h:.0f}px (min {min_side}x{min_side}px)",
+                    )
 
             quality = {
                 "sharpness": 1.0,
@@ -408,7 +510,20 @@ async def upload_seeds(
             if detector_provider:
                 quality["detector_provider"] = detector_provider
 
-            landmarks_abs = [coord * (w if i % 2 == 0 else h) for i, coord in enumerate(landmarks_rel or [])]
+            landmarks_abs = None
+            if landmarks_rel is not None:
+                try:
+                    landmarks_list = [float(coord) for coord in landmarks_rel]
+                except Exception:
+                    landmarks_list = []
+                if landmarks_list:
+                    max_coord = max(abs(val) for val in landmarks_list)
+                    if max_coord <= 1.5:
+                        landmarks_abs = [
+                            coord * (w if i % 2 == 0 else h) for i, coord in enumerate(landmarks_list)
+                        ]
+                    else:
+                        landmarks_abs = landmarks_list
 
             _diag(
                 "SEED_INPUT",
@@ -419,6 +534,9 @@ async def upload_seeds(
                 bbox_ratio=float(bbox_ratio),
                 conf=float(conf),
                 detector_mode=detector_mode,
+                detection_count=len(detections),
+                min_face_frac=SEED_MIN_FACE_FRAC,
+                min_face_pixels=SEED_MIN_FACE_PIXELS,
             )
 
             display_crop, display_bbox = _prepare_display_crop(image, bbox, detector_mode)
@@ -496,6 +614,8 @@ async def upload_seeds(
             display_s3_key = None
             embed_s3_key = None
             orig_s3_key = None
+            s3_upload_failed = False
+            s3_upload_error = None
             try:
                 display_s3_key = storage_service.upload_facebank_seed(
                     show_id,
@@ -523,6 +643,8 @@ async def upload_seeds(
                         content_type_hint="image/png",
                     )
             except Exception as exc:  # pragma: no cover - best effort mirror
+                s3_upload_failed = True
+                s3_upload_error = str(exc)
                 LOGGER.error(
                     "Failed to upload facebank derivatives %s/%s/%s: %s",
                     show_id,
@@ -530,6 +652,12 @@ async def upload_seeds(
                     seed_id,
                     exc,
                 )
+                # If S3 is enabled and required, fail the upload
+                if storage_service.s3_enabled():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to upload seed to cloud storage: {exc}. Seed not saved."
+                    )
 
             _diag(
                 "SEED_S3",
@@ -612,7 +740,7 @@ async def upload_seeds(
             show_id,
             cast_id,
             "upload",
-            [seed["fb_id"] for seed in uploaded_seeds],
+            [seed.get("fb_id") for seed in uploaded_seeds if seed.get("fb_id")],
         )
 
     response_payload = {

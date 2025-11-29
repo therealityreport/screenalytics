@@ -6,7 +6,9 @@ import types
 from pathlib import Path
 from typing import Iterator, List
 
-if "requests" not in sys.modules:
+try:
+    import requests  # noqa: F401
+except ImportError:
     mock_requests = types.SimpleNamespace(RequestException=Exception, HTTPError=Exception)
     sys.modules["requests"] = mock_requests
 if "streamlit" not in sys.modules:

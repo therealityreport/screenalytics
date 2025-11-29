@@ -102,10 +102,11 @@ def test_detect_track_real_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     det_rows = _read_jsonl(detections_path)
     track_rows = _read_jsonl(tracks_path)
 
-    assert det_rows, "Expected at least one detection from YOLOv8 pipeline"
+    assert det_rows, "Expected at least one detection from detection pipeline"
     assert track_rows, "Expected at least one track from ByteTrack pipeline"
 
-    assert det_rows[0]["model"].startswith("yolov8")
+    model_val = det_rows[0].get("model", "")
+    assert model_val.startswith(("yolov8", "retinaface"))
     assert det_rows[0]["tracker"] == "bytetrack"
     assert any(row.get("track_id") is not None for row in det_rows), "Detections lack track IDs"
     assert track_rows[0]["frame_count"] >= 1

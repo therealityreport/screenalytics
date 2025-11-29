@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -13,12 +15,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+from apps.api.services.archive import archive_service
 from apps.api.services.people import PeopleService
 from apps.api.services.storage import StorageService
 
 router = APIRouter()
 people_service = PeopleService()
 storage_service = StorageService()
+LOGGER = logging.getLogger(__name__)
 
 
 class PersonResponse(BaseModel):
@@ -39,11 +43,13 @@ class PersonUpdateRequest(BaseModel):
     rep_crop: Optional[str] = None
     rep_crop_s3_key: Optional[str] = None
     aliases: Optional[List[str]] = None
+    cast_id: Optional[str] = None
 
 
 class PersonCreateRequest(BaseModel):
     name: Optional[str] = None
     aliases: Optional[List[str]] = None
+    cast_id: Optional[str] = None
 
 
 class PersonMergeRequest(BaseModel):
@@ -71,6 +77,7 @@ def _hydrate_rep_crop(person: dict) -> dict:
 @router.get("/shows/{show_id}/people")
 def list_people(show_id: str) -> dict:
     """Get all people for a show."""
+    show_id = show_id.upper()  # Normalize to match storage path
     people = people_service.list_people(show_id)
     hydrated = [_hydrate_rep_crop(person) for person in people]
     return {
@@ -83,6 +90,7 @@ def list_people(show_id: str) -> dict:
 @router.get("/shows/{show_id}/people/{person_id}")
 def get_person(show_id: str, person_id: str) -> PersonResponse:
     """Get a specific person."""
+    show_id = show_id.upper()  # Normalize to match storage path
     person = people_service.get_person(show_id, person_id)
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
@@ -92,19 +100,37 @@ def get_person(show_id: str, person_id: str) -> PersonResponse:
 @router.post("/shows/{show_id}/people")
 def create_person(show_id: str, body: PersonCreateRequest) -> PersonResponse:
     """Create a new person."""
-    person = people_service.create_person(show_id, name=body.name)
+    show_id = show_id.upper()  # Normalize to match storage path
+    LOGGER.info(
+        "Creating person",
+        extra={
+            "show_id": show_id,
+            "name": body.name,
+            "cast_id": body.cast_id,
+            "aliases": body.aliases or [],
+        },
+    )
+    person = people_service.create_person(
+        show_id,
+        name=body.name,
+        cast_id=body.cast_id,
+        aliases=body.aliases,
+    )
     return PersonResponse(**_hydrate_rep_crop(person))
 
 
 @router.patch("/shows/{show_id}/people/{person_id}")
 def update_person(show_id: str, person_id: str, body: PersonUpdateRequest) -> PersonResponse:
     """Update a person."""
+    show_id = show_id.upper()  # Normalize to match storage path
     person = people_service.update_person(
         show_id,
         person_id,
         name=body.name,
         rep_crop=body.rep_crop,
         rep_crop_s3_key=body.rep_crop_s3_key,
+        cast_id=body.cast_id,
+        aliases=body.aliases,
     )
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
@@ -113,16 +139,45 @@ def update_person(show_id: str, person_id: str, body: PersonUpdateRequest) -> Pe
 
 @router.delete("/shows/{show_id}/people/{person_id}")
 def delete_person(show_id: str, person_id: str) -> dict:
-    """Delete a person."""
+    """Delete (archive) a person.
+
+    The person is moved to the archive where their centroid is stored.
+    This allows matching faces in future episodes to be auto-archived.
+    """
+    show_id = show_id.upper()  # Normalize to match storage path
+    # Get person data before deleting (for archive)
+    person = people_service.get_person(show_id, person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
+
+    # Archive the person with their centroid for future matching
+    try:
+        centroid = person.get("prototype")  # Person's prototype embedding
+        rep_crop_url = person.get("rep_crop_url")
+        archive_service.archive_person(
+            show_id=show_id,
+            person_data=person,
+            reason="user_deleted",
+            centroid=centroid,
+            rep_crop_url=rep_crop_url,
+        )
+        LOGGER.info(f"Archived person {person_id} before deletion")
+    except Exception as e:
+        LOGGER.warning(f"Failed to archive person {person_id}: {e}")
+        # Continue with deletion even if archive fails
+
+    # Delete the person
     success = people_service.delete_person(show_id, person_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-    return {"status": "deleted", "person_id": person_id}
+
+    return {"status": "archived_and_deleted", "person_id": person_id}
 
 
 @router.post("/shows/{show_id}/people/merge")
 def merge_people(show_id: str, body: PersonMergeRequest) -> PersonResponse:
     """Merge source person into target person."""
+    show_id = show_id.upper()  # Normalize to match storage path
     if body.source_person_id == body.target_person_id:
         raise HTTPException(status_code=400, detail="Source and target must be different")
 
@@ -139,6 +194,7 @@ def merge_people(show_id: str, body: PersonMergeRequest) -> PersonResponse:
 @router.post("/shows/{show_id}/people/{person_id}/add_alias")
 def add_alias(show_id: str, person_id: str, body: PersonAddAliasRequest) -> PersonResponse:
     """Add an alias to a person."""
+    show_id = show_id.upper()  # Normalize to match storage path
     person = people_service.add_alias_to_person(show_id, person_id, body.alias)
     if not person:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")

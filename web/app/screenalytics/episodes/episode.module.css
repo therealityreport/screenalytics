@@ -1,0 +1,59 @@
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.statusGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.statusCard {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fff;
+}
+
+.statusTitle {
+  font-weight: 700;
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.statusBadge {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.pending {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.running {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.completed {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.error {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.logList {
+  margin-top: 10px;
+  padding-left: 16px;
+  color: #475569;
+}

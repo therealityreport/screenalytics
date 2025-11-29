@@ -53,7 +53,9 @@ def test_tracking_produces_consistent_track_ids(tmp_path):
 
     assert count == len(records) == 2
     track_ids = {rec["track_id"] for rec in records}
-    assert track_ids == {"track-00001", "track-00002"}
+    assert track_ids == {1, 2}
+    track_labels = {rec.get("track_label") for rec in records}
+    assert track_labels == {"track_0001", "track_0002"}
     for rec in records:
         assert rec["schema_version"] == "track_v1"
         assert rec["stats"]["detections"] == 2

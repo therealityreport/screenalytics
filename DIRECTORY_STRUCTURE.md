@@ -1,166 +1,71 @@
-# DIRECTORY_STRUCTURE.md — Screenalytics
+# Directory Structure — Screenalytics
 
-Version: 1.1 (Enhanced)
-Status: Planning
+**Quick Reference** | [Full Documentation →](docs/architecture/directory_structure.md)
 
 ---
 
-## 1. Top-Level Map
-```
+## Repository Layout
 
+```
 screenalytics/
-├─ apps/
-│  ├─ api/
-│  └─ workspace-ui/
-├─ workers/
-├─ packages/
-├─ db/
-├─ config/
-├─ FEATURES/
-├─ agents/
-├─ mcps/
-├─ docs/
-├─ infra/
-├─ tests/
-├─ tools/
-├─ .github/
-└─ root files (MANIFEST.md, README.md, PRD.md, etc.)
-
+├── apps/                        # Frontend + API (STABLE)
+│   ├── api/                     # FastAPI backend
+│   └── workspace-ui/            # Streamlit workspace UI
+├── web/                         # Next.js prototype (event/division admin)
+├── packages/                    # Shared Python/TS libs (STABLE)
+├── db/                          # Migrations, views, seeds (VERSIONED)
+├── config/                      # All YAML/TOML configs (VERSIONED)
+│   └── pipeline/                # detection.yaml, tracking.yaml, etc.
+├── FEATURES/                    # Experimental sandboxes (TTL: 30 days)
+├── agents/                      # Codex/Claude automation (CONTROLLED)
+├── mcps/                        # MCP servers (CONTROLLED)
+├── docs/                        # Permanent documentation (STABLE)
+│   ├── architecture/
+│   ├── pipeline/
+│   ├── reference/
+│   └── ops/
+├── infra/                       # Docker, IaC (SUPPORT)
+├── tests/                       # Unit/integration/e2e (REQUIRED)
+└── tools/                       # CLI utilities (SUPPORT)
 ```
 
 ---
 
-## 2. Folder Purposes
+## Key Concepts
 
-| Folder | Purpose | Notes |
-|---------|----------|-------|
-| **apps/** | Frontend + API endpoints | stable |
-| **workers/** | ML & analytics pipeline stages | stable |
-| **packages/** | Shared libs (Python & TypeScript) | stable |
-| **db/** | migrations, views, seeds | versioned |
-| **config/** | all YAML/TOML configs, codex, policies | versioned |
-| **FEATURES/** | experimental feature sandboxes | 30-day TTL |
-| **agents/** | Codex/Claude profiles, playbooks, prompts | controlled |
-| **mcps/** | MCP servers for Screenalytics, storage, postgres | controlled |
-| **docs/** | permanent project documentation | stable |
-| **infra/** | docker, terraform, IaC | support |
-| **tests/** | integration/unit/e2e tests | required |
-| **tools/** | helper scripts (new-feature, promote-feature) | support |
-| **.github/** | CI/CD workflows and promotion checks | enforced |
+### STABLE Paths
+Production-ready code that has passed promotion gates. Changes require PR review, tests, and docs.
+- `apps/`, `web/`, `packages/`, `db/`, `config/`, `docs/`
+
+### FEATURES Sandboxes
+Temporary experimental code (30-day TTL). **No production imports allowed.**
+- Structure: `FEATURES/<name>/` with `src/`, `tests/`, `docs/`, `TODO.md`
+- Promotion: `tools/promote-feature.py <name>`
+
+### Import Policy
+✅ **ALLOWED:** Production imports from `apps/`, `web/`, `packages/`
+❌ **FORBIDDEN:** Production imports from `FEATURES/**` (CI enforced)
 
 ---
 
-## 3. FEATURES/ Policy
-```
+## Promotion Workflow
 
-FEATURES/<feature>/
-├─ src/
-├─ tests/
-├─ docs/
-└─ TODO.md
-
-````
-- Time-to-live: 30 days
-- Imports from `FEATURES/**` forbidden in production code
-- Promotion requires CI approval, docs, and tests
+1. Develop in `FEATURES/<name>/`
+2. Pass CI (tests + docs + lint)
+3. Run `tools/promote-feature.py <name> --dest <path>`
+4. Code moves to target path, docs updated automatically
+5. CI verifies ACCEPTANCE_MATRIX.md entry exists
 
 ---
 
-## 4. Promotion Workflow
-1. Implement under `FEATURES/<feature>/`.
-2. Add docs and configs in that folder.
-3. Pass CI and promotion checklist.
-4. Run `tools/promote-feature.py`.
-5. Agents update global docs (README, PRD, Solution Architecture, Directory Structure).
-6. Update `ACCEPTANCE_MATRIX.md` to ✅ for the feature, either via the promotion trigger or manually before merge.
+## Documentation
+
+**For complete details, see:**
+
+- **[Full Directory Structure](docs/architecture/directory_structure.md)** — Detailed repo map, policies, promotion workflow
+- **[FEATURES_GUIDE.md](FEATURES_GUIDE.md)** — Feature sandbox workflow
+- **[ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md)** — Quality gates
 
 ---
 
-## 5. CI Enforcement
-- `.github/workflows/feature-promote.yml` checks:
-  - `TODO.md` status → PROMOTED
-  - `docs/**` updated
-  - tests present
-  - imports validated
-- `.github/workflows/doc-policy.yml` also runs `tools/check-acceptance-matrix.py` to block promotion if a production feature lacks a ✅ entry.
-
----
-
-## 6. Stable vs Experimental
-
-| Zone | Status | Policy |
-|------|---------|--------|
-| `/apps`, `/workers`, `/packages`, `/db`, `/config`, `/docs` | **Stable** | protected |
-| `/FEATURES` | **Experimental** | TTL + CI gating |
-| `/agents`, `/mcps` | **Controlled** | schema-locked |
-| `/infra`, `/tools` | **Support** | low churn |
-
----
-
-## 7. Agent Update Hooks
-- Any file creation, deletion, or rename triggers **Codex** and **Claude** agents.
-- Agents automatically patch:
-  - `SOLUTION_ARCHITECTURE.md`
-  - `DIRECTORY_STRUCTURE.md`
-  - `PRD.md`
-  - `README.md`
-
-Hook defined in `/agents/playbooks/update-docs-on-change.yaml`.
-
----
-
-# Message to CODEX (configuration directive)
-
-> **To:** Codex system agent
-> **Subject:** Repo-wide doc synchronization rule
-> **Action:** Update configuration to maintain documentation parity.
-
----
-
-**Instruction**
-
-Codex, please configure the repository automation as follows:
-
-1. **Watch Paths**
-   - Any `add`, `delete`, or `rename` event under:
-     - `/apps/**`
-     - `/workers/**`
-     - `/packages/**`
-     - `/db/**`
-     - `/config/**`
-     - `/FEATURES/**`
-     - `/agents/**`
-     - `/mcps/**`
-     - `/docs/**`
-     - `/infra/**`
-     - `/tests/**`
-     - `/tools/**`
-
-2. **Trigger Playbook**
-   - Run: `agents/playbooks/update-docs-on-change.yaml`
-
-3. **Playbook Behavior**
-   - For each detected file change, open or update:
-     - `SOLUTION_ARCHITECTURE.md` → adjust affected components/paths
-     - `DIRECTORY_STRUCTURE.md` → update tree and descriptions
-     - `PRD.md` → mark feature addition/removal under “Core Features”
-     - `README.md` → reflect new or removed directories in “Repository Layout”
-   - Commit changes with message:
-     ```
-     docs(sync): auto-update architecture and directory docs after file change
-     ```
-
-4. **Claude Policy Alignment**
-   - Mirror this rule in `config/claude.policies.yaml` under `auto_doc_update: true`.
-   - Claude performs the same sync if Codex is inactive or unavailable.
-
-5. **Safety**
-   - No other files may be altered automatically.
-   - CI ensures all four files remain consistent with the live repo structure.
-
----
-
-**Outcome**
-
-Every structural change instantly refreshes the project’s high-level documentation.
-Codex and Claude stay aware of evolving architecture, keeping README, PRD, SolutionArchitecture, and DirectoryStructure perpetually in sync.
+**Maintained by:** Screenalytics Engineering

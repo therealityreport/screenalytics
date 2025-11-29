@@ -1,0 +1,41 @@
+# Identity clustering configuration
+# Controls how face tracks are grouped into identities
+
+# Agglomerative clustering settings
+cluster_thresh: 0.58  # Cosine similarity threshold (0.0-1.0, higher = stricter)
+                      # Balanced: 0.58, Loose: 0.50, Strict: 0.70
+                      # Converted to distance: dist = 1 - similarity
+
+min_cluster_size: 1   # Minimum tracks per cluster (1 = allow singletons)
+                      # Set higher to filter out brief appearances
+
+# Outlier filtering
+min_identity_sim: 0.50  # Minimum similarity to cluster centroid
+                        # Tracks below this are ejected as outliers
+
+# Track prototype selection
+# (How to aggregate multiple face embeddings per track)
+track_prototype:
+  max_samples: 6        # Maximum face samples to use per track
+  sim_delta: 0.08       # Similarity threshold for filtering bad samples
+  sim_min: 0.60         # Minimum similarity to prototype
+
+# Cluster metrics thresholds (for guardrails)
+metrics_thresholds:
+  max_singleton_fraction: 0.50    # Warn if > 50% of identities are singletons
+  max_largest_cluster_fraction: 0.60  # Warn if one cluster has > 60% of tracks
+  min_cluster_count: 3            # Warn if < 3 identities found
+  max_cluster_count: 50           # Warn if > 50 identities (possible over-segmentation)
+
+# Second-stage singleton merge (optional) for high-singleton runs
+singleton_merge:
+  enabled: true
+  trigger_singleton_frac: 0.60       # Only run merge if >= this singleton fraction
+  similarity_thresh: 0.62            # Looser cosine similarity threshold for merging singletons
+  fallback_delta: 0.05               # If similarity_thresh missing, use primary - delta
+  neighbor_top_k: 20                 # Candidate neighbors per singleton (top-K by similarity)
+  min_tracks_per_merged_cluster: 2   # Require at least this many tracks in a merged cluster
+  max_singleton_merge_iters: 1       # Avoid unbounded reclustering loops
+
+# Description
+description: "Balanced clustering settings for TV show episodes"

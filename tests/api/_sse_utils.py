@@ -9,6 +9,10 @@ from py_screenalytics.artifacts import ensure_dirs, get_path
 def write_sample_tracks(ep_id: str, sample_count: int = 5) -> None:
     """Create a minimal tracks.jsonl with a handful of sampled faces."""
     ensure_dirs(ep_id)
+    video_path = get_path(ep_id, "video")
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    if not video_path.exists():
+        video_path.write_bytes(b"fake-video")
     manifests_dir = get_path(ep_id, "detections").parent
     tracks_path = manifests_dir / "tracks.jsonl"
     tracks_path.parent.mkdir(parents=True, exist_ok=True)

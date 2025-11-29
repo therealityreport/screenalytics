@@ -9,6 +9,9 @@ class _FakeStorage:
     def __init__(self) -> None:
         self._calls = []
 
+    def video_object_key_v2(self, show_slug: str, season: int, episode: int) -> str:
+        return f"raw/videos/{show_slug}/s{season:02d}/e{episode:02d}/episode.mp4"
+
     def presign_episode_video(self, ep_id: str, **_) -> PresignedUpload:
         self._calls.append(ep_id)
         return PresignedUpload(

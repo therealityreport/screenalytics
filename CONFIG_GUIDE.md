@@ -1,57 +1,130 @@
-# CONFIG_GUIDE.md — Screenalytics
+# Configuration Guide — Screenalytics
 
-Version: 1.0
+**Quick Reference** | [Full Documentation →](docs/reference/config/pipeline_configs.md)
 
-## Files
-- `config/pipeline/detection.yaml` — RetinaFace ids, thresholds
-- `config/pipeline/tracking.yaml` — ByteTrack params
-- `config/pipeline/recognition.yaml` — ArcFace model id, similarity_th, hysteresis
-- `config/pipeline/audio.yaml` — diarization/asr settings
-- `config/pipeline/screen_time_v2.yaml` — DAG toggles and stage order
-- `config/storage.yaml` — buckets, prefixes, lifecycle rules
-- `config/services.yaml` — external endpoints/timeouts
-- `config/codex.config.toml` — models, MCP servers, write policies
-- `config/agents/policies.yaml` + `config/claude.policies.yaml` — doc/write rules
+---
 
-## Screen time presets
-- `config/pipeline/screen_time_v2.yaml` now exposes `screen_time_presets` with a default `bravo_default` profile for track-based aggregation plus a stricter fallback.
-- Update the `preset` key (or pass `--preset` / API overrides) to switch between presets without editing code.
-- Each preset can set `quality_min`, `gap_tolerance_s`, `screen_time_mode`, `edge_padding_s`, `track_coverage_min`, and `use_video_decode`; keep unrelated flows (facebank, embeddings) on their own presets if the thresholds diverge.
+## Overview
 
-## Conventions
-- All thresholds and ids configured here; no magic numbers in code.
-- Code reads configs via helper `packages/py-screenalytics/config.py` with override support.
-- Promotion PR must include config diffs and doc updates.
+All pipeline behavior is **config-driven** (no hardcoded thresholds). Configs live in `config/pipeline/*.yaml`.
 
-## RetinaFace health + downloads
-- The API now calls `tools.episode_run.ensure_retinaface_ready()` on startup and before facebank seed uploads. If InsightFace models are missing it serves a WARN banner (`detector="simulated"`) and the Streamlit Cast page shows a yellow notice.
-- Install the InsightFace bundle and warm up the Buffalo-L profile once per machine to fetch RetinaFace + ArcFace weights:
+---
 
-```bash
-pip install -U insightface onnxruntime opencv-python
-python - <<'PY'
-from insightface.app import FaceAnalysis
-FaceAnalysis(name="buffalo_l").prepare(ctx_id=0, det_size=(640, 640))
-print("RetinaFace ready")
-PY
+## Key Configuration Files
+
+| File | Purpose | Key Parameters |
+|------|---------|----------------|
+| **detection.yaml** | RetinaFace detection | `min_size`, `confidence_th`, `iou_th`, `nms_mode` |
+| **tracking.yaml** | ByteTrack association | `track_thresh`, `match_thresh`, `track_buffer`, `gate_enabled` |
+| **faces_embed_sampling.yaml** | Face quality gating | `min_quality`, `max_crops_per_track`, `sampling_mode` |
+| **performance_profiles.yaml** | Device-aware profiles | `low_power`, `balanced`, `high_accuracy` |
+| **screen_time_v2.yaml** | Screentime aggregation | `quality_min`, `gap_tolerance_s`, `track_coverage_min` |
+
+---
+
+## Performance Profiles
+
+Pre-configured profiles for common hardware (used by the API to choose defaults). `tools/episode_run.py`
+does **not** accept `--profile`; pass explicit `--stride`/`--fps` or call the API with `profile`
+to apply these presets.
+
+```yaml
+# config/pipeline/performance_profiles.yaml
+
+low_power:
+  # For fanless devices (MacBook Air, low-power)
+  frame_stride: 8
+  detection_fps_limit: 8
+  min_size: 120
+  cpu_threads: 2
+
+balanced:
+  # Standard local dev
+  frame_stride: 5
+  detection_fps_limit: 24
+  min_size: 90
+
+high_accuracy:
+  # GPU production
+  frame_stride: 1
+  detection_fps_limit: 30
+  min_size: 64
+
+# Compatibility: API maps profile="fast_cpu" to low_power for legacy clients.
 ```
 
-- When running completely offline, copy the downloaded `~/.insightface/models/buffalo_l` directory into your build image or shared cache before launching the API.
+**Usage:**
+```bash
+# CLI: pass explicit stride/FPS (mirrors "balanced")
+python tools/episode_run.py --ep-id <ep_id> --video <path> --stride 5 --fps 24
 
-## Facebank seed derivatives
-- Use `SEED_DISPLAY_SIZE`/`SEED_EMBED_SIZE` to control the square crops written during `/cast/{cast_id}/seeds/upload`. Defaults are `512` (display) and `112` (ArcFace input) and must stay >= 64.
-- `SEED_DISPLAY_FORMAT` and `SEED_EMBED_FORMAT` accept `png|jpg`. The default is `png` for lossless UI thumbnails; set to `jpg` only when bandwidth or storage is constrained.
-- `SEED_JPEG_QUALITY` is applied whenever a derivative is stored as JPEG (default `92`).
-- `SEED_DISPLAY_MIN`/`SEED_DISPLAY_MAX` bound the aspect-preserving resize for the display derivative. Uploads larger than `SEED_DISPLAY_MAX` are clamped down; smaller uploads are never upscaled beyond their original size.
-- `FACEBANK_KEEP_ORIG=1` persists the uploaded original (post EXIF transpose) so future re-crops/backfills can regenerate higher quality displays without asking the user to re-upload.
-- Changing any of the above will alter the derivative filenames (`*_d.<ext>` / `*_e.<ext>`). Run the facebank refresh job after changing formats so cached presigns and the UI rebuild using the new extensions.
-- `/jobs/facebank/backfill_display` will regenerate missing or <=128 px displays (preferring the saved original, falling back to the embed crop and marking it `low_res=true` when no better source exists).
+# API: include a profile name to apply defaults server-side
+POST /jobs/detect_track { "ep_id": "...", "profile": "balanced" }
+```
 
-## Stub jobs
+---
 
-## Codex Actions (CI)
-- Required secret: add `OPENAI_API_KEY` in GitHub > Settings > Secrets and variables > Actions.
-- Workflows:
-  - `.github/workflows/on-push-doc-sync.yml` — runs Codex playbook to sync docs on push.
-  - `.github/workflows/codex-manual.yml` — run Codex on demand via the Actions tab.
-- Manual run: choose `codex-manual` workflow, set `mode` to `prompt` (enter freeform text) or `playbook` (e.g. `agents/playbooks/update-docs-on-change.yaml`).
+## Common Knobs
+
+### Detection
+- **`min_size`**: Minimum face size (pixels). Lower = more faces, slower.
+  - CPU safe: `120`
+  - Balanced: `90`
+  - Max recall: `64`
+
+- **`confidence_th`**: Detection threshold. Lower = more faces, more false positives.
+  - Safe: `0.8`
+  - Balanced: `0.7`
+  - Aggressive: `0.6`
+
+### Tracking
+- **`track_thresh`**: Min confidence to track. Lower = more tracks, more noise.
+  - Safe: `0.75`
+  - Balanced: `0.70`
+  - Permissive: `0.65`
+
+- **`track_buffer`**: Frames to keep track alive. Higher = fewer ID switches, longer tracks.
+  - Short: `60` (~2 sec)
+  - Balanced: `90` (~3 sec)
+  - Long: `120` (~4 sec)
+
+### Embedding
+- **`min_quality`**: Combined quality threshold. Higher = fewer but better faces.
+  - Permissive: `0.6`
+  - Balanced: `0.7`
+  - Strict: `0.8`
+
+- **`max_crops_per_track`**: Limit crops per track.
+  - Fast: `20`
+  - Balanced: `50`
+  - Max recall: `100`
+
+### Clustering
+- **`cluster_thresh`**: Cosine similarity threshold. Lower = more clusters.
+  - Loose: `0.50`
+  - Balanced: `0.58`
+  - Strict: `0.70`
+
+---
+
+## Configuration Override Precedence
+
+1. **CLI args** (highest): `--stride 3`
+2. **Environment variables**: `TRACK_THRESH=0.75`
+3. **Profile-specific**: `performance_profiles.yaml:balanced`
+4. **Stage-specific**: `tracking.yaml`, `detection.yaml`
+5. **Default values** (lowest): Hardcoded
+
+---
+
+## Documentation
+
+**For complete details, see:**
+
+- **[Pipeline Configs Reference](docs/reference/config/pipeline_configs.md)** — Key-by-key documentation
+- **[Performance Tuning](docs/ops/performance_tuning_faces_pipeline.md)** — Speed vs accuracy tuning
+- **[Pipeline Overview](docs/pipeline/overview.md)** — How configs affect each stage
+
+---
+
+**Maintained by:** Screenalytics Engineering

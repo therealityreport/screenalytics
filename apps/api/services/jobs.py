@@ -3,17 +3,48 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+try:
+    import psutil  # type: ignore
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _PSUTIL_AVAILABLE = False
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _find_project_root() -> Path:
+    """Find the SCREENALYTICS project root directory.
+
+    Uses marker files (pyproject.toml, .git) to reliably locate the root,
+    regardless of how the module was imported or from what working directory.
+    """
+    # Start from this file's location
+    current = Path(__file__).resolve().parent
+
+    # Walk up looking for project markers
+    for parent in [current] + list(current.parents):
+        if (parent / "pyproject.toml").exists() or (parent / ".git").exists():
+            return parent
+
+    # Fallback to parent count (apps/api/services/jobs.py -> SCREENALYTICS)
+    return Path(__file__).resolve().parents[3]
+
+
+# Compute once at module load time for reliability
+PROJECT_ROOT = _find_project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
@@ -34,6 +65,112 @@ _SCENE_DETECTOR_ENV = os.getenv("SCENE_DETECTOR", "pyscenedetect").strip().lower
 if _SCENE_DETECTOR_ENV not in SCENE_DETECTOR_CHOICES:
     _SCENE_DETECTOR_ENV = "pyscenedetect"
 SCENE_DETECTOR_DEFAULT = getattr(episode_run, "SCENE_DETECTOR_DEFAULT", _SCENE_DETECTOR_ENV)
+try:
+    _CPULIMIT_PERCENT = int(os.environ.get("SCREENALYTICS_CPULIMIT_PERCENT", "250"))
+except ValueError:
+    _CPULIMIT_PERCENT = 0
+
+# ─── Performance Profile Configuration ──────────────────────────────────────
+PROFILE_DEFAULTS = {
+    "low_power": {
+        "frame_stride": 12,
+        "detection_fps_limit": 15.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 2,
+    },
+    "balanced": {
+        "frame_stride": 6,
+        "detection_fps_limit": 24.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 4,
+    },
+    "performance": {
+        "frame_stride": 4,
+        "detection_fps_limit": 30.0,
+        "save_frames": False,
+        "save_crops": True,
+        "cpu_threads": 8,
+    },
+}
+
+DEVICE_DEFAULT_PROFILE = {
+    "coreml": "low_power",
+    "mps": "low_power",
+    "cpu": "low_power",
+    "cuda": "balanced",
+    "auto": "balanced",
+}
+
+
+def default_profile_for_device(device: str | None, resolved_device: str | None = None) -> str:
+    """Return the default performance profile for a given device type."""
+    # Prefer resolved device if available
+    check_device = resolved_device or device
+    if not check_device:
+        return "balanced"
+    normalized = str(check_device).strip().lower()
+    return DEVICE_DEFAULT_PROFILE.get(normalized, "balanced")
+
+
+def load_performance_profile(profile_value: str | None) -> dict:
+    """Load performance profile configuration by name."""
+    if not profile_value:
+        return PROFILE_DEFAULTS.get("balanced", {})
+    normalized = str(profile_value).strip().lower()
+    return PROFILE_DEFAULTS.get(normalized, PROFILE_DEFAULTS.get("balanced", {}))
+
+
+def _maybe_wrap_with_cpulimit(command: list[str]) -> list[str]:
+    """Prefix detect jobs with cpulimit when configured.
+    
+    Logs a warning if SCREANALYTICS_CPULIMIT_PERCENT is set but cpulimit
+    binary is unavailable, so operators know the CPU cap is not enforced.
+    """
+    if _CPULIMIT_PERCENT <= 0:
+        return command
+    binary = shutil.which("cpulimit")
+    if not binary:
+        LOGGER.warning(
+            "SCREANALYTICS_CPULIMIT_PERCENT=%d is set but 'cpulimit' binary not found. "
+            "CPU usage will NOT be capped. Install cpulimit (brew install cpulimit / apt install cpulimit) "
+            "or the process will use fallback CPU affinity if psutil is available.",
+            _CPULIMIT_PERCENT,
+        )
+        return command
+    return [binary, "-l", str(_CPULIMIT_PERCENT), "-i", "--", *command]
+
+
+def _apply_cpu_affinity_fallback(pid: int, limit_percent: int) -> None:
+    """Apply CPU affinity as fallback when cpulimit is not available.
+
+    Uses psutil to restrict the process to a subset of available CPUs
+    proportional to the requested CPU limit percentage.
+    """
+    if not _PSUTIL_AVAILABLE:
+        LOGGER.debug("psutil not available; CPU affinity fallback skipped for pid %d", pid)
+        return
+
+    try:
+        proc = psutil.Process(pid)
+        cpu_count = psutil.cpu_count()
+        if cpu_count is None or cpu_count <= 1:
+            return
+
+        # Calculate how many CPUs to use based on limit percentage
+        # e.g., 250% with 8 cores -> use min(3, 8) = 3 cores
+        cores_to_use = max(1, min(cpu_count, int(math.ceil(limit_percent / 100.0))))
+
+        # Set affinity to first N cores
+        affinity_list = list(range(cores_to_use))
+        proc.cpu_affinity(affinity_list)
+        LOGGER.debug(
+            "Applied CPU affinity fallback for pid %d: using %d of %d cores",
+            pid, cores_to_use, cpu_count
+        )
+    except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError) as exc:
+        LOGGER.debug("CPU affinity fallback failed for pid %d: %s", pid, exc)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -162,7 +299,7 @@ class JobService:
 
     # ------------------------------------------------------------------
     def _now(self) -> str:
-        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"
@@ -228,13 +365,19 @@ class JobService:
         env = os.environ.copy()
         # Open stderr log for subprocess (will be closed automatically when process exits)
         stderr_file = open(stderr_log_path, "w", encoding="utf-8")  # noqa: SIM115
+        effective_command = _maybe_wrap_with_cpulimit(command)
         proc = subprocess.Popen(
-            command,
+            effective_command,
             cwd=str(PROJECT_ROOT),
             env=env,
             stderr=stderr_file,
             stdout=subprocess.DEVNULL,  # Stdout goes to progress.json via ProgressEmitter
         )  # noqa: S603
+        
+        # Apply CPU affinity fallback if cpulimit wrapper wasn't applied
+        if _CPULIMIT_PERCENT > 0 and effective_command == command:
+            # cpulimit wasn't available, try psutil affinity fallback
+            _apply_cpu_affinity_fallback(proc.pid, _CPULIMIT_PERCENT)
 
         record: JobRecord = {
             "job_id": job_id,
@@ -246,7 +389,7 @@ class JobService:
             "ended_at": None,
             "progress_file": str(progress_path),
             "stderr_log": str(stderr_log_path),
-            "command": command,
+            "command": effective_command,
             "requested": requested,
             "summary": None,
             "error": None,
@@ -295,7 +438,7 @@ class JobService:
             raise FileNotFoundError(f"Episode video not found: {video_path}")
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
-        self.ensure_retinaface_ready(detector_value, device, det_thresh)
+        resolved_detect_device = self.ensure_retinaface_ready(detector_value, device, det_thresh)
         progress_path = self._progress_path(ep_id)
         scene_detector_value = self._normalize_scene_detector(scene_detector)
         scene_min_len = max(int(scene_min_len), 1)
@@ -346,6 +489,7 @@ class JobService:
             "stride": stride,
             "fps": fps,
             "device": device,
+            "resolved_detect_device": resolved_detect_device or device,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -384,7 +528,7 @@ class JobService:
         if not track_path.exists():
             raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
         device_value = device or "auto"
-        self.ensure_arcface_ready(device_value)
+        resolved_embed_device = self.ensure_arcface_ready(device_value)
         progress_path = self._progress_path(ep_id)
         command = [
             sys.executable,
@@ -407,6 +551,7 @@ class JobService:
         command += ["--thumb-size", str(thumb_size)]
         requested = {
             "device": device_value,
+            "resolved_embed_device": resolved_embed_device or device_value,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -494,6 +639,9 @@ class JobService:
         detector_value = self._normalize_detector(detector)
         tracker_value = self._normalize_tracker(tracker)
         scene_detector_value = self._normalize_scene_detector(scene_detector)
+        resolved_detect_device = self.ensure_retinaface_ready(detector_value, device, det_thresh)
+        embed_device_value = embed_device or device
+        resolved_embed_device = self.ensure_arcface_ready(embed_device_value)
         progress_path = self._progress_path(ep_id)
         command: List[str] = [
             sys.executable,
@@ -509,7 +657,7 @@ class JobService:
             "--device",
             device,
             "--embed-device",
-            embed_device or device,
+            embed_device_value,
             "--detector",
             detector_value,
             "--tracker",
@@ -555,7 +703,9 @@ class JobService:
             "stride": stride,
             "fps": fps,
             "device": device,
-            "embed_device": embed_device,
+            "resolved_detect_device": resolved_detect_device or device,
+            "embed_device": embed_device_value,
+            "resolved_embed_device": resolved_embed_device or embed_device_value,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -805,34 +955,34 @@ class JobService:
         detector: str,
         device: str,
         det_thresh: float | None,
-    ) -> None:
+    ) -> str | None:
         if detector != "retinaface":
-            return
+            return None
         if episode_run is None:
             raise ValueError(
                 "RetinaFace validation unavailable: install the ML stack (pip install -r requirements-ml.txt) "
                 "before running RetinaFace."
             )
-        ok, error_detail, _ = episode_run.ensure_retinaface_ready(
+        ok, error_detail, resolved = episode_run.ensure_retinaface_ready(
             device,
             det_thresh if det_thresh is not None else None,
         )
         if ok:
-            return
+            return resolved
         message = episode_run.RETINAFACE_HELP
         if error_detail:
             message = f"{message} ({error_detail})"
         raise ValueError(message)
 
-    def ensure_arcface_ready(self, device: str) -> None:
+    def ensure_arcface_ready(self, device: str) -> str | None:
         if episode_run is None:
             raise ValueError(
                 "ArcFace validation unavailable: install the ML stack (pip install -r requirements-ml.txt) "
                 "before running face embedding."
             )
-        ok, error_detail, _ = episode_run.ensure_arcface_ready(device)
+        ok, error_detail, resolved = episode_run.ensure_arcface_ready(device)
         if ok:
-            return
+            return resolved
         message = getattr(
             episode_run,
             "ARC_FACE_HELP",

@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 from typing import Any, List, Literal
 
@@ -47,6 +48,8 @@ SCENE_MIN_LEN_DEFAULT = getattr(jobs_service, "SCENE_MIN_LEN_DEFAULT", 12)
 SCENE_WARMUP_DETS_DEFAULT = getattr(jobs_service, "SCENE_WARMUP_DETS_DEFAULT", 3)
 DEFAULT_CLUSTER_SIMILARITY = float(os.getenv("SCREENALYTICS_CLUSTER_SIM", "0.7"))
 MIN_IDENTITY_SIMILARITY = float(os.getenv("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
+DEFAULT_JPEG_QUALITY = int(os.getenv("SCREENALYTICS_JPEG_QUALITY", "72"))
+DEFAULT_MIN_FRAMES_BETWEEN_CROPS = int(os.getenv("SCREENALYTICS_MIN_FRAMES_BETWEEN_CROPS", "32"))
 CLEANUP_ACTIONS = ("split_tracks", "reembed", "recluster", "group_clusters")
 CleanupAction = Literal["split_tracks", "reembed", "recluster", "group_clusters"]
 
@@ -81,12 +84,26 @@ async def _reject_legacy_payload(request: Request) -> None:
         raise HTTPException(status_code=400, detail="Stub mode is not supported.")
 
 
+DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
+PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "high_accuracy"]
+
+
 class DetectRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
     video: str = Field(..., description="Source video path or URL")
-    stride: int = Field(5, description="Frame stride for detection sampling")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Overrides stride/FPS/min_size defaults.",
+    )
+    stride: int = Field(
+        4,
+        description="Frame stride for detection sampling (default 4 aligns with detect+track 42-minute runs)",
+    )
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    device: DEVICE_LITERAL = Field(
+        "auto",
+        description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
+    )
 
 
 class TrackRequest(BaseModel):
@@ -95,12 +112,24 @@ class TrackRequest(BaseModel):
 
 class DetectTrackRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stride: int = Field(4, description="Frame stride for detection sampling")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Overrides stride/FPS/min_size defaults.",
+    )
+    stride: int = Field(6, description="Frame stride for detection sampling (default: 6)")
     fps: float | None = Field(None, description="Optional target FPS for sampling")
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Execution device")
+    device: DEVICE_LITERAL = Field(
+        "auto",
+        description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
+    )
     save_frames: bool = Field(False, description="Sample full-frame JPGs to S3/local frames root")
     save_crops: bool = Field(False, description="Save per-track crops (requires tracks)")
-    jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for frame/crop exports")
+    jpeg_quality: int = Field(
+        DEFAULT_JPEG_QUALITY,
+        ge=1,
+        le=100,
+        description="JPEG quality for frame/crop exports",
+    )
     detector: str = Field(
         DEFAULT_DETECTOR_ENV,
         description="Face detector backend (retinaface)",
@@ -157,25 +186,51 @@ class DetectTrackRequest(BaseModel):
         ge=0.0,
         description="Optional ByteTrack min_box_area override",
     )
+    cpu_threads: int | None = Field(
+        None,
+        ge=1,
+        le=16,
+        description="CPU thread limit for ML libraries (OMP, MKL, etc.)",
+    )
 
 
 class FacesEmbedRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
+    profile: PROFILE_LITERAL | None = Field(
         None,
-        description="Execution device (defaults to server auto-detect)",
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Controls quality gating and sampling.",
+    )
+    device: DEVICE_LITERAL | None = Field(
+        None,
+        description="Execution device (auto→CUDA→CoreML→CPU; accepts coreml/metal/apple aliases)",
     )
     save_frames: bool = Field(False, description="Export sampled frames alongside crops")
     save_crops: bool = Field(False, description="Export crops to data/frames + S3")
-    jpeg_quality: int = Field(85, ge=1, le=100, description="JPEG quality for face crops")
+    jpeg_quality: int = Field(DEFAULT_JPEG_QUALITY, ge=1, le=100, description="JPEG quality for face crops")
+    min_frames_between_crops: int = Field(
+        DEFAULT_MIN_FRAMES_BETWEEN_CROPS,
+        ge=1,
+        le=1000,
+        description="Minimum frame gap between successive crops on the same track",
+    )
     thumb_size: int = Field(256, ge=64, le=512, description="Square thumbnail size")
+    cpu_threads: int | None = Field(
+        None,
+        ge=1,
+        le=16,
+        description="CPU thread limit for ML libraries (OMP, MKL, etc.)",
+    )
 
 
 class ClusterRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    device: Literal["auto", "cpu", "mps", "cuda"] | None = Field(
+    profile: PROFILE_LITERAL | None = Field(
         None,
-        description="Execution device (defaults to server auto-detect)",
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Controls clustering thresholds.",
+    )
+    device: DEVICE_LITERAL | None = Field(
+        None,
+        description="Execution device (defaults to server auto-detect with CUDA/CoreML fallbacks)",
     )
     cluster_thresh: float = Field(
         DEFAULT_CLUSTER_SIMILARITY,
@@ -194,17 +249,21 @@ class ClusterRequest(BaseModel):
 
 class CleanupJobRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
-    stride: int = Field(3, ge=1, le=50)
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile (fast_cpu/low_power/balanced/high_accuracy). Applies to all cleanup stages.",
+    )
+    stride: int = Field(4, ge=1, le=50)
     fps: float | None = Field(None, ge=0.0)
-    device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Detect/track device")
-    embed_device: Literal["auto", "cpu", "mps", "cuda"] = Field("auto", description="Faces embed device")
+    device: DEVICE_LITERAL = Field("auto", description="Detect/track device (auto→CUDA→CoreML→CPU)")
+    embed_device: DEVICE_LITERAL = Field("auto", description="Faces embed device (supports coreml/metal/apple alias)")
     detector: str = Field(DEFAULT_DETECTOR_ENV, description="Detector backend (retinaface)")
     tracker: str = Field(DEFAULT_TRACKER_ENV, description="Tracker backend")
     max_gap: int = Field(30, ge=1, le=240)
     det_thresh: float | None = Field(None, ge=0.0, le=1.0)
     save_frames: bool = False
     save_crops: bool = False
-    jpeg_quality: int = Field(85, ge=50, le=100)
+    jpeg_quality: int = Field(DEFAULT_JPEG_QUALITY, ge=50, le=100)
     scene_detector: Literal[SCENE_DETECTOR_CHOICES] = Field(SCENE_DETECTOR_DEFAULT)
     scene_threshold: float = Field(SCENE_THRESHOLD_DEFAULT, ge=0.0)
     scene_min_len: int = Field(SCENE_MIN_LEN_DEFAULT, ge=1)
@@ -244,13 +303,23 @@ def _artifact_summary(ep_id: str) -> dict:
 
 
 def _validate_episode_ready(ep_id: str) -> Path:
-    record = EPISODE_STORE.get(ep_id)
-    if not record:
-        raise HTTPException(
-            status_code=400,
-            detail="Episode not tracked yet; create it via /episodes/upsert_by_id.",
-        )
     video_path = get_path(ep_id, "video")
+    flat_video_path = video_path.parent.parent / f"{ep_id}.mp4"
+    record = EPISODE_STORE.get(ep_id)
+    if not record and not video_path.exists() and flat_video_path.exists():
+        try:
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(flat_video_path, video_path)
+            LOGGER.info("Mirrored %s into canonical episode path %s", flat_video_path, video_path)
+        except OSError:
+            video_path = flat_video_path
+        try:
+            EPISODE_STORE.upsert_ep_id(ep_id=ep_id, show_slug=ep_id, season=0, episode=0)
+        except Exception as exc:
+            LOGGER.debug("Failed to upsert ep_id=%s into EpisodeStore during validation: %s", ep_id, exc)
+            record = None
+        else:
+            record = EPISODE_STORE.get(ep_id)
     if not video_path.exists():
         raise HTTPException(
             status_code=400,
@@ -305,22 +374,105 @@ def _normalize_scene_detector(scene_detector: str | None) -> str:
     return value
 
 
+def _coerce_cpu_threads(value: Any) -> int | None:
+    try:
+        threads = int(value)
+    except (TypeError, ValueError):
+        return None
+    if threads < 1:
+        return None
+    return min(threads, 16)
+
+
+def _resolve_detect_track_inputs(req: DetectTrackRequest, resolved_device: str | None) -> dict[str, Any]:
+    """Apply profile defaults (including laptop low_power) to detect/track inputs."""
+
+    fields_set = getattr(req, "__fields_set__", set())
+    profile_value = req.profile or jobs_service.default_profile_for_device(req.device, resolved_device)
+    if profile_value == "fast_cpu":
+        profile_value = "low_power"
+    profile_cfg = jobs_service.load_performance_profile(profile_value) if profile_value else {}
+
+    stride_value = req.stride
+    if "stride" not in fields_set and profile_cfg.get("frame_stride"):
+        try:
+            stride_value = max(int(profile_cfg["frame_stride"]), 1)
+        except (TypeError, ValueError):
+            stride_value = req.stride
+
+    fps_value = req.fps if req.fps and req.fps > 0 else None
+    if fps_value is None:
+        fps_raw = profile_cfg.get("detection_fps_limit") or profile_cfg.get("max_fps")
+        try:
+            fps_numeric = float(fps_raw)
+        except (TypeError, ValueError):
+            fps_numeric = None
+        if fps_numeric and fps_numeric > 0:
+            fps_value = fps_numeric
+
+    save_frames_value = req.save_frames
+    if "save_frames" not in fields_set and "save_frames" in profile_cfg:
+        save_frames_value = bool(profile_cfg.get("save_frames"))
+
+    save_crops_value = req.save_crops
+    if "save_crops" not in fields_set and "save_crops" in profile_cfg:
+        save_crops_value = bool(profile_cfg.get("save_crops"))
+
+    cpu_threads_value = req.cpu_threads
+    if cpu_threads_value is None:
+        cpu_threads_value = _coerce_cpu_threads(profile_cfg.get("cpu_threads"))
+
+    return {
+        "profile": profile_value,
+        "profile_cfg": profile_cfg,
+        "stride": stride_value,
+        "fps": fps_value,
+        "save_frames": save_frames_value,
+        "save_crops": save_crops_value,
+        "cpu_threads": cpu_threads_value,
+    }
+
+
 def _build_detect_track_command(
     req: DetectTrackRequest,
     video_path: Path,
     progress_path: Path,
-    detector_value: str,
-    tracker_value: str,
-    det_thresh: float | None,
-    scene_detector: str,
-    scene_threshold: float,
-    scene_min_len: int,
-    scene_warmup_dets: int,
-    track_high_thresh: float | None,
-    new_track_thresh: float | None,
-    track_buffer: int | None,
-    min_box_area: float | None,
+    detector_value: str | None = None,
+    tracker_value: str | None = None,
+    det_thresh: float | None = None,
+    scene_detector: str | None = None,
+    scene_threshold: float | None = None,
+    scene_min_len: int | None = None,
+    scene_warmup_dets: int | None = None,
+    track_high_thresh: float | None = None,
+    new_track_thresh: float | None = None,
+    track_buffer: int | None = None,
+    min_box_area: float | None = None,
+    device_value: str | None = None,
+    stride_override: int | None = None,
+    fps_override: float | None = None,
+    save_frames: bool | None = None,
+    save_crops: bool | None = None,
+    profile_name: str | None = None,
 ) -> List[str]:
+    detector_value = _normalize_detector(detector_value or req.detector)
+    tracker_value = _normalize_tracker(tracker_value or req.tracker)
+    device_value = device_value or req.device or "auto"
+    scene_detector = _normalize_scene_detector(scene_detector or req.scene_detector)
+    scene_threshold = scene_threshold if scene_threshold is not None else req.scene_threshold
+    scene_min_len = scene_min_len if scene_min_len is not None else req.scene_min_len
+    scene_warmup_dets = scene_warmup_dets if scene_warmup_dets is not None else req.scene_warmup_dets
+    det_thresh_value = det_thresh if det_thresh is not None else req.det_thresh
+    track_high_thresh = track_high_thresh if track_high_thresh is not None else req.track_high_thresh
+    new_track_thresh = new_track_thresh if new_track_thresh is not None else req.new_track_thresh
+    track_buffer = track_buffer if track_buffer is not None else req.track_buffer
+    min_box_area = min_box_area if min_box_area is not None else req.min_box_area
+    stride_value = stride_override if stride_override is not None else req.stride
+    fps_value = fps_override if fps_override is not None else req.fps
+    save_frames_value = req.save_frames if save_frames is None else bool(save_frames)
+    save_crops_value = req.save_crops if save_crops is None else bool(save_crops)
+    profile_value = profile_name if profile_name is not None else req.profile
+
     command: List[str] = [
         sys.executable,
         str(PROJECT_ROOT / "tools" / "episode_run.py"),
@@ -329,19 +481,21 @@ def _build_detect_track_command(
         "--video",
         str(video_path),
         "--stride",
-        str(req.stride),
+        str(stride_value),
         "--device",
-        req.device,
+        device_value,
         "--progress-file",
         str(progress_path),
     ]
-    if req.fps is not None and req.fps > 0:
-        command += ["--fps", str(req.fps)]
-    if req.save_frames:
+    # Note: profile_value is used internally for stride/fps defaults,
+    # but episode_run.py doesn't accept --profile as a command line argument
+    if fps_value is not None and fps_value > 0:
+        command += ["--fps", str(fps_value)]
+    if save_frames_value:
         command.append("--save-frames")
-    if req.save_crops:
+    if save_crops_value:
         command.append("--save-crops")
-    if req.jpeg_quality and req.jpeg_quality != 85:
+    if req.jpeg_quality and req.jpeg_quality != DEFAULT_JPEG_QUALITY:
         command += ["--jpeg-quality", str(req.jpeg_quality)]
     command += ["--detector", detector_value]
     command += ["--tracker", tracker_value]
@@ -355,8 +509,8 @@ def _build_detect_track_command(
         command += ["--min-box-area", str(min_box_area)]
     if req.max_gap:
         command += ["--max-gap", str(req.max_gap)]
-    if det_thresh is not None:
-        command += ["--det-thresh", str(det_thresh)]
+    if det_thresh_value is not None:
+        command += ["--det-thresh", str(det_thresh_value)]
     command += ["--scene-detector", scene_detector]
     command += ["--scene-threshold", str(scene_threshold)]
     command += ["--scene-min-len", str(max(scene_min_len, 1))]
@@ -377,12 +531,18 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         "--progress-file",
         str(progress_path),
     ]
+    # Note: profile is used internally for defaults, but episode_run.py doesn't accept --profile
     if req.save_frames:
         command.append("--save-frames")
     if req.save_crops:
         command.append("--save-crops")
-    if req.jpeg_quality and req.jpeg_quality != 85:
+    if req.jpeg_quality and req.jpeg_quality != DEFAULT_JPEG_QUALITY:
         command += ["--jpeg-quality", str(req.jpeg_quality)]
+    if (
+        req.min_frames_between_crops
+        and req.min_frames_between_crops != DEFAULT_MIN_FRAMES_BETWEEN_CROPS
+    ):
+        command += ["--min-frames-between-crops", str(req.min_frames_between_crops)]
     if req.thumb_size and req.thumb_size != 256:
         command += ["--thumb-size", str(req.thumb_size)]
     return command
@@ -401,6 +561,7 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
         "--progress-file",
         str(progress_path),
     ]
+    # Note: profile is used internally for defaults, but episode_run.py doesn't accept --profile
     command += ["--cluster-thresh", str(req.cluster_thresh)]
     command += ["--min-cluster-size", str(req.min_cluster_size)]
     command += ["--min-identity-sim", str(req.min_identity_sim)]
@@ -430,13 +591,37 @@ def _count_lines(path: Path) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def _load_progress_payload(progress_path: Path | None) -> dict | None:
+    if not progress_path or not progress_path.exists():
+        return None
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _wants_sse(request: Request) -> bool:
     accept = (request.headers.get("accept") or "").lower()
     return "text/event-stream" in accept
 
 
-def _run_job_with_optional_sse(command: List[str], request: Request, progress_file: Path | None = None):
+def _run_job_with_optional_sse(
+    command: List[str], request: Request, progress_file: Path | None = None, cpu_threads: int | None = None
+):
     env = os.environ.copy()
+    # Apply CPU thread limits if specified
+    if cpu_threads is not None:
+        env["SCREANALYTICS_MAX_CPU_THREADS"] = str(cpu_threads)
+        env["SCREENALYTICS_MAX_CPU_THREADS"] = str(cpu_threads)
+        env["OMP_NUM_THREADS"] = str(cpu_threads)
+        env["MKL_NUM_THREADS"] = str(cpu_threads)
+        env["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+        env["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+        env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+        env["OPENCV_NUM_THREADS"] = str(cpu_threads)
+        env["ORT_INTRA_OP_NUM_THREADS"] = str(cpu_threads)
+        env["ORT_INTER_OP_NUM_THREADS"] = "1"  # Keep inter-op at 1 for stability
     if _wants_sse(request):
         generator = _stream_progress_command(command, env, request, progress_file=progress_file)
         return StreamingResponse(
@@ -656,8 +841,14 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
     scene_detector_value = _normalize_scene_detector(req.scene_detector)
+    resolved_device = req.device
     try:
-        JOB_SERVICE.ensure_retinaface_ready(detector_value, req.device, req.det_thresh)
+        if getattr(jobs_service, "episode_run", None) and hasattr(jobs_service.episode_run, "resolve_device"):
+            resolved_device = jobs_service.episode_run.resolve_device(req.device, LOGGER)  # type: ignore[attr-defined]
+    except Exception:
+        resolved_device = req.device
+    try:
+        JOB_SERVICE.ensure_retinaface_ready(detector_value, resolved_device, req.det_thresh)
     except ValueError as exc:
         # Model validation failed - provide actionable error message
         raise HTTPException(
@@ -681,16 +872,28 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
     except FileNotFoundError:
         # Missing progress files are normal when a prior run never started.
         pass
-    # Remove stale manifests before launching a new detect/track run
-    stale_paths = [get_path(req.ep_id, "detections"), get_path(req.ep_id, "tracks")]
+    # Remove downstream artifacts before launching a new detect/track run
+    # This ensures faces/cluster artifacts don't reference obsolete track IDs
+    # NOTE: detections.jsonl and tracks.jsonl are NOT deleted here - they are written
+    # atomically via temp files and will only be replaced on successful completion
+    manifests_dir = get_path(req.ep_id, "detections").parent
+    embeds_dir = manifests_dir.parent / "embeds" / req.ep_id
+    stale_paths = [
+        manifests_dir / "faces.jsonl",
+        manifests_dir / "identities.json",
+        embeds_dir / "faces.npy",
+        embeds_dir / "tracks.npy",
+        embeds_dir / "track_ids.json",
+    ]
     for stale_path in stale_paths:
         try:
             stale_path.unlink()
-            LOGGER.info("Removed stale artifact before rerun: %s", stale_path)
+            LOGGER.info("Removed stale artifact before detect/track rerun: %s", stale_path)
         except FileNotFoundError:
             continue
         except OSError as exc:
             LOGGER.warning("Failed to remove stale artifact %s: %s", stale_path, exc)
+    effective = _resolve_detect_track_inputs(req, resolved_device)
     command = _build_detect_track_command(
         req,
         video_path,
@@ -706,19 +909,39 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
         req.new_track_thresh,
         req.track_buffer,
         req.min_box_area,
+        resolved_device,
+        stride_override=effective["stride"],
+        fps_override=effective["fps"],
+        save_frames=effective["save_frames"],
+        save_crops=effective["save_crops"],
+        profile_name=effective["profile"],
     )
-    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
+    result = _run_job_with_optional_sse(
+        command,
+        request,
+        progress_file=progress_path,
+        cpu_threads=effective["cpu_threads"],
+    )
     if isinstance(result, StreamingResponse):
         return result
 
     detections_count = _count_lines(Path(artifacts["detections"]))
     tracks_count = _count_lines(Path(artifacts["tracks"]))
+    progress_payload = _load_progress_payload(progress_path) or {}
+    progress_resolved_device = progress_payload.get("resolved_device")
+    resolved_device_out = progress_resolved_device or resolved_device
 
     return {
         "job": "detect_track",
         "ep_id": req.ep_id,
         "command": command,
         "device": req.device,
+        "resolved_device": resolved_device_out,
+        "profile": effective["profile"],
+        "stride": effective["stride"],
+        "save_frames": effective["save_frames"],
+        "save_crops": effective["save_crops"],
+        "cpu_threads": effective["cpu_threads"],
         "detector": detector_value,
         "tracker": tracker_value,
         "scene_detector": scene_detector_value,
@@ -732,6 +955,7 @@ async def run_detect_track(req: DetectTrackRequest, request: Request):
 @router.post("/faces_embed")
 async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     await _reject_legacy_payload(request)
+    _validate_episode_ready(req.ep_id)
     track_path = get_path(req.ep_id, "tracks")
     if not track_path.exists():
         raise HTTPException(status_code=400, detail="tracks.jsonl not found; run detect/track first")
@@ -757,7 +981,7 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
         ) from exc
     progress_path = _progress_file_path(req.ep_id)
     command = _build_faces_command(req, progress_path)
-    result = _run_job_with_optional_sse(command, request, progress_file=progress_path)
+    result = _run_job_with_optional_sse(command, request, progress_file=progress_path, cpu_threads=req.cpu_threads)
     if isinstance(result, StreamingResponse):
         return result
 
@@ -765,10 +989,14 @@ async def run_faces_embed(req: FacesEmbedRequest, request: Request):
     faces_path = manifests_dir / "faces.jsonl"
     faces_count = _count_lines(faces_path)
     frames_dir = get_path(req.ep_id, "frames_root") / "frames"
+    progress_payload = _load_progress_payload(progress_path)
+    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
     return {
         "job": "faces_embed",
         "ep_id": req.ep_id,
         "faces_count": faces_count,
+        "device": device_value,
+        "resolved_device": resolved_device,
         "artifacts": {
             "faces": str(faces_path),
             "tracks": str(track_path),
@@ -803,11 +1031,15 @@ async def run_cluster(req: ClusterRequest, request: Request):
         except json.JSONDecodeError:
             # A partially written identities.json should not break the API response.
             pass
+    progress_payload = _load_progress_payload(progress_path)
+    resolved_device = progress_payload.get("resolved_device") if progress_payload else None
     return {
         "job": "cluster",
         "ep_id": req.ep_id,
         "identities_count": identities_count,
         "faces_count": faces_count,
+        "device": req.device or "auto",
+        "resolved_device": resolved_device,
         "artifacts": {
             "identities": str(identities_path),
             "faces": str(faces_path),
@@ -822,19 +1054,25 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
     await _reject_legacy_payload(request)
     artifacts = _artifact_summary(req.ep_id)
     video_path = _validate_episode_ready(req.ep_id)
-    fps_value = req.fps if req.fps and req.fps > 0 else None
     detector_value = _normalize_detector(req.detector)
     tracker_value = _normalize_tracker(req.tracker)
     scene_detector_value = _normalize_scene_detector(req.scene_detector)
+    resolved_device = req.device
+    try:
+        if getattr(jobs_service, "episode_run", None) and hasattr(jobs_service.episode_run, "resolve_device"):
+            resolved_device = jobs_service.episode_run.resolve_device(req.device, LOGGER)  # type: ignore[attr-defined]
+    except Exception:
+        resolved_device = req.device
+    effective = _resolve_detect_track_inputs(req, resolved_device)
     try:
         job = JOB_SERVICE.start_detect_track_job(
             ep_id=req.ep_id,
-            stride=req.stride,
-            fps=fps_value,
+            stride=effective["stride"],
+            fps=effective["fps"],
             device=req.device,
             video_path=video_path,
-            save_frames=req.save_frames,
-            save_crops=req.save_crops,
+            save_frames=effective["save_frames"],
+            save_crops=effective["save_crops"],
             jpeg_quality=req.jpeg_quality,
             detector=detector_value,
             tracker=tracker_value,
@@ -848,6 +1086,8 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             new_track_thresh=req.new_track_thresh,
             track_buffer=req.track_buffer,
             min_box_area=req.min_box_area,
+            # Note: profile and cpu_threads are used internally for stride/fps defaults
+            # but not passed to the job service (it uses the resolved values above)
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -946,6 +1186,7 @@ async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request
             thumb_size=req.thumb_size,
             actions=actions,
             write_back=req.write_back,
+            profile=req.profile,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1037,12 +1278,16 @@ def get_job_progress(job_id: str) -> dict:
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail="Job not found")
     progress = JOB_SERVICE.get_progress(job_id) or {}
+    track_metrics = job.get("track_metrics")
+    if not track_metrics and isinstance(progress, dict):
+        track_metrics = progress.get("track_metrics")
     return {
         "job_id": job_id,
         "ep_id": job["ep_id"],
         "state": job["state"],
         "started_at": job["started_at"],
         "ended_at": job.get("ended_at"),
+        "track_metrics": track_metrics,
         "progress": progress,
     }
 
@@ -1061,6 +1306,7 @@ def job_details(job_id: str) -> dict:
         "ended_at": job.get("ended_at"),
         "summary": job.get("summary"),
         "error": job.get("error"),
+        "track_metrics": job.get("track_metrics"),
         "requested": job.get("requested"),
         "progress_file": job.get("progress_file"),
     }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -24,12 +24,12 @@ def data_root() -> Path:
 
 
 def use_s3() -> bool:
-    backend = os.environ.get("STORAGE_BACKEND", "local").lower()
+    backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
     return backend in {"s3", "minio"}
 
 
 def now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _ensure_storage():

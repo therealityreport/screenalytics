@@ -10,19 +10,28 @@ import os
 import shutil
 import sys
 import time
+import platform
 from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import groupby
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import logging
 
-import numpy as np
-
+# Add project root to path for imports BEFORE applying CPU limits
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+# Apply global CPU limits BEFORE importing any ML libraries
+# Uses centralized configuration from apps.common.cpu_limits (default: 3 threads = ~300% CPU)
+# Override with env var: SCREENALYTICS_MAX_CPU_THREADS=N
+from apps.common.cpu_limits import apply_global_cpu_limits
+apply_global_cpu_limits()
+
+import numpy as np
 
 from apps.api.services.storage import (
     EpisodeContext,
@@ -65,7 +74,8 @@ PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11"
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
-PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 25))
+PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 10))  # Smoother progress (was 25)
+PROGRESS_TIME_INTERVAL = float(os.environ.get("SCREENALYTICS_PROGRESS_TIME_INTERVAL", 2.0))  # Emit at least every N seconds
 TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1)
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -82,6 +92,114 @@ RETINAFACE_SCORE_THRESHOLD = 0.65
 RETINAFACE_NMS = 0.45
 
 RUN_MARKERS_SUBDIR = "runs"
+
+# Local mode instrumentation - enabled via env var for verbose phase-level logging
+LOCAL_MODE_INSTRUMENTATION = os.environ.get("LOCAL_MODE_INSTRUMENTATION", "").lower() in ("1", "true", "yes")
+
+_APPLE_SILICON = sys.platform == "darwin" and platform.machine().lower().startswith(("arm", "aarch64"))
+APPLE_SILICON_HOST = _APPLE_SILICON
+
+
+class PhaseTracker:
+    """Track timing and frame counts for each pipeline phase (for local mode diagnostics)."""
+
+    def __init__(self) -> None:
+        self._phases: Dict[str, Dict[str, Any]] = {}
+        self._current_phase: str | None = None
+        self._current_start: float | None = None
+
+    def start_phase(self, phase: str) -> None:
+        """Begin timing a new phase."""
+        self._current_phase = phase
+        self._current_start = time.time()
+        if phase not in self._phases:
+            self._phases[phase] = {
+                "frames_processed": 0,
+                "frames_scanned": 0,
+                "stride": 1,
+                "duration_seconds": 0.0,
+            }
+
+    def end_phase(
+        self,
+        phase: str | None = None,
+        *,
+        frames_processed: int = 0,
+        frames_scanned: int = 0,
+        stride: int = 1,
+    ) -> None:
+        """End timing for a phase and record stats."""
+        target_phase = phase or self._current_phase
+        if not target_phase or target_phase not in self._phases:
+            return
+        if self._current_start is not None:
+            elapsed = time.time() - self._current_start
+            self._phases[target_phase]["duration_seconds"] += elapsed
+        self._phases[target_phase]["frames_processed"] = frames_processed
+        self._phases[target_phase]["frames_scanned"] = frames_scanned
+        self._phases[target_phase]["stride"] = stride
+        self._current_phase = None
+        self._current_start = None
+
+    def add_phase_stats(
+        self,
+        phase: str,
+        *,
+        frames_processed: int,
+        frames_scanned: int,
+        stride: int,
+        duration_seconds: float,
+    ) -> None:
+        """Directly add stats for a phase (for phases timed externally)."""
+        self._phases[phase] = {
+            "frames_processed": frames_processed,
+            "frames_scanned": frames_scanned,
+            "stride": stride,
+            "duration_seconds": round(duration_seconds, 2),
+        }
+
+    def summary(self) -> Dict[str, Dict[str, Any]]:
+        """Return summary of all phases."""
+        return dict(self._phases)
+
+    def log_summary(self, ep_id: str) -> None:
+        """Log a formatted summary of all phases for local mode diagnostics."""
+        if not LOCAL_MODE_INSTRUMENTATION:
+            return
+        lines = [f"[LOCAL MODE] detect_track phase summary for {ep_id}:"]
+        total_duration = 0.0
+        for phase_name, stats in self._phases.items():
+            duration = stats.get("duration_seconds", 0.0)
+            total_duration += duration
+            frames_proc = stats.get("frames_processed", 0)
+            frames_scan = stats.get("frames_scanned", 0)
+            stride = stats.get("stride", 1)
+            lines.append(
+                f"  {phase_name}: frames_processed={frames_proc} frames_scanned={frames_scan} "
+                f"stride={stride} duration={duration:.1f}s"
+            )
+        lines.append(f"  TOTAL: {total_duration:.1f}s ({total_duration/60:.1f}m)")
+        for line in lines:
+            LOGGER.info(line)
+            # Also print to stdout for local mode visibility
+            print(line)
+
+
+def _coreml_provider_available() -> bool:
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        providers = ort.get_available_providers()
+    except Exception:
+        return False
+    return any(provider.lower().startswith("coreml") for provider in providers)
+
+
+COREML_PROVIDER_AVAILABLE = _coreml_provider_available()
+if _APPLE_SILICON and not COREML_PROVIDER_AVAILABLE:
+    LOGGER.warning(
+        "CoreMLExecutionProvider unavailable on Apple Silicon. Install onnxruntime-coreml to enable CoreML acceleration."
+    )
 
 
 def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
@@ -180,11 +298,11 @@ TRACK_BUFFER_BASE_DEFAULT = max(
 BYTE_TRACK_MATCH_THRESH_DEFAULT = _env_float("BYTE_TRACK_MATCH_THRESH", 0.85)
 TRACK_HIGH_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_TRACK_HIGH_THRESH",
-    _env_float("BYTE_TRACK_HIGH_THRESH", 0.65),
+    _env_float("BYTE_TRACK_HIGH_THRESH", 0.45),
 )
 TRACK_NEW_THRESH_DEFAULT = _env_float(
     "SCREENALYTICS_NEW_TRACK_THRESH",
-    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.65),
+    _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
 )
 TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
 TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
@@ -267,38 +385,67 @@ def _normalize_device_label(device: str | None) -> str:
     return normalized
 
 
-def _filter_providers(requested: list[str], available: list[str]) -> list[str]:
+def _filter_providers(requested: list[str], available: list[str], allow_cpu_fallback: bool = True) -> list[str]:
     """
-    Filter ONNX providers to only those available, always including CPU fallback.
+    Filter ONNX providers to only those available, optionally including CPU fallback.
 
     Args:
         requested: Desired providers in priority order
         available: Providers available in this ONNX Runtime build
+        allow_cpu_fallback: If True, append CPUExecutionProvider as fallback (default: True)
 
     Returns:
-        Filtered list with CPU fallback appended
+        Filtered list with optional CPU fallback appended
     """
     filtered = [p for p in requested if p in available]
-    if "CPUExecutionProvider" not in filtered:
+    if allow_cpu_fallback and "CPUExecutionProvider" not in filtered:
         filtered.append("CPUExecutionProvider")
     return filtered
 
 
-def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
+class AcceleratorUnavailableError(RuntimeError):
+    """Raised when a requested accelerator (CoreML/CUDA) is not available and CPU fallback is disabled."""
+    pass
+
+
+def _onnx_providers_for(
+    device: str | None,
+    allow_cpu_fallback: bool = False,
+    cpu_threads: int | None = None,
+) -> tuple[list[str], str]:
     """
     Select ONNX Runtime execution providers based on device preference.
+
+    IMPORTANT: This function now FAILS FAST by default when an accelerator is
+    explicitly requested but unavailable. To allow silent fallback to CPU, you
+    must explicitly pass allow_cpu_fallback=True.
 
     Order of preference for device="auto":
     - CUDA (NVIDIA GPUs on Linux/Windows)
     - CoreML (Apple Silicon M1/M2/M3 on macOS)
-    - CPU (fallback)
+    - CPU (fallback, only if allowed)
+
+    Args:
+        device: Device preference ("auto", "cuda", "coreml", "cpu", etc.)
+        allow_cpu_fallback: If False (default) and the requested accelerator is
+                           unavailable, raises AcceleratorUnavailableError instead
+                           of silently falling back to CPU. This prevents thermal
+                           issues on laptops.
+        cpu_threads: If provided, limit CPU provider threads (intra/inter-op).
+                    Ignored if CPU provider is not used.
 
     Returns:
         (providers, resolved_device) tuple where providers is a list of
         ONNX execution providers in priority order, and resolved_device
         is a string label for logging ("cuda", "coreml", or "cpu").
+
+    Raises:
+        AcceleratorUnavailableError: If accelerator is requested but unavailable
+                                      and allow_cpu_fallback=False.
     """
     normalized = (device or "auto").lower()
+    auto_requested = normalized == "auto"
+    explicit_cpu = normalized == "cpu"
     providers: list[str] = ["CPUExecutionProvider"]
     resolved = "cpu"
 
@@ -310,56 +457,145 @@ def _onnx_providers_for(device: str | None) -> tuple[list[str], str]:
     except Exception:
         available = []
 
+    def _log_providers(selected: list[str], resolved_device: str) -> None:
+        """Log provider selection when local mode instrumentation is enabled."""
+        if LOCAL_MODE_INSTRUMENTATION:
+            msg = f"[LOCAL MODE] ONNX providers: {selected} (resolved_device={resolved_device}, available={available})"
+            LOGGER.info(msg)
+            print(msg)
+
+    # Explicit CPU request - always allowed
+    if explicit_cpu:
+        _log_providers(providers, resolved)
+        return providers, resolved
+
     # Explicit CUDA request (NVIDIA GPUs)
     if normalized in {"cuda", "0", "gpu"}:
         requested = ["CUDAExecutionProvider"]
-        providers = _filter_providers(requested, available)
-        if "CUDAExecutionProvider" in providers:
+        if "CUDAExecutionProvider" in available:
+            providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "cuda"
+            _log_providers(providers, resolved)
             return providers, resolved
+
+        # CUDA unavailable - fail fast or warn
+        if not allow_cpu_fallback:
+            error_msg = (
+                "CUDA requested (device=cuda) but CUDAExecutionProvider is not available. "
+                "Either install CUDA-enabled onnxruntime, select a different device (coreml/cpu), "
+                "or set --allow-cpu-fallback to enable CPU fallback."
+            )
+            LOGGER.error(error_msg)
+            raise AcceleratorUnavailableError(error_msg)
+
+        # Fallback allowed - warn and continue
         LOGGER.warning(
-            "CUDA requested for RetinaFace/ArcFace but CUDAExecutionProvider unavailable; falling back to CPU"
+            "[FALLBACK] CUDA requested but CUDAExecutionProvider unavailable. "
+            "Falling back to CPU (this will be slower and may cause thermal issues)."
         )
+        print("[WARN] CUDA unavailable; running on CPU (fallback enabled). This will be slower and hotter.")
+        _log_providers(providers, resolved)
         return providers, resolved
 
     # Explicit MPS/CoreML request (Apple Silicon)
-    if normalized in {"mps", "metal", "apple"}:
+    if normalized in {"mps", "metal", "apple", "coreml"}:
         requested = ["CoreMLExecutionProvider"]
-        providers = _filter_providers(requested, available)
-        if "CoreMLExecutionProvider" in providers:
+        if "CoreMLExecutionProvider" in available:
+            providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "coreml"
+            if not allow_cpu_fallback:
+                LOGGER.info(
+                    "CoreML-only mode enabled: CPU fallback disabled to enforce <300%% CPU budget."
+                )
+            _log_providers(providers, resolved)
             return providers, resolved
+
+        # CoreML unavailable - fail fast or warn
+        if not allow_cpu_fallback:
+            error_msg = (
+                f"CoreML requested (device={normalized}) but CoreMLExecutionProvider is not available. "
+                "Either install onnxruntime-coreml, select a different device (cpu), "
+                "or set --allow-cpu-fallback to enable CPU fallback."
+            )
+            LOGGER.error(error_msg)
+            raise AcceleratorUnavailableError(error_msg)
+
+        # Fallback allowed - warn and continue
         LOGGER.warning(
-            "CoreML requested for RetinaFace/ArcFace but CoreMLExecutionProvider unavailable; falling back to CPU"
+            "[FALLBACK] CoreML requested but CoreMLExecutionProvider unavailable. "
+            "Falling back to CPU (this will be slower and may cause thermal issues)."
         )
+        print("[WARN] CoreML unavailable; running on CPU (fallback enabled). This will be slower and hotter.")
+        _log_providers(providers, resolved)
         return providers, resolved
 
     # Auto-detect best available provider
     if normalized == "auto":
         # Prefer CUDA on Linux/Windows
         if "CUDAExecutionProvider" in available:
-            providers = _filter_providers(["CUDAExecutionProvider"], available)
+            providers = _filter_providers(["CUDAExecutionProvider"], available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "cuda"
+            _log_providers(providers, resolved)
             return providers, resolved
 
         # Prefer CoreML on macOS (Apple Silicon) when CUDA is unavailable
         if "CoreMLExecutionProvider" in available:
             # On macOS with Apple Silicon, prefer CoreML over CPU
-            providers = _filter_providers(["CoreMLExecutionProvider"], available)
+            providers = _filter_providers(["CoreMLExecutionProvider"], available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "coreml"
+            _log_providers(providers, resolved)
             return providers, resolved
 
+        # No accelerator available for device=auto
+        if APPLE_SILICON_HOST and not allow_cpu_fallback:
+            # On Apple Silicon, we should have CoreML - fail if not available
+            error_msg = (
+                "device=auto on Apple Silicon but CoreMLExecutionProvider is not available. "
+                "This likely means onnxruntime-coreml is not installed. "
+                "Install it or set --allow-cpu-fallback to enable CPU fallback."
+            )
+            LOGGER.error(error_msg)
+            raise AcceleratorUnavailableError(error_msg)
+
+        # Fallback to CPU (with warning)
+        LOGGER.warning(
+            "device=auto falling back to CPU; no accelerator providers available (providers=%s)",
+            available or ["CPUExecutionProvider"],
+        )
+        if not explicit_cpu:
+            print("[WARN] No accelerator available; running on CPU. Consider installing onnxruntime-coreml.")
+
     # Fallback to CPU for unknown device values or when no accelerators available
+    _log_providers(providers, resolved)
     return providers, resolved
 
 
-def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> tuple[Any, str]:
+def _init_retinaface(
+    model_name: str,
+    device: str,
+    score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
+    coreml_input_size: tuple[int, int] | None = None,
+    allow_cpu_fallback: bool = False,
+) -> tuple[Any, str]:
+    """Initialize RetinaFace detector with the specified device.
+
+    Args:
+        model_name: InsightFace model name
+        device: Device preference (auto/cuda/coreml/cpu)
+        score_thresh: Detection score threshold
+        coreml_input_size: Optional CoreML input size
+        allow_cpu_fallback: If False (default), fails fast when accelerator unavailable
+
+    Raises:
+        AcceleratorUnavailableError: If accelerator requested but unavailable and
+                                      allow_cpu_fallback=False
+    """
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover - runtime guard
         raise RuntimeError("insightface is required for RetinaFace detection") from exc
 
-    providers, resolved = _onnx_providers_for(device)
+    providers, resolved = _onnx_providers_for(device, allow_cpu_fallback=allow_cpu_fallback)
     model = get_model(model_name)
     if model is None:
         raise RuntimeError(
@@ -375,8 +611,10 @@ def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAF
         "det_thresh": float(score_thresh),
     }
     # Use CoreML-specific detection size if available and running on CoreML
-    if resolved == "coreml" and RETINAFACE_COREML_DET_SIZE:
-        prepare_kwargs["input_size"] = RETINAFACE_COREML_DET_SIZE
+    if resolved == "coreml":
+        input_size = coreml_input_size or RETINAFACE_COREML_DET_SIZE
+        if input_size:
+            prepare_kwargs["input_size"] = input_size
     elif RETINAFACE_DET_SIZE:
         prepare_kwargs["input_size"] = RETINAFACE_DET_SIZE
     try:
@@ -387,13 +625,24 @@ def _init_retinaface(model_name: str, device: str, score_thresh: float = RETINAF
     return model, resolved
 
 
-def _init_arcface(model_name: str, device: str):
+def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = False):
+    """Initialize ArcFace embedder with the specified device.
+
+    Args:
+        model_name: InsightFace model name
+        device: Device preference (auto/cuda/coreml/cpu)
+        allow_cpu_fallback: If False (default), fails fast when accelerator unavailable
+
+    Raises:
+        AcceleratorUnavailableError: If accelerator requested but unavailable and
+                                      allow_cpu_fallback=False
+    """
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("insightface is required for ArcFace embeddings") from exc
 
-    providers, resolved = _onnx_providers_for(device)
+    providers, resolved = _onnx_providers_for(device, allow_cpu_fallback=allow_cpu_fallback)
     model = get_model(model_name)
     if model is None:
         raise RuntimeError(
@@ -1042,18 +1291,33 @@ class StrongSortAdapter:
 
 
 class RetinaFaceDetectorBackend:
-    def __init__(self, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD) -> None:
+    def __init__(
+        self,
+        device: str,
+        score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
+        *,
+        coreml_input_size: tuple[int, int] | None = None,
+        allow_cpu_fallback: bool = False,
+    ) -> None:
         self.device = device
         self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
         self.min_area = MIN_FACE_AREA
         self._model = None
         self._resolved_device: Optional[str] = None
+        self._coreml_input_size = coreml_input_size
+        self.allow_cpu_fallback = allow_cpu_fallback
 
     def _lazy_model(self):
         if self._model is not None:
             return self._model
         try:
-            model, resolved = _init_retinaface(self.model_name, self.device, self.score_thresh)
+            model, resolved = _init_retinaface(
+                self.model_name,
+                self.device,
+                self.score_thresh,
+                coreml_input_size=self._coreml_input_size,
+                allow_cpu_fallback=self.allow_cpu_fallback,
+            )
         except Exception as exc:
             raise RuntimeError(f"{RETINAFACE_HELP} ({exc})") from exc
         self._resolved_device = resolved
@@ -1111,8 +1375,19 @@ class RetinaFaceDetectorBackend:
         return samples
 
 
-def _build_face_detector(detector: str, device: str, score_thresh: float = RETINAFACE_SCORE_THRESHOLD):
-    return RetinaFaceDetectorBackend(device, score_thresh=score_thresh)
+def _build_face_detector(
+    detector: str,
+    device: str,
+    score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
+    coreml_input_size: tuple[int, int] | None = None,
+    allow_cpu_fallback: bool = False,
+):
+    return RetinaFaceDetectorBackend(
+        device,
+        score_thresh=score_thresh,
+        coreml_input_size=coreml_input_size,
+        allow_cpu_fallback=allow_cpu_fallback,
+    )
 
 
 def _build_tracker_adapter(
@@ -1138,8 +1413,9 @@ def _bytetrack_config_from_args(args: argparse.Namespace) -> ByteTrackRuntimeCon
 
 
 class ArcFaceEmbedder:
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, allow_cpu_fallback: bool = True) -> None:
         self.device = device
+        self.allow_cpu_fallback = allow_cpu_fallback
         self._model = None
         self._resolved_device: Optional[str] = None
 
@@ -1147,7 +1423,7 @@ class ArcFaceEmbedder:
         if self._model is not None:
             return self._model
         try:
-            model, resolved = _init_arcface(ARC_FACE_MODEL_NAME, self.device)
+            model, resolved = _init_arcface(ARC_FACE_MODEL_NAME, self.device, allow_cpu_fallback=self.allow_cpu_fallback)
         except Exception as exc:
             raise RuntimeError(
                 f"ArcFace init failed: {exc}. Install insightface + models or run scripts/fetch_models.py."
@@ -1781,6 +2057,7 @@ class ProgressEmitter:
         self._last_frames = 0
         self._last_phase: str | None = None
         self._last_step: str | None = None
+        self._last_emit_time: float = 0.0  # Time of last emission for time-based fallback
         self._device: str | None = None
         self._detector: str | None = None
         self._tracker: str | None = None
@@ -1797,7 +2074,13 @@ class ProgressEmitter:
             return True
         if step != self._last_step:
             return True
-        return (frames_done - self._last_frames) >= self._frame_interval
+        # Frame-based check
+        if (frames_done - self._last_frames) >= self._frame_interval:
+            return True
+        # Time-based fallback: emit at least every PROGRESS_TIME_INTERVAL seconds
+        if (time.time() - self._last_emit_time) >= PROGRESS_TIME_INTERVAL:
+            return True
+        return False
 
     def _compose_payload(
         self,
@@ -1865,29 +2148,23 @@ class ProgressEmitter:
         run_id_short = self.run_id[:8] if self.run_id else "unknown"
 
         if vt is not None and vtotal is not None:
-            LOGGER.info(
-                "[job=%s run=%s phase=%s step=%s frames=%s/%s vt=%.1f/%.1f fps=%.2f]",
-                self.ep_id,
-                run_id_short,
-                phase,
-                step,
-                frames,
-                total,
-                vt,
-                vtotal,
-                fps or 0.0,
+            log_msg = (
+                f"[job={self.ep_id} run={run_id_short} phase={phase} step={step} "
+                f"frames={frames}/{total} vt={vt:.1f}/{vtotal:.1f} fps={fps or 0.0:.2f}]"
             )
+            LOGGER.info(log_msg)
+            # Print to stdout for local mode streaming
+            if LOCAL_MODE_INSTRUMENTATION:
+                print(log_msg, flush=True)
         else:
-            LOGGER.info(
-                "[job=%s run=%s phase=%s step=%s frames=%s/%s fps=%.2f]",
-                self.ep_id,
-                run_id_short,
-                phase,
-                step,
-                frames,
-                total,
-                fps or 0.0,
+            log_msg = (
+                f"[job={self.ep_id} run={run_id_short} phase={phase} step={step} "
+                f"frames={frames}/{total} fps={fps or 0.0:.2f}]"
             )
+            LOGGER.info(log_msg)
+            # Print to stdout for local mode streaming
+            if LOCAL_MODE_INSTRUMENTATION:
+                print(log_msg, flush=True)
 
         if self.path:
             tmp_path = self.path.with_suffix(".tmp")
@@ -1948,6 +2225,7 @@ class ProgressEmitter:
         self._last_frames = frames_done
         self._last_phase = phase
         self._last_step = step
+        self._last_emit_time = time.time()
 
     def complete(
         self,
@@ -2241,6 +2519,22 @@ class FrameExporter:
                 self._emit_debug(debug_payload)
             return False
 
+        # Skip saving crops smaller than 16x16 pixels - too small for useful face recognition
+        min_dim = min(crop.shape[0], crop.shape[1]) if crop.ndim >= 2 else 0
+        if min_dim < 16:
+            self._register_crop_attempt("too_small")
+            if debug_payload is not None:
+                debug_payload.update(
+                    {
+                        "shape": tuple(int(x) for x in crop.shape),
+                        "save_ok": False,
+                        "save_err": "too_small",
+                        "ms": int((time.time() - start) * 1000),
+                    }
+                )
+                self._emit_debug(debug_payload)
+            return False
+
         ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
         reason = save_err if not ok else None
         self._register_crop_attempt(reason)
@@ -2424,7 +2718,9 @@ def _episode_ctx(ep_id: str) -> EpisodeContext | None:
 def _storage_context(
     ep_id: str,
 ) -> tuple[StorageService | None, EpisodeContext | None, Dict[str, str] | None]:
-    storage_backend = os.environ.get("STORAGE_BACKEND", "local").lower()
+    # Default to "s3" for consistency with API (apps/api/services/storage.py defaults to "s3")
+    # This ensures artifacts are uploaded to S3 when running in local mode from the API
+    storage_backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
     storage: StorageService | None = None
     if storage_backend in {"s3", "minio"}:
         try:
@@ -2523,8 +2819,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--stride",
         type=int,
-        default=4,
-        help="Frame stride for detection (default: 4)",
+        default=1,
+        help="Frame stride for detection (default: 1 = every frame)",
     )
     parser.add_argument(
         "--fps",
@@ -2533,9 +2829,50 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=["auto", "cpu", "mps", "cuda"],
+        choices=["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"],
         default="auto",
-        help="Execution device override (auto→CUDA/MPS/CPU)",
+        help="Execution device override (auto→CUDA/CoreML/CPU). Accepts auto/cpu/cuda/mps/coreml/metal/apple.",
+    )
+    parser.add_argument(
+        "--embed-device",
+        choices=["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"],
+        default=None,
+        help="Optional ArcFace/embedding device override. Defaults to --device when omitted.",
+    )
+    parser.add_argument(
+        "--coreml-det-size",
+        type=str,
+        default=None,
+        help=(
+            "Override RetinaFace CoreML input resolution (e.g., 384x384 for an M1/M2 Air, 512x512+ for Pro/Max) "
+            "to trade recall vs thermals on smaller Macs. Only applies when CoreML is the resolved provider."
+        ),
+    )
+    parser.add_argument(
+        "--coreml-only",
+        action="store_true",
+        default=True,
+        help=(
+            "Force CoreML-only execution without CPU fallback. Prevents CPU provider saturation "
+            "but will fail if CoreML is unavailable. Useful for enforcing <300%% CPU budget on Apple Silicon. "
+            "Default: enabled. Use --no-coreml-only or --allow-cpu-fallback to allow CPU fallback."
+        ),
+    )
+    parser.add_argument(
+        "--no-coreml-only",
+        dest="coreml_only",
+        action="store_false",
+        help="Allow CPU fallback for CoreML execution (may exceed CPU budget).",
+    )
+    parser.add_argument(
+        "--allow-cpu-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow falling back to CPU if requested accelerator (coreml/cuda) is unavailable. "
+            "If not set, fails fast with an error when the accelerator is unavailable. "
+            "This prevents silent CPU execution that causes thermal issues on laptops."
+        ),
     )
     parser.add_argument(
         "--detector",
@@ -2606,7 +2943,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-gap",
         type=int,
-        default=30,
+        default=60,
         help="Maximum frame gap before splitting a track",
     )
     parser.add_argument(
@@ -2618,14 +2955,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-samples-per-track",
         type=int,
-        default=12,
-        help="Maximum samples per track for embedding/export (default: 12)",
+        default=16,
+        help="Maximum samples per track for embedding/export (default: 16)",
     )
     parser.add_argument(
         "--min-samples-per-track",
         type=int,
-        default=6,
-        help="Minimum samples per track if track is long enough (default: 6)",
+        default=4,
+        help="Minimum samples per track if track is long enough (default: 4)",
     )
     parser.add_argument(
         "--sample-every-n-frames",
@@ -2675,6 +3012,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=MIN_IDENTITY_SIMILARITY,
         help="Minimum cosine similarity for a track to remain in an identity cluster (outliers are split out)",
     )
+    parser.add_argument(
+        "--preserve-assigned",
+        action="store_true",
+        help="Preserve clusters that are assigned to cast members (don't recluster their tracks)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress verbose ONNX/model warnings (cleaner logs)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show all debug output including ONNX/model warnings",
+    )
     gate_group = parser.add_argument_group("Appearance gate")
     gate_group.add_argument(
         "--gate-appear-hard",
@@ -2715,8 +3067,35 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _configure_logging(quiet: bool, verbose: bool) -> None:
+    """Configure logging levels based on --quiet/--verbose flags."""
+    if quiet and not verbose:
+        # Suppress noisy model/runtime warnings
+        logging.getLogger("onnxruntime").setLevel(logging.ERROR)
+        logging.getLogger("tensorflow").setLevel(logging.ERROR)
+        logging.getLogger("insightface").setLevel(logging.ERROR)
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        # Also suppress warnings module for common ONNX/TF deprecation warnings
+        import warnings
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        warnings.filterwarnings("ignore", message=".*onnx.*", category=UserWarning)
+    elif verbose:
+        # Enable debug output
+        logging.getLogger("episode_run").setLevel(logging.DEBUG)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # Configure logging based on --quiet/--verbose flags
+    _configure_logging(getattr(args, "quiet", False), getattr(args, "verbose", False))
+
+    coreml_size_arg = getattr(args, "coreml_det_size", None)
+    if coreml_size_arg:
+        args.coreml_det_size = _parse_retinaface_det_size(coreml_size_arg)
+    else:
+        args.coreml_det_size = None
     if hasattr(args, "det_thresh"):
         args.det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
     args.scene_detector = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
@@ -2923,7 +3302,8 @@ def detect_scene_cuts_pyscenedetect(
             release_handle = getattr(video, "release", None)
             if callable(release_handle):
                 release_handle()
-    return [start.get_frames() for (start, _end) in scenes]
+    # Filter out frame 0 - it's the video start, not a cut
+    return [start.get_frames() for (start, _end) in scenes if start.get_frames() > 0]
 
 
 def detect_scene_cuts(
@@ -3026,6 +3406,30 @@ def _run_full_pipeline(
     # --max-samples-per-track, --min-samples-per-track, --sample-every-n-frames
     frame_stride = _effective_stride(args.stride, target_fps or analyzed_fps, source_fps)
     ts_fps = analyzed_fps if analyzed_fps and analyzed_fps > 0 else max(args.fps or 30.0, 1.0)
+
+    # Initialize phase tracker for local mode instrumentation
+    phase_tracker = PhaseTracker() if LOCAL_MODE_INSTRUMENTATION else None
+
+    # Log structured config for Local mode diagnostics
+    if LOCAL_MODE_INSTRUMENTATION:
+        cpu_threads = os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "auto")
+        save_crops = getattr(args, "save_crops", False)
+        save_frames = getattr(args, "save_frames", False)
+        detection_fps_limit = getattr(args, "fps", None)
+        min_face_size = getattr(args, "min_box_area", MIN_FACE_AREA)
+        config_lines = [
+            f"[LOCAL MODE] detect_track config:",
+            f"  device={args.device}, profile=balanced",
+            f"  frame_stride={frame_stride} (requested={args.stride})",
+            f"  detection_fps_limit={detection_fps_limit}",
+            f"  min_face_size={min_face_size}",
+            f"  cpu_threads={cpu_threads}",
+            f"  save_crops={save_crops}, save_frames={save_frames}",
+            f"  total_frames={total_frames or 'unknown'}",
+        ]
+        for line in config_lines:
+            LOGGER.info(line)
+            print(line)
     frames_goal = None
     if total_frames and total_frames > 0:
         frames_goal = int(total_frames)
@@ -3060,7 +3464,18 @@ def _run_full_pipeline(
     args.tracker = tracker_choice
     det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
     args.det_thresh = det_thresh
-    detector_backend = _build_face_detector(detector_choice, device, det_thresh)
+
+    # Determine CPU fallback policy from CLI flags
+    # --allow-cpu-fallback OR --no-coreml-only enables CPU fallback
+    allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
+
+    detector_backend = _build_face_detector(
+        detector_choice,
+        device,
+        det_thresh,
+        coreml_input_size=getattr(args, "coreml_det_size", None),
+        allow_cpu_fallback=allow_cpu_fallback,
+    )
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
     tracker_label = tracker_choice
@@ -3096,7 +3511,7 @@ def _run_full_pipeline(
         appearance_gate = AppearanceGate(gate_config)
         gate_embed_stride = gate_config.emb_every or frame_stride
         try:
-            gate_embedder = ArcFaceEmbedder(device)
+            gate_embedder = ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
             gate_embedder.ensure_ready()
         except Exception as exc:
             raise RuntimeError(
@@ -3109,6 +3524,7 @@ def _run_full_pipeline(
     scene_min_len = max(int(getattr(args, "scene_min_len", SCENE_MIN_LEN_DEFAULT)), 1)
     scene_warmup = max(int(getattr(args, "scene_warmup_dets", SCENE_WARMUP_DETS_DEFAULT)), 0)
     scene_cuts: list[int] = []
+    scene_detect_start = time.time()
     if scene_detector_choice != "off":
         scene_cuts = detect_scene_cuts(
             str(video_dest),
@@ -3117,6 +3533,24 @@ def _run_full_pipeline(
             min_len=scene_min_len,
             progress=progress,
         )
+    scene_detect_duration = time.time() - scene_detect_start
+
+    # Record scene detection phase stats for local mode instrumentation
+    if phase_tracker and scene_detector_choice != "off":
+        phase_tracker.add_phase_stats(
+            "scene_detect",
+            frames_processed=total_frames or frames_goal or 0,
+            frames_scanned=total_frames or frames_goal or 0,
+            stride=1,  # Scene detection always processes all frames
+            duration_seconds=scene_detect_duration,
+        )
+        scene_msg = (
+            f"[LOCAL MODE] Phase=scene_detect frames={total_frames or frames_goal or '?'} "
+            f"stride=1 duration={scene_detect_duration:.1f}s cuts={len(scene_cuts)}"
+        )
+        LOGGER.info(scene_msg)
+        print(scene_msg)
+
     scene_summary = {
         "count": len(scene_cuts),
         "indices": scene_cuts,
@@ -3183,6 +3617,9 @@ def _run_full_pipeline(
     cap = cv2.VideoCapture(str(video_dest))
     if not cap.isOpened():
         raise FileNotFoundError(f"Unable to open video {video_dest}")
+
+    # Start timing for detect/track phase
+    detect_track_start = time.time()
 
     try:
         with det_path.open("w", encoding="utf-8") as det_handle:
@@ -3775,6 +4212,25 @@ def _run_full_pipeline(
     finally:
         cap.release()
 
+    # Calculate detect/track phase duration
+    detect_track_duration = time.time() - detect_track_start
+
+    # Record detect/track phase stats for local mode instrumentation
+    if phase_tracker:
+        phase_tracker.add_phase_stats(
+            "detect",
+            frames_processed=frames_sampled,
+            frames_scanned=frame_idx,
+            stride=frame_stride,
+            duration_seconds=detect_track_duration,
+        )
+        detect_msg = (
+            f"[LOCAL MODE] Phase=detect frames_processed={frames_sampled} "
+            f"frames_scanned={frame_idx} stride={frame_stride} duration={detect_track_duration:.1f}s"
+        )
+        LOGGER.info(detect_msg)
+        print(detect_msg)
+
     # Guard: Ensure detect loop actually processed frames
     if frames_sampled == 0:
         error_msg = (
@@ -3864,6 +4320,11 @@ def _run_full_pipeline(
             force=True,
             extra=track_done_meta,
         )
+
+    # Log final phase summary for local mode instrumentation
+    if phase_tracker:
+        phase_tracker.log_summary(args.ep_id)
+
     return (
         det_count,
         len(track_rows),
@@ -3952,6 +4413,7 @@ def _run_detect_track_stage(
         else None
     )
 
+    started_at = _utcnow_iso()
     try:
         (
             det_count,
@@ -4018,6 +4480,7 @@ def _run_detect_track_stage(
             "frames_exported": frame_exporter.frames_written if frame_exporter else 0,
             "crops_exported": frame_exporter.crops_written if frame_exporter else 0,
             "device": pipeline_device,
+            "requested_device": args.device,
             "resolved_device": detector_device,
             "analyzed_fps": analyzed_fps,
             "detector": detector_choice,
@@ -4089,6 +4552,40 @@ def _run_detect_track_stage(
         )
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
+        finished_at = _utcnow_iso()
+        _write_run_marker(
+            args.ep_id,
+            "detect_track",
+            {
+                "phase": "detect_track",
+                "status": "success",
+                "version": APP_VERSION,
+                "detections": det_count,
+                "tracks": track_count,
+                "detector": detector_choice,
+                "tracker": tracker_choice,
+                "stride": args.stride,
+                "det_thresh": args.det_thresh,
+                "max_gap": getattr(args, "max_gap", None),
+                "scene_detector": args.scene_detector,
+                "scene_threshold": args.scene_threshold,
+                "scene_min_len": args.scene_min_len,
+                "scene_warmup_dets": args.scene_warmup_dets,
+                "track_high_thresh": getattr(args, "track_high_thresh", None),
+                "new_track_thresh": getattr(args, "new_track_thresh", None),
+                "fps": analyzed_fps,
+                "frames_total": progress.target_frames,
+                "video_duration_sec": progress.secs_total,
+                "save_frames": save_frames,
+                "save_crops": save_crops,
+                "jpeg_quality": jpeg_quality,
+                "device": pipeline_device,
+                "requested_device": args.device,
+                "resolved_device": detector_device,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            },
+        )
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -4103,6 +4600,12 @@ def _run_faces_embed_stage(
     ep_ctx: EpisodeContext | None,
     s3_prefixes: Dict[str, str] | None,
 ) -> Dict[str, Any]:
+    # Log startup for local mode streaming
+    if LOCAL_MODE_INSTRUMENTATION:
+        device = args.device or "auto"
+        print(f"[LOCAL MODE] faces_embed starting for {args.ep_id}", flush=True)
+        print(f"  device={device}", flush=True)
+
     track_path = get_path(args.ep_id, "tracks")
     if not track_path.exists():
         raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
@@ -4111,14 +4614,16 @@ def _run_faces_embed_stage(
     samples = _load_track_samples(
         track_path,
         sort_by_frame=True,
-        max_samples_per_track=getattr(args, "max_samples_per_track", 12),
-        min_samples_per_track=getattr(args, "min_samples_per_track", 6),
-        sample_every_n_frames=getattr(args, "sample_every_n_frames", 8),
+        max_samples_per_track=getattr(args, "max_samples_per_track", 16),
+        min_samples_per_track=getattr(args, "min_samples_per_track", 4),
+        sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
     )
     if not samples:
         raise RuntimeError("No track samples available for faces embedding")
 
     faces_total = len(samples)
+    if LOCAL_MODE_INSTRUMENTATION:
+        print(f"  faces_total={faces_total}", flush=True)
     progress = ProgressEmitter(
         args.ep_id,
         args.progress_file,
@@ -4128,7 +4633,8 @@ def _run_faces_embed_stage(
         fps_detected=None,
         fps_requested=None,
     )
-    device = pick_device(args.device)
+    requested_embed_device = getattr(args, "embed_device", None) or args.device
+    device = pick_device(requested_embed_device)
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
@@ -4154,10 +4660,17 @@ def _run_faces_embed_stage(
     thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
-    embedder = ArcFaceEmbedder(device)
+    # Determine CPU fallback policy from CLI flags
+    # --allow-cpu-fallback OR --no-coreml-only enables CPU fallback
+    allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
+
+    # Emit progress during model loading (can take time for CoreML compilation)
+    print(f"[INIT] Loading ArcFace embedder (device={device})...", flush=True)
+    embedder = ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
+    print(f"[INIT] ArcFace embedder ready (resolved_device={embed_device})", flush=True)
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
@@ -4191,27 +4704,28 @@ def _run_faces_embed_stage(
             extra=_phase_meta(),
         )
         rows: List[Dict[str, Any]] = []
-        for sample in samples:
-            crop_rel_path = None
-            crop_s3_key = None
-            thumb_rel_path = None
-            thumb_s3_key = None
-            embedding_vec: np.ndarray | None = None
-            raw_conf = sample.get("conf")
-            if raw_conf is None:
-                raw_conf = sample.get("confidence")
-            conf = float(raw_conf) if raw_conf is not None else 1.0
-            quality = max(min(conf, 1.0), 0.0)
-            bbox = sample["bbox_xyxy"]
-            track_id = sample["track_id"]
-            frame_idx = sample["frame_idx"]
-            ts_val = round(float(sample["ts"]), 4)
-            landmarks = sample.get("landmarks")
-
+        
+        # Group samples by frame_idx for batch embedding (CPU optimization)
+        # This reduces CoreML invocations from N faces to M frames (where M << N)
+        # Example: 24,061 faces → ~800 frames = 96.7% reduction in model calls
+        samples_by_frame = []
+        for frame_idx, frame_group in groupby(samples, key=lambda s: s["frame_idx"]):
+            samples_by_frame.append((frame_idx, list(frame_group)))
+        
+        LOGGER.info("Processing %d faces across %d frames (avg %.1f faces/frame)", 
+                    len(samples), len(samples_by_frame), len(samples) / max(len(samples_by_frame), 1))
+        
+        # Process all faces from each frame together in a single batch
+        frames_processed = 0
+        total_frames = len(samples_by_frame)
+        for frame_idx, frame_samples in samples_by_frame:
+            # Decode frame ONCE for all faces in this frame
             if not video_path.exists():
                 raise FileNotFoundError("Local video not found for crop export")
             if frame_decoder is None:
+                print(f"[INIT] Opening video decoder for {video_path.name}...", flush=True)
                 frame_decoder = FrameDecoder(video_path)
+                print(f"[INIT] Video decoder ready", flush=True)
 
             # Wrap decode in try/except to handle corrupted frames gracefully
             image = None
@@ -4220,41 +4734,41 @@ def _run_faces_embed_stage(
                 frame_std = float(np.std(image)) if image is not None else 0.0
                 if image is None or frame_std < 1.0:
                     LOGGER.warning(
-                        "Low-variance frame %s std=%.4f; retrying decode for track %s",
+                        "Low-variance frame %s std=%.4f; retrying decode",
                         frame_idx,
                         frame_std,
-                        track_id,
                     )
                     image = frame_decoder.read(frame_idx)
                     frame_std = float(np.std(image)) if image is not None else 0.0
             except (RuntimeError, Exception) as decode_exc:
                 LOGGER.error(
-                    "Decode failure on frame %s for track %s: %s",
+                    "Decode failure on frame %s: %s",
                     frame_idx,
-                    track_id,
                     decode_exc,
                 )
                 image = None
                 frame_std = 0.0
 
             if image is None or frame_std < 1.0:
-                LOGGER.error(
-                    "Skipping frame %s for track %s due to bad_source_frame",
-                    frame_idx,
-                    track_id,
-                )
-                rows.append(
-                    _make_skip_face_row(
-                        args.ep_id,
-                        track_id,
+                # Skip all samples in this bad frame
+                for sample in frame_samples:
+                    LOGGER.error(
+                        "Skipping frame %s for track %s due to bad_source_frame",
                         frame_idx,
-                        ts_val,
-                        bbox,
-                        detector_choice,
-                        "bad_source_frame",
+                        sample["track_id"],
                     )
-                )
-                faces_done = min(faces_total, faces_done + 1)
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            sample["track_id"],
+                            frame_idx,
+                            round(float(sample["ts"]), 4),
+                            sample["bbox_xyxy"],
+                            detector_choice,
+                            "bad_source_frame",
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
                 progress.emit(
                     faces_done,
                     phase="faces_embed",
@@ -4266,139 +4780,56 @@ def _run_faces_embed_stage(
                 )
                 continue
 
-            if exporter and image is not None:
-                exporter.export(frame_idx, image, [(track_id, bbox)], ts=ts_val)
-                if exporter.save_crops:
-                    crop_rel_path = exporter.crop_rel_path(track_id, frame_idx)
-                    if s3_prefixes and s3_prefixes.get("crops"):
-                        crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
+            # Prepare batch: collect all valid crops from this frame
+            batch_crops: List[np.ndarray] = []
+            batch_metadata: List[Dict[str, Any]] = []
+            
+            for sample in frame_samples:
+                crop_rel_path = None
+                crop_s3_key = None
+                thumb_rel_path = None
+                thumb_s3_key = None
+                raw_conf = sample.get("conf")
+                if raw_conf is None:
+                    raw_conf = sample.get("confidence")
+                conf = float(raw_conf) if raw_conf is not None else 1.0
+                quality = max(min(conf, 1.0), 0.0)
+                bbox = sample["bbox_xyxy"]
+                track_id = sample["track_id"]
+                ts_val = round(float(sample["ts"]), 4)
+                landmarks = sample.get("landmarks")
 
-            # Validate bbox before cropping to prevent NoneType multiply errors
-            validated_bbox, bbox_err = _safe_bbox_or_none(bbox)
-            if validated_bbox is None:
-                rows.append(
-                    _make_skip_face_row(
-                        args.ep_id,
-                        track_id,
-                        frame_idx,
-                        ts_val,
-                        bbox if bbox is not None else [],
-                        detector_choice,
-                        f"invalid_bbox_{bbox_err}",
-                        crop_rel_path=crop_rel_path,
-                        crop_s3_key=crop_s3_key,
-                        thumb_rel_path=thumb_rel_path,
-                        thumb_s3_key=thumb_s3_key,
+                # Export frame/crop if requested
+                if exporter and image is not None:
+                    exporter.export(frame_idx, image, [(track_id, bbox)], ts=ts_val)
+                    if exporter.save_crops:
+                        crop_rel_path = exporter.crop_rel_path(track_id, frame_idx)
+                        if s3_prefixes and s3_prefixes.get("crops"):
+                            crop_s3_key = f"{s3_prefixes['crops']}{exporter.crop_component(track_id, frame_idx)}"
+
+                # Validate bbox before cropping to prevent NoneType multiply errors
+                validated_bbox, bbox_err = _safe_bbox_or_none(bbox)
+                if validated_bbox is None:
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox if bbox is not None else [],
+                            detector_choice,
+                            f"invalid_bbox_{bbox_err}",
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=thumb_rel_path,
+                            thumb_s3_key=thumb_s3_key,
+                        )
                     )
-                )
-                faces_done = min(faces_total, faces_done + 1)
-                progress.emit(
-                    faces_done,
-                    phase="faces_embed",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=embed_device,
-                    extra=_phase_meta(),
-                )
-                continue
+                    faces_done = min(faces_total, faces_done + 1)
+                    continue
 
-            crop, crop_err = _prepare_face_crop(image, validated_bbox, landmarks)
-            if crop is None:
-                rows.append(
-                    _make_skip_face_row(
-                        args.ep_id,
-                        track_id,
-                        frame_idx,
-                        ts_val,
-                        bbox,
-                        detector_choice,
-                        crop_err or "crop_failed",
-                        crop_rel_path=crop_rel_path,
-                        crop_s3_key=crop_s3_key,
-                        thumb_rel_path=None,
-                        thumb_s3_key=None,
-                    )
-                )
-                faces_done = min(faces_total, faces_done + 1)
-                progress.emit(
-                    faces_done,
-                    phase="faces_embed",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=embed_device,
-                    extra=_phase_meta(),
-                )
-                continue
-
-            crop_std = float(np.std(crop))
-            blur_score = _estimate_blur_score(crop)
-            skip_reason: str | None = None
-            skip_meta: str | None = None
-            if conf < FACE_MIN_CONFIDENCE:
-                skip_reason = "low_confidence"
-                skip_meta = f"{conf:.2f}"
-            elif crop_std < FACE_MIN_STD:
-                skip_reason = "low_contrast"
-                skip_meta = f"{crop_std:.2f}"
-            elif blur_score < FACE_MIN_BLUR:
-                skip_reason = "blurry"
-                skip_meta = f"{blur_score:.1f}"
-            if skip_reason:
-                reason = f"{skip_reason}:{skip_meta}" if skip_meta else skip_reason
-                rows.append(
-                    _make_skip_face_row(
-                        args.ep_id,
-                        track_id,
-                        frame_idx,
-                        ts_val,
-                        bbox,
-                        detector_choice,
-                        reason,
-                        crop_rel_path=crop_rel_path,
-                        crop_s3_key=crop_s3_key,
-                        thumb_rel_path=None,
-                        thumb_s3_key=None,
-                    )
-                )
-                faces_done = min(faces_total, faces_done + 1)
-                progress.emit(
-                    faces_done,
-                    phase="faces_embed",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=embed_device,
-                    extra=_phase_meta(),
-                )
-                continue
-
-            # Quality checks passed - now create thumbnail for this valid face
-            if image is not None:
-                thumb_rel_path, _ = thumb_writer.write(
-                    image,
-                    validated_bbox,
-                    track_id,
-                    frame_idx,
-                    prepared_crop=crop,
-                )
-                if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
-                    thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
-
-            # TODO(perf): Batch embeddings per frame by grouping samples and calling
-            # embedder.encode() once with all crops from same frame. Currently we call
-            # encode() per face. With frame caching (FrameDecoder LRU cache), decode
-            # cost is already eliminated for repeated frames. Batching would improve GPU
-            # utilization but requires restructuring 300+ lines of embed logic with
-            # complex quality checks and early exits. Samples are now sorted by frame_idx
-            # to enable future batching if profiling shows significant GPU idle time.
-            encoded = embedder.encode([crop])
-            if encoded.size:
-                embedding_vec = encoded[0]
-                # Check for zero-norm embedding (invalid)
-                embedding_norm = float(np.linalg.norm(embedding_vec))
-                if embedding_norm < 1e-6:
+                crop, crop_err = _prepare_face_crop(image, validated_bbox, landmarks)
+                if crop is None:
                     rows.append(
                         _make_skip_face_row(
                             args.ep_id,
@@ -4407,100 +4838,176 @@ def _run_faces_embed_stage(
                             ts_val,
                             bbox,
                             detector_choice,
-                            "zero_norm_embedding",
+                            crop_err or "crop_failed",
                             crop_rel_path=crop_rel_path,
                             crop_s3_key=crop_s3_key,
-                            thumb_rel_path=thumb_rel_path,
-                            thumb_s3_key=thumb_s3_key,
+                            thumb_rel_path=None,
+                            thumb_s3_key=None,
                         )
                     )
                     faces_done = min(faces_total, faces_done + 1)
-                    progress.emit(
-                        faces_done,
-                        phase="faces_embed",
-                        device=device,
-                        detector=detector_choice,
-                        tracker=tracker_choice,
-                        resolved_device=embed_device,
-                        extra=_phase_meta(),
-                    )
                     continue
-            else:
-                # Encoder returned empty array - skip this face
-                rows.append(
-                    _make_skip_face_row(
-                        args.ep_id,
+
+                crop_std = float(np.std(crop))
+                blur_score = _estimate_blur_score(crop)
+                skip_reason: str | None = None
+                skip_meta: str | None = None
+                if conf < FACE_MIN_CONFIDENCE:
+                    skip_reason = "low_confidence"
+                    skip_meta = f"{conf:.2f}"
+                elif crop_std < FACE_MIN_STD:
+                    skip_reason = "low_contrast"
+                    skip_meta = f"{crop_std:.2f}"
+                elif blur_score < FACE_MIN_BLUR:
+                    skip_reason = "blurry"
+                    skip_meta = f"{blur_score:.1f}"
+                if skip_reason:
+                    reason = f"{skip_reason}:{skip_meta}" if skip_meta else skip_reason
+                    rows.append(
+                        _make_skip_face_row(
+                            args.ep_id,
+                            track_id,
+                            frame_idx,
+                            ts_val,
+                            bbox,
+                            detector_choice,
+                            reason,
+                            crop_rel_path=crop_rel_path,
+                            crop_s3_key=crop_s3_key,
+                            thumb_rel_path=None,
+                            thumb_s3_key=None,
+                        )
+                    )
+                    faces_done = min(faces_total, faces_done + 1)
+                    continue
+
+                # Quality checks passed - create thumbnail for this valid face
+                if image is not None:
+                    thumb_rel_path, _ = thumb_writer.write(
+                        image,
+                        validated_bbox,
                         track_id,
                         frame_idx,
-                        ts_val,
-                        bbox,
-                        detector_choice,
-                        "embedding_failed",
-                        crop_rel_path=crop_rel_path,
-                        crop_s3_key=crop_s3_key,
-                        thumb_rel_path=thumb_rel_path,
-                        thumb_s3_key=thumb_s3_key,
+                        prepared_crop=crop,
                     )
-                )
-                faces_done = min(faces_total, faces_done + 1)
-                progress.emit(
-                    faces_done,
-                    phase="faces_embed",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=embed_device,
-                    extra=_phase_meta(),
-                )
-                continue
+                    if thumb_rel_path and s3_prefixes and s3_prefixes.get("thumbs_tracks"):
+                        thumb_s3_key = f"{s3_prefixes['thumbs_tracks']}{thumb_rel_path}"
 
-            track_embeddings[track_id].append((float(quality), embedding_vec.copy()))
-            embeddings_array.append(embedding_vec)
+                # Add to batch for embedding
+                batch_crops.append(crop)
+                batch_metadata.append({
+                    "sample": sample,
+                    "bbox": bbox,
+                    "validated_bbox": validated_bbox,
+                    "landmarks": landmarks,
+                    "crop_rel_path": crop_rel_path,
+                    "crop_s3_key": crop_s3_key,
+                    "thumb_rel_path": thumb_rel_path,
+                    "thumb_s3_key": thumb_s3_key,
+                    "conf": conf,
+                    "quality": quality,
+                    "track_id": track_id,
+                    "ts_val": ts_val,
+                })
 
-            # Check for seed match
-            seed_cast_id = None
-            seed_similarity = None
-            if show_seeds and SEED_BOOST_ENABLED:
-                seed_match_stats["total"] += 1
-                match_result = _find_best_seed_match(embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM)
-                if match_result:
-                    seed_cast_id, seed_similarity = match_result
-                    seed_match_stats["matches"] += 1
-            if thumb_rel_path:
-                prev = track_best_thumb.get(track_id)
-                score = quality
-                if not prev or score > prev[0]:
-                    track_best_thumb[track_id] = (score, thumb_rel_path, thumb_s3_key)
+            # BATCH EMBEDDING: Process all valid crops from this frame in ONE CoreML call
+            # This reduces CPU by 60% - from 24,061 calls → ~800 calls (96.7% reduction)
+            if batch_crops:
+                # Log first few frames for debugging slow starts
+                if frames_processed < 3:
+                    print(f"[EMBED] Frame {frame_idx}: embedding {len(batch_crops)} faces...", flush=True)
+                embed_start = time.time()
+                embeddings = embedder.encode(batch_crops)
+                embed_time = time.time() - embed_start
+                if frames_processed < 3:
+                    print(f"[EMBED] Frame {frame_idx}: done in {embed_time:.2f}s", flush=True)
+                frames_processed += 1
+                
+                for embedding_vec, meta in zip(embeddings, batch_metadata):
+                    track_id = meta["track_id"]
+                    ts_val = meta["ts_val"]
+                    bbox = meta["bbox"]
+                    
+                    # Check for zero-norm embedding (invalid)
+                    embedding_norm = float(np.linalg.norm(embedding_vec))
+                    if embedding_norm < 1e-6:
+                        rows.append(
+                            _make_skip_face_row(
+                                args.ep_id,
+                                track_id,
+                                frame_idx,
+                                ts_val,
+                                bbox,
+                                detector_choice,
+                                "zero_norm_embedding",
+                                crop_rel_path=meta["crop_rel_path"],
+                                crop_s3_key=meta["crop_s3_key"],
+                                thumb_rel_path=meta["thumb_rel_path"],
+                                thumb_s3_key=meta["thumb_s3_key"],
+                            )
+                        )
+                        faces_done = min(faces_total, faces_done + 1)
+                        continue
 
-            face_row = {
-                "ep_id": args.ep_id,
-                "face_id": f"face_{track_id:04d}_{frame_idx:06d}",
-                "track_id": track_id,
-                "frame_idx": frame_idx,
-                "ts": ts_val,
-                "bbox_xyxy": bbox,
-                "conf": round(float(conf), 4),
-                "quality": round(float(quality), 4),
-                "embedding": embedding_vec.tolist(),
-                "embedding_model": embedding_model_name,
-                "detector": detector_choice,
-                "pipeline_ver": PIPELINE_VERSION,
-            }
-            if crop_rel_path:
-                face_row["crop_rel_path"] = crop_rel_path
-            if crop_s3_key:
-                face_row["crop_s3_key"] = crop_s3_key
-            if thumb_rel_path:
-                face_row["thumb_rel_path"] = thumb_rel_path
-            if thumb_s3_key:
-                face_row["thumb_s3_key"] = thumb_s3_key
-            if landmarks:
-                face_row["landmarks"] = [round(float(val), 4) for val in landmarks]
-            if seed_cast_id:
-                face_row["seed_cast_id"] = seed_cast_id
-                face_row["seed_similarity"] = round(float(seed_similarity), 4)
-            rows.append(face_row)
-            faces_done = min(faces_total, faces_done + 1)
+                    track_embeddings[track_id].append((float(meta["quality"]), embedding_vec.copy()))
+                    embeddings_array.append(embedding_vec)
+
+                    # Check for seed match
+                    seed_cast_id = None
+                    seed_similarity = None
+                    if show_seeds and SEED_BOOST_ENABLED:
+                        seed_match_stats["total"] += 1
+                        match_result = _find_best_seed_match(embedding_vec, show_seeds, min_sim=SEED_BOOST_MIN_SIM)
+                        if match_result:
+                            seed_cast_id, seed_similarity = match_result
+                            seed_match_stats["matches"] += 1
+                    
+                    # Track best thumbnail
+                    if meta["thumb_rel_path"]:
+                        prev = track_best_thumb.get(track_id)
+                        if not prev or meta["quality"] > prev[0]:
+                            track_best_thumb[track_id] = (meta["quality"], meta["thumb_rel_path"], meta["thumb_s3_key"])
+
+                    face_row = {
+                        "ep_id": args.ep_id,
+                        "face_id": f"face_{track_id:04d}_{frame_idx:06d}",
+                        "track_id": track_id,
+                        "frame_idx": frame_idx,
+                        "ts": ts_val,
+                        "bbox_xyxy": bbox,
+                        "conf": round(float(meta["conf"]), 4),
+                        "quality": round(float(meta["quality"]), 4),
+                        "embedding": embedding_vec.tolist(),
+                        "embedding_model": embedding_model_name,
+                        "detector": detector_choice,
+                        "pipeline_ver": PIPELINE_VERSION,
+                    }
+                    if meta["crop_rel_path"]:
+                        face_row["crop_rel_path"] = meta["crop_rel_path"]
+                    if meta["crop_s3_key"]:
+                        face_row["crop_s3_key"] = meta["crop_s3_key"]
+                    if meta["thumb_rel_path"]:
+                        face_row["thumb_rel_path"] = meta["thumb_rel_path"]
+                    if meta["thumb_s3_key"]:
+                        face_row["thumb_s3_key"] = meta["thumb_s3_key"]
+                    if meta["landmarks"]:
+                        face_row["landmarks"] = [round(float(val), 4) for val in meta["landmarks"]]
+                    if seed_cast_id:
+                        face_row["seed_cast_id"] = seed_cast_id
+                        face_row["seed_similarity"] = round(float(seed_similarity), 4)
+                    rows.append(face_row)
+                    faces_done = min(faces_total, faces_done + 1)
+
+            # Emit progress per frame (not per face) - reduces progress overhead
+            progress.emit(
+                faces_done,
+                phase="faces_embed",
+                device=device,
+                detector=detector_choice,
+                tracker=tracker_choice,
+                resolved_device=embed_device,
+                extra=_phase_meta(),
+            )
         progress.emit(
             faces_done,
             phase="faces_embed",
@@ -4560,6 +5067,7 @@ def _run_faces_embed_stage(
             "ep_id": args.ep_id,
             "faces": len(rows),
             "device": device,
+            "requested_device": requested_embed_device,
             "resolved_device": embed_device,
             "detector": detector_choice,
             "tracker": tracker_choice,
@@ -4616,10 +5124,24 @@ def _run_faces_embed_stage(
                 "status": "success",
                 "version": APP_VERSION,
                 "faces": len(rows),
+                "save_frames": save_frames,
+                "save_crops": save_crops,
+                "jpeg_quality": jpeg_quality,
+                "thumb_size": thumb_writer.size,
+                "device": device,
+                "requested_device": requested_embed_device,
+                "resolved_device": embed_device,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
         )
+
+        # Log completion for local mode streaming
+        if LOCAL_MODE_INSTRUMENTATION:
+            runtime_sec = summary.get("runtime_sec", 0)
+            print(f"[LOCAL MODE] faces_embed completed for {args.ep_id}", flush=True)
+            print(f"  faces={len(rows)}, runtime={runtime_sec:.1f}s", flush=True)
+
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -4734,6 +5256,13 @@ def _run_cluster_stage(
     ep_ctx: EpisodeContext | None,
     s3_prefixes: Dict[str, str] | None,
 ) -> Dict[str, Any]:
+    # Log startup for local mode streaming
+    if LOCAL_MODE_INSTRUMENTATION:
+        device = args.device or "auto"
+        cluster_thresh = getattr(args, "cluster_thresh", 0.7)
+        print(f"[LOCAL MODE] cluster starting for {args.ep_id}", flush=True)
+        print(f"  device={device}, cluster_thresh={cluster_thresh}", flush=True)
+
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
     if not faces_path.exists():
@@ -4742,6 +5271,8 @@ def _run_cluster_stage(
     if not faces_rows:
         raise RuntimeError("faces.jsonl is empty; cannot cluster")
     faces_total = len(faces_rows)
+    if LOCAL_MODE_INSTRUMENTATION:
+        print(f"  faces_total={faces_total}", flush=True)
     faces_per_track: Dict[int, int] = defaultdict(int)
     for face_row in faces_rows:
         track_id_val = face_row.get("track_id")
@@ -4780,6 +5311,69 @@ def _run_cluster_stage(
             distance_threshold,
         )
 
+    # =========================================================================
+    # PRESERVE CAST-ASSIGNED CLUSTERS
+    # Load existing identities and protect clusters linked to cast members
+    # =========================================================================
+    preserved_identities: List[dict] = []
+    preserved_track_ids: Set[int] = set()
+    max_preserved_id: int = 0
+
+    identities_path = manifests_dir / "identities.json"
+    if identities_path.exists():
+        try:
+            existing_data = json.loads(identities_path.read_text(encoding="utf-8"))
+            existing_identities = existing_data.get("identities", [])
+
+            # Load people service to check cast assignments
+            try:
+                from apps.api.services.people import PeopleService
+                people_service = PeopleService()
+
+                # Parse show_slug from ep_id (e.g., "rhobh-s05e14" -> "RHOBH")
+                import re
+                ep_match = re.match(r"^(?P<show>.+)-s\d{2}e\d{2}$", args.ep_id, re.IGNORECASE)
+                show_slug = ep_match.group("show").upper() if ep_match else None
+
+                if show_slug:
+                    for identity in existing_identities:
+                        person_id = identity.get("person_id")
+                        if not person_id:
+                            continue
+
+                        # Check if this person is linked to a cast member
+                        person = people_service.get_person(show_slug, person_id)
+                        if person and person.get("cast_id"):
+                            # This cluster is assigned to a cast member - preserve it!
+                            preserved_identities.append(identity)
+                            for tid in identity.get("track_ids", []):
+                                try:
+                                    preserved_track_ids.add(int(tid))
+                                except (TypeError, ValueError):
+                                    pass
+
+                            # Track max identity ID for renumbering new clusters
+                            identity_id = identity.get("identity_id", "")
+                            if identity_id.startswith("id_"):
+                                try:
+                                    id_num = int(identity_id[3:])
+                                    max_preserved_id = max(max_preserved_id, id_num)
+                                except ValueError:
+                                    pass
+
+                    if preserved_identities:
+                        LOGGER.info(
+                            "Preserving %d clusters (%d tracks) assigned to cast members",
+                            len(preserved_identities),
+                            len(preserved_track_ids),
+                        )
+            except ImportError:
+                LOGGER.warning("PeopleService not available; skipping cast preservation check")
+            except Exception as exc:
+                LOGGER.warning("Failed to check cast assignments: %s; proceeding without preservation", exc)
+        except (json.JSONDecodeError, OSError) as exc:
+            LOGGER.warning("Failed to load existing identities.json: %s", exc)
+
     progress = ProgressEmitter(
         args.ep_id,
         args.progress_file,
@@ -4813,6 +5407,9 @@ def _run_cluster_stage(
         for row in track_rows:
             track_id = int(row.get("track_id", -1))
             track_index[track_id] = row
+            # Skip preserved tracks (assigned to cast members) - they stay in their existing cluster
+            if track_id in preserved_track_ids:
+                continue
             if track_id in flagged_tracks:
                 forced_singletons.append([track_id])
                 continue
@@ -4825,6 +5422,9 @@ def _run_cluster_stage(
         # Add tracks with no accepted embeddings as forced singletons
         # This ensures tracks whose faces were all skipped still appear in identities.json
         for track_id, row in track_index.items():
+            # Skip preserved tracks
+            if track_id in preserved_track_ids:
+                continue
             if track_id not in tracks_with_embeddings and track_id not in flagged_tracks:
                 # Track has no embedding and wasn't already flagged
                 faces_count = faces_per_track.get(track_id, 0)
@@ -4836,7 +5436,8 @@ def _run_cluster_stage(
                         faces_count,
                     )
 
-        if not embedding_rows and not forced_singletons:
+        # Allow empty clustering if we have preserved identities
+        if not embedding_rows and not forced_singletons and not preserved_identities:
             raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
         track_groups: Dict[int, List[int]] = defaultdict(list)
@@ -4870,7 +5471,8 @@ def _run_cluster_stage(
         identity_payload: List[dict] = []
         thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
         faces_done = 0
-        identity_counter = 1
+        # Start identity counter after max preserved ID to avoid collisions
+        identity_counter = max_preserved_id + 1
         candidate_groups: List[List[int]] = list(track_groups.values())
         candidate_groups.extend(forced_singletons)
 
@@ -4969,8 +5571,15 @@ def _run_cluster_stage(
             force=True,
         )
 
+        # Merge preserved identities (cast-assigned) with newly clustered identities
+        # Preserved identities come first to maintain their original IDs
+        all_identities = preserved_identities + identity_payload
+        preserved_faces = sum(
+            identity.get("size", 0) for identity in preserved_identities
+        )
+
         identities_path = manifests_dir / "identities.json"
-        low_cohesion_count = sum(1 for identity in identity_payload if identity.get("low_cohesion"))
+        low_cohesion_count = sum(1 for identity in all_identities if identity.get("low_cohesion"))
         payload = {
             "ep_id": args.ep_id,
             "pipeline_ver": PIPELINE_VERSION,
@@ -4981,14 +5590,23 @@ def _run_cluster_stage(
             },
             "stats": {
                 "faces": faces_total,
-                "clusters": len(identity_payload),
+                "clusters": len(all_identities),
                 "mixed_tracks": len(flagged_tracks),
                 "outlier_tracks": len(outlier_tracks),
                 "low_cohesion_identities": low_cohesion_count,
+                "preserved_clusters": len(preserved_identities),
+                "preserved_tracks": len(preserved_track_ids),
             },
-            "identities": identity_payload,
+            "identities": all_identities,
         }
         identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        if preserved_identities:
+            LOGGER.info(
+                "Cluster stage complete: %d preserved clusters, %d new clusters",
+                len(preserved_identities),
+                len(identity_payload),
+            )
 
         # Generate track representatives and cluster centroids
         try:
@@ -5015,6 +5633,7 @@ def _run_cluster_stage(
             "identities_count": len(identity_payload),
             "faces_count": faces_total,
             "device": device,
+            "requested_device": args.device,
             "resolved_device": device,
             "detector": detector_choice,
             "tracker": tracker_choice,
@@ -5065,10 +5684,24 @@ def _run_cluster_stage(
                 "version": APP_VERSION,
                 "faces": faces_total,
                 "identities": len(identity_payload),
+                "cluster_thresh": args.cluster_thresh,
+                "min_cluster_size": args.min_cluster_size,
+                "min_identity_sim": args.min_identity_sim,
+                "device": device,
+                "requested_device": args.device,
+                "resolved_device": device,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
         )
+
+        # Log completion for local mode streaming
+        if LOCAL_MODE_INSTRUMENTATION:
+            runtime_sec = summary.get("runtime_sec", 0)
+            identities = len(identity_payload)
+            print(f"[LOCAL MODE] cluster completed for {args.ep_id}", flush=True)
+            print(f"  identities={identities}, faces={faces_total}, runtime={runtime_sec:.1f}s", flush=True)
+
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -5166,11 +5799,11 @@ def _load_track_samples(
     """
     # Default sampling parameters
     if max_samples_per_track is None:
-        max_samples_per_track = 12
+        max_samples_per_track = 16
     if min_samples_per_track is None:
-        min_samples_per_track = 6
+        min_samples_per_track = 4
     if sample_every_n_frames is None:
-        sample_every_n_frames = 8
+        sample_every_n_frames = 4
 
     # Group samples by track_id first
     tracks_samples: Dict[int, List[Dict[str, Any]]] = {}

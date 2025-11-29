@@ -23,11 +23,11 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     run_dir = manifests_dir / "runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "faces_embed.json").write_text(
-        '{"phase": "faces_embed", "status": "success", "faces": 6, "finished_at": "2024-12-01T10:00:00Z"}',
+        '{"phase": "faces_embed", "status": "success", "faces": 6, "started_at": "2024-12-01T09:55:00Z", "finished_at": "2024-12-01T10:00:00Z"}',
         encoding="utf-8",
     )
     (run_dir / "cluster.json").write_text(
-        '{"phase": "cluster", "status": "success", "faces": 6, "identities": 2, "finished_at": "2024-12-01T10:05:00Z"}',
+        '{"phase": "cluster", "status": "success", "faces": 6, "identities": 2, "started_at": "2024-12-01T10:00:00Z", "finished_at": "2024-12-01T10:05:00Z"}',
         encoding="utf-8",
     )
 
@@ -49,11 +49,13 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     assert faces_status.get("status") == "success"
     assert isinstance(faces_status.get("faces"), int) and faces_status["faces"] > 0
     assert faces_status.get("finished_at")
+    assert faces_status.get("runtime_sec") == 300.0
     assert faces_status.get("source") == "marker"
 
     cluster_status = payload.get("cluster", {})
     assert cluster_status.get("status") == "success"
     assert isinstance(cluster_status.get("identities"), int) and cluster_status["identities"] > 0
+    assert cluster_status.get("runtime_sec") == 300.0
     assert cluster_status.get("source") == "marker"
 
     if run_dir.exists():
@@ -64,5 +66,40 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     inferred = inferred_resp.json()
     assert inferred["faces_embed"]["status"] == "success"
     assert inferred["faces_embed"].get("source") == "output"
+    assert inferred["faces_embed"].get("runtime_sec") is None
     assert inferred["cluster"]["status"] == "success"
     assert inferred["cluster"].get("source") == "output"
+    assert inferred["cluster"].get("runtime_sec") is None
+
+
+def test_detect_track_tracks_only_marks_stale(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    ep_id = "stale-tracks-only"
+
+    manifests_dir = get_path(ep_id, "detections").parent
+    tracks_path = manifests_dir / "tracks.jsonl"
+    tracks_path.parent.mkdir(parents=True, exist_ok=True)
+    tracks_path.write_text(
+        json.dumps(
+            {
+                "ep_id": ep_id,
+                "track_id": 1,
+                "detector": "retinaface",
+                "tracker": "bytetrack",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    client = TestClient(app)
+    status_resp = client.get(f"/episodes/{ep_id}/status")
+    assert status_resp.status_code == 200
+    payload = status_resp.json()
+
+    detect_status = payload.get("detect_track", {})
+    assert detect_status.get("status") == "stale"
+    assert payload.get("tracks_ready") is False
+    # Scenes are considered ready when tracks manifest exists even if detections are missing
+    assert payload.get("scenes_ready") is True

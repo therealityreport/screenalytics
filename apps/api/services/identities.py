@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Generator, Iterable, List, Sequence
 
 from py_screenalytics.artifacts import get_path
 
@@ -19,6 +21,26 @@ from apps.shared.storage import s3_write_json, use_s3
 
 STORAGE = StorageService()
 LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def _episode_lock(ep_id: str) -> Generator[None, None, None]:
+    """Acquire an exclusive lock for episode-level file operations.
+
+    Uses fcntl advisory locking to prevent concurrent modifications
+    to faces, tracks, and identities files for the same episode.
+    """
+    lock_path = _manifests_dir(ep_id) / ".episode.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = None
+    try:
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
 
 
 def _manifests_dir(ep_id: str) -> Path:
@@ -41,17 +63,108 @@ def _thumbs_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "thumbs"
 
 
-def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    if s3_key:
-        url = STORAGE.presign_get(str(s3_key))
+def _crops_root(ep_id: str) -> Path:
+    return get_path(ep_id, "frames_root") / "crops"
+
+
+def _crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    """Resolve a crop URL, preferring S3 with local fallback.
+
+    Priority:
+    1. Use provided s3_key if available
+    2. Construct S3 key from rel_path if s3_key not provided
+    3. Fall back to local file if S3 fails
+    """
+    constructed_s3_key = s3_key
+
+    # If no S3 key provided, try to construct one from rel_path
+    if not constructed_s3_key and rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = artifact_prefixes(ep_ctx)
+            crops_prefix = prefixes.get("crops")
+            if crops_prefix:
+                crop_rel = rel_path
+                if crop_rel.startswith("crops/"):
+                    crop_rel = crop_rel[6:]
+                constructed_s3_key = f"{crops_prefix}{crop_rel}"
+        except (ValueError, KeyError):
+            pass
+
+    # Try S3 first
+    if constructed_s3_key:
+        url = STORAGE.presign_get(str(constructed_s3_key))
         if url:
             return url
-    if not rel_path:
-        return None
-    local = _thumbs_root(ep_id) / rel_path
-    if local.exists():
-        return str(local)
+
+    # Local fallback
+    if rel_path:
+        frames_root = get_path(ep_id, "frames_root")
+        if rel_path.startswith("crops/"):
+            local = frames_root / rel_path
+        else:
+            local = _crops_root(ep_id) / rel_path
+        if local.exists():
+            return str(local)
+
     return None
+
+
+def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    """Resolve a thumbnail URL, preferring S3 with local fallback.
+
+    Priority:
+    1. Use provided s3_key if available
+    2. Construct S3 key from rel_path if s3_key not provided
+    3. Fall back to local file if S3 fails
+    """
+    constructed_s3_key = s3_key
+
+    # If no S3 key provided, try to construct one from rel_path
+    if not constructed_s3_key and rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = artifact_prefixes(ep_ctx)
+            thumbs_prefix = prefixes.get("thumbs")
+            if thumbs_prefix:
+                constructed_s3_key = f"{thumbs_prefix}{rel_path}"
+        except (ValueError, KeyError):
+            pass
+
+    # Try S3 first
+    if constructed_s3_key:
+        url = STORAGE.presign_get(str(constructed_s3_key))
+        if url:
+            return url
+
+    # Local fallback - try crop path first if it looks like a crop
+    if rel_path and (rel_path.startswith("crops/") or "crops/" in rel_path):
+        frames_root = get_path(ep_id, "frames_root")
+        crop_path = frames_root / rel_path
+        if crop_path.exists():
+            return str(crop_path)
+
+    if rel_path:
+        local = _thumbs_root(ep_id) / rel_path
+        if local.exists():
+            return str(local)
+
+    return None
+
+
+def _track_media_url(ep_id: str, track_row: Dict[str, Any] | None) -> str | None:
+    """Resolve the best media URL for a track, prioritizing crops over thumbs.
+
+    IMPORTANT: Crops are authoritative. best_crop_rel_path should be used first.
+    """
+    if not track_row:
+        return None
+    # Prioritize best crop - authoritative source for track preview
+    crop = _crop_url(ep_id, track_row.get("best_crop_rel_path"), track_row.get("best_crop_s3_key"))
+    if crop:
+        return crop
+    # Fall back to thumb only if crop is unavailable
+    return _thumbnail_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
 
 
 def _analytics_root(ep_id: str) -> Path:
@@ -283,6 +396,27 @@ def cluster_track_summary(
     tracks = load_tracks(ep_id)
     faces = load_faces(ep_id)
     track_lookup = _track_lookup(tracks)
+
+    # Load cluster centroids for cohesion data and track similarity computation
+    cluster_cohesion: Dict[str, float] = {}
+    cluster_centroids_data: Dict[str, Dict[str, Any]] = {}
+    track_reps_data: Dict[str, Dict[str, Any]] = {}
+    try:
+        from apps.api.services.track_reps import load_cluster_centroids, load_track_reps
+        import numpy as np
+
+        centroids = load_cluster_centroids(ep_id)
+        for cluster_id, cluster_data in centroids.items():
+            if isinstance(cluster_data, dict):
+                if cluster_data.get("cohesion") is not None:
+                    cluster_cohesion[cluster_id] = cluster_data["cohesion"]
+                if cluster_data.get("centroid") is not None:
+                    cluster_centroids_data[cluster_id] = cluster_data
+
+        # Load track reps for similarity computation
+        track_reps_data = load_track_reps(ep_id)
+    except Exception:
+        pass  # Cohesion/similarity data not available
     face_counts: Dict[int, int] = {}
     for row in faces:
         try:
@@ -290,6 +424,18 @@ def cluster_track_summary(
         except (TypeError, ValueError):
             continue
         face_counts[tid] = face_counts.get(tid, 0) + 1
+
+    # Helper to compute cosine similarity
+    def _cosine_sim(a: Any, b: Any) -> float | None:
+        try:
+            import numpy as np
+            a_vec = np.array(a, dtype=np.float32)
+            b_vec = np.array(b, dtype=np.float32)
+            norm_a = np.linalg.norm(a_vec) + 1e-12
+            norm_b = np.linalg.norm(b_vec) + 1e-12
+            return float(np.dot(a_vec / norm_a, b_vec / norm_b))
+        except Exception:
+            return None
 
     clusters: List[Dict[str, Any]] = []
     for identity in identities_payload.get("identities", []):
@@ -299,6 +445,13 @@ def cluster_track_summary(
         if include_set and identity_id.lower() not in include_set:
             continue
         track_ids = identity.get("track_ids", []) or []
+
+        # Get cluster centroid for similarity computation
+        cluster_centroid = None
+        cluster_data = cluster_centroids_data.get(identity_id)
+        if cluster_data:
+            cluster_centroid = cluster_data.get("centroid")
+
         tracks_payload: List[Dict[str, Any]] = []
         for raw_tid in track_ids:
             try:
@@ -308,13 +461,33 @@ def cluster_track_summary(
             track_row = track_lookup.get(tid)
             if not track_row:
                 continue
-            thumb_url = _thumbnail_url(ep_id, track_row.get("thumb_rel_path"), track_row.get("thumb_s3_key"))
+            # Use _track_media_url to prioritize crops (authoritative) over thumbs
+            thumb_url = _track_media_url(ep_id, track_row)
+
+            # Get track rep data for similarity computation
+            track_key = f"track_{tid:04d}"
+            track_rep = track_reps_data.get(track_key)
+
+            # Compute track similarity to cluster centroid
+            track_similarity = None
+            if cluster_centroid is not None and track_rep and track_rep.get("embed"):
+                track_similarity = _cosine_sim(track_rep["embed"], cluster_centroid)
+                if track_similarity is not None:
+                    track_similarity = round(track_similarity, 3)
+
+            # Get track internal consistency (how similar rep frame is to track centroid)
+            internal_similarity = None
+            if track_rep and track_rep.get("sim_to_centroid") is not None:
+                internal_similarity = round(track_rep["sim_to_centroid"], 3)
+
             tracks_payload.append(
                 {
                     "track_id": tid,
                     "faces": track_row.get("faces_count") or face_counts.get(tid) or 0,
                     "frames": track_row.get("frame_count"),
                     "rep_thumb_url": thumb_url,
+                    "similarity": track_similarity,
+                    "internal_similarity": internal_similarity,  # Track internal consistency
                 }
             )
         if limit_per_cluster:
@@ -325,6 +498,8 @@ def cluster_track_summary(
                 "identity_id": identity_id,
                 "name": identity.get("name"),
                 "label": identity.get("label"),
+                "person_id": identity.get("person_id"),  # For filtering assigned vs unassigned
+                "cohesion": cluster_cohesion.get(identity_id),  # Add cohesion from centroids
                 "counts": {
                     "tracks": len(track_ids),
                     "faces": identity.get("faces") or sum(face_counts.get(int(tid), 0) for tid in track_ids),
@@ -363,6 +538,12 @@ def _rebuild_track_entry(track_entry: Dict[str, Any], face_rows: Sequence[Dict[s
         track_entry["thumb_rel_path"] = thumb_rel
     if thumb_s3:
         track_entry["thumb_s3_key"] = thumb_s3
+    crop_rel = sorted_rows[0].get("crop_rel_path")
+    crop_s3 = sorted_rows[0].get("crop_s3_key")
+    if crop_rel:
+        track_entry.setdefault("best_crop_rel_path", crop_rel)
+    if crop_s3:
+        track_entry.setdefault("best_crop_s3_key", crop_s3)
     return track_entry
 
 
@@ -417,10 +598,11 @@ def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, An
     target = next((item for item in identities if item.get("identity_id") == target_id), None)
     if not source or not target:
         raise ValueError("identity_not_found")
-    merged = set(target.get("track_ids", []) or [])
-    for tid in source.get("track_ids", []) or []:
-        merged.add(int(tid))
-    target["track_ids"] = sorted({int(val) for val in merged})
+    # Consistently coerce all track_ids to int to avoid type confusion
+    target_tids = {int(tid) for tid in (target.get("track_ids", []) or [])}
+    source_tids = {int(tid) for tid in (source.get("track_ids", []) or [])}
+    merged = target_tids | source_tids
+    target["track_ids"] = sorted(merged)
     payload["identities"] = [item for item in identities if item.get("identity_id") != source_id]
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
@@ -434,26 +616,35 @@ def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dic
     source_identity = None
     target_identity = None
     for identity in identities:
-        track_ids = identity.get("track_ids", []) or []
+        # Coerce track_ids to int for consistent comparison (handles string/int mismatch)
+        track_ids = {int(tid) for tid in (identity.get("track_ids", []) or [])}
         if track_id in track_ids:
             source_identity = identity
         if target_identity_id and identity.get("identity_id") == target_identity_id:
             target_identity = identity
     if target_identity_id and target_identity is None:
         raise ValueError("target_not_found")
-    if source_identity and track_id in source_identity.get("track_ids", []):
-        source_identity["track_ids"] = [tid for tid in source_identity["track_ids"] if tid != track_id]
+    # Remove from source identity (coerce to int for comparison)
+    if source_identity:
+        source_track_ids = {int(tid) for tid in source_identity.get("track_ids", [])}
+        source_identity["track_ids"] = sorted(tid for tid in source_track_ids if tid != track_id)
     if target_identity is not None:
         target_identity.setdefault("track_ids", [])
-        if track_id not in target_identity["track_ids"]:
-            target_identity["track_ids"].append(track_id)
-            target_identity["track_ids"] = sorted(target_identity["track_ids"])
+        # Coerce existing track_ids to int and add new track
+        target_track_ids = {int(tid) for tid in target_identity["track_ids"]}
+        target_track_ids.add(track_id)
+        target_identity["track_ids"] = sorted(target_track_ids)
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
     sync_manifests(ep_id, identities_path)
+
+    # Automatically clean up any empty clusters (source may now be empty)
+    cleanup_result = cleanup_empty_clusters(ep_id)
+
     return {
         "identity_id": target_identity_id,
         "track_ids": target_identity["track_ids"] if target_identity else [],
+        "empty_clusters_removed": len(cleanup_result.get("removed_clusters", [])),
     }
 
 
@@ -465,11 +656,21 @@ def drop_track(ep_id: str, track_id: int) -> Dict[str, Any]:
     tracks_path = write_tracks(ep_id, kept_tracks)
     identities = load_identities(ep_id)
     for identity in identities.get("identities", []):
-        identity["track_ids"] = [tid for tid in identity.get("track_ids", []) if tid != track_id]
+        # Coerce to int for consistent comparison
+        identity["track_ids"] = sorted(
+            int(tid) for tid in identity.get("track_ids", []) if int(tid) != track_id
+        )
     update_identity_stats(ep_id, identities)
     identities_path = write_identities(ep_id, identities)
     sync_manifests(ep_id, tracks_path, identities_path)
-    return {"track_id": track_id, "remaining_tracks": len(kept_tracks)}
+
+    # Automatically clean up any empty clusters
+    cleanup_result = cleanup_empty_clusters(ep_id)
+    return {
+        "track_id": track_id,
+        "remaining_tracks": len(kept_tracks),
+        "empty_clusters_removed": len(cleanup_result.get("removed_clusters", [])),
+    }
 
 
 def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = False) -> Dict[str, Any]:
@@ -508,12 +709,100 @@ def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = 
     return {"track_id": track_id, "frame_idx": frame_idx, "removed": len(removed)}
 
 
+def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, Any]:
+    """Remove clusters with no tracks and update people.json accordingly.
+
+    This should be called after any operation that might leave clusters empty:
+    - drop_track()
+    - move_track()
+    - Merge operations
+
+    Args:
+        ep_id: Episode identifier
+        show_id: Show identifier (extracted from ep_id if not provided)
+
+    Returns:
+        {
+            "removed_clusters": List of identity_ids that were removed,
+            "people_updated": List of person_ids that had clusters removed,
+            "identities_before": Count before cleanup,
+            "identities_after": Count after cleanup,
+        }
+    """
+    from apps.api.services.people import PeopleService
+
+    identities = load_identities(ep_id)
+    all_identities = identities.get("identities", [])
+    identities_before = len(all_identities)
+
+    # Find empty clusters (no track_ids)
+    empty_cluster_ids = []
+    kept_identities = []
+    for identity in all_identities:
+        track_ids = identity.get("track_ids", []) or []
+        if not track_ids:
+            empty_cluster_ids.append(identity.get("identity_id"))
+            LOGGER.info(
+                "Removing empty cluster %s from episode %s",
+                identity.get("identity_id"),
+                ep_id,
+            )
+        else:
+            kept_identities.append(identity)
+
+    if not empty_cluster_ids:
+        return {
+            "removed_clusters": [],
+            "people_updated": [],
+            "identities_before": identities_before,
+            "identities_after": identities_before,
+        }
+
+    # Update identities.json
+    identities["identities"] = kept_identities
+    update_identity_stats(ep_id, identities)
+    identities_path = write_identities(ep_id, identities)
+    sync_manifests(ep_id, identities_path)
+
+    # Remove from people.json
+    people_updated = []
+    if show_id is None:
+        try:
+            ctx = episode_context_from_id(ep_id)
+            show_id = ctx.show_slug
+        except Exception:
+            LOGGER.warning("Could not extract show_id from ep_id %s", ep_id)
+
+    if show_id:
+        people_service = PeopleService()
+        for cluster_id in empty_cluster_ids:
+            # Full cluster ID format: ep_id:identity_id
+            full_cluster_id = f"{ep_id}:{cluster_id}"
+            modified = people_service.remove_cluster_from_all_people(show_id, full_cluster_id)
+            people_updated.extend(modified)
+
+    LOGGER.info(
+        "Cleaned up %d empty clusters from episode %s, updated %d people",
+        len(empty_cluster_ids),
+        ep_id,
+        len(set(people_updated)),
+    )
+
+    return {
+        "removed_clusters": empty_cluster_ids,
+        "people_updated": list(set(people_updated)),
+        "identities_before": identities_before,
+        "identities_after": len(kept_identities),
+    }
+
+
 def _persist_identity_name(
     ep_id: str,
     payload: Dict[str, Any],
     identity_id: str,
     trimmed_name: str,
     show: str | None,
+    cast_id: str | None = None,
 ) -> Dict[str, Any]:
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
@@ -545,8 +834,32 @@ def _persist_identity_name(
             # Build cluster_id with episode prefix
             cluster_id_with_prefix = f"{ep_id}:{identity_id}"
 
-            # Use alias-aware lookup to find existing person
-            existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
+            existing_person = None
+
+            # PRIORITY 1: If cast_id provided, look for person with that cast_id first
+            if cast_id:
+                existing_person = next(
+                    (p for p in people_service.list_people(show_slug) if p.get("cast_id") == cast_id),
+                    None,
+                )
+                if existing_person:
+                    LOGGER.info(f"Found existing person by cast_id {cast_id}: {existing_person['person_id']}")
+
+            # PRIORITY 2: If no cast_id match, use alias-aware lookup by name
+            if not existing_person:
+                existing_person = people_service.find_person_by_name_or_alias(show_slug, trimmed_name)
+
+            # PRIORITY 3: Fallback to case-insensitive primary-name match
+            if not existing_person:
+                existing_person = next(
+                    (
+                        person
+                        for person in people_service.list_people(show_slug)
+                        if people_service.normalize_name(person.get("name"))
+                        == people_service.normalize_name(trimmed_name)
+                    ),
+                    None,
+                )
 
             if existing_person:
                 # Add cluster to existing person (if not already present)
@@ -568,24 +881,41 @@ def _persist_identity_name(
                 if people_service.normalize_name(trimmed_name) != people_service.normalize_name(primary_name):
                     people_service.add_alias_to_person(show_slug, person_id, trimmed_name)
                     LOGGER.info(f"Added alias '{trimmed_name}' to person {person_id}")
+
+                # Ensure cast_id is set if provided
+                if cast_id and existing_person.get("cast_id") != cast_id:
+                    people_service.update_person(show_slug, person_id, cast_id=cast_id)
+                    LOGGER.info(f"Updated person {person_id} with cast_id {cast_id}")
             else:
-                # Create new person
+                # Create new person with cast_id
                 person = people_service.create_person(
                     show_slug,
                     name=trimmed_name,
                     cluster_ids=[cluster_id_with_prefix],
                     aliases=[],
+                    cast_id=cast_id,  # Include cast_id when creating person
                 )
-                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id}")
+                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id} and cast_id {cast_id}")
 
         except Exception as exc:
             # Don't fail the naming operation if People service fails
             LOGGER.warning(f"Failed to create/update People record for {trimmed_name}: {exc}")
 
+        # Mark assignment as manual so it's protected during cleanup operations
+        try:
+            from apps.api.services.grouping import GroupingService
+
+            grouping_service = GroupingService()
+            grouping_service.mark_assignment_manual(ep_id, identity_id, cast_id=cast_id)
+            LOGGER.info(f"Marked cluster {identity_id} as manually assigned (cast_id={cast_id})")
+        except Exception as exc:
+            # Don't fail the naming operation if marking manual fails
+            LOGGER.warning(f"Failed to mark cluster {identity_id} as manual: {exc}")
+
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
 
 
-def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None) -> Dict[str, Any]:
+def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
     payload = load_identities(ep_id)
     entries = _identity_rows(payload)
     target = next(
@@ -598,10 +928,10 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
     if not trimmed:
         raise ValueError("name_required")
     target["name"] = trimmed
-    return _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
+    return _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
 
 
-def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None) -> Dict[str, Any]:
+def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
     trimmed = (name or "").strip()
     if not trimmed:
         raise ValueError("name_required")
@@ -636,7 +966,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
 
     if len(track_ids_for_identity) <= 1:
         target_identity["name"] = trimmed
-        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show)
+        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
         result["track_id"] = track_id_int
         result["split"] = False
         return result
@@ -653,7 +983,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
     }
     payload.setdefault("identities", []).append(new_identity)
 
-    result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show)
+    result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
     result["track_id"] = track_id_int
     result["split"] = True
     result["source_identity_id"] = identity_id
@@ -676,6 +1006,21 @@ def move_frames(
     except ValueError as exc:
         raise ValueError("invalid_ep_id") from exc
 
+    # Acquire episode lock to prevent concurrent modifications
+    with _episode_lock(ep_id):
+        return _move_frames_locked(ep_id, from_track_id, face_ids, target_identity_id, new_identity_name, show_id, ctx)
+
+
+def _move_frames_locked(
+    ep_id: str,
+    from_track_id: int,
+    face_ids: Sequence[str],
+    target_identity_id: str | None,
+    new_identity_name: str | None,
+    show_id: str | None,
+    ctx: Any,
+) -> Dict[str, Any]:
+    """Internal implementation of move_frames, called while holding episode lock."""
     faces = load_faces(ep_id)
     face_map = {str(row.get("face_id")): row for row in faces}
     selected: List[Dict[str, Any]] = []
@@ -696,8 +1041,9 @@ def move_frames(
 
     identities_payload = load_identities(ep_id)
     identities = _identity_rows(identities_payload)
+    # Coerce track_ids to int for consistent comparison (handles string/int mismatch)
     source_identity = next(
-        (entry for entry in identities if from_track_id in (entry.get("track_ids") or [])),
+        (entry for entry in identities if from_track_id in {int(tid) for tid in (entry.get("track_ids") or [])}),
         None,
     )
 

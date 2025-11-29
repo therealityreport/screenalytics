@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import sys
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Literal, Optional, Set
 
+import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -19,9 +22,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
 from py_screenalytics.facebank_seed import select_facebank_seeds, write_facebank_seeds
+from tools import episode_run
 
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
+from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services.storage import (
     StorageService,
@@ -38,6 +43,15 @@ STORAGE = StorageService()
 LOGGER = logging.getLogger(__name__)
 
 DIAG = os.getenv("DIAG_LOG", "0") == "1"
+
+
+def normalize_ep_id(ep_id: str) -> str:
+    """Normalize ep_id to lowercase for case-insensitive handling.
+
+    This ensures that 'RHOSLC-s06e02' and 'rhoslc-s06e02' are treated as the same episode
+    throughout the API and file system operations.
+    """
+    return ep_id.strip().lower()
 
 
 def _diag(tag: str, **kw) -> None:
@@ -64,7 +78,7 @@ def _append_face_ops(ep_id: str, entries: Iterable[Dict[str, Any]]) -> None:
         return
     path = _faces_ops_path(ep_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     with path.open("a", encoding="utf-8") as handle:
         for entry in entries:
             payload = dict(entry)
@@ -183,6 +197,13 @@ def _safe_int(value) -> int | None:
         return None
 
 
+def _safe_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _count_nonempty_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -237,48 +258,210 @@ def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _compute_runtime_sec(started_at: str | None, finished_at: str | None) -> float | None:
+    """Compute runtime in seconds from ISO timestamps."""
+    if not started_at or not finished_at:
+        return None
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+        delta = (end - start).total_seconds()
+        return delta if delta >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, Any]:
     status_value = str(marker.get("status") or "unknown").lower()
+    started_at = marker.get("started_at")
+    finished_at = marker.get("finished_at")
+    runtime_sec = _compute_runtime_sec(started_at, finished_at)
     return {
         "phase": phase,
         "status": status_value,
         "faces": _safe_int(marker.get("faces")),
         "identities": _safe_int(marker.get("identities")),
-        "started_at": marker.get("started_at"),
-        "finished_at": marker.get("finished_at"),
+        "detections": _safe_int(marker.get("detections")),
+        "tracks": _safe_int(marker.get("tracks")),
+        "detector": marker.get("detector"),
+        "tracker": marker.get("tracker"),
+        "device": marker.get("device"),
+        "requested_device": marker.get("requested_device"),
+        "resolved_device": marker.get("resolved_device"),
+        "stride": _safe_int(marker.get("stride")),
+        "det_thresh": _safe_float(marker.get("det_thresh")),
+        "max_gap": _safe_int(marker.get("max_gap")),
+        "scene_threshold": _safe_float(marker.get("scene_threshold")),
+        "scene_min_len": _safe_int(marker.get("scene_min_len")),
+        "scene_warmup_dets": _safe_int(marker.get("scene_warmup_dets")),
+        "track_high_thresh": _safe_float(marker.get("track_high_thresh")),
+        "new_track_thresh": _safe_float(marker.get("new_track_thresh")),
+        "save_frames": marker.get("save_frames"),
+        "save_crops": marker.get("save_crops"),
+        "jpeg_quality": _safe_int(marker.get("jpeg_quality")),
+        "thumb_size": _safe_int(marker.get("thumb_size")),
+        "cluster_thresh": _safe_float(marker.get("cluster_thresh")),
+        "min_cluster_size": _safe_int(marker.get("min_cluster_size")),
+        "min_identity_sim": _safe_float(marker.get("min_identity_sim")),
+        "started_at": started_at,
+        "finished_at": finished_at,
         "version": marker.get("version"),
         "source": "marker",
+        "runtime_sec": runtime_sec,
+        "frames_total": _safe_int(marker.get("frames_total")),
+        "video_duration_sec": _safe_float(marker.get("video_duration_sec")),
+        "fps": _safe_float(marker.get("fps")),
     }
+
+
+def _get_file_mtime_iso(path: Path) -> str | None:
+    """Get the modification time of a file as an ISO timestamp."""
+    if not path.exists():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except OSError:
+        return None
 
 
 def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
     marker = _load_run_marker(ep_id, "faces_embed")
     if marker:
-        return _phase_status_from_marker("faces_embed", marker)
+        result = _phase_status_from_marker("faces_embed", marker)
+        # Add manifest existence info even when marker exists
+        faces_path = _faces_path(ep_id)
+        result["manifest_exists"] = faces_path.exists()
+        # Prefer marker timestamp; fall back to manifest mtime if available
+        result["last_run_at"] = marker.get("finished_at") or _get_file_mtime_iso(faces_path)
+        faces_count = result.get("faces") or 0
+        result["zero_rows"] = result["manifest_exists"] and faces_count == 0
+        return result
     faces_path = _faces_path(ep_id)
+    manifest_exists = faces_path.exists()
     faces_count = _count_nonempty_lines(faces_path)
-    status_value = "success" if faces_count > 0 else "missing"
-    source = "output" if faces_path.exists() else "absent"
+    # SUCCESS if manifest exists (even with 0 rows), MISSING only if no manifest
+    status_value = "success" if manifest_exists else "missing"
+    source = "output" if manifest_exists else "absent"
+    last_run_at = _get_file_mtime_iso(faces_path)
     return {
         "phase": "faces_embed",
         "status": status_value,
         "faces": faces_count,
         "identities": None,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "save_frames": None,
+        "save_crops": None,
+        "jpeg_quality": None,
+        "thumb_size": None,
         "started_at": None,
         "finished_at": None,
         "version": None,
         "source": source,
+        "manifest_exists": manifest_exists,
+        "zero_rows": manifest_exists and faces_count == 0,
+        "last_run_at": last_run_at,
     }
 
 
+def _extract_singleton_merge_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract singleton merge stats from identities.json stats block."""
+    stats_block = payload.get("stats") if isinstance(payload, dict) else None
+    if not isinstance(stats_block, dict):
+        return {}
+
+    result: Dict[str, Any] = {}
+
+    # Include the full singleton_stats block for backwards compatibility
+    singleton_stats = stats_block.get("singleton_stats")
+    if isinstance(singleton_stats, dict):
+        result["singleton_stats"] = singleton_stats
+        result["singleton_merge_enabled"] = singleton_stats.get("enabled", True)
+        before = singleton_stats.get("before", {})
+        after = singleton_stats.get("after", {})
+        if isinstance(before, dict):
+            result["singleton_fraction_before"] = _safe_float(before.get("singleton_fraction"))
+        if isinstance(after, dict):
+            result["singleton_fraction_after"] = _safe_float(after.get("singleton_fraction"))
+            result["singleton_merge_merge_count"] = _safe_int(after.get("merge_count"))
+
+    # Check singleton_merge block (newer format) - may have additional fields
+    singleton_merge = stats_block.get("singleton_merge")
+    if isinstance(singleton_merge, dict):
+        result["singleton_merge_enabled"] = singleton_merge.get("enabled", True)
+        if "singleton_fraction_before" not in result:
+            result["singleton_fraction_before"] = _safe_float(singleton_merge.get("singleton_fraction_before"))
+        if "singleton_fraction_after" not in result:
+            result["singleton_fraction_after"] = _safe_float(singleton_merge.get("singleton_fraction_after"))
+        result["singleton_merge_neighbor_top_k"] = _safe_int(singleton_merge.get("neighbor_top_k"))
+        result["singleton_merge_similarity_thresh"] = _safe_float(singleton_merge.get("similarity_thresh"))
+        if "singleton_merge_merge_count" not in result:
+            result["singleton_merge_merge_count"] = _safe_int(singleton_merge.get("num_singleton_merges"))
+
+    return result
+
+
 def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
+    """Get cluster phase status, checking both identities.json and track_metrics.json.
+
+    For staleness detection, we need to check BOTH files because:
+    - identities.json: Main cluster output
+    - track_metrics.json: Written during clustering, may exist even when identities.json doesn't
+
+    The cluster is considered to have run if EITHER file exists, and last_run_at
+    is the max mtime of both files.
+    """
+    from py_screenalytics.artifacts import get_path
+
+    identities_path = _identities_path(ep_id)
+    manifests_dir = get_path(ep_id, "detections").parent
+    track_metrics_path = manifests_dir / "track_metrics.json"
+
+    # Helper to get max mtime of multiple paths
+    def _max_mtime_iso(*paths) -> str | None:
+        mtimes = []
+        for path in paths:
+            if path.exists():
+                mtime_iso = _get_file_mtime_iso(path)
+                if mtime_iso:
+                    mtimes.append(mtime_iso)
+        if not mtimes:
+            return None
+        # ISO timestamps sort lexicographically, so max() works
+        return max(mtimes)
+
     marker = _load_run_marker(ep_id, "cluster")
     if marker:
-        return _phase_status_from_marker("cluster", marker)
-    identities_path = _identities_path(ep_id)
+        result = _phase_status_from_marker("cluster", marker)
+        # Add manifest existence info even when marker exists
+        result["manifest_exists"] = identities_path.exists()
+        # Use marker finished_at first; fall back to max of identities/track_metrics mtimes
+        result["last_run_at"] = marker.get("finished_at") or _max_mtime_iso(identities_path, track_metrics_path)
+        result["track_metrics_exists"] = track_metrics_path.exists()
+        identities_count = result.get("identities") or 0
+        result["zero_rows"] = result["manifest_exists"] and identities_count == 0
+        # Try to add singleton merge stats from identities.json
+        if identities_path.exists():
+            try:
+                payload = json.loads(identities_path.read_text(encoding="utf-8"))
+                singleton_stats = _extract_singleton_merge_stats(payload)
+                result.update(singleton_stats)
+            except (OSError, json.JSONDecodeError):
+                pass
+        return result
+
+    manifest_exists = identities_path.exists()
+    track_metrics_exists = track_metrics_path.exists()
+    # Cluster has run if either identities.json or track_metrics.json exists
+    has_cluster_output = manifest_exists or track_metrics_exists
+
     faces_total = 0
     identities_count = 0
-    if identities_path.exists():
+    singleton_merge_stats: Dict[str, Any] = {}
+
+    if manifest_exists:
         try:
             payload = json.loads(identities_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -289,17 +472,46 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         stats_block = payload.get("stats") if isinstance(payload, dict) else None
         if isinstance(stats_block, dict):
             faces_total = _safe_int(stats_block.get("faces")) or 0
-    status_value = "success" if identities_count > 0 else "missing"
-    source = "output" if identities_path.exists() else "absent"
+        singleton_merge_stats = _extract_singleton_merge_stats(payload)
+
+    # Try to get cluster metrics from track_metrics.json (fallback source)
+    if track_metrics_exists and not manifest_exists:
+        try:
+            metrics_data = json.loads(track_metrics_path.read_text(encoding="utf-8"))
+            if isinstance(metrics_data, dict):
+                cluster_block = metrics_data.get("cluster_metrics") or {}
+                if isinstance(cluster_block, dict):
+                    identities_count = cluster_block.get("identities_count", 0)
+                    faces_total = cluster_block.get("faces_count", 0)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # SUCCESS if any cluster output exists (even with 0 identities), MISSING only if no output
+    status_value = "success" if has_cluster_output else "missing"
+    source = "output" if manifest_exists else ("metrics_fallback" if track_metrics_exists else "absent")
+    # Use max of both files for staleness detection
+    last_run_at = _max_mtime_iso(identities_path, track_metrics_path)
+
     return {
         "phase": "cluster",
         "status": status_value,
         "faces": faces_total,
         "identities": identities_count,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "cluster_thresh": None,
+        "min_cluster_size": None,
+        "min_identity_sim": None,
         "started_at": None,
         "finished_at": None,
         "version": None,
         "source": source,
+        "manifest_exists": manifest_exists,
+        "track_metrics_exists": track_metrics_exists,
+        "zero_rows": has_cluster_output and identities_count == 0,
+        "last_run_at": last_run_at,
+        **singleton_merge_stats,
     }
 
 
@@ -309,6 +521,18 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     IMPORTANT: Returns the FACE detector (e.g., retinaface), NOT the scene detector.
     Scene detection (pyscenedetect) is a preliminary step, not the main detect/track operation.
     """
+    marker = _load_run_marker(ep_id, "detect_track")
+    if marker:
+        result = _phase_status_from_marker("detect_track", marker)
+        # Add manifest existence info even when marker exists
+        tracks_path = _tracks_path(ep_id)
+        result["manifest_exists"] = tracks_path.exists()
+        # Prefer marker timestamp for stale detection; fall back to manifest mtime if unavailable
+        # This ensures consistent timestamp comparison with faces_embed and cluster phases
+        result["last_run_at"] = marker.get("finished_at") or _get_file_mtime_iso(tracks_path)
+        tracks_count = result.get("tracks") or 0
+        result["zero_rows"] = result["manifest_exists"] and tracks_count == 0
+        return result
     from py_screenalytics.artifacts import get_path
 
     tracks_path = get_path(ep_id, "tracks")
@@ -316,6 +540,8 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
 
     detections_count = _count_nonempty_lines(detections_path)
     tracks_count = _count_nonempty_lines(tracks_path)
+    manifest_exists = tracks_path.exists()
+    last_run_at = _get_file_mtime_iso(tracks_path)
 
     # Infer detector/tracker from tracks.jsonl if available
     # Only accept FACE detectors (retinaface, yolov8face, etc.), NOT scene detectors
@@ -358,16 +584,32 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         "tracks": tracks_count,
         "detector": detector,
         "tracker": tracker,
+        "device": None,
+        "requested_device": None,
+        "resolved_device": None,
+        "stride": None,
+        "det_thresh": None,
+        "max_gap": None,
+        "scene_threshold": None,
+        "scene_min_len": None,
+        "scene_warmup_dets": None,
+        "track_high_thresh": None,
+        "new_track_thresh": None,
         "faces": None,
         "identities": None,
         "started_at": None,
         "finished_at": None,
         "version": None,
         "source": source,
+        "manifest_exists": manifest_exists,
+        "zero_rows": manifest_exists and tracks_count == 0,
+        "last_run_at": last_run_at,
     }
 
 
 def _delete_episode_assets(ep_id: str, options) -> Dict[str, Any]:
+    # Normalize ep_id to lowercase for case-insensitive handling
+    ep_id = normalize_ep_id(ep_id)
     record = EPISODE_STORE.get(ep_id)
     if not record:
         raise HTTPException(status_code=404, detail="Episode not found")
@@ -1080,6 +1322,10 @@ def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, p
     for entry in page_entries:
         frame_idx = entry["frame_idx"]
         meta = face_rows.get(frame_idx, {})
+        # Skip frames that don't have a corresponding entry in faces.json
+        # Without this, the UI would show frames that can't be moved/deleted
+        if not meta:
+            continue
         local_path = entry.get("abs_path")
         local_url = str(local_path) if isinstance(local_path, Path) and local_path.exists() else None
         rel_path = entry.get("rel_path")
@@ -1219,6 +1465,13 @@ class IdentityNameRequest(BaseModel):
     show: str | None = Field(None, description="Optional show slug override")
 
 
+class BulkTrackAssignRequest(BaseModel):
+    track_ids: List[int] = Field(..., min_length=1, description="List of track IDs to assign")
+    name: str = Field(..., min_length=1, max_length=200, description="Name to assign")
+    show: str | None = Field(None, description="Optional show slug override")
+    cast_id: str | None = Field(None, description="Optional cast_id to link assignment")
+
+
 class IdentityMergeRequest(BaseModel):
     source_id: str
     target_id: str
@@ -1332,10 +1585,43 @@ class PhaseStatus(BaseModel):
     tracks: int | None = None
     detector: str | None = None
     tracker: str | None = None
+    device: str | None = None
+    requested_device: str | None = None
+    resolved_device: str | None = None
+    stride: int | None = None
+    det_thresh: float | None = None
+    max_gap: int | None = None
+    scene_threshold: float | None = None
+    scene_min_len: int | None = None
+    scene_warmup_dets: int | None = None
+    track_high_thresh: float | None = None
+    new_track_thresh: float | None = None
+    save_frames: bool | None = None
+    save_crops: bool | None = None
+    jpeg_quality: int | None = None
+    thumb_size: int | None = None
+    cluster_thresh: float | None = None
+    min_cluster_size: int | None = None
+    min_identity_sim: float | None = None
     started_at: str | None = None
     finished_at: str | None = None
     version: str | None = None
     source: str | None = None
+    runtime_sec: float | None = None  # Computed from started_at/finished_at
+    # Singleton merge stats for cluster phase
+    singleton_merge_enabled: bool | None = None
+    singleton_fraction_before: float | None = None
+    singleton_fraction_after: float | None = None
+    singleton_merge_neighbor_top_k: int | None = None
+    singleton_merge_merge_count: int | None = None
+    singleton_merge_similarity_thresh: float | None = None
+    singleton_stats: Dict[str, Any] | None = None  # Full singleton stats block
+    # New fields for manifest existence and zero-result detection
+    manifest_exists: bool | None = None
+    zero_rows: bool | None = None
+    last_run_at: str | None = None  # ISO timestamp of manifest mtime
+    # Cluster-specific: indicates track_metrics.json exists (even if identities.json missing)
+    track_metrics_exists: bool | None = None
 
 
 class EpisodeStatusResponse(BaseModel):
@@ -1347,6 +1633,13 @@ class EpisodeStatusResponse(BaseModel):
     scenes_ready: bool
     tracks_ready: bool
     faces_harvested: bool
+    coreml_available: bool | None = None
+    # Stale detection flags
+    faces_stale: bool = False
+    cluster_stale: bool = False
+    # Fallback indicators for backwards compatibility
+    faces_manifest_fallback: bool = False  # True if faces are stale relative to tracks
+    tracks_only_fallback: bool = False  # True if cluster is stale
 
 
 class AssetUploadResponse(BaseModel):
@@ -1397,11 +1690,16 @@ class PurgeAllIn(BaseModel):
 
 @router.get("/episodes", response_model=EpisodeListResponse, tags=["episodes"])
 def list_episodes() -> EpisodeListResponse:
+    """List all episodes.
+
+    Show slugs are normalized to UPPERCASE for consistent display.
+    """
     records = EPISODE_STORE.list()
     episodes = [
         EpisodeSummary(
             ep_id=record.ep_id,
-            show_slug=record.show_ref,
+            # Normalize show_slug to uppercase for consistent display
+            show_slug=record.show_ref.upper() if record.show_ref else record.show_ref,
             season_number=record.season_number,
             episode_number=record.episode_number,
             title=record.title,
@@ -1444,17 +1742,22 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
 
 @router.get("/episodes/s3_shows", response_model=S3ShowsResponse, tags=["episodes"])
 def list_s3_shows() -> S3ShowsResponse:
-    """List all shows available in S3 with episode counts."""
+    """List all shows available in S3 with episode counts.
+
+    Show codes are normalized to UPPERCASE and deduplicated case-insensitively.
+    """
     raw_items = STORAGE.list_episode_videos_s3(limit=10000)
 
-    # Group by show
+    # Group by show (normalized to uppercase for deduplication)
     show_episodes: Dict[str, int] = {}
     for obj in raw_items:
         show = obj.get("show")
         if show and isinstance(show, str):
-            show_episodes[show] = show_episodes.get(show, 0) + 1
+            # Normalize to uppercase for case-insensitive grouping
+            show_upper = show.upper()
+            show_episodes[show_upper] = show_episodes.get(show_upper, 0) + 1
 
-    # Convert to sorted list
+    # Convert to sorted list (already uppercase)
     shows = [S3Show(show=show, episode_count=count) for show, count in sorted(show_episodes.items())]
     return S3ShowsResponse(shows=shows, count=len(shows))
 
@@ -1529,9 +1832,11 @@ def episode_details(ep_id: str) -> EpisodeDetailResponse:
         raise HTTPException(status_code=404, detail="Episode not found")
 
     local_path = get_path(ep_id, "video")
-    v2_key = STORAGE.video_object_key_v2(record.show_ref, record.season_number, record.episode_number)
+    # Check both lowercase and uppercase show slugs for S3 v2 path (case-insensitive)
+    v2_key = STORAGE.video_object_key_v2(record.show_ref.lower(), record.season_number, record.episode_number)
+    v2_key_upper = STORAGE.video_object_key_v2(record.show_ref.upper(), record.season_number, record.episode_number)
     v1_key = STORAGE.video_object_key_v1(ep_id)
-    v2_exists = STORAGE.object_exists(v2_key)
+    v2_exists = STORAGE.object_exists(v2_key) or STORAGE.object_exists(v2_key_upper)
     v1_exists = STORAGE.object_exists(v1_key)
 
     return EpisodeDetailResponse(
@@ -1564,31 +1869,137 @@ def episode_progress(ep_id: str) -> dict:
     return {"ep_id": ep_id, "progress": payload}
 
 
+def _parse_iso_timestamp(ts: str | None) -> datetime | None:
+    """Parse an ISO timestamp string to datetime."""
+    if not ts:
+        return None
+    try:
+        cleaned = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+def _phase_progress_value(status: str | None) -> float | None:
+    """Map phase status to a coarse progress value for SSE clients."""
+    if not status:
+        return None
+    status_lower = status.lower()
+    mapping = {
+        "success": 1.0,
+        "stale": 0.9,
+        "running": 0.6,
+        "partial": 0.5,
+        "invalid": 0.2,
+        "missing": 0.0,
+    }
+    return mapping.get(status_lower, None)
+
+
+def _status_to_events(ep_id: str, status: EpisodeStatusResponse) -> List[Dict[str, Any]]:
+    flags = {
+        "tracks_only_fallback": status.tracks_only_fallback,
+        "faces_manifest_fallback": status.faces_manifest_fallback,
+    }
+    events: List[Dict[str, Any]] = []
+    for phase_name, phase_status in (
+        ("detect_track", status.detect_track),
+        ("faces", status.faces_embed),
+        ("cluster", status.cluster),
+    ):
+        if not phase_status:
+            continue
+        payload: Dict[str, Any] = {
+            "episode_id": ep_id,
+            "phase": phase_name,
+            "event": "progress",
+            "message": phase_status.status,
+            "progress": _phase_progress_value(getattr(phase_status, "status", None)),
+            "flags": flags,
+            "manifest_mtime": getattr(phase_status, "last_run_at", None),
+        }
+        if phase_name == "cluster":
+            payload["metrics"] = {
+                "singleton_fraction_before": phase_status.singleton_fraction_before,
+                "singleton_fraction_after": phase_status.singleton_fraction_after,
+            }
+        events.append(payload)
+    return events
+
+
+async def _status_snapshot(ep_id: str) -> EpisodeStatusResponse:
+    return await asyncio.to_thread(episode_run_status, ep_id)
+
+
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
-    detect_track_payload = _detect_track_phase_status(ep_id)
-
     tracks_path = get_path(ep_id, "tracks")
     detections_path = get_path(ep_id, "detections")
+    detect_track_payload = _detect_track_phase_status(ep_id)
+
+    detections_manifest_ready = _manifest_has_rows(detections_path)
     tracks_manifest_ready = _manifest_has_rows(tracks_path)
-    if detect_track_payload.get("status") == "success" and not tracks_manifest_ready:
+    manifest_ready = detections_manifest_ready and tracks_manifest_ready
+    if detect_track_payload.get("status") == "success" and not manifest_ready:
         detect_track_payload["status"] = "stale"
         detect_track_payload["source"] = "missing_artifact"
     detect_track_status = PhaseStatus(**detect_track_payload)
-    faces_status = PhaseStatus(**_faces_phase_status(ep_id))
-    cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
+    faces_payload = _faces_phase_status(ep_id)
+    cluster_payload = _cluster_phase_status(ep_id)
+
+    # Stale detection: compare timestamps to detect outdated downstream artifacts
+    detect_track_mtime = _parse_iso_timestamp(detect_track_payload.get("last_run_at"))
+    faces_mtime = _parse_iso_timestamp(faces_payload.get("last_run_at"))
+    cluster_mtime = _parse_iso_timestamp(cluster_payload.get("last_run_at"))
+
+    faces_stale = False
+    cluster_stale = False
+    faces_manifest_fallback = False
+    tracks_only_fallback = False
+
+    # If detect/track is newer than faces, faces are stale
+    if detect_track_mtime and faces_mtime and detect_track_mtime > faces_mtime:
+        if faces_payload.get("manifest_exists"):
+            faces_stale = True
+            faces_manifest_fallback = True
+            # Mark faces status as stale
+            if faces_payload.get("status") == "success":
+                faces_payload["status"] = "stale"
+
+    # If detect/track or faces is newer than cluster, cluster is stale
+    # Check both manifest_exists and track_metrics_exists for stale detection
+    has_cluster_output = cluster_payload.get("manifest_exists") or cluster_payload.get("track_metrics_exists")
+    if has_cluster_output:
+        if detect_track_mtime and cluster_mtime and detect_track_mtime > cluster_mtime:
+            cluster_stale = True
+            # tracks_only_fallback indicates we're using metrics-only fallback
+            tracks_only_fallback = not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists")
+            if cluster_payload.get("status") == "success":
+                cluster_payload["status"] = "stale"
+        elif faces_mtime and cluster_mtime and faces_mtime > cluster_mtime:
+            cluster_stale = True
+            tracks_only_fallback = not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists")
+            if cluster_payload.get("status") == "success":
+                cluster_payload["status"] = "stale"
+        # Even if not stale, mark tracks_only_fallback if using metrics fallback
+        if not cluster_stale and not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists"):
+            tracks_only_fallback = True
+
+    faces_status = PhaseStatus(**faces_payload)
+    cluster_status = PhaseStatus(**cluster_payload)
 
     # Compute pipeline state indicators
     # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
-    scenes_ready = tracks_manifest_ready or (
-        detect_track_status.detections is not None and detect_track_status.detections > 0
-    )
+    scenes_ready = tracks_manifest_ready or detections_manifest_ready
 
-    # tracks_ready: True only when tracks manifest exists and API reports success
-    tracks_ready = tracks_manifest_ready and detect_track_status.status == "success"
+    # tracks_ready: True only when both detections+tracks exist and API reports success
+    tracks_ready = manifest_ready and detect_track_status.status == "success"
 
-    # faces_harvested: True if faces.jsonl exists and has content
-    faces_harvested = faces_status.faces is not None and faces_status.faces > 0
+    # faces_harvested: True if faces.jsonl EXISTS (even with 0 rows)
+    # This distinguishes "never ran" from "ran with zero results"
+    faces_harvested = bool(faces_status.manifest_exists)
+
+    coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
 
     return EpisodeStatusResponse(
         ep_id=ep_id,
@@ -1598,7 +2009,51 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         scenes_ready=scenes_ready,
         tracks_ready=tracks_ready,
         faces_harvested=faces_harvested,
+        coreml_available=coreml_available if isinstance(coreml_available, bool) else None,
+        faces_stale=faces_stale,
+        cluster_stale=cluster_stale,
+        faces_manifest_fallback=faces_manifest_fallback,
+        tracks_only_fallback=tracks_only_fallback,
     )
+
+
+@router.get(
+    "/episodes/{ep_id}/events",
+    tags=["episodes"],
+    response_class=StreamingResponse,
+)
+async def episode_events(
+    ep_id: str,
+    poll_ms: int = Query(1500, ge=200, le=10000),
+    max_events: int = Query(250, ge=1, le=2000),
+):
+    ep_id_normalized = normalize_ep_id(ep_id)
+
+    async def event_stream():
+        # SSE stream keeps the web UI in sync without aggressive polling.
+        sent = 0
+        while sent < max_events:
+            try:
+                status = await _status_snapshot(ep_id_normalized)
+            except HTTPException as exc:
+                payload = {
+                    "episode_id": ep_id_normalized,
+                    "phase": "detect_track",
+                    "event": "error",
+                    "message": str(exc.detail),
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+                break
+
+            for payload in _status_to_events(ep_id_normalized, status):
+                yield f"data: {json.dumps(payload)}\n\n"
+                sent += 1
+                if sent >= max_events:
+                    break
+
+            await asyncio.sleep(poll_ms / 1000)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/episodes", response_model=EpisodeCreateResponse, tags=["episodes"])
@@ -1702,24 +2157,601 @@ def hydrate_episode_video(ep_id: str) -> EpisodeMirrorResponse:
     return mirror_episode_video(ep_id)
 
 
+class MirrorArtifactsRequest(BaseModel):
+    """Request to mirror specific artifacts from S3 to local storage."""
+
+    artifacts: List[str] = ["faces", "identities"]  # faces.jsonl, identities.json
+
+
+class MirrorArtifactsResponse(BaseModel):
+    """Response from mirroring artifacts."""
+
+    ep_id: str
+    mirrored: Dict[str, bool]  # artifact -> success
+    errors: Dict[str, str]  # artifact -> error message
+    faces_manifest_exists: bool
+    identities_manifest_exists: bool
+
+
+@router.post("/episodes/{ep_id}/mirror_artifacts", tags=["episodes"])
+def mirror_episode_artifacts(ep_id: str, payload: MirrorArtifactsRequest | None = None) -> MirrorArtifactsResponse:
+    """Mirror faces/identities artifacts from S3 to local storage.
+
+    This endpoint downloads manifest files (faces.jsonl, identities.json) from S3
+    to the local file system, enabling clustering operations on machines that
+    don't have direct S3 access or need local copies.
+
+    Unlike /mirror which only mirrors the video, this mirrors the pipeline artifacts.
+    """
+    record = EPISODE_STORE.get(ep_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    if payload is None:
+        payload = MirrorArtifactsRequest()
+
+    ensure_dirs(ep_id)
+    mirrored: Dict[str, bool] = {}
+    errors: Dict[str, str] = {}
+
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid episode id: {exc}") from exc
+
+    # Get S3 prefixes for manifests
+    from apps.api.services.storage import artifact_prefixes
+
+    prefixes = artifact_prefixes(ep_ctx)
+    manifests_prefix = prefixes.get("manifests", "")
+
+    # Define artifact mappings: artifact_name -> (s3_key_suffix, local_path)
+    manifests_dir = _manifests_dir(ep_id)
+    artifact_map = {
+        "faces": ("faces.jsonl", manifests_dir / "faces.jsonl"),
+        "identities": ("identities.json", manifests_dir / "identities.json"),
+        "tracks": ("tracks.jsonl", get_path(ep_id, "tracks")),
+        "detections": ("detections.jsonl", get_path(ep_id, "detections")),
+    }
+
+    # Mirror requested artifacts
+    for artifact_name in payload.artifacts:
+        if artifact_name not in artifact_map:
+            errors[artifact_name] = f"Unknown artifact: {artifact_name}"
+            mirrored[artifact_name] = False
+            continue
+
+        s3_suffix, local_path = artifact_map[artifact_name]
+        s3_key = f"{manifests_prefix}{s3_suffix}"
+
+        # Ensure parent directory exists
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try to download from S3
+        if STORAGE.backend not in {"s3", "minio"} or STORAGE._client is None:
+            # Local mode - check if file exists locally
+            if local_path.exists():
+                mirrored[artifact_name] = True
+            else:
+                errors[artifact_name] = "Storage backend is local and file doesn't exist"
+                mirrored[artifact_name] = False
+            continue
+
+        try:
+            # Check if object exists in S3
+            STORAGE._client.head_object(Bucket=STORAGE.bucket, Key=s3_key)
+            # Download the file
+            STORAGE._client.download_file(STORAGE.bucket, s3_key, str(local_path))
+            mirrored[artifact_name] = True
+            LOGGER.info("Mirrored %s from s3://%s/%s to %s", artifact_name, STORAGE.bucket, s3_key, local_path)
+        except Exception as exc:
+            error_code = None
+            if hasattr(exc, "response"):
+                error_code = exc.response.get("Error", {}).get("Code")  # type: ignore[union-attr]
+            if error_code in {"404", "NoSuchKey", "NotFound"}:
+                errors[artifact_name] = f"Not found in S3: {s3_key}"
+            else:
+                errors[artifact_name] = str(exc)
+            mirrored[artifact_name] = False
+
+    # Check final state of manifests
+    faces_path = _faces_path(ep_id)
+    identities_path = _identities_path(ep_id)
+
+    return MirrorArtifactsResponse(
+        ep_id=ep_id,
+        mirrored=mirrored,
+        errors=errors,
+        faces_manifest_exists=faces_path.exists(),
+        identities_manifest_exists=identities_path.exists(),
+    )
+
+
 @router.post("/episodes/{ep_id}/refresh_similarity", tags=["episodes"])
 def refresh_similarity_values(ep_id: str) -> dict:
     """Recompute all similarity scores for the episode.
 
-    This regenerates track representatives, cluster centroids, and updates
-    all similarity scores at the track and frame level.
+    This regenerates track representatives, cluster centroids, updates
+    all similarity scores, and refreshes suggestions for unassigned clusters.
+
+    Returns detailed step-by-step progress log with stats.
     """
+    import time
+
+    log_steps = []
+    start_time = time.time()
+
     try:
-        # Refresh all track reps and centroids for all identities
-        _refresh_similarity_indexes(ep_id, identity_ids=None, track_ids=None)
+        # Step 1: Load identities to count tracks and clusters (0-10%)
+        step_start = time.time()
+        identities_payload = _load_identities(ep_id)
+        identities = identities_payload.get("identities", [])
+        track_count = sum(len(i.get("track_ids", [])) for i in identities)
+        cluster_count = len(identities)
+
+        # Count assigned vs unassigned clusters
+        assigned_count = sum(1 for i in identities if i.get("person_id"))
+        unassigned_count = cluster_count - assigned_count
+
+        log_steps.append({
+            "step": "load_identities",
+            "status": "success",
+            "progress_pct": 10,
+            "duration_ms": int((time.time() - step_start) * 1000),
+            "cluster_count": cluster_count,
+            "track_count": track_count,
+            "assigned_count": assigned_count,
+            "unassigned_count": unassigned_count,
+            "details": [
+                f"Loaded {cluster_count} clusters ({track_count} tracks)",
+                f"Assigned: {assigned_count}, Unassigned: {unassigned_count}",
+            ],
+        })
+
+        # Step 2: Generate track reps and centroids (10-50%)
+        step_start = time.time()
+        track_reps_count = 0
+        centroids_count = 0
+        try:
+            from apps.api.services.track_reps import (
+                generate_track_reps_and_centroids,
+            )
+            result = generate_track_reps_and_centroids(ep_id)
+            track_reps_count = result.get("tracks_processed", 0)
+            centroids_count = result.get("centroids_computed", 0)
+            tracks_with_reps = result.get("tracks_with_reps", 0)
+            tracks_skipped = result.get("tracks_skipped", 0)
+
+            details = [
+                f"Processed {track_reps_count} tracks",
+                f"Computed {centroids_count} cluster centroids",
+            ]
+            if tracks_with_reps:
+                details.append(f"Tracks with valid reps: {tracks_with_reps}")
+            if tracks_skipped:
+                details.append(f"Tracks skipped (no embeddings): {tracks_skipped}")
+
+            log_steps.append({
+                "step": "generate_track_reps",
+                "status": "success",
+                "progress_pct": 50,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "track_reps_count": track_reps_count,
+                "centroids_count": centroids_count,
+                "details": details,
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "generate_track_reps",
+                "status": "error",
+                "progress_pct": 50,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.error("Track rep regeneration failed for %s: %s", ep_id, exc)
+
+        # Step 3: Update people prototypes (50-80%)
+        step_start = time.time()
+        people_updated = 0
+        people_details = []
+        try:
+            from apps.api.services.people import PeopleService, l2_normalize
+            import numpy as np
+            from apps.api.services.track_reps import load_cluster_centroids
+
+            ep_ctx = episode_context_from_id(ep_id)
+            show_id = ep_ctx.show_slug.upper()
+            people_service = PeopleService()
+            people = people_service.list_people(show_id)
+
+            if people:
+                # Find all person_ids that have clusters in this episode
+                touched_person_ids = set()
+                for identity in identities:
+                    if identity.get("person_id"):
+                        touched_person_ids.add(identity["person_id"])
+
+                # Update prototypes
+                people_by_id = {p.get("person_id"): p for p in people if p.get("person_id")}
+                try:
+                    centroids_data = load_cluster_centroids(ep_id)
+                except Exception:
+                    centroids_data = {}
+
+                for person_id in touched_person_ids:
+                    person = people_by_id.get(person_id)
+                    if not person:
+                        continue
+                    person_name = person.get("name") or person.get("display_name") or person_id
+                    cluster_refs = person.get("cluster_ids") or []
+                    vectors = []
+                    ep_clusters = 0
+                    for cluster_ref in cluster_refs:
+                        if not isinstance(cluster_ref, str) or ":" not in cluster_ref:
+                            continue
+                        ep_slug, cluster_id = cluster_ref.split(":", 1)
+                        if ep_slug == ep_id:
+                            ep_clusters += 1
+                            centroid_data = centroids_data.get(cluster_id, {})
+                            if centroid_data and centroid_data.get("centroid"):
+                                vectors.append(np.array(centroid_data["centroid"], dtype=np.float32))
+                    if vectors:
+                        stacked = np.stack(vectors, axis=0)
+                        proto = l2_normalize(np.mean(stacked, axis=0)).tolist()
+                        people_service.update_person(show_id, person_id, prototype=proto)
+                        people_updated += 1
+                        people_details.append(f"  • {person_name}: updated from {len(vectors)} centroid(s)")
+
+            details = [f"Updated {people_updated} people prototypes"]
+            if people_details:
+                details.extend(people_details[:10])  # Limit to first 10 for brevity
+                if len(people_details) > 10:
+                    details.append(f"  ... and {len(people_details) - 10} more")
+
+            log_steps.append({
+                "step": "update_prototypes",
+                "status": "success",
+                "progress_pct": 80,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "people_updated": people_updated,
+                "people_total": len(touched_person_ids) if people else 0,
+                "details": details,
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "update_prototypes",
+                "status": "error",
+                "progress_pct": 80,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.warning("People prototype update failed for %s: %s", ep_id, exc)
+
+        # Step 4: Refresh suggestions for unassigned clusters (80-100%)
+        step_start = time.time()
+        suggestions_count = 0
+        suggestions_details = []
+        suggestions_list = []
+        try:
+            from apps.api.services.grouping import GroupingService
+            grouping_service = GroupingService()
+            suggestions_result = grouping_service.suggest_from_assigned_clusters(ep_id)
+            suggestions_list = suggestions_result.get("suggestions", [])
+            suggestions_count = len(suggestions_list)
+
+            # Build lookup for person names
+            person_names = {}
+            if people:
+                for p in people:
+                    pid = p.get("person_id")
+                    if pid:
+                        person_names[pid] = p.get("name") or p.get("display_name") or pid
+
+            details = [f"Generated {suggestions_count} suggestions for unassigned clusters"]
+            for suggestion in suggestions_list[:10]:  # Show first 10 suggestions
+                cluster_id = suggestion.get("cluster_id", "?")
+                suggested_person = suggestion.get("suggested_person_id", "?")
+                distance = suggestion.get("distance", 0)
+                person_name = person_names.get(suggested_person, suggested_person)
+                confidence = max(0, min(100, int((1 - distance) * 100)))
+                details.append(f"  • Cluster {cluster_id} → {person_name} ({confidence}% confidence)")
+                suggestions_details.append({
+                    "cluster_id": cluster_id,
+                    "suggested_person_id": suggested_person,
+                    "suggested_person_name": person_name,
+                    "distance": round(distance, 4),
+                    "confidence_pct": confidence,
+                })
+
+            if len(suggestions_list) > 10:
+                details.append(f"  ... and {len(suggestions_list) - 10} more suggestions")
+
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "success",
+                "progress_pct": 100,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "suggestions_count": suggestions_count,
+                "unassigned_clusters": unassigned_count,
+                "details": details,
+                "suggestions": suggestions_details[:20],  # Include first 20 in response
+            })
+        except FileNotFoundError:
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "skipped",
+                "progress_pct": 100,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "message": "No identities file found",
+                "details": ["Skipped: No identities file found"],
+            })
+        except Exception as exc:
+            log_steps.append({
+                "step": "refresh_suggestions",
+                "status": "error",
+                "progress_pct": 100,
+                "duration_ms": int((time.time() - step_start) * 1000),
+                "error": str(exc),
+                "details": [f"Error: {exc}"],
+            })
+            LOGGER.warning("Suggestions refresh failed for %s: %s", ep_id, exc)
+
+        total_duration = int((time.time() - start_time) * 1000)
 
         return {
             "status": "success",
             "ep_id": ep_id,
             "message": "Similarity values refreshed successfully",
+            "log": {
+                "steps": log_steps,
+                "total_duration_ms": total_duration,
+            },
+            "summary": {
+                "clusters": cluster_count,
+                "tracks": track_count,
+                "assigned_clusters": assigned_count,
+                "unassigned_clusters": unassigned_count,
+                "centroids_computed": centroids_count,
+                "people_updated": people_updated,
+                "suggestions_generated": suggestions_count,
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to refresh similarity values: {str(e)}")
+
+
+# Lazy Celery availability check
+_celery_available_cache = None
+
+
+def _check_celery_available() -> bool:
+    """Check if Celery/Redis are available for async jobs."""
+    global _celery_available_cache
+    if _celery_available_cache is None:
+        try:
+            import redis
+            from apps.api.config import REDIS_URL
+            r = redis.from_url(REDIS_URL, socket_timeout=1)
+            r.ping()
+            _celery_available_cache = True
+        except Exception as e:
+            LOGGER.warning(f"Celery/Redis not available: {e}")
+            _celery_available_cache = False
+    return _celery_available_cache
+
+
+class RefreshSimilarityRequest(BaseModel):
+    """Request model for similarity refresh with optional execution mode."""
+    execution_mode: Optional[Literal["redis", "local"]] = Field(
+        "redis",
+        description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
+    )
+
+
+@router.post("/episodes/{ep_id}/refresh_similarity_async", status_code=202, tags=["episodes"])
+def refresh_similarity_async(ep_id: str, body: RefreshSimilarityRequest = Body(default=RefreshSimilarityRequest())) -> dict:
+    """Enqueue similarity refresh as background job (non-blocking).
+
+    Execution Mode:
+        - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
+        - execution_mode="local": Runs job synchronously in-process, returns result when done
+
+    If Celery/Redis are unavailable in redis mode, returns an error.
+    """
+    execution_mode = body.execution_mode or "redis"
+
+    # Handle local execution mode
+    if execution_mode == "local":
+        LOGGER.info(f"[{ep_id}] Running local refresh_similarity")
+        try:
+            # Import and run the similarity refresh directly
+            from apps.api.services.similarity_refresh import refresh_similarity_indexes
+            result = refresh_similarity_indexes(ep_id)
+            return {
+                "status": "completed",
+                "ep_id": ep_id,
+                "async": False,
+                "execution_mode": "local",
+                "message": "Executed synchronously (local mode)",
+                "result": result,
+            }
+        except Exception as e:
+            LOGGER.exception(f"[{ep_id}] Local refresh_similarity failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Redis/Celery mode - check if Celery is available
+    if not _check_celery_available():
+        LOGGER.info(f"[{ep_id}] Celery unavailable for refresh_similarity")
+        return {
+            "status": "error",
+            "ep_id": ep_id,
+            "async": False,
+            "execution_mode": "redis",
+            "message": "Background jobs unavailable (Celery/Redis not running). Please start background services or use execution_mode='local'.",
+        }
+
+    try:
+        from apps.api.tasks import run_refresh_similarity_task, check_active_job
+
+        # Check for active job
+        active = check_active_job(ep_id, "refresh_similarity")
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Refresh job already in progress: {active}",
+            )
+
+        # Enqueue the task
+        task = run_refresh_similarity_task.delay(episode_id=ep_id)
+
+        return {
+            "job_id": task.id,
+            "status": "queued",
+            "ep_id": ep_id,
+            "async": True,
+            "execution_mode": "redis",
+            "message": "Refresh similarity job queued. Poll /celery_jobs/{job_id} for status.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to enqueue refresh_similarity: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
+
+
+@router.get("/episodes/{ep_id}/recover_noise_tracks/preview", tags=["episodes"])
+def recover_noise_tracks_preview(
+    ep_id: str,
+    frame_window: int = Query(8, ge=1, le=30, description="Number of frames to search before/after"),
+    min_similarity: float = Query(0.70, ge=0.5, le=1.0, description="Minimum cosine similarity to merge"),
+) -> dict:
+    """Preview what would change if recovery were run (without making changes).
+
+    Returns counts of single-frame tracks and estimated recoverable tracks.
+    """
+    from apps.api.services.identities import load_faces, _episode_lock
+
+    try:
+        with _episode_lock(ep_id):
+            faces = load_faces(ep_id)
+
+        if not faces:
+            return {
+                "status": "success",
+                "single_frame_tracks": 0,
+                "estimated_recoverable": 0,
+                "frame_window": frame_window,
+                "min_similarity": min_similarity,
+            }
+
+        # Count faces per track
+        from collections import defaultdict
+        faces_by_track: dict = defaultdict(int)
+        for face in faces:
+            track_id = face.get("track_id")
+            if track_id is not None:
+                faces_by_track[track_id] += 1
+
+        single_frame_tracks = sum(1 for count in faces_by_track.values() if count == 1)
+
+        # Estimate recoverable (rough estimate based on typical recovery rates)
+        estimated_recoverable = int(single_frame_tracks * 0.15)  # ~15% typically recoverable
+
+        return {
+            "status": "success",
+            "single_frame_tracks": single_frame_tracks,
+            "multi_frame_tracks": sum(1 for count in faces_by_track.values() if count > 1),
+            "estimated_recoverable": estimated_recoverable,
+            "frame_window": frame_window,
+            "min_similarity": min_similarity,
+        }
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to preview recovery: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/recover_noise_tracks", tags=["episodes"])
+def recover_noise_tracks(
+    ep_id: str,
+    frame_window: int = Query(8, ge=1, le=30, description="Number of frames to search before/after"),
+    min_similarity: float = Query(0.70, ge=0.5, le=1.0, description="Minimum cosine similarity to merge"),
+) -> dict:
+    """Recover single-frame tracks by finding similar faces in adjacent frames.
+
+    For each track that has only 1 face (single-frame track):
+    1. Searches ±frame_window frames for similar faces (cosine similarity >= min_similarity)
+    2. Merges matching faces into the single-frame track
+    3. Updates faces.jsonl and tracks.jsonl with new assignments
+
+    This helps convert "noise" clusters (single-frame-only) into reviewable clusters.
+
+    Args:
+        frame_window: Number of frames to search before/after (default: 8)
+        min_similarity: Minimum cosine similarity to merge faces (default: 0.70)
+
+    Returns:
+        tracks_analyzed: Number of single-frame tracks examined
+        tracks_expanded: Number of tracks that were expanded
+        faces_merged: Total faces added to tracks
+        details: List of {track_id, original_frame, added_frames}
+    """
+    from apps.api.services.track_recovery import recover_single_frame_tracks
+
+    try:
+        result = recover_single_frame_tracks(ep_id, frame_window=frame_window, min_similarity=min_similarity)
+
+        # After recovery, refresh similarity indexes and recompute centroids for affected clusters
+        if result.get("tracks_expanded", 0) > 0:
+            affected_track_ids = [d.get("track_id") for d in result.get("details", []) if d.get("track_id") is not None]
+            _refresh_similarity_indexes(ep_id, track_ids=affected_track_ids)
+
+            # Recompute cluster centroids since track assignments have changed
+            try:
+                from apps.api.services.grouping import GroupingService
+                grouping_service = GroupingService()
+                grouping_service.compute_cluster_centroids(ep_id)
+                LOGGER.info(f"[{ep_id}] Recomputed cluster centroids after recovery")
+            except Exception as centroid_err:
+                LOGGER.warning(f"[{ep_id}] Failed to recompute centroids after recovery: {centroid_err}")
+
+        return result
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to recover noise tracks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/cleanup_empty_clusters", tags=["episodes"])
+def cleanup_empty_clusters_endpoint(ep_id: str) -> dict:
+    """Remove clusters that have no tracks/frames.
+
+    Clusters can become empty when:
+    - All tracks are dropped from a cluster
+    - All tracks are moved to another cluster
+    - Merge operations leave source clusters empty
+
+    This endpoint removes empty clusters from identities.json and updates
+    people.json to remove references to the deleted clusters.
+
+    Returns:
+        removed_clusters: List of identity_ids that were removed
+        people_updated: List of person_ids that had clusters removed
+        identities_before: Count before cleanup
+        identities_after: Count after cleanup
+    """
+    from apps.api.services.identities import cleanup_empty_clusters
+
+    try:
+        result = cleanup_empty_clusters(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to cleanup empty clusters: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get(
@@ -1888,26 +2920,41 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
         ep_ctx = episode_context_from_id(ep_id)
         show_slug = ep_ctx.show_slug.upper()
 
-        # Load people data
-        from apps.api.services.people import PeopleService
+        # Load identities first - we need this regardless of person lookup
+        identities_data = _load_identities(ep_id)
+        identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
 
+        # Try to find clusters via person registry first
+        episode_clusters = []
+
+        from apps.api.services.people import PeopleService
         people_service = PeopleService()
         person = people_service.get_person(show_slug, person_id)
 
-        if not person:
-            raise HTTPException(status_code=404, detail="Person not found")
+        if person:
+            # Person exists in registry - use their cluster_ids
+            cluster_ids = person.get("cluster_ids", []) if isinstance(person, dict) else []
+            if not isinstance(cluster_ids, list):
+                LOGGER.warning(f"cluster_ids is not a list: {type(cluster_ids)}, value: {cluster_ids}")
+                cluster_ids = []
 
-        # Filter cluster IDs for this episode
-        cluster_ids = person.get("cluster_ids", []) if isinstance(person, dict) else []
-        if not isinstance(cluster_ids, list):
-            LOGGER.warning(f"cluster_ids is not a list: {type(cluster_ids)}, value: {cluster_ids}")
-            cluster_ids = []
+            episode_clusters = [
+                cid.split(":", 1)[1] if ":" in cid else cid
+                for cid in cluster_ids
+                if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
+            ]
+        else:
+            # Person not in registry - find identities assigned to this person_id
+            # This handles auto-clustered people that don't have person records yet
+            LOGGER.info(f"Person {person_id} not in registry, checking identities for this episode")
+            for ident in identities_list:
+                if isinstance(ident, dict) and ident.get("person_id") == person_id:
+                    identity_id = ident.get("identity_id")
+                    if identity_id:
+                        episode_clusters.append(identity_id)
 
-        episode_clusters = [
-            cid.split(":", 1)[1] if ":" in cid else cid
-            for cid in cluster_ids
-            if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
-        ]
+            if not episode_clusters:
+                raise HTTPException(status_code=404, detail="Person not found")
 
         if not episode_clusters:
             return {
@@ -1921,15 +2968,7 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
         track_reps = load_track_reps(ep_id)
         cluster_centroids = load_cluster_centroids(ep_id)
 
-        # Load identities for face counts
-        identities_data = _load_identities(ep_id)
-        LOGGER.info(
-            f"identities_data type: {type(identities_data)}, keys: {list(identities_data.keys()) if isinstance(identities_data, dict) else 'not a dict'}"
-        )
-        identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
-        LOGGER.info(
-            f"identities_list type: {type(identities_list)}, length: {len(identities_list) if isinstance(identities_list, list) else 'not a list'}"
-        )
+        # Build identity index for face counts (identities_list already loaded above)
         identity_index = {}
         for ident in identities_list:
             if isinstance(ident, dict) and "identity_id" in ident:
@@ -2344,6 +3383,37 @@ def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> d
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/episodes/{ep_id}/tracks/bulk_assign")
+def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
+    """Bulk assign multiple tracks to a cast member by name.
+
+    This creates or updates identity assignments for each track, similar to
+    calling assign_track_name for each track individually but more efficient.
+    """
+    assigned = 0
+    failed = 0
+    errors: list[str] = []
+
+    for track_id in body.track_ids:
+        try:
+            identity_service.assign_track_name(
+                ep_id, track_id, body.name, body.show, body.cast_id
+            )
+            assigned += 1
+        except ValueError as exc:
+            failed += 1
+            errors.append(f"track {track_id}: {exc}")
+        except Exception as exc:
+            failed += 1
+            errors.append(f"track {track_id}: {exc}")
+
+    return {
+        "assigned": assigned,
+        "failed": failed,
+        "errors": errors if errors else None,
+    }
+
+
 @router.post("/episodes/{ep_id}/identities/merge")
 def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
     payload = _load_identities(ep_id)
@@ -2426,18 +3496,199 @@ def move_faces(ep_id: str, body: FaceMoveRequest) -> dict:
     return result
 
 
+@router.post("/episodes/{ep_id}/frames/{frame_idx}/overlay")
+def generate_frame_overlay(ep_id: str, frame_idx: int) -> dict:
+    """Generate a full-frame image with bounding boxes for all faces in that frame.
+
+    This extracts the frame from the video, draws colored bounding boxes for each
+    track present in that frame, and saves the result as an overlay image.
+
+    Returns:
+        {
+            "url": "path/to/overlay.jpg",
+            "frame_idx": 804,
+            "tracks": [{"track_id": 1, "bbox": [x1,y1,x2,y2]}, ...]
+        }
+    """
+    import hashlib
+    import numpy as np
+
+    # Load faces for this episode
+    faces = identity_service.load_faces(ep_id)
+    if not faces:
+        raise HTTPException(status_code=404, detail="No faces found for episode")
+
+    # Filter to faces in the requested frame
+    frame_faces = [f for f in faces if f.get("frame_idx") == frame_idx]
+    if not frame_faces:
+        raise HTTPException(status_code=404, detail=f"No faces found in frame {frame_idx}")
+
+    # Get video path
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    # Extract the frame from video
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=404, detail=f"Could not read frame {frame_idx}")
+
+        # Draw bounding boxes for each face/track
+        # Use different colors for different tracks
+        colors = [
+            (66, 133, 244),   # Blue
+            (52, 168, 83),    # Green
+            (251, 188, 4),    # Yellow
+            (234, 67, 53),    # Red
+            (154, 0, 255),    # Purple
+            (0, 188, 212),    # Cyan
+            (255, 152, 0),    # Orange
+            (156, 39, 176),   # Deep Purple
+        ]
+
+        track_info = []
+        track_ids_seen = set()
+        for face in frame_faces:
+            track_id = face.get("track_id")
+            bbox = face.get("bbox_xyxy")
+            if track_id is None or not bbox:
+                continue
+
+            # Get color based on track_id
+            color_idx = track_id % len(colors)
+            color = colors[color_idx]
+
+            # Draw bbox
+            try:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # Add track ID label
+                label = f"T{track_id}"
+                font_scale = 0.6
+                thickness = 2
+                (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+                # Draw label background
+                cv2.rectangle(frame, (x1, y1 - label_h - 4), (x1 + label_w + 4, y1), color, -1)
+                cv2.putText(frame, label, (x1 + 2, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+                if track_id not in track_ids_seen:
+                    track_info.append({"track_id": track_id, "bbox": bbox})
+                    track_ids_seen.add(track_id)
+            except (TypeError, ValueError):
+                continue
+
+        # Save overlay image locally first
+        import tempfile
+        overlay_filename = f"frame_{frame_idx:06d}_overlay.jpg"
+
+        # Create temp file for the overlay
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        success = cv2.imwrite(str(tmp_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not success:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="Failed to save overlay image")
+
+        # Upload to S3 and get presigned URL
+        try:
+            # S3 key for overlays: artifacts/{ep_id}/overlays/frame_XXXXXX_overlay.jpg
+            s3_key = f"artifacts/{ep_id}/overlays/{overlay_filename}"
+
+            # Upload using STORAGE service
+            if STORAGE.backend in {"s3", "minio"} and STORAGE._client is not None:
+                extra_args = {"ContentType": "image/jpeg"}
+                STORAGE._client.upload_file(
+                    str(tmp_path),
+                    STORAGE.bucket,
+                    s3_key,
+                    ExtraArgs=extra_args,
+                )
+                # Get presigned URL
+                url = STORAGE.presign_get(s3_key, expires_in=3600)
+                if not url:
+                    raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+            else:
+                # Local mode - save to artifacts directory
+                artifacts_dir = get_path(ep_id, "frames_root").parent / "overlays"
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                local_path = artifacts_dir / overlay_filename
+                import shutil
+                shutil.copy(tmp_path, local_path)
+                url = str(local_path)
+        finally:
+            # Clean up temp file
+            tmp_path.unlink(missing_ok=True)
+
+        return {
+            "url": url,
+            "frame_idx": frame_idx,
+            "tracks": track_info,
+        }
+    finally:
+        cap.release()
+
+
 @router.delete("/episodes/{ep_id}/identities/{identity_id}")
 def delete_identity(ep_id: str, identity_id: str) -> dict:
+    """Delete (archive) an identity/cluster.
+
+    The cluster is moved to the archive where its centroid is stored.
+    This allows matching faces in future episodes to be auto-archived.
+    """
     payload = _load_identities(ep_id)
     identities = payload.get("identities", [])
-    before = len(identities)
-    payload["identities"] = [item for item in identities if item.get("identity_id") != identity_id]
-    if len(payload["identities"]) == before:
+
+    # Find the identity to archive before deleting
+    identity_to_delete = None
+    for item in identities:
+        if item.get("identity_id") == identity_id:
+            identity_to_delete = item
+            break
+
+    if not identity_to_delete:
         raise HTTPException(status_code=404, detail="Identity not found")
+
+    # Extract show_id from episode_id (e.g., "rhoslc-s06e02" -> "RHOSLC")
+    show_id = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
+
+    # Archive the cluster with its centroid for future matching
+    try:
+        centroid = identity_to_delete.get("centroid")
+        rep_crop_url = identity_to_delete.get("rep_crop_url")
+        track_ids = identity_to_delete.get("track_ids", [])
+        face_count = identity_to_delete.get("face_count", 0)
+
+        archive_service.archive_cluster(
+            show_id=show_id,
+            episode_id=ep_id,
+            cluster_id=identity_id,
+            reason="user_deleted",
+            centroid=centroid,
+            rep_crop_url=rep_crop_url,
+            track_ids=track_ids,
+            face_count=face_count,
+        )
+        LOGGER.info(f"Archived cluster {identity_id} before deletion")
+    except Exception as e:
+        LOGGER.warning(f"Failed to archive cluster {identity_id}: {e}")
+        # Continue with deletion even if archive fails
+
+    # Remove the identity
+    payload["identities"] = [item for item in identities if item.get("identity_id") != identity_id]
     _update_identity_stats(ep_id, payload)
     path = _write_identities(ep_id, payload)
     _sync_manifests(ep_id, path)
-    return {"deleted": identity_id, "remaining": len(payload["identities"])}
+
+    return {"deleted": identity_id, "archived": True, "remaining": len(payload["identities"])}
 
 
 @router.delete("/episodes/{ep_id}/tracks/{track_id}")
@@ -2604,3 +3855,97 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
         "refresh_required": True,
         "message": f"Exported {len(seeds)} high-quality seeds to facebank. Similarity refresh recommended.",
     }
+
+
+# =============================================================================
+# Enhancement #7: Real-time Collaboration Indicators (Presence Tracking)
+# =============================================================================
+
+# In-memory presence store (for single-instance deployments)
+# For production, use Redis or similar for cross-instance presence
+_PRESENCE_STORE: Dict[str, Dict[str, Any]] = {}
+_PRESENCE_TTL_SECONDS = 60  # Presence expires after 60 seconds of no heartbeat
+
+
+class PresenceHeartbeat(BaseModel):
+    """Request body for presence heartbeat."""
+    user_id: Optional[str] = Field(None, description="User identifier")
+    user_name: Optional[str] = Field("Anonymous", description="Display name")
+
+
+@router.get("/episodes/{ep_id}/presence", tags=["episodes"])
+def get_presence(ep_id: str) -> Dict[str, Any]:
+    """Get current viewers for an episode.
+
+    Returns list of users currently viewing this episode,
+    excluding viewers whose heartbeat has expired.
+    """
+    ep_id = normalize_ep_id(ep_id)
+    now = datetime.now(timezone.utc).timestamp()
+
+    # Clean up expired entries and collect active viewers
+    viewers = []
+    if ep_id in _PRESENCE_STORE:
+        active = {}
+        for user_key, presence in _PRESENCE_STORE[ep_id].items():
+            if now - presence.get("last_seen", 0) < _PRESENCE_TTL_SECONDS:
+                active[user_key] = presence
+                viewers.append({
+                    "user_id": presence.get("user_id"),
+                    "name": presence.get("user_name", "Anonymous"),
+                    "last_seen": presence.get("last_seen"),
+                })
+        _PRESENCE_STORE[ep_id] = active
+
+    return {
+        "ep_id": ep_id,
+        "viewers": viewers,
+        "count": len(viewers),
+    }
+
+
+@router.post("/episodes/{ep_id}/presence", tags=["episodes"])
+def update_presence(ep_id: str, heartbeat: PresenceHeartbeat = Body(default=None)) -> Dict[str, Any]:
+    """Update presence heartbeat for a user viewing an episode.
+
+    Call this endpoint periodically (every 30s) to maintain presence.
+    """
+    ep_id = normalize_ep_id(ep_id)
+    heartbeat = heartbeat or PresenceHeartbeat()
+
+    user_id = heartbeat.user_id or "anonymous"
+    user_name = heartbeat.user_name or "Anonymous"
+    user_key = f"{user_id}_{hash(user_name) % 10000}"
+
+    if ep_id not in _PRESENCE_STORE:
+        _PRESENCE_STORE[ep_id] = {}
+
+    _PRESENCE_STORE[ep_id][user_key] = {
+        "user_id": user_id,
+        "user_name": user_name,
+        "last_seen": datetime.now(timezone.utc).timestamp(),
+    }
+
+    return {
+        "status": "ok",
+        "ep_id": ep_id,
+        "user_id": user_id,
+    }
+
+
+@router.delete("/episodes/{ep_id}/presence", tags=["episodes"])
+def leave_presence(ep_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Remove presence for a user (when leaving the page)."""
+    ep_id = normalize_ep_id(ep_id)
+
+    if ep_id in _PRESENCE_STORE:
+        if user_id:
+            # Remove specific user
+            keys_to_remove = [k for k in _PRESENCE_STORE[ep_id] if k.startswith(user_id)]
+            for k in keys_to_remove:
+                _PRESENCE_STORE[ep_id].pop(k, None)
+        else:
+            # Clean up entire episode presence
+            _PRESENCE_STORE.pop(ep_id, None)
+
+    return {"status": "ok", "ep_id": ep_id}
