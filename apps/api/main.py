@@ -14,6 +14,7 @@ from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from apps.api.errors import install_error_handlers
 from apps.api.routers import (
     archive,
     cast,
@@ -30,6 +31,7 @@ from apps.api.routers import (
 from tools import episode_run
 
 app = FastAPI(title="Screenalytics API", version="0.1.0")
+install_error_handlers(app)
 LOGGER = logging.getLogger(__name__)
 
 ui_origin = os.environ.get("UI_ORIGIN", "http://localhost:8501")

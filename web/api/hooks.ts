@@ -1,9 +1,16 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createEpisode, eventsUrl, fetchEpisodeStatus, mapEventStream, presignEpisodeAssets, triggerJob } from "./client";
-import type { ApiError, AssetUploadResponse, EpisodeCreateRequest, EpisodeEvent, EpisodePhase, EpisodeStatus } from "./types";
+import type {
+  ApiError,
+  AssetUploadResponse,
+  EpisodeCreateRequest,
+  EpisodeEvent,
+  EpisodePhase,
+  EpisodeStatus,
+} from "./types";
 
 export function useEpisodeStatus(
   episodeId?: string,
@@ -39,6 +46,8 @@ export function useTriggerPhase() {
   });
 }
 
+export type EventConnectionState = "idle" | "connecting" | "connected" | "error";
+
 export function useEpisodeEvents(
   episodeId?: string,
   handlers?: {
@@ -49,43 +58,75 @@ export function useEpisodeEvents(
   // Use ref to avoid re-creating EventSource when handlers change
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
+  const queryClient = useQueryClient();
+  const [events, setEvents] = useState<EpisodeEvent[]>([]);
+  const [lastEvent, setLastEvent] = useState<EpisodeEvent | null>(null);
+  const [state, setState] = useState<EventConnectionState>("idle");
+  const [manifestMtimes, setManifestMtimes] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!episodeId) return undefined;
 
     if (process.env.NEXT_PUBLIC_MSW === "1") {
+      setState("connected");
       const timer = setInterval(() => {
-        handlersRef.current?.onEvent?.({
+        const mockEvent: EpisodeEvent = {
           episode_id: episodeId,
           phase: "detect-track",
           event: "progress",
           message: "mock event",
           progress: Math.random(),
-        });
+        };
+        handlersRef.current?.onEvent?.(mockEvent);
+        setLastEvent(mockEvent);
+        setEvents((prev) => [mockEvent, ...prev].slice(0, 50));
       }, 3000);
       return () => clearInterval(timer);
     }
 
     const url = eventsUrl(episodeId);
     const source = new EventSource(url);
+    setState("connecting");
 
     const onMessage = (evt: MessageEvent<string>) => {
       const parsed = mapEventStream(evt);
-      if (parsed && handlersRef.current?.onEvent) {
-        handlersRef.current.onEvent(parsed);
+      if (!parsed) return;
+      handlersRef.current?.onEvent?.(parsed);
+      setLastEvent(parsed);
+      setEvents((prev) => [parsed, ...prev].slice(0, 50));
+      if (parsed.manifest_mtime && parsed.phase) {
+        const manifestKey = parsed.manifest_type || parsed.phase;
+        setManifestMtimes((prev) => ({
+          ...prev,
+          [manifestKey]: parsed.manifest_mtime as string,
+        }));
+        queryClient.invalidateQueries({
+          predicate: (query) => {
+            const key = query.queryKey;
+            return Array.isArray(key) && key[0] === "episode-status" && key[1] === episodeId;
+          },
+        });
+        queryClient.invalidateQueries({ queryKey: ["episode-manifest", episodeId, manifestKey] });
       }
     };
     const onError = (evt: Event) => {
+      setState("error");
       handlersRef.current?.onError?.(evt);
     };
+    const onOpen = () => setState("connected");
 
     source.addEventListener("message", onMessage as EventListener);
     source.addEventListener("error", onError);
+    source.addEventListener("open", onOpen);
 
     return () => {
       source.removeEventListener("message", onMessage as EventListener);
       source.removeEventListener("error", onError);
+      source.removeEventListener("open", onOpen);
       source.close();
+      setState("idle");
     };
-  }, [episodeId]);
+  }, [episodeId, queryClient]);
+
+  return { events, lastEvent, state, manifestMtimes };
 }

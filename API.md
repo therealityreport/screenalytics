@@ -21,35 +21,33 @@ https://api.screenalytics.example.com  # Production
 
 ---
 
-## Response Envelope
+## Response Envelope (errors)
 
-All responses follow this format:
+Errors are standardized for the Next.js client as:
 
 ```json
 {
-  "ok": true,
-  "data": { ... },
-  "meta": {
-    "request_id": "req-abc123",
-    "timestamp": "2025-11-18T12:34:56Z"
-  }
+  "code": "EPISODE_NOT_FOUND",
+  "message": "Episode 'rhobh-s05e02' not found",
+  "details": {}
 }
 ```
 
-**Error format:**
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "EPISODE_NOT_FOUND",
-    "message": "Episode 'rhobh-s05e02' not found",
-    "details": {}
-  },
-  "meta": {
-    "request_id": "req-abc123"
-  }
-}
-```
+Success responses return the domain payload directly (no outer `ok` wrapper).
+
+## OpenAPI + typed client
+
+- OpenAPI is exposed at `/openapi.json`.
+- Regenerate the frontend types/client: `cd web && npm run api:gen` (writes `web/api/schema.ts`).
+- The typed client and hooks consume only the generated schema; do not hand-edit `schema.ts`.
+
+## Episode events (SSE) and manifest cache-busting
+
+- Live updates are streamed from `GET /episodes/{ep_id}/events` (Server-Sent Events).
+- Event payload fields:
+  - `episode_id`, `phase`, `event` (`progress` | `manifest_updated` | `error` | `start` | `finish`)
+  - `manifest_mtime` and `manifest_type` when artifacts change.
+- Frontend uses `manifest_mtime` to invalidate manifest/status queries and appends `mtime` as a cache-buster when fetching manifests.
 
 ---
 

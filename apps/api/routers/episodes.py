@@ -1909,14 +1909,16 @@ def _status_to_events(ep_id: str, status: EpisodeStatusResponse) -> List[Dict[st
     ):
         if not phase_status:
             continue
+        event_name = "manifest_updated" if getattr(phase_status, "last_run_at", None) else "progress"
         payload: Dict[str, Any] = {
             "episode_id": ep_id,
             "phase": phase_name,
-            "event": "progress",
+            "event": event_name,
             "message": phase_status.status,
             "progress": _phase_progress_value(getattr(phase_status, "status", None)),
             "flags": flags,
             "manifest_mtime": getattr(phase_status, "last_run_at", None),
+            "manifest_type": phase_name,
         }
         if phase_name == "cluster":
             payload["metrics"] = {
