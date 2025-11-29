@@ -10,8 +10,6 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple
 
-import numpy as np
-
 from .models import SeparationConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -87,6 +85,7 @@ def separate_vocals(
 
     try:
         import demucs.separate
+        from demucs.apply import apply_model
         import torch
         import torchaudio
 
@@ -114,66 +113,24 @@ def separate_vocals(
         # Add batch dimension
         waveform = waveform.unsqueeze(0).to(device)
 
-        # Process in chunks for memory efficiency
-        chunk_samples = int(config.chunk_seconds * model_sr)
-        overlap_samples = int(config.overlap_seconds * model_sr)
+        # Add batch dimension
+        waveform = waveform.unsqueeze(0).to(device)
 
-        total_samples = waveform.shape[-1]
+        # demucs BagOfModels require apply_model; use config chunk/overlap to set segment windows.
+        segment_seconds = max(float(config.chunk_seconds), 1.0)
+        overlap_ratio = 0.0
+        if config.chunk_seconds > 0:
+            overlap_ratio = min(max(config.overlap_seconds / config.chunk_seconds, 0.0), 0.95)
 
-        if total_samples <= chunk_samples:
-            # Process whole file at once
-            with torch.no_grad():
-                sources = model(waveform)
-        else:
-            # Process in overlapping chunks
-            LOGGER.info(f"Processing {total_samples / model_sr:.1f}s audio in chunks")
-
-            # Get source names
-            source_names = model.sources
-            vocals_idx = source_names.index("vocals") if "vocals" in source_names else 0
-
-            # Initialize output
-            sources = torch.zeros(
-                1, len(source_names), 2, total_samples,
-                device=device, dtype=waveform.dtype
-            )
-            weights = torch.zeros(total_samples, device=device)
-
-            # Process chunks
-            hop = chunk_samples - overlap_samples
-            for start in range(0, total_samples, hop):
-                end = min(start + chunk_samples, total_samples)
-                chunk = waveform[:, :, start:end]
-
-                # Pad if needed
-                if chunk.shape[-1] < chunk_samples:
-                    pad_size = chunk_samples - chunk.shape[-1]
-                    chunk = torch.nn.functional.pad(chunk, (0, pad_size))
-
-                with torch.no_grad():
-                    chunk_sources = model(chunk)
-
-                # Trim padding
-                actual_len = end - start
-                chunk_sources = chunk_sources[:, :, :, :actual_len]
-
-                # Blend with overlap
-                blend_len = min(overlap_samples, actual_len, start)
-                if blend_len > 0 and start > 0:
-                    blend_weights = torch.linspace(0, 1, blend_len, device=device)
-                    for i in range(len(source_names)):
-                        sources[:, i, :, start:start+blend_len] = (
-                            sources[:, i, :, start:start+blend_len] * (1 - blend_weights) +
-                            chunk_sources[:, i, :, :blend_len] * blend_weights
-                        )
-                    sources[:, :, :, start+blend_len:end] = chunk_sources[:, :, :, blend_len:]
-                else:
-                    sources[:, :, :, start:end] = chunk_sources
-
-                weights[start:end] = 1.0
-
-                progress = (start + chunk_samples) / total_samples * 100
-                LOGGER.debug(f"Separation progress: {min(progress, 100):.1f}%")
+        sources = apply_model(
+            model,
+            waveform,
+            overlap=overlap_ratio,
+            segment=segment_seconds,
+            device=device,
+            split=True,
+            shifts=1,
+        )
 
         # Extract vocals and accompaniment
         source_names = model.sources
