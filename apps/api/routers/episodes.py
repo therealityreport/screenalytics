@@ -254,8 +254,24 @@ def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _compute_runtime_sec(started_at: str | None, finished_at: str | None) -> float | None:
+    """Compute runtime in seconds from ISO timestamps."""
+    if not started_at or not finished_at:
+        return None
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+        delta = (end - start).total_seconds()
+        return delta if delta >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, Any]:
     status_value = str(marker.get("status") or "unknown").lower()
+    started_at = marker.get("started_at")
+    finished_at = marker.get("finished_at")
+    runtime_sec = _compute_runtime_sec(started_at, finished_at)
     return {
         "phase": phase,
         "status": status_value,
@@ -283,21 +299,43 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
         "cluster_thresh": _safe_float(marker.get("cluster_thresh")),
         "min_cluster_size": _safe_int(marker.get("min_cluster_size")),
         "min_identity_sim": _safe_float(marker.get("min_identity_sim")),
-        "started_at": marker.get("started_at"),
-        "finished_at": marker.get("finished_at"),
+        "started_at": started_at,
+        "finished_at": finished_at,
         "version": marker.get("version"),
         "source": "marker",
+        "runtime_sec": runtime_sec,
     }
+
+
+def _get_file_mtime_iso(path: Path) -> str | None:
+    """Get the modification time of a file as an ISO timestamp."""
+    if not path.exists():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except OSError:
+        return None
 
 
 def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
     marker = _load_run_marker(ep_id, "faces_embed")
     if marker:
-        return _phase_status_from_marker("faces_embed", marker)
+        result = _phase_status_from_marker("faces_embed", marker)
+        # Add manifest existence info even when marker exists
+        faces_path = _faces_path(ep_id)
+        result["manifest_exists"] = faces_path.exists()
+        result["last_run_at"] = _get_file_mtime_iso(faces_path)
+        faces_count = result.get("faces") or 0
+        result["zero_rows"] = result["manifest_exists"] and faces_count == 0
+        return result
     faces_path = _faces_path(ep_id)
+    manifest_exists = faces_path.exists()
     faces_count = _count_nonempty_lines(faces_path)
-    status_value = "success" if faces_count > 0 else "missing"
-    source = "output" if faces_path.exists() else "absent"
+    # SUCCESS if manifest exists (even with 0 rows), MISSING only if no manifest
+    status_value = "success" if manifest_exists else "missing"
+    source = "output" if manifest_exists else "absent"
+    last_run_at = _get_file_mtime_iso(faces_path)
     return {
         "phase": "faces_embed",
         "status": status_value,
@@ -314,17 +352,74 @@ def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
         "finished_at": None,
         "version": None,
         "source": source,
+        "manifest_exists": manifest_exists,
+        "zero_rows": manifest_exists and faces_count == 0,
+        "last_run_at": last_run_at,
     }
+
+
+def _extract_singleton_merge_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract singleton merge stats from identities.json stats block."""
+    stats_block = payload.get("stats") if isinstance(payload, dict) else None
+    if not isinstance(stats_block, dict):
+        return {}
+
+    result: Dict[str, Any] = {}
+
+    # Include the full singleton_stats block for backwards compatibility
+    singleton_stats = stats_block.get("singleton_stats")
+    if isinstance(singleton_stats, dict):
+        result["singleton_stats"] = singleton_stats
+        result["singleton_merge_enabled"] = singleton_stats.get("enabled", True)
+        before = singleton_stats.get("before", {})
+        after = singleton_stats.get("after", {})
+        if isinstance(before, dict):
+            result["singleton_fraction_before"] = _safe_float(before.get("singleton_fraction"))
+        if isinstance(after, dict):
+            result["singleton_fraction_after"] = _safe_float(after.get("singleton_fraction"))
+            result["singleton_merge_merge_count"] = _safe_int(after.get("merge_count"))
+
+    # Check singleton_merge block (newer format) - may have additional fields
+    singleton_merge = stats_block.get("singleton_merge")
+    if isinstance(singleton_merge, dict):
+        result["singleton_merge_enabled"] = singleton_merge.get("enabled", True)
+        if "singleton_fraction_before" not in result:
+            result["singleton_fraction_before"] = _safe_float(singleton_merge.get("singleton_fraction_before"))
+        if "singleton_fraction_after" not in result:
+            result["singleton_fraction_after"] = _safe_float(singleton_merge.get("singleton_fraction_after"))
+        result["singleton_merge_neighbor_top_k"] = _safe_int(singleton_merge.get("neighbor_top_k"))
+        result["singleton_merge_similarity_thresh"] = _safe_float(singleton_merge.get("similarity_thresh"))
+        if "singleton_merge_merge_count" not in result:
+            result["singleton_merge_merge_count"] = _safe_int(singleton_merge.get("num_singleton_merges"))
+
+    return result
 
 
 def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
     marker = _load_run_marker(ep_id, "cluster")
     if marker:
-        return _phase_status_from_marker("cluster", marker)
+        result = _phase_status_from_marker("cluster", marker)
+        # Add manifest existence info even when marker exists
+        identities_path = _identities_path(ep_id)
+        result["manifest_exists"] = identities_path.exists()
+        result["last_run_at"] = _get_file_mtime_iso(identities_path)
+        identities_count = result.get("identities") or 0
+        result["zero_rows"] = result["manifest_exists"] and identities_count == 0
+        # Try to add singleton merge stats from identities.json
+        if identities_path.exists():
+            try:
+                payload = json.loads(identities_path.read_text(encoding="utf-8"))
+                singleton_stats = _extract_singleton_merge_stats(payload)
+                result.update(singleton_stats)
+            except (OSError, json.JSONDecodeError):
+                pass
+        return result
     identities_path = _identities_path(ep_id)
+    manifest_exists = identities_path.exists()
     faces_total = 0
     identities_count = 0
-    if identities_path.exists():
+    singleton_merge_stats: Dict[str, Any] = {}
+    if manifest_exists:
         try:
             payload = json.loads(identities_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -335,8 +430,11 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         stats_block = payload.get("stats") if isinstance(payload, dict) else None
         if isinstance(stats_block, dict):
             faces_total = _safe_int(stats_block.get("faces")) or 0
-    status_value = "success" if identities_count > 0 else "missing"
-    source = "output" if identities_path.exists() else "absent"
+        singleton_merge_stats = _extract_singleton_merge_stats(payload)
+    # SUCCESS if manifest exists (even with 0 identities), MISSING only if no manifest
+    status_value = "success" if manifest_exists else "missing"
+    source = "output" if manifest_exists else "absent"
+    last_run_at = _get_file_mtime_iso(identities_path)
     return {
         "phase": "cluster",
         "status": status_value,
@@ -352,6 +450,10 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         "finished_at": None,
         "version": None,
         "source": source,
+        "manifest_exists": manifest_exists,
+        "zero_rows": manifest_exists and identities_count == 0,
+        "last_run_at": last_run_at,
+        **singleton_merge_stats,
     }
 
 
@@ -363,7 +465,14 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
     """
     marker = _load_run_marker(ep_id, "detect_track")
     if marker:
-        return _phase_status_from_marker("detect_track", marker)
+        result = _phase_status_from_marker("detect_track", marker)
+        # Add manifest existence info even when marker exists
+        tracks_path = _tracks_path(ep_id)
+        result["manifest_exists"] = tracks_path.exists()
+        result["last_run_at"] = _get_file_mtime_iso(tracks_path)
+        tracks_count = result.get("tracks") or 0
+        result["zero_rows"] = result["manifest_exists"] and tracks_count == 0
+        return result
     from py_screenalytics.artifacts import get_path
 
     tracks_path = get_path(ep_id, "tracks")
@@ -371,6 +480,8 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
 
     detections_count = _count_nonempty_lines(detections_path)
     tracks_count = _count_nonempty_lines(tracks_path)
+    manifest_exists = tracks_path.exists()
+    last_run_at = _get_file_mtime_iso(tracks_path)
 
     # Infer detector/tracker from tracks.jsonl if available
     # Only accept FACE detectors (retinaface, yolov8face, etc.), NOT scene detectors
@@ -430,6 +541,9 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         "finished_at": None,
         "version": None,
         "source": source,
+        "manifest_exists": manifest_exists,
+        "zero_rows": manifest_exists and tracks_count == 0,
+        "last_run_at": last_run_at,
     }
 
 
@@ -1422,6 +1536,19 @@ class PhaseStatus(BaseModel):
     finished_at: str | None = None
     version: str | None = None
     source: str | None = None
+    runtime_sec: float | None = None  # Computed from started_at/finished_at
+    # Singleton merge stats for cluster phase
+    singleton_merge_enabled: bool | None = None
+    singleton_fraction_before: float | None = None
+    singleton_fraction_after: float | None = None
+    singleton_merge_neighbor_top_k: int | None = None
+    singleton_merge_merge_count: int | None = None
+    singleton_merge_similarity_thresh: float | None = None
+    singleton_stats: Dict[str, Any] | None = None  # Full singleton stats block
+    # New fields for manifest existence and zero-result detection
+    manifest_exists: bool | None = None
+    zero_rows: bool | None = None
+    last_run_at: str | None = None  # ISO timestamp of manifest mtime
 
 
 class EpisodeStatusResponse(BaseModel):
@@ -1434,6 +1561,12 @@ class EpisodeStatusResponse(BaseModel):
     tracks_ready: bool
     faces_harvested: bool
     coreml_available: bool | None = None
+    # Stale detection flags
+    faces_stale: bool = False
+    cluster_stale: bool = False
+    # Fallback indicators for backwards compatibility
+    faces_manifest_fallback: bool = False  # True if faces are stale relative to tracks
+    tracks_only_fallback: bool = False  # True if cluster is stale
 
 
 class AssetUploadResponse(BaseModel):
@@ -1484,11 +1617,16 @@ class PurgeAllIn(BaseModel):
 
 @router.get("/episodes", response_model=EpisodeListResponse, tags=["episodes"])
 def list_episodes() -> EpisodeListResponse:
+    """List all episodes.
+
+    Show slugs are normalized to UPPERCASE for consistent display.
+    """
     records = EPISODE_STORE.list()
     episodes = [
         EpisodeSummary(
             ep_id=record.ep_id,
-            show_slug=record.show_ref,
+            # Normalize show_slug to uppercase for consistent display
+            show_slug=record.show_ref.upper() if record.show_ref else record.show_ref,
             season_number=record.season_number,
             episode_number=record.episode_number,
             title=record.title,
@@ -1531,17 +1669,22 @@ def list_s3_videos(q: str | None = Query(None), limit: int = Query(200, ge=1, le
 
 @router.get("/episodes/s3_shows", response_model=S3ShowsResponse, tags=["episodes"])
 def list_s3_shows() -> S3ShowsResponse:
-    """List all shows available in S3 with episode counts."""
+    """List all shows available in S3 with episode counts.
+
+    Show codes are normalized to UPPERCASE and deduplicated case-insensitively.
+    """
     raw_items = STORAGE.list_episode_videos_s3(limit=10000)
 
-    # Group by show
+    # Group by show (normalized to uppercase for deduplication)
     show_episodes: Dict[str, int] = {}
     for obj in raw_items:
         show = obj.get("show")
         if show and isinstance(show, str):
-            show_episodes[show] = show_episodes.get(show, 0) + 1
+            # Normalize to uppercase for case-insensitive grouping
+            show_upper = show.upper()
+            show_episodes[show_upper] = show_episodes.get(show_upper, 0) + 1
 
-    # Convert to sorted list
+    # Convert to sorted list (already uppercase)
     shows = [S3Show(show=show, episode_count=count) for show, count in sorted(show_episodes.items())]
     return S3ShowsResponse(shows=shows, count=len(shows))
 
@@ -1653,6 +1796,17 @@ def episode_progress(ep_id: str) -> dict:
     return {"ep_id": ep_id, "progress": payload}
 
 
+def _parse_iso_timestamp(ts: str | None) -> datetime | None:
+    """Parse an ISO timestamp string to datetime."""
+    if not ts:
+        return None
+    try:
+        cleaned = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
 @router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
 def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     tracks_path = get_path(ep_id, "tracks")
@@ -1666,8 +1820,43 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         detect_track_payload["status"] = "stale"
         detect_track_payload["source"] = "missing_artifact"
     detect_track_status = PhaseStatus(**detect_track_payload)
-    faces_status = PhaseStatus(**_faces_phase_status(ep_id))
-    cluster_status = PhaseStatus(**_cluster_phase_status(ep_id))
+    faces_payload = _faces_phase_status(ep_id)
+    cluster_payload = _cluster_phase_status(ep_id)
+
+    # Stale detection: compare timestamps to detect outdated downstream artifacts
+    detect_track_mtime = _parse_iso_timestamp(detect_track_payload.get("last_run_at"))
+    faces_mtime = _parse_iso_timestamp(faces_payload.get("last_run_at"))
+    cluster_mtime = _parse_iso_timestamp(cluster_payload.get("last_run_at"))
+
+    faces_stale = False
+    cluster_stale = False
+    faces_manifest_fallback = False
+    tracks_only_fallback = False
+
+    # If detect/track is newer than faces, faces are stale
+    if detect_track_mtime and faces_mtime and detect_track_mtime > faces_mtime:
+        if faces_payload.get("manifest_exists"):
+            faces_stale = True
+            faces_manifest_fallback = True
+            # Mark faces status as stale
+            if faces_payload.get("status") == "success":
+                faces_payload["status"] = "stale"
+
+    # If detect/track or faces is newer than cluster, cluster is stale
+    if cluster_payload.get("manifest_exists"):
+        if detect_track_mtime and cluster_mtime and detect_track_mtime > cluster_mtime:
+            cluster_stale = True
+            tracks_only_fallback = True
+            if cluster_payload.get("status") == "success":
+                cluster_payload["status"] = "stale"
+        elif faces_mtime and cluster_mtime and faces_mtime > cluster_mtime:
+            cluster_stale = True
+            tracks_only_fallback = True
+            if cluster_payload.get("status") == "success":
+                cluster_payload["status"] = "stale"
+
+    faces_status = PhaseStatus(**faces_payload)
+    cluster_status = PhaseStatus(**cluster_payload)
 
     # Compute pipeline state indicators
     # scenes_ready: True if scene detection has run (consider ready if tracks manifest has rows)
@@ -1676,8 +1865,9 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
     # tracks_ready: True only when both detections+tracks exist and API reports success
     tracks_ready = manifest_ready and detect_track_status.status == "success"
 
-    # faces_harvested: True if faces.jsonl exists and has content
-    faces_harvested = faces_status.faces is not None and faces_status.faces > 0
+    # faces_harvested: True if faces.jsonl EXISTS (even with 0 rows)
+    # This distinguishes "never ran" from "ran with zero results"
+    faces_harvested = bool(faces_status.manifest_exists)
 
     coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
 
@@ -1690,6 +1880,10 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         tracks_ready=tracks_ready,
         faces_harvested=faces_harvested,
         coreml_available=coreml_available if isinstance(coreml_available, bool) else None,
+        faces_stale=faces_stale,
+        cluster_stale=cluster_stale,
+        faces_manifest_fallback=faces_manifest_fallback,
+        tracks_only_fallback=tracks_only_fallback,
     )
 
 
@@ -1792,6 +1986,116 @@ def mirror_episode_video(ep_id: str) -> EpisodeMirrorResponse:
 )
 def hydrate_episode_video(ep_id: str) -> EpisodeMirrorResponse:
     return mirror_episode_video(ep_id)
+
+
+class MirrorArtifactsRequest(BaseModel):
+    """Request to mirror specific artifacts from S3 to local storage."""
+
+    artifacts: List[str] = ["faces", "identities"]  # faces.jsonl, identities.json
+
+
+class MirrorArtifactsResponse(BaseModel):
+    """Response from mirroring artifacts."""
+
+    ep_id: str
+    mirrored: Dict[str, bool]  # artifact -> success
+    errors: Dict[str, str]  # artifact -> error message
+    faces_manifest_exists: bool
+    identities_manifest_exists: bool
+
+
+@router.post("/episodes/{ep_id}/mirror_artifacts", tags=["episodes"])
+def mirror_episode_artifacts(ep_id: str, payload: MirrorArtifactsRequest | None = None) -> MirrorArtifactsResponse:
+    """Mirror faces/identities artifacts from S3 to local storage.
+
+    This endpoint downloads manifest files (faces.jsonl, identities.json) from S3
+    to the local file system, enabling clustering operations on machines that
+    don't have direct S3 access or need local copies.
+
+    Unlike /mirror which only mirrors the video, this mirrors the pipeline artifacts.
+    """
+    record = EPISODE_STORE.get(ep_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    if payload is None:
+        payload = MirrorArtifactsRequest()
+
+    ensure_dirs(ep_id)
+    mirrored: Dict[str, bool] = {}
+    errors: Dict[str, str] = {}
+
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid episode id: {exc}") from exc
+
+    # Get S3 prefixes for manifests
+    from apps.api.services.storage import artifact_prefixes
+
+    prefixes = artifact_prefixes(ep_ctx)
+    manifests_prefix = prefixes.get("manifests", "")
+
+    # Define artifact mappings: artifact_name -> (s3_key_suffix, local_path)
+    manifests_dir = _manifests_dir(ep_id)
+    artifact_map = {
+        "faces": ("faces.jsonl", manifests_dir / "faces.jsonl"),
+        "identities": ("identities.json", manifests_dir / "identities.json"),
+        "tracks": ("tracks.jsonl", get_path(ep_id, "tracks")),
+        "detections": ("detections.jsonl", get_path(ep_id, "detections")),
+    }
+
+    # Mirror requested artifacts
+    for artifact_name in payload.artifacts:
+        if artifact_name not in artifact_map:
+            errors[artifact_name] = f"Unknown artifact: {artifact_name}"
+            mirrored[artifact_name] = False
+            continue
+
+        s3_suffix, local_path = artifact_map[artifact_name]
+        s3_key = f"{manifests_prefix}{s3_suffix}"
+
+        # Ensure parent directory exists
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try to download from S3
+        if STORAGE.backend not in {"s3", "minio"} or STORAGE._client is None:
+            # Local mode - check if file exists locally
+            if local_path.exists():
+                mirrored[artifact_name] = True
+            else:
+                errors[artifact_name] = "Storage backend is local and file doesn't exist"
+                mirrored[artifact_name] = False
+            continue
+
+        try:
+            # Check if object exists in S3
+            STORAGE._client.head_object(Bucket=STORAGE.bucket, Key=s3_key)
+            # Download the file
+            STORAGE._client.download_file(STORAGE.bucket, s3_key, str(local_path))
+            mirrored[artifact_name] = True
+            LOGGER.info("Mirrored %s from s3://%s/%s to %s", artifact_name, STORAGE.bucket, s3_key, local_path)
+        except Exception as exc:
+            error_code = None
+            if hasattr(exc, "response"):
+                error_code = exc.response.get("Error", {}).get("Code")  # type: ignore[union-attr]
+            if error_code in {"404", "NoSuchKey", "NotFound"}:
+                errors[artifact_name] = f"Not found in S3: {s3_key}"
+            else:
+                errors[artifact_name] = str(exc)
+            mirrored[artifact_name] = False
+
+    # Check final state of manifests
+    faces_path = _faces_path(ep_id)
+    identities_path = _identities_path(ep_id)
+
+    return MirrorArtifactsResponse(
+        ep_id=ep_id,
+        mirrored=mirrored,
+        errors=errors,
+        faces_manifest_exists=faces_path.exists(),
+        identities_manifest_exists=identities_path.exists(),
+    )
 
 
 @router.post("/episodes/{ep_id}/refresh_similarity", tags=["episodes"])

@@ -586,6 +586,10 @@ if _job_activity_key(ep_id) not in st.session_state:
     st.session_state[_job_activity_key(ep_id)] = False
 job_running = bool(st.session_state.get(running_job_key))
 
+# Hydrate logs for this episode on page load (local mode log persistence)
+# This fetches any previously saved logs so they can be displayed without re-running jobs
+helpers.hydrate_logs_for_episode(ep_id)
+
 # Cache API responses with 10s TTL to reduce repeated requests
 cache_key = time.time() // 10
 
@@ -2179,7 +2183,7 @@ with col_cluster:
         "Device (for clustering)",
         helpers.DEVICE_LABELS,
         index=helpers.device_label_index(cluster_device_label_default),
-        key="cluster_device_choice",
+        key=f"{ep_id}::cluster_device_choice",
     )
     st.caption("Device for similarity comparisons during clustering; GPU/CoreML provides faster batch processing.")
     cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
@@ -2190,6 +2194,7 @@ with col_cluster:
         value=float(cluster_thresh_default),
         step=0.01,
         help="Higher thresholds require tighter ArcFace similarity between faces to form a cluster.",
+        key=f"{ep_id}::cluster_similarity_threshold",
     )
     # Provide threshold guidance based on selected value
     if cluster_thresh_value >= 0.80:
@@ -2208,6 +2213,7 @@ with col_cluster:
         value=int(min_cluster_size_default),
         step=1,
         help="Clusters smaller than this are discarded as noise. Recommended: 2+ for cleaner results.",
+        key=f"{ep_id}::cluster_min_tracks_per_identity",
     )
     if min_cluster_size_value == 1:
         st.caption("⚠️ Single-track clusters may contain noise/false detections.")
@@ -2282,12 +2288,22 @@ with col_cluster:
                 local_video_exists = True
         # Ensure faces manifest is mirrored locally before clustering
         if can_run_cluster and not faces_path.exists():
-            with st.spinner("Mirroring faces manifest from S3…"):
+            with st.spinner("Mirroring faces artifacts from S3…"):
                 try:
-                    helpers.api_post(f"/episodes/{ep_id}/mirror")
-                    st.success("Faces manifest mirrored successfully.")
+                    # Use the new mirror_artifacts endpoint that actually mirrors faces/identities
+                    mirror_resp = helpers.api_post(
+                        f"/episodes/{ep_id}/mirror_artifacts",
+                        json={"artifacts": ["faces", "identities"]},
+                    )
+                    if mirror_resp.get("faces_manifest_exists"):
+                        st.success("Faces manifest mirrored successfully.")
+                    else:
+                        errors = mirror_resp.get("errors", {})
+                        error_msg = errors.get("faces", "Faces manifest not found in S3")
+                        st.error(f"Failed to mirror faces: {error_msg}")
+                        can_run_cluster = False
                 except requests.RequestException as exc:
-                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/mirror", exc))
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/mirror_artifacts", exc))
                     can_run_cluster = False
         if can_run_cluster:
             payload = {

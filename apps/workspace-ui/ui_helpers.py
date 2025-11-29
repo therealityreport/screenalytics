@@ -290,6 +290,202 @@ def is_redis_mode(ep_id: str) -> bool:
     return get_execution_mode(ep_id) == "redis"
 
 
+# =============================================================================
+# Local Mode Log Persistence and Hydration
+# =============================================================================
+# These helpers fetch persisted logs from the backend and cache them in session
+# state so they can be displayed on page load without re-running jobs.
+
+_LOCAL_LOGS_SESSION_KEY = "_local_logs_cache"
+_VALID_OPERATIONS = {"detect_track", "faces_embed", "cluster"}
+
+
+def _get_logs_cache() -> Dict[str, Dict[str, Any]]:
+    """Get the logs cache dict from session state."""
+    return st.session_state.setdefault(_LOCAL_LOGS_SESSION_KEY, {})
+
+
+def _logs_cache_key(ep_id: str, operation: str) -> str:
+    """Generate a cache key for an episode/operation."""
+    return f"{ep_id}::{operation}"
+
+
+def fetch_operation_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Fetch persisted logs for an operation from the backend API.
+
+    Args:
+        ep_id: Episode identifier
+        operation: One of 'detect_track', 'faces_embed', 'cluster'
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if not available
+    """
+    if operation not in _VALID_OPERATIONS:
+        LOGGER.warning(f"Invalid operation for log fetch: {operation}")
+        return None
+
+    try:
+        base = st.session_state.get("api_base")
+        if not base:
+            base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+        url = f"{base}/celery_jobs/logs/{ep_id}/{operation}"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "none":
+            return None
+        return data
+    except requests.RequestException as exc:
+        LOGGER.debug(f"Failed to fetch logs for {ep_id}/{operation}: {exc}")
+        return None
+
+
+def get_cached_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
+    """Get cached logs from session state for an episode/operation.
+
+    Returns:
+        Dict with logs, status, elapsed_seconds, etc. or None if not cached
+    """
+    cache = _get_logs_cache()
+    key = _logs_cache_key(ep_id, operation)
+    return cache.get(key)
+
+
+def cache_logs(
+    ep_id: str,
+    operation: str,
+    logs: List[str],
+    status: str,
+    elapsed_seconds: float,
+    extra: Dict[str, Any] | None = None,
+) -> None:
+    """Cache logs in session state for an episode/operation.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name
+        logs: List of log lines
+        status: Final status (completed, error, cancelled, timeout)
+        elapsed_seconds: Total runtime in seconds
+        extra: Additional metadata to store
+    """
+    cache = _get_logs_cache()
+    key = _logs_cache_key(ep_id, operation)
+    cache[key] = {
+        "episode_id": ep_id,
+        "operation": operation,
+        "logs": logs,
+        "status": status,
+        "elapsed_seconds": elapsed_seconds,
+        **(extra or {}),
+    }
+
+
+def hydrate_logs_for_episode(ep_id: str, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Fetch and cache persisted logs for all operations for an episode.
+
+    This should be called on page load to populate the log cache with
+    any previously saved logs. Only fetches if not already cached unless
+    force=True.
+
+    Args:
+        ep_id: Episode identifier
+        force: If True, always fetch from backend even if cached
+
+    Returns:
+        Dict mapping operation name to log data
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    cache = _get_logs_cache()
+
+    for operation in _VALID_OPERATIONS:
+        key = _logs_cache_key(ep_id, operation)
+
+        # Skip if already cached and not forcing refresh
+        if not force and key in cache:
+            if cache[key]:
+                result[operation] = cache[key]
+            continue
+
+        # Fetch from backend
+        data = fetch_operation_logs(ep_id, operation)
+        if data:
+            cache[key] = data
+            result[operation] = data
+        else:
+            # Mark as fetched but empty so we don't keep retrying
+            cache[key] = {}
+
+    return result
+
+
+def render_cached_logs(ep_id: str, operation: str) -> bool:
+    """Render cached logs for an operation if available.
+
+    Should be called to display "Last run" logs on page load.
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation name
+
+    Returns:
+        True if logs were rendered, False if no logs available
+    """
+    cached = get_cached_logs(ep_id, operation)
+    if not cached or not cached.get("logs"):
+        return False
+
+    logs = cached.get("logs", [])
+    status = cached.get("status", "unknown")
+    elapsed = cached.get("elapsed_seconds", 0)
+    updated_at = cached.get("updated_at")
+
+    # Format elapsed time
+    if elapsed >= 60:
+        elapsed_min = int(elapsed // 60)
+        elapsed_sec = int(elapsed % 60)
+        elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+    else:
+        elapsed_str = f"{elapsed:.1f}s"
+
+    # Status indicator
+    if status == "completed":
+        status_icon = "completed"
+        status_label = "Last run completed"
+    elif status == "error":
+        status_icon = "error"
+        status_label = "Last run failed"
+    elif status == "cancelled":
+        status_icon = "cancelled"
+        status_label = "Last run cancelled"
+    elif status == "timeout":
+        status_icon = "timeout"
+        status_label = "Last run timed out"
+    else:
+        status_icon = "unknown"
+        status_label = f"Last run: {status}"
+
+    # Build header with timestamp if available
+    header_parts = [status_label]
+    if elapsed > 0:
+        header_parts.append(f"({elapsed_str})")
+    if updated_at:
+        # Parse and format timestamp
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
+            header_parts.append(f"at {formatted}")
+        except Exception:
+            pass
+
+    # Render in an expander
+    with st.expander(f"Last run log - {' '.join(header_parts)}", expanded=False):
+        st.code("\n".join(logs), language="text")
+
+    return True
+
+
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
@@ -307,13 +503,19 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def known_shows(include_session: bool = True) -> List[str]:
-    """Return a sorted list of known show identifiers from episodes + S3 (plus session state)."""
+    """Return a sorted list of known show identifiers from episodes + S3 (plus session state).
+
+    All show codes are normalized to UPPERCASE and deduplicated case-insensitively.
+    This ensures 'rhoslc', 'RHOSLC', and 'RhoSlc' all resolve to a single 'RHOSLC' entry.
+    """
+    # Use uppercase keys for deduplication
     shows: set[str] = set()
 
     def _remember(show_value: Any) -> None:
         if not show_value or not isinstance(show_value, str):
             return
-        cleaned = show_value.strip()
+        # Normalize to uppercase for consistent display and deduplication
+        cleaned = show_value.strip().upper()
         if cleaned:
             shows.add(cleaned)
 
@@ -346,16 +548,26 @@ def known_shows(include_session: bool = True) -> List[str]:
         for entry in st.session_state.get(_CUSTOM_SHOWS_SESSION_KEY, []):
             _remember(entry)
 
-    return sorted(shows, key=lambda value: value.lower())
+    # Return sorted uppercase codes
+    return sorted(shows)
 
 
 def remember_custom_show(show_id: str) -> None:
-    """Persist a show identifier in session state so dropdowns include it immediately."""
-    cleaned = (show_id or "").strip()
+    """Persist a show identifier in session state so dropdowns include it immediately.
+
+    The show_id is normalized to UPPERCASE for consistency.
+    Case-insensitive deduplication ensures 'rhoslc' and 'RHOSLC' don't create duplicates.
+    """
+    if not show_id or not isinstance(show_id, str):
+        return
+    # Normalize to uppercase
+    cleaned = show_id.strip().upper()
     if not cleaned:
         return
     custom: List[str] = st.session_state.setdefault(_CUSTOM_SHOWS_SESSION_KEY, [])
-    if cleaned not in custom:
+    # Check case-insensitively to avoid duplicates
+    existing_upper = {s.upper() for s in custom}
+    if cleaned not in existing_upper:
         custom.append(cleaned)
 
 
@@ -509,6 +721,19 @@ def set_ep_id(ep_id: str, rerun: bool = True) -> None:
 
 
 def get_ep_id() -> str:
+    return st.session_state.get("ep_id", "")
+
+
+def get_ep_id_from_query_params() -> str:
+    """Get ep_id from query params, falling back to session state.
+
+    Returns:
+        The ep_id from query params if present, otherwise from session state,
+        or empty string if neither is set.
+    """
+    query_ep_id = st.query_params.get("ep_id", "")
+    if query_ep_id:
+        return query_ep_id
     return st.session_state.get("ep_id", "")
 
 
@@ -2118,6 +2343,9 @@ def run_celery_job_with_progress(
         _append_log("Error: No job_id returned from Celery endpoint")
         return None, "No job_id returned"
 
+    # Store job_id in session state for running job detection
+    store_celery_job_id(ep_id, operation, job_id)
+
     if start_result.get("state") == "already_running":
         _append_log(f"Job {job_id} is already running for this episode")
         status_placeholder.info(f"⏳ {operation} job is already running...")
@@ -2156,6 +2384,8 @@ def run_celery_job_with_progress(
             result_status = result.get("status", "success")
             _append_log(f"Job completed: {result_status}")
             detail_placeholder.caption(f"Completed in {elapsed:.1f}s")
+            # Clear job_id from session state - job is done
+            clear_celery_job_id(ep_id, operation)
 
             # Check if the subprocess actually succeeded
             if result_status == "error":
@@ -2183,12 +2413,16 @@ def run_celery_job_with_progress(
             error = status_data.get("error", "Unknown error")
             status_placeholder.error(f"❌ {operation} failed: {error}")
             _append_log(f"Job failed: {error}")
+            # Clear job_id from session state - job is done
+            clear_celery_job_id(ep_id, operation)
             return None, error
 
         elif state == "cancelled":
             progress_bar.progress(1.0)
             status_placeholder.warning(f"⚠️ {operation} was cancelled")
             _append_log("Job was cancelled")
+            # Clear job_id from session state - job is done
+            clear_celery_job_id(ep_id, operation)
             return None, "Job cancelled"
 
         elif state == "in_progress":
@@ -2231,7 +2465,8 @@ def run_celery_job_with_progress(
                     _append_log(error_msg)
                     return None, error_msg
 
-    # Timeout
+    # Timeout - clear job_id from session state
+    clear_celery_job_id(ep_id, operation)
     _append_log(f"Job timed out after {max_poll_time}s")
     return None, f"Job timed out after {max_poll_time}s"
 
@@ -2275,6 +2510,36 @@ def check_celery_job_status(job_id: str) -> Dict[str, Any] | None:
         return None
 
 
+def _celery_job_session_key(ep_id: str, job_type: str) -> str:
+    """Get session state key for tracking a Celery job."""
+    return f"{ep_id}::celery_job::{job_type}"
+
+
+def store_celery_job_id(ep_id: str, job_type: str, job_id: str) -> None:
+    """Store a Celery job_id in session state for tracking."""
+    import streamlit as st
+
+    key = _celery_job_session_key(ep_id, job_type)
+    st.session_state[key] = job_id
+
+
+def clear_celery_job_id(ep_id: str, job_type: str) -> None:
+    """Clear a stored Celery job_id from session state."""
+    import streamlit as st
+
+    key = _celery_job_session_key(ep_id, job_type)
+    if key in st.session_state:
+        del st.session_state[key]
+
+
+def get_stored_celery_job_id(ep_id: str, job_type: str) -> str | None:
+    """Get a stored Celery job_id from session state."""
+    import streamlit as st
+
+    key = _celery_job_session_key(ep_id, job_type)
+    return st.session_state.get(key)
+
+
 def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | None:
     """Check if there's a running job of a specific type for an episode.
 
@@ -2285,9 +2550,17 @@ def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | N
     Returns:
         Job info dict with progress if running, None otherwise.
         Dict includes: job_id, state, progress_pct, message, started_at
+
+    Checks multiple sources:
+    1. Legacy /jobs API (subprocess jobs)
+    2. /celery_jobs (active Celery tasks)
+    3. /celery_jobs/local (local subprocess jobs)
+    4. Session state for stored job_id
     """
+    running_states = {"running", "in_progress", "queued", "started", "pending"}
+
+    # 1. Check legacy /jobs API
     try:
-        # Check jobs API for running jobs
         resp = requests.get(
             f"{_api_base()}/jobs",
             params={"ep_id": ep_id, "job_type": job_type, "limit": 1},
@@ -2298,13 +2571,14 @@ def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | N
 
         for job in jobs:
             state = str(job.get("state", "")).lower()
-            if state in ("running", "in_progress", "queued"):
+            if state in running_states:
                 job_id = job.get("job_id")
                 result = {
                     "job_id": job_id,
                     "state": state,
                     "started_at": job.get("started_at"),
                     "job_type": job_type,
+                    "source": "legacy_jobs",
                 }
 
                 # Try to get progress from Celery if it's a Celery job
@@ -2328,10 +2602,94 @@ def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | N
                         result["frames_total"] = frames_total
 
                 return result
-
-        return None
     except requests.RequestException:
-        return None
+        pass  # Continue checking other sources
+
+    # 2. Check /celery_jobs/local for local subprocess jobs
+    try:
+        resp = requests.get(
+            f"{_api_base()}/celery_jobs/local",
+            params={"ep_id": ep_id},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        local_jobs = resp.json().get("jobs", [])
+
+        for job in local_jobs:
+            op = job.get("operation", "")
+            if op == job_type:
+                state = str(job.get("state", "")).lower()
+                if state in running_states:
+                    result = {
+                        "job_id": job.get("job_id"),
+                        "state": state,
+                        "started_at": job.get("started_at"),
+                        "job_type": job_type,
+                        "source": "celery_local",
+                        "pid": job.get("pid"),
+                    }
+
+                    # Get progress from progress.json
+                    progress_data = get_episode_progress(ep_id)
+                    if progress_data:
+                        frames_done = progress_data.get("frames_done", 0)
+                        frames_total = progress_data.get("frames_total", 1)
+                        if frames_total > 0:
+                            result["progress_pct"] = (frames_done / frames_total) * 100
+                        result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                        result["frames_done"] = frames_done
+                        result["frames_total"] = frames_total
+
+                    return result
+    except requests.RequestException:
+        pass  # Continue checking other sources
+
+    # 3. Check /celery_jobs for active Celery tasks
+    try:
+        resp = requests.get(f"{_api_base()}/celery_jobs", timeout=10)
+        resp.raise_for_status()
+        celery_jobs = resp.json().get("jobs", [])
+
+        for job in celery_jobs:
+            job_ep_id = job.get("ep_id")
+            op = job.get("operation") or job.get("name", "").replace("local_", "")
+            state = str(job.get("state", "")).lower()
+
+            # Match by ep_id and operation
+            if job_ep_id == ep_id and op == job_type and state in running_states:
+                result = {
+                    "job_id": job.get("job_id"),
+                    "state": state,
+                    "started_at": job.get("started_at"),
+                    "job_type": job_type,
+                    "source": "celery_active",
+                }
+                return result
+    except requests.RequestException:
+        pass  # Continue checking other sources
+
+    # 4. Check session state for stored job_id
+    stored_job_id = get_stored_celery_job_id(ep_id, job_type)
+    if stored_job_id:
+        celery_status = check_celery_job_status(stored_job_id)
+        if celery_status:
+            state = str(celery_status.get("state", "")).lower()
+            if state in running_states:
+                progress = celery_status.get("progress", {})
+                result = {
+                    "job_id": stored_job_id,
+                    "state": state,
+                    "job_type": job_type,
+                    "source": "session_state",
+                    "progress_pct": progress.get("progress", 0) * 100,
+                    "message": progress.get("message", ""),
+                }
+                return result
+            else:
+                # Job is no longer running, clear from session state
+                clear_celery_job_id(ep_id, job_type)
+
+    return None
 
 
 def get_episode_progress(ep_id: str) -> Dict[str, Any] | None:
@@ -2409,6 +2767,9 @@ def render_previous_logs(
 ) -> bool:
     """Render the most recent logs for an operation in a Streamlit expander.
 
+    Uses cached logs from session state first (populated by hydrate_logs_for_episode
+    on page load), falling back to API call if not cached.
+
     Args:
         ep_id: Episode identifier
         operation: Operation name (detect_track, faces_embed, cluster)
@@ -2418,7 +2779,12 @@ def render_previous_logs(
     Returns:
         True if logs were found and rendered, False otherwise
     """
-    data = load_operation_logs(ep_id, operation)
+    # Try cached logs first (from hydrate_logs_for_episode on page load)
+    data = get_cached_logs(ep_id, operation)
+
+    # Fall back to API call if not cached
+    if not data or not data.get("logs"):
+        data = load_operation_logs(ep_id, operation)
 
     if data is None:
         if show_if_none:
@@ -2603,6 +2969,9 @@ def run_pipeline_job_with_mode(
                     "elapsed_seconds": elapsed_seconds,
                     **summary,
                 }
+
+                # Cache logs in session state for display on page reload
+                cache_logs(ep_id, operation, log_lines, status, elapsed_seconds)
 
                 if status == "completed":
                     status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed in {elapsed_str}")
