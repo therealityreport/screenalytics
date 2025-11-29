@@ -1585,7 +1585,7 @@ class GroupingService:
         centroids_map = {cid: data["centroid"] for cid, data in centroids_map_full.items()}
 
         # Load people and cast data once
-        people = self.people_service.get_all_people(show_id)
+        people = self.people_service.list_people(show_id)
         people_by_cast_id = {p.get("cast_id"): p for p in people if p.get("cast_id")}
 
         # Load cast data for names
