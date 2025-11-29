@@ -2529,16 +2529,75 @@ def refresh_similarity_async(ep_id: str, body: RefreshSimilarityRequest = Body(d
         raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {str(e)}")
 
 
+@router.get("/episodes/{ep_id}/recover_noise_tracks/preview", tags=["episodes"])
+def recover_noise_tracks_preview(
+    ep_id: str,
+    frame_window: int = Query(8, ge=1, le=30, description="Number of frames to search before/after"),
+    min_similarity: float = Query(0.70, ge=0.5, le=1.0, description="Minimum cosine similarity to merge"),
+) -> dict:
+    """Preview what would change if recovery were run (without making changes).
+
+    Returns counts of single-frame tracks and estimated recoverable tracks.
+    """
+    from apps.api.services.identities import load_faces, _episode_lock
+
+    try:
+        with _episode_lock(ep_id):
+            faces = load_faces(ep_id)
+
+        if not faces:
+            return {
+                "status": "success",
+                "single_frame_tracks": 0,
+                "estimated_recoverable": 0,
+                "frame_window": frame_window,
+                "min_similarity": min_similarity,
+            }
+
+        # Count faces per track
+        from collections import defaultdict
+        faces_by_track: dict = defaultdict(int)
+        for face in faces:
+            track_id = face.get("track_id")
+            if track_id is not None:
+                faces_by_track[track_id] += 1
+
+        single_frame_tracks = sum(1 for count in faces_by_track.values() if count == 1)
+
+        # Estimate recoverable (rough estimate based on typical recovery rates)
+        estimated_recoverable = int(single_frame_tracks * 0.15)  # ~15% typically recoverable
+
+        return {
+            "status": "success",
+            "single_frame_tracks": single_frame_tracks,
+            "multi_frame_tracks": sum(1 for count in faces_by_track.values() if count > 1),
+            "estimated_recoverable": estimated_recoverable,
+            "frame_window": frame_window,
+            "min_similarity": min_similarity,
+        }
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to preview recovery: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/episodes/{ep_id}/recover_noise_tracks", tags=["episodes"])
-def recover_noise_tracks(ep_id: str) -> dict:
+def recover_noise_tracks(
+    ep_id: str,
+    frame_window: int = Query(8, ge=1, le=30, description="Number of frames to search before/after"),
+    min_similarity: float = Query(0.70, ge=0.5, le=1.0, description="Minimum cosine similarity to merge"),
+) -> dict:
     """Recover single-frame tracks by finding similar faces in adjacent frames.
 
     For each track that has only 1 face (single-frame track):
-    1. Searches ±8 frames for similar faces (cosine similarity >= 0.70)
+    1. Searches ±frame_window frames for similar faces (cosine similarity >= min_similarity)
     2. Merges matching faces into the single-frame track
     3. Updates faces.jsonl and tracks.jsonl with new assignments
 
     This helps convert "noise" clusters (single-frame-only) into reviewable clusters.
+
+    Args:
+        frame_window: Number of frames to search before/after (default: 8)
+        min_similarity: Minimum cosine similarity to merge faces (default: 0.70)
 
     Returns:
         tracks_analyzed: Number of single-frame tracks examined
@@ -2549,7 +2608,7 @@ def recover_noise_tracks(ep_id: str) -> dict:
     from apps.api.services.track_recovery import recover_single_frame_tracks
 
     try:
-        result = recover_single_frame_tracks(ep_id)
+        result = recover_single_frame_tracks(ep_id, frame_window=frame_window, min_similarity=min_similarity)
 
         # After recovery, refresh similarity indexes and recompute centroids for affected clusters
         if result.get("tracks_expanded", 0) > 0:
@@ -3672,3 +3731,97 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
         "refresh_required": True,
         "message": f"Exported {len(seeds)} high-quality seeds to facebank. Similarity refresh recommended.",
     }
+
+
+# =============================================================================
+# Enhancement #7: Real-time Collaboration Indicators (Presence Tracking)
+# =============================================================================
+
+# In-memory presence store (for single-instance deployments)
+# For production, use Redis or similar for cross-instance presence
+_PRESENCE_STORE: Dict[str, Dict[str, Any]] = {}
+_PRESENCE_TTL_SECONDS = 60  # Presence expires after 60 seconds of no heartbeat
+
+
+class PresenceHeartbeat(BaseModel):
+    """Request body for presence heartbeat."""
+    user_id: Optional[str] = Field(None, description="User identifier")
+    user_name: Optional[str] = Field("Anonymous", description="Display name")
+
+
+@router.get("/episodes/{ep_id}/presence", tags=["episodes"])
+def get_presence(ep_id: str) -> Dict[str, Any]:
+    """Get current viewers for an episode.
+
+    Returns list of users currently viewing this episode,
+    excluding viewers whose heartbeat has expired.
+    """
+    ep_id = normalize_ep_id(ep_id)
+    now = datetime.now(timezone.utc).timestamp()
+
+    # Clean up expired entries and collect active viewers
+    viewers = []
+    if ep_id in _PRESENCE_STORE:
+        active = {}
+        for user_key, presence in _PRESENCE_STORE[ep_id].items():
+            if now - presence.get("last_seen", 0) < _PRESENCE_TTL_SECONDS:
+                active[user_key] = presence
+                viewers.append({
+                    "user_id": presence.get("user_id"),
+                    "name": presence.get("user_name", "Anonymous"),
+                    "last_seen": presence.get("last_seen"),
+                })
+        _PRESENCE_STORE[ep_id] = active
+
+    return {
+        "ep_id": ep_id,
+        "viewers": viewers,
+        "count": len(viewers),
+    }
+
+
+@router.post("/episodes/{ep_id}/presence", tags=["episodes"])
+def update_presence(ep_id: str, heartbeat: PresenceHeartbeat = Body(default=None)) -> Dict[str, Any]:
+    """Update presence heartbeat for a user viewing an episode.
+
+    Call this endpoint periodically (every 30s) to maintain presence.
+    """
+    ep_id = normalize_ep_id(ep_id)
+    heartbeat = heartbeat or PresenceHeartbeat()
+
+    user_id = heartbeat.user_id or "anonymous"
+    user_name = heartbeat.user_name or "Anonymous"
+    user_key = f"{user_id}_{hash(user_name) % 10000}"
+
+    if ep_id not in _PRESENCE_STORE:
+        _PRESENCE_STORE[ep_id] = {}
+
+    _PRESENCE_STORE[ep_id][user_key] = {
+        "user_id": user_id,
+        "user_name": user_name,
+        "last_seen": datetime.now(timezone.utc).timestamp(),
+    }
+
+    return {
+        "status": "ok",
+        "ep_id": ep_id,
+        "user_id": user_id,
+    }
+
+
+@router.delete("/episodes/{ep_id}/presence", tags=["episodes"])
+def leave_presence(ep_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Remove presence for a user (when leaving the page)."""
+    ep_id = normalize_ep_id(ep_id)
+
+    if ep_id in _PRESENCE_STORE:
+        if user_id:
+            # Remove specific user
+            keys_to_remove = [k for k in _PRESENCE_STORE[ep_id] if k.startswith(user_id)]
+            for k in keys_to_remove:
+                _PRESENCE_STORE[ep_id].pop(k, None)
+        else:
+            # Clean up entire episode presence
+            _PRESENCE_STORE.pop(ep_id, None)
+
+    return {"status": "ok", "ep_id": ep_id}

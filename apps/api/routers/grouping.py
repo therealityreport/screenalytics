@@ -982,4 +982,187 @@ def save_assignments(ep_id: str) -> dict:
         raise HTTPException(status_code=500, detail=f"Failed to save assignments: {str(e)}")
 
 
+# =============================================================================
+# Enhancement #3: Undo/Redo Stack Endpoints
+# =============================================================================
+
+
+@router.get("/episodes/{ep_id}/undo_stack")
+def get_undo_stack(ep_id: str) -> dict:
+    """Get the undo stack for an episode.
+
+    Returns list of operations that can be undone, with id, type, description, timestamp.
+    """
+    try:
+        operations = grouping_service.get_undo_stack(ep_id)
+        return {
+            "ep_id": ep_id,
+            "operations": operations,
+            "count": len(operations),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get undo stack: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/undo")
+def undo_last_operation(ep_id: str) -> dict:
+    """Undo the last operation for an episode.
+
+    Restores the state before the last undoable operation.
+    """
+    try:
+        result = grouping_service.undo_last_operation(ep_id)
+        if result is None:
+            return {
+                "status": "no_operations",
+                "ep_id": ep_id,
+                "message": "No operations to undo",
+            }
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to undo operation: {str(e)}")
+
+
+# =============================================================================
+# Enhancement #6: Confidence-Based Auto-Assignment Queue Endpoints
+# =============================================================================
+
+
+@router.get("/episodes/{ep_id}/tiered_suggestions")
+def get_tiered_suggestions(
+    ep_id: str,
+    high_threshold: float = 0.85,
+    medium_threshold: float = 0.68,
+) -> dict:
+    """Get cast suggestions tiered by confidence level.
+
+    Returns suggestions in three tiers:
+    - high_confidence: Auto-assignable (≥85% similarity)
+    - medium_confidence: Review queue (68-85% similarity)
+    - low_confidence: Manual review required (<68% similarity)
+    """
+    try:
+        return grouping_service.get_tiered_suggestions(
+            ep_id,
+            high_threshold=high_threshold,
+            medium_threshold=medium_threshold,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get tiered suggestions: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/auto_assign_high_confidence")
+def auto_assign_high_confidence(ep_id: str, threshold: float = 0.85) -> dict:
+    """Auto-assign all high-confidence suggestions.
+
+    Automatically assigns clusters to cast members when similarity exceeds threshold.
+
+    Args:
+        threshold: Minimum similarity for auto-assignment (default 0.85)
+    """
+    try:
+        result = grouping_service.auto_assign_high_confidence(ep_id, threshold=threshold)
+        # Queue async similarity refresh
+        _queue_async_similarity_refresh(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to auto-assign: {str(e)}")
+
+
+# =============================================================================
+# Enhancement #10: Smart Merge Suggestions Endpoints
+# =============================================================================
+
+
+class MergeClustersRequest(BaseModel):
+    """Request to merge multiple clusters."""
+    cluster_ids: List[str] = Field(..., description="List of cluster IDs to merge")
+    target_person_id: Optional[str] = Field(None, description="Optional person ID to merge into")
+
+
+class MergeAllRequest(BaseModel):
+    """Request to merge all high-similarity pairs."""
+    similarity_threshold: float = Field(0.90, description="Minimum similarity for auto-merge")
+
+
+@router.get("/episodes/{ep_id}/potential_duplicates")
+def get_potential_duplicates(
+    ep_id: str,
+    similarity_threshold: float = 0.85,
+    max_pairs: int = 20,
+) -> dict:
+    """Find clusters that might be duplicates (same person split across clusters).
+
+    Returns pairs of clusters that exceed the similarity threshold.
+    """
+    try:
+        return grouping_service.find_potential_duplicates(
+            ep_id,
+            similarity_threshold=similarity_threshold,
+            max_pairs=max_pairs,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to find duplicates: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/merge_clusters")
+def merge_clusters(ep_id: str, req: MergeClustersRequest) -> dict:
+    """Merge multiple clusters into a single person.
+
+    Args:
+        cluster_ids: List of cluster IDs to merge
+        target_person_id: Optional person ID to merge into (creates new if not provided)
+    """
+    try:
+        result = grouping_service.merge_clusters(
+            ep_id,
+            cluster_ids=req.cluster_ids,
+            target_person_id=req.target_person_id,
+        )
+        # Queue async similarity refresh
+        _queue_async_similarity_refresh(ep_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to merge clusters: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/merge_all_duplicates")
+def merge_all_duplicates(ep_id: str, req: MergeAllRequest) -> dict:
+    """Automatically merge all high-similarity cluster pairs.
+
+    Uses transitive closure to group connected clusters before merging.
+
+    Args:
+        similarity_threshold: Minimum similarity for auto-merge (default 0.90)
+    """
+    try:
+        result = grouping_service.merge_all_high_similarity_pairs(
+            ep_id,
+            similarity_threshold=req.similarity_threshold,
+        )
+        # Queue async similarity refresh
+        _queue_async_similarity_refresh(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to merge duplicates: {str(e)}")
+
+
 __all__ = ["router"]

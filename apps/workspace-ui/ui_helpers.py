@@ -1906,7 +1906,8 @@ def default_cleanup_payload(ep_id: str) -> Dict[str, Any]:
         "cluster_thresh": DEFAULT_CLUSTER_SIMILARITY,
         "min_cluster_size": 2,
         "thumb_size": 256,
-        "actions": ["split_tracks", "reembed", "recluster", "group_clusters"],
+        # Focus cleanup on unassigned identities/clusters; avoid full recluster by default.
+        "actions": ["split_tracks", "reembed", "group_clusters"],
         "write_back": True,
     }
 

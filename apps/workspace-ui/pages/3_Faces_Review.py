@@ -1098,6 +1098,10 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
     with action_cols[1]:
         # Enhancement #4: Selective Cleanup Actions + Enhancement #3: Preview
         with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
+            st.info(
+                "Cleanup focuses on **Needs Cast Assignment** items only: unassigned clusters, tracks, frames, and crops. "
+                "It fixes noisy tracks, refreshes embeddings, and regroups unassigned clusters into draft people without touching named cast links."
+            )
             # Show last cleanup timestamp if available
             last_cleanup = st.session_state.get(f"last_cleanup:{ep_id}")
             if last_cleanup:
@@ -1135,35 +1139,30 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 for warning in warnings:
                     st.info(warning)
 
-                st.markdown("---")
+            st.markdown("---")
 
             # Quick Cleanup Presets
             st.markdown("**Quick Presets:**")
-            preset_cols = st.columns(3)
+            preset_cols = st.columns(2)
             with preset_cols[0]:
                 if st.button("🚀 Quick Fix", key="preset_quick", help="Low risk: Just fix tracking issues"):
                     st.session_state["cleanup_preset"] = "quick"
                     st.rerun()
             with preset_cols[1]:
-                if st.button("⚡ Standard", key="preset_standard", help="Medium risk: Fix + reembed + group"):
+                if st.button("⚡ Standard", key="preset_standard", help="Recommended: Fix + reembed + regroup unassigned"):
                     st.session_state["cleanup_preset"] = "standard"
-                    st.rerun()
-            with preset_cols[2]:
-                if st.button("🔄 Full Reset", key="preset_full", help="High risk: Complete recluster"):
-                    st.session_state["cleanup_preset"] = "full"
                     st.rerun()
 
             # Apply preset if set
             active_preset = st.session_state.get("cleanup_preset", "standard")
             preset_defaults = {
-                "quick": {"split_tracks": True, "reembed": False, "recluster": False, "group_clusters": False},
-                "standard": {"split_tracks": True, "reembed": True, "recluster": False, "group_clusters": True},
-                "full": {"split_tracks": True, "reembed": True, "recluster": True, "group_clusters": True},
+                "quick": {"split_tracks": True, "reembed": False, "group_clusters": False},
+                "standard": {"split_tracks": True, "reembed": True, "group_clusters": True},
             }
             current_defaults = preset_defaults.get(active_preset, preset_defaults["standard"])
 
             st.markdown("---")
-            st.markdown("**Select cleanup actions:**")
+            st.markdown("**Select cleanup actions (unassigned-only):**")
 
             # Define actions with risk levels (defaults come from preset)
             cleanup_actions = {
@@ -1176,21 +1175,14 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 },
                 "reembed": {
                     "label": "Regenerate embeddings (reembed)",
-                    "help": "Use when: Face quality has changed or embeddings seem outdated. Recalculates face embeddings. Low risk - just regenerates vectors.",
+                    "help": "Use when: Face quality has changed or embeddings seem outdated. Recalculates face embeddings for unassigned clusters. Low risk - just regenerates vectors.",
                     "default": current_defaults.get("reembed", True),
                     "risk": "low",
                     "est_time": "~1-2min",
                 },
-                "recluster": {
-                    "label": "Re-cluster faces (recluster)",
-                    "help": "Use when: Starting fresh after major changes. ⚠️ HIGH RISK: Regenerates identities.json, may undo manual splits and assignments.",
-                    "default": current_defaults.get("recluster", False),
-                    "risk": "high",
-                    "est_time": "~2-3min",
-                },
                 "group_clusters": {
                     "label": "Auto-group clusters (group_clusters)",
-                    "help": "Use when: You have unassigned clusters that need to be matched to people. Groups similar clusters into people. Medium risk - respects seed matching.",
+                    "help": "Use when: You have unassigned clusters that need to be matched to people. Groups similar unassigned clusters into draft people (remains Needs Cast Assignment until named).",
                     "default": current_defaults.get("group_clusters", True),
                     "risk": "medium",
                     "est_time": "~1min",
@@ -1219,13 +1211,26 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
 
             # Show total estimated time
             if selected_actions:
-                time_map = {"split_tracks": 30, "reembed": 90, "recluster": 150, "group_clusters": 60}
+                time_map = {"split_tracks": 30, "reembed": 90, "group_clusters": 60}
                 total_seconds = sum(time_map.get(a, 0) for a in selected_actions)
                 if total_seconds >= 60:
                     est_str = f"~{total_seconds // 60}min {total_seconds % 60}s" if total_seconds % 60 else f"~{total_seconds // 60}min"
                 else:
                     est_str = f"~{total_seconds}s"
                 st.caption(f"⏱️ Estimated total time: {est_str}")
+
+            # Protection for recently-edited identities
+            recently_edited = st.session_state.get(f"recently_edited_identities:{ep_id}", {})
+            num_recent = len(recently_edited)
+            protect_recent = st.checkbox(
+                f"🛡️ Protect recently-edited ({num_recent})",
+                value=True if num_recent > 0 else False,
+                key="protect_recent_edits",
+                help="Skip identities you've manually edited during cleanup to preserve your work",
+                disabled=num_recent == 0,
+            )
+            if num_recent > 0 and protect_recent:
+                st.caption(f"  ↳ {num_recent} identitie(s) will be protected")
 
             # Enhancement #7: Show backup/restore info
             backups_resp = _safe_api_get(f"/episodes/{ep_id}/backups")
@@ -1300,6 +1305,9 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                     else:
                         payload = helpers.default_cleanup_payload(ep_id)
                         payload["actions"] = selected_actions
+                        # Add protected identity IDs if enabled
+                        if protect_recent and recently_edited:
+                            payload["protected_identity_ids"] = list(recently_edited.keys())
                         with st.spinner(f"Running cleanup ({', '.join(selected_actions)})…"):
                             summary, error_message = helpers.run_job_with_progress(
                                 ep_id,
@@ -1404,14 +1412,95 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 if success:
                     helpers.try_switch_page("pages/3_Smart_Suggestions.py")
 
-        # Recovery button row
-        recovery_row = st.columns([1, 2])
+        # Recovery button row with settings
+        recovery_row = st.columns([1, 1, 1])
         with recovery_row[0]:
-            recover_clicked = st.button(
-                "🔧 Recover Noise Tracks",
-                key="recover_noise_tracks",
-                help="Find adjacent frames for single-frame tracks and expand them (±8 frames, similarity ≥70%)",
-            )
+            with st.popover("🔧 Recover Noise Tracks", help="Expand single-frame tracks by finding similar faces"):
+                st.markdown("**Recovery Settings:**")
+
+                # Show last recovery timestamp if available
+                last_recovery = st.session_state.get(f"last_recovery:{ep_id}")
+                if last_recovery:
+                    try:
+                        dt = datetime.datetime.fromisoformat(last_recovery)
+                        st.caption(f"🕐 Last run: {dt.strftime('%b %d, %H:%M')}")
+                    except (ValueError, TypeError):
+                        pass
+
+                # Configurable settings
+                frame_window = st.slider(
+                    "Frame Window (±)",
+                    min_value=1,
+                    max_value=30,
+                    value=st.session_state.get("recovery_frame_window", 8),
+                    key="recovery_frame_window_slider",
+                    help="Number of frames to search before/after each single-frame track",
+                )
+                st.session_state["recovery_frame_window"] = frame_window
+
+                min_similarity = st.slider(
+                    "Min Similarity (%)",
+                    min_value=50,
+                    max_value=100,
+                    value=st.session_state.get("recovery_min_similarity", 70),
+                    key="recovery_min_similarity_slider",
+                    help="Minimum face similarity to merge (higher = stricter matching)",
+                )
+                st.session_state["recovery_min_similarity"] = min_similarity
+
+                st.caption(f"Settings: ±{frame_window} frames, ≥{min_similarity}% similarity")
+
+                # Preview button
+                st.markdown("---")
+                if st.button("👁️ Preview", key="recovery_preview_btn", help="See what would be recovered"):
+                    preview_resp = _safe_api_get(
+                        f"/episodes/{ep_id}/recover_noise_tracks/preview"
+                        f"?frame_window={frame_window}&min_similarity={min_similarity / 100:.2f}"
+                    )
+                    if preview_resp:
+                        st.info("**Preview:**")
+                        st.write(f"• Single-frame tracks: {preview_resp.get('single_frame_tracks', 0)}")
+                        st.write(f"• Multi-frame tracks: {preview_resp.get('multi_frame_tracks', 0)}")
+                        st.write(f"• Est. recoverable: ~{preview_resp.get('estimated_recoverable', 0)}")
+
+                # Run button
+                recover_clicked = st.button(
+                    "▶️ Run Recovery",
+                    key="recover_noise_tracks",
+                    type="primary",
+                    help="Find and merge similar faces from adjacent frames",
+                )
+
+                # Undo last recovery
+                last_recovery_backup = st.session_state.get(f"last_recovery_backup:{ep_id}")
+                if last_recovery_backup:
+                    st.markdown("---")
+                    if st.button("↩️ Undo Last Recovery", key="undo_recovery_btn", help="Restore to state before last recovery"):
+                        restore_resp = _api_post(f"/episodes/{ep_id}/restore/{last_recovery_backup}", {})
+                        if restore_resp and restore_resp.get("files_restored", 0) > 0:
+                            _invalidate_assignment_caches()
+                            st.session_state.pop(f"last_recovery_backup:{ep_id}", None)
+                            st.success("✓ Restored from recovery backup!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to restore from recovery backup.")
+
+                # Show recovery history
+                history = st.session_state.get(f"recovery_history:{ep_id}", [])
+                if history:
+                    with st.expander(f"📜 Recovery History ({len(history)})", expanded=False):
+                        for entry in history[:5]:
+                            try:
+                                dt = datetime.datetime.fromisoformat(entry["timestamp"])
+                                time_str = dt.strftime("%b %d, %H:%M")
+                            except (ValueError, TypeError, KeyError):
+                                time_str = "Unknown"
+                            fw = entry.get("frame_window", 8)
+                            ms = int(entry.get("min_similarity", 0.7) * 100)
+                            expanded = entry.get("tracks_expanded", 0)
+                            merged = entry.get("faces_merged", 0)
+                            st.caption(f"**{time_str}**: ±{fw} frames, ≥{ms}%")
+                            st.caption(f"  ↳ {expanded} tracks expanded, {merged} faces merged")
         with recovery_row[1]:
             # Show last recovery timestamp if available
             last_recovery = st.session_state.get(f"last_recovery:{ep_id}")
@@ -1428,13 +1517,29 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
 
     # Handle recovery button click
     if recover_clicked:
-        with recovery_progress_area.container():
-            with st.status("Recovering noise tracks...", expanded=True) as status:
-                # Step 1: Call the recovery API
-                st.write("🔍 Analyzing single-frame tracks...")
-                progress_bar = st.progress(10, text="Loading face data...")
+        # Get configured settings
+        frame_window = st.session_state.get("recovery_frame_window", 8)
+        min_similarity = st.session_state.get("recovery_min_similarity", 70) / 100.0
 
-                resp = _api_post(f"/episodes/{ep_id}/recover_noise_tracks", {})
+        with recovery_progress_area.container():
+            with st.status(f"Recovering noise tracks (±{frame_window} frames, ≥{int(min_similarity*100)}% sim)...", expanded=True) as status:
+                # Step 0: Create backup before recovery (for undo capability)
+                st.write("💾 Creating backup...")
+                progress_bar = st.progress(5, text="Creating backup...")
+                backup_resp = _api_post(f"/episodes/{ep_id}/backup", {})
+                recovery_backup_id = backup_resp.get("backup_id") if backup_resp else None
+                if recovery_backup_id:
+                    st.session_state[f"last_recovery_backup:{ep_id}"] = recovery_backup_id
+                    st.write(f"✓ Backup created: {recovery_backup_id[-15:]}")
+
+                # Step 1: Call the recovery API with configured parameters
+                st.write("🔍 Analyzing single-frame tracks...")
+                progress_bar.progress(10, text="Loading face data...")
+
+                resp = _api_post(
+                    f"/episodes/{ep_id}/recover_noise_tracks?frame_window={frame_window}&min_similarity={min_similarity:.2f}",
+                    {}
+                )
                 progress_bar.progress(60, text="Recovery analysis complete...")
 
                 if not resp:
@@ -1478,21 +1583,45 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                         if len(details) > 10:
                             st.write(f"  ... and {len(details) - 10} more tracks recovered")
 
+                        # Show which clusters gained faces (group by from_track to find affected clusters)
+                        affected_source_tracks = set()
+                        for detail in details:
+                            for af in detail.get("added_frames", []):
+                                src = af.get("from_track")
+                                if src is not None:
+                                    affected_source_tracks.add(src)
+                        if affected_source_tracks:
+                            st.write(f"📦 Faces moved from **{len(affected_source_tracks)}** other track(s)")
+
                         progress_bar.progress(100, text="Complete!")
                         status.update(
                             label=f"✅ Recovered {tracks_expanded} track(s) with {faces_merged} face(s)",
                             state="complete",
                         )
 
-                        # Track last recovery timestamp
-                        st.session_state[f"last_recovery:{ep_id}"] = datetime.datetime.now().isoformat()
+                        # Track last recovery timestamp and add to history
+                        now_iso = datetime.datetime.now().isoformat()
+                        st.session_state[f"last_recovery:{ep_id}"] = now_iso
+
+                        # Add to recovery history (keep last 10)
+                        history_key = f"recovery_history:{ep_id}"
+                        history = st.session_state.get(history_key, [])
+                        history.insert(0, {
+                            "timestamp": now_iso,
+                            "frame_window": frame_window,
+                            "min_similarity": min_similarity,
+                            "tracks_expanded": tracks_expanded,
+                            "faces_merged": faces_merged,
+                            "backup_id": recovery_backup_id,
+                        })
+                        st.session_state[history_key] = history[:10]
 
                         # Clear caches and refresh UI with new data
                         _invalidate_assignment_caches()
                         st.rerun()
                     else:
                         progress_bar.progress(100, text="No recoverable tracks found")
-                        st.write("ℹ️ No similar faces found in adjacent frames (±8 frames, ≥70% similarity)")
+                        st.write(f"ℹ️ No similar faces found in adjacent frames (±{frame_window} frames, ≥{int(min_similarity*100)}% similarity)")
                         status.update(
                             label="✅ Analysis complete - no recoverable tracks",
                             state="complete",
@@ -5091,10 +5220,23 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
             _delete_frames_api(ep_id, track_id, selected_frames)
 
 
+def _track_identity_edit(ep_id: str, identity_id: str) -> None:
+    """Track that an identity was recently edited (for protection during cleanup)."""
+    key = f"recently_edited_identities:{ep_id}"
+    edited = st.session_state.get(key, {})
+    edited[identity_id] = datetime.datetime.now().isoformat()
+    # Keep only last 100 edits
+    if len(edited) > 100:
+        sorted_items = sorted(edited.items(), key=lambda x: x[1], reverse=True)
+        edited = dict(sorted_items[:100])
+    st.session_state[key] = edited
+
+
 def _rename_identity(ep_id: str, identity_id: str, label: str) -> None:
     endpoint = f"/identities/{ep_id}/rename"
     payload = {"identity_id": identity_id, "new_label": label}
     if _api_post(endpoint, payload):
+        _track_identity_edit(ep_id, identity_id)  # Track edit for cleanup protection
         _invalidate_assignment_caches()  # Clear caches so UI reflects changes
         st.success("Identity renamed.")
         st.rerun()
@@ -5111,6 +5253,7 @@ def _delete_identity(ep_id: str, identity_id: str) -> None:
 def _api_merge(ep_id: str, source_id: str, target_id: str) -> None:
     endpoint = f"/identities/{ep_id}/merge"
     if _api_post(endpoint, {"source_id": source_id, "target_id": target_id}):
+        _track_identity_edit(ep_id, target_id)  # Track edit for cleanup protection
         _invalidate_assignment_caches()  # Clear caches so UI reflects changes
         st.success("Identities merged.")
         st.rerun()
@@ -5121,6 +5264,8 @@ def _move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> No
     payload = {"track_id": track_id, "target_identity_id": target_identity_id}
     resp = _api_post(endpoint, payload)
     if resp:
+        if target_identity_id:
+            _track_identity_edit(ep_id, target_identity_id)  # Track edit for cleanup protection
         _invalidate_assignment_caches()  # Clear caches so UI reflects changes
         st.success("Track assigned.")
         st.rerun()

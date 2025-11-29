@@ -2354,8 +2354,8 @@ with col_cluster:
         if facebank_assigned:
             parts.append(f"{facebank_assigned} facebank matches")
         if not parts:
-            return "Auto-group complete"
-        return "Auto-grouped " + ", ".join(parts)
+            return "Auto-group complete (draft people stay in Needs Cast Assignment)"
+        return "Auto-grouped " + ", ".join(parts) + " (draft people stay in Needs Cast Assignment)"
 
     if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
         can_run_cluster = True

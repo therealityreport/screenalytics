@@ -1090,33 +1090,32 @@ class GroupingService:
 
         progress_entries: List[Dict[str, Any]] = []
 
-        try:
-            def _progress(step: str, pct: float, msg: str, meta: Optional[Dict[str, Any]] = None):
-                entry: Dict[str, Any] = {
-                    "step": step,
-                    "progress": pct,
-                    "message": msg,
-                }
-                if meta:
-                    entry.update(meta)
-                progress_entries.append(entry)
-                if progress_callback:
-                    progress_callback(step, pct, msg)
-                LOGGER.info(f"[{ep_id}] {step}: {msg} ({int(pct*100)}%)")
-                self._write_progress(
-                    ep_id,
-                    progress_entries,
-                    started_at=log["started_at"],
-                    finished=False,
-                )
-
-            log = {
-                "ep_id": ep_id,
-                "started_at": _now_iso(),
-                "steps": [],
+        def _progress(step: str, pct: float, msg: str, meta: Optional[Dict[str, Any]] = None):
+            entry: Dict[str, Any] = {
+                "step": step,
+                "progress": pct,
+                "message": msg,
             }
-            # Initialize progress file so UI polling can show immediate state
-            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=False)
+            if meta:
+                entry.update(meta)
+            progress_entries.append(entry)
+            if progress_callback:
+                progress_callback(step, pct, msg)
+            LOGGER.info(f"[{ep_id}] {step}: {msg} ({int(pct*100)}%)")
+            self._write_progress(
+                ep_id,
+                progress_entries,
+                started_at=log["started_at"],
+                finished=False,
+            )
+
+        log = {
+            "ep_id": ep_id,
+            "started_at": _now_iso(),
+            "steps": [],
+        }
+        # Initialize progress file so UI polling can show immediate state
+        self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=False)
 
         # Step 0: Clear stale person_id assignments from previous runs
         _progress("clear_assignments", 0.0, "Clearing stale person assignments...")
@@ -1158,6 +1157,7 @@ class GroupingService:
             self._save_group_log(ep_id, log)
             _progress("compute_centroids", 0.4, f"ERROR: {str(e)}")
             self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True, error=str(e))
+            self._cleanup_progress_file(ep_id)
             raise
 
         # Normalize centroids into a unified format with validation
@@ -1300,6 +1300,7 @@ class GroupingService:
             self._save_group_log(ep_id, log)
             _progress("group_across_episodes", 0.9, f"ERROR: {str(e)}")
             self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True, error=str(e))
+            self._cleanup_progress_file(ep_id)
             raise
 
         # Step 4: Apply within-episode merges to the assigned people
@@ -1478,23 +1479,21 @@ class GroupingService:
             f"Applied {len(groups)} group(s); merged {merged_clusters} cluster(s); facebank matched {facebank_assigned}",
         )
 
-            log["finished_at"] = _now_iso()
-            self._save_group_log(ep_id, log)
-            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True)
+        log["finished_at"] = _now_iso()
+        self._save_group_log(ep_id, log)
+        self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True)
+        self._cleanup_progress_file(ep_id)
 
-            return {
-                "ep_id": ep_id,
-                "centroids": centroids_result,
-                "facebank_matching": facebank_result,
-                "facebank_assigned": facebank_assigned,
-                "within_episode": within_result,
-                "across_episodes": across_result,
-                "assignments": final_assignments,
-                "log": log,
-            }
-        finally:
-            # Remove progress file so new runs don't inherit stale progress states
-            self._cleanup_progress_file(ep_id)
+        return {
+            "ep_id": ep_id,
+            "centroids": centroids_result,
+            "facebank_matching": facebank_result,
+            "facebank_assigned": facebank_assigned,
+            "within_episode": within_result,
+            "across_episodes": across_result,
+            "assignments": final_assignments,
+            "log": log,
+        }
 
     def _save_group_log(self, ep_id: str, log: Dict[str, Any]) -> None:
         """Save grouping audit log."""
@@ -2350,6 +2349,543 @@ class GroupingService:
 
         LOGGER.info(f"[{ep_id}] Saved {saved_count} cluster assignments to people.json")
         return {"saved_count": saved_count}
+
+    # =========================================================================
+    # Enhancement #3: Undo/Redo Stack for Batch Operations
+    # =========================================================================
+
+    def _undo_stack_path(self, ep_id: str) -> Path:
+        """Get path to undo stack file for an episode."""
+        manifests_dir = get_path(ep_id, "detections").parent
+        return manifests_dir / "undo_stack.json"
+
+    def _load_undo_stack(self, ep_id: str) -> List[Dict[str, Any]]:
+        """Load the undo stack for an episode."""
+        path = self._undo_stack_path(ep_id)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data.get("operations", [])
+        except Exception:
+            return []
+
+    def _save_undo_stack(self, ep_id: str, operations: List[Dict[str, Any]]) -> None:
+        """Save the undo stack for an episode."""
+        path = self._undo_stack_path(ep_id)
+        # Keep only last 20 operations
+        operations = operations[-20:]
+        data = {
+            "ep_id": ep_id,
+            "operations": operations,
+            "updated_at": _now_iso(),
+        }
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def push_undo_operation(
+        self,
+        ep_id: str,
+        operation_type: str,
+        description: str,
+        before_state: Dict[str, Any],
+        after_state: Dict[str, Any],
+    ) -> None:
+        """Push an operation onto the undo stack.
+
+        Args:
+            ep_id: Episode ID
+            operation_type: Type of operation (assign, unassign, merge, etc.)
+            description: Human-readable description
+            before_state: State before the operation (for undo)
+            after_state: State after the operation (for redo)
+        """
+        operations = self._load_undo_stack(ep_id)
+        operations.append({
+            "id": f"op_{len(operations)}_{int(datetime.now(timezone.utc).timestamp())}",
+            "type": operation_type,
+            "description": description,
+            "before": before_state,
+            "after": after_state,
+            "timestamp": _now_iso(),
+        })
+        self._save_undo_stack(ep_id, operations)
+
+    def undo_last_operation(self, ep_id: str) -> Optional[Dict[str, Any]]:
+        """Undo the last operation for an episode.
+
+        Returns:
+            The undone operation info, or None if no operations to undo
+        """
+        operations = self._load_undo_stack(ep_id)
+        if not operations:
+            return None
+
+        operation = operations.pop()
+        before_state = operation.get("before", {})
+
+        # Restore identities.json from before state
+        if "identities" in before_state:
+            identities_path = self._identities_path(ep_id)
+            identities_path.write_text(
+                json.dumps(before_state["identities"], indent=2),
+                encoding="utf-8"
+            )
+
+        # Restore manual_assignments from before state
+        if "manual_assignments" in before_state:
+            self._save_manual_assignments(ep_id, before_state["manual_assignments"])
+
+        self._save_undo_stack(ep_id, operations)
+
+        LOGGER.info(f"[{ep_id}] Undid operation: {operation.get('description')}")
+        return {
+            "undone": True,
+            "operation": operation,
+            "remaining_operations": len(operations),
+        }
+
+    def get_undo_stack(self, ep_id: str) -> List[Dict[str, Any]]:
+        """Get the undo stack for an episode (without full state data).
+
+        Returns list of operations with id, type, description, timestamp.
+        """
+        operations = self._load_undo_stack(ep_id)
+        # Return summary without full state data
+        return [
+            {
+                "id": op.get("id"),
+                "type": op.get("type"),
+                "description": op.get("description"),
+                "timestamp": op.get("timestamp"),
+            }
+            for op in operations
+        ]
+
+    # =========================================================================
+    # Enhancement #6: Confidence-Based Auto-Assignment Queue
+    # =========================================================================
+
+    def get_tiered_suggestions(
+        self,
+        ep_id: str,
+        high_threshold: float = 0.85,
+        medium_threshold: float = 0.68,
+    ) -> Dict[str, Any]:
+        """Get suggestions tiered by confidence level.
+
+        Returns:
+            - high_confidence: Auto-assignable (≥85% similarity)
+            - medium_confidence: Review queue (68-85% similarity)
+            - low_confidence: Manual review required (<68% similarity)
+        """
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+
+        # Get all cast suggestions
+        try:
+            all_suggestions = self.suggest_cast_for_unassigned_clusters(ep_id)
+            suggestions_by_cluster = all_suggestions.get("suggestions", {})
+        except Exception as e:
+            LOGGER.warning(f"[{ep_id}] Failed to get suggestions: {e}")
+            suggestions_by_cluster = {}
+
+        high_confidence = []
+        medium_confidence = []
+        low_confidence = []
+
+        for cluster_id, cluster_suggestions in suggestions_by_cluster.items():
+            if not cluster_suggestions:
+                low_confidence.append({
+                    "cluster_id": cluster_id,
+                    "suggestions": [],
+                    "tier": "low",
+                })
+                continue
+
+            # Get the best suggestion
+            best = cluster_suggestions[0]
+            similarity = best.get("similarity", 0)
+
+            tier_entry = {
+                "cluster_id": cluster_id,
+                "best_suggestion": best,
+                "all_suggestions": cluster_suggestions[:3],  # Top 3
+                "similarity": similarity,
+            }
+
+            if similarity >= high_threshold:
+                tier_entry["tier"] = "high"
+                high_confidence.append(tier_entry)
+            elif similarity >= medium_threshold:
+                tier_entry["tier"] = "medium"
+                medium_confidence.append(tier_entry)
+            else:
+                tier_entry["tier"] = "low"
+                low_confidence.append(tier_entry)
+
+        return {
+            "ep_id": ep_id,
+            "high_confidence": sorted(high_confidence, key=lambda x: -x["similarity"]),
+            "medium_confidence": sorted(medium_confidence, key=lambda x: -x["similarity"]),
+            "low_confidence": sorted(low_confidence, key=lambda x: -x.get("similarity", 0)),
+            "counts": {
+                "high": len(high_confidence),
+                "medium": len(medium_confidence),
+                "low": len(low_confidence),
+                "total": len(high_confidence) + len(medium_confidence) + len(low_confidence),
+            },
+            "thresholds": {
+                "high": high_threshold,
+                "medium": medium_threshold,
+            },
+        }
+
+    def auto_assign_high_confidence(
+        self,
+        ep_id: str,
+        threshold: float = 0.85,
+    ) -> Dict[str, Any]:
+        """Auto-assign all high-confidence suggestions.
+
+        Args:
+            ep_id: Episode ID
+            threshold: Minimum similarity for auto-assignment (default 0.85)
+
+        Returns:
+            Summary of auto-assignments made
+        """
+        tiered = self.get_tiered_suggestions(ep_id, high_threshold=threshold)
+        high_confidence = tiered.get("high_confidence", [])
+
+        if not high_confidence:
+            return {
+                "auto_assigned": 0,
+                "assignments": [],
+                "message": "No high-confidence suggestions found",
+            }
+
+        assignments = []
+        for entry in high_confidence:
+            cluster_id = entry["cluster_id"]
+            best = entry["best_suggestion"]
+            cast_id = best.get("cast_id")
+            cast_name = best.get("cast_name")
+
+            if not cast_id:
+                continue
+
+            try:
+                result = self.assign_cluster_to_cast(
+                    ep_id,
+                    cluster_id,
+                    cast_id=cast_id,
+                    cast_name=cast_name,
+                )
+                assignments.append({
+                    "cluster_id": cluster_id,
+                    "cast_id": cast_id,
+                    "cast_name": cast_name,
+                    "similarity": entry["similarity"],
+                    "person_id": result.get("person_id"),
+                })
+            except Exception as e:
+                LOGGER.warning(f"Failed to auto-assign {cluster_id}: {e}")
+
+        LOGGER.info(f"[{ep_id}] Auto-assigned {len(assignments)} high-confidence cluster(s)")
+        return {
+            "auto_assigned": len(assignments),
+            "assignments": assignments,
+            "threshold": threshold,
+        }
+
+    # =========================================================================
+    # Enhancement #10: Smart Merge Suggestions (Potential Duplicates)
+    # =========================================================================
+
+    def find_potential_duplicates(
+        self,
+        ep_id: str,
+        similarity_threshold: float = 0.85,
+        max_pairs: int = 20,
+    ) -> Dict[str, Any]:
+        """Find clusters that might be duplicates (same person split across clusters).
+
+        Computes pairwise similarity between all clusters and returns pairs
+        that exceed the threshold.
+
+        Args:
+            ep_id: Episode ID
+            similarity_threshold: Minimum similarity to consider duplicates (default 0.85)
+            max_pairs: Maximum number of pairs to return (default 20)
+
+        Returns:
+            List of potential duplicate pairs with similarity scores
+        """
+        # Load centroids
+        try:
+            centroids_data = self.load_cluster_centroids(ep_id)
+            centroids_map = _normalize_centroids_to_map(
+                centroids_data.get("centroids", {}),
+                validate=True
+            )
+        except FileNotFoundError:
+            return {
+                "ep_id": ep_id,
+                "pairs": [],
+                "message": "No centroids found",
+            }
+
+        if len(centroids_map) < 2:
+            return {
+                "ep_id": ep_id,
+                "pairs": [],
+                "message": "Not enough clusters to compare",
+            }
+
+        # Load identities to get person assignments
+        identities_path = self._identities_path(ep_id)
+        cluster_to_person: Dict[str, str] = {}
+        if identities_path.exists():
+            identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+            for identity in identities_data.get("identities", []):
+                cid = identity.get("identity_id")
+                pid = identity.get("person_id")
+                if cid:
+                    cluster_to_person[cid] = pid
+
+        # Compute pairwise similarities
+        cluster_ids = list(centroids_map.keys())
+        pairs = []
+
+        for i in range(len(cluster_ids)):
+            for j in range(i + 1, len(cluster_ids)):
+                cid_i, cid_j = cluster_ids[i], cluster_ids[j]
+                centroid_i = centroids_map[cid_i]["centroid"]
+                centroid_j = centroids_map[cid_j]["centroid"]
+
+                # Compute cosine similarity
+                similarity = float(np.dot(centroid_i, centroid_j))
+
+                if similarity >= similarity_threshold:
+                    person_i = cluster_to_person.get(cid_i)
+                    person_j = cluster_to_person.get(cid_j)
+
+                    pairs.append({
+                        "cluster_id_1": cid_i,
+                        "cluster_id_2": cid_j,
+                        "similarity": round(similarity, 4),
+                        "person_id_1": person_i,
+                        "person_id_2": person_j,
+                        "same_person": person_i is not None and person_i == person_j,
+                        "cohesion_1": centroids_map[cid_i].get("cohesion"),
+                        "cohesion_2": centroids_map[cid_j].get("cohesion"),
+                    })
+
+        # Sort by similarity descending
+        pairs.sort(key=lambda x: -x["similarity"])
+
+        # Limit to max_pairs
+        pairs = pairs[:max_pairs]
+
+        return {
+            "ep_id": ep_id,
+            "pairs": pairs,
+            "count": len(pairs),
+            "threshold": similarity_threshold,
+            "total_clusters": len(cluster_ids),
+        }
+
+    def merge_clusters(
+        self,
+        ep_id: str,
+        cluster_ids: List[str],
+        target_person_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Merge multiple clusters into a single person.
+
+        Args:
+            ep_id: Episode ID
+            cluster_ids: List of cluster IDs to merge
+            target_person_id: Optional person ID to assign to (creates new if not provided)
+
+        Returns:
+            Result of the merge operation
+        """
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
+
+        if len(cluster_ids) < 2:
+            return {
+                "status": "error",
+                "error": "Need at least 2 clusters to merge",
+            }
+
+        # Load centroids for merged prototype
+        try:
+            centroids_data = self.load_cluster_centroids(ep_id)
+            centroids_map = _normalize_centroids_to_map(
+                centroids_data.get("centroids", {}),
+                validate=True
+            )
+        except FileNotFoundError:
+            return {
+                "status": "error",
+                "error": "No centroids found",
+            }
+
+        # Compute merged centroid
+        merged_centroid = _compute_group_centroid(cluster_ids, centroids_map)
+        if merged_centroid is None:
+            return {
+                "status": "error",
+                "error": "Could not compute merged centroid",
+            }
+
+        # Get or create target person
+        if target_person_id:
+            person = self.people_service.get_person(show_id, target_person_id)
+            if not person:
+                return {
+                    "status": "error",
+                    "error": f"Person {target_person_id} not found",
+                }
+        else:
+            # Create new person with merged centroid
+            person = self.people_service.create_person(
+                show_id,
+                prototype=merged_centroid.tolist(),
+                cluster_ids=[f"{ep_id}:{cid}" for cid in cluster_ids],
+            )
+            target_person_id = person["person_id"]
+
+        # Save before state for undo
+        identities_path = self._identities_path(ep_id)
+        before_identities = None
+        if identities_path.exists():
+            before_identities = json.loads(identities_path.read_text(encoding="utf-8"))
+
+        before_manual = self._load_manual_assignments(ep_id)
+
+        # Update identities to point all clusters to target person
+        if identities_path.exists():
+            identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+            identities = identities_data.get("identities", [])
+
+            for identity in identities:
+                if identity.get("identity_id") in cluster_ids:
+                    identity["person_id"] = target_person_id
+
+            identities_path.write_text(
+                json.dumps(identities_data, indent=2),
+                encoding="utf-8"
+            )
+
+        # Add all clusters to person
+        for cid in cluster_ids:
+            full_cid = f"{ep_id}:{cid}"
+            centroid = centroids_map.get(cid, {}).get("centroid")
+            self.people_service.add_cluster_to_person(
+                show_id,
+                target_person_id,
+                full_cid,
+                update_prototype=True,
+                cluster_centroid=centroid,
+            )
+
+        # Push to undo stack
+        after_identities = json.loads(identities_path.read_text(encoding="utf-8"))
+        self.push_undo_operation(
+            ep_id,
+            "merge",
+            f"Merged {len(cluster_ids)} clusters into person {target_person_id}",
+            {"identities": before_identities, "manual_assignments": before_manual},
+            {"identities": after_identities, "manual_assignments": self._load_manual_assignments(ep_id)},
+        )
+
+        LOGGER.info(f"[{ep_id}] Merged {len(cluster_ids)} clusters into person {target_person_id}")
+        return {
+            "status": "success",
+            "merged_count": len(cluster_ids),
+            "cluster_ids": cluster_ids,
+            "person_id": target_person_id,
+        }
+
+    def merge_all_high_similarity_pairs(
+        self,
+        ep_id: str,
+        similarity_threshold: float = 0.90,
+    ) -> Dict[str, Any]:
+        """Automatically merge all high-similarity cluster pairs.
+
+        Args:
+            ep_id: Episode ID
+            similarity_threshold: Minimum similarity for auto-merge (default 0.90)
+
+        Returns:
+            Summary of merge operations
+        """
+        duplicates = self.find_potential_duplicates(
+            ep_id,
+            similarity_threshold=similarity_threshold,
+            max_pairs=50,
+        )
+
+        pairs = duplicates.get("pairs", [])
+        if not pairs:
+            return {
+                "merged_count": 0,
+                "message": "No high-similarity pairs found",
+            }
+
+        # Build groups of connected clusters
+        # (if A~B and B~C, then A, B, C should all be in one group)
+        cluster_groups: Dict[str, set] = {}  # cluster_id -> set of connected clusters
+
+        for pair in pairs:
+            cid1, cid2 = pair["cluster_id_1"], pair["cluster_id_2"]
+
+            # Get existing groups
+            group1 = cluster_groups.get(cid1, {cid1})
+            group2 = cluster_groups.get(cid2, {cid2})
+
+            # Merge groups
+            merged_group = group1 | group2
+
+            # Update all members to point to merged group
+            for cid in merged_group:
+                cluster_groups[cid] = merged_group
+
+        # Get unique groups
+        unique_groups = []
+        seen = set()
+        for cid, group in cluster_groups.items():
+            group_key = tuple(sorted(group))
+            if group_key not in seen and len(group) >= 2:
+                seen.add(group_key)
+                unique_groups.append(list(group))
+
+        # Merge each group
+        merge_results = []
+        for group in unique_groups:
+            try:
+                result = self.merge_clusters(ep_id, group)
+                merge_results.append(result)
+            except Exception as e:
+                LOGGER.warning(f"Failed to merge group {group}: {e}")
+
+        LOGGER.info(
+            f"[{ep_id}] Auto-merged {len(merge_results)} groups "
+            f"(threshold={similarity_threshold})"
+        )
+        return {
+            "merged_count": len(merge_results),
+            "groups": unique_groups,
+            "results": merge_results,
+            "threshold": similarity_threshold,
+        }
 
 
 __all__ = ["GroupingService", "GROUP_WITHIN_EP_DISTANCE", "PEOPLE_MATCH_DISTANCE"]
