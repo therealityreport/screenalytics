@@ -572,6 +572,11 @@ class DetectTrackCeleryRequest(BaseModel):
     min_box_area: Optional[float] = Field(None, ge=0.0, description="ByteTrack min_box_area override")
     cpu_threads: Optional[int] = Field(None, ge=1, le=16, description="CPU thread cap for detect/track run")
     profile: Optional[str] = Field(None, description="Performance profile")
+    allow_cpu_fallback: bool = Field(
+        False,
+        description="Allow falling back to CPU if requested accelerator (coreml/cuda) is unavailable. "
+                    "If False (default), fails fast with an error when accelerator is unavailable."
+    )
     execution_mode: Optional[EXECUTION_MODE_LITERAL] = Field(
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
@@ -589,6 +594,10 @@ class FacesEmbedCeleryRequest(BaseModel):
     thumb_size: int = Field(256, ge=64, le=512, description="Thumbnail size")
     cpu_threads: Optional[int] = Field(None, ge=1, le=16, description="CPU thread cap")
     profile: Optional[str] = Field(None, description="Performance profile")
+    allow_cpu_fallback: bool = Field(
+        False,
+        description="Allow falling back to CPU if requested accelerator is unavailable."
+    )
     execution_mode: Optional[EXECUTION_MODE_LITERAL] = Field(
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
@@ -604,6 +613,10 @@ class ClusterCeleryRequest(BaseModel):
     min_identity_sim: Optional[float] = Field(0.5, ge=0.0, le=0.99, description="Min identity similarity")
     cpu_threads: Optional[int] = Field(None, ge=1, le=16, description="CPU thread cap")
     profile: Optional[str] = Field(None, description="Performance profile")
+    allow_cpu_fallback: bool = Field(
+        False,
+        description="Allow falling back to CPU if requested accelerator is unavailable."
+    )
     execution_mode: Optional[EXECUTION_MODE_LITERAL] = Field(
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
@@ -748,12 +761,52 @@ async def cancel_celery_job(job_id: str):
     }
 
 
+def _extract_job_metadata(task_info: Dict) -> Dict[str, Any]:
+    """Extract ep_id and operation from Celery task info.
+
+    Celery task info includes args/kwargs that contain our job parameters.
+    This extracts the episode ID and operation type for matching.
+    """
+    result: Dict[str, Any] = {}
+
+    # Try to get ep_id from args (first positional argument)
+    args = task_info.get("args") or []
+    if args and len(args) > 0:
+        result["ep_id"] = args[0]
+
+    # Try to get ep_id from kwargs if not in args
+    kwargs = task_info.get("kwargs") or {}
+    if "ep_id" in kwargs:
+        result["ep_id"] = kwargs["ep_id"]
+    elif "episode_id" in kwargs:
+        result["ep_id"] = kwargs["episode_id"]
+
+    # Infer operation from task name
+    task_name = task_info.get("name", "")
+    if "detect_track" in task_name.lower():
+        result["operation"] = "detect_track"
+    elif "faces_embed" in task_name.lower() or "faces_harvest" in task_name.lower():
+        result["operation"] = "faces_embed"
+    elif "cluster" in task_name.lower():
+        result["operation"] = "cluster"
+    else:
+        # Try to extract from task name pattern like "tasks.run_detect_track_task"
+        parts = task_name.split(".")
+        if parts:
+            last_part = parts[-1].replace("run_", "").replace("_task", "")
+            result["operation"] = last_part
+
+    return result
+
+
 @router.get("")
 async def list_active_celery_jobs():
     """List currently active Celery jobs.
 
     Note: This only shows jobs known to the current worker.
     Completed jobs are available via their individual job_id.
+
+    Each job now includes ep_id and operation for matching after page reload.
     """
     # Get active tasks from Celery
     inspect = celery_app.control.inspect()
@@ -768,32 +821,44 @@ async def list_active_celery_jobs():
     # Collect all active jobs
     for worker, tasks in active.items():
         for task in tasks:
+            metadata = _extract_job_metadata(task)
             jobs.append({
                 "job_id": task.get("id"),
                 "name": task.get("name"),
                 "state": "in_progress",
                 "worker": worker,
+                "ep_id": metadata.get("ep_id"),
+                "operation": metadata.get("operation"),
+                "source": "celery",
             })
 
     # Collect scheduled jobs
     for worker, tasks in scheduled.items():
         for task in tasks:
             request = task.get("request", {})
+            metadata = _extract_job_metadata(request)
             jobs.append({
                 "job_id": request.get("id"),
                 "name": request.get("name"),
                 "state": "scheduled",
                 "worker": worker,
+                "ep_id": metadata.get("ep_id"),
+                "operation": metadata.get("operation"),
+                "source": "celery",
             })
 
     # Collect reserved (queued) jobs
     for worker, tasks in reserved.items():
         for task in tasks:
+            metadata = _extract_job_metadata(task)
             jobs.append({
                 "job_id": task.get("id"),
                 "name": task.get("name"),
                 "state": "queued",
                 "worker": worker,
+                "ep_id": metadata.get("ep_id"),
+                "operation": metadata.get("operation"),
+                "source": "celery",
             })
 
     # Also include local running jobs (registered + detected orphan processes)
@@ -805,6 +870,7 @@ async def list_active_celery_jobs():
             "state": local_job.get("state", "running"),
             "worker": f"local (PID {local_job.get('pid')})",
             "ep_id": local_job.get("ep_id"),
+            "operation": local_job.get("operation"),
             "source": local_job.get("source", "local"),
         })
 
@@ -1432,6 +1498,8 @@ def _build_detect_track_command(
         command += ["--track-buffer", str(options["track_buffer"])]
     if options.get("min_box_area") is not None:
         command += ["--min-box-area", str(options["min_box_area"])]
+    if options.get("allow_cpu_fallback"):
+        command.append("--allow-cpu-fallback")
 
     return command
 
@@ -1468,6 +1536,8 @@ def _build_faces_embed_command(
         command += ["--sample-every-n-frames", str(options["min_frames_between_crops"])]
     if options.get("thumb_size"):
         command += ["--thumb-size", str(options["thumb_size"])]
+    if options.get("allow_cpu_fallback"):
+        command.append("--allow-cpu-fallback")
 
     return command
 
@@ -1499,6 +1569,8 @@ def _build_cluster_command(
         command += ["--min-cluster-size", str(options["min_cluster_size"])]
     if options.get("min_identity_sim") is not None:
         command += ["--min-identity-sim", str(options["min_identity_sim"])]
+    if options.get("allow_cpu_fallback"):
+        command.append("--allow-cpu-fallback")
 
     return command
 
@@ -1864,6 +1936,7 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         "track_buffer": req.track_buffer,
         "min_box_area": req.min_box_area,
         "cpu_threads": req.cpu_threads,
+        "allow_cpu_fallback": req.allow_cpu_fallback,
     }
 
     # Apply profile-based defaults (CPU thread limits, fps, etc.)
@@ -1959,6 +2032,7 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
         "min_frames_between_crops": req.min_frames_between_crops,
         "thumb_size": req.thumb_size,
         "cpu_threads": req.cpu_threads,
+        "allow_cpu_fallback": req.allow_cpu_fallback,
     }
 
     # Apply profile-based CPU thread defaults
@@ -2051,6 +2125,7 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
         "min_cluster_size": req.min_cluster_size,
         "min_identity_sim": req.min_identity_sim,
         "cpu_threads": req.cpu_threads,
+        "allow_cpu_fallback": req.allow_cpu_fallback,
     }
 
     # Apply profile-based CPU thread defaults

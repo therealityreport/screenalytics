@@ -87,10 +87,16 @@ class CastService:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def list_registered_shows(self) -> List[Dict[str, Any]]:
-        """Return all shows that have cast metadata on disk."""
-        shows: List[Dict[str, Any]] = []
+        """Return all shows that have cast metadata on disk.
+
+        Show IDs are normalized to UPPERCASE and deduplicated case-insensitively.
+        This ensures 'rhoslc' and 'RHOSLC' are treated as the same show.
+        """
         if not self.cast_dir.exists():
-            return shows
+            return []
+
+        # Use a dict keyed by uppercase show_id for case-insensitive deduplication
+        shows_by_id: Dict[str, Dict[str, Any]] = {}
 
         for entry in sorted(self.cast_dir.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir():
@@ -102,16 +108,25 @@ class CastService:
                 payload = json.loads(cast_file.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 payload = {"cast": []}
-            shows.append(
-                {
-                    "show_id": payload.get("show_id") or entry.name,
-                    "title": payload.get("show_title"),
-                    "full_name": payload.get("full_name"),
-                    "imdb_series_id": payload.get("imdb_series_id"),
-                    "cast_count": len(payload.get("cast", []) or []),
-                }
-            )
-        return shows
+
+            # Normalize show_id to uppercase
+            raw_show_id = payload.get("show_id") or entry.name
+            show_id = raw_show_id.upper() if isinstance(raw_show_id, str) else str(raw_show_id).upper()
+
+            # Skip if we already have this show (case-insensitive dedup)
+            if show_id in shows_by_id:
+                continue
+
+            shows_by_id[show_id] = {
+                "show_id": show_id,
+                "title": payload.get("show_title"),
+                "full_name": payload.get("full_name"),
+                "imdb_series_id": payload.get("imdb_series_id"),
+                "cast_count": len(payload.get("cast", []) or []),
+            }
+
+        # Return sorted by show_id
+        return sorted(shows_by_id.values(), key=lambda s: s["show_id"])
 
     def register_show(
         self,

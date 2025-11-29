@@ -31,8 +31,17 @@ DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DEFAULT_STRIDE = 6  # Every 6th frame - balances accuracy vs false positives
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
-DEFAULT_DEVICE = "auto"
-DEFAULT_DEVICE_LABEL = "Auto"
+
+# Platform-aware device defaults
+# On macOS Apple Silicon: prefer CoreML for quiet, thermal-safe operation
+# On other platforms: use "auto" which will pick CUDA > CPU
+_IS_MACOS_APPLE_SILICON = (
+    platform.system().lower() == "darwin" and
+    platform.machine().lower().startswith(("arm", "aarch64"))
+)
+DEFAULT_DEVICE = "coreml" if _IS_MACOS_APPLE_SILICON else "auto"
+DEFAULT_DEVICE_LABEL = "CoreML (Apple Silicon)" if _IS_MACOS_APPLE_SILICON else "Auto"
+
 DEFAULT_DET_THRESH = 0.65  # Raised from 0.5 to reduce false positive face detections
 DEFAULT_MAX_GAP = 60
 DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
@@ -150,12 +159,14 @@ PROFILE_DEFAULTS = {
     },
 }
 # Default profile per device type
+# On macOS Apple Silicon: low_power profile for thermal safety
+# On other platforms: balanced for better throughput
 DEVICE_DEFAULT_PROFILE = {
     "coreml": "low_power",  # CoreML: use higher stride to reduce false detections
     "mps": "low_power",
     "cpu": "low_power",
     "cuda": "balanced",  # CUDA can handle more frames
-    "auto": "balanced",
+    "auto": "low_power" if _IS_MACOS_APPLE_SILICON else "balanced",
 }
 
 SUPPORTED_PIPELINE_COMBOS = {
@@ -181,16 +192,67 @@ _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
 # This controls whether jobs run synchronously in-process ("local") or are
 # queued via Redis/Celery ("redis"). The mode is stored per-episode in session
 # state and persisted to localStorage for the browser.
+#
+# IMPORTANT: We prefer Redis when available because:
+# - Background processing doesn't block the UI
+# - Better progress tracking and cancellation
+# - Worker concurrency is properly managed
+#
+# Local mode is a fallback for laptops without Redis, with explicit warnings
+# about thermal impact for long/heavy episodes.
 
 EXECUTION_MODE_SESSION_KEY = "_execution_mode"
 EXECUTION_MODE_OPTIONS = [
     ("Redis/Celery (queued)", "redis"),
-    ("Local Worker (direct)", "local"),
+    ("Local (CPU/CoreML on this machine)", "local"),
 ]
 EXECUTION_MODE_LABELS = [label for label, _ in EXECUTION_MODE_OPTIONS]
 EXECUTION_MODE_VALUE_MAP = {label: value for label, value in EXECUTION_MODE_OPTIONS}
 EXECUTION_MODE_LABEL_MAP = {value: label for label, value in EXECUTION_MODE_OPTIONS}
-EXECUTION_MODE_DEFAULT = "local"  # Default to local for laptop-friendly thermal management
+
+# Cache for Redis availability check
+_REDIS_AVAILABLE_CACHE: Dict[str, Any] = {"checked": False, "available": False, "last_check": 0}
+_REDIS_CHECK_INTERVAL_SEC = 60  # Re-check every 60 seconds
+
+
+def _check_redis_available() -> bool:
+    """Check if Redis/Celery is available and healthy.
+
+    Returns True if we can connect to the Celery workers via the API.
+    Caches result to avoid repeated checks.
+    """
+    import time
+    now = time.time()
+
+    # Use cached result if recent
+    if _REDIS_AVAILABLE_CACHE["checked"] and (now - _REDIS_AVAILABLE_CACHE["last_check"]) < _REDIS_CHECK_INTERVAL_SEC:
+        return _REDIS_AVAILABLE_CACHE["available"]
+
+    try:
+        base = st.session_state.get("api_base")
+        if not base:
+            base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+        resp = requests.get(f"{base}/celery_jobs", timeout=3)
+        resp.raise_for_status()
+        # If we got a response, Redis is available
+        _REDIS_AVAILABLE_CACHE["available"] = True
+    except requests.RequestException:
+        _REDIS_AVAILABLE_CACHE["available"] = False
+
+    _REDIS_AVAILABLE_CACHE["checked"] = True
+    _REDIS_AVAILABLE_CACHE["last_check"] = now
+    return _REDIS_AVAILABLE_CACHE["available"]
+
+
+def _get_execution_mode_default() -> str:
+    """Determine the default execution mode.
+
+    - If Redis is available and healthy: default to 'redis'
+    - Otherwise: default to 'local' with warnings
+    """
+    if _check_redis_available():
+        return "redis"
+    return "local"
 
 
 def _execution_mode_key(ep_id: str) -> str:
@@ -201,16 +263,17 @@ def _execution_mode_key(ep_id: str) -> str:
 def get_execution_mode(ep_id: str) -> str:
     """Get the current execution mode for an episode.
 
-    Returns:
-        "local" (default) or "redis"
+    If no mode is explicitly set, returns:
+    - "redis" if Redis is available
+    - "local" otherwise
     """
     if not ep_id:
-        return EXECUTION_MODE_DEFAULT
+        return _get_execution_mode_default()
     key = _execution_mode_key(ep_id)
     mode = st.session_state.get(key)
     if mode in ("redis", "local"):
         return mode
-    return EXECUTION_MODE_DEFAULT
+    return _get_execution_mode_default()
 
 
 def set_execution_mode(ep_id: str, mode: str) -> None:
@@ -223,7 +286,7 @@ def set_execution_mode(ep_id: str, mode: str) -> None:
     if not ep_id:
         return
     if mode not in ("redis", "local"):
-        mode = EXECUTION_MODE_DEFAULT
+        mode = _get_execution_mode_default()
     key = _execution_mode_key(ep_id)
     st.session_state[key] = mode
 
@@ -242,7 +305,18 @@ def execution_mode_index(mode: str) -> int:
         return 0
 
 
-def render_execution_mode_selector(ep_id: str, key_suffix: str = "") -> str:
+def is_redis_available() -> bool:
+    """Check if Redis/Celery backend is available."""
+    return _check_redis_available()
+
+
+def render_execution_mode_selector(
+    ep_id: str,
+    key_suffix: str = "",
+    *,
+    frame_count: int | None = None,
+    duration_seconds: float | None = None,
+) -> str:
     """Render an execution mode dropdown and return the current mode.
 
     This component allows switching between local (direct) and redis (queued)
@@ -251,31 +325,66 @@ def render_execution_mode_selector(ep_id: str, key_suffix: str = "") -> str:
     Args:
         ep_id: Episode identifier
         key_suffix: Optional suffix for the selectbox key to avoid conflicts
+        frame_count: Optional total frame count for heavy episode warnings
+        duration_seconds: Optional video duration for heavy episode warnings
 
     Returns:
         Current execution mode ("redis" or "local")
     """
     if not ep_id:
-        return EXECUTION_MODE_DEFAULT
+        return _get_execution_mode_default()
 
+    redis_available = is_redis_available()
     current_mode = get_execution_mode(ep_id)
     current_index = execution_mode_index(current_mode)
 
     widget_key = f"execution_mode_selector::{ep_id}::{key_suffix}"
+
+    # Customize help text based on Redis availability
+    if redis_available:
+        help_text = "Redis/Celery queues jobs for background workers. Local runs on this machine synchronously."
+    else:
+        help_text = (
+            "⚠️ Redis/Celery not available. "
+            "Local runs on this machine (may be slow/hot for long episodes). "
+            "Start Redis to enable background processing."
+        )
 
     selected_label = st.selectbox(
         "Execution Mode",
         EXECUTION_MODE_LABELS,
         index=current_index,
         key=widget_key,
-        help="Local Worker runs jobs synchronously in-process. Redis/Celery queues jobs for background workers.",
+        help=help_text,
     )
 
-    selected_mode = EXECUTION_MODE_VALUE_MAP.get(selected_label, EXECUTION_MODE_DEFAULT)
+    selected_mode = EXECUTION_MODE_VALUE_MAP.get(selected_label, _get_execution_mode_default())
 
     # Update state if changed
     if selected_mode != current_mode:
         set_execution_mode(ep_id, selected_mode)
+
+    # Show warning for Local mode on heavy episodes
+    if selected_mode == "local":
+        is_heavy = False
+        warning_parts = []
+
+        if frame_count and frame_count > 5000:
+            is_heavy = True
+            warning_parts.append(f"{frame_count:,} frames")
+
+        if duration_seconds and duration_seconds > 600:  # > 10 minutes
+            is_heavy = True
+            mins = int(duration_seconds // 60)
+            warning_parts.append(f"{mins}+ min video")
+
+        if is_heavy:
+            warning_msg = f"⚠️ Local mode on heavy episode ({', '.join(warning_parts)}) may cause thermal throttling."
+            if redis_available:
+                warning_msg += " Consider using Redis/Celery for background processing."
+            else:
+                warning_msg += " Consider using low_power profile or high stride."
+            st.warning(warning_msg)
 
     return selected_mode
 
@@ -1363,6 +1472,15 @@ def default_detect_track_payload(
     device: str | None = None,
     det_thresh: float | None = None,
 ) -> Dict[str, Any]:
+    """Build default payload for detect/track pipeline.
+
+    IMPORTANT: Defaults are optimized for minimal resource usage:
+    - save_frames=False (explicitly enable to save sampled frames)
+    - save_crops=False (explicitly enable to save face crops)
+    - jpeg_quality=72 (lower quality for smaller files when enabled)
+
+    This ensures default runs are fast and don't generate unnecessary I/O.
+    """
     payload: Dict[str, Any] = {
         "ep_id": ep_id,
         "stride": int(stride if stride is not None else DEFAULT_STRIDE),
@@ -1370,9 +1488,9 @@ def default_detect_track_payload(
         "detector": DEFAULT_DETECTOR,
         "tracker": DEFAULT_TRACKER,
         "det_thresh": float(det_thresh if det_thresh is not None else DEFAULT_DET_THRESH),
-        "save_frames": True,
-        "save_crops": True,
-        "jpeg_quality": 85,
+        "save_frames": False,  # CHANGED: off by default for minimal I/O
+        "save_crops": False,   # CHANGED: off by default for minimal I/O
+        "jpeg_quality": 72,    # CHANGED: lower quality (was 85) when enabled
         "scene_detector": SCENE_DETECTOR_DEFAULT,
         "scene_threshold": SCENE_THRESHOLD_DEFAULT,
         "scene_min_len": SCENE_MIN_LEN_DEFAULT,

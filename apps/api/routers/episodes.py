@@ -396,13 +396,42 @@ def _extract_singleton_merge_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
+    """Get cluster phase status, checking both identities.json and track_metrics.json.
+
+    For staleness detection, we need to check BOTH files because:
+    - identities.json: Main cluster output
+    - track_metrics.json: Written during clustering, may exist even when identities.json doesn't
+
+    The cluster is considered to have run if EITHER file exists, and last_run_at
+    is the max mtime of both files.
+    """
+    from py_screenalytics.artifacts import get_path
+
+    identities_path = _identities_path(ep_id)
+    manifests_dir = get_path(ep_id, "detections").parent
+    track_metrics_path = manifests_dir / "track_metrics.json"
+
+    # Helper to get max mtime of multiple paths
+    def _max_mtime_iso(*paths) -> str | None:
+        mtimes = []
+        for path in paths:
+            if path.exists():
+                mtime_iso = _get_file_mtime_iso(path)
+                if mtime_iso:
+                    mtimes.append(mtime_iso)
+        if not mtimes:
+            return None
+        # ISO timestamps sort lexicographically, so max() works
+        return max(mtimes)
+
     marker = _load_run_marker(ep_id, "cluster")
     if marker:
         result = _phase_status_from_marker("cluster", marker)
         # Add manifest existence info even when marker exists
-        identities_path = _identities_path(ep_id)
         result["manifest_exists"] = identities_path.exists()
-        result["last_run_at"] = _get_file_mtime_iso(identities_path)
+        # Use max of identities.json and track_metrics.json mtimes for staleness
+        result["last_run_at"] = _max_mtime_iso(identities_path, track_metrics_path)
+        result["track_metrics_exists"] = track_metrics_path.exists()
         identities_count = result.get("identities") or 0
         result["zero_rows"] = result["manifest_exists"] and identities_count == 0
         # Try to add singleton merge stats from identities.json
@@ -414,11 +443,16 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
             except (OSError, json.JSONDecodeError):
                 pass
         return result
-    identities_path = _identities_path(ep_id)
+
     manifest_exists = identities_path.exists()
+    track_metrics_exists = track_metrics_path.exists()
+    # Cluster has run if either identities.json or track_metrics.json exists
+    has_cluster_output = manifest_exists or track_metrics_exists
+
     faces_total = 0
     identities_count = 0
     singleton_merge_stats: Dict[str, Any] = {}
+
     if manifest_exists:
         try:
             payload = json.loads(identities_path.read_text(encoding="utf-8"))
@@ -431,10 +465,25 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         if isinstance(stats_block, dict):
             faces_total = _safe_int(stats_block.get("faces")) or 0
         singleton_merge_stats = _extract_singleton_merge_stats(payload)
-    # SUCCESS if manifest exists (even with 0 identities), MISSING only if no manifest
-    status_value = "success" if manifest_exists else "missing"
-    source = "output" if manifest_exists else "absent"
-    last_run_at = _get_file_mtime_iso(identities_path)
+
+    # Try to get cluster metrics from track_metrics.json (fallback source)
+    if track_metrics_exists and not manifest_exists:
+        try:
+            metrics_data = json.loads(track_metrics_path.read_text(encoding="utf-8"))
+            if isinstance(metrics_data, dict):
+                cluster_block = metrics_data.get("cluster_metrics") or {}
+                if isinstance(cluster_block, dict):
+                    identities_count = cluster_block.get("identities_count", 0)
+                    faces_total = cluster_block.get("faces_count", 0)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # SUCCESS if any cluster output exists (even with 0 identities), MISSING only if no output
+    status_value = "success" if has_cluster_output else "missing"
+    source = "output" if manifest_exists else ("metrics_fallback" if track_metrics_exists else "absent")
+    # Use max of both files for staleness detection
+    last_run_at = _max_mtime_iso(identities_path, track_metrics_path)
+
     return {
         "phase": "cluster",
         "status": status_value,
@@ -451,7 +500,8 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         "version": None,
         "source": source,
         "manifest_exists": manifest_exists,
-        "zero_rows": manifest_exists and identities_count == 0,
+        "track_metrics_exists": track_metrics_exists,
+        "zero_rows": has_cluster_output and identities_count == 0,
         "last_run_at": last_run_at,
         **singleton_merge_stats,
     }
@@ -1843,17 +1893,23 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
                 faces_payload["status"] = "stale"
 
     # If detect/track or faces is newer than cluster, cluster is stale
-    if cluster_payload.get("manifest_exists"):
+    # Check both manifest_exists and track_metrics_exists for stale detection
+    has_cluster_output = cluster_payload.get("manifest_exists") or cluster_payload.get("track_metrics_exists")
+    if has_cluster_output:
         if detect_track_mtime and cluster_mtime and detect_track_mtime > cluster_mtime:
             cluster_stale = True
-            tracks_only_fallback = True
+            # tracks_only_fallback indicates we're using metrics-only fallback
+            tracks_only_fallback = not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists")
             if cluster_payload.get("status") == "success":
                 cluster_payload["status"] = "stale"
         elif faces_mtime and cluster_mtime and faces_mtime > cluster_mtime:
             cluster_stale = True
-            tracks_only_fallback = True
+            tracks_only_fallback = not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists")
             if cluster_payload.get("status") == "success":
                 cluster_payload["status"] = "stale"
+        # Even if not stale, mark tracks_only_fallback if using metrics fallback
+        if not cluster_stale and not cluster_payload.get("manifest_exists") and cluster_payload.get("track_metrics_exists"):
+            tracks_only_fallback = True
 
     faces_status = PhaseStatus(**faces_payload)
     cluster_status = PhaseStatus(**cluster_payload)

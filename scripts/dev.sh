@@ -25,7 +25,29 @@ fi
 # CPU thread limits are now managed by apps/common/cpu_limits.py
 # Override the default (3 threads = ~300% CPU) by setting SCREANALYTICS_MAX_CPU_THREADS
 # Example: export SCREENALYTICS_MAX_CPU_THREADS=5  # for ~500% CPU usage
-export SCREANALYTICS_MAX_CPU_THREADS="${SCREANALYTICS_MAX_CPU_THREADS:-3}"
+export SCREENALYTICS_MAX_CPU_THREADS="${SCREANALYTICS_MAX_CPU_THREADS:-3}"
+
+# =============================================================================
+# macOS Low-Noise Profile (Apple Silicon)
+# =============================================================================
+# These environment variables optimize MPS (Metal Performance Shaders) for
+# quiet laptop operation. They're only effective on macOS but harmless elsewhere.
+#
+# See: apps/common/macos_profile.py for full documentation
+# =============================================================================
+
+# Mark this as a dev environment for auto-profile activation
+export SCREENALYTICS_ENV="${SCREENALYTICS_ENV:-dev}"
+
+# MPS memory management - prevent unified memory pressure
+export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.6}"
+export PYTORCH_MPS_BLOCK_SIZE="${PYTORCH_MPS_BLOCK_SIZE:-262144}"
+export PYTORCH_MPS_ALLOCATOR_MAX_SHARE="${PYTORCH_MPS_ALLOCATOR_MAX_SHARE:-0.8}"
+export PYTORCH_MPS_LOGS="${PYTORCH_MPS_LOGS:-0}"
+
+# CoreML/ONNX Runtime settings
+export ORT_USE_COREML="${ORT_USE_COREML:-1}"
 
 if [[ "$STORAGE_BACKEND" == "s3" && -z "$AWS_S3_BUCKET" ]]; then
   echo "AWS_S3_BUCKET must be set when STORAGE_BACKEND=s3" >&2

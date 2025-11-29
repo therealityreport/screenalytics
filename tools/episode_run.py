@@ -402,23 +402,34 @@ def _filter_providers(requested: list[str], available: list[str], allow_cpu_fall
     return filtered
 
 
+class AcceleratorUnavailableError(RuntimeError):
+    """Raised when a requested accelerator (CoreML/CUDA) is not available and CPU fallback is disabled."""
+    pass
+
+
 def _onnx_providers_for(
     device: str | None,
-    allow_cpu_fallback: bool = True,
+    allow_cpu_fallback: bool = False,
     cpu_threads: int | None = None,
 ) -> tuple[list[str], str]:
     """
     Select ONNX Runtime execution providers based on device preference.
 
+    IMPORTANT: This function now FAILS FAST by default when an accelerator is
+    explicitly requested but unavailable. To allow silent fallback to CPU, you
+    must explicitly pass allow_cpu_fallback=True.
+
     Order of preference for device="auto":
     - CUDA (NVIDIA GPUs on Linux/Windows)
     - CoreML (Apple Silicon M1/M2/M3 on macOS)
-    - CPU (fallback, if allowed)
+    - CPU (fallback, only if allowed)
 
     Args:
         device: Device preference ("auto", "cuda", "coreml", "cpu", etc.)
-        allow_cpu_fallback: If False and device="coreml", skip CPU fallback to
-                           prevent CPU saturation. Defaults to True for backward compat.
+        allow_cpu_fallback: If False (default) and the requested accelerator is
+                           unavailable, raises AcceleratorUnavailableError instead
+                           of silently falling back to CPU. This prevents thermal
+                           issues on laptops.
         cpu_threads: If provided, limit CPU provider threads (intra/inter-op).
                     Ignored if CPU provider is not used.
 
@@ -426,9 +437,14 @@ def _onnx_providers_for(
         (providers, resolved_device) tuple where providers is a list of
         ONNX execution providers in priority order, and resolved_device
         is a string label for logging ("cuda", "coreml", or "cpu").
+
+    Raises:
+        AcceleratorUnavailableError: If accelerator is requested but unavailable
+                                      and allow_cpu_fallback=False.
     """
     normalized = (device or "auto").lower()
     auto_requested = normalized == "auto"
+    explicit_cpu = normalized == "cpu"
     providers: list[str] = ["CPUExecutionProvider"]
     resolved = "cpu"
 
@@ -447,42 +463,68 @@ def _onnx_providers_for(
             LOGGER.info(msg)
             print(msg)
 
+    # Explicit CPU request - always allowed
+    if explicit_cpu:
+        _log_providers(providers, resolved)
+        return providers, resolved
+
     # Explicit CUDA request (NVIDIA GPUs)
     if normalized in {"cuda", "0", "gpu"}:
         requested = ["CUDAExecutionProvider"]
-        providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
-        if "CUDAExecutionProvider" in providers:
+        if "CUDAExecutionProvider" in available:
+            providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "cuda"
             _log_providers(providers, resolved)
             return providers, resolved
+
+        # CUDA unavailable - fail fast or warn
+        if not allow_cpu_fallback:
+            error_msg = (
+                "CUDA requested (device=cuda) but CUDAExecutionProvider is not available. "
+                "Either install CUDA-enabled onnxruntime, select a different device (coreml/cpu), "
+                "or set --allow-cpu-fallback to enable CPU fallback."
+            )
+            LOGGER.error(error_msg)
+            raise AcceleratorUnavailableError(error_msg)
+
+        # Fallback allowed - warn and continue
         LOGGER.warning(
-            "CUDA requested for RetinaFace/ArcFace but CUDAExecutionProvider unavailable; falling back to CPU"
+            "[FALLBACK] CUDA requested but CUDAExecutionProvider unavailable. "
+            "Falling back to CPU (this will be slower and may cause thermal issues)."
         )
+        print("[WARN] CUDA unavailable; running on CPU (fallback enabled). This will be slower and hotter.")
         _log_providers(providers, resolved)
         return providers, resolved
 
     # Explicit MPS/CoreML request (Apple Silicon)
     if normalized in {"mps", "metal", "apple", "coreml"}:
         requested = ["CoreMLExecutionProvider"]
-        providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
-        if "CoreMLExecutionProvider" in providers:
+        if "CoreMLExecutionProvider" in available:
+            providers = _filter_providers(requested, available, allow_cpu_fallback=allow_cpu_fallback)
             resolved = "coreml"
             if not allow_cpu_fallback:
                 LOGGER.info(
-                    "CoreML-only mode enabled: CPU fallback disabled to enforce <300%% CPU budget. "
-                    "Inference will fail if CoreML unavailable."
+                    "CoreML-only mode enabled: CPU fallback disabled to enforce <300%% CPU budget."
                 )
             _log_providers(providers, resolved)
             return providers, resolved
-        if allow_cpu_fallback:
-            LOGGER.warning(
-                "CoreML requested for RetinaFace/ArcFace but CoreMLExecutionProvider unavailable; falling back to CPU"
+
+        # CoreML unavailable - fail fast or warn
+        if not allow_cpu_fallback:
+            error_msg = (
+                f"CoreML requested (device={normalized}) but CoreMLExecutionProvider is not available. "
+                "Either install onnxruntime-coreml, select a different device (cpu), "
+                "or set --allow-cpu-fallback to enable CPU fallback."
             )
-        else:
-            LOGGER.error(
-                "CoreML requested with no CPU fallback, but CoreMLExecutionProvider unavailable. "
-                "Install onnxruntime-coreml or set allow_cpu_fallback=True."
-            )
+            LOGGER.error(error_msg)
+            raise AcceleratorUnavailableError(error_msg)
+
+        # Fallback allowed - warn and continue
+        LOGGER.warning(
+            "[FALLBACK] CoreML requested but CoreMLExecutionProvider unavailable. "
+            "Falling back to CPU (this will be slower and may cause thermal issues)."
+        )
+        print("[WARN] CoreML unavailable; running on CPU (fallback enabled). This will be slower and hotter.")
         _log_providers(providers, resolved)
         return providers, resolved
 
@@ -503,11 +545,25 @@ def _onnx_providers_for(
             _log_providers(providers, resolved)
             return providers, resolved
 
-    if auto_requested and resolved == "cpu":
+        # No accelerator available for device=auto
+        if APPLE_SILICON_HOST and not allow_cpu_fallback:
+            # On Apple Silicon, we should have CoreML - fail if not available
+            error_msg = (
+                "device=auto on Apple Silicon but CoreMLExecutionProvider is not available. "
+                "This likely means onnxruntime-coreml is not installed. "
+                "Install it or set --allow-cpu-fallback to enable CPU fallback."
+            )
+            LOGGER.error(error_msg)
+            raise AcceleratorUnavailableError(error_msg)
+
+        # Fallback to CPU (with warning)
         LOGGER.warning(
-            "device=auto falling back to CPU; accelerator providers unavailable (providers=%s)",
+            "device=auto falling back to CPU; no accelerator providers available (providers=%s)",
             available or ["CPUExecutionProvider"],
         )
+        if not explicit_cpu:
+            print("[WARN] No accelerator available; running on CPU. Consider installing onnxruntime-coreml.")
+
     # Fallback to CPU for unknown device values or when no accelerators available
     _log_providers(providers, resolved)
     return providers, resolved
@@ -518,8 +574,21 @@ def _init_retinaface(
     device: str,
     score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
     coreml_input_size: tuple[int, int] | None = None,
-    allow_cpu_fallback: bool = True,
+    allow_cpu_fallback: bool = False,
 ) -> tuple[Any, str]:
+    """Initialize RetinaFace detector with the specified device.
+
+    Args:
+        model_name: InsightFace model name
+        device: Device preference (auto/cuda/coreml/cpu)
+        score_thresh: Detection score threshold
+        coreml_input_size: Optional CoreML input size
+        allow_cpu_fallback: If False (default), fails fast when accelerator unavailable
+
+    Raises:
+        AcceleratorUnavailableError: If accelerator requested but unavailable and
+                                      allow_cpu_fallback=False
+    """
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover - runtime guard
@@ -555,7 +624,18 @@ def _init_retinaface(
     return model, resolved
 
 
-def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = True):
+def _init_arcface(model_name: str, device: str, allow_cpu_fallback: bool = False):
+    """Initialize ArcFace embedder with the specified device.
+
+    Args:
+        model_name: InsightFace model name
+        device: Device preference (auto/cuda/coreml/cpu)
+        allow_cpu_fallback: If False (default), fails fast when accelerator unavailable
+
+    Raises:
+        AcceleratorUnavailableError: If accelerator requested but unavailable and
+                                      allow_cpu_fallback=False
+    """
     try:
         from insightface.model_zoo import get_model  # type: ignore
     except ImportError as exc:  # pragma: no cover
@@ -1216,6 +1296,7 @@ class RetinaFaceDetectorBackend:
         score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
         *,
         coreml_input_size: tuple[int, int] | None = None,
+        allow_cpu_fallback: bool = False,
     ) -> None:
         self.device = device
         self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
@@ -1223,6 +1304,7 @@ class RetinaFaceDetectorBackend:
         self._model = None
         self._resolved_device: Optional[str] = None
         self._coreml_input_size = coreml_input_size
+        self.allow_cpu_fallback = allow_cpu_fallback
 
     def _lazy_model(self):
         if self._model is not None:
@@ -1233,6 +1315,7 @@ class RetinaFaceDetectorBackend:
                 self.device,
                 self.score_thresh,
                 coreml_input_size=self._coreml_input_size,
+                allow_cpu_fallback=self.allow_cpu_fallback,
             )
         except Exception as exc:
             raise RuntimeError(f"{RETINAFACE_HELP} ({exc})") from exc
@@ -1296,8 +1379,14 @@ def _build_face_detector(
     device: str,
     score_thresh: float = RETINAFACE_SCORE_THRESHOLD,
     coreml_input_size: tuple[int, int] | None = None,
+    allow_cpu_fallback: bool = False,
 ):
-    return RetinaFaceDetectorBackend(device, score_thresh=score_thresh, coreml_input_size=coreml_input_size)
+    return RetinaFaceDetectorBackend(
+        device,
+        score_thresh=score_thresh,
+        coreml_input_size=coreml_input_size,
+        allow_cpu_fallback=allow_cpu_fallback,
+    )
 
 
 def _build_tracker_adapter(
@@ -2739,7 +2828,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help=(
             "Force CoreML-only execution without CPU fallback. Prevents CPU provider saturation "
             "but will fail if CoreML is unavailable. Useful for enforcing <300%% CPU budget on Apple Silicon. "
-            "Default: enabled. Use --no-coreml-only to allow CPU fallback."
+            "Default: enabled. Use --no-coreml-only or --allow-cpu-fallback to allow CPU fallback."
         ),
     )
     parser.add_argument(
@@ -2747,6 +2836,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         dest="coreml_only",
         action="store_false",
         help="Allow CPU fallback for CoreML execution (may exceed CPU budget).",
+    )
+    parser.add_argument(
+        "--allow-cpu-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow falling back to CPU if requested accelerator (coreml/cuda) is unavailable. "
+            "If not set, fails fast with an error when the accelerator is unavailable. "
+            "This prevents silent CPU execution that causes thermal issues on laptops."
+        ),
     )
     parser.add_argument(
         "--detector",
@@ -3306,11 +3405,17 @@ def _run_full_pipeline(
     args.tracker = tracker_choice
     det_thresh = _normalize_det_thresh(getattr(args, "det_thresh", RETINAFACE_SCORE_THRESHOLD))
     args.det_thresh = det_thresh
+
+    # Determine CPU fallback policy from CLI flags
+    # --allow-cpu-fallback OR --no-coreml-only enables CPU fallback
+    allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
+
     detector_backend = _build_face_detector(
         detector_choice,
         device,
         det_thresh,
         coreml_input_size=getattr(args, "coreml_det_size", None),
+        allow_cpu_fallback=allow_cpu_fallback,
     )
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
@@ -3347,8 +3452,6 @@ def _run_full_pipeline(
         appearance_gate = AppearanceGate(gate_config)
         gate_embed_stride = gate_config.emb_every or frame_stride
         try:
-            # Respect --coreml-only flag for gate embedder as well
-            allow_cpu_fallback = not getattr(args, "coreml_only", False)
             gate_embedder = ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
             gate_embedder.ensure_ready()
         except Exception as exc:
@@ -4496,8 +4599,9 @@ def _run_faces_embed_stage(
     thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
-    # Respect --coreml-only flag to prevent CPU fallback and enforce <300% CPU budget
-    allow_cpu_fallback = not getattr(args, "coreml_only", False)
+    # Determine CPU fallback policy from CLI flags
+    # --allow-cpu-fallback OR --no-coreml-only enables CPU fallback
+    allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
     embedder = ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
