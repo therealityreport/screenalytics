@@ -65,6 +65,7 @@ from apps.api.tasks import (
     run_faces_embed_task,
     run_cluster_task,
 )
+from apps.api.services.log_formatter import LogFormatter, format_config_block, format_completion_summary
 
 LOGGER = logging.getLogger(__name__)
 
@@ -338,19 +339,23 @@ def _get_log_storage_path(episode_id: str, operation: str) -> Path:
 def save_operation_logs(
     episode_id: str,
     operation: str,
-    logs: List[str],
+    formatted_logs: List[str],
     status: str,
     elapsed_seconds: float,
+    raw_logs: List[str] | None = None,
     extra: Dict[str, Any] | None = None,
 ) -> bool:
     """Save operation logs to persistent storage.
 
+    Stores both formatted (human-readable) and raw logs for debugging.
+
     Args:
         episode_id: Episode identifier
         operation: Operation name (detect_track, faces_embed, cluster)
-        logs: List of log lines
+        formatted_logs: List of formatted/cleaned log lines
         status: Final status (completed, error, cancelled, timeout)
         elapsed_seconds: Total runtime in seconds
+        raw_logs: Optional list of raw unprocessed log lines (for debugging)
         extra: Additional metadata to store
 
     Returns:
@@ -364,7 +369,8 @@ def save_operation_logs(
             "episode_id": episode_id,
             "operation": operation,
             "status": status,
-            "logs": logs,
+            "logs": formatted_logs,  # Primary formatted logs
+            "raw_logs": raw_logs or formatted_logs,  # Raw logs for debugging
             "elapsed_seconds": elapsed_seconds,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             **(extra or {}),
@@ -373,7 +379,7 @@ def save_operation_logs(
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
-        LOGGER.info(f"[{episode_id}] Saved {len(logs)} log lines for {operation}")
+        LOGGER.info(f"[{episode_id}] Saved {len(formatted_logs)} formatted + {len(raw_logs or [])} raw log lines for {operation}")
         return True
 
     except Exception as e:
@@ -1512,8 +1518,10 @@ def _stream_local_subprocess(
     """Run a pipeline command and yield log lines as newline-delimited JSON.
 
     This generator streams log lines as they are produced by the subprocess,
-    enabling live updates in the UI. Each line is a JSON object:
-    - {"type": "log", "line": "..."} for log lines
+    enabling live updates in the UI. Uses LogFormatter to clean up raw output.
+
+    Each yielded line is a JSON object:
+    - {"type": "log", "line": "...", "raw": "..."} for log lines
     - {"type": "summary", "status": "completed"|"error", ...} at the end
 
     Args:
@@ -1537,29 +1545,30 @@ def _stream_local_subprocess(
         return
 
     project_root = _find_project_root()
-    logs: List[str] = []
 
-    # Build context string for logging
+    # Extract config values
     device = options.get("device", "auto")
     stride = options.get("stride", 6)
-    profile = options.get("profile", "default")
+    profile = options.get("profile", "low_power")
     cpu_threads = options.get("cpu_threads", 2)
 
-    # Yield initial status
-    start_msg = f"[LOCAL MODE] Starting {operation} (device={device}, profile={profile})"
-    logs.append(start_msg)
-    yield json.dumps({"type": "log", "line": start_msg}) + "\n"
+    # Initialize the log formatter
+    formatter = LogFormatter(episode_id, operation)
 
-    config_msg = f"  Stride: {stride}, CPU threads: {cpu_threads}"
-    logs.append(config_msg)
-    yield json.dumps({"type": "log", "line": config_msg}) + "\n"
+    # Track both formatted and raw lines
+    formatted_logs: List[str] = []
+    raw_logs: List[str] = []
 
-    sync_msg = "  This runs synchronously - page refresh will cancel the job."
-    logs.append(sync_msg)
-    yield json.dumps({"type": "log", "line": sync_msg}) + "\n"
+    def _emit_formatted(line: str, raw_line: str | None = None) -> str:
+        """Helper to emit a formatted log line and track it."""
+        formatted_logs.append(line)
+        if raw_line is not None:
+            raw_logs.append(raw_line)
+        return json.dumps({"type": "log", "line": line}) + "\n"
 
-    LOGGER.info(f"[{episode_id}] Starting streaming local {operation}")
-    LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
+    def _emit_raw_only(raw_line: str) -> None:
+        """Track a raw line that was suppressed from formatted output."""
+        raw_logs.append(raw_line)
 
     # Set up environment with CPU thread limits
     env = os.environ.copy()
@@ -1578,16 +1587,43 @@ def _stream_local_subprocess(
         "PYTHONUNBUFFERED": "1",
     })
 
-    thermal_msg = f"Local mode: CPU threads capped at {local_max_threads} for thermal safety"
-    logs.append(thermal_msg)
-    yield json.dumps({"type": "log", "line": thermal_msg}) + "\n"
-
     # Apply cpulimit wrapper for thermal safety
     effective_command, cpulimit_applied = _maybe_wrap_with_cpulimit_local(command)
-    if cpulimit_applied:
-        cpu_msg = f"Local mode: Using cpulimit at {_LOCAL_CPULIMIT_PERCENT}% for thermal safety"
-        logs.append(cpu_msg)
-        yield json.dumps({"type": "log", "line": cpu_msg}) + "\n"
+    cpulimit_percent = _LOCAL_CPULIMIT_PERCENT if cpulimit_applied else None
+
+    # Try to get video metadata for frame count
+    total_frames = None
+    fps = None
+    try:
+        from py_screenalytics.artifacts import get_path
+        video_path = get_path(episode_id, "video")
+        if video_path.exists():
+            import cv2
+            cap = cv2.VideoCapture(str(video_path))
+            if cap.isOpened():
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) or None
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or None
+                cap.release()
+    except Exception:
+        pass  # Video metadata is optional
+
+    # Emit canonical config block
+    config_block = format_config_block(
+        operation=operation,
+        episode_id=episode_id,
+        device=device,
+        profile=profile,
+        cpu_threads=local_max_threads,
+        stride=stride if operation == "detect_track" else None,
+        total_frames=total_frames,
+        fps=fps,
+        cpulimit_percent=cpulimit_percent,
+    )
+    for line in config_block.split("\n"):
+        yield _emit_formatted(line, line)
+
+    LOGGER.info(f"[{episode_id}] Starting streaming local {operation}")
+    LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
 
     start_time = time.time()
     process: subprocess.Popen | None = None
@@ -1610,6 +1646,24 @@ def _stream_local_subprocess(
             except Exception:
                 pass
 
+    def _save_logs_always(status: str, elapsed: float, extra: Dict[str, Any] | None = None) -> None:
+        """Always persist logs, even on crash/cancel. Called from finally block."""
+        # Add formatter finalization message if any
+        final_msg = formatter.finalize()
+        if final_msg:
+            for line in final_msg.split("\n"):
+                formatted_logs.append(line)
+
+        save_operation_logs(
+            episode_id,
+            operation,
+            formatted_logs,
+            status,
+            elapsed,
+            raw_logs=raw_logs,
+            extra=extra,
+        )
+
     try:
         # Start subprocess with line-buffered output for streaming
         process = subprocess.Popen(
@@ -1626,20 +1680,18 @@ def _stream_local_subprocess(
         # Apply CPU affinity fallback if cpulimit wasn't available
         if not cpulimit_applied and _LOCAL_CPULIMIT_PERCENT > 0:
             if _apply_cpu_affinity_fallback_local(process.pid, _LOCAL_CPULIMIT_PERCENT):
-                affinity_msg = "Local mode: Using CPU affinity fallback (cpulimit not available)"
-                logs.append(affinity_msg)
-                yield json.dumps({"type": "log", "line": affinity_msg}) + "\n"
+                affinity_msg = "[INFO] Using CPU affinity fallback (cpulimit not available)"
+                yield _emit_formatted(affinity_msg, affinity_msg)
 
         # Register the job
         _register_local_job(episode_id, operation, process.pid, job_id=None)
-        pid_msg = f"Process started (PID {process.pid})"
-        logs.append(pid_msg)
-        yield json.dumps({"type": "log", "line": pid_msg}) + "\n"
+        pid_msg = f"[INFO] Process started (PID {process.pid})"
+        yield _emit_formatted(pid_msg, pid_msg)
 
-        # Stream stdout lines as they arrive
+        # Stream stdout lines as they arrive, applying formatting
         assert process.stdout is not None
-        for line in iter(process.stdout.readline, ""):
-            if not line:
+        for raw_line in iter(process.stdout.readline, ""):
+            if not raw_line:
                 break
 
             # Check for timeout
@@ -1647,12 +1699,11 @@ def _stream_local_subprocess(
             if elapsed > timeout:
                 _kill_process_tree(process)
                 _unregister_local_job(episode_id, operation)
-                timeout_msg = f"TIMEOUT: Job timed out after {timeout}s"
-                logs.append(timeout_msg)
-                yield json.dumps({"type": "log", "line": timeout_msg}) + "\n"
+                timeout_msg = f"[ERROR] Job timed out after {timeout}s"
+                yield _emit_formatted(timeout_msg, raw_line)
 
-                # Save logs before yielding summary
-                save_operation_logs(episode_id, operation, logs, "timeout", elapsed)
+                # Save logs in finally block
+                _save_logs_always("timeout", elapsed)
 
                 yield json.dumps({
                     "type": "summary",
@@ -1662,10 +1713,18 @@ def _stream_local_subprocess(
                 }) + "\n"
                 return
 
-            stripped = line.rstrip()
-            if stripped:
-                logs.append(stripped)
-                yield json.dumps({"type": "log", "line": stripped}) + "\n"
+            stripped = raw_line.rstrip()
+            if not stripped:
+                continue
+
+            # Apply formatting
+            formatted_line = formatter.format_line(stripped)
+            if formatted_line:
+                # Line was formatted and should be shown
+                yield _emit_formatted(formatted_line, stripped)
+            else:
+                # Line was suppressed - still track raw
+                _emit_raw_only(stripped)
 
         # Wait for process to complete
         process.wait()
@@ -1675,12 +1734,11 @@ def _stream_local_subprocess(
         # Handle result
         if process.returncode != 0:
             error_msg = f"Process exited with code {process.returncode}"
-            logs.append(f"ERROR: {error_msg}")
-            yield json.dumps({"type": "log", "line": f"ERROR: {error_msg}"}) + "\n"
+            yield _emit_formatted(f"[ERROR] {error_msg}", f"ERROR: {error_msg}")
             LOGGER.error(f"[{episode_id}] local {operation} failed: {error_msg}")
 
             # Save logs
-            save_operation_logs(episode_id, operation, logs, "error", elapsed, {"return_code": process.returncode})
+            _save_logs_always("error", elapsed, {"return_code": process.returncode})
 
             yield json.dumps({
                 "type": "summary",
@@ -1691,21 +1749,13 @@ def _stream_local_subprocess(
             }) + "\n"
             return
 
-        # Success
-        if elapsed >= 60:
-            mins = int(elapsed // 60)
-            secs = int(elapsed % 60)
-            elapsed_str = f"{mins}m {secs}s"
-        else:
-            elapsed_str = f"{elapsed:.1f}s"
-
-        success_msg = f"[LOCAL MODE] {operation} completed successfully in {elapsed_str}"
-        logs.append(success_msg)
-        yield json.dumps({"type": "log", "line": success_msg}) + "\n"
-        LOGGER.info(f"[{episode_id}] local {operation} completed successfully in {elapsed_str}")
+        # Success - emit completion summary
+        success_msg = format_completion_summary(operation, "completed", elapsed)
+        yield _emit_formatted(success_msg, success_msg)
+        LOGGER.info(f"[{episode_id}] local {operation} completed successfully")
 
         # Save logs
-        save_operation_logs(episode_id, operation, logs, "completed", elapsed)
+        _save_logs_always("completed", elapsed)
 
         yield json.dumps({
             "type": "summary",
@@ -1720,11 +1770,13 @@ def _stream_local_subprocess(
         if process and process.poll() is None:
             LOGGER.warning(f"[{episode_id}] Client disconnected, killing {operation} process tree (PID {process.pid})")
             _kill_process_tree(process)
-            logs.append(f"CANCELLED: Client disconnected after {elapsed:.1f}s, process killed")
+            cancel_msg = f"[CANCELLED] Client disconnected after {elapsed:.1f}s, process killed"
+            formatted_logs.append(cancel_msg)
+            raw_logs.append(cancel_msg)
         _unregister_local_job(episode_id, operation)
 
-        # Save partial logs as cancelled
-        save_operation_logs(episode_id, operation, logs, "cancelled", elapsed)
+        # ALWAYS save logs, even on cancel
+        _save_logs_always("cancelled", elapsed)
         raise
 
     except Exception as e:
@@ -1734,12 +1786,14 @@ def _stream_local_subprocess(
         _unregister_local_job(episode_id, operation)
 
         error_msg = str(e)
-        logs.append(f"EXCEPTION: {error_msg}")
-        yield json.dumps({"type": "log", "line": f"EXCEPTION: {error_msg}"}) + "\n"
+        exception_line = f"[EXCEPTION] {error_msg}"
+        formatted_logs.append(exception_line)
+        raw_logs.append(exception_line)
+        yield json.dumps({"type": "log", "line": exception_line}) + "\n"
         LOGGER.exception(f"[{episode_id}] local {operation} raised exception: {e}")
 
-        # Save logs
-        save_operation_logs(episode_id, operation, logs, "error", elapsed, {"exception": error_msg})
+        # ALWAYS save logs, even on exception
+        _save_logs_always("error", elapsed, {"exception": error_msg})
 
         yield json.dumps({
             "type": "summary",

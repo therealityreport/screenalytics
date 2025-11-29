@@ -357,6 +357,7 @@ def cache_logs(
     logs: List[str],
     status: str,
     elapsed_seconds: float,
+    raw_logs: List[str] | None = None,
     extra: Dict[str, Any] | None = None,
 ) -> None:
     """Cache logs in session state for an episode/operation.
@@ -364,9 +365,10 @@ def cache_logs(
     Args:
         ep_id: Episode identifier
         operation: Operation name
-        logs: List of log lines
+        logs: List of formatted log lines
         status: Final status (completed, error, cancelled, timeout)
         elapsed_seconds: Total runtime in seconds
+        raw_logs: Optional list of raw unprocessed log lines
         extra: Additional metadata to store
     """
     cache = _get_logs_cache()
@@ -375,6 +377,7 @@ def cache_logs(
         "episode_id": ep_id,
         "operation": operation,
         "logs": logs,
+        "raw_logs": raw_logs or logs,
         "status": status,
         "elapsed_seconds": elapsed_seconds,
         **(extra or {}),
@@ -2770,6 +2773,8 @@ def render_previous_logs(
     Uses cached logs from session state first (populated by hydrate_logs_for_episode
     on page load), falling back to API call if not cached.
 
+    Displays formatted (human-friendly) logs by default with a toggle to show raw logs.
+
     Args:
         ep_id: Episode identifier
         operation: Operation name (detect_track, faces_embed, cluster)
@@ -2793,7 +2798,8 @@ def render_previous_logs(
         return False
 
     status = data.get("status", "unknown")
-    logs = data.get("logs", [])
+    formatted_logs = data.get("logs", [])
+    raw_logs = data.get("raw_logs", formatted_logs)  # Fall back to formatted if no raw
     elapsed_seconds = data.get("elapsed_seconds", 0)
     updated_at = data.get("updated_at", "")
 
@@ -2827,8 +2833,31 @@ def render_previous_logs(
     expander_label = f"{icon} Previous {operation} run ({status}, {elapsed_str}){timestamp_str}"
 
     with st.expander(expander_label, expanded=expanded):
-        if logs:
-            st.code("\n".join(logs), language="text")
+        if not formatted_logs and not raw_logs:
+            st.caption("No log lines recorded.")
+            return True
+
+        # Add toggle between formatted and raw logs if they differ
+        has_raw_logs = raw_logs and raw_logs != formatted_logs
+        toggle_key = f"log_toggle_{ep_id}_{operation}"
+
+        if has_raw_logs:
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                show_raw = st.checkbox(
+                    "Show raw log",
+                    key=toggle_key,
+                    help="Toggle between formatted (clean) and raw (full debug) logs",
+                )
+        else:
+            show_raw = False
+
+        # Display the appropriate logs
+        if show_raw and raw_logs:
+            st.caption(f"Raw log ({len(raw_logs)} lines) - for debugging/copy-paste")
+            st.code("\n".join(raw_logs), language="text")
+        elif formatted_logs:
+            st.code("\n".join(formatted_logs), language="text")
         else:
             st.caption("No log lines recorded.")
 
