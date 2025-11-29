@@ -1,9 +1,30 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createEpisode, eventsUrl, fetchEpisodeStatus, mapEventStream, presignEpisodeAssets, triggerJob } from "./client";
-import type { ApiError, AssetUploadResponse, EpisodeCreateRequest, EpisodeEvent, EpisodePhase, EpisodeStatus } from "./types";
+import type {
+  ApiError,
+  AssetUploadResponse,
+  EpisodeCreateRequest,
+  EpisodeEvent,
+  EpisodePhase,
+  EpisodeStatus,
+  S3EpisodesForShowResponse,
+  S3ShowsResponse,
+} from "./types";
+import {
+  cancelJob,
+  createEpisode,
+  eventsUrl,
+  fetchEpisodeStatus,
+  fetchJobProgress,
+  listEpisodesForShow,
+  listShows,
+  mapEventStream,
+  presignEpisodeAssets,
+  triggerJob,
+} from "./client";
+import type { JobProgressResponse } from "./client";
 
 export function useEpisodeStatus(
   episodeId?: string,
@@ -39,6 +60,44 @@ export function useTriggerPhase() {
   });
 }
 
+export function useCancelJob() {
+  const client = useQueryClient();
+  return useMutation<{ job_id: string }, ApiError, { jobId: string; episodeId?: string }>({
+    mutationFn: ({ jobId }) => cancelJob(jobId),
+    onSuccess: (_data, variables) => {
+      if (variables.episodeId) {
+        client.invalidateQueries({ queryKey: ["episode-status", variables.episodeId] });
+      }
+    },
+  });
+}
+
+export function useJobProgress(jobId?: string, options?: { enabled?: boolean; refetchInterval?: number }) {
+  return useQuery<JobProgressResponse, ApiError>({
+    queryKey: ["job-progress", jobId],
+    queryFn: () => fetchJobProgress(jobId as string),
+    enabled: Boolean(jobId) && (options?.enabled ?? true),
+    refetchInterval: options?.refetchInterval ?? 2000,
+  });
+}
+
+export function useShows() {
+  return useQuery<S3ShowsResponse, ApiError>({
+    queryKey: ["shows"],
+    queryFn: () => listShows(),
+  });
+}
+
+export function useShowEpisodes(show?: string) {
+  return useQuery<S3EpisodesForShowResponse, ApiError>({
+    queryKey: ["show-episodes", show],
+    queryFn: () => listEpisodesForShow(show as string),
+    enabled: Boolean(show),
+  });
+}
+
+export type EventConnectionState = "idle" | "connecting" | "connected" | "error";
+
 export function useEpisodeEvents(
   episodeId?: string,
   handlers?: {
@@ -46,46 +105,77 @@ export function useEpisodeEvents(
     onError?: (err: Event) => void;
   },
 ) {
-  // Use ref to avoid re-creating EventSource when handlers change
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
+  const queryClient = useQueryClient();
+  const [events, setEvents] = useState<EpisodeEvent[]>([]);
+  const [lastEvent, setLastEvent] = useState<EpisodeEvent | null>(null);
+  const [state, setState] = useState<EventConnectionState>("idle");
+  const [manifestMtimes, setManifestMtimes] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!episodeId) return undefined;
 
     if (process.env.NEXT_PUBLIC_MSW === "1") {
+      setState("connected");
       const timer = setInterval(() => {
-        handlersRef.current?.onEvent?.({
+        const mockEvent: EpisodeEvent = {
           episode_id: episodeId,
           phase: "detect-track",
           event: "progress",
           message: "mock event",
           progress: Math.random(),
-        });
+        };
+        handlersRef.current?.onEvent?.(mockEvent);
+        setLastEvent(mockEvent);
+        setEvents((prev) => [mockEvent, ...prev].slice(0, 50));
       }, 3000);
       return () => clearInterval(timer);
     }
 
     const url = eventsUrl(episodeId);
     const source = new EventSource(url);
+    setState("connecting");
 
     const onMessage = (evt: MessageEvent<string>) => {
       const parsed = mapEventStream(evt);
-      if (parsed && handlersRef.current?.onEvent) {
-        handlersRef.current.onEvent(parsed);
+      if (!parsed) return;
+      handlersRef.current?.onEvent?.(parsed);
+      setLastEvent(parsed);
+      setEvents((prev) => [parsed, ...prev].slice(0, 50));
+      if (parsed.manifest_mtime && parsed.phase) {
+        const manifestKey = parsed.manifest_type || parsed.phase;
+        setManifestMtimes((prev) => ({
+          ...prev,
+          [manifestKey]: parsed.manifest_mtime as string,
+        }));
+        queryClient.invalidateQueries({
+          predicate: (query) => {
+            const key = query.queryKey;
+            return Array.isArray(key) && key[0] === "episode-status" && key[1] === episodeId;
+          },
+        });
+        queryClient.invalidateQueries({ queryKey: ["episode-manifest", episodeId, manifestKey] });
       }
     };
     const onError = (evt: Event) => {
+      setState("error");
       handlersRef.current?.onError?.(evt);
     };
+    const onOpen = () => setState("connected");
 
     source.addEventListener("message", onMessage as EventListener);
     source.addEventListener("error", onError);
+    source.addEventListener("open", onOpen);
 
     return () => {
       source.removeEventListener("message", onMessage as EventListener);
       source.removeEventListener("error", onError);
+      source.removeEventListener("open", onOpen);
       source.close();
+      setState("idle");
     };
-  }, [episodeId]);
+  }, [episodeId, queryClient]);
+
+  return { events, lastEvent, state, manifestMtimes };
 }

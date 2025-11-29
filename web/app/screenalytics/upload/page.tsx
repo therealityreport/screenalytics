@@ -2,7 +2,17 @@
 
 import { useEffect, useMemo, useReducer, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { useCreateEpisode, useEpisodeStatus, usePresignAssets, useTriggerPhase } from "@/api/hooks";
+import {
+  useCancelJob,
+  useCreateEpisode,
+  useEpisodeEvents,
+  useEpisodeStatus,
+  useJobProgress,
+  usePresignAssets,
+  useShowEpisodes,
+  useShows,
+  useTriggerPhase,
+} from "@/api/hooks";
 import { normalizeError } from "@/api/client";
 import { uploadFileWithProgress } from "@/api/upload";
 import { createInitialState, uploadReducer } from "@/lib/state/uploadMachine";
@@ -35,12 +45,20 @@ export default function UploadPage() {
   const createEpisodeMutation = useCreateEpisode();
   const presignMutation = usePresignAssets();
   const triggerPhase = useTriggerPhase();
+  const cancelJob = useCancelJob();
 
   const episodeId = useMemo(() => state.episodeId || lockedEpisodeId, [state.episodeId, lockedEpisodeId]);
+
+  const showsQuery = useShows();
+  const showEpisodesQuery = useShowEpisodes(showName || undefined);
 
   const statusQuery = useEpisodeStatus(episodeId, {
     enabled: Boolean(episodeId) && (state.step === "processing" || state.step === "success"),
     refetchInterval: state.step === "processing" ? 1200 : false,
+  });
+  const jobProgressQuery = useJobProgress(state.jobId, {
+    enabled: Boolean(state.jobId) && state.step === "processing",
+    refetchInterval: 1500,
   });
 
   useEffect(() => {
@@ -59,6 +77,23 @@ export default function UploadPage() {
       toast.notify({ title: "Detect + track ready", description: `Episode ${statusQuery.data.ep_id}` });
     }
   }, [statusQuery.data, state.step, toast]);
+
+  useEpisodeEvents(episodeId, {
+    onEvent: (evt) => {
+      if (evt.phase === "detect_track" && evt.message?.toLowerCase() === "success") {
+        dispatch({
+          type: "SET_STEP",
+          step: "success",
+          flags: evt.flags,
+          message: "Detect + Track complete",
+          jobId: state.jobId,
+        });
+      }
+      if (evt.flags) {
+        dispatch({ type: "SET_STEP", step: state.step, flags: evt.flags });
+      }
+    },
+  });
 
   const handleFileChange = (next?: File | null) => {
     setFile(next || undefined);
@@ -100,6 +135,23 @@ export default function UploadPage() {
     dispatch({ type: "SET_STEP", step: "processing", jobId: (job as { job_id?: string }).job_id, message: "Detect/track running" });
   };
 
+  const handleCancel = async () => {
+    if (!state.jobId) return;
+    try {
+      await cancelJob.mutateAsync({ jobId: state.jobId, episodeId });
+      dispatch({ type: "CANCEL" });
+      toast.notify({ title: "Job canceled", description: `Detect/track canceled for ${episodeId}` });
+    } catch (err) {
+      const error = normalizeError(err);
+      toast.notify({ title: "Cancel failed", description: error.message, variant: "error" });
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!episodeId) return;
+    await triggerDetectTrack(episodeId);
+  };
+
   const handleUpload = async () => {
     if (!file) {
       const err = normalizeError({ code: "missing_file", message: "Select a video first" });
@@ -115,7 +167,7 @@ export default function UploadPage() {
       dispatch({ type: "SET_MODE", mode: "replace", episodeId: epId });
 
       if (presign.method === "FILE" || !presign.upload_url) {
-        // Local-only path: treat as immediate success and kick off detect/track.
+        // Local-only path (no remote presign). Treat as success once file is staged locally and kick detect/track.
         dispatch({ type: "SET_STEP", step: "verifying", message: "Local upload ready" });
         await triggerDetectTrack(epId);
         toast.notify({ title: "Local upload", description: `Video staged at ${presign.path || "local"}` });
@@ -156,6 +208,41 @@ export default function UploadPage() {
 
   const disabled = state.step === "uploading" || state.step === "processing";
 
+  const seasons = useMemo(() => {
+    const seasonSet = new Set<number>();
+    showEpisodesQuery.data?.episodes?.forEach((ep) => {
+      if (typeof ep.season === "number") seasonSet.add(ep.season);
+    });
+    return Array.from(seasonSet).sort((a, b) => a - b);
+  }, [showEpisodesQuery.data]);
+
+  const episodesForSeason = useMemo(() => {
+    if (!season) return [];
+    const seasonNumber = Number(season);
+    if (Number.isNaN(seasonNumber)) return [];
+    return (
+      showEpisodesQuery.data?.episodes?.filter((ep) => ep.season === seasonNumber).map((ep) => ep.episode).sort((a, b) => a - b) || []
+    );
+  }, [season, showEpisodesQuery.data]);
+
+  const etaText = useMemo(() => {
+    const progress = jobProgressQuery.data?.progress as { percent?: number; fps?: number; frames_processed?: number; total_frames?: number } | undefined;
+    if (!progress) return "Estimating…";
+    if (typeof progress.percent === "number") {
+      const pct = Math.min(Math.max(progress.percent, 0), 1);
+      if (progress.fps && progress.frames_processed !== undefined && progress.total_frames) {
+        const remainingFrames = Math.max(progress.total_frames - progress.frames_processed, 0);
+        const seconds = remainingFrames / Math.max(progress.fps, 0.0001);
+        if (Number.isFinite(seconds)) {
+          const minutes = Math.ceil(seconds / 60);
+          return `~${minutes}m remaining`;
+        }
+      }
+      return `~${Math.round((1 - pct) * 100)}% remaining`;
+    }
+    return "Estimating…";
+  }, [jobProgressQuery.data]);
+
   return (
     <div className={styles.page}>
       <div className="card">
@@ -165,9 +252,24 @@ export default function UploadPage() {
             Replace mode locked to episode <strong>{lockedEpisodeId}</strong>
           </p>
         ) : (
-          <p className={styles.labelRow}>
-            Create a new episode by selecting show/season/episode and dropping a file.
-          </p>
+          <p className={styles.labelRow}>Create a new episode by selecting show/season/episode and dropping a file.</p>
+        )}
+        {state.mode === "replace" && episodeId && (
+          <div className={styles.infoBanner}>
+            Uploading will replace video for <strong>{episodeId}</strong>.{" "}
+            <button
+              type="button"
+              className={styles.inlineButton}
+              onClick={() => {
+                dispatch({ type: "SET_MODE", mode: "new", episodeId: undefined });
+                setShowName("");
+                setSeason("");
+                setEpisodeName("");
+              }}
+            >
+              Change episode
+            </button>
+          </div>
         )}
 
         <div className={styles.grid}>
@@ -175,37 +277,62 @@ export default function UploadPage() {
             <div className={styles.labelRow}>
               <span>Show</span>
             </div>
-            <input
+            <select
               className={styles.input}
-              placeholder="e.g. The Reality Report"
               value={showName}
-              onChange={(e) => setShowName(e.target.value)}
-              disabled={Boolean(lockedEpisodeId) || disabled}
-            />
+              onChange={(e) => {
+                setShowName(e.target.value);
+                setSeason("");
+                setEpisodeName("");
+              }}
+              disabled={Boolean(lockedEpisodeId) || disabled || showsQuery.isPending}
+            >
+              <option value="">Select show</option>
+              {showsQuery.data?.shows?.map((show) => (
+                <option key={show.show} value={show.show}>
+                  {show.show} ({show.episode_count})
+                </option>
+              ))}
+            </select>
           </div>
           <div className={styles.field}>
             <div className={styles.labelRow}>
               <span>Season</span>
             </div>
-            <input
+            <select
               className={styles.input}
-              placeholder="e.g. 3"
               value={season}
-              onChange={(e) => setSeason(e.target.value)}
-              disabled={Boolean(lockedEpisodeId) || disabled}
-            />
+              onChange={(e) => {
+                setSeason(e.target.value);
+                setEpisodeName("");
+              }}
+              disabled={Boolean(lockedEpisodeId) || disabled || !showName}
+            >
+              <option value="">Select season</option>
+              {seasons.map((s) => (
+                <option key={s} value={s}>
+                  Season {s}
+                </option>
+              ))}
+            </select>
           </div>
           <div className={styles.field}>
             <div className={styles.labelRow}>
               <span>Episode</span>
             </div>
-            <input
+            <select
               className={styles.input}
-              placeholder="e.g. 5"
               value={episodeName}
               onChange={(e) => setEpisodeName(e.target.value)}
-              disabled={Boolean(lockedEpisodeId) || disabled}
-            />
+              disabled={Boolean(lockedEpisodeId) || disabled || !season}
+            >
+              <option value="">Select episode</option>
+              {episodesForSeason.map((ep) => (
+                <option key={ep} value={ep}>
+                  Episode {ep}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
 
@@ -256,6 +383,15 @@ export default function UploadPage() {
             Upload verified. Detect/track complete for episode {episodeId}.
           </div>
         )}
+        {state.step === "canceled" && <div className={styles.alert}>Detect/track job canceled.</div>}
+        {statusQuery.data?.tracks_only_fallback && (
+          <div className={styles.alertMuted}>
+            Using tracks-only fallback; some faces/embeddings may be incomplete until a full detect+track rerun.
+          </div>
+        )}
+        {statusQuery.data?.faces_manifest_fallback && (
+          <div className={styles.alertMuted}>Faces manifest is stale; using last known manifest.</div>
+        )}
       </div>
 
       <div className="card">
@@ -271,6 +407,15 @@ export default function UploadPage() {
             <div>Detect+Track: {statusQuery.data?.detect_track?.status || "pending"}</div>
             <div>Faces: {statusQuery.data?.faces_embed?.status || "pending"}</div>
             <div>Cluster: {statusQuery.data?.cluster?.status || "pending"}</div>
+            {state.step === "processing" && <div>ETA: {etaText}</div>}
+          </div>
+          <div className={styles.actions}>
+            <button className={styles.buttonSecondary} onClick={handleRetry} disabled={!episodeId || triggerPhase.isPending}>
+              Retry detect/track
+            </button>
+            <button className={styles.buttonSecondary} onClick={handleCancel} disabled={!state.jobId || cancelJob.isPending}>
+              Cancel
+            </button>
           </div>
         </div>
       </div>

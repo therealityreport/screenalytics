@@ -1,14 +1,16 @@
 import type {
-  ApiError,
+  ApiErrorEnvelope,
   AssetUploadResponse,
   EpisodeCreateRequest,
   EpisodeCreateResponse,
   EpisodeEvent,
-  EpisodeStatus,
   EpisodePhase,
+  EpisodeStatus,
+  S3EpisodesForShowResponse,
+  S3ShowsResponse,
 } from "./types";
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/$/, "");
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE?.replace(/\/$/, "");
 
 export type JobTriggerResponse = {
   job_id?: string;
@@ -16,41 +18,65 @@ export type JobTriggerResponse = {
   phase?: string;
 };
 
-function normalizeError(err: unknown): ApiError {
+export type JobProgressResponse = {
+  job_id: string;
+  ep_id: string;
+  state: string;
+  started_at?: string;
+  ended_at?: string;
+  progress?: Record<string, unknown>;
+  track_metrics?: unknown;
+};
+
+function buildUrl(path: string): string {
+  if (path.startsWith("http")) return path;
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  if (API_BASE) {
+    return `${API_BASE}${normalized}`;
+  }
+  return `/api${normalized}`;
+}
+
+function ensureEnvelope(err: unknown, fallbackCode = "UNKNOWN_ERROR"): ApiErrorEnvelope {
   if (typeof err === "object" && err !== null && "code" in err && "message" in err) {
     const maybe = err as { code?: string; message?: string; details?: unknown };
     return {
-      code: maybe.code || "unknown_error",
+      code: maybe.code || fallbackCode,
       message: maybe.message || "Unknown error",
       details: maybe.details,
     };
   }
-
   if (err instanceof Error) {
-    return { code: "error", message: err.message };
+    return { code: fallbackCode, message: err.message };
   }
+  return { code: fallbackCode, message: "Unknown error" };
+}
 
-  return { code: "error", message: "Unknown error" };
+async function parseErrorResponse(response: Response): Promise<ApiErrorEnvelope> {
+  try {
+    const payload = await response.json();
+    return ensureEnvelope(payload, `HTTP_${response.status}`);
+  } catch (parseErr) {
+    return ensureEnvelope(parseErr, `HTTP_${response.status}`);
+  }
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const url = path.startsWith("http") ? path : `/api${path.startsWith("/") ? "" : "/"}${path}`;
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(path), {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers || {}),
+      },
+    });
+  } catch (networkErr) {
+    throw ensureEnvelope(networkErr, "NETWORK_ERROR");
+  }
 
   if (!response.ok) {
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch (parseErr) {
-      throw normalizeError(parseErr);
-    }
-    throw normalizeError(payload);
+    throw await parseErrorResponse(response);
   }
 
   if (response.status === 204) {
@@ -58,20 +84,33 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     return undefined;
   }
 
-  return (await response.json()) as T;
+  try {
+    return (await response.json()) as T;
+  } catch (parseErr) {
+    throw ensureEnvelope(parseErr, "PARSE_ERROR");
+  }
+}
+
+export const apiClient = {
+  get: <T>(path: string, init?: RequestInit) => apiFetch<T>(path, { ...init, method: "GET" }),
+  post: <TBody, TResponse>(path: string, body?: TBody, init?: RequestInit) =>
+    apiFetch<TResponse>(path, {
+      ...init,
+      method: "POST",
+      body: body !== undefined ? JSON.stringify(body) : init?.body,
+    }),
+};
+
+export function normalizeError(err: unknown): ApiErrorEnvelope {
+  return ensureEnvelope(err, "UNKNOWN_ERROR");
 }
 
 export async function createEpisode(payload: EpisodeCreateRequest) {
-  return apiFetch<EpisodeCreateResponse>("/episodes", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  return apiClient.post<EpisodeCreateRequest, EpisodeCreateResponse>("/episodes", payload);
 }
 
 export async function presignEpisodeAssets(epId: string): Promise<AssetUploadResponse> {
-  return apiFetch<AssetUploadResponse>(`/episodes/${epId}/assets`, {
-    method: "POST",
-  });
+  return apiClient.post<undefined, AssetUploadResponse>(`/episodes/${epId}/assets`);
 }
 
 export async function triggerJob(episodeId: string, phase: EpisodePhase): Promise<JobTriggerResponse> {
@@ -87,31 +126,41 @@ export async function triggerJob(episodeId: string, phase: EpisodePhase): Promis
             : null;
 
   if (!path) {
-    throw normalizeError({ code: "unsupported_phase", message: `Unsupported phase ${phase}` });
+    throw normalizeError({ code: "UNSUPPORTED_PHASE", message: `Unsupported phase ${phase}` });
   }
 
-  return apiFetch<JobTriggerResponse>(path, {
-    method: "POST",
-    body: JSON.stringify({ ep_id: episodeId }),
-  });
+  return apiClient.post<{ ep_id: string }, JobTriggerResponse>(path, { ep_id: episodeId });
 }
 
 export async function fetchEpisodeStatus(episodeId: string): Promise<EpisodeStatus> {
-  return apiFetch<EpisodeStatus>(`/episodes/${episodeId}/status`);
+  return apiClient.get<EpisodeStatus>(`/episodes/${episodeId}/status`);
+}
+
+export async function listShows(): Promise<S3ShowsResponse> {
+  return apiClient.get<S3ShowsResponse>("/episodes/s3_shows");
+}
+
+export async function listEpisodesForShow(show: string): Promise<S3EpisodesForShowResponse> {
+  return apiClient.get<S3EpisodesForShowResponse>(`/episodes/s3_shows/${encodeURIComponent(show)}/episodes`);
+}
+
+export async function cancelJob(jobId: string): Promise<{ job_id: string }> {
+  return apiClient.post<undefined, { job_id: string }>(`/jobs/${jobId}/cancel`);
+}
+
+export async function fetchJobProgress(jobId: string): Promise<JobProgressResponse> {
+  return apiClient.get<JobProgressResponse>(`/jobs/${jobId}/progress`);
 }
 
 export function eventsUrl(episodeId: string): string {
-  return `/api/episodes/${episodeId}/events`;
+  return buildUrl(`/episodes/${episodeId}/events`);
 }
 
 export function mapEventStream(event: MessageEvent<string>): EpisodeEvent | null {
   try {
-    const parsed = JSON.parse(event.data) as EpisodeEvent;
-    return parsed;
+    return JSON.parse(event.data) as EpisodeEvent;
   } catch (err) {
     console.warn("Failed to parse event", err);
     return null;
   }
 }
-
-export { normalizeError };

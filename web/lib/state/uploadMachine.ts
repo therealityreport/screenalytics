@@ -7,6 +7,7 @@ export type UploadStep =
   | "uploading"
   | "verifying"
   | "processing"
+  | "canceled"
   | "success"
   | "error";
 
@@ -42,6 +43,7 @@ export type UploadAction =
   | { type: "SET_STEP"; step: UploadStep; message?: string; flags?: UploadFlags; jobId?: string }
   | { type: "SET_PROGRESS"; progress: number; speedBps?: number }
   | { type: "ERROR"; error: ApiError }
+  | { type: "CANCEL" }
   | { type: "RESET" };
 
 export function createInitialState(episodeId?: string): UploadState {
@@ -71,6 +73,8 @@ export function uploadReducer(state: UploadState, action: UploadAction): UploadS
       return { ...state, progress: action.progress, speedBps: action.speedBps };
     case "ERROR":
       return { ...state, step: "error", error: action.error };
+    case "CANCEL":
+      return { ...state, step: "canceled" };
     case "RESET":
       return createInitialState(state.mode === "replace" ? state.episodeId : undefined);
     default:

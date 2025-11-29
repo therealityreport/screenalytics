@@ -129,6 +129,34 @@
   font-size: 14px;
 }
 
+.alertMuted {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 13px;
+}
+
+.infoBanner {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  color: #075985;
+  font-size: 14px;
+}
+
+.inlineButton {
+  border: none;
+  background: transparent;
+  color: #0f172a;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
 .success {
   padding: 10px 12px;
   border-radius: 10px;
