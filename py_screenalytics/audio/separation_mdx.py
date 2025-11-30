@@ -110,10 +110,7 @@ def separate_vocals(
         elif waveform.shape[0] > 2:
             waveform = waveform[:2]
 
-        # Add batch dimension
-        waveform = waveform.unsqueeze(0).to(device)
-
-        # Add batch dimension
+        # Add batch dimension: (channels, length) -> (1, channels, length)
         waveform = waveform.unsqueeze(0).to(device)
 
         # demucs BagOfModels require apply_model; use config chunk/overlap to set segment windows.

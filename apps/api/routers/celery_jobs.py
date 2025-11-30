@@ -993,6 +993,18 @@ def _extract_job_metadata(task_info: Dict) -> Dict[str, Any]:
     Celery task info includes args/kwargs that contain our job parameters.
     This extracts the episode ID and operation type for matching.
     """
+    audio_stage_order = {
+        "ingest": 1,
+        "separate": 2,
+        "enhance": 3,
+        "diarize": 4,
+        "transcribe": 5,
+        "voices": 6,
+        "align": 7,
+        "export": 8,
+        "qc": 9,
+        "pipeline": 10,
+    }
     result: Dict[str, Any] = {}
 
     # Try to get ep_id from args (first positional argument)
@@ -1009,12 +1021,19 @@ def _extract_job_metadata(task_info: Dict) -> Dict[str, Any]:
 
     # Infer operation from task name
     task_name = task_info.get("name", "")
-    if "detect_track" in task_name.lower():
+    task_lower = task_name.lower()
+    if "detect_track" in task_lower:
         result["operation"] = "detect_track"
-    elif "faces_embed" in task_name.lower() or "faces_harvest" in task_name.lower():
+    elif "faces_embed" in task_lower or "faces_harvest" in task_lower:
         result["operation"] = "faces_embed"
-    elif "cluster" in task_name.lower():
+    elif "cluster" in task_lower:
         result["operation"] = "cluster"
+    elif task_lower.startswith("audio."):
+        result["operation"] = "audio_pipeline"
+        # Capture the specific audio stage for richer progress display
+        stage_name = task_lower.split(".", 1)[-1]
+        result["stage"] = stage_name
+        result["stage_order"] = audio_stage_order.get(stage_name, 0)
     else:
         # Try to extract from task name pattern like "tasks.run_detect_track_task"
         parts = task_name.split(".")
@@ -1117,6 +1136,8 @@ async def list_active_celery_jobs():
                 "worker": worker,
                 "ep_id": metadata.get("ep_id"),
                 "operation": metadata.get("operation"),
+                "stage": metadata.get("stage"),
+                "stage_order": metadata.get("stage_order"),
                 "source": "celery",
             })
 
@@ -1132,6 +1153,8 @@ async def list_active_celery_jobs():
                 "worker": worker,
                 "ep_id": metadata.get("ep_id"),
                 "operation": metadata.get("operation"),
+                "stage": metadata.get("stage"),
+                "stage_order": metadata.get("stage_order"),
                 "source": "celery",
             })
 
@@ -1146,6 +1169,8 @@ async def list_active_celery_jobs():
                 "worker": worker,
                 "ep_id": metadata.get("ep_id"),
                 "operation": metadata.get("operation"),
+                "stage": metadata.get("stage"),
+                "stage_order": metadata.get("stage_order"),
                 "source": "celery",
             })
 

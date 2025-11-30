@@ -284,10 +284,21 @@ def episode_audio_diarize_task(
 @celery_app.task(bind=True, base=AudioPipelineTask, name="audio.voices")
 def episode_audio_voices_task(
     self,
-    ep_id: str,
+    previous_results: Any = None,  # Chord callback receives header results as first arg
+    ep_id: str = "",
     overwrite: bool = False,
 ) -> Dict[str, Any]:
-    """Cluster voices and map to voice bank."""
+    """Cluster voices and map to voice bank.
+
+    Note: When used as a chord callback, this function receives the results
+    from the header tasks (diarize & transcribe) as the first argument.
+    """
+    # Handle both direct calls and chord callback calls
+    # When called directly, previous_results might be the ep_id string
+    if isinstance(previous_results, str) and not ep_id:
+        ep_id = previous_results
+        previous_results = None
+
     job_id = self.request.id
     LOGGER.info(f"[{job_id}] Starting voice clustering for {ep_id}")
 
@@ -377,6 +388,9 @@ def episode_audio_transcribe_task(
 
         # Use provider from args or config
         provider = asr_provider or config.asr.provider
+        # Normalize legacy name
+        if provider == "gemini":
+            provider = "gemini_3"
 
         if provider == "gemini_3":
             from py_screenalytics.audio.asr_gemini import transcribe_audio

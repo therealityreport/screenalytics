@@ -32,6 +32,20 @@ from .models import (
 LOGGER = logging.getLogger(__name__)
 
 
+# Pipeline step metadata for progress tracking
+AUDIO_PIPELINE_STEPS = {
+    "extract": {"name": "Extract Audio", "order": 1, "weight": 5},
+    "separate": {"name": "Separate Vocals", "order": 2, "weight": 20},
+    "enhance": {"name": "Enhance Audio", "order": 3, "weight": 15},
+    "diarize": {"name": "Speaker Diarization", "order": 4, "weight": 20},
+    "voices": {"name": "Voice Clustering", "order": 5, "weight": 10},
+    "transcribe": {"name": "Transcription", "order": 6, "weight": 15},
+    "fuse": {"name": "Fuse Transcript", "order": 7, "weight": 5},
+    "export": {"name": "Export", "order": 8, "weight": 5},
+    "qc": {"name": "Quality Control", "order": 9, "weight": 5},
+}
+
+
 def _load_config(config_path: Optional[Path] = None) -> AudioPipelineConfig:
     """Load audio pipeline configuration from YAML."""
     if config_path is None:
@@ -210,12 +224,14 @@ def run_episode_audio_pipeline(
         _update_progress("enhance", 1.0, "Enhancement complete")
 
         # Step 4: Diarization
+        # Use vocals (separated, no music) for diarization - better for speaker detection
+        # Enhancement can alter voice characteristics, so we use the cleaner separated vocals
         _update_progress("diarize", 0.0, "Running speaker diarization...")
 
         from .diarization_pyannote import run_diarization
 
         diarization_segments = run_diarization(
-            enhanced_path,
+            vocals_path,  # Use separated vocals (no music) for better speaker detection
             paths["diarization"],
             config.diarization,
             overwrite=overwrite,
@@ -231,7 +247,7 @@ def run_episode_audio_pipeline(
         from .voice_bank import match_voice_clusters_to_bank
 
         voice_clusters = cluster_episode_voices(
-            enhanced_path,
+            vocals_path,  # Use separated vocals for voice embedding extraction
             diarization_segments,
             paths["voice_clusters"],
             config.voice_clustering,

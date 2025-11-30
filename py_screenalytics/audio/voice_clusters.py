@@ -69,18 +69,33 @@ def cluster_episode_voices(
         _save_voice_clusters(clusters, output_path)
         return clusters
 
-    # Group embeddings by diarization speaker label
-    speaker_embeddings: Dict[str, List[Tuple[DiarizationSegment, np.ndarray]]] = defaultdict(list)
-    for segment, embedding in segment_embeddings:
-        speaker_embeddings[segment.speaker].append((segment, embedding))
+    # Check how many unique speakers diarization found
+    unique_diar_speakers = set(seg.speaker for seg in diarization_segments)
+    LOGGER.info(f"Diarization found {len(unique_diar_speakers)} unique speakers")
 
-    # Refine clusters using embeddings
-    clusters = _refine_clusters_with_embeddings(
-        speaker_embeddings,
-        config.similarity_threshold,
-        config.min_segments_per_cluster,
-        config.centroid_method,
-    )
+    # If diarization found very few speakers (1-2), do embedding-based clustering
+    # to properly separate voices that diarization missed
+    if len(unique_diar_speakers) <= 2 and len(segment_embeddings) >= 3:
+        LOGGER.info("Diarization found few speakers - using embedding-based clustering")
+        clusters = _cluster_by_embeddings(
+            segment_embeddings,
+            config.similarity_threshold,
+            config.min_segments_per_cluster,
+            config.centroid_method,
+        )
+    else:
+        # Group embeddings by diarization speaker label
+        speaker_embeddings: Dict[str, List[Tuple[DiarizationSegment, np.ndarray]]] = defaultdict(list)
+        for segment, embedding in segment_embeddings:
+            speaker_embeddings[segment.speaker].append((segment, embedding))
+
+        # Refine clusters using embeddings
+        clusters = _refine_clusters_with_embeddings(
+            speaker_embeddings,
+            config.similarity_threshold,
+            config.min_segments_per_cluster,
+            config.centroid_method,
+        )
 
     # Assign stable IDs
     clusters = _assign_cluster_ids(clusters)
@@ -91,6 +106,129 @@ def cluster_episode_voices(
     LOGGER.info(f"Created {len(clusters)} voice clusters")
 
     return clusters
+
+
+def _cluster_by_embeddings(
+    segment_embeddings: List[Tuple[DiarizationSegment, np.ndarray]],
+    similarity_threshold: float,
+    min_segments: int,
+    centroid_method: str,
+) -> List[VoiceCluster]:
+    """Cluster segments purely by embedding similarity, ignoring diarization labels.
+
+    Uses agglomerative clustering with cosine similarity.
+    """
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import pdist
+
+    if len(segment_embeddings) < 2:
+        # Not enough for clustering
+        return _single_cluster_from_embeddings(segment_embeddings, centroid_method)
+
+    # Extract embeddings matrix
+    embeddings = np.array([emb for _, emb in segment_embeddings])
+
+    # Normalize embeddings
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    embeddings = embeddings / norms
+
+    # Compute pairwise cosine distances (1 - similarity)
+    # Using correlation distance as proxy for cosine on normalized vectors
+    distances = pdist(embeddings, metric='cosine')
+
+    # Hierarchical clustering
+    Z = linkage(distances, method='average')
+
+    # Cut at threshold (convert similarity to distance)
+    distance_threshold = 1 - similarity_threshold
+    cluster_labels = fcluster(Z, t=distance_threshold, criterion='distance')
+
+    # Group segments by cluster
+    clusters_dict: Dict[int, List[Tuple[DiarizationSegment, np.ndarray]]] = defaultdict(list)
+    for i, (segment, embedding) in enumerate(segment_embeddings):
+        cluster_id = cluster_labels[i]
+        clusters_dict[cluster_id].append((segment, embedding))
+
+    LOGGER.info(f"Embedding clustering found {len(clusters_dict)} clusters")
+
+    # Create VoiceCluster objects
+    clusters = []
+    for cluster_id, items in clusters_dict.items():
+        if len(items) < min_segments:
+            LOGGER.debug(f"Skipping cluster {cluster_id}: only {len(items)} segments")
+            continue
+
+        segments = [
+            VoiceClusterSegment(
+                start=seg.start,
+                end=seg.end,
+                diar_speaker=seg.speaker,
+            )
+            for seg, _ in items
+        ]
+
+        total_duration = sum(seg.end - seg.start for seg, _ in items)
+
+        # Compute centroid
+        cluster_embeddings = np.array([emb for _, emb in items])
+        if centroid_method == "median":
+            centroid = np.median(cluster_embeddings, axis=0)
+        else:
+            centroid = np.mean(cluster_embeddings, axis=0)
+
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+
+        cluster = VoiceCluster(
+            voice_cluster_id="",  # Will be assigned later
+            segments=segments,
+            total_duration=total_duration,
+            segment_count=len(items),
+            centroid=centroid.tolist(),
+        )
+        clusters.append(cluster)
+
+    return clusters
+
+
+def _single_cluster_from_embeddings(
+    segment_embeddings: List[Tuple[DiarizationSegment, np.ndarray]],
+    centroid_method: str,
+) -> List[VoiceCluster]:
+    """Create a single cluster from all segments."""
+    if not segment_embeddings:
+        return []
+
+    segments = [
+        VoiceClusterSegment(
+            start=seg.start,
+            end=seg.end,
+            diar_speaker=seg.speaker,
+        )
+        for seg, _ in segment_embeddings
+    ]
+
+    total_duration = sum(seg.end - seg.start for seg, _ in segment_embeddings)
+
+    embeddings = np.array([emb for _, emb in segment_embeddings])
+    if centroid_method == "median":
+        centroid = np.median(embeddings, axis=0)
+    else:
+        centroid = np.mean(embeddings, axis=0)
+
+    norm = np.linalg.norm(centroid)
+    if norm > 0:
+        centroid = centroid / norm
+
+    return [VoiceCluster(
+        voice_cluster_id="VC_01",
+        segments=segments,
+        total_duration=total_duration,
+        segment_count=len(segments),
+        centroid=centroid.tolist(),
+    )]
 
 
 def _clusters_from_diarization_labels(

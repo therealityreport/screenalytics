@@ -77,8 +77,11 @@ class ASRConfig(BaseModel):
 
 class VoiceClusteringConfig(BaseModel):
     """Configuration for voice clustering."""
-    similarity_threshold: float = 0.78
-    min_segments_per_cluster: int = 2
+    # Lower threshold = more clusters (different voices separated)
+    # Higher threshold = fewer clusters (similar voices merged)
+    # 0.65 works well for separating distinct speakers
+    similarity_threshold: float = 0.65
+    min_segments_per_cluster: int = 1  # Allow single-segment clusters for trailers
     embedding_model: str = "pyannote/embedding"
     centroid_method: str = "mean"
 
