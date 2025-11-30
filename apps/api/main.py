@@ -14,8 +14,10 @@ from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from apps.api.errors import install_error_handlers
 from apps.api.routers import (
     archive,
+    audio,
     cast,
     episodes,
     facebank,
@@ -30,6 +32,7 @@ from apps.api.routers import (
 from tools import episode_run
 
 app = FastAPI(title="Screenalytics API", version="0.1.0")
+install_error_handlers(app)
 LOGGER = logging.getLogger(__name__)
 
 ui_origin = os.environ.get("UI_ORIGIN", "http://localhost:8501")
@@ -52,6 +55,7 @@ app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
 app.include_router(metadata.router)
 app.include_router(archive.router, tags=["archive"])
+app.include_router(audio.router, tags=["audio"])
 
 # Celery is optional in local dev; guard the import so /healthz stays alive even if
 # celery[redis] is not installed. Expose a 503 stub so callers see a clear error.

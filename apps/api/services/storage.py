@@ -140,17 +140,22 @@ def episode_context_from_id(ep_id: str) -> EpisodeContext:
 
 
 def artifact_prefixes(ep_ctx: EpisodeContext) -> Dict[str, str]:
-    """Return v2 S3 prefixes for frames/crops/manifests under single bucket."""
+    """Return v2 S3 prefixes for frames/crops/manifests/audio under single bucket."""
 
     show = ep_ctx.show_slug
     season = ep_ctx.season_number
     episode = ep_ctx.episode_number
+    base = f"{show}/s{season:02d}/e{episode:02d}"
     return {
-        "frames": f"{ARTIFACT_ROOT}/frames/{show}/s{season:02d}/e{episode:02d}/frames/",
-        "crops": f"{ARTIFACT_ROOT}/crops/{show}/s{season:02d}/e{episode:02d}/tracks/",
-        "manifests": f"{ARTIFACT_ROOT}/manifests/{show}/s{season:02d}/e{episode:02d}/",
-        "thumbs_tracks": f"{ARTIFACT_ROOT}/thumbs/{show}/s{season:02d}/e{episode:02d}/tracks/",
-        "thumbs_identities": f"{ARTIFACT_ROOT}/thumbs/{show}/s{season:02d}/e{episode:02d}/identities/",
+        "frames": f"{ARTIFACT_ROOT}/frames/{base}/frames/",
+        "crops": f"{ARTIFACT_ROOT}/crops/{base}/tracks/",
+        "manifests": f"{ARTIFACT_ROOT}/manifests/{base}/",
+        "thumbs_tracks": f"{ARTIFACT_ROOT}/thumbs/{base}/tracks/",
+        "thumbs_identities": f"{ARTIFACT_ROOT}/thumbs/{base}/identities/",
+        # Audio pipeline artifacts
+        "audio": f"{ARTIFACT_ROOT}/audio/{base}/audio/",
+        "audio_transcripts": f"{ARTIFACT_ROOT}/audio/{base}/transcripts/",
+        "audio_qc": f"{ARTIFACT_ROOT}/audio/{base}/qc/",
     }
 
 

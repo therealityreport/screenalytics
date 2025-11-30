@@ -184,6 +184,85 @@ episode+person ──< screen_time
 ### tracks.jsonl (track_v1)
 - track_id, ep_id, start_s, end_s, frame_span [start,end], sample_thumbs [paths]
 
+### audio_diarization.jsonl (audio_diar_v1)
+- start (float): Segment start time in seconds
+- end (float): Segment end time in seconds
+- speaker (text): Raw speaker label from diarization (e.g., "SPEAKER_00")
+- confidence (float, null): Diarization confidence score
+
+### audio_asr_raw.jsonl (audio_asr_v1)
+- start (float): Segment start time
+- end (float): Segment end time
+- text (text): Transcribed text
+- confidence (float, null): ASR confidence
+- words (array, null): Word-level timings [{w, t0, t1}]
+- language (text, null): Detected language
+
+### audio_voice_clusters.json (audio_vc_v1)
+```json
+[
+  {
+    "voice_cluster_id": "VC_01",
+    "segments": [{"start": 0.0, "end": 5.0, "diar_speaker": "SPEAKER_00"}],
+    "total_duration": 30.0,
+    "segment_count": 5,
+    "centroid": [0.1, 0.2, ...]  // 256-d embedding, optional
+  }
+]
+```
+
+### audio_voice_mapping.json (audio_vm_v1)
+```json
+[
+  {
+    "voice_cluster_id": "VC_01",
+    "voice_bank_id": "voice_lisa_barlow",
+    "speaker_id": "SPK_LISA_BARLOW",
+    "speaker_display_name": "Lisa Barlow",
+    "similarity": 0.89,
+    "is_new_entry": false
+  }
+]
+```
+
+### episode_transcript.jsonl (audio_tx_v1)
+- start (float): Segment start time
+- end (float): Segment end time
+- text (text): Transcribed text
+- speaker_id (text): Speaker ID (e.g., "SPK_LISA_BARLOW" or "SPK_UNLABELED_01")
+- speaker_display_name (text): Human-readable speaker name
+- voice_cluster_id (text): Episode voice cluster ID (e.g., "VC_01")
+- voice_bank_id (text): Voice bank entry ID
+- conf (float, null): Confidence score
+- words (array, null): Word-level timings
+
+### episode_transcript.vtt (audio_vtt_v1)
+WebVTT with speaker metadata in NOTE lines:
+```
+NOTE speaker_id=SPK_LISA_BARLOW speaker_display_name="Lisa Barlow" voice_cluster_id=VC_01 voice_bank_id=voice_lisa_barlow
+1
+00:00:00.000 --> 00:00:05.000
+<v Lisa Barlow>I said what I said.</v>
+```
+
+### audio_qc.json (audio_qc_v1)
+```json
+{
+  "ep_id": "rhoslc-s06e02",
+  "status": "ok",  // ok | warn | needs_review
+  "metrics": [
+    {"name": "duration_drift_pct", "value": 0.14, "threshold": 1.0, "passed": true},
+    {"name": "snr_db", "value": 22.5, "threshold": 14.0, "passed": true}
+  ],
+  "voice_cluster_count": 5,
+  "labeled_voices": 4,
+  "unlabeled_voices": 1,
+  "transcript_row_count": 245,
+  "warnings": [],
+  "errors": []
+}
+```
+
 ## Indices & Performance
 - HNSW(vec) for embedding.vec (dim 512).
 - btree on time ranges: (ep_id, start_s, end_s).

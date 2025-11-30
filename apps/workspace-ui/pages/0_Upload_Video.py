@@ -563,6 +563,22 @@ with st.form("episode-upload"):
     )
     uploaded_file = st.file_uploader("Episode video", type=["mp4"], accept_multiple_files=False)
     st.caption("Video will be uploaded to S3. After upload, open Episode Detail to run detect/track.")
+
+    # Audio pipeline options
+    st.divider()
+    run_audio_after_upload = st.checkbox(
+        "Run audio pipeline after upload",
+        value=False,
+        help="Extract audio, transcribe, and identify speakers automatically",
+    )
+    audio_asr_provider = st.selectbox(
+        "ASR Provider",
+        options=["openai_whisper", "gemini"],
+        index=0,
+        disabled=not run_audio_after_upload,
+        help="Whisper is faster and more accurate; Gemini is cheaper for long videos",
+    )
+
     submit = st.form_submit_button("Upload episode", type="primary")
 
 if add_show_clicked:
@@ -683,6 +699,22 @@ if submit:
         flash_lines = [f"Episode `{ep_id}` saved locally."]
     flash_lines.append(f"Video -> {helpers.link_local(artifacts['video'])}")
     flash_lines.append("Go to Episode Detail to run detect/track processing.")
+
+    # Trigger audio pipeline if requested
+    if run_audio_after_upload:
+        try:
+            audio_payload = {
+                "ep_id": ep_id,
+                "overwrite": False,
+                "asr_provider": audio_asr_provider,
+            }
+            audio_resp = helpers.api_post("/jobs/episode_audio_pipeline", json=audio_payload)
+            audio_job_id = audio_resp.get("job_id")
+            if audio_job_id:
+                helpers.store_celery_job_id(ep_id, "audio_pipeline", audio_job_id)
+                flash_lines.append(f"Audio pipeline started: `{audio_job_id}`")
+        except requests.RequestException as exc:
+            flash_lines.append(f"Audio pipeline failed to start: {exc}")
 
     st.session_state["upload_flash"] = "\n".join(flash_lines)
     helpers.set_ep_id(ep_id)
