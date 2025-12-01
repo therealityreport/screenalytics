@@ -17,9 +17,23 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import yaml
+
+# Load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    # Try to find .env in common locations
+    for env_path in [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parents[3] / ".env",  # project root
+    ]:
+        if env_path.exists():
+            load_dotenv(env_path)
+            break
+except ImportError:
+    pass  # dotenv not installed, rely on system environment
 
 from .models import (
     AudioArtifacts,
@@ -89,6 +103,9 @@ def _get_audio_paths(ep_id: str, data_root: Optional[Path] = None) -> dict:
         "vocals_enhanced": audio_dir / "episode_vocals_enhanced.wav",
         "final_voice_only": audio_dir / "episode_final_voice_only.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
+        "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
+        "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
+        "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
         "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
         "voice_clusters": manifests_dir / "audio_voice_clusters.json",
         "voice_mapping": manifests_dir / "audio_voice_mapping.json",
@@ -107,13 +124,85 @@ def _get_show_id(ep_id: str) -> str:
     return ep_id.upper()
 
 
+def _save_diarization_comparison(
+    pyannote_segments: list,
+    gpt4o_segments: list,
+    output_path: Path,
+) -> dict:
+    """Compare pyannote and GPT-4o diarization outputs and save report.
+
+    Args:
+        pyannote_segments: Diarization segments from pyannote
+        gpt4o_segments: Diarization segments from GPT-4o
+        output_path: Path to save comparison JSON
+
+    Returns:
+        Comparison report dict
+    """
+    import json
+
+    # Get pyannote stats
+    pyannote_speakers = set(s.speaker for s in pyannote_segments)
+    pyannote_duration = sum(s.end - s.start for s in pyannote_segments)
+
+    # Get GPT-4o stats
+    gpt4o_speakers = set(s.speaker for s in gpt4o_segments if s.speaker)
+    gpt4o_duration = sum(s.end - s.start for s in gpt4o_segments) if gpt4o_segments else 0
+
+    # Build comparison report
+    comparison = {
+        "pyannote": {
+            "segment_count": len(pyannote_segments),
+            "speaker_count": len(pyannote_speakers),
+            "speakers": sorted(pyannote_speakers),
+            "total_speech_duration_s": round(pyannote_duration, 2),
+            "avg_segment_duration_s": round(pyannote_duration / len(pyannote_segments), 2) if pyannote_segments else 0,
+        },
+        "gpt4o": {
+            "segment_count": len(gpt4o_segments),
+            "speaker_count": len(gpt4o_speakers),
+            "speakers": sorted(gpt4o_speakers),
+            "total_speech_duration_s": round(gpt4o_duration, 2),
+            "avg_segment_duration_s": round(gpt4o_duration / len(gpt4o_segments), 2) if gpt4o_segments else 0,
+            "has_transcription": True if gpt4o_segments else False,
+        },
+        "comparison": {
+            "speaker_count_diff": len(gpt4o_speakers) - len(pyannote_speakers),
+            "segment_count_diff": len(gpt4o_segments) - len(pyannote_segments),
+            "duration_diff_s": round(gpt4o_duration - pyannote_duration, 2),
+        },
+        # Sample segments for manual review
+        "samples": {
+            "pyannote_first_5": [
+                {"start": s.start, "end": s.end, "speaker": s.speaker}
+                for s in pyannote_segments[:5]
+            ],
+            "gpt4o_first_5": [
+                {"start": s.start, "end": s.end, "speaker": s.speaker, "text": s.text[:100] if hasattr(s, 'text') else ""}
+                for s in gpt4o_segments[:5]
+            ],
+        },
+    }
+
+    # Save comparison
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(comparison, f, indent=2)
+
+    LOGGER.info(f"Diarization comparison saved: {output_path}")
+    LOGGER.info(f"  Pyannote: {len(pyannote_speakers)} speakers, {len(pyannote_segments)} segments")
+    LOGGER.info(f"  GPT-4o: {len(gpt4o_speakers)} speakers, {len(gpt4o_segments)} segments")
+
+    return comparison
+
+
 def run_episode_audio_pipeline(
     ep_id: str,
     overwrite: bool = False,
     asr_provider: Optional[str] = None,
     config_path: Optional[Path] = None,
     data_root: Optional[Path] = None,
-    progress_callback: Optional[callable] = None,
+    progress_callback: Optional[Callable[[str, float, str], None]] = None,
 ) -> AudioPipelineResult:
     """Run the complete audio pipeline for an episode.
 
@@ -136,7 +225,9 @@ def run_episode_audio_pipeline(
 
     # Override ASR provider if specified
     if asr_provider:
-        config.asr.provider = asr_provider
+        # Normalize aliases for backwards compatibility (CLI uses "gemini")
+        provider_override = "gemini_3" if asr_provider == "gemini" else asr_provider
+        config.asr.provider = provider_override
 
     # Get paths
     paths = _get_audio_paths(ep_id, data_root)
@@ -223,22 +314,60 @@ def run_episode_audio_pipeline(
 
         _update_progress("enhance", 1.0, "Enhancement complete")
 
-        # Step 4: Diarization
+        # Step 4: Diarization (dual mode: pyannote + GPT-4o for comparison)
         # Use vocals (separated, no music) for diarization - better for speaker detection
         # Enhancement can alter voice characteristics, so we use the cleaner separated vocals
-        _update_progress("diarize", 0.0, "Running speaker diarization...")
+        _update_progress("diarize", 0.0, "Running dual diarization (pyannote + GPT-4o)...")
 
+        # 4a: Run pyannote diarization
         from .diarization_pyannote import run_diarization
 
-        diarization_segments = run_diarization(
+        _update_progress("diarize", 0.1, "Running pyannote diarization...")
+        pyannote_segments = run_diarization(
             vocals_path,  # Use separated vocals (no music) for better speaker detection
-            paths["diarization"],
+            paths["diarization_pyannote"],
             config.diarization,
             overwrite=overwrite,
         )
+        LOGGER.info(f"Pyannote diarization: {len(pyannote_segments)} segments, "
+                   f"{len(set(s.speaker for s in pyannote_segments))} speakers")
+
+        # 4b: Run GPT-4o diarization (unified transcription + diarization)
+        _update_progress("diarize", 0.5, "Running GPT-4o diarization...")
+        try:
+            from .asr_openai import transcribe_with_diarization, check_api_available
+
+            if check_api_available():
+                gpt4o_segments = transcribe_with_diarization(
+                    vocals_path,
+                    paths["diarization_gpt4o"],
+                    overwrite=overwrite,
+                )
+                gpt4o_speakers = len(set(s.speaker for s in gpt4o_segments if s.speaker))
+                LOGGER.info(f"GPT-4o diarization: {len(gpt4o_segments)} segments, {gpt4o_speakers} speakers")
+            else:
+                LOGGER.warning("OpenAI API not available, skipping GPT-4o diarization")
+                gpt4o_segments = []
+        except Exception as e:
+            LOGGER.warning(f"GPT-4o diarization failed: {e}")
+            gpt4o_segments = []
+
+        # 4c: Create comparison report
+        _update_progress("diarize", 0.8, "Generating diarization comparison...")
+        _save_diarization_comparison(
+            pyannote_segments,
+            gpt4o_segments,
+            paths["diarization_comparison"],
+        )
+
+        # Use pyannote as primary for now (copy to standard diarization path)
+        import shutil
+        if paths["diarization_pyannote"].exists():
+            shutil.copy(paths["diarization_pyannote"], paths["diarization"])
+        diarization_segments = pyannote_segments
         result.manifest_artifacts.diarization = paths["diarization"]
 
-        _update_progress("diarize", 1.0, f"Diarization complete: {len(diarization_segments)} segments")
+        _update_progress("diarize", 1.0, f"Dual diarization complete: pyannote={len(pyannote_segments)}, gpt4o={len(gpt4o_segments)}")
 
         # Step 5: Voice clustering + voice bank mapping
         _update_progress("voices", 0.0, "Clustering voices...")
@@ -275,6 +404,10 @@ def run_episode_audio_pipeline(
 
         # Step 6: ASR
         _update_progress("transcribe", 0.0, f"Transcribing with {config.asr.provider}...")
+
+        # Normalize provider before selecting implementation
+        if config.asr.provider == "gemini":
+            config.asr.provider = "gemini_3"
 
         if config.asr.provider == "gemini_3":
             from .asr_gemini import transcribe_audio

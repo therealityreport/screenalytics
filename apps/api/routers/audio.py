@@ -11,14 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 import sys
-import time
 from pathlib import Path
-from typing import Any, Generator, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 # Path setup
@@ -32,128 +30,6 @@ router = APIRouter(prefix="/jobs", tags=["audio"])
 LOGGER = logging.getLogger(__name__)
 
 
-def _stream_audio_pipeline(
-    command: list[str],
-    ep_id: str,
-    timeout: int = 7200,
-) -> Generator[str, None, None]:
-    """Stream audio pipeline subprocess output as NDJSON.
-
-    The audio pipeline CLI emits JSON progress lines directly.
-    This function passes them through with minimal processing.
-
-    Args:
-        command: Command to execute
-        ep_id: Episode identifier
-        timeout: Max runtime in seconds (default 2 hours)
-
-    Yields:
-        NDJSON lines
-    """
-    start_time = time.time()
-
-    # Set up environment
-    env = os.environ.copy()
-    # Clamp thread envs to keep laptop runs from pegging CPU
-    env.setdefault("OMP_NUM_THREADS", "1")
-    env.setdefault("MKL_NUM_THREADS", "1")
-    env.setdefault("OPENBLAS_NUM_THREADS", "1")
-
-    # Emit start message
-    yield json.dumps({
-        "phase": "init",
-        "progress": 0,
-        "message": f"Starting audio pipeline for {ep_id}...",
-        "timestamp": time.time(),
-    }) + "\n"
-
-    try:
-        LOGGER.info(f"Starting audio pipeline subprocess: {' '.join(command)}")
-
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-            cwd=str(PROJECT_ROOT),
-        )
-
-        # Stream output lines as they arrive
-        for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
-
-            line = line.strip()
-            if not line:
-                continue
-
-            # Check timeout
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                process.kill()
-                yield json.dumps({
-                    "phase": "error",
-                    "progress": 0,
-                    "message": f"Audio pipeline timed out after {elapsed:.0f}s",
-                    "timestamp": time.time(),
-                }) + "\n"
-                return
-
-            # Try to parse as JSON (audio pipeline emits JSON progress)
-            try:
-                data = json.loads(line)
-                # Pass through JSON lines from the pipeline
-                yield line + "\n"
-            except json.JSONDecodeError:
-                # For plain log lines, wrap them
-                if line.startswith('['):
-                    # Looks like a log line [INFO] or [ERROR]
-                    yield json.dumps({
-                        "phase": "log",
-                        "progress": 0,
-                        "message": line,
-                        "timestamp": time.time(),
-                    }) + "\n"
-                else:
-                    # Other output
-                    yield json.dumps({
-                        "phase": "log",
-                        "progress": 0,
-                        "message": line,
-                        "timestamp": time.time(),
-                    }) + "\n"
-
-        # Wait for process to complete
-        process.wait()
-        elapsed = time.time() - start_time
-
-        if process.returncode == 0:
-            yield json.dumps({
-                "phase": "complete",
-                "progress": 1.0,
-                "message": f"Audio pipeline completed in {elapsed:.1f}s",
-                "timestamp": time.time(),
-            }) + "\n"
-        else:
-            yield json.dumps({
-                "phase": "error",
-                "progress": 0,
-                "message": f"Audio pipeline failed with exit code {process.returncode}",
-                "timestamp": time.time(),
-            }) + "\n"
-
-    except Exception as e:
-        LOGGER.exception(f"Audio pipeline streaming error: {e}")
-        yield json.dumps({
-            "phase": "error",
-            "progress": 0,
-            "message": f"Audio pipeline error: {e}",
-            "timestamp": time.time(),
-        }) + "\n"
-
-
 # =============================================================================
 # Request/Response Models
 # =============================================================================
@@ -162,7 +38,7 @@ def _stream_audio_pipeline(
 class AudioPipelineRequest(BaseModel):
     """Request to start audio pipeline."""
     ep_id: str = Field(..., description="Episode identifier")
-    run_mode: Literal["queue", "local"] = Field(
+    run_mode: Literal["queue", "local", "redis"] = Field(
         "queue",
         description="Run mode: 'queue' for Celery, 'local' for synchronous",
     )
@@ -171,6 +47,28 @@ class AudioPipelineRequest(BaseModel):
         None,
         description="Override ASR provider (gemini_3 and gemini are equivalent)",
     )
+
+
+class AudioFilesRequest(BaseModel):
+    """Request for Phase 1: Create audio files."""
+    ep_id: str = Field(..., description="Episode identifier")
+    overwrite: bool = Field(False, description="Overwrite existing artifacts")
+
+
+class DiarizeTranscribeRequest(BaseModel):
+    """Request for Phase 2: Diarization + Transcription."""
+    ep_id: str = Field(..., description="Episode identifier")
+    asr_provider: Optional[Literal["openai_whisper", "gemini_3"]] = Field(
+        None,
+        description="Override ASR provider",
+    )
+    overwrite: bool = Field(False, description="Overwrite existing artifacts")
+
+
+class FinalizeTranscriptRequest(BaseModel):
+    """Request for Phase 4: Finalize transcript."""
+    ep_id: str = Field(..., description="Episode identifier")
+    overwrite: bool = Field(False, description="Overwrite existing artifacts")
 
 
 class AudioPipelineResponse(BaseModel):
@@ -233,6 +131,7 @@ def _get_audio_paths(ep_id: str) -> dict:
         "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
         "qc": manifests_dir / "audio_qc.json",
+        "archived_segments": manifests_dir / "audio_archived_segments.json",
     }
 
 
@@ -271,6 +170,15 @@ def _load_qc_status(ep_id: str) -> tuple[str, dict]:
         return "error", {}
 
 
+def _normalize_run_mode(run_mode: Optional[str]) -> str:
+    """Normalize run mode values (treat 'redis' as 'queue')."""
+    if not run_mode:
+        return "local"
+    if run_mode == "redis":
+        return "queue"
+    return run_mode
+
+
 # =============================================================================
 # API Endpoints
 # =============================================================================
@@ -296,6 +204,8 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
     Returns:
         AudioPipelineResponse with job_id and status
     """
+    run_mode = _normalize_run_mode(req.run_mode)
+
     # Validate episode exists
     video_path = get_path(req.ep_id, "video")
     if not video_path.exists():
@@ -304,7 +214,7 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
             detail=f"Video not found for episode {req.ep_id}. Mirror from S3 first.",
         )
 
-    if req.run_mode == "queue":
+    if run_mode == "queue":
         # Normalize provider before Celery chain (gemini → gemini_3)
         asr_provider = req.asr_provider
         if asr_provider == "gemini":
@@ -331,7 +241,7 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
                 job_id=result.get("job_id"),
                 status="queued",
                 ep_id=req.ep_id,
-                run_mode="queue",
+                run_mode=run_mode,
             )
 
         except Exception as e:
@@ -343,6 +253,12 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
 
     else:
         # Run locally via streaming subprocess for real-time logs
+        # Uses shared infrastructure that:
+        # - Registers job with PID for cancel support
+        # - Kills subprocess on client disconnect (page refresh)
+        # - Properly cleans up on completion
+        from apps.api.routers.celery_jobs import _stream_local_subprocess
+
         # Normalize ASR provider name (API uses gemini_3, CLI uses gemini)
         asr_provider = req.asr_provider or "openai_whisper"
         if asr_provider == "gemini_3":
@@ -365,9 +281,19 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
         progress_file = manifests_dir / "audio_progress.json"
         command.extend(["--progress-file", str(progress_file)])
 
+        # Options for job tracking
+        options = {
+            "asr_provider": asr_provider,
+            "overwrite": req.overwrite,
+        }
+
         # Return streaming response for live log updates
+        # Uses _stream_local_subprocess which:
+        # - Registers job with PID (enables cancel button)
+        # - Handles GeneratorExit on client disconnect
+        # - Uses process groups to kill child processes
         return StreamingResponse(
-            _stream_audio_pipeline(command, req.ep_id),
+            _stream_local_subprocess(command, req.ep_id, "audio_pipeline", options, timeout=7200),
             media_type="application/x-ndjson",
             headers={
                 "X-Content-Type-Options": "nosniff",
@@ -621,3 +547,2603 @@ async def assign_voice_cluster(
             status_code=500,
             detail=f"Failed to assign voice cluster: {e}",
         )
+
+
+# =============================================================================
+# Phased Pipeline Endpoints
+# =============================================================================
+
+
+@router.post("/episode_audio_files", response_model=AudioPipelineResponse)
+async def start_audio_files(req: AudioFilesRequest) -> AudioPipelineResponse:
+    """Phase 1: Create audio files (extract, separate, enhance).
+
+    Args:
+        req: Request with ep_id and options
+
+    Returns:
+        AudioPipelineResponse with job_id and status
+    """
+    # Validate episode exists
+    video_path = get_path(req.ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video not found for episode {req.ep_id}. Mirror from S3 first.",
+        )
+
+    try:
+        from apps.api.jobs_audio import episode_audio_files_async
+
+        result = episode_audio_files_async(
+            req.ep_id,
+            overwrite=req.overwrite,
+        )
+
+        if result.get("status") == "error":
+            return AudioPipelineResponse(
+                status="error",
+                ep_id=req.ep_id,
+                error=result.get("error"),
+            )
+
+        return AudioPipelineResponse(
+            job_id=result.get("job_id"),
+            status="queued",
+            ep_id=req.ep_id,
+            run_mode="queue",
+        )
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to queue audio files job: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to queue audio files job: {e}",
+        )
+
+
+@router.post("/episode_audio_diarize_transcribe", response_model=AudioPipelineResponse)
+async def start_diarize_transcribe(req: DiarizeTranscribeRequest) -> AudioPipelineResponse:
+    """Phase 2: Diarization + Transcription + Initial Clustering.
+
+    Args:
+        req: Request with ep_id, asr_provider, and options
+
+    Returns:
+        AudioPipelineResponse with job_id and status
+    """
+    # Validate audio files exist
+    paths = _get_audio_paths(req.ep_id)
+    if not paths["audio_vocals"].exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio files not found for episode {req.ep_id}. Run 'Create Audio Files' first.",
+        )
+
+    try:
+        from apps.api.jobs_audio import episode_audio_diarize_transcribe_async
+
+        result = episode_audio_diarize_transcribe_async(
+            req.ep_id,
+            asr_provider=req.asr_provider,
+            overwrite=req.overwrite,
+        )
+
+        if result.get("status") == "error":
+            return AudioPipelineResponse(
+                status="error",
+                ep_id=req.ep_id,
+                error=result.get("error"),
+            )
+
+        return AudioPipelineResponse(
+            job_id=result.get("job_id"),
+            status="queued",
+            ep_id=req.ep_id,
+            run_mode="queue",
+        )
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to queue diarize/transcribe job: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to queue diarize/transcribe job: {e}",
+        )
+
+
+@router.post("/episode_audio_finalize", response_model=AudioPipelineResponse)
+async def start_finalize_transcript(req: FinalizeTranscriptRequest) -> AudioPipelineResponse:
+    """Phase 4: Finalize transcript (align -> export -> qc).
+
+    Args:
+        req: Request with ep_id and options
+
+    Returns:
+        AudioPipelineResponse with job_id and status
+    """
+    # Validate prerequisites exist
+    paths = _get_audio_paths(req.ep_id)
+    if not paths["diarization"].exists() or not paths["asr_raw"].exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Diarization or ASR not found for episode {req.ep_id}. Run 'Diarization + Transcription' first.",
+        )
+
+    try:
+        from apps.api.jobs_audio import episode_audio_finalize_async
+
+        result = episode_audio_finalize_async(
+            req.ep_id,
+            overwrite=req.overwrite,
+        )
+
+        if result.get("status") == "error":
+            return AudioPipelineResponse(
+                status="error",
+                ep_id=req.ep_id,
+                error=result.get("error"),
+            )
+
+        return AudioPipelineResponse(
+            job_id=result.get("job_id"),
+            status="queued",
+            ep_id=req.ep_id,
+            run_mode="queue",
+        )
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to queue finalize job: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to queue finalize job: {e}",
+        )
+
+
+# =============================================================================
+# Voice Cluster Management Endpoints
+# =============================================================================
+
+
+class SegmentMoveRequest(BaseModel):
+    """Request to move a segment to a different cluster."""
+    segment_start: float = Field(..., description="Segment start time in seconds")
+    segment_end: float = Field(..., description="Segment end time in seconds")
+    from_cluster_id: str = Field(..., description="Current cluster ID")
+    to_cluster_id: str = Field(..., description="Target cluster ID")
+
+
+class ClusterMergeRequest(BaseModel):
+    """Request to merge two clusters."""
+    source_cluster_id: str = Field(..., description="Cluster to merge from (will be deleted)")
+    target_cluster_id: str = Field(..., description="Cluster to merge into")
+
+
+class ClusterCreateRequest(BaseModel):
+    """Request to create a new cluster from segments."""
+    segments: list = Field(..., description="List of segments [{start, end, from_cluster_id}]")
+    new_cluster_label: Optional[str] = Field(None, description="Optional label for new cluster")
+
+
+class SegmentSplitRequest(BaseModel):
+    """Request to split a segment into multiple based on ASR boundaries."""
+    cluster_id: str = Field(..., description="Cluster containing the segment")
+    segment_start: float = Field(..., description="Original segment start time")
+    segment_end: float = Field(..., description="Original segment end time")
+    split_points: List[Dict] = Field(
+        ...,
+        description="List of new segment boundaries [{start, end}, ...]",
+    )
+
+
+class SmartSplitRequest(BaseModel):
+    """Request for smart split that uses voice embeddings to assign segments."""
+    cluster_id: str = Field(..., description="Cluster containing the segment")
+    segment_start: float = Field(..., description="Original segment start time")
+    segment_end: float = Field(..., description="Original segment end time")
+    split_points: List[Dict] = Field(
+        ...,
+        description="List of new segment boundaries [{start, end}, ...]",
+    )
+    auto_assign: bool = Field(
+        True,
+        description="If True, automatically assign to best matching cluster; if False, keep all in original cluster",
+    )
+    min_similarity: float = Field(
+        0.65,
+        ge=0.0,
+        le=1.0,
+        description="Minimum similarity threshold for auto-assignment",
+    )
+
+
+class ClusterReclusterRequest(BaseModel):
+    """Request to re-run clustering with different parameters."""
+    similarity_threshold: float = Field(0.35, ge=0.1, le=0.9, description="Similarity threshold")
+    min_segments_per_cluster: int = Field(1, ge=1, description="Minimum segments per cluster")
+    run_mode: Literal["queue", "local", "redis"] = Field(
+        "local",
+        description="Execution mode: 'queue' for Celery background job, 'local' for streaming subprocess",
+    )
+
+
+class SegmentAssignCastRequest(BaseModel):
+    """Request to move a segment to a new cluster and assign it to a cast member."""
+    segment_start: float = Field(..., description="Segment start time in seconds")
+    segment_end: float = Field(..., description="Segment end time in seconds")
+    from_cluster_id: str = Field(..., description="Current cluster ID")
+    cast_id: str = Field(..., description="Cast member ID to assign the new cluster to")
+
+
+@router.post("/episodes/{ep_id}/audio/segments/move")
+async def move_segment(ep_id: str, req: SegmentMoveRequest) -> dict:
+    """Move a segment from one cluster to another.
+
+    Args:
+        ep_id: Episode identifier
+        req: Move request with segment times and cluster IDs
+
+    Returns:
+        Success status and updated cluster info
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    try:
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        # Find source and target clusters
+        source_cluster = None
+        target_cluster = None
+        segment_to_move = None
+
+        for cluster in clusters:
+            if cluster["voice_cluster_id"] == req.from_cluster_id:
+                source_cluster = cluster
+                # Find the segment
+                for seg in cluster["segments"]:
+                    if abs(seg["start"] - req.segment_start) < 0.1 and abs(seg["end"] - req.segment_end) < 0.1:
+                        segment_to_move = seg
+                        break
+            if cluster["voice_cluster_id"] == req.to_cluster_id:
+                target_cluster = cluster
+
+        if not source_cluster:
+            raise HTTPException(status_code=404, detail=f"Source cluster {req.from_cluster_id} not found")
+        if not target_cluster:
+            raise HTTPException(status_code=404, detail=f"Target cluster {req.to_cluster_id} not found")
+        if not segment_to_move:
+            raise HTTPException(status_code=404, detail="Segment not found in source cluster")
+
+        # Move segment
+        source_cluster["segments"].remove(segment_to_move)
+        target_cluster["segments"].append(segment_to_move)
+
+        # Update totals
+        seg_duration = segment_to_move["end"] - segment_to_move["start"]
+        source_cluster["segment_count"] = len(source_cluster["segments"])
+        source_cluster["total_duration"] = sum(s["end"] - s["start"] for s in source_cluster["segments"])
+        target_cluster["segment_count"] = len(target_cluster["segments"])
+        target_cluster["total_duration"] = sum(s["end"] - s["start"] for s in target_cluster["segments"])
+
+        # Save
+        with clusters_path.open("w", encoding="utf-8") as f:
+            json.dump(clusters, f, indent=2)
+
+        return {
+            "success": True,
+            "source_cluster": {
+                "id": source_cluster["voice_cluster_id"],
+                "segment_count": source_cluster["segment_count"],
+            },
+            "target_cluster": {
+                "id": target_cluster["voice_cluster_id"],
+                "segment_count": target_cluster["segment_count"],
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to move segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/segments/split")
+async def split_segment(ep_id: str, req: SegmentSplitRequest) -> dict:
+    """Split a segment into multiple segments based on ASR boundaries.
+
+    This is useful when a diarization segment contains multiple speakers
+    and needs to be split so each speaker's portion can be assigned correctly.
+
+    Args:
+        ep_id: Episode identifier
+        req: Split request with cluster_id, original segment bounds, and split points
+
+    Returns:
+        Success status and new segment details
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    if not req.split_points or len(req.split_points) < 1:
+        raise HTTPException(status_code=400, detail="At least one split point is required")
+
+    try:
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        # Find the cluster
+        target_cluster = None
+        for cluster in clusters:
+            if cluster["voice_cluster_id"] == req.cluster_id:
+                target_cluster = cluster
+                break
+
+        if not target_cluster:
+            raise HTTPException(status_code=404, detail=f"Cluster {req.cluster_id} not found")
+
+        # Find the segment to split
+        segment_to_split = None
+        segment_idx = -1
+        for idx, seg in enumerate(target_cluster["segments"]):
+            if abs(seg["start"] - req.segment_start) < 0.1 and abs(seg["end"] - req.segment_end) < 0.1:
+                segment_to_split = seg
+                segment_idx = idx
+                break
+
+        if segment_to_split is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Segment at {req.segment_start}-{req.segment_end} not found in cluster {req.cluster_id}",
+            )
+
+        # Get diar_speaker from original segment
+        diar_speaker = segment_to_split.get("diar_speaker", "SPEAKER_00")
+
+        # Create new segments from split points
+        new_segments = []
+        for sp in req.split_points:
+            new_seg = {
+                "start": sp["start"],
+                "end": sp["end"],
+                "diar_speaker": diar_speaker,
+            }
+            new_segments.append(new_seg)
+
+        # Remove old segment and insert new ones at the same position
+        target_cluster["segments"].pop(segment_idx)
+        for i, new_seg in enumerate(new_segments):
+            target_cluster["segments"].insert(segment_idx + i, new_seg)
+
+        # Update cluster stats
+        target_cluster["segment_count"] = len(target_cluster["segments"])
+        target_cluster["total_duration"] = sum(s["end"] - s["start"] for s in target_cluster["segments"])
+
+        # Save
+        with clusters_path.open("w", encoding="utf-8") as f:
+            json.dump(clusters, f, indent=2)
+
+        return {
+            "success": True,
+            "cluster_id": req.cluster_id,
+            "original_segment": {
+                "start": req.segment_start,
+                "end": req.segment_end,
+            },
+            "new_segments": new_segments,
+            "new_segment_count": target_cluster["segment_count"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to split segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/segments/smart_split")
+async def smart_split_segment(ep_id: str, req: SmartSplitRequest) -> dict:
+    """Smart split that extracts voice embeddings and assigns segments to best matching clusters.
+
+    This is useful when a segment contains multiple speakers. For each sub-segment:
+    1. Extract voice embedding using pyannote
+    2. Compare against all cluster centroids
+    3. Assign to best matching cluster (if above min_similarity threshold)
+
+    Args:
+        ep_id: Episode identifier
+        req: Smart split request with cluster_id, segment bounds, split points, and options
+
+    Returns:
+        Success status, assignments made, and any segments that stayed in original cluster
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    if not req.split_points or len(req.split_points) < 1:
+        raise HTTPException(status_code=400, detail="At least one split point is required")
+
+    # Find audio file for embedding extraction
+    audio_path = paths["audio_vocals_enhanced"]
+    if not audio_path.exists():
+        audio_path = paths["audio_vocals"]
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio files not found for embedding extraction")
+
+    try:
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        # Find the source cluster
+        source_cluster = None
+        for cluster in clusters:
+            if cluster["voice_cluster_id"] == req.cluster_id:
+                source_cluster = cluster
+                break
+
+        if not source_cluster:
+            raise HTTPException(status_code=404, detail=f"Cluster {req.cluster_id} not found")
+
+        # Find the segment to split
+        segment_to_split = None
+        segment_idx = -1
+        for idx, seg in enumerate(source_cluster["segments"]):
+            if abs(seg["start"] - req.segment_start) < 0.1 and abs(seg["end"] - req.segment_end) < 0.1:
+                segment_to_split = seg
+                segment_idx = idx
+                break
+
+        if segment_to_split is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Segment at {req.segment_start}-{req.segment_end} not found in cluster {req.cluster_id}",
+            )
+
+        # Get diar_speaker from original segment
+        diar_speaker = segment_to_split.get("diar_speaker", "SPEAKER_00")
+
+        # Remove the original segment from source cluster
+        source_cluster["segments"].pop(segment_idx)
+
+        # Build lookup of cluster centroids (cluster_id -> normalized centroid)
+        cluster_centroids = {}
+        for cluster in clusters:
+            if cluster.get("centroid"):
+                import numpy as np
+                centroid = np.array(cluster["centroid"])
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid = centroid / norm
+                cluster_centroids[cluster["voice_cluster_id"]] = centroid
+
+        # Extract embeddings for each sub-segment and determine assignments
+        assignments = []  # List of {split_point, assigned_cluster_id, similarity}
+        segments_by_cluster = {}  # cluster_id -> list of new segments
+
+        if req.auto_assign and cluster_centroids:
+            # Try to import pyannote for embedding extraction
+            try:
+                import numpy as np
+                import soundfile as sf
+                from py_screenalytics.audio.diarization_pyannote import _get_embedding_model
+
+                # Load audio
+                audio_data, sample_rate = sf.read(audio_path)
+                if len(audio_data.shape) > 1:
+                    audio_data = np.mean(audio_data, axis=1)
+
+                # Get embedding model
+                embedding_model = _get_embedding_model()
+
+                # Try to get Inference class
+                try:
+                    from pyannote.audio import Inference
+                    inference = Inference(embedding_model, window="whole")
+                except ImportError:
+                    inference = None
+                    LOGGER.warning("pyannote.audio not available - falling back to basic split")
+
+                if inference:
+                    import torch
+
+                    for sp in req.split_points:
+                        sp_start = sp["start"]
+                        sp_end = sp["end"]
+
+                        # Extract audio for this sub-segment
+                        start_sample = int(sp_start * sample_rate)
+                        end_sample = int(sp_end * sample_rate)
+                        segment_audio = audio_data[start_sample:end_sample]
+
+                        # Skip very short segments (< 0.3s)
+                        if len(segment_audio) < sample_rate * 0.3:
+                            LOGGER.debug(f"Segment {sp_start:.2f}-{sp_end:.2f} too short for embedding")
+                            # Keep in original cluster
+                            if req.cluster_id not in segments_by_cluster:
+                                segments_by_cluster[req.cluster_id] = []
+                            segments_by_cluster[req.cluster_id].append({
+                                "start": sp_start,
+                                "end": sp_end,
+                                "diar_speaker": diar_speaker,
+                            })
+                            assignments.append({
+                                "start": sp_start,
+                                "end": sp_end,
+                                "assigned_cluster_id": req.cluster_id,
+                                "similarity": None,
+                                "reason": "segment_too_short",
+                            })
+                            continue
+
+                        # Get embedding
+                        try:
+                            segment_tensor = torch.from_numpy(segment_audio).float().unsqueeze(0)
+                            embedding = inference({"waveform": segment_tensor, "sample_rate": sample_rate})
+                            embedding = np.array(embedding)
+
+                            # Normalize embedding
+                            norm = np.linalg.norm(embedding)
+                            if norm > 0:
+                                embedding = embedding / norm
+
+                            # Find best matching cluster
+                            best_cluster_id = req.cluster_id
+                            best_similarity = 0.0
+
+                            for cid, centroid in cluster_centroids.items():
+                                sim = float(np.dot(embedding, centroid))
+                                if sim > best_similarity:
+                                    best_similarity = sim
+                                    best_cluster_id = cid
+
+                            # Only assign if above threshold
+                            if best_similarity >= req.min_similarity:
+                                assigned_cluster_id = best_cluster_id
+                                reason = "embedding_match"
+                            else:
+                                assigned_cluster_id = req.cluster_id
+                                reason = "below_threshold"
+
+                            if assigned_cluster_id not in segments_by_cluster:
+                                segments_by_cluster[assigned_cluster_id] = []
+                            segments_by_cluster[assigned_cluster_id].append({
+                                "start": sp_start,
+                                "end": sp_end,
+                                "diar_speaker": diar_speaker,
+                            })
+                            assignments.append({
+                                "start": sp_start,
+                                "end": sp_end,
+                                "assigned_cluster_id": assigned_cluster_id,
+                                "similarity": round(best_similarity, 3),
+                                "reason": reason,
+                            })
+
+                        except Exception as emb_err:
+                            LOGGER.warning(f"Failed to extract embedding for {sp_start:.2f}-{sp_end:.2f}: {emb_err}")
+                            # Keep in original cluster
+                            if req.cluster_id not in segments_by_cluster:
+                                segments_by_cluster[req.cluster_id] = []
+                            segments_by_cluster[req.cluster_id].append({
+                                "start": sp_start,
+                                "end": sp_end,
+                                "diar_speaker": diar_speaker,
+                            })
+                            assignments.append({
+                                "start": sp_start,
+                                "end": sp_end,
+                                "assigned_cluster_id": req.cluster_id,
+                                "similarity": None,
+                                "reason": "embedding_error",
+                            })
+                else:
+                    # No inference available, keep all in original
+                    for sp in req.split_points:
+                        if req.cluster_id not in segments_by_cluster:
+                            segments_by_cluster[req.cluster_id] = []
+                        segments_by_cluster[req.cluster_id].append({
+                            "start": sp["start"],
+                            "end": sp["end"],
+                            "diar_speaker": diar_speaker,
+                        })
+                        assignments.append({
+                            "start": sp["start"],
+                            "end": sp["end"],
+                            "assigned_cluster_id": req.cluster_id,
+                            "similarity": None,
+                            "reason": "no_inference",
+                        })
+
+            except ImportError as ie:
+                LOGGER.warning(f"Cannot import embedding dependencies: {ie}")
+                # Fall back to basic split (all in original cluster)
+                for sp in req.split_points:
+                    if req.cluster_id not in segments_by_cluster:
+                        segments_by_cluster[req.cluster_id] = []
+                    segments_by_cluster[req.cluster_id].append({
+                        "start": sp["start"],
+                        "end": sp["end"],
+                        "diar_speaker": diar_speaker,
+                    })
+                    assignments.append({
+                        "start": sp["start"],
+                        "end": sp["end"],
+                        "assigned_cluster_id": req.cluster_id,
+                        "similarity": None,
+                        "reason": "import_error",
+                    })
+        else:
+            # No auto-assign or no centroids - keep all in original cluster
+            for sp in req.split_points:
+                if req.cluster_id not in segments_by_cluster:
+                    segments_by_cluster[req.cluster_id] = []
+                segments_by_cluster[req.cluster_id].append({
+                    "start": sp["start"],
+                    "end": sp["end"],
+                    "diar_speaker": diar_speaker,
+                })
+                assignments.append({
+                    "start": sp["start"],
+                    "end": sp["end"],
+                    "assigned_cluster_id": req.cluster_id,
+                    "similarity": None,
+                    "reason": "auto_assign_disabled" if not req.auto_assign else "no_centroids",
+                })
+
+        # Add new segments to their assigned clusters
+        for cluster in clusters:
+            cid = cluster["voice_cluster_id"]
+            if cid in segments_by_cluster:
+                cluster["segments"].extend(segments_by_cluster[cid])
+                cluster["segment_count"] = len(cluster["segments"])
+                cluster["total_duration"] = sum(s["end"] - s["start"] for s in cluster["segments"])
+
+        # Save updated clusters
+        with clusters_path.open("w", encoding="utf-8") as f:
+            json.dump(clusters, f, indent=2)
+
+        # Update voice mapping to reflect new cluster segment counts and suggest cast
+        mapping_path = paths["voice_mapping"]
+        voice_bank_suggestions = []
+
+        if mapping_path.exists():
+            try:
+                with mapping_path.open("r", encoding="utf-8") as f:
+                    mappings = json.load(f)
+
+                # Update segment counts in mappings
+                cluster_info = {c["voice_cluster_id"]: c for c in clusters}
+                for m in mappings:
+                    cid = m.get("voice_cluster_id", "")
+                    if cid in cluster_info:
+                        m["segment_count"] = cluster_info[cid].get("segment_count", 0)
+                        m["total_duration"] = cluster_info[cid].get("total_duration", 0)
+
+                # Save updated mappings
+                with mapping_path.open("w", encoding="utf-8") as f:
+                    json.dump(mappings, f, indent=2)
+
+                # Check voice bank for cast suggestions on newly assigned clusters
+                data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+                voice_bank_dir = data_root / "voice_bank"
+
+                if voice_bank_dir.exists():
+                    # Extract show_id from ep_id (e.g., rhoslc-s06e02 -> rhoslc)
+                    show_id = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
+                    show_bank_path = voice_bank_dir / show_id / "voice_bank.json"
+
+                    if show_bank_path.exists():
+                        with show_bank_path.open("r", encoding="utf-8") as f:
+                            voice_bank = json.load(f)
+
+                        # For each cluster that received new segments, suggest cast matches
+                        for cid in segments_by_cluster.keys():
+                            cluster = cluster_info.get(cid, {})
+                            centroid = cluster.get("centroid")
+                            if not centroid:
+                                continue
+
+                            import numpy as np
+                            cluster_emb = np.array(centroid)
+                            norm = np.linalg.norm(cluster_emb)
+                            if norm > 0:
+                                cluster_emb = cluster_emb / norm
+
+                            # Compare against voice bank entries
+                            best_match = None
+                            best_sim = 0.0
+
+                            for entry in voice_bank.get("entries", []):
+                                bank_emb = entry.get("embedding")
+                                if not bank_emb:
+                                    continue
+                                bank_emb = np.array(bank_emb)
+                                bnorm = np.linalg.norm(bank_emb)
+                                if bnorm > 0:
+                                    bank_emb = bank_emb / bnorm
+                                sim = float(np.dot(cluster_emb, bank_emb))
+                                if sim > best_sim and sim >= 0.7:
+                                    best_sim = sim
+                                    best_match = entry
+
+                            if best_match:
+                                voice_bank_suggestions.append({
+                                    "cluster_id": cid,
+                                    "suggested_cast_id": best_match.get("cast_id"),
+                                    "suggested_name": best_match.get("name", best_match.get("cast_id")),
+                                    "similarity": round(best_sim, 3),
+                                })
+            except Exception as mapping_err:
+                LOGGER.warning(f"Failed to update mappings after smart split: {mapping_err}")
+
+        # Count how many went to other clusters vs stayed
+        moved_count = sum(1 for a in assignments if a["assigned_cluster_id"] != req.cluster_id)
+        stayed_count = len(assignments) - moved_count
+
+        return {
+            "success": True,
+            "original_cluster_id": req.cluster_id,
+            "original_segment": {
+                "start": req.segment_start,
+                "end": req.segment_end,
+            },
+            "assignments": assignments,
+            "moved_to_other_clusters": moved_count,
+            "stayed_in_original": stayed_count,
+            "total_new_segments": len(assignments),
+            "voice_bank_suggestions": voice_bank_suggestions,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to smart split segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/clusters/merge")
+async def merge_clusters(ep_id: str, req: ClusterMergeRequest) -> dict:
+    """Merge one cluster into another.
+
+    Args:
+        ep_id: Episode identifier
+        req: Merge request with source and target cluster IDs
+
+    Returns:
+        Success status and merged cluster info
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    try:
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        source_cluster = None
+        target_cluster = None
+        source_idx = -1
+
+        for i, cluster in enumerate(clusters):
+            if cluster["voice_cluster_id"] == req.source_cluster_id:
+                source_cluster = cluster
+                source_idx = i
+            if cluster["voice_cluster_id"] == req.target_cluster_id:
+                target_cluster = cluster
+
+        if not source_cluster:
+            raise HTTPException(status_code=404, detail=f"Source cluster {req.source_cluster_id} not found")
+        if not target_cluster:
+            raise HTTPException(status_code=404, detail=f"Target cluster {req.target_cluster_id} not found")
+
+        # Merge segments
+        target_cluster["segments"].extend(source_cluster["segments"])
+        target_cluster["segment_count"] = len(target_cluster["segments"])
+        target_cluster["total_duration"] = sum(s["end"] - s["start"] for s in target_cluster["segments"])
+
+        # Remove source cluster
+        clusters.pop(source_idx)
+
+        # Save
+        with clusters_path.open("w", encoding="utf-8") as f:
+            json.dump(clusters, f, indent=2)
+
+        return {
+            "success": True,
+            "merged_cluster": {
+                "id": target_cluster["voice_cluster_id"],
+                "segment_count": target_cluster["segment_count"],
+                "total_duration": target_cluster["total_duration"],
+            },
+            "deleted_cluster_id": req.source_cluster_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to merge clusters: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TranscribeOnlyRequest(BaseModel):
+    """Request to re-run transcription only."""
+    asr_provider: Optional[Literal["openai_whisper", "gemini_3"]] = Field(
+        None, description="ASR provider"
+    )
+    run_mode: Literal["queue", "local", "redis"] = Field(
+        "local",
+        description="Execution mode: 'queue' for Celery background job, 'local' for streaming subprocess",
+    )
+
+
+@router.post("/episodes/{ep_id}/audio/transcribe_only")
+async def transcribe_only(ep_id: str, req: TranscribeOnlyRequest):
+    """Re-run only the transcription stage without re-doing diarization.
+
+    Useful when you want to try a different ASR provider or fix transcription
+    issues without losing existing diarization work.
+
+    Supports two modes:
+    - local: Runs as streaming subprocess with real-time logs (default)
+    - queue: Queues as Celery task (not yet implemented, falls back to sync)
+
+    Args:
+        ep_id: Episode identifier
+        req: Transcription options
+
+    Returns:
+        StreamingResponse for local mode, or result dict for queue mode
+    """
+    paths = _get_audio_paths(ep_id)
+
+    if not paths["diarization"].exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Diarization not found. Run full diarization first.",
+        )
+
+    audio_path = paths["audio_vocals_enhanced"]
+    if not audio_path.exists():
+        audio_path = paths["audio_vocals"]
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio files not found")
+
+    asr_provider = req.asr_provider or "openai_whisper"
+    # Normalize provider alias for downstream components
+    provider = "gemini_3" if asr_provider in ("gemini", "gemini_3") else "openai_whisper"
+    run_mode = _normalize_run_mode(req.run_mode or "local")
+
+    if run_mode == "local":
+        # Run locally via streaming subprocess for real-time logs
+        from apps.api.routers.celery_jobs import _stream_local_subprocess
+
+        # Normalize provider name for CLI
+        cli_provider = "gemini" if asr_provider == "gemini_3" else asr_provider
+
+        # Build command for transcribe-only
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "audio_pipeline_run.py"),
+            "--ep-id", ep_id,
+            "--transcribe-only",
+            "--asr-provider", cli_provider,
+        ]
+
+        # Options for job tracking
+        options = {
+            "asr_provider": asr_provider,
+            "operation_type": "transcribe_only",
+        }
+
+        # Return streaming response for live log updates
+        return StreamingResponse(
+            _stream_local_subprocess(command, ep_id, "transcribe_only", options, timeout=3600),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    # Queue mode (Celery) - fall back to sync for now
+    try:
+        from py_screenalytics.audio.asr_openai import transcribe_audio as transcribe_openai
+        from py_screenalytics.audio.asr_gemini import transcribe_audio as transcribe_gemini
+        from py_screenalytics.audio.episode_audio_pipeline import _load_config
+
+        # Use YAML-backed config so chunking/model options stay in sync with pipeline
+        asr_config = _load_config().asr
+        asr_config = asr_config.model_copy(update={"provider": provider})
+
+        LOGGER.info(f"Re-running transcription for {ep_id} with {provider}")
+
+        if provider == "gemini_3":
+            segments = transcribe_gemini(
+                audio_path,
+                paths["asr_raw"],
+                asr_config,
+                overwrite=True,
+            )
+        else:
+            segments = transcribe_openai(
+                audio_path,
+                paths["asr_raw"],
+                asr_config,
+                overwrite=True,
+            )
+
+        return {
+            "success": True,
+            "ep_id": ep_id,
+            "provider": provider,
+            "segment_count": len(segments),
+            "output_path": str(paths["asr_raw"]),
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to re-run transcription: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DiarizeOnlyRequest(BaseModel):
+    """Request body for re-running diarization."""
+    num_speakers: Optional[int] = Field(
+        None,
+        description="Force exact speaker count. If None, uses min/max from config.",
+    )
+    run_mode: Literal["queue", "local", "redis"] = Field(
+        "local",
+        description="Execution mode: 'queue' for Celery background job, 'local' for streaming subprocess",
+    )
+
+
+@router.post("/episodes/{ep_id}/audio/diarize_only")
+async def diarize_only(ep_id: str, req: Optional[DiarizeOnlyRequest] = None):
+    """Re-run only the diarization stage without re-doing separation/enhancement.
+
+    Useful for fixing speaker segmentation issues.
+
+    Supports two modes:
+    - local: Runs as streaming subprocess with real-time logs (default)
+    - queue: Queues as Celery task (not yet implemented, falls back to local)
+
+    Args:
+        ep_id: Episode identifier
+        req: Optional request body with num_speakers override and run_mode
+
+    Returns:
+        StreamingResponse for local mode, or result dict for queue mode
+    """
+    paths = _get_audio_paths(ep_id)
+
+    audio_path = paths["audio_vocals_enhanced"]
+    if not audio_path.exists():
+        audio_path = paths["audio_vocals"]
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio files not found")
+
+    # Determine run mode (default to local for real-time feedback)
+    run_mode = _normalize_run_mode((req and req.run_mode) or "local")
+    num_speakers = (req and req.num_speakers) or None
+
+    if run_mode == "local":
+        # Run locally via streaming subprocess for real-time logs
+        from apps.api.routers.celery_jobs import _stream_local_subprocess
+
+        # Build command for diarize-only
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "audio_pipeline_run.py"),
+            "--ep-id", ep_id,
+            "--diarize-only",
+        ]
+        if num_speakers is not None:
+            command.extend(["--num-speakers", str(num_speakers)])
+
+        # Options for job tracking
+        options = {
+            "num_speakers": num_speakers,
+            "operation_type": "diarize_only",
+        }
+
+        # Return streaming response for live log updates
+        return StreamingResponse(
+            _stream_local_subprocess(command, ep_id, "diarize_only", options, timeout=3600),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    # Queue mode (Celery) - fall back to sync for now
+    # TODO: Implement Celery task for diarize_only
+    from apps.api.jobs_audio import _write_progress, _write_progress_complete, _write_progress_error
+
+    try:
+        _write_progress(ep_id, "diarize", "Starting re-diarization...", 0.0)
+
+        from py_screenalytics.audio.diarization_pyannote import run_diarization
+        from py_screenalytics.audio.episode_audio_pipeline import _load_config
+
+        # Load config from yaml for proper defaults
+        pipeline_config = _load_config()
+        config = pipeline_config.diarization
+
+        # Apply num_speakers override if provided
+        if num_speakers is not None:
+            config = config.model_copy(update={"num_speakers": num_speakers})
+            LOGGER.info(f"Re-running diarization for {ep_id} with forced num_speakers={num_speakers}")
+            _write_progress(ep_id, "diarize", f"Running diarization (forcing {num_speakers} speakers)...", 0.2)
+        else:
+            LOGGER.info(f"Re-running diarization for {ep_id} with auto speaker detection")
+            _write_progress(ep_id, "diarize", "Running diarization (auto speaker detection)...", 0.2)
+
+        segments = run_diarization(
+            audio_path,
+            paths["diarization"],
+            config,
+            overwrite=True,
+        )
+
+        speakers = set(s.speaker for s in segments)
+
+        _write_progress_complete(ep_id, f"Re-diarization complete: {len(speakers)} speakers, {len(segments)} segments")
+
+        return {
+            "success": True,
+            "ep_id": ep_id,
+            "segment_count": len(segments),
+            "speaker_count": len(speakers),
+            "output_path": str(paths["diarization"]),
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to re-run diarization: {e}")
+        _write_progress_error(ep_id, "diarize", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/voices_only")
+async def voices_only(ep_id: str, req: ClusterReclusterRequest) -> dict:
+    """Re-run only the voice clustering stage.
+
+    Same as recluster but with a clearer name for the incremental pipeline.
+
+    Args:
+        ep_id: Episode identifier
+        req: Clustering parameters
+
+    Returns:
+        Result summary
+    """
+    # Delegate to existing recluster endpoint
+    return await recluster_voices(ep_id, req)
+
+
+@router.post("/episodes/{ep_id}/audio/clusters/preview")
+async def preview_clustering(ep_id: str, req: ClusterReclusterRequest) -> dict:
+    """Preview clustering with new parameters WITHOUT saving.
+
+    Runs clustering in-memory and returns proposed cluster count and
+    representative samples. Useful for real-time threshold adjustment.
+
+    Args:
+        ep_id: Episode identifier
+        req: Clustering parameters to preview
+
+    Returns:
+        Preview of clustering results
+    """
+    paths = _get_audio_paths(ep_id)
+
+    if not paths["diarization"].exists():
+        raise HTTPException(status_code=404, detail="Diarization not found")
+
+    audio_path = paths["audio_vocals_enhanced"]
+    if not audio_path.exists():
+        audio_path = paths["audio_vocals"]
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio files not found")
+
+    try:
+        from py_screenalytics.audio.models import DiarizationSegment, VoiceClusteringConfig
+        from py_screenalytics.audio.diarization_pyannote import extract_speaker_embeddings
+
+        import numpy as np
+        from scipy.cluster.hierarchy import linkage, fcluster
+        from scipy.spatial.distance import pdist
+
+        # Load diarization segments
+        segments = []
+        with paths["diarization"].open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data = json.loads(line)
+                    segments.append(DiarizationSegment(**data))
+
+        if not segments:
+            return {"error": "No diarization segments"}
+
+        # Extract embeddings
+        config = VoiceClusteringConfig(
+            similarity_threshold=req.similarity_threshold,
+            min_segments_per_cluster=req.min_segments_per_cluster,
+        )
+
+        segment_embeddings = extract_speaker_embeddings(
+            audio_path,
+            segments,
+            config.embedding_model,
+        )
+
+        if len(segment_embeddings) < 2:
+            return {
+                "ep_id": ep_id,
+                "similarity_threshold": req.similarity_threshold,
+                "proposed_cluster_count": 1,
+                "segments_analyzed": len(segment_embeddings),
+                "clusters": [],
+            }
+
+        # Run clustering in memory
+        embeddings = np.array([emb for _, emb in segment_embeddings])
+
+        # Normalize embeddings
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        embeddings = embeddings / norms
+
+        # Compute pairwise cosine distances
+        distances = pdist(embeddings, metric='cosine')
+
+        # Hierarchical clustering
+        Z = linkage(distances, method='average')
+
+        # Cut at threshold
+        distance_threshold = 1 - req.similarity_threshold
+        cluster_labels = fcluster(Z, t=distance_threshold, criterion='distance')
+
+        # Group segments by cluster
+        clusters_dict = {}
+        for i, (segment, embedding) in enumerate(segment_embeddings):
+            cluster_id = int(cluster_labels[i])
+            if cluster_id not in clusters_dict:
+                clusters_dict[cluster_id] = []
+            clusters_dict[cluster_id].append({
+                "start": segment.start,
+                "end": segment.end,
+                "duration": segment.end - segment.start,
+            })
+
+        # Filter by min segments and build preview
+        preview_clusters = []
+        for cluster_id, segs in sorted(clusters_dict.items()):
+            if len(segs) < req.min_segments_per_cluster:
+                continue
+
+            total_duration = sum(s["duration"] for s in segs)
+
+            # Get representative samples (first 3 segments)
+            samples = sorted(segs, key=lambda x: x["start"])[:3]
+
+            preview_clusters.append({
+                "cluster_id": f"VC_{len(preview_clusters) + 1:02d}",
+                "segment_count": len(segs),
+                "total_duration": round(total_duration, 1),
+                "samples": samples,
+            })
+
+        # Sort by total duration
+        preview_clusters.sort(key=lambda x: x["total_duration"], reverse=True)
+
+        # Compare with current
+        current_count = 0
+        if paths["voice_clusters"].exists():
+            with paths["voice_clusters"].open("r", encoding="utf-8") as f:
+                current_clusters = json.load(f)
+                current_count = len(current_clusters)
+
+        return {
+            "ep_id": ep_id,
+            "similarity_threshold": req.similarity_threshold,
+            "min_segments_per_cluster": req.min_segments_per_cluster,
+            "segments_analyzed": len(segment_embeddings),
+            "proposed_cluster_count": len(preview_clusters),
+            "current_cluster_count": current_count,
+            "change": len(preview_clusters) - current_count,
+            "clusters": preview_clusters,
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to preview clustering: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/clusters/recluster")
+async def recluster_voices(ep_id: str, req: ClusterReclusterRequest):
+    """Re-run voice clustering with new parameters.
+
+    Supports two modes:
+    - local: Runs as streaming subprocess with real-time logs (default)
+    - queue: Runs synchronously (Celery not yet implemented for this operation)
+
+    Args:
+        ep_id: Episode identifier
+        req: Parameters for reclustering
+
+    Returns:
+        StreamingResponse for local mode, or result dict for queue mode
+    """
+    paths = _get_audio_paths(ep_id)
+
+    if not paths["diarization"].exists():
+        raise HTTPException(status_code=404, detail="Diarization not found")
+
+    run_mode = _normalize_run_mode(req.run_mode or "local")
+
+    if run_mode == "local":
+        # Run locally via streaming subprocess for real-time logs
+        from apps.api.routers.celery_jobs import _stream_local_subprocess
+
+        # Build command for voices-only
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "audio_pipeline_run.py"),
+            "--ep-id", ep_id,
+            "--voices-only",
+            "--similarity-threshold", str(req.similarity_threshold),
+        ]
+
+        # Options for job tracking
+        options = {
+            "similarity_threshold": req.similarity_threshold,
+            "min_segments_per_cluster": req.min_segments_per_cluster,
+            "operation_type": "voices_only",
+        }
+
+        # Return streaming response for live log updates
+        return StreamingResponse(
+            _stream_local_subprocess(command, ep_id, "voices_only", options, timeout=1800),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    # Queue mode - fall back to sync execution
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from py_screenalytics.audio.voice_clusters import cluster_episode_voices
+        from py_screenalytics.audio.voice_bank import match_voice_clusters_to_bank
+        from py_screenalytics.audio.diarization_pyannote import _load_diarization_manifest
+        from py_screenalytics.audio.models import VoiceClusteringConfig, VoiceBankConfig
+
+        # Get show_id
+        show_id = ep_id.rsplit("-", 1)[0] if "-" in ep_id else ep_id
+
+        # Load diarization
+        diarization_segments = _load_diarization_manifest(paths["diarization"])
+
+        # Get audio path
+        audio_path = paths["audio_vocals_enhanced"]
+        if not audio_path.exists():
+            audio_path = paths["audio_vocals"]
+        if not audio_path.exists():
+            raise HTTPException(status_code=404, detail="Audio files not found")
+
+        # Create config with new parameters
+        clustering_config = VoiceClusteringConfig(
+            similarity_threshold=req.similarity_threshold,
+            min_segments_per_cluster=req.min_segments_per_cluster,
+        )
+
+        # Re-run clustering
+        voice_clusters = cluster_episode_voices(
+            audio_path,
+            diarization_segments,
+            paths["voice_clusters"],
+            clustering_config,
+            overwrite=True,
+        )
+
+        # Re-run voice mapping
+        voice_bank_config = VoiceBankConfig()
+        match_voice_clusters_to_bank(
+            show_id,
+            voice_clusters,
+            paths["voice_mapping"],
+            voice_bank_config,
+            req.similarity_threshold,
+            overwrite=True,
+        )
+
+        return {
+            "success": True,
+            "cluster_count": len(voice_clusters),
+            "parameters": {
+                "similarity_threshold": req.similarity_threshold,
+                "min_segments_per_cluster": req.min_segments_per_cluster,
+            },
+            "clusters": [
+                {
+                    "id": c.voice_cluster_id,
+                    "segment_count": c.segment_count,
+                    "total_duration": c.total_duration,
+                }
+                for c in voice_clusters
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to recluster: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/audio/clusters/suggest_merges")
+async def suggest_cluster_merges(
+    ep_id: str,
+    min_similarity: float = Query(0.85, ge=0.5, le=1.0, description="Minimum similarity for merge suggestion"),
+) -> dict:
+    """Get suggested cluster merges based on centroid similarity.
+
+    Analyzes pairwise cosine similarity between all voice cluster centroids
+    and returns pairs that exceed the min_similarity threshold.
+
+    Args:
+        ep_id: Episode identifier
+        min_similarity: Minimum similarity threshold (default 0.85)
+
+    Returns:
+        List of suggested merges with similarity scores
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+    mapping_path = paths["voice_mapping"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    try:
+        import numpy as np
+
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        # Load mapping for display names
+        mapping_lookup = {}
+        if mapping_path.exists():
+            with mapping_path.open("r", encoding="utf-8") as f:
+                mapping_data = json.load(f)
+            mapping_lookup = {m.get("voice_cluster_id", ""): m for m in mapping_data}
+
+        # Extract clusters with centroids
+        clusters_with_centroids = []
+        for c in clusters:
+            if c.get("centroid"):
+                centroid = np.array(c["centroid"])
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid = centroid / norm
+                clusters_with_centroids.append({
+                    "voice_cluster_id": c["voice_cluster_id"],
+                    "centroid": centroid,
+                    "segment_count": c.get("segment_count", 0),
+                    "total_duration": c.get("total_duration", 0),
+                })
+
+        # Compute pairwise similarities
+        suggestions = []
+        n = len(clusters_with_centroids)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                c1 = clusters_with_centroids[i]
+                c2 = clusters_with_centroids[j]
+
+                similarity = float(np.dot(c1["centroid"], c2["centroid"]))
+
+                if similarity >= min_similarity:
+                    # Get display names from mapping
+                    m1 = mapping_lookup.get(c1["voice_cluster_id"], {})
+                    m2 = mapping_lookup.get(c2["voice_cluster_id"], {})
+
+                    suggestions.append({
+                        "cluster_a": {
+                            "voice_cluster_id": c1["voice_cluster_id"],
+                            "display_name": m1.get("speaker_display_name", c1["voice_cluster_id"]),
+                            "segment_count": c1["segment_count"],
+                            "total_duration": round(c1["total_duration"], 1),
+                            "is_labeled": m1.get("similarity") is not None,
+                        },
+                        "cluster_b": {
+                            "voice_cluster_id": c2["voice_cluster_id"],
+                            "display_name": m2.get("speaker_display_name", c2["voice_cluster_id"]),
+                            "segment_count": c2["segment_count"],
+                            "total_duration": round(c2["total_duration"], 1),
+                            "is_labeled": m2.get("similarity") is not None,
+                        },
+                        "similarity": round(similarity, 3),
+                    })
+
+        # Sort by similarity descending
+        suggestions.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return {
+            "ep_id": ep_id,
+            "min_similarity": min_similarity,
+            "suggestions": suggestions,
+            "total_clusters": len(clusters),
+            "clusters_with_centroids": n,
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to compute merge suggestions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/clusters/bulk_merge")
+async def bulk_merge_clusters(ep_id: str, merges: List[Dict]) -> dict:
+    """Merge multiple cluster pairs at once.
+
+    Args:
+        ep_id: Episode identifier
+        merges: List of merge operations [{source_cluster_id, target_cluster_id}, ...]
+
+    Returns:
+        Success status and summary
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    try:
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        merged_count = 0
+        errors = []
+
+        for merge in merges:
+            source_id = merge.get("source_cluster_id")
+            target_id = merge.get("target_cluster_id")
+
+            if not source_id or not target_id:
+                errors.append(f"Invalid merge spec: {merge}")
+                continue
+
+            # Find clusters
+            source_cluster = None
+            target_cluster = None
+            source_idx = -1
+
+            for i, c in enumerate(clusters):
+                if c["voice_cluster_id"] == source_id:
+                    source_cluster = c
+                    source_idx = i
+                if c["voice_cluster_id"] == target_id:
+                    target_cluster = c
+
+            if not source_cluster:
+                errors.append(f"Source cluster {source_id} not found")
+                continue
+            if not target_cluster:
+                errors.append(f"Target cluster {target_id} not found")
+                continue
+
+            # Merge segments
+            target_cluster["segments"].extend(source_cluster["segments"])
+            target_cluster["segment_count"] = len(target_cluster["segments"])
+            target_cluster["total_duration"] = sum(
+                s["end"] - s["start"] for s in target_cluster["segments"]
+            )
+
+            # Mark source for deletion (we'll remove after loop)
+            source_cluster["_deleted"] = True
+            merged_count += 1
+
+        # Remove deleted clusters
+        clusters = [c for c in clusters if not c.get("_deleted")]
+
+        # Save
+        with clusters_path.open("w", encoding="utf-8") as f:
+            json.dump(clusters, f, indent=2)
+
+        return {
+            "success": True,
+            "merged_count": merged_count,
+            "remaining_clusters": len(clusters),
+            "errors": errors if errors else None,
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to bulk merge: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/segments/assign_cast")
+async def assign_segment_to_cast(ep_id: str, req: SegmentAssignCastRequest) -> dict:
+    """Move a segment to a new cluster and assign it to a cast member.
+
+    This creates a new voice cluster containing the specified segment,
+    removes the segment from the source cluster, and assigns the new
+    cluster to the specified cast member.
+
+    Args:
+        ep_id: Episode identifier
+        req: Request with segment info and cast_id
+
+    Returns:
+        Success status and new cluster details
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+    mapping_path = paths["voice_mapping"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    try:
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        # Find source cluster and segment
+        source_cluster = None
+        segment_to_move = None
+        segment_idx = -1
+
+        for cluster in clusters:
+            if cluster["voice_cluster_id"] == req.from_cluster_id:
+                source_cluster = cluster
+                for idx, seg in enumerate(cluster["segments"]):
+                    if abs(seg["start"] - req.segment_start) < 0.1 and abs(seg["end"] - req.segment_end) < 0.1:
+                        segment_to_move = seg
+                        segment_idx = idx
+                        break
+                break
+
+        if not source_cluster:
+            raise HTTPException(status_code=404, detail=f"Source cluster {req.from_cluster_id} not found")
+        if segment_to_move is None:
+            raise HTTPException(status_code=404, detail="Segment not found in source cluster")
+
+        # Generate new cluster ID
+        existing_ids = [c["voice_cluster_id"] for c in clusters]
+        new_id_num = 1
+        while f"VC_{new_id_num:02d}" in existing_ids:
+            new_id_num += 1
+        new_cluster_id = f"VC_{new_id_num:02d}"
+
+        # Remove segment from source cluster
+        source_cluster["segments"].pop(segment_idx)
+        source_cluster["segment_count"] = len(source_cluster["segments"])
+        source_cluster["total_duration"] = sum(s["end"] - s["start"] for s in source_cluster["segments"])
+
+        # Create new cluster
+        seg_duration = segment_to_move["end"] - segment_to_move["start"]
+        new_cluster = {
+            "voice_cluster_id": new_cluster_id,
+            "segments": [segment_to_move],
+            "total_duration": seg_duration,
+            "segment_count": 1,
+            "centroid": None,  # Will be computed on next recluster
+        }
+        clusters.append(new_cluster)
+
+        # Save updated clusters
+        with clusters_path.open("w", encoding="utf-8") as f:
+            json.dump(clusters, f, indent=2)
+
+        # Now assign the new cluster to the cast member
+        # Load mapping
+        if mapping_path.exists():
+            with mapping_path.open("r", encoding="utf-8") as f:
+                mapping_data = json.load(f)
+        else:
+            mapping_data = []
+
+        # Get cast member name
+        speaker_id = f"SPK_{req.cast_id.upper()}"
+        speaker_display_name = req.cast_id.replace("_", " ").title()
+        voice_bank_id = f"voice_{req.cast_id.lower()}"
+
+        # Try to get actual cast member name
+        try:
+            from apps.api.routers.cast import get_cast_member
+            show_id = ep_id.split("-")[0].upper()
+            cast_info = await get_cast_member(show_id, req.cast_id)
+            if cast_info and cast_info.get("name"):
+                speaker_display_name = cast_info["name"]
+        except Exception:
+            pass
+
+        # Add new mapping entry
+        new_mapping = {
+            "voice_cluster_id": new_cluster_id,
+            "speaker_id": speaker_id,
+            "speaker_display_name": speaker_display_name,
+            "voice_bank_id": voice_bank_id,
+            "similarity": 1.0,  # Manual assignment
+        }
+        mapping_data.append(new_mapping)
+
+        # Save mapping
+        with mapping_path.open("w", encoding="utf-8") as f:
+            json.dump(mapping_data, f, indent=2)
+
+        LOGGER.info(f"Created cluster {new_cluster_id} and assigned to {speaker_display_name}")
+
+        return {
+            "success": True,
+            "new_cluster_id": new_cluster_id,
+            "cast_id": req.cast_id,
+            "speaker_display_name": speaker_display_name,
+            "segment_moved": {
+                "start": req.segment_start,
+                "end": req.segment_end,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to assign segment to cast: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Voice Reference Upload Endpoints (Feature #1)
+# =============================================================================
+
+
+def _get_voice_reference_path(show_id: str, cast_id: str) -> Path:
+    """Get path for voice reference audio file."""
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+    return data_root / "voice_bank" / show_id.lower() / cast_id.lower() / "reference.wav"
+
+
+@router.post("/shows/{show_id}/cast/{cast_id}/voice_reference")
+async def upload_voice_reference(
+    show_id: str,
+    cast_id: str,
+    file: UploadFile = File(..., description="Audio file (WAV, MP3, M4A)"),
+) -> dict:
+    """Upload a voice reference audio clip for a cast member.
+
+    This reference can be used by the ASR pipeline to improve speaker
+    identification accuracy for known cast members.
+
+    Args:
+        show_id: Show identifier
+        cast_id: Cast member identifier
+        file: Audio file upload
+
+    Returns:
+        Success status and file path
+    """
+    # Validate file type
+    allowed_types = {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/m4a"}
+    content_type = file.content_type or ""
+    if content_type not in allowed_types and not file.filename.lower().endswith((".wav", ".mp3", ".m4a")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio format: {content_type}. Use WAV, MP3, or M4A.",
+        )
+
+    try:
+        import subprocess
+        import tempfile
+
+        # Read uploaded file
+        content = await file.read()
+
+        # Save to temp file for conversion
+        suffix = Path(file.filename).suffix if file.filename else ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        # Output path
+        ref_path = _get_voice_reference_path(show_id, cast_id)
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert to standardized WAV format (16kHz mono for embeddings)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", tmp_path,
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            str(ref_path),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+
+        # Clean up temp file
+        Path(tmp_path).unlink(missing_ok=True)
+
+        # Get file info
+        file_size = ref_path.stat().st_size if ref_path.exists() else 0
+
+        LOGGER.info(f"Uploaded voice reference for {show_id}/{cast_id}: {ref_path}")
+
+        return {
+            "success": True,
+            "show_id": show_id,
+            "cast_id": cast_id,
+            "file_path": str(ref_path),
+            "file_size_bytes": file_size,
+        }
+
+    except subprocess.CalledProcessError as e:
+        LOGGER.error(f"FFmpeg conversion failed: {e.stderr.decode() if e.stderr else e}")
+        raise HTTPException(status_code=500, detail="Failed to convert audio file")
+    except Exception as e:
+        LOGGER.exception(f"Failed to upload voice reference: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shows/{show_id}/cast/{cast_id}/voice_reference")
+async def get_voice_reference_status(show_id: str, cast_id: str) -> dict:
+    """Check if a voice reference exists for a cast member.
+
+    Args:
+        show_id: Show identifier
+        cast_id: Cast member identifier
+
+    Returns:
+        Status and file info if exists
+    """
+    ref_path = _get_voice_reference_path(show_id, cast_id)
+
+    if ref_path.exists():
+        import subprocess
+
+        # Get audio duration using ffprobe
+        duration = None
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(ref_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+        except Exception:
+            pass
+
+        return {
+            "exists": True,
+            "show_id": show_id,
+            "cast_id": cast_id,
+            "file_path": str(ref_path),
+            "file_size_bytes": ref_path.stat().st_size,
+            "duration_seconds": duration,
+        }
+
+    return {
+        "exists": False,
+        "show_id": show_id,
+        "cast_id": cast_id,
+    }
+
+
+@router.delete("/shows/{show_id}/cast/{cast_id}/voice_reference")
+async def delete_voice_reference(show_id: str, cast_id: str) -> dict:
+    """Delete a voice reference for a cast member.
+
+    Args:
+        show_id: Show identifier
+        cast_id: Cast member identifier
+
+    Returns:
+        Success status
+    """
+    ref_path = _get_voice_reference_path(show_id, cast_id)
+
+    if not ref_path.exists():
+        raise HTTPException(status_code=404, detail="Voice reference not found")
+
+    try:
+        ref_path.unlink()
+        LOGGER.info(f"Deleted voice reference for {show_id}/{cast_id}")
+
+        return {
+            "success": True,
+            "show_id": show_id,
+            "cast_id": cast_id,
+            "deleted": True,
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to delete voice reference: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/audio/waveform")
+async def get_audio_waveform(
+    ep_id: str,
+    start: float = Query(0.0, description="Start time in seconds"),
+    end: float = Query(60.0, description="End time in seconds"),
+    resolution: int = Query(1000, description="Number of data points"),
+) -> dict:
+    """Get waveform data for audio visualization.
+
+    Returns amplitude data sampled at the specified resolution for
+    rendering interactive waveform displays with speaker lanes.
+
+    Args:
+        ep_id: Episode identifier
+        start: Start time in seconds
+        end: End time in seconds (max 60s window)
+        resolution: Number of amplitude samples to return
+
+    Returns:
+        Waveform data with speaker annotations
+    """
+    paths = _get_audio_paths(ep_id)
+
+    audio_path = paths["audio_vocals_enhanced"]
+    if not audio_path.exists():
+        audio_path = paths["audio_vocals"]
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio files not found")
+
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        # Limit window size to prevent memory issues
+        max_window = 120  # 2 minutes max
+        end = min(end, start + max_window)
+
+        # Load audio segment
+        info = sf.info(audio_path)
+        sample_rate = info.samplerate
+        total_duration = info.duration
+
+        start = max(0, min(start, total_duration))
+        end = min(end, total_duration)
+
+        start_sample = int(start * sample_rate)
+        end_sample = int(end * sample_rate)
+
+        audio_data, _ = sf.read(audio_path, start=start_sample, stop=end_sample)
+
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
+
+        # Downsample for visualization
+        n_samples = len(audio_data)
+        samples_per_point = max(1, n_samples // resolution)
+
+        # Get min/max for each window (creates envelope)
+        n_points = min(resolution, n_samples)
+        waveform_data = []
+
+        for i in range(n_points):
+            chunk_start = i * samples_per_point
+            chunk_end = min(chunk_start + samples_per_point, n_samples)
+            chunk = audio_data[chunk_start:chunk_end]
+
+            if len(chunk) > 0:
+                waveform_data.append({
+                    "time": round(start + (i * (end - start) / n_points), 3),
+                    "min": round(float(np.min(chunk)), 4),
+                    "max": round(float(np.max(chunk)), 4),
+                    "rms": round(float(np.sqrt(np.mean(chunk ** 2))), 4),
+                })
+
+        # Load speaker annotations
+        speaker_regions = []
+        mapping_lookup = {}
+
+        # Load voice mapping for display names
+        if paths["voice_mapping"].exists():
+            with paths["voice_mapping"].open("r", encoding="utf-8") as f:
+                for m in json.load(f):
+                    mapping_lookup[m.get("voice_cluster_id", "")] = m.get("speaker_display_name", "")
+
+        # Load voice clusters
+        if paths["voice_clusters"].exists():
+            with paths["voice_clusters"].open("r", encoding="utf-8") as f:
+                clusters = json.load(f)
+
+            for cluster in clusters:
+                cluster_id = cluster.get("voice_cluster_id", "")
+                display_name = mapping_lookup.get(cluster_id, cluster_id)
+
+                for seg in cluster.get("segments", []):
+                    seg_start = seg.get("start", 0)
+                    seg_end = seg.get("end", 0)
+
+                    # Check if segment overlaps with requested window
+                    if seg_start < end and seg_end > start:
+                        speaker_regions.append({
+                            "start": max(seg_start, start),
+                            "end": min(seg_end, end),
+                            "cluster_id": cluster_id,
+                            "speaker": display_name,
+                        })
+
+        # Sort regions by start time
+        speaker_regions.sort(key=lambda x: x["start"])
+
+        return {
+            "ep_id": ep_id,
+            "start": start,
+            "end": end,
+            "duration": round(end - start, 2),
+            "total_duration": round(total_duration, 2),
+            "sample_rate": sample_rate,
+            "resolution": len(waveform_data),
+            "waveform": waveform_data,
+            "speaker_regions": speaker_regions,
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to get waveform: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/audio/diarization/comparison")
+async def get_diarization_comparison(ep_id: str) -> dict:
+    """Get A/B comparison of pyannote vs GPT-4o diarization.
+
+    Returns the pre-generated comparison report and segment details
+    for side-by-side comparison.
+
+    Args:
+        ep_id: Episode identifier
+
+    Returns:
+        Comparison data for UI visualization
+    """
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+    manifests_dir = data_root / "manifests" / ep_id
+
+    comparison_path = manifests_dir / "audio_diarization_comparison.json"
+    pyannote_path = manifests_dir / "audio_diarization_pyannote.jsonl"
+    gpt4o_path = manifests_dir / "audio_diarization_gpt4o.jsonl"
+
+    result = {
+        "ep_id": ep_id,
+        "has_comparison": comparison_path.exists(),
+        "has_pyannote": pyannote_path.exists(),
+        "has_gpt4o": gpt4o_path.exists(),
+    }
+
+    # Load comparison summary if available
+    if comparison_path.exists():
+        try:
+            with comparison_path.open("r", encoding="utf-8") as f:
+                result["summary"] = json.load(f)
+        except Exception as e:
+            LOGGER.warning(f"Failed to load comparison: {e}")
+
+    # Load pyannote segments for timeline
+    if pyannote_path.exists():
+        try:
+            segments = []
+            with pyannote_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        seg = json.loads(line)
+                        segments.append({
+                            "start": seg.get("start", 0),
+                            "end": seg.get("end", 0),
+                            "speaker": seg.get("speaker", ""),
+                            "provider": "pyannote",
+                        })
+            result["pyannote_segments"] = segments
+        except Exception as e:
+            LOGGER.warning(f"Failed to load pyannote segments: {e}")
+
+    # Load GPT-4o segments for timeline
+    if gpt4o_path.exists():
+        try:
+            segments = []
+            with gpt4o_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        seg = json.loads(line)
+                        segments.append({
+                            "start": seg.get("start", 0),
+                            "end": seg.get("end", 0),
+                            "speaker": seg.get("speaker", ""),
+                            "text": seg.get("text", "")[:100],  # First 100 chars
+                            "provider": "gpt4o",
+                        })
+            result["gpt4o_segments"] = segments
+        except Exception as e:
+            LOGGER.warning(f"Failed to load gpt4o segments: {e}")
+
+    return result
+
+
+@router.get("/episodes/{ep_id}/audio/segments/quality")
+async def get_segment_quality_scores(ep_id: str) -> dict:
+    """Get quality scores for each audio segment.
+
+    Computes SNR (signal-to-noise ratio), clarity, and overlap detection
+    for each diarization segment. Useful for identifying segments that
+    need manual review.
+
+    Args:
+        ep_id: Episode identifier
+
+    Returns:
+        Quality scores per segment
+    """
+    paths = _get_audio_paths(ep_id)
+
+    if not paths["diarization"].exists():
+        raise HTTPException(status_code=404, detail="Diarization not found")
+
+    audio_path = paths["audio_vocals_enhanced"]
+    if not audio_path.exists():
+        audio_path = paths["audio_vocals"]
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio files not found")
+
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        # Load audio
+        audio_data, sample_rate = sf.read(audio_path)
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
+
+        # Load diarization segments
+        segments = []
+        with paths["diarization"].open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    segments.append(json.loads(line))
+
+        # Load ASR for overlap detection
+        asr_segments = []
+        if paths["asr_raw"].exists():
+            with paths["asr_raw"].open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        asr_segments.append(json.loads(line))
+
+        quality_scores = []
+
+        for seg in segments:
+            seg_start = seg.get("start", 0)
+            seg_end = seg.get("end", 0)
+            speaker = seg.get("speaker", "")
+
+            # Extract segment audio
+            start_sample = int(seg_start * sample_rate)
+            end_sample = int(seg_end * sample_rate)
+            segment_audio = audio_data[start_sample:end_sample]
+
+            if len(segment_audio) < sample_rate * 0.1:
+                # Skip very short segments
+                continue
+
+            # Compute RMS (as proxy for signal level)
+            rms = np.sqrt(np.mean(segment_audio ** 2))
+
+            # Compute SNR estimate (ratio of RMS to noise floor)
+            # Noise floor estimated from lowest 10% of samples
+            sorted_abs = np.sort(np.abs(segment_audio))
+            noise_floor = np.mean(sorted_abs[:len(sorted_abs) // 10]) + 1e-10
+            snr_estimate = 20 * np.log10(rms / noise_floor) if noise_floor > 0 else 0
+
+            # Compute zero-crossing rate (high = noisy)
+            zero_crossings = np.sum(np.abs(np.diff(np.sign(segment_audio)))) / (2 * len(segment_audio))
+
+            # Check for overlapping speech (multiple ASR segments in this time range)
+            overlap_count = 0
+            for asr in asr_segments:
+                asr_start = asr.get("start", 0)
+                asr_end = asr.get("end", 0)
+                # Check if ASR segment overlaps with diarization segment
+                if asr_start < seg_end and asr_end > seg_start:
+                    overlap_count += 1
+
+            has_overlap = bool(overlap_count > 1)
+
+            # Compute clipping detection
+            clip_threshold = 0.95
+            clipping_ratio = np.sum(np.abs(segment_audio) > clip_threshold) / len(segment_audio)
+            has_clipping = bool(clipping_ratio > 0.01)
+
+            # Determine quality status
+            if snr_estimate < 10 or has_clipping:
+                status = "poor"
+                badge = "🔴"
+            elif snr_estimate < 15 or has_overlap:
+                status = "fair"
+                badge = "⚠️"
+            else:
+                status = "good"
+                badge = "✅"
+
+            quality_scores.append({
+                "start": round(float(seg_start), 2),
+                "end": round(float(seg_end), 2),
+                "speaker": speaker,
+                "duration": round(float(seg_end - seg_start), 2),
+                "snr_db": round(float(snr_estimate), 1),
+                "zero_crossing_rate": round(float(zero_crossings), 4),
+                "has_overlap": has_overlap,
+                "overlap_count": int(overlap_count),
+                "has_clipping": has_clipping,
+                "clipping_ratio": round(float(clipping_ratio), 4),
+                "status": status,
+                "badge": badge,
+            })
+
+        # Summary stats
+        poor_count = sum(1 for q in quality_scores if q["status"] == "poor")
+        fair_count = sum(1 for q in quality_scores if q["status"] == "fair")
+        good_count = sum(1 for q in quality_scores if q["status"] == "good")
+
+        return {
+            "ep_id": ep_id,
+            "segment_count": len(quality_scores),
+            "summary": {
+                "good": good_count,
+                "fair": fair_count,
+                "poor": poor_count,
+                "poor_pct": round(poor_count / len(quality_scores) * 100, 1) if quality_scores else 0,
+            },
+            "segments": quality_scores,
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to compute segment quality: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Segment Archive Endpoints
+# =============================================================================
+
+
+class ArchiveSegmentRequest(BaseModel):
+    """Request to archive a transcript segment."""
+    start: float = Field(..., description="Segment start time")
+    end: float = Field(..., description="Segment end time")
+    text: str = Field(..., description="Segment text")
+    voice_cluster_id: Optional[str] = Field(None, description="Voice cluster the segment belongs to")
+    reason: Optional[str] = Field(None, description="Reason for archiving")
+
+
+@router.post("/episodes/{ep_id}/audio/segments/archive")
+async def archive_transcript_segment(ep_id: str, body: ArchiveSegmentRequest) -> dict:
+    """Archive a transcript segment so it won't be used in voicebank.
+
+    Archived segments are stored separately and excluded from cast voice profiles.
+    They can be restored later if needed.
+
+    Args:
+        ep_id: Episode identifier
+        body: Segment to archive
+
+    Returns:
+        Success status
+    """
+    paths = _get_audio_paths(ep_id)
+    archive_path = paths["archived_segments"]
+
+    try:
+        # Load existing archived segments
+        archived = []
+        if archive_path.exists():
+            with archive_path.open("r", encoding="utf-8") as f:
+                archived = json.load(f)
+
+        # Check if already archived (by time range)
+        already_archived = any(
+            abs(s.get("start", 0) - body.start) < 0.1 and abs(s.get("end", 0) - body.end) < 0.1
+            for s in archived
+        )
+        if already_archived:
+            return {"success": True, "message": "Segment already archived", "archived_count": len(archived)}
+
+        # Add to archive
+        from datetime import datetime
+        archived.append({
+            "start": body.start,
+            "end": body.end,
+            "text": body.text,
+            "voice_cluster_id": body.voice_cluster_id,
+            "reason": body.reason,
+            "archived_at": datetime.now().isoformat(),
+        })
+
+        # Save
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with archive_path.open("w", encoding="utf-8") as f:
+            json.dump(archived, f, indent=2)
+
+        LOGGER.info(f"Archived segment [{body.start:.1f}-{body.end:.1f}] for {ep_id}")
+
+        return {
+            "success": True,
+            "message": f"Archived segment [{body.start:.1f}s - {body.end:.1f}s]",
+            "archived_count": len(archived),
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to archive segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/audio/segments/archived")
+async def list_archived_segments(ep_id: str) -> dict:
+    """List all archived transcript segments for an episode.
+
+    Args:
+        ep_id: Episode identifier
+
+    Returns:
+        List of archived segments
+    """
+    paths = _get_audio_paths(ep_id)
+    archive_path = paths["archived_segments"]
+
+    archived = []
+    if archive_path.exists():
+        try:
+            with archive_path.open("r", encoding="utf-8") as f:
+                archived = json.load(f)
+        except Exception as e:
+            LOGGER.warning(f"Failed to load archived segments: {e}")
+
+    return {
+        "ep_id": ep_id,
+        "archived_count": len(archived),
+        "segments": archived,
+    }
+
+
+@router.post("/episodes/{ep_id}/audio/segments/restore")
+async def restore_archived_segment(ep_id: str, body: ArchiveSegmentRequest) -> dict:
+    """Restore an archived segment (remove from archive).
+
+    Args:
+        ep_id: Episode identifier
+        body: Segment to restore (matched by start/end time)
+
+    Returns:
+        Success status
+    """
+    paths = _get_audio_paths(ep_id)
+    archive_path = paths["archived_segments"]
+
+    if not archive_path.exists():
+        return {"success": False, "message": "No archived segments found"}
+
+    try:
+        with archive_path.open("r", encoding="utf-8") as f:
+            archived = json.load(f)
+
+        # Find and remove the segment
+        original_count = len(archived)
+        archived = [
+            s for s in archived
+            if not (abs(s.get("start", 0) - body.start) < 0.1 and abs(s.get("end", 0) - body.end) < 0.1)
+        ]
+
+        if len(archived) == original_count:
+            return {"success": False, "message": "Segment not found in archive"}
+
+        # Save updated archive
+        with archive_path.open("w", encoding="utf-8") as f:
+            json.dump(archived, f, indent=2)
+
+        LOGGER.info(f"Restored segment [{body.start:.1f}-{body.end:.1f}] for {ep_id}")
+
+        return {
+            "success": True,
+            "message": f"Restored segment [{body.start:.1f}s - {body.end:.1f}s]",
+            "archived_count": len(archived),
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to restore segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/audio/clusters/similarity_matrix")
+async def get_cluster_similarity_matrix(ep_id: str) -> dict:
+    """Get pairwise similarity matrix between all voice clusters.
+
+    Returns a matrix of cosine similarities between cluster centroids,
+    useful for visualizing which voices are easily confused.
+
+    Args:
+        ep_id: Episode identifier
+
+    Returns:
+        Similarity matrix data for heatmap visualization
+    """
+    paths = _get_audio_paths(ep_id)
+    clusters_path = paths["voice_clusters"]
+    mapping_path = paths["voice_mapping"]
+
+    if not clusters_path.exists():
+        raise HTTPException(status_code=404, detail="Voice clusters not found")
+
+    try:
+        import numpy as np
+
+        with clusters_path.open("r", encoding="utf-8") as f:
+            clusters = json.load(f)
+
+        # Load mapping for display names
+        mapping_lookup = {}
+        if mapping_path.exists():
+            with mapping_path.open("r", encoding="utf-8") as f:
+                mapping_data = json.load(f)
+            mapping_lookup = {m.get("voice_cluster_id", ""): m for m in mapping_data}
+
+        # Extract clusters with centroids
+        cluster_info = []
+        centroids = []
+
+        for c in clusters:
+            if c.get("centroid"):
+                centroid = np.array(c["centroid"])
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid = centroid / norm
+                    centroids.append(centroid)
+
+                    m = mapping_lookup.get(c["voice_cluster_id"], {})
+                    cluster_info.append({
+                        "voice_cluster_id": c["voice_cluster_id"],
+                        "display_name": m.get("speaker_display_name", c["voice_cluster_id"]),
+                        "is_labeled": m.get("similarity") is not None,
+                        "segment_count": c.get("segment_count", 0),
+                        "total_duration": round(c.get("total_duration", 0), 1),
+                    })
+
+        if len(centroids) < 2:
+            return {
+                "ep_id": ep_id,
+                "cluster_count": len(cluster_info),
+                "matrix": [],
+                "labels": [],
+                "message": "Need at least 2 clusters with centroids for similarity matrix",
+            }
+
+        # Compute pairwise similarity matrix
+        n = len(centroids)
+        matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                matrix[i, j] = float(np.dot(centroids[i], centroids[j]))
+
+        # Format for JSON (list of lists)
+        similarity_matrix = matrix.tolist()
+
+        # Find most confusable pairs (for highlighting)
+        confusable_pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = matrix[i, j]
+                if sim >= 0.7:
+                    confusable_pairs.append({
+                        "cluster_a": cluster_info[i]["voice_cluster_id"],
+                        "cluster_b": cluster_info[j]["voice_cluster_id"],
+                        "similarity": round(sim, 3),
+                    })
+
+        confusable_pairs.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return {
+            "ep_id": ep_id,
+            "cluster_count": n,
+            "clusters": cluster_info,
+            "labels": [c["display_name"] for c in cluster_info],
+            "matrix": similarity_matrix,
+            "confusable_pairs": confusable_pairs[:10],  # Top 10
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to compute similarity matrix: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shows/{show_id}/voice_references")
+async def list_voice_references(show_id: str) -> dict:
+    """List all voice references for a show.
+
+    Args:
+        show_id: Show identifier
+
+    Returns:
+        List of cast members with voice references
+    """
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+    voice_bank_dir = data_root / "voice_bank" / show_id.lower()
+
+    references = []
+
+    if voice_bank_dir.exists():
+        for cast_dir in voice_bank_dir.iterdir():
+            if cast_dir.is_dir():
+                ref_path = cast_dir / "reference.wav"
+                if ref_path.exists():
+                    references.append({
+                        "cast_id": cast_dir.name,
+                        "file_path": str(ref_path),
+                        "file_size_bytes": ref_path.stat().st_size,
+                    })
+
+    return {
+        "show_id": show_id,
+        "references": references,
+        "count": len(references),
+    }
+
+
+@router.get("/shows/{show_id}/voice_analytics")
+async def get_voice_analytics(show_id: str) -> dict:
+    """Get cross-episode voice tracking analytics for a show.
+
+    Aggregates speaking time per cast member across all episodes,
+    showing patterns like total speaking time, episode appearances,
+    and first/last appearances.
+
+    Args:
+        show_id: Show identifier
+
+    Returns:
+        Voice analytics data for dashboard visualization
+    """
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+    manifests_dir = data_root / "manifests"
+
+    # Find all episode directories for this show
+    show_prefix = show_id.lower()
+    episode_dirs = []
+
+    if manifests_dir.exists():
+        for ep_dir in manifests_dir.iterdir():
+            if ep_dir.is_dir() and ep_dir.name.lower().startswith(show_prefix):
+                episode_dirs.append(ep_dir)
+
+    if not episode_dirs:
+        return {
+            "show_id": show_id,
+            "episode_count": 0,
+            "message": "No episodes found for this show",
+        }
+
+    # Sort episodes by name (which gives chronological order for format show-sXXeYY)
+    episode_dirs.sort(key=lambda d: d.name)
+
+    # Aggregate data
+    cast_stats = {}  # cast_id -> stats
+    episode_summaries = []
+
+    for ep_dir in episode_dirs:
+        ep_id = ep_dir.name
+        mapping_path = ep_dir / "audio_voice_mapping.json"
+        clusters_path = ep_dir / "audio_voice_clusters.json"
+
+        if not mapping_path.exists() or not clusters_path.exists():
+            continue
+
+        try:
+            with mapping_path.open("r", encoding="utf-8") as f:
+                mappings = json.load(f)
+
+            with clusters_path.open("r", encoding="utf-8") as f:
+                clusters = json.load(f)
+
+            # Build cluster duration lookup
+            cluster_durations = {}
+            for c in clusters:
+                cluster_durations[c["voice_cluster_id"]] = c.get("total_duration", 0)
+
+            episode_cast = {}
+
+            for m in mappings:
+                cluster_id = m.get("voice_cluster_id", "")
+                speaker_name = m.get("speaker_display_name", "Unknown")
+                duration = cluster_durations.get(cluster_id, 0)
+
+                # Skip unlabeled/unknown
+                if speaker_name.startswith("Unlabeled") or speaker_name.lower() == "unknown":
+                    continue
+
+                # Use speaker name as key (normalized)
+                cast_key = speaker_name.lower().replace(" ", "_")
+
+                # Update cast stats
+                if cast_key not in cast_stats:
+                    cast_stats[cast_key] = {
+                        "name": speaker_name,
+                        "total_speaking_time": 0,
+                        "episode_count": 0,
+                        "episodes": [],
+                        "first_appearance": ep_id,
+                        "last_appearance": ep_id,
+                    }
+
+                cast_stats[cast_key]["total_speaking_time"] += duration
+                cast_stats[cast_key]["last_appearance"] = ep_id
+
+                if ep_id not in cast_stats[cast_key]["episodes"]:
+                    cast_stats[cast_key]["episodes"].append(ep_id)
+                    cast_stats[cast_key]["episode_count"] += 1
+
+                episode_cast[cast_key] = {
+                    "name": speaker_name,
+                    "speaking_time": duration,
+                }
+
+            if episode_cast:
+                episode_summaries.append({
+                    "ep_id": ep_id,
+                    "cast_speaking_times": episode_cast,
+                })
+
+        except Exception as e:
+            LOGGER.warning(f"Failed to process {ep_id}: {e}")
+            continue
+
+    # Sort cast by total speaking time
+    sorted_cast = sorted(
+        cast_stats.values(),
+        key=lambda x: x["total_speaking_time"],
+        reverse=True,
+    )
+
+    # Build chart data (speaking time per cast per episode)
+    chart_data = []
+    for ep_summary in episode_summaries:
+        ep_id = ep_summary["ep_id"]
+        # Extract season/episode for display
+        ep_label = ep_id.split("-")[-1] if "-" in ep_id else ep_id
+
+        for cast_key, cast_data in ep_summary["cast_speaking_times"].items():
+            chart_data.append({
+                "episode": ep_label,
+                "ep_id": ep_id,
+                "cast_member": cast_data["name"],
+                "speaking_time": round(cast_data["speaking_time"], 1),
+            })
+
+    return {
+        "show_id": show_id,
+        "episode_count": len(episode_summaries),
+        "cast_count": len(cast_stats),
+        "cast_stats": sorted_cast,
+        "episode_summaries": episode_summaries,
+        "chart_data": chart_data,
+    }
