@@ -67,6 +67,7 @@ from apps.api.tasks import (
     run_cluster_task,
 )
 from apps.api.services.log_formatter import LogFormatter, format_config_block, format_completion_summary
+from celery.result import AsyncResult
 
 LOGGER = logging.getLogger(__name__)
 
@@ -275,6 +276,32 @@ def _list_local_jobs(ep_id: str | None = None) -> List[Dict[str, Any]]:
             LOGGER.info(f"Cleaned up stale local job: {key}")
 
     return result
+
+
+def _kill_process_tree_by_pid(pid: int) -> tuple[bool, str]:
+    """Kill a process (and its children) by PID using the process group."""
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            os.waitpid(-pgid, os.WNOHANG)
+        except Exception:
+            pass
+        return True, "terminated"
+    except ProcessLookupError:
+        return False, "not_found"
+    except Exception as exc:  # Defensive fallback if process groups fail
+        try:
+            import psutil  # type: ignore
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+            return True, "terminated"
+        except Exception as inner_exc:
+            return False, f"error:{inner_exc}"
 
 
 def _is_local_job_running(ep_id: str, operation: str) -> bool:
@@ -863,6 +890,107 @@ async def get_operation_logs(ep_id: str, operation: str):
     return data
 
 
+@router.get("/stream/{job_id}")
+async def stream_celery_job(job_id: str, ep_id: str | None = None):
+    """Stream progress for a Celery job as NDJSON (for queue mode UI).
+
+    Args:
+        job_id: Celery task ID
+        ep_id: Optional episode ID for audio pipeline jobs (enables progress file polling)
+    """
+
+    def _progress_line(state: str, progress: dict | None, status: str | None = None) -> str:
+        progress = progress or {}
+        pct = progress.get("progress", 0)
+        return json.dumps({
+            "type": "progress",
+            "state": state,
+            "progress": pct,
+            "message": progress.get("message", ""),
+            "step": progress.get("step") or progress.get("phase") or "",
+            "step_name": progress.get("step_name") or progress.get("step") or progress.get("phase") or "",
+            "step_order": progress.get("step_order", 0),
+            "total_steps": progress.get("total_steps", 0),
+            "timestamp": time.time(),
+            "status": status or state,
+        }) + "\n"
+
+    def _summary_line(status: str, error: str | None, elapsed: float) -> str:
+        payload = {
+            "type": "summary",
+            "status": status,
+            "elapsed_seconds": elapsed,
+        }
+        if error:
+            payload["error"] = error
+        return json.dumps(payload) + "\n"
+
+    def _read_progress_file(ep_id: str) -> dict | None:
+        """Read audio_progress.json for the episode if it exists."""
+        if not ep_id:
+            return None
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+        progress_file = data_root / "manifests" / ep_id / "audio_progress.json"
+        if progress_file.exists():
+            try:
+                return json.loads(progress_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return None
+
+    def _gen():
+        result = AsyncResult(job_id, app=celery_app)
+        start = time.time()
+        poll_interval = 2.0
+        max_runtime = 7200.0
+
+        # If job is unknown, return 404 via summary
+        if result.state == "PENDING" and not result.backend.get_task_meta(job_id):
+            yield _summary_line("not_found", "Job not found", 0.0)
+            return
+
+        while True:
+            state = result.state
+            info = result.info if isinstance(result.info, dict) else {}
+
+            # For chain tasks, also check progress file (written by individual tasks)
+            progress = _read_progress_file(ep_id) if ep_id else None
+            if not progress:
+                progress = info.get("progress") if isinstance(info, dict) else {}
+
+            # Emit progress line
+            yield _progress_line(state.lower(), progress)
+
+            if result.ready():
+                elapsed = time.time() - start
+                if result.successful():
+                    yield _summary_line("success", None, elapsed)
+                elif result.failed():
+                    err = ""
+                    if isinstance(info, dict):
+                        err = str(info.get("exc_message") or info.get("error") or info)
+                    else:
+                        err = str(info)
+                    yield _summary_line("error", err, elapsed)
+                elif state == "REVOKED":
+                    yield _summary_line("cancelled", None, elapsed)
+                else:
+                    yield _summary_line(state.lower(), None, elapsed)
+                break
+
+            if time.time() - start > max_runtime:
+                yield _summary_line("timeout", "Timed out waiting for job", max_runtime)
+                break
+
+            time.sleep(poll_interval)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
+    return StreamingResponse(_gen(), media_type="application/x-ndjson", headers=headers)
+
+
 @router.get("/{job_id}")
 async def get_celery_job_status(job_id: str):
     """Get status of a Celery background job.
@@ -949,21 +1077,23 @@ async def cancel_celery_job(job_id: str):
                 if job.get("operation") == operation:
                     pid = job.get("pid")
                     if pid:
-                        try:
-                            proc = psutil.Process(pid)
-                            proc.terminate()
+                        success, reason = _kill_process_tree_by_pid(pid)
+                        _unregister_local_job(ep_id, operation)
+
+                        # Clear progress file for audio pipeline to stop UI auto-refresh
+                        if operation == "audio_pipeline":
                             try:
-                                proc.wait(timeout=5)
-                            except psutil.TimeoutExpired:
-                                proc.kill()
-                            _unregister_local_job(ep_id, operation)
+                                progress_path = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")) / "manifests" / ep_id / "audio_progress.json"
+                                progress_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
+                        if success:
                             LOGGER.info(f"Killed local job PID {pid} ({ep_id}::{operation})")
                             return {"job_id": job_id, "status": "cancelled", "pid": pid}
-                        except psutil.NoSuchProcess:
-                            _unregister_local_job(ep_id, operation)
+                        if reason == "not_found":
                             return {"job_id": job_id, "status": "already_finished", "message": "Process not found"}
-                        except psutil.AccessDenied:
-                            return {"job_id": job_id, "status": "error", "message": "Access denied killing process"}
+                        return {"job_id": job_id, "status": "error", "message": reason}
             return {"job_id": job_id, "status": "not_found", "message": "Local job not found in registry"}
         return {"job_id": job_id, "status": "error", "message": "Invalid local job ID format"}
 
@@ -2097,6 +2227,13 @@ def _stream_local_subprocess(
             extra=extra,
         )
 
+    def _clean_noise(text: str) -> str:
+        if not text:
+            return text
+        if "call apply_model on this" in text.lower():
+            return "Demucs failed to load the MDX model (library noise suppressed)"
+        return text
+
     try:
         # Start subprocess with line-buffered output for streaming
         process = subprocess.Popen(
@@ -2150,20 +2287,41 @@ def _stream_local_subprocess(
             if not stripped:
                 continue
 
+            # Suppress demucs BagOfModels noise that leaks through demucs stdout
+            if "call apply_model on this" in stripped.lower():
+                continue
+
             # Check if this is a JSON progress line - send as separate message type
             if stripped.startswith('{') and '"phase"' in stripped:
                 try:
                     progress_data = json.loads(stripped)
                     if isinstance(progress_data, dict) and "phase" in progress_data:
-                        # Send progress update to UI
-                        yield json.dumps({
-                            "type": "progress",
-                            "frames_done": progress_data.get("frames_done", 0),
-                            "frames_total": progress_data.get("frames_total", 0),
-                            "phase": progress_data.get("phase", ""),
-                            "fps_infer": progress_data.get("fps_infer"),
-                            "secs_done": progress_data.get("secs_done", 0),
-                        }) + "\n"
+                        # Audio pipeline uses different progress format with more fields
+                        if operation == "audio_pipeline":
+                            # Pass through audio pipeline progress with all fields intact
+                            yield json.dumps({
+                                "type": "audio_progress",
+                                "phase": progress_data.get("phase", ""),
+                                "progress": progress_data.get("progress", 0),
+                                "message": progress_data.get("message", ""),
+                                "step_name": progress_data.get("step_name", ""),
+                                "step_progress": progress_data.get("step_progress", 0),
+                                "step_order": progress_data.get("step_order", 0),
+                                "total_steps": progress_data.get("total_steps", 9),
+                                "voice_clusters": progress_data.get("voice_clusters"),
+                                "labeled_voices": progress_data.get("labeled_voices"),
+                                "unlabeled_voices": progress_data.get("unlabeled_voices"),
+                            }) + "\n"
+                        else:
+                            # Standard progress for detect_track, faces_embed, cluster
+                            yield json.dumps({
+                                "type": "progress",
+                                "frames_done": progress_data.get("frames_done", 0),
+                                "frames_total": progress_data.get("frames_total", 0),
+                                "phase": progress_data.get("phase", ""),
+                                "fps_infer": progress_data.get("fps_infer"),
+                                "secs_done": progress_data.get("secs_done", 0),
+                            }) + "\n"
                         # Also format and show in logs
                         formatted_line = formatter.format_line(stripped)
                         if formatted_line:
@@ -2242,7 +2400,7 @@ def _stream_local_subprocess(
             _kill_process_tree(process)
         _unregister_local_job(episode_id, operation)
 
-        error_msg = str(e)
+        error_msg = _clean_noise(str(e))
         exception_line = f"[EXCEPTION] {error_msg}"
         formatted_logs.append(exception_line)
         raw_logs.append(exception_line)

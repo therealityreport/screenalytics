@@ -52,7 +52,12 @@ class EnhanceConfig(BaseModel):
 
 
 class DiarizationConfig(BaseModel):
-    """Configuration for speaker diarization."""
+    """Configuration for speaker diarization.
+
+    Note: min_speakers/max_speakers are HINTS, not guarantees. Pyannote may still
+    detect fewer speakers if it determines they are similar. Use num_speakers to
+    force a specific count when you know it ahead of time.
+    """
     model_config = {"protected_namespaces": ()}
     provider: str = "pyannote"
     model_name: str = "pyannote/speaker-diarization-3.1"
@@ -60,19 +65,32 @@ class DiarizationConfig(BaseModel):
     max_overlap: float = 0.1
     merge_gap_ms: int = 300
     min_speakers: int = 1
-    max_speakers: int = 10
+    max_speakers: int = 20  # Safe upper bound for reality TV
+    # Force exact speaker count (overrides min/max if set)
+    num_speakers: Optional[int] = None
 
 
 class ASRConfig(BaseModel):
-    """Configuration for automatic speech recognition."""
+    """Configuration for automatic speech recognition.
+
+    OpenAI model options:
+    - whisper-1: Legacy model, supports word timestamps
+    - gpt-4o-transcribe: Higher quality, no word timestamps
+    - gpt-4o-mini-transcribe: Faster, good quality, no word timestamps
+    - gpt-4o-transcribe-diarize: Includes speaker diarization (can replace pyannote)
+    """
     provider: str = "openai_whisper"
-    model: str = "whisper-1"
+    model: str = "gpt-4o-transcribe"  # Default to higher quality model
     language: str = "en"
-    enable_word_timestamps: bool = True
+    enable_word_timestamps: bool = True  # Only works with whisper-1
     chunk_duration_seconds: int = 30
     temperature: float = 0.0
     gemini_model: str = "gemini-2.0-flash-exp"
     gemini_use_for_cleanup: bool = True
+    # For gpt-4o-transcribe-diarize: use known speaker references
+    use_diarization_model: bool = False  # Set True to use gpt-4o-transcribe-diarize
+    known_speaker_names: List[str] = Field(default_factory=list)
+    known_speaker_audio_paths: List[str] = Field(default_factory=list)
 
 
 class VoiceClusteringConfig(BaseModel):
@@ -166,6 +184,7 @@ class ASRSegment(BaseModel):
     confidence: Optional[float] = Field(None, description="ASR confidence score")
     words: Optional[List[WordTiming]] = Field(None, description="Word-level timings")
     language: Optional[str] = Field(None, description="Detected language")
+    speaker: Optional[str] = Field(None, description="Speaker label (from gpt-4o-transcribe-diarize)")
 
 
 # ============================================================================

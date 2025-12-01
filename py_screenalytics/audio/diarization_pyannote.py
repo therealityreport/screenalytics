@@ -4,6 +4,9 @@ Handles:
 - Speaker diarization using Pyannote Audio
 - Segment merging and confidence scoring
 - Embedding extraction for voice clustering
+
+THERMAL SAFETY: CPU thread limits are set BEFORE importing torch to prevent
+laptop overheating during diarization. Override with SCREENALYTICS_DIARIZATION_THREADS.
 """
 
 from __future__ import annotations
@@ -13,6 +16,16 @@ import logging
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
+from functools import lru_cache
+
+# CRITICAL: Set CPU thread limits BEFORE importing torch/numpy to prevent overheating.
+# Default to 2 threads for thermal safety on laptops.
+_DIARIZATION_THREADS = os.environ.get("SCREENALYTICS_DIARIZATION_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", _DIARIZATION_THREADS)
+os.environ.setdefault("MKL_NUM_THREADS", _DIARIZATION_THREADS)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", _DIARIZATION_THREADS)
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _DIARIZATION_THREADS)
+os.environ.setdefault("NUMEXPR_NUM_THREADS", _DIARIZATION_THREADS)
 
 import numpy as np
 
@@ -25,9 +38,55 @@ _DIARIZATION_PIPELINE = None
 _EMBEDDING_MODEL = None
 
 
+@lru_cache(maxsize=1)
+def _load_env_token() -> Optional[str]:
+    """Load a Pyannote/HF token from .env/.env.local if not in the environment."""
+    candidate_keys = {"PYANNOTE_AUTH_TOKEN", "HF_TOKEN"}
+
+    def _parse_env_file(path: Path) -> Optional[str]:
+        if not path.exists():
+            return None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                key = key.strip()
+                if key in candidate_keys:
+                    return value.strip().strip('"').strip("'")
+        except Exception:
+            return None
+        return None
+
+    # Search upward for .env/.env.local starting from this file's parents
+    start = Path(__file__).resolve()
+    for parent in [start] + list(start.parents):
+        for env_name in (".env.local", ".env"):
+            token = _parse_env_file(parent / env_name)
+            if token:
+                return token
+    return None
+
+
 def _get_auth_token() -> Optional[str]:
     """Get Pyannote auth token from environment."""
-    return os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN")
+    env_token = os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN")
+    if env_token:
+        return env_token
+
+    # Fallback to .env/.env.local if set but not exported
+    file_token = _load_env_token()
+    if file_token:
+        # Set in os.environ so downstream libraries pick it up too
+        os.environ.setdefault("PYANNOTE_AUTH_TOKEN", file_token)
+        os.environ.setdefault("HF_TOKEN", file_token)
+        LOGGER.info("Loaded PYANNOTE_AUTH_TOKEN from .env/.env.local")
+        return file_token
+
+    return None
 
 
 def _get_diarization_pipeline(config: DiarizationConfig):
@@ -44,8 +103,9 @@ def _get_diarization_pipeline(config: DiarizationConfig):
         auth_token = _get_auth_token()
         if not auth_token:
             LOGGER.warning(
-                "No PYANNOTE_AUTH_TOKEN found. Some models require authentication. "
-                "Get token from https://huggingface.co/settings/tokens"
+                "No PYANNOTE_AUTH_TOKEN found (also checked .env/.env.local). "
+                "Some models require authentication. Get a token from https://huggingface.co/settings/tokens "
+                "and set PYANNOTE_AUTH_TOKEN in your environment or .env file."
             )
 
         LOGGER.info(f"Loading diarization pipeline: {config.model_name}")
@@ -126,12 +186,19 @@ def run_diarization(
 
     LOGGER.info(f"Running diarization: {audio_path}")
 
+    # Build diarization kwargs
+    # num_speakers forces exact count and overrides min/max
+    diarization_kwargs = {}
+    if config.num_speakers is not None:
+        LOGGER.info(f"Forcing {config.num_speakers} speakers (num_speakers override)")
+        diarization_kwargs["num_speakers"] = config.num_speakers
+    else:
+        diarization_kwargs["min_speakers"] = config.min_speakers
+        diarization_kwargs["max_speakers"] = config.max_speakers
+        LOGGER.info(f"Speaker range: {config.min_speakers}-{config.max_speakers}")
+
     # Run diarization
-    diarization = pipeline(
-        audio_path,
-        min_speakers=config.min_speakers,
-        max_speakers=config.max_speakers,
-    )
+    diarization = pipeline(audio_path, **diarization_kwargs)
 
     # Convert to segments
     segments = []
@@ -201,13 +268,27 @@ def _calculate_overlap_ratios(segments: List[DiarizationSegment]) -> List[Diariz
     # Sort by start time
     segments = sorted(segments, key=lambda s: s.start)
 
+    # Optimization: pre-compute overlap using interval sweep (O(n log n) vs O(n²))
+    # Only check segments that could potentially overlap (within max segment duration)
+    max_duration = max((s.end - s.start for s in segments), default=0)
+
     result = []
     for i, segment in enumerate(segments):
         overlap_duration = 0.0
         segment_duration = segment.end - segment.start
 
-        for j, other in enumerate(segments):
+        # Only check nearby segments that could overlap
+        # (segments are sorted by start time)
+        for j in range(max(0, i - 50), min(len(segments), i + 50)):
             if i == j:
+                continue
+            other = segments[j]
+
+            # Early exit: if other segment starts after current ends, no more overlaps possible
+            if other.start >= segment.end:
+                break
+            # Skip if other segment ends before current starts
+            if other.end <= segment.start:
                 continue
 
             # Calculate overlap

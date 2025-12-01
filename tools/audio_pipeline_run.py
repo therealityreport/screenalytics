@@ -208,8 +208,9 @@ def run_voices_only(args):
         emit_progress("voices", 0.2, f"Clustering with threshold {args.similarity_threshold}...",
                      step_name="Voice Clustering", step_order=1, total_steps=1)
 
-        # Load diarization segments
-        segments = _load_diarization_manifest(paths["diarization"])
+        # Load diarization segments (prefer combined pyannote+GPT-4o if present)
+        diar_path = paths.get("diarization_combined", paths["diarization"])
+        segments = _load_diarization_manifest(diar_path if diar_path.exists() else paths["diarization"])
 
         # Run clustering
         clusters = cluster_episode_voices(

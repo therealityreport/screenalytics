@@ -155,11 +155,11 @@ def _find_cluster_for_segment(
     """Find which voice cluster contains a diarization segment."""
     for cluster in voice_clusters:
         for seg in cluster.segments:
-            # Check if diarization segment is within cluster segment
+            # Check if diarization segment overlaps with cluster segment
             if seg.diar_speaker == diar_segment.speaker:
-                # Check time overlap
-                if (seg.start <= diar_segment.start < seg.end or
-                    seg.start < diar_segment.end <= seg.end):
+                # Check time overlap using proper interval overlap logic:
+                # Two intervals [a, b) and [c, d) overlap iff a < d and c < b
+                if diar_segment.start < seg.end and seg.start < diar_segment.end:
                     return cluster.voice_cluster_id
 
     return None

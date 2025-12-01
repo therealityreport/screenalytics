@@ -2467,6 +2467,10 @@ transcript_vtt_path = manifests_dir / "episode_transcript.vtt"
 audio_qc_path = manifests_dir / "audio_qc.json"
 voice_clusters_path = manifests_dir / "audio_voice_clusters.json"
 voice_mapping_path = manifests_dir / "audio_voice_mapping.json"
+diarization_path = manifests_dir / "audio_diarization.jsonl"
+asr_raw_path = manifests_dir / "audio_asr_raw.jsonl"
+vocals_path = audio_dir / "episode_vocals.wav"
+vocals_enhanced_path = audio_dir / "episode_vocals_enhanced.wav"
 
 # Check what exists
 has_transcript_jsonl = transcript_jsonl_path.exists()
@@ -2474,6 +2478,9 @@ has_transcript_vtt = transcript_vtt_path.exists()
 has_audio_qc = audio_qc_path.exists()
 has_voice_clusters = voice_clusters_path.exists()
 has_voice_mapping = voice_mapping_path.exists()
+has_audio_files = vocals_path.exists()
+has_diarization = diarization_path.exists()
+has_asr = asr_raw_path.exists()
 
 # Determine audio pipeline status
 audio_status = "not_started"
@@ -2582,13 +2589,46 @@ if running_audio_job:
 
 # Audio pipeline controls (when not running)
 audio_job_running = running_audio_job is not None
-with st.expander("Audio Pipeline Settings", expanded=not audio_status == "complete"):
+with st.expander("Audio Pipeline (Phased)", expanded=not audio_status == "complete"):
     audio_overwrite = st.checkbox(
-        "Overwrite existing audio artifacts",
+        "Overwrite existing artifacts",
         value=False,
         key=f"audio_overwrite_{ep_id}",
         disabled=audio_job_running,
     )
+
+    # Phase 1: Create Audio Files
+    st.markdown("---")
+    st.markdown("**Phase 1: Create Audio Files**")
+    phase1_status = "✅" if has_audio_files else "⏳"
+    st.caption(f"{phase1_status} Extract audio, separate vocals, enhance")
+
+    if st.button(
+        "🎵 Create Audio Files",
+        key=f"create_audio_files_{ep_id}",
+        disabled=audio_job_running or (has_audio_files and not audio_overwrite),
+        use_container_width=True,
+    ):
+        try:
+            payload = {"ep_id": ep_id, "overwrite": audio_overwrite}
+            resp = helpers.api_post("/jobs/episode_audio_files", json=payload)
+            job_id = resp.get("job_id")
+            if job_id:
+                helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
+                st.success(f"Audio files job started: {job_id}")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(f"Failed to start job: {resp}")
+        except requests.RequestException as exc:
+            st.error(helpers.describe_error("Create Audio Files", exc))
+
+    # Phase 2: Diarization + Transcription
+    st.markdown("---")
+    st.markdown("**Phase 2: Diarization + Transcription**")
+    phase2_status = "✅" if (has_diarization and has_asr and has_voice_clusters) else "⏳"
+    st.caption(f"{phase2_status} Run diarization, transcription, initial clustering")
+
     asr_provider = st.selectbox(
         "ASR Provider",
         options=["openai_whisper", "gemini"],
@@ -2597,30 +2637,72 @@ with st.expander("Audio Pipeline Settings", expanded=not audio_status == "comple
         disabled=audio_job_running,
     )
 
-    run_audio_disabled = audio_job_running
     if st.button(
-        "🎙️ Generate Audio + Transcript",
-        key=f"run_audio_pipeline_{ep_id}",
-        disabled=run_audio_disabled,
+        "🎙️ Run Diarization + Transcription",
+        key=f"run_diarize_transcribe_{ep_id}",
+        disabled=audio_job_running or not has_audio_files,
         use_container_width=True,
     ):
+        if not has_audio_files:
+            st.error("Audio files not found. Run 'Create Audio Files' first.")
+        else:
+            try:
+                payload = {"ep_id": ep_id, "asr_provider": asr_provider, "overwrite": audio_overwrite}
+                resp = helpers.api_post("/jobs/episode_audio_diarize_transcribe", json=payload)
+                job_id = resp.get("job_id")
+                if job_id:
+                    helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
+                    st.success(f"Diarization job started: {job_id}")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"Failed to start job: {resp}")
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error("Run Diarization", exc))
+
+    # Phase 3: Manual Review (link to Voices Review page)
+    st.markdown("---")
+    st.markdown("**Phase 3: Review Voices**")
+    if has_voice_clusters:
+        cluster_count = 0
         try:
-            payload = {
-                "ep_id": ep_id,
-                "overwrite": audio_overwrite,
-                "asr_provider": asr_provider,
-            }
-            resp = helpers.api_post("/jobs/episode_audio_pipeline", json=payload)
-            job_id = resp.get("job_id")
-            if job_id:
-                helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
-                st.success(f"Audio pipeline started: {job_id}")
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.error(f"Failed to start audio pipeline: {resp}")
-        except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}/jobs/episode_audio_pipeline", exc))
+            cluster_data = json.loads(voice_clusters_path.read_text(encoding="utf-8"))
+            cluster_count = len(cluster_data)
+        except Exception:
+            pass
+        st.caption(f"✅ {cluster_count} voice clusters ready for review")
+        st.page_link("pages/3_Voices_Review.py", label="🔊 Go to Voices Review", icon="🔊")
+    else:
+        st.caption("⏳ Run diarization first to create voice clusters")
+
+    # Phase 4: Finalize Transcript
+    st.markdown("---")
+    st.markdown("**Phase 4: Finalize Transcript**")
+    phase4_status = "✅" if has_transcript_jsonl else "⏳"
+    st.caption(f"{phase4_status} Generate final transcript with voice assignments, run QC")
+
+    if st.button(
+        "📝 Finalize Transcript",
+        key=f"finalize_transcript_{ep_id}",
+        disabled=audio_job_running or not (has_diarization and has_asr),
+        use_container_width=True,
+    ):
+        if not (has_diarization and has_asr):
+            st.error("Diarization or ASR not found. Run 'Diarization + Transcription' first.")
+        else:
+            try:
+                payload = {"ep_id": ep_id, "overwrite": audio_overwrite}
+                resp = helpers.api_post("/jobs/episode_audio_finalize", json=payload)
+                job_id = resp.get("job_id")
+                if job_id:
+                    helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
+                    st.success(f"Finalize job started: {job_id}")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"Failed to start job: {resp}")
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error("Finalize Transcript", exc))
 
 st.divider()
 

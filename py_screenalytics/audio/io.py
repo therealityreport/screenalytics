@@ -155,9 +155,13 @@ def extract_audio_from_video(
     else:
         acodec = "pcm_s32le"
 
+    # Build ffmpeg command - use -y (overwrite) always since we check existence above
+    # -n can cause hangs if file exists but we already return early for that case
     cmd = [
         "ffmpeg",
-        "-y" if overwrite else "-n",
+        "-y",  # Always overwrite - we handle skip logic above
+        "-hide_banner",
+        "-loglevel", "error",
         "-i", str(video_path),
         "-vn",  # No video
         "-acodec", acodec,
@@ -167,10 +171,14 @@ def extract_audio_from_video(
     ]
 
     LOGGER.info(f"Extracting audio: {video_path} -> {output_path}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
 
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg audio extraction failed: {result.stderr}")
+        # Truncate long error messages
+        stderr = result.stderr.strip()
+        if len(stderr) > 500:
+            stderr = stderr[:500] + "... (truncated)"
+        raise RuntimeError(f"ffmpeg audio extraction failed: {stderr}")
 
     stats = _compute_audio_stats(output_path)
     LOGGER.info(f"Audio extracted: {stats.duration_seconds:.2f}s, {sample_rate}Hz, {bit_depth}bit")
@@ -207,10 +215,12 @@ def normalize_audio(
     # Build loudnorm filter
     filter_parts = [f"loudnorm=I=-16:TP={target_peak_dbfs}:LRA=11"]
 
-    # Build command
+    # Build command - use -y since we check existence above
     cmd = [
         "ffmpeg",
-        "-y" if overwrite else "-n",
+        "-y",  # Always overwrite - we handle skip logic above
+        "-hide_banner",
+        "-loglevel", "error",
         "-i", str(input_path),
         "-af", ",".join(filter_parts),
     ]
@@ -221,10 +231,13 @@ def normalize_audio(
     cmd.append(str(output_path))
 
     LOGGER.info(f"Normalizing audio: {input_path} -> {output_path}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
 
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg normalization failed: {result.stderr}")
+        stderr = result.stderr.strip()
+        if len(stderr) > 500:
+            stderr = stderr[:500] + "... (truncated)"
+        raise RuntimeError(f"ffmpeg normalization failed: {stderr}")
 
     stats = _compute_audio_stats(output_path)
     return output_path, stats

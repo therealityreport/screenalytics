@@ -126,7 +126,9 @@ def _get_audio_paths(ep_id: str) -> dict:
         "audio_final": audio_dir / "episode_final_voice_only.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
         "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
+        "diarization_combined": manifests_dir / "audio_diarization_combined.jsonl",
         "voice_clusters": manifests_dir / "audio_voice_clusters.json",
+        "voice_clusters_gpt4o": manifests_dir / "audio_voice_clusters_gpt4o.json",
         "voice_mapping": manifests_dir / "audio_voice_mapping.json",
         "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
@@ -1837,7 +1839,8 @@ async def recluster_voices(ep_id: str, req: ClusterReclusterRequest):
         show_id = ep_id.rsplit("-", 1)[0] if "-" in ep_id else ep_id
 
         # Load diarization
-        diarization_segments = _load_diarization_manifest(paths["diarization"])
+        diar_path = paths.get("diarization_combined", paths["diarization"])
+        diarization_segments = _load_diarization_manifest(diar_path if diar_path.exists() else paths["diarization"])
 
         # Get audio path
         audio_path = paths["audio_vocals_enhanced"]
