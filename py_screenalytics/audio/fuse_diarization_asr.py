@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .models import (
     ASRSegment,
+    AudioSpeakerGroupsManifest,
     DiarizationSegment,
     TranscriptRow,
     VoiceBankMatchResult,
@@ -30,10 +31,12 @@ def fuse_transcript(
     asr_segments: List[ASRSegment],
     voice_clusters: List[VoiceCluster],
     voice_mapping: List[VoiceBankMatchResult],
+    speaker_groups_manifest: Optional[AudioSpeakerGroupsManifest],
     output_jsonl: Path,
     output_vtt: Path,
     include_speaker_notes: bool = True,
     overwrite: bool = False,
+    diarization_source: str = "pyannote",
 ) -> List[TranscriptRow]:
     """Fuse diarization, ASR, and voice mapping into final transcript.
 
@@ -42,10 +45,12 @@ def fuse_transcript(
         asr_segments: ASR results
         voice_clusters: Voice cluster data
         voice_mapping: Voice bank mapping results
+        speaker_groups_manifest: Speaker group manifest (preferred mapping surface)
         output_jsonl: Path for JSONL transcript
         output_vtt: Path for VTT transcript
         include_speaker_notes: Whether to include speaker notes in VTT
         overwrite: Whether to overwrite existing files
+        diarization_source: Source name to prefix diarization speakers when building group IDs
 
     Returns:
         List of TranscriptRow objects
@@ -65,6 +70,7 @@ def fuse_transcript(
     # Build lookup structures
     cluster_mapping = _build_cluster_mapping(voice_mapping)
     cluster_lookup = {c.voice_cluster_id: c for c in voice_clusters}
+    group_to_cluster = _build_group_cluster_lookup(voice_clusters)
 
     # Fuse segments
     transcript_rows = []
@@ -73,9 +79,16 @@ def fuse_transcript(
         # Find overlapping diarization segment
         best_diar = _find_best_diarization_match(asr_segment, diarization_segments)
 
+        speaker_group_id: Optional[str] = None
         if best_diar:
-            # Find which voice cluster this belongs to
-            cluster_id = _find_cluster_for_segment(best_diar, voice_clusters)
+            speaker_group_id = _speaker_group_from_diar(best_diar, diarization_source)
+
+        cluster_id = None
+        if best_diar:
+            # Prefer speaker-group → cluster mapping
+            cluster_id = group_to_cluster.get(speaker_group_id or "", None)
+            if not cluster_id:
+                cluster_id = _find_cluster_for_segment(best_diar, voice_clusters)
             mapping = cluster_mapping.get(cluster_id)
 
             if mapping:
@@ -83,9 +96,20 @@ def fuse_transcript(
                 speaker_display_name = mapping.speaker_display_name
                 voice_bank_id = mapping.voice_bank_id
             else:
-                # Fallback to diarization label
-                speaker_id = f"SPK_{best_diar.speaker}"
-                speaker_display_name = f"Speaker {best_diar.speaker}"
+                # Fallback to diarization label (or speaker group label if available)
+                group_label = None
+                if speaker_groups_manifest:
+                    group_lookup = {
+                        g.speaker_group_id: g
+                        for src in speaker_groups_manifest.sources
+                        for g in src.speakers
+                    }
+                    group = group_lookup.get(speaker_group_id or "")
+                    if group:
+                        group_label = group.speaker_label
+                speaker_label = group_label or best_diar.speaker
+                speaker_id = f"SPK_{speaker_label}"
+                speaker_display_name = f"Speaker {speaker_label}"
                 voice_bank_id = "voice_unknown"
                 cluster_id = cluster_id or "VC_00"
         else:
@@ -127,6 +151,19 @@ def _build_cluster_mapping(
     return {m.voice_cluster_id: m for m in voice_mapping}
 
 
+def _build_group_cluster_lookup(
+    voice_clusters: List[VoiceCluster],
+) -> Dict[str, str]:
+    """Map speaker_group_id -> voice_cluster_id."""
+    mapping: Dict[str, str] = {}
+    for cluster in voice_clusters:
+        for gid in cluster.speaker_group_ids:
+            mapping[gid] = cluster.voice_cluster_id
+        for source_group in cluster.sources:
+            mapping[source_group.speaker_group_id] = cluster.voice_cluster_id
+    return mapping
+
+
 def _find_best_diarization_match(
     asr_segment: ASRSegment,
     diarization_segments: List[DiarizationSegment],
@@ -146,6 +183,16 @@ def _find_best_diarization_match(
             best_match = diar_seg
 
     return best_match
+
+
+def _speaker_group_from_diar(
+    diar_segment: DiarizationSegment,
+    diarization_source: str,
+) -> str:
+    """Create a speaker_group_id for a diarization segment."""
+    if ":" in diar_segment.speaker:
+        return diar_segment.speaker
+    return f"{diarization_source}:{diar_segment.speaker}"
 
 
 def _find_cluster_for_segment(

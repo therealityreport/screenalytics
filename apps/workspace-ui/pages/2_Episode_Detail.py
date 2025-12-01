@@ -256,6 +256,47 @@ def _manifest_has_rows(path: Path) -> bool:
         return False
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _load_speaker_groups_manifest(path_str: str, mtime: float) -> Dict[str, Any] | None:
+    """Load speaker groups manifest with caching."""
+    path = Path(path_str)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _load_transcript_rows(path_str: str, mtime: float) -> list[dict]:
+    """Load transcript rows for overlap lookup."""
+    path = Path(path_str)
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    except Exception:
+        return []
+    return rows
+
+
+def _transcript_overlap(rows: list[dict], start: float, end: float, tolerance: float = 0.25) -> list[dict]:
+    """Return transcript segments overlapping a time range."""
+    matches = []
+    for row in rows:
+        row_start = float(row.get("start", 0))
+        row_end = float(row.get("end", 0))
+        if row_start < (end + tolerance) and row_end > (start - tolerance):
+            matches.append(row)
+    return sorted(matches, key=lambda r: r.get("start", 0))
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def _cached_episode_details(ep_id: str, cache_key: float) -> Dict[str, Any]:
     """Cache episode details API response with 10s TTL."""
@@ -2469,8 +2510,10 @@ voice_clusters_path = manifests_dir / "audio_voice_clusters.json"
 voice_mapping_path = manifests_dir / "audio_voice_mapping.json"
 diarization_path = manifests_dir / "audio_diarization.jsonl"
 asr_raw_path = manifests_dir / "audio_asr_raw.jsonl"
+speaker_groups_path = manifests_dir / "audio_speaker_groups.json"
 vocals_path = audio_dir / "episode_vocals.wav"
 vocals_enhanced_path = audio_dir / "episode_vocals_enhanced.wav"
+final_voice_path = audio_dir / "episode_final_voice_only.wav"
 
 # Check what exists
 has_transcript_jsonl = transcript_jsonl_path.exists()
@@ -2481,6 +2524,7 @@ has_voice_mapping = voice_mapping_path.exists()
 has_audio_files = vocals_path.exists()
 has_diarization = diarization_path.exists()
 has_asr = asr_raw_path.exists()
+has_speaker_groups = speaker_groups_path.exists()
 
 # Determine audio pipeline status
 audio_status = "not_started"
@@ -2703,6 +2747,115 @@ with st.expander("Audio Pipeline (Phased)", expanded=not audio_status == "comple
                     st.error(f"Failed to start job: {resp}")
             except requests.RequestException as exc:
                 st.error(helpers.describe_error("Finalize Transcript", exc))
+
+# Speaker group exploration + Smart Split
+st.markdown("### Speaker Groups (Pyannote vs GPT-4o)")
+if not has_speaker_groups:
+    st.caption("Run diarization to generate speaker groups for audio review.")
+else:
+    sg_mtime = speaker_groups_path.stat().st_mtime if speaker_groups_path.exists() else 0
+    speaker_groups_data = _load_speaker_groups_manifest(str(speaker_groups_path), sg_mtime) or {}
+    transcript_rows = _load_transcript_rows(
+        str(transcript_jsonl_path),
+        transcript_jsonl_path.stat().st_mtime if transcript_jsonl_path.exists() else 0,
+    ) if transcript_jsonl_path.exists() else []
+
+    sources_payload = speaker_groups_data.get("sources") or []
+    if not sources_payload:
+        st.caption("Speaker groups manifest is empty.")
+    else:
+        # Summaries
+        summary_cols = st.columns(max(1, min(3, len(sources_payload))))
+        for idx, src in enumerate(sources_payload):
+            summary = src.get("summary") or {}
+            summary_cols[idx % len(summary_cols)].metric(
+                label=src.get("source", "unknown").title(),
+                value=f"{summary.get('speakers', 0)} speakers",
+                delta=f"{summary.get('segments', 0)} segments • {summary.get('speech_seconds', 0)}s",
+            )
+
+        source_options = [src.get("source", "unknown") for src in sources_payload]
+        selected_source = st.selectbox(
+            "Diarization source",
+            options=source_options,
+            key=f"speaker_source_{ep_id}",
+        )
+        source_data = next((s for s in sources_payload if s.get("source") == selected_source), sources_payload[0])
+        groups = source_data.get("speakers") or []
+
+        if not groups:
+            st.caption("No speaker groups found for this source.")
+        else:
+            group_table = [
+                {
+                    "speaker_group_id": g.get("speaker_group_id"),
+                    "label": g.get("speaker_label"),
+                    "segments": g.get("segment_count", len(g.get("segments", []))),
+                    "duration_s": round(g.get("total_duration", 0.0), 2),
+                }
+                for g in groups
+            ]
+            st.dataframe(group_table, use_container_width=True, hide_index=True)
+
+            group_ids = [g.get("speaker_group_id") for g in groups]
+            selected_group_id = st.selectbox(
+                "Select speaker group",
+                options=group_ids,
+                index=0,
+                key=f"speaker_group_select_{ep_id}",
+            )
+            selected_group = next((g for g in groups if g.get("speaker_group_id") == selected_group_id), None)
+            if selected_group:
+                st.markdown(f"**Segments for {selected_group_id} ({selected_group.get('speaker_label')})**")
+                expected_voices = st.slider(
+                    "Expected voices if split",
+                    min_value=2,
+                    max_value=4,
+                    value=2,
+                    key=f"split_expected_{selected_group_id}",
+                )
+                final_audio_bytes = None
+                if final_voice_path.exists():
+                    try:
+                        final_audio_bytes = final_voice_path.read_bytes()
+                    except OSError:
+                        final_audio_bytes = None
+
+                for seg in selected_group.get("segments", []):
+                    seg_id = seg.get("segment_id")
+                    seg_start = seg.get("start", 0.0)
+                    seg_end = seg.get("end", 0.0)
+                    with st.expander(f"{seg_id or 'segment'}: {seg_start:.2f}s → {seg_end:.2f}s", expanded=False):
+                        if final_audio_bytes:
+                            st.audio(final_audio_bytes, format="audio/wav")
+                            st.caption(f"Focus on {seg_start:.2f}s → {seg_end:.2f}s")
+                        overlap_rows = _transcript_overlap(transcript_rows, seg_start, seg_end)
+                        if overlap_rows:
+                            st.caption("Transcript overlap:")
+                            for row in overlap_rows[:3]:
+                                st.write(f"{row.get('speaker_display_name', '')}: {row.get('text', '')}")
+                        if st.button(
+                            "Smart Split",
+                            key=f"smart_split_btn_{selected_group_id}_{seg_id}",
+                            use_container_width=True,
+                        ):
+                            payload = {
+                                "source": selected_source,
+                                "speaker_group_id": selected_group_id,
+                                "segment_id": seg_id,
+                                "expected_voices": expected_voices,
+                            }
+                            try:
+                                with st.spinner("Splitting segment..."):
+                                    resp = helpers.api_post(f"/episodes/{ep_id}/audio/smart_split", json=payload)
+                                if resp.get("error"):
+                                    st.error(resp.get("error"))
+                                else:
+                                    st.success("Segment split complete")
+                                    time.sleep(0.8)
+                                    st.rerun()
+                            except requests.RequestException as exc:
+                                st.error(helpers.describe_error("Smart Split", exc))
 
 st.divider()
 

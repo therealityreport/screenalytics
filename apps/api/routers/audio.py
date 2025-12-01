@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import get_path
 
 router = APIRouter(prefix="/jobs", tags=["audio"])
+edit_router = APIRouter(tags=["audio"])
 LOGGER = logging.getLogger(__name__)
 
 
@@ -107,6 +108,16 @@ class VoiceAssignResponse(BaseModel):
     error: Optional[str] = None
 
 
+class SmartSplitRequest(BaseModel):
+    """Request payload for smart split."""
+    source: Literal["pyannote", "gpt4o"]
+    speaker_group_id: str
+    segment_id: Optional[str] = Field(None, description="Segment identifier to split")
+    start: Optional[float] = Field(None, description="Start time (seconds) if segment_id not provided")
+    end: Optional[float] = Field(None, description="End time (seconds) if segment_id not provided")
+    expected_voices: int = Field(2, ge=2, le=5, description="Expected number of voices within the segment")
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -134,6 +145,7 @@ def _get_audio_paths(ep_id: str) -> dict:
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
         "qc": manifests_dir / "audio_qc.json",
         "archived_segments": manifests_dir / "audio_archived_segments.json",
+        "speaker_groups": manifests_dir / "audio_speaker_groups.json",
     }
 
 
@@ -179,6 +191,34 @@ def _normalize_run_mode(run_mode: Optional[str]) -> str:
     if run_mode == "redis":
         return "queue"
     return run_mode
+
+
+@edit_router.post("/episodes/{ep_id}/audio/smart_split")
+async def smart_split_segment(ep_id: str, req: SmartSplitRequest) -> dict:
+    """Smart split a diarization segment into subsegments and reassign speakers."""
+    if not req.segment_id and (req.start is None or req.end is None):
+        raise HTTPException(status_code=400, detail="Provide segment_id or start/end to split")
+
+    try:
+        from py_screenalytics.audio.speaker_edit import smart_split_segment as _smart_split
+
+        result = _smart_split(
+            ep_id=ep_id,
+            source=req.source,
+            speaker_group_id=req.speaker_group_id,
+            segment_id=req.segment_id,
+            start=req.start,
+            end=req.end,
+            expected_voices=req.expected_voices,
+        )
+        return result.model_dump()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.exception("Smart split failed for %s: %s", ep_id, exc)
+        raise HTTPException(status_code=500, detail=f"Smart split failed: {exc}")
 
 
 # =============================================================================

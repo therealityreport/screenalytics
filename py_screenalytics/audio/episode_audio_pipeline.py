@@ -114,6 +114,7 @@ def _get_audio_paths(ep_id: str, data_root: Optional[Path] = None) -> dict:
         "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
         "qc": manifests_dir / "audio_qc.json",
+        "speaker_groups": manifests_dir / "audio_speaker_groups.json",
     }
 
 
@@ -381,17 +382,34 @@ def run_episode_audio_pipeline(
         import shutil
         if paths["diarization_pyannote"].exists():
             shutil.copy(paths["diarization_pyannote"], paths["diarization"])
+        result.manifest_artifacts.diarization_pyannote = paths["diarization_pyannote"]
         clustering_segments = pyannote_segments
         if gpt4o_diar_segments:
             try:
                 from .diarization_pyannote import _save_diarization_manifest
                 clustering_segments = pyannote_segments + gpt4o_diar_segments
                 _save_diarization_manifest(clustering_segments, paths["diarization_combined"])
+                result.manifest_artifacts.diarization_gpt4o = paths["diarization_gpt4o"]
             except Exception as err:
                 LOGGER.warning(f"Failed to save combined diarization manifest: {err}")
                 clustering_segments = pyannote_segments
         diarization_segments = pyannote_segments
         result.manifest_artifacts.diarization = paths["diarization"]
+
+        # 4d: Build speaker groups manifest (primary surface for UI)
+        from .speaker_groups import build_speaker_groups_manifest
+
+        speaker_group_sources = {"pyannote": pyannote_segments}
+        if gpt4o_diar_segments:
+            speaker_group_sources["gpt4o"] = gpt4o_diar_segments
+
+        speaker_groups_manifest = build_speaker_groups_manifest(
+            ep_id,
+            speaker_group_sources,
+            paths["speaker_groups"],
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.speaker_groups = paths["speaker_groups"]
 
         _update_progress("diarize", 1.0, f"Dual diarization complete: pyannote={len(pyannote_segments)}, gpt4o={len(gpt4o_segments)}")
 
@@ -407,6 +425,7 @@ def run_episode_audio_pipeline(
             paths["voice_clusters"],
             config.voice_clustering,
             overwrite=overwrite,
+            speaker_groups_manifest=speaker_groups_manifest,
         )
         result.manifest_artifacts.voice_clusters = paths["voice_clusters"]
 
@@ -471,10 +490,12 @@ def run_episode_audio_pipeline(
             asr_segments,
             voice_clusters,
             voice_mapping,
+            speaker_groups_manifest,
             paths["transcript_jsonl"],
             paths["transcript_vtt"],
             config.export.vtt_include_speaker_notes,
             overwrite=overwrite,
+            diarization_source="pyannote",
         )
         result.manifest_artifacts.transcript_jsonl = paths["transcript_jsonl"]
         result.manifest_artifacts.transcript_vtt = paths["transcript_vtt"]
@@ -686,6 +707,7 @@ def sync_audio_artifacts_to_s3(
         ("qc", result.manifest_artifacts.qc, f"{base_name}_audio_qc.json"),
         ("voice_clusters", result.manifest_artifacts.voice_clusters, f"{base_name}_audio_voice_clusters.json"),
         ("voice_mapping", result.manifest_artifacts.voice_mapping, f"{base_name}_audio_voice_mapping.json"),
+        ("speaker_groups", result.manifest_artifacts.speaker_groups, f"{base_name}_audio_speaker_groups.json"),
     ]
 
     for key, path, s3_name in qc_files:

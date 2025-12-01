@@ -56,6 +56,7 @@ app.include_router(grouping.router, tags=["grouping"])
 app.include_router(metadata.router)
 app.include_router(archive.router, tags=["archive"])
 app.include_router(audio.router, tags=["audio"])
+app.include_router(audio.edit_router, tags=["audio"])
 
 # Celery is optional in local dev; guard the import so /healthz stays alive even if
 # celery[redis] is not installed. Expose a 503 stub so callers see a clear error.

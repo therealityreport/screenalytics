@@ -626,6 +626,7 @@ def episode_audio_align_task(
         from py_screenalytics.audio.voice_clusters import _load_voice_clusters
         from py_screenalytics.audio.voice_bank import _load_voice_mapping
         from py_screenalytics.audio.episode_audio_pipeline import _get_audio_paths, _load_config
+        from py_screenalytics.audio.speaker_groups import load_speaker_groups_manifest
 
         config = _load_config()
         paths = _get_audio_paths(ep_id)
@@ -636,6 +637,9 @@ def episode_audio_align_task(
         asr_segments = _load_asr_manifest(paths["asr_raw"])
         voice_clusters = _load_voice_clusters(paths["voice_clusters"])
         voice_mapping = _load_voice_mapping(paths["voice_mapping"])
+        speaker_groups_manifest = None
+        if paths.get("speaker_groups") and paths["speaker_groups"].exists():
+            speaker_groups_manifest = load_speaker_groups_manifest(paths["speaker_groups"])
 
         # Fuse into transcript
         _write_progress(ep_id, "align", "Fusing transcript...", 0.5)
@@ -644,10 +648,12 @@ def episode_audio_align_task(
             asr_segments,
             voice_clusters,
             voice_mapping,
+            speaker_groups_manifest,
             paths["transcript_jsonl"],
             paths["transcript_vtt"],
             config.export.vtt_include_speaker_notes,
             overwrite=overwrite,
+            diarization_source="pyannote",
         )
 
         _write_progress(ep_id, "align", f"Generated {len(transcript_rows)} transcript rows", 1.0)

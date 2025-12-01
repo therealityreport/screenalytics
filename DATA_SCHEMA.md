@@ -189,6 +189,34 @@ episode+person ──< screen_time
 - end (float): Segment end time in seconds
 - speaker (text): Raw speaker label from diarization (e.g., "SPEAKER_00")
 - confidence (float, null): Diarization confidence score
+- Notes: source-specific manifests are also written as `audio_diarization_pyannote.jsonl` and `audio_diarization_gpt4o.jsonl` for comparison.
+
+### audio_speaker_groups.json (audio_sg_v1)
+```json
+{
+  "ep_id": "show-s01e01",
+  "schema_version": "audio_sg_v1",
+  "sources": [
+    {
+      "source": "pyannote",
+      "summary": {"speakers": 2, "segments": 25, "speech_seconds": 83.8},
+      "speakers": [
+        {
+          "speaker_label": "PY_SPK_00",
+          "speaker_group_id": "pyannote:PY_SPK_00",
+          "total_duration": 52.4,
+          "segment_count": 13,
+          "segments": [
+            {"segment_id": "py_0001", "start": 0.5, "end": 4.2},
+            {"segment_id": "py_0002", "start": 5.0, "end": 7.8}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+- Primary surface for UI; groups remain stable even when clusters change.
 
 ### audio_asr_raw.jsonl (audio_asr_v1)
 - start (float): Segment start time
@@ -198,18 +226,24 @@ episode+person ──< screen_time
 - words (array, null): Word-level timings [{w, t0, t1}]
 - language (text, null): Detected language
 
-### audio_voice_clusters.json (audio_vc_v1)
+### audio_voice_clusters.json (audio_vc_v2)
 ```json
 [
   {
     "voice_cluster_id": "VC_01",
-    "segments": [{"start": 0.0, "end": 5.0, "diar_speaker": "SPEAKER_00"}],
+    "speaker_group_ids": ["pyannote:PY_SPK_00", "gpt4o:LLM_SPK_02"],
+    "sources": [
+      {"source": "pyannote", "speaker_group_id": "pyannote:PY_SPK_00", "speaker_label": "PY_SPK_00"},
+      {"source": "gpt4o", "speaker_group_id": "gpt4o:LLM_SPK_02", "speaker_label": "LLM_SPK_02"}
+    ],
+    "segments": [{"start": 0.0, "end": 5.0, "diar_speaker": "PY_SPK_00", "speaker_group_id": "pyannote:PY_SPK_00"}],
     "total_duration": 30.0,
     "segment_count": 5,
-    "centroid": [0.1, 0.2, ...]  // 256-d embedding, optional
+    "centroid": [0.1, 0.2, ...]
   }
 ]
 ```
+- Clusters are built on top of speaker groups (not raw micro-segments) and may merge similar groups across sources.
 
 ### audio_voice_mapping.json (audio_vm_v1)
 ```json

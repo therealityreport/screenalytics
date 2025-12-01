@@ -17,30 +17,36 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .models import (
+    AudioSpeakerGroupsManifest,
     DiarizationSegment,
+    SpeakerGroup,
     VoiceCluster,
     VoiceClusterSegment,
+    VoiceClusterSourceGroup,
     VoiceClusteringConfig,
 )
+from .speaker_groups import compute_group_centroids, speaker_group_lookup
 
 LOGGER = logging.getLogger(__name__)
 
 
 def cluster_episode_voices(
     audio_path: Path,
-    diarization_segments: List[DiarizationSegment],
+    diarization_segments: List[DiarizationSegment] | None,
     output_path: Path,
     config: Optional[VoiceClusteringConfig] = None,
     overwrite: bool = False,
+    speaker_groups_manifest: Optional[AudioSpeakerGroupsManifest] = None,
 ) -> List[VoiceCluster]:
-    """Cluster diarization segments into unique voices.
+    """Cluster speaker groups into unique voices.
 
     Args:
         audio_path: Path to audio file
-        diarization_segments: List of diarization segments
+        diarization_segments: List of diarization segments (deprecated; use speaker_groups_manifest)
         output_path: Path for voice clusters JSON
         config: Voice clustering configuration
         overwrite: Whether to overwrite existing results
+        speaker_groups_manifest: Optional precomputed speaker groups
 
     Returns:
         List of VoiceCluster objects
@@ -52,9 +58,188 @@ def cluster_episode_voices(
     config = config or VoiceClusteringConfig()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info(f"Clustering {len(diarization_segments)} segments into voice clusters")
+    if speaker_groups_manifest:
+        clusters = _cluster_from_speaker_groups(
+            audio_path,
+            speaker_groups_manifest,
+            config,
+        )
+    elif diarization_segments:
+        LOGGER.warning(
+            "Deprecated diarization_segments clustering path used. "
+            "Provide speaker_groups_manifest for group-first clustering."
+        )
+        clusters = _cluster_from_segments_legacy(
+            audio_path,
+            diarization_segments,
+            config,
+        )
+    else:
+        LOGGER.warning("No diarization data provided for voice clustering")
+        clusters = []
 
-    # Extract embeddings for each segment
+    clusters = _assign_cluster_ids(clusters)
+    _save_voice_clusters(clusters, output_path)
+    LOGGER.info("Created %d voice clusters", len(clusters))
+
+    return clusters
+
+
+def _cluster_from_speaker_groups(
+    audio_path: Path,
+    manifest: AudioSpeakerGroupsManifest,
+    config: VoiceClusteringConfig,
+) -> List[VoiceCluster]:
+    """Cluster voices from speaker groups across sources."""
+    group_lookup = speaker_group_lookup(manifest)
+    if not group_lookup:
+        return []
+
+    try:
+        centroids = compute_group_centroids(audio_path, manifest, config.embedding_model)
+    except Exception as exc:  # pragma: no cover - depends on heavy deps
+        LOGGER.warning("Failed to compute speaker group centroids: %s", exc)
+        centroids = {}
+
+    group_data = []
+    for source in manifest.sources:
+        for group in source.speakers:
+            centroid = centroids.get(group.speaker_group_id)
+            group_data.append(
+                {
+                    "source": source.source,
+                    "group": group,
+                    "centroid": centroid,
+                }
+            )
+
+    # Determine cross-source merges using conservative mutual best match
+    matches = _mutual_best_matches(group_data, config.similarity_threshold)
+
+    assigned: set[str] = set()
+    clusters: List[VoiceCluster] = []
+
+    for g1_id, g2_id in matches:
+        if g1_id in assigned or g2_id in assigned:
+            continue
+        groups = [group_lookup[g1_id], group_lookup[g2_id]]
+        clusters.append(_cluster_from_groups(groups, centroids))
+        assigned.add(g1_id)
+        assigned.add(g2_id)
+
+    # Remaining groups become single-group clusters
+    for item in group_data:
+        gid = item["group"].speaker_group_id
+        if gid in assigned:
+            continue
+        clusters.append(_cluster_from_groups([item["group"]], centroids))
+        assigned.add(gid)
+
+    # Filter out empty clusters
+    return [c for c in clusters if c.segment_count >= config.min_segments_per_cluster]
+
+
+def _cluster_from_groups(
+    groups: List[SpeakerGroup],
+    centroids: Dict[str, np.ndarray],
+) -> VoiceCluster:
+    """Build a VoiceCluster from one or more speaker groups."""
+    total_duration = sum(g.total_duration for g in groups)
+    segment_count = sum(g.segment_count for g in groups)
+    segments: List[VoiceClusterSegment] = []
+    sources: List[VoiceClusterSourceGroup] = []
+    centroid_vectors: List[np.ndarray] = []
+
+    for group in groups:
+        for seg in group.segments:
+            segments.append(
+                VoiceClusterSegment(
+                    start=seg.start,
+                    end=seg.end,
+                    diar_speaker=group.speaker_label,
+                    speaker_group_id=group.speaker_group_id,
+                )
+            )
+        centroid_vec = centroids.get(group.speaker_group_id)
+        if centroid_vec is not None:
+            centroid_vectors.append(centroid_vec)
+        sources.append(
+            VoiceClusterSourceGroup(
+                source=group.speaker_group_id.split(":", 1)[0],
+                speaker_group_id=group.speaker_group_id,
+                speaker_label=group.speaker_label,
+                centroid=centroid_vec.tolist() if centroid_vec is not None else None,
+            )
+        )
+
+    centroid = None
+    if centroid_vectors:
+        centroid = compute_cluster_centroid(centroid_vectors, method="mean").tolist()
+
+    return VoiceCluster(
+        voice_cluster_id="",
+        segments=segments,
+        sources=sources,
+        speaker_group_ids=[g.speaker_group_id for g in groups],
+        total_duration=total_duration,
+        segment_count=segment_count,
+        centroid=centroid,
+    )
+
+
+def _mutual_best_matches(
+    group_data: List[Dict],
+    similarity_threshold: float,
+) -> List[Tuple[str, str]]:
+    """Find mutual best centroid matches across different sources."""
+    if len(group_data) < 2:
+        return []
+
+    # Build map of centroid by group_id
+    centroid_map: Dict[str, np.ndarray] = {}
+    for item in group_data:
+        centroid = item.get("centroid")
+        if centroid is not None:
+            centroid_map[item["group"].speaker_group_id] = centroid
+
+    best: Dict[str, Tuple[str, float]] = {}
+    for i, item in enumerate(group_data):
+        gid = item["group"].speaker_group_id
+        centroid = centroid_map.get(gid)
+        if centroid is None:
+            continue
+        for other in group_data[i + 1:]:
+            other_gid = other["group"].speaker_group_id
+            if other["source"] == item["source"]:
+                continue
+            other_centroid = centroid_map.get(other_gid)
+            if other_centroid is None:
+                continue
+            sim = float(np.dot(centroid, other_centroid))
+            if sim < similarity_threshold:
+                continue
+            if sim > best.get(gid, ("", -1))[1]:
+                best[gid] = (other_gid, sim)
+            if sim > best.get(other_gid, ("", -1))[1]:
+                best[other_gid] = (gid, sim)
+
+    matches: List[Tuple[str, str]] = []
+    for gid, (candidate, _) in best.items():
+        reciprocal = best.get(candidate, (None, -1))[0]
+        if reciprocal == gid:
+            pair = tuple(sorted([gid, candidate]))
+            if pair not in matches:
+                matches.append(pair)
+    return matches
+
+
+def _cluster_from_segments_legacy(
+    audio_path: Path,
+    diarization_segments: List[DiarizationSegment],
+    config: VoiceClusteringConfig,
+) -> List[VoiceCluster]:
+    """Legacy segment-level clustering retained for backwards compatibility."""
+    LOGGER.info("Clustering %d segments into voice clusters (legacy path)", len(diarization_segments))
     from .diarization_pyannote import extract_speaker_embeddings
 
     segment_embeddings = extract_speaker_embeddings(
@@ -65,47 +250,28 @@ def cluster_episode_voices(
 
     if not segment_embeddings:
         LOGGER.warning("No embeddings extracted, creating clusters from diarization labels")
-        clusters = _clusters_from_diarization_labels(diarization_segments)
-        _save_voice_clusters(clusters, output_path)
-        return clusters
+        return _clusters_from_diarization_labels(diarization_segments)
 
-    # Check how many unique speakers diarization found
     unique_diar_speakers = set(seg.speaker for seg in diarization_segments)
-    LOGGER.info(f"Diarization found {len(unique_diar_speakers)} unique speakers")
-
-    # If diarization found very few speakers (1-2), do embedding-based clustering
-    # to properly separate voices that diarization missed
     if len(unique_diar_speakers) <= 2 and len(segment_embeddings) >= 3:
         LOGGER.info("Diarization found few speakers - using embedding-based clustering")
-        clusters = _cluster_by_embeddings(
+        return _cluster_by_embeddings(
             segment_embeddings,
             config.similarity_threshold,
             config.min_segments_per_cluster,
             config.centroid_method,
         )
-    else:
-        # Group embeddings by diarization speaker label
-        speaker_embeddings: Dict[str, List[Tuple[DiarizationSegment, np.ndarray]]] = defaultdict(list)
-        for segment, embedding in segment_embeddings:
-            speaker_embeddings[segment.speaker].append((segment, embedding))
 
-        # Refine clusters using embeddings
-        clusters = _refine_clusters_with_embeddings(
-            speaker_embeddings,
-            config.similarity_threshold,
-            config.min_segments_per_cluster,
-            config.centroid_method,
-        )
+    speaker_embeddings: Dict[str, List[Tuple[DiarizationSegment, np.ndarray]]] = defaultdict(list)
+    for segment, embedding in segment_embeddings:
+        speaker_embeddings[segment.speaker].append((segment, embedding))
 
-    # Assign stable IDs
-    clusters = _assign_cluster_ids(clusters)
-
-    # Save clusters
-    _save_voice_clusters(clusters, output_path)
-
-    LOGGER.info(f"Created {len(clusters)} voice clusters")
-
-    return clusters
+    return _refine_clusters_with_embeddings(
+        speaker_embeddings,
+        config.similarity_threshold,
+        config.min_segments_per_cluster,
+        config.centroid_method,
+    )
 
 
 def _cluster_by_embeddings(
@@ -256,6 +422,14 @@ def _clusters_from_diarization_labels(
         cluster = VoiceCluster(
             voice_cluster_id=f"VC_{i+1:02d}",
             segments=cluster_segments,
+            speaker_group_ids=[speaker],
+            sources=[
+                VoiceClusterSourceGroup(
+                    source=speaker.split(":", 1)[0] if ":" in speaker else "diarization",
+                    speaker_group_id=speaker,
+                    speaker_label=speaker,
+                )
+            ],
             total_duration=total_duration,
             segment_count=len(segs),
         )
