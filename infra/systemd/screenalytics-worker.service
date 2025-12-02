@@ -1,0 +1,71 @@
+# Screenalytics Celery Worker Service
+#
+# This systemd unit runs the Celery worker for background job processing.
+# Copy to /etc/systemd/system/screenalytics-worker.service
+#
+# Usage:
+#   sudo cp infra/systemd/screenalytics-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable screenalytics-worker
+#   sudo systemctl start screenalytics-worker
+#
+# Prerequisites:
+#   - Application installed at /opt/screenalytics
+#   - Python virtualenv at /opt/screenalytics/.venv
+#   - Environment file at /opt/screenalytics/.env
+#   - 'screenalytics' user created
+#   - Redis running (Celery broker)
+#
+# Concurrency notes:
+#   - Default --concurrency=2 is conservative for t3.xlarge (4 vCPU)
+#   - Increase to 3-4 for larger instances
+#   - ML tasks are CPU-intensive; avoid over-subscribing
+#
+# See: docs/infra/screenalytics_deploy_plan.md
+
+[Unit]
+Description=Screenalytics Celery Worker
+Documentation=https://github.com/therealityreport/screenalytics
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=screenalytics
+Group=screenalytics
+WorkingDirectory=/opt/screenalytics
+
+# Load environment variables from .env file
+EnvironmentFile=/opt/screenalytics/.env
+
+# Run Celery worker with conservative concurrency
+# Processes tasks from default queue (detect_track, faces, cluster, grouping)
+ExecStart=/opt/screenalytics/.venv/bin/celery \
+    -A apps.api.celery_app:celery_app \
+    worker \
+    --loglevel=info \
+    --concurrency=2 \
+    --hostname=worker@%%h
+
+# Graceful shutdown (wait for tasks to complete)
+ExecStop=/bin/kill -s TERM $MAINPID
+TimeoutStopSec=300
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits (ML tasks can be memory-intensive)
+# LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=screenalytics-worker
+
+[Install]
+WantedBy=multi-user.target

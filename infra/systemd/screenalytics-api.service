@@ -1,0 +1,60 @@
+# Screenalytics FastAPI Service
+#
+# This systemd unit runs the FastAPI backend API server.
+# Copy to /etc/systemd/system/screenalytics-api.service
+#
+# Usage:
+#   sudo cp infra/systemd/screenalytics-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable screenalytics-api
+#   sudo systemctl start screenalytics-api
+#
+# Prerequisites:
+#   - Application installed at /opt/screenalytics
+#   - Python virtualenv at /opt/screenalytics/.venv
+#   - Environment file at /opt/screenalytics/.env
+#   - 'screenalytics' user created
+#   - Redis running (for Celery integration)
+#
+# See: docs/infra/screenalytics_deploy_plan.md
+
+[Unit]
+Description=Screenalytics FastAPI API Server
+Documentation=https://github.com/therealityreport/screenalytics
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=screenalytics
+Group=screenalytics
+WorkingDirectory=/opt/screenalytics
+
+# Load environment variables from .env file
+EnvironmentFile=/opt/screanalytics/.env
+
+# Run uvicorn binding to localhost only (nginx handles external traffic)
+ExecStart=/opt/screenalytics/.venv/bin/uvicorn apps.api.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --log-level info
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits (adjust based on instance size)
+# LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=screenalytics-api
+
+[Install]
+WantedBy=multi-user.target
