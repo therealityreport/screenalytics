@@ -135,6 +135,44 @@ class VoiceBankConfig(BaseModel):
     max_unlabeled_per_episode: int = 20
 
 
+class VoiceprintIdentificationConfig(BaseModel):
+    """Configuration for voiceprint identification pass.
+
+    HARD RULES (Manual-First, ML-Second):
+    1. Manual assignments are preserved unless allow_high_conf_override=True
+       AND ident_confidence >= high_conf_override_threshold (80%)
+    2. "if_better" policy requires 10%+ improvement in score
+    3. Minimum 10s clean speech required to create voiceprint
+    4. Identification never silently relabels - low confidence goes to review queue
+    """
+
+    # Segment selection for voiceprint creation
+    min_segment_duration: float = 4.0  # Minimum segment duration in seconds
+    max_segment_duration: float = 20.0  # Maximum segment duration (Pyannote limit is 30s)
+    max_segments_per_cast: int = 3  # Max segments to use for voiceprint creation
+    min_total_clean_speech_per_cast: float = 10.0  # Must have 10s+ to create voiceprint
+
+    # Voiceprint creation policy
+    voiceprint_overwrite_policy: str = "if_missing"  # "if_missing" | "always" | "if_better"
+    # For "if_better": score = total_duration_s * mean_confidence
+    # Only overwrite if new_score > old_score * improvement_threshold
+    if_better_improvement_threshold: float = 1.1  # Require 10% improvement
+
+    # Identification matching (Pyannote API params)
+    ident_matching_threshold: int = 60  # Minimum confidence for matching (0-100)
+    ident_matching_exclusive: bool = True  # Prevent multiple speakers matching same voiceprint
+
+    # Transcript regeneration - MANUAL-FIRST, ML-SECOND
+    ident_conf_threshold: float = 60.0  # Minimum confidence to assign cast from identification
+    high_conf_override_threshold: float = 80.0  # Threshold to override MANUAL assignments
+    allow_high_conf_override: bool = False  # Must explicitly enable overriding manual assignments
+    preserve_manual_assignments: bool = True  # HARD RULE: manual corrections always win
+
+    # Review queue generation
+    diar_conf_threshold: float = 70.0  # Flag segments below this diarization confidence
+    review_queue_enabled: bool = True  # Generate review queue artifact
+
+
 class QCConfig(BaseModel):
     """Configuration for quality control."""
     max_duration_drift_pct: float = 1.0

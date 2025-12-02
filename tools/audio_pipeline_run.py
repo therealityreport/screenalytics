@@ -60,6 +60,7 @@ def _get_audio_paths(ep_id: str):
         "audio_vocals": audio_dir / "episode_vocals.wav",
         "audio_vocals_enhanced": audio_dir / "episode_vocals_enhanced.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
+        "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
         "voice_clusters": manifests_dir / "audio_voice_clusters.json",
         "voice_mapping": manifests_dir / "audio_voice_mapping.json",
         "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
@@ -87,23 +88,107 @@ def run_diarize_only(args):
             emit_progress("error", 0, "No audio files found. Run full pipeline first.")
             sys.exit(1)
 
+        # Clear old diarization data for a fresh start
+        files_to_clear = [
+            paths["diarization"],            # audio_diarization.jsonl
+            paths["diarization_comparison"], # audio_diarization_comparison.json
+            paths["voice_clusters"],         # audio_voice_clusters.json (depends on diarization)
+            paths["voice_mapping"],          # audio_voice_mapping.json (depends on diarization)
+        ]
+        for old_file in files_to_clear:
+            if old_file.exists():
+                logger.info(f"Clearing old file: {old_file.name}")
+                old_file.unlink()
+        emit_progress("diarize", 0.05, "Cleared old diarization data",
+                     step_name="Diarization", step_order=1, total_steps=1)
+
         from py_screenalytics.audio.diarization_pyannote import run_diarization
-        from py_screenalytics.audio.episode_audio_pipeline import _load_config
+        from py_screenalytics.audio.episode_audio_pipeline import _load_config, _get_cast_count_for_episode
 
         config = _load_config().diarization
 
-        # Apply num_speakers override
+        # Apply speaker count overrides
+        config_updates = {}
         if args.num_speakers is not None:
-            config = config.model_copy(update={"num_speakers": args.num_speakers})
+            config_updates["num_speakers"] = args.num_speakers
             logger.info(f"Forcing {args.num_speakers} speakers")
             emit_progress("diarize", 0.1, f"Running diarization (forcing {args.num_speakers} speakers)...",
                          step_name="Diarization", step_order=1, total_steps=1)
-        else:
-            emit_progress("diarize", 0.1, "Running diarization (auto speaker detection)...",
+        elif args.min_speakers is not None or args.max_speakers is not None:
+            if args.min_speakers is not None:
+                config_updates["min_speakers"] = args.min_speakers
+            if args.max_speakers is not None:
+                config_updates["max_speakers"] = args.max_speakers
+            logger.info(f"Speaker range: {args.min_speakers or config.min_speakers}-{args.max_speakers or config.max_speakers}")
+            emit_progress("diarize", 0.1, f"Running diarization (speakers: {args.min_speakers or config.min_speakers}-{args.max_speakers or config.max_speakers})...",
                          step_name="Diarization", step_order=1, total_steps=1)
+        else:
+            # Auto-calculate speaker range from cast count
+            cast_count = _get_cast_count_for_episode(ep_id)
+            if cast_count > 0:
+                auto_min = max(1, cast_count - 2)
+                auto_max = cast_count + 5
+                config_updates["min_speakers"] = auto_min
+                config_updates["max_speakers"] = auto_max
+                logger.info(f"Auto-calculated speaker range from {cast_count} cast members: {auto_min}-{auto_max}")
+                emit_progress("diarize", 0.1, f"Running diarization (auto: {auto_min}-{auto_max} speakers from {cast_count} cast)...",
+                             step_name="Diarization", step_order=1, total_steps=1)
+            else:
+                emit_progress("diarize", 0.1, "Running diarization (using config defaults)...",
+                             step_name="Diarization", step_order=1, total_steps=1)
+
+        if config_updates:
+            config = config.model_copy(update=config_updates)
+
+        # Log final config for debugging
+        logger.info(f"Diarization config: backend={config.backend}, min_speakers={config.min_speakers}, max_speakers={config.max_speakers}, num_speakers={config.num_speakers}")
+        emit_progress("diarize", 0.15, f"Config: backend={config.backend}, speakers={config.min_speakers}-{config.max_speakers}",
+                     step_name="Diarization", step_order=1, total_steps=1)
 
         segments = run_diarization(audio_path, paths["diarization"], config, overwrite=True)
         speakers = set(s.speaker for s in segments)
+
+        emit_progress("diarize", 0.7, f"Pyannote diarization complete: {len(speakers)} speakers",
+                     step_name="Diarization", step_order=1, total_steps=1)
+
+        # Regenerate diarization comparison using existing GPT-4o data
+        emit_progress("diarize", 0.8, "Regenerating diarization comparison...",
+                     step_name="Diarization", step_order=1, total_steps=1)
+        try:
+            from py_screenalytics.audio.episode_audio_pipeline import _save_diarization_comparison, _get_audio_paths as get_full_paths
+            from py_screenalytics.audio.diarization_comparison import augment_diarization_comparison
+
+            full_paths = get_full_paths(ep_id)
+
+            # Load existing GPT-4o diarization if available
+            gpt4o_segments = []
+            gpt4o_path = full_paths.get("diarization_gpt4o")
+            if gpt4o_path and gpt4o_path.exists():
+                import json
+                with gpt4o_path.open("r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            gpt4o_segments.append(json.loads(line))
+                logger.info(f"Loaded {len(gpt4o_segments)} GPT-4o segments for comparison")
+
+            # Convert pyannote segments to dict format for comparison
+            pyannote_dicts = [{"start": s.start, "end": s.end, "speaker": s.speaker} for s in segments]
+
+            # Save comparison
+            comparison_path = full_paths.get("diarization_comparison")
+            if comparison_path:
+                _save_diarization_comparison(pyannote_dicts, gpt4o_segments, comparison_path)
+                logger.info(f"Saved diarization comparison to {comparison_path}")
+
+                # Augment with transcript text
+                transcript_path = full_paths.get("transcript_jsonl")
+                if transcript_path and transcript_path.exists():
+                    augment_diarization_comparison(comparison_path, transcript_path)
+                    logger.info("Augmented comparison with transcript text")
+
+        except Exception as e:
+            logger.warning(f"Could not regenerate comparison: {e}")
 
         emit_progress("complete", 1.0, f"Diarization complete: {len(speakers)} speakers, {len(segments)} segments",
                      step_name="Complete", step_order=1, total_steps=1,
@@ -248,6 +333,109 @@ def run_voices_only(args):
         sys.exit(1)
 
 
+def run_voiceprint_refresh(args):
+    """Run voiceprint identification refresh pipeline.
+
+    This function:
+    1. Selects clean segments from manually assigned clusters
+    2. Creates voiceprints for cast members using Pyannote API
+    3. Runs identification pass on full episode audio
+    4. Regenerates transcript with cast names
+    5. Generates review queue for low-confidence segments
+    """
+    setup_logging()
+    logger = logging.getLogger("audio_pipeline_run")
+
+    ep_id = args.ep_id
+    logger.info(f"Starting voiceprint refresh for {ep_id}")
+    emit_progress("voiceprint_refresh", 0, f"Starting voiceprint identification refresh for {ep_id}",
+                 step_name="Voiceprint Refresh", step_order=1, total_steps=5)
+
+    try:
+        paths = _get_audio_paths(ep_id)
+
+        if not paths["diarization"].exists():
+            emit_progress("error", 0, "No diarization found. Run audio pipeline first.")
+            sys.exit(1)
+
+        # Find input audio
+        audio_path = paths["audio_vocals_enhanced"]
+        if not audio_path.exists():
+            audio_path = paths["audio_vocals"]
+        if not audio_path.exists():
+            emit_progress("error", 0, "No audio files found. Run full pipeline first.")
+            sys.exit(1)
+
+        # Get show_id from ep_id
+        show_id = ep_id.rsplit("-", 1)[0] if "-" in ep_id else ep_id
+
+        # Build voiceprint overwrite policy
+        policy = "always" if args.overwrite_voiceprints else "if_missing"
+
+        emit_progress("voiceprint_refresh", 0.1, "Loading configuration...",
+                     step_name="Voiceprint Refresh", step_order=1, total_steps=5)
+
+        from py_screenalytics.audio.models import VoiceprintIdentificationConfig
+
+        config = VoiceprintIdentificationConfig(
+            voiceprint_overwrite_policy=policy,
+            ident_matching_threshold=args.ident_threshold,
+        )
+
+        # Use async runner
+        import asyncio
+        from apps.api.jobs_audio import episode_voiceprint_refresh_async
+
+        async def run_with_progress():
+            def progress_cb(step: str, progress: float, message: str = ""):
+                # Map steps to progress stages
+                step_map = {
+                    "select_segments": (1, "Selecting Segments"),
+                    "create_voiceprints": (2, "Creating Voiceprints"),
+                    "run_identification": (3, "Running Identification"),
+                    "regenerate_transcript": (4, "Regenerating Transcript"),
+                    "generate_review_queue": (5, "Generating Review Queue"),
+                }
+                step_order, step_name = step_map.get(step, (1, step))
+                overall = (step_order - 1 + progress) / 5.0
+                emit_progress("voiceprint_refresh", overall, message,
+                            step_name=step_name, step_order=step_order, total_steps=5,
+                            step_progress=progress)
+
+            result = await episode_voiceprint_refresh_async(
+                ep_id=ep_id,
+                show_id=show_id,
+                overwrite_voiceprints=args.overwrite_voiceprints,
+                ident_threshold=args.ident_threshold,
+                progress_callback=progress_cb,
+            )
+            return result
+
+        result = asyncio.run(run_with_progress())
+
+        if result.get("status") == "succeeded":
+            summary = result.get("summary", {})
+            emit_progress(
+                "complete", 1.0,
+                f"Voiceprint refresh complete: {summary.get('voiceprints_created', 0)} voiceprints, "
+                f"{summary.get('review_queue_count', 0)} items in review queue",
+                step_name="Complete", step_order=5, total_steps=5,
+                voiceprints_created=summary.get("voiceprints_created", 0),
+                voiceprints_skipped=summary.get("voiceprints_skipped", 0),
+                review_queue_count=summary.get("review_queue_count", 0),
+            )
+            logger.info(f"Voiceprint refresh complete for {ep_id}")
+            sys.exit(0)
+        else:
+            emit_progress("error", 0, f"Voiceprint refresh failed: {result.get('error', 'Unknown error')}")
+            sys.exit(1)
+
+    except Exception as e:
+        logger.exception(f"Voiceprint refresh failed: {e}")
+        emit_progress("error", 0, f"Voiceprint refresh failed: {e}")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run audio pipeline for an episode")
     parser.add_argument("--ep-id", required=True, help="Episode ID")
@@ -266,8 +454,20 @@ def main():
                        help="Re-run only voice clustering (requires existing diarization)")
     parser.add_argument("--num-speakers", type=int, default=None,
                        help="Force exact speaker count for diarization")
+    parser.add_argument("--min-speakers", type=int, default=None,
+                       help="Minimum expected speakers (hint to diarization model)")
+    parser.add_argument("--max-speakers", type=int, default=None,
+                       help="Maximum expected speakers (hint to diarization model)")
     parser.add_argument("--similarity-threshold", type=float, default=0.30,
                        help="Similarity threshold for voice clustering (lower = fewer clusters)")
+
+    # Voiceprint refresh flags
+    parser.add_argument("--voiceprint-refresh", action="store_true",
+                       help="Run voiceprint identification refresh (requires diarization + manual assignments)")
+    parser.add_argument("--overwrite-voiceprints", action="store_true",
+                       help="Force recreation of voiceprints even if they exist")
+    parser.add_argument("--ident-threshold", type=int, default=60,
+                       help="Confidence threshold for identification matching (0-100)")
 
     args = parser.parse_args()
 
@@ -278,6 +478,8 @@ def main():
         return run_transcribe_only(args)
     if args.voices_only:
         return run_voices_only(args)
+    if args.voiceprint_refresh:
+        return run_voiceprint_refresh(args)
 
     setup_logging()
     logger = logging.getLogger("audio_pipeline_run")
@@ -339,6 +541,8 @@ def main():
             overwrite=args.overwrite,
             asr_provider=args.asr_provider,
             progress_callback=progress_callback,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers,
         )
 
         if result.status == "succeeded":

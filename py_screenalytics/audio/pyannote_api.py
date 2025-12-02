@@ -52,6 +52,36 @@ class DiarizationJobResult:
     raw_response: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class VoiceprintJobResult:
+    """Result from a completed voiceprint creation job."""
+
+    job_id: str
+    status: str
+    voiceprint: Optional[str] = None  # Base64 encoded voiceprint blob
+    error: Optional[str] = None
+    raw_response: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class IdentificationJobResult:
+    """Result from a completed identification job.
+
+    Output format from /v1/identify:
+    - diarization: [{speaker, start, end}, ...]
+    - identification: [{speaker, start, end, diarizationSpeaker, match}, ...]
+    - voiceprints: [{speaker, match, confidence: {label: score, ...}}, ...]
+    """
+
+    job_id: str
+    status: str
+    diarization: List[Dict[str, Any]] = field(default_factory=list)
+    identification: List[Dict[str, Any]] = field(default_factory=list)
+    voiceprints: List[Dict[str, Any]] = field(default_factory=list)
+    error: Optional[str] = None
+    raw_response: Optional[Dict[str, Any]] = None
+
+
 class PyannoteAPIError(Exception):
     """Exception for PyannoteAI API errors."""
 
@@ -414,6 +444,335 @@ class PyannoteAPIClient:
             status=status,
             diarization=diarization,
             exclusive_diarization=exclusive_diarization,
+            raw_response=result,
+        )
+
+    # =========================================================================
+    # Voiceprint Creation API
+    # =========================================================================
+
+    def submit_voiceprint(
+        self,
+        media_url: str,
+        webhook_url: Optional[str] = None,
+    ) -> str:
+        """Submit voiceprint creation job to PyannoteAI.
+
+        Per official docs:
+        - Audio must be single-speaker only
+        - Maximum duration: 30 seconds
+        - POST /v1/voiceprint with {url: <audio_url>}
+
+        Args:
+            media_url: Publicly accessible audio URL (single speaker, <=30s)
+            webhook_url: Optional webhook URL for async notification
+
+        Returns:
+            Job ID for polling
+
+        Raises:
+            PyannoteAPIError: If submission fails
+        """
+        body: Dict[str, Any] = {"url": media_url}
+
+        if webhook_url:
+            body["webhook"] = webhook_url
+
+        LOGGER.info(f"Submitting voiceprint job to PyannoteAI")
+        LOGGER.debug(f"Voiceprint request body: {json.dumps(body)}")
+
+        try:
+            with self._breaker:
+                response = self._client.post("/voiceprint", json=body)
+        except CircuitBreakerError as e:
+            raise PyannoteAPIError(
+                f"PyannoteAI API unavailable (circuit breaker open): {e}"
+            ) from e
+
+        if response.status_code != 200:
+            error_text = response.text
+            raise PyannoteAPIError(
+                f"Voiceprint submission failed: {response.status_code} - {error_text}",
+                status_code=response.status_code,
+            )
+
+        result = response.json()
+        job_id = result.get("jobId")
+
+        if not job_id:
+            raise PyannoteAPIError(f"No jobId in response: {result}")
+
+        LOGGER.info(f"Voiceprint job submitted to PyannoteAI: jobId={job_id}")
+        return job_id
+
+    def poll_voiceprint_job(
+        self,
+        job_id: str,
+        max_wait: float = 300.0,
+    ) -> VoiceprintJobResult:
+        """Poll for voiceprint job completion.
+
+        Args:
+            job_id: Job ID to poll
+            max_wait: Maximum wait time in seconds (default 5 min)
+
+        Returns:
+            VoiceprintJobResult with voiceprint blob
+
+        Raises:
+            PyannoteAPIError: If job fails or times out
+        """
+        elapsed = 0.0
+        LOGGER.info(f"Polling PyannoteAI voiceprint job: {job_id} (timeout: {max_wait}s)")
+
+        while elapsed < max_wait:
+            result = self.get_job_status(job_id)
+            status = result.get("status", "unknown")
+
+            LOGGER.debug(f"Voiceprint job {job_id} status: {status}")
+
+            if status in TERMINAL_STATUSES:
+                return self._parse_voiceprint_result(job_id, result)
+
+            jitter = random.uniform(-1.0, self._poll_interval_jitter)
+            poll_interval = self._poll_interval_base + jitter
+
+            LOGGER.info(f"Polling PyannoteAI voiceprint job status... (interval: {poll_interval:.1f}s)")
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        raise PyannoteAPIError(
+            f"Voiceprint job timed out after {max_wait}s",
+            job_id=job_id,
+        )
+
+    def _parse_voiceprint_result(
+        self,
+        job_id: str,
+        result: Dict[str, Any],
+    ) -> VoiceprintJobResult:
+        """Parse completed voiceprint job result."""
+        status = result.get("status", "unknown")
+
+        if status == STATUS_FAILED:
+            error = result.get("error", "Unknown error")
+            LOGGER.error(f"PyannoteAI voiceprint creation failed: {error}")
+            return VoiceprintJobResult(
+                job_id=job_id,
+                status=status,
+                error=error,
+                raw_response=result,
+            )
+
+        if status == STATUS_CANCELED:
+            LOGGER.warning(f"PyannoteAI voiceprint job was canceled: {job_id}")
+            return VoiceprintJobResult(
+                job_id=job_id,
+                status=status,
+                error="Job was canceled",
+                raw_response=result,
+            )
+
+        # Parse output
+        output = result.get("output", {})
+        voiceprint = output.get("voiceprint")
+
+        if not voiceprint:
+            LOGGER.warning(f"No voiceprint in output for job {job_id}")
+
+        LOGGER.info(f"PyannoteAI voiceprint succeeded: jobId={job_id}")
+
+        return VoiceprintJobResult(
+            job_id=job_id,
+            status=status,
+            voiceprint=voiceprint,
+            raw_response=result,
+        )
+
+    # =========================================================================
+    # Identification API
+    # =========================================================================
+
+    def submit_identification(
+        self,
+        media_url: str,
+        voiceprints: List[Dict[str, str]],
+        threshold: int = 60,
+        exclusive: bool = True,
+        webhook_url: Optional[str] = None,
+    ) -> str:
+        """Submit identification job to PyannoteAI.
+
+        Per official docs:
+        POST /v1/identify with:
+        {
+            "url": "<episode_audio_url>",
+            "voiceprints": [
+                {"label": "<cast_id>", "voiceprint": "<base64_blob>"},
+                ...
+            ],
+            "matching": {
+                "threshold": <0-100>,
+                "exclusive": true
+            }
+        }
+
+        Args:
+            media_url: Publicly accessible audio URL for full episode
+            voiceprints: List of {label: str, voiceprint: str} dicts
+            threshold: Minimum confidence for matching (0-100, default 60)
+            exclusive: Prevent multiple speakers matching same voiceprint
+            webhook_url: Optional webhook URL for async notification
+
+        Returns:
+            Job ID for polling
+
+        Raises:
+            PyannoteAPIError: If submission fails
+        """
+        if not voiceprints:
+            raise PyannoteAPIError("At least one voiceprint required for identification")
+
+        body: Dict[str, Any] = {
+            "url": media_url,
+            "voiceprints": voiceprints,
+            "matching": {
+                "threshold": threshold,
+                "exclusive": exclusive,
+            },
+        }
+
+        if webhook_url:
+            body["webhook"] = webhook_url
+
+        LOGGER.info(
+            f"Submitting identification job: {len(voiceprints)} voiceprints, "
+            f"threshold={threshold}, exclusive={exclusive}"
+        )
+        LOGGER.debug(f"Identification request body (voiceprints truncated): "
+                     f"url={media_url}, labels={[v['label'] for v in voiceprints]}")
+
+        try:
+            with self._breaker:
+                response = self._client.post("/identify", json=body)
+        except CircuitBreakerError as e:
+            raise PyannoteAPIError(
+                f"PyannoteAI API unavailable (circuit breaker open): {e}"
+            ) from e
+
+        if response.status_code != 200:
+            error_text = response.text
+            raise PyannoteAPIError(
+                f"Identification submission failed: {response.status_code} - {error_text}",
+                status_code=response.status_code,
+            )
+
+        result = response.json()
+        job_id = result.get("jobId")
+
+        if not job_id:
+            raise PyannoteAPIError(f"No jobId in response: {result}")
+
+        LOGGER.info(f"Identification job submitted to PyannoteAI: jobId={job_id}")
+        return job_id
+
+    def poll_identification_job(
+        self,
+        job_id: str,
+        max_wait: float = 900.0,
+    ) -> IdentificationJobResult:
+        """Poll for identification job completion.
+
+        Args:
+            job_id: Job ID to poll
+            max_wait: Maximum wait time in seconds (default 15 min)
+
+        Returns:
+            IdentificationJobResult with diarization, identification, and voiceprints
+
+        Raises:
+            PyannoteAPIError: If job fails or times out
+        """
+        elapsed = 0.0
+        LOGGER.info(f"Polling PyannoteAI identification job: {job_id} (timeout: {max_wait}s)")
+
+        while elapsed < max_wait:
+            result = self.get_job_status(job_id)
+            status = result.get("status", "unknown")
+
+            LOGGER.debug(f"Identification job {job_id} status: {status}")
+
+            if status in TERMINAL_STATUSES:
+                return self._parse_identification_result(job_id, result)
+
+            jitter = random.uniform(-1.0, self._poll_interval_jitter)
+            poll_interval = self._poll_interval_base + jitter
+
+            LOGGER.info(f"Polling PyannoteAI identification job status... (interval: {poll_interval:.1f}s)")
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        raise PyannoteAPIError(
+            f"Identification job timed out after {max_wait}s",
+            job_id=job_id,
+        )
+
+    def _parse_identification_result(
+        self,
+        job_id: str,
+        result: Dict[str, Any],
+    ) -> IdentificationJobResult:
+        """Parse completed identification job result.
+
+        Output format:
+        {
+            "output": {
+                "diarization": [{speaker, start, end}, ...],
+                "identification": [{speaker, start, end, diarizationSpeaker, match}, ...],
+                "voiceprints": [{speaker, match, confidence: {label: score}}, ...]
+            }
+        }
+        """
+        status = result.get("status", "unknown")
+
+        if status == STATUS_FAILED:
+            error = result.get("error", "Unknown error")
+            LOGGER.error(f"PyannoteAI identification failed: {error}")
+            return IdentificationJobResult(
+                job_id=job_id,
+                status=status,
+                error=error,
+                raw_response=result,
+            )
+
+        if status == STATUS_CANCELED:
+            LOGGER.warning(f"PyannoteAI identification job was canceled: {job_id}")
+            return IdentificationJobResult(
+                job_id=job_id,
+                status=status,
+                error="Job was canceled",
+                raw_response=result,
+            )
+
+        # Parse output
+        output = result.get("output", {})
+        diarization = output.get("diarization", [])
+        identification = output.get("identification", [])
+        voiceprints = output.get("voiceprints", [])
+
+        LOGGER.info(
+            f"PyannoteAI identification succeeded: jobId={job_id}, "
+            f"{len(diarization)} diarization segments, "
+            f"{len(identification)} identification segments, "
+            f"{len(voiceprints)} voiceprint matches"
+        )
+
+        return IdentificationJobResult(
+            job_id=job_id,
+            status=status,
+            diarization=diarization,
+            identification=identification,
+            voiceprints=voiceprints,
             raw_response=result,
         )
 

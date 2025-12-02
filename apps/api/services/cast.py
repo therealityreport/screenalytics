@@ -297,6 +297,155 @@ class CastService:
 
         return False
 
+    # =========================================================================
+    # Voiceprint Methods
+    # =========================================================================
+
+    def update_cast_voiceprint(
+        self,
+        show_id: str,
+        cast_id: str,
+        voiceprint_blob: str,
+        source_ep_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update voiceprint for a cast member.
+
+        Stores voiceprint data directly on the cast member record:
+        - voiceprint_blob: Base64 encoded Pyannote voiceprint
+        - voiceprint_source_episode_id: Episode used to create voiceprint
+        - voiceprint_updated_at: ISO timestamp
+        - voiceprint_metadata: Optional metadata (segments used, duration, score)
+
+        Args:
+            show_id: Show identifier
+            cast_id: Cast member ID
+            voiceprint_blob: Base64 encoded voiceprint from Pyannote
+            source_ep_id: Episode ID used to create the voiceprint
+            metadata: Optional dict with segments_used, total_duration_s, mean_confidence, score
+
+        Returns:
+            Updated cast member dict, or None if not found
+        """
+        data = self._load_cast(show_id)
+        cast_members = data.get("cast", [])
+
+        for member in cast_members:
+            if member.get("cast_id") == cast_id:
+                member["voiceprint_blob"] = voiceprint_blob
+                member["voiceprint_source_episode_id"] = source_ep_id
+                member["voiceprint_updated_at"] = _now_iso()
+                member["voiceprint_metadata"] = metadata or {}
+                member["updated_at"] = _now_iso()
+
+                data["cast"] = cast_members
+                self._save_cast(show_id, data)
+                return member
+
+        return None
+
+    def get_cast_voiceprint(
+        self,
+        show_id: str,
+        cast_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Get voiceprint data for a cast member.
+
+        Returns:
+            Dict with voiceprint_blob, source_episode_id, updated_at, metadata
+            or None if cast member not found or has no voiceprint
+        """
+        member = self.get_cast_member(show_id, cast_id)
+        if not member:
+            return None
+
+        voiceprint_blob = member.get("voiceprint_blob")
+        if not voiceprint_blob:
+            return None
+
+        return {
+            "cast_id": cast_id,
+            "name": member.get("name"),
+            "voiceprint_blob": voiceprint_blob,
+            "voiceprint_source_episode_id": member.get("voiceprint_source_episode_id"),
+            "voiceprint_updated_at": member.get("voiceprint_updated_at"),
+            "voiceprint_metadata": member.get("voiceprint_metadata", {}),
+        }
+
+    def list_cast_with_voiceprints(
+        self,
+        show_id: str,
+        season: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get all cast members that have voiceprints.
+
+        Args:
+            show_id: Show identifier
+            season: Optional season filter
+
+        Returns:
+            List of cast members with voiceprints (includes voiceprint data)
+        """
+        cast_members = self.list_cast(show_id, season)
+
+        return [
+            {
+                "cast_id": m["cast_id"],
+                "name": m.get("name"),
+                "voiceprint_blob": m.get("voiceprint_blob"),
+                "voiceprint_source_episode_id": m.get("voiceprint_source_episode_id"),
+                "voiceprint_updated_at": m.get("voiceprint_updated_at"),
+                "voiceprint_metadata": m.get("voiceprint_metadata", {}),
+            }
+            for m in cast_members
+            if m.get("voiceprint_blob")
+        ]
+
+    def should_update_voiceprint(
+        self,
+        show_id: str,
+        cast_id: str,
+        new_score: float,
+        policy: str = "if_missing",
+        improvement_threshold: float = 1.1,
+    ) -> bool:
+        """Determine if voiceprint should be updated based on policy.
+
+        Policies:
+        - "if_missing": Only update if no voiceprint exists
+        - "always": Always update
+        - "if_better": Update if new_score > old_score * improvement_threshold
+
+        For "if_better", score = total_duration_s * mean_confidence
+
+        Args:
+            show_id: Show identifier
+            cast_id: Cast member ID
+            new_score: Score of the new voiceprint (duration * confidence)
+            policy: Overwrite policy
+            improvement_threshold: Required improvement ratio for "if_better"
+
+        Returns:
+            True if voiceprint should be updated
+        """
+        existing = self.get_cast_voiceprint(show_id, cast_id)
+
+        if policy == "always":
+            return True
+
+        if policy == "if_missing":
+            return existing is None
+
+        if policy == "if_better":
+            if existing is None:
+                return True
+            old_metadata = existing.get("voiceprint_metadata", {})
+            old_score = old_metadata.get("score", 0.0)
+            return new_score > old_score * improvement_threshold
+
+        # Default: if_missing
+        return existing is None
+
     def bulk_import_cast(
         self,
         show_id: str,

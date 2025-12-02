@@ -3274,6 +3274,158 @@ async def get_voice_analytics(show_id: str) -> dict:
 
 
 # =============================================================================
+# Voiceprint Identification Refresh Endpoint
+# =============================================================================
+
+
+class VoiceprintRefreshRequest(BaseModel):
+    """Request to refresh voiceprint identification for an episode."""
+
+    show_id: Optional[str] = Field(
+        None,
+        description="Show identifier. Auto-detected from ep_id if not provided.",
+    )
+    overwrite_voiceprints: bool = Field(
+        False,
+        description="Force recreation of voiceprints even if they exist.",
+    )
+    ident_threshold: int = Field(
+        60,
+        ge=0,
+        le=100,
+        description="Confidence threshold for identification matching (0-100).",
+    )
+    run_mode: Literal["queue", "local"] = Field(
+        "local",
+        description="Execution mode: 'queue' for Celery background job, 'local' for streaming subprocess.",
+    )
+
+
+class VoiceprintRefreshResponse(BaseModel):
+    """Response from voiceprint refresh job."""
+
+    success: bool
+    ep_id: str
+    job_id: Optional[str] = None
+    status: Optional[str] = None
+    message: Optional[str] = None
+    voiceprints_created: Optional[int] = None
+    voiceprints_skipped: Optional[int] = None
+    segments_processed: Optional[int] = None
+    review_queue_count: Optional[int] = None
+
+
+@router.post("/episodes/{ep_id}/audio/voiceprint_refresh", response_model=VoiceprintRefreshResponse)
+async def refresh_voiceprint_identification(
+    ep_id: str,
+    req: Optional[VoiceprintRefreshRequest] = None,
+) -> VoiceprintRefreshResponse:
+    """Refresh voiceprint identification for an episode.
+
+    This endpoint triggers the voiceprint identification pipeline which:
+    1. Selects clean segments from manually assigned clusters for each cast member
+    2. Creates voiceprints using Pyannote API (if needed)
+    3. Runs identification pass on full episode audio
+    4. Regenerates speaker transcript with cast names
+    5. Generates review queue for low-confidence segments
+
+    Prerequisites:
+    - Episode must be diarized
+    - Manual cluster assignments must exist (cast members need 10s+ of clean speech)
+
+    Args:
+        ep_id: Episode identifier
+        req: Optional request body with configuration options
+
+    Returns:
+        VoiceprintRefreshResponse with job status and results
+    """
+    # Default request values
+    show_id = (req and req.show_id) or None
+    overwrite_voiceprints = (req and req.overwrite_voiceprints) or False
+    ident_threshold = (req and req.ident_threshold) or 60
+    run_mode = _normalize_run_mode((req and req.run_mode) or "local")
+
+    # Auto-detect show_id from ep_id if not provided
+    if not show_id:
+        from py_screenalytics.artifacts import parse_ep_id
+
+        try:
+            parsed = parse_ep_id(ep_id)
+            show_id = parsed.get("show_id")
+        except Exception:
+            pass
+
+    if not show_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine show_id from ep_id. Please provide show_id explicitly.",
+        )
+
+    # Validate prerequisites
+    paths = _get_audio_paths(ep_id)
+    if not paths["diarization"].exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Diarization not found. Run audio pipeline first.",
+        )
+
+    if run_mode == "local":
+        # Run locally with streaming subprocess for real-time logs
+        from apps.api.routers.celery_jobs import _stream_local_subprocess
+
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "audio_pipeline_run.py"),
+            "--ep-id", ep_id,
+            "--voiceprint-refresh",
+        ]
+        if overwrite_voiceprints:
+            command.append("--overwrite-voiceprints")
+        if ident_threshold != 60:
+            command.extend(["--ident-threshold", str(ident_threshold)])
+
+        options = {
+            "show_id": show_id,
+            "overwrite_voiceprints": overwrite_voiceprints,
+            "ident_threshold": ident_threshold,
+            "operation_type": "voiceprint_refresh",
+        }
+
+        return StreamingResponse(
+            _stream_local_subprocess(command, ep_id, "voiceprint_refresh", options, timeout=3600),
+            media_type="application/x-ndjson",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    # Queue mode (Celery)
+    from apps.api.jobs_audio import episode_voiceprint_refresh_task
+
+    try:
+        task = episode_voiceprint_refresh_task.delay(
+            ep_id=ep_id,
+            show_id=show_id,
+            overwrite_voiceprints=overwrite_voiceprints,
+            ident_threshold=ident_threshold,
+        )
+
+        return VoiceprintRefreshResponse(
+            success=True,
+            ep_id=ep_id,
+            job_id=task.id,
+            status="queued",
+            message="Voiceprint refresh job queued",
+        )
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to queue voiceprint refresh: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
 # PyannoteAI Webhook Endpoints
 # =============================================================================
 
