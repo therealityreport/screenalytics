@@ -185,6 +185,27 @@ def _save_diarization_comparison(
                 for s in gpt4o_segments[:5]
             ],
         },
+        # Full segment lists for downstream UI/flagging
+        "segments": {
+            "pyannote": [
+                {
+                    "start": s.start,
+                    "end": s.end,
+                    "speaker": s.speaker,
+                }
+                for s in pyannote_segments
+            ],
+            "gpt4o": [
+                {
+                    "segment_id": f"gpt4o_{i+1:04d}",
+                    "start": s.start,
+                    "end": s.end,
+                    "speaker": getattr(s, "speaker", None),
+                    "raw_text": getattr(s, "text", None)[:400] if getattr(s, "text", None) else None,
+                }
+                for i, s in enumerate(gpt4o_segments)
+            ],
+        },
     }
 
     # Save comparison
@@ -500,6 +521,17 @@ def run_episode_audio_pipeline(
         result.manifest_artifacts.transcript_jsonl = paths["transcript_jsonl"]
         result.manifest_artifacts.transcript_vtt = paths["transcript_vtt"]
         result.transcript_row_count = len(transcript_rows)
+
+        # Enrich diarization comparison with canonical text + mixed-speaker flags
+        try:
+            from .diarization_comparison import augment_diarization_comparison
+
+            augment_diarization_comparison(
+                paths["diarization_comparison"],
+                paths["transcript_jsonl"],
+            )
+        except Exception as exc:
+            LOGGER.warning(f"Failed to augment diarization comparison: {exc}")
 
         _update_progress("fuse", 1.0, f"Transcript generated: {len(transcript_rows)} rows")
 

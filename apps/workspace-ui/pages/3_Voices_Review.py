@@ -1260,14 +1260,53 @@ with st.expander("🔄 Diarization Comparison (Pyannote vs GPT-4o)", expanded=Fa
                             st.markdown(f"**Speaker {spk}** ({len(segs)} segments, {total_dur:.1f}s total)")
                             seg_rows = []
                             for s in segs[:20]:
-                                text_preview = s.get("text", "")[:50] + "..." if len(s.get("text", "")) > 50 else s.get("text", "")
+                                display_text = s.get("canonical_text") or s.get("text") or s.get("raw_text") or ""
+                                if len(display_text) > 80:
+                                    display_text = display_text[:80] + "..."
                                 seg_rows.append({
                                     "Start": f"{s['start']:.1f}s",
                                     "End": f"{s['end']:.1f}s",
                                     "Duration": f"{s['end'] - s['start']:.1f}s",
-                                    "Text": text_preview,
+                                    "Text": display_text,
+                                    "Mixed": "⚠️" if s.get("mixed_speaker") else "—",
                                 })
                             st.dataframe(seg_rows, use_container_width=True, hide_index=True)
+
+                            mixed_segments = [s for s in segs if s.get("mixed_speaker")]
+                            if mixed_segments:
+                                st.caption("⚠️ Mixed-speaker segments detected. Use Smart Split to correct.")
+                                for s in mixed_segments[:5]:
+                                    seg_id = s.get("segment_id") or f"gpt4o_{int(s.get('start',0)*1000):07d}"
+                                    canonical = s.get("canonical_text")
+                                    raw_text = s.get("text") or s.get("raw_text")
+                                    with st.expander(f"{seg_id}: {s.get('start',0):.2f}s → {s.get('end',0):.2f}s", expanded=False):
+                                        if canonical:
+                                            st.write(f"**Canonical (Whisper):** {canonical}")
+                                        if raw_text and raw_text != canonical:
+                                            st.caption(f"Model raw: {raw_text}")
+                                        if st.button(
+                                            "Smart Split",
+                                            key=f"smart_split_gpt4o_{seg_id}",
+                                            use_container_width=True,
+                                        ):
+                                            payload = {
+                                                "source": "gpt4o",
+                                                "speaker_group_id": f"gpt4o:{spk}",
+                                                "segment_id": seg_id,
+                                                "start": s.get("start"),
+                                                "end": s.get("end"),
+                                                "expected_voices": 2,
+                                            }
+                                            try:
+                                                resp = helpers.api_post(f"/episodes/{ep_id}/audio/smart_split", json=payload)
+                                                if resp.get("error"):
+                                                    st.error(resp.get("error"))
+                                                else:
+                                                    st.success("Smart split started")
+                                                    time.sleep(1)
+                                                    st.rerun()
+                                            except requests.RequestException as exc:
+                                                st.error(helpers.describe_error("Smart Split", exc))
                             if len(segs) > 20:
                                 st.caption(f"... and {len(segs) - 20} more segments")
                     else:

@@ -443,7 +443,7 @@ def fetch_operation_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
         base = st.session_state.get("api_base")
         if not base:
             base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
-        url = f"{base}/celery_jobs/logs/{ep_id}/{operation}"
+        url = f"{base}/celery_jobs/logs/{ep_id}/{operation}?include_history=true&limit=25"
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
@@ -3934,6 +3934,9 @@ def render_previous_logs(
                 st.caption("No previous logs available for this operation.")
         return False
 
+    history = data.get("history") or []
+    runs = history if history else [data]
+
     status = data.get("status", "unknown")
     formatted_logs = data.get("logs", [])
     elapsed_seconds = data.get("elapsed_seconds", 0)
@@ -3969,12 +3972,29 @@ def render_previous_logs(
     expander_label = f"{icon} Previous {operation} run ({status}, {elapsed_str}){timestamp_str}"
 
     with st.expander(expander_label, expanded=expanded):
-        if not formatted_logs:
+        # Run selector when history available
+        selected_run = runs[0]
+        if history:
+            options = []
+            for run in runs:
+                ts = run.get("updated_at")
+                ts_label = format_est(ts) or ts or "unknown time"
+                options.append(f"{ts_label} · {run.get('status', 'unknown')} · {run.get('elapsed_seconds', 0):.1f}s")
+            idx = st.selectbox(
+                "Choose run",
+                options=range(len(options)),
+                format_func=lambda i: options[i],
+                index=0,
+                key=f"{ep_id}::{operation}::log_history_select",
+            )
+            selected_run = runs[idx]
+
+        selected_logs = selected_run.get("logs", [])
+        if not selected_logs:
             st.caption("No log lines recorded.")
             return True
 
-        # Display formatted logs (no raw log toggle - cleaner UI)
-        st.code("\n".join(formatted_logs), language="text")
+        st.code("\n".join(selected_logs), language="text")
 
     return True
 

@@ -69,35 +69,18 @@ def fuse_transcript(
 
     # Build lookup structures
     cluster_mapping = _build_cluster_mapping(voice_mapping)
-    cluster_lookup = {c.voice_cluster_id: c for c in voice_clusters}
     group_to_cluster = _build_group_cluster_lookup(voice_clusters)
 
-    # Fuse segments
-    transcript_rows = []
-
+    # Build word-level assignments to prevent cross-speaker rows
+    words: List[dict] = []
     for asr_segment in asr_segments:
-        # Find overlapping diarization segment
-        best_diar = _find_best_diarization_match(asr_segment, diarization_segments)
-
-        speaker_group_id: Optional[str] = None
-        if best_diar:
-            speaker_group_id = _speaker_group_from_diar(best_diar, diarization_source)
-
-        cluster_id = None
-        if best_diar:
-            # Prefer speaker-group → cluster mapping
-            cluster_id = group_to_cluster.get(speaker_group_id or "", None)
-            if not cluster_id:
-                cluster_id = _find_cluster_for_segment(best_diar, voice_clusters)
-            mapping = cluster_mapping.get(cluster_id)
-
-            if mapping:
-                speaker_id = mapping.speaker_id
-                speaker_display_name = mapping.speaker_display_name
-                voice_bank_id = mapping.voice_bank_id
-            else:
-                # Fallback to diarization label (or speaker group label if available)
-                group_label = None
+        if asr_segment.words:
+            for w in asr_segment.words:
+                diar_match = _find_best_diarization_match_word(w, diarization_segments)
+                speaker_group_id = _speaker_group_from_diar(diar_match, diarization_source) if diar_match else None
+                cluster_id = group_to_cluster.get(speaker_group_id or "", None)
+                mapping = cluster_mapping.get(cluster_id or "", None)
+                speaker_label = diar_match.speaker if diar_match else "UNKNOWN"
                 if speaker_groups_manifest:
                     group_lookup = {
                         g.speaker_group_id: g
@@ -106,34 +89,58 @@ def fuse_transcript(
                     }
                     group = group_lookup.get(speaker_group_id or "")
                     if group:
-                        group_label = group.speaker_label
-                speaker_label = group_label or best_diar.speaker
-                speaker_id = f"SPK_{speaker_label}"
-                speaker_display_name = f"Speaker {speaker_label}"
-                voice_bank_id = "voice_unknown"
-                cluster_id = cluster_id or "VC_00"
+                        speaker_label = group.speaker_label
+                speaker_id, speaker_display_name, voice_bank_id, cluster_id = _resolve_speaker_fields(
+                    speaker_group_id,
+                    speaker_label,
+                    cluster_id,
+                    mapping,
+                )
+                words.append({
+                    "w": w.w,
+                    "t0": w.t0,
+                    "t1": w.t1,
+                    "speaker_id": speaker_id,
+                    "speaker_display_name": speaker_display_name,
+                    "voice_cluster_id": cluster_id,
+                    "voice_bank_id": voice_bank_id,
+                    "conf": w.t1 - w.t0,  # placeholder; whisper does not include per-word conf
+                })
         else:
-            # No diarization match - use unknown speaker
-            speaker_id = "SPK_UNKNOWN"
-            speaker_display_name = "Unknown Speaker"
-            voice_bank_id = "voice_unknown"
-            cluster_id = "VC_00"
+            diar_match = _find_best_diarization_match(asr_segment, diarization_segments)
+            speaker_group_id = _speaker_group_from_diar(diar_match, diarization_source) if diar_match else None
+            cluster_id = group_to_cluster.get(speaker_group_id or "", None)
+            mapping = cluster_mapping.get(cluster_id or "", None)
+            speaker_label = diar_match.speaker if diar_match else "UNKNOWN"
+            if speaker_groups_manifest:
+                group_lookup = {
+                    g.speaker_group_id: g
+                    for src in speaker_groups_manifest.sources
+                    for g in src.speakers
+                }
+                group = group_lookup.get(speaker_group_id or "")
+                if group:
+                    speaker_label = group.speaker_label
+            speaker_id, speaker_display_name, voice_bank_id, cluster_id = _resolve_speaker_fields(
+                speaker_group_id,
+                speaker_label,
+                cluster_id,
+                mapping,
+            )
+            words.append({
+                "w": asr_segment.text,
+                "t0": asr_segment.start,
+                "t1": asr_segment.end,
+                "speaker_id": speaker_id,
+                "speaker_display_name": speaker_display_name,
+                "voice_cluster_id": cluster_id,
+                "voice_bank_id": voice_bank_id,
+                "conf": asr_segment.confidence,
+            })
 
-        row = TranscriptRow(
-            start=asr_segment.start,
-            end=asr_segment.end,
-            speaker_id=speaker_id,
-            speaker_display_name=speaker_display_name,
-            voice_cluster_id=cluster_id,
-            voice_bank_id=voice_bank_id,
-            text=asr_segment.text,
-            conf=asr_segment.confidence,
-            words=asr_segment.words,
-        )
-        transcript_rows.append(row)
+    words = sorted(words, key=lambda w: w.get("t0", 0.0))
 
-    # Merge consecutive rows with same speaker
-    transcript_rows = _merge_consecutive_speaker_rows(transcript_rows)
+    transcript_rows = _rows_from_words(words)
 
     # Save outputs
     _save_transcript_jsonl(transcript_rows, output_jsonl)
@@ -157,11 +164,38 @@ def _build_group_cluster_lookup(
     """Map speaker_group_id -> voice_cluster_id."""
     mapping: Dict[str, str] = {}
     for cluster in voice_clusters:
+        for seg in cluster.segments:
+            if seg.diar_speaker:
+                mapping[seg.diar_speaker] = cluster.voice_cluster_id
+                mapping[f"pyannote:{seg.diar_speaker}"] = cluster.voice_cluster_id
         for gid in cluster.speaker_group_ids:
             mapping[gid] = cluster.voice_cluster_id
         for source_group in cluster.sources:
             mapping[source_group.speaker_group_id] = cluster.voice_cluster_id
     return mapping
+
+
+def _resolve_speaker_fields(
+    speaker_group_id: Optional[str],
+    diar_label: str,
+    cluster_id: Optional[str],
+    mapping: Optional[VoiceBankMatchResult],
+) -> Tuple[str, str, str, str]:
+    """Resolve speaker_id/display/voice ids with fallbacks."""
+    if mapping:
+        return (
+            mapping.speaker_id,
+            mapping.speaker_display_name,
+            mapping.voice_bank_id,
+            mapping.voice_cluster_id,
+        )
+
+    label = diar_label or "UNKNOWN"
+    speaker_id = f"SPK_{label}"
+    speaker_display_name = f"Speaker {label}"
+    voice_bank_id = "voice_unknown"
+    resolved_cluster = cluster_id or "VC_00"
+    return speaker_id, speaker_display_name, voice_bank_id, resolved_cluster
 
 
 def _find_best_diarization_match(
@@ -183,6 +217,15 @@ def _find_best_diarization_match(
             best_match = diar_seg
 
     return best_match
+
+
+def _find_best_diarization_match_word(
+    word: WordTiming,
+    diarization_segments: List[DiarizationSegment],
+) -> Optional[DiarizationSegment]:
+    """Find the diarization segment with most overlap with a word."""
+    asr_like = ASRSegment(start=word.t0, end=word.t1, text=word.w)
+    return _find_best_diarization_match(asr_like, diarization_segments)
 
 
 def _speaker_group_from_diar(
@@ -263,6 +306,59 @@ def _merge_consecutive_speaker_rows(
 
     merged.append(current)
     return merged
+
+
+def _rows_from_words(words: List[dict], max_gap: float = 0.8) -> List[TranscriptRow]:
+    """Build transcript rows from word-level speaker assignments."""
+    if not words:
+        return []
+
+    rows: List[TranscriptRow] = []
+    current_words: List[dict] = []
+
+    def _flush():
+        if not current_words:
+            return
+        speaker_id = current_words[0]["speaker_id"]
+        speaker_display_name = current_words[0]["speaker_display_name"]
+        cluster_id = current_words[0]["voice_cluster_id"]
+        voice_bank_id = current_words[0]["voice_bank_id"]
+        text = " ".join(w["w"] for w in current_words if w.get("w"))
+        start = current_words[0]["t0"]
+        end = current_words[-1]["t1"]
+        confs = [w.get("conf") for w in current_words if w.get("conf") is not None]
+        conf = sum(confs) / len(confs) if confs else None
+        rows.append(
+            TranscriptRow(
+                start=start,
+                end=end,
+                speaker_id=speaker_id,
+                speaker_display_name=speaker_display_name,
+                voice_cluster_id=cluster_id,
+                voice_bank_id=voice_bank_id,
+                text=text.strip(),
+                conf=conf,
+                words=[
+                    WordTiming(w=w["w"], t0=w["t0"], t1=w["t1"]) for w in current_words
+                ],
+            )
+        )
+
+    prev_word = None
+    for w in words:
+        if prev_word:
+            gap = w.get("t0", 0.0) - prev_word.get("t1", 0.0)
+            if (
+                w.get("speaker_id") != prev_word.get("speaker_id")
+                or gap > max_gap
+            ):
+                _flush()
+                current_words = []
+        current_words.append(w)
+        prev_word = w
+
+    _flush()
+    return _merge_consecutive_speaker_rows(rows, max_gap=max_gap)
 
 
 def _save_transcript_jsonl(rows: List[TranscriptRow], output_path: Path):

@@ -2567,6 +2567,7 @@ async def get_diarization_comparison(ep_id: str) -> dict:
     comparison_path = manifests_dir / "audio_diarization_comparison.json"
     pyannote_path = manifests_dir / "audio_diarization_pyannote.jsonl"
     gpt4o_path = manifests_dir / "audio_diarization_gpt4o.jsonl"
+    transcript_path = manifests_dir / "episode_transcript.jsonl"
 
     result = {
         "ep_id": ep_id,
@@ -2579,7 +2580,16 @@ async def get_diarization_comparison(ep_id: str) -> dict:
     if comparison_path.exists():
         try:
             with comparison_path.open("r", encoding="utf-8") as f:
-                result["summary"] = json.load(f)
+                comparison_data = json.load(f)
+            # Optionally augment with canonical text + mixed-speaker flags if transcript exists
+            if transcript_path.exists():
+                try:
+                    from py_screenalytics.audio.diarization_comparison import augment_diarization_comparison
+
+                    comparison_data = augment_diarization_comparison(comparison_path, transcript_path) or comparison_data
+                except Exception as exc:
+                    LOGGER.warning("Could not augment diarization comparison: %s", exc)
+            result["summary"] = comparison_data
         except Exception as e:
             LOGGER.warning(f"Failed to load comparison: {e}")
 
@@ -2611,13 +2621,31 @@ async def get_diarization_comparison(ep_id: str) -> dict:
                     line = line.strip()
                     if line:
                         seg = json.loads(line)
-                        segments.append({
+                        seg_data = {
                             "start": seg.get("start", 0),
                             "end": seg.get("end", 0),
                             "speaker": seg.get("speaker", ""),
                             "text": seg.get("text", "")[:100],  # First 100 chars
                             "provider": "gpt4o",
-                        })
+                        }
+                        segments.append(seg_data)
+            for idx, seg in enumerate(segments):
+                seg.setdefault("segment_id", f"gpt4o_{idx+1:04d}")
+            # Inject canonical_text/mixed_speaker from comparison if available
+            comp_segments = (result.get("summary") or {}).get("segments", {}).get("gpt4o", [])
+            if comp_segments:
+                for seg in segments:
+                    for cseg in comp_segments:
+                        if abs(seg["start"] - cseg.get("start", 0)) < 1e-3 and abs(seg["end"] - cseg.get("end", 0)) < 1e-3:
+                            if cseg.get("canonical_text"):
+                                seg["canonical_text"] = cseg.get("canonical_text")
+                            if cseg.get("raw_text"):
+                                seg["raw_text"] = cseg.get("raw_text")
+                            if cseg.get("mixed_speaker") is not None:
+                                seg["mixed_speaker"] = cseg.get("mixed_speaker")
+                            if cseg.get("speakers") is not None:
+                                seg["speakers"] = cseg.get("speakers")
+                            break
             result["gpt4o_segments"] = segments
         except Exception as e:
             LOGGER.warning(f"Failed to load gpt4o segments: {e}")

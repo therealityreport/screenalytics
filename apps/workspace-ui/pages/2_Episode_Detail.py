@@ -2492,9 +2492,8 @@ with col_cluster:
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
 
-    # Show previous run logs (only in local mode, collapsed by default)
-    if helpers.get_execution_mode(ep_id) == "local":
-        helpers.render_previous_logs(ep_id, "cluster", expanded=False)
+    # Keep latest cluster log handy for copy/paste
+    helpers.render_previous_logs(ep_id, "cluster", expanded=False)
 
 # =============================================================================
 # Audio & Transcript Section

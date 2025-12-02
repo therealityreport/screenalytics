@@ -519,6 +519,7 @@ def _check_job_lock(ep_id: str, operation: str) -> Dict[str, Any] | None:
 # Per-Episode Log Storage - Persist logs for UI display after completion
 # =============================================================================
 # Logs are stored at: data/manifests/{episode_id}/logs/{operation}_latest.json
+# History is appended to: data/manifests/{episode_id}/logs/{operation}_history.jsonl
 # Each log file contains: {"logs": [...], "status": "completed"|"error", "elapsed_seconds": N, ...}
 
 
@@ -529,6 +530,59 @@ def _get_log_storage_path(episode_id: str, operation: str) -> Path:
     manifests_dir = get_path(episode_id, "detections").parent
     logs_dir = manifests_dir / "logs"
     return logs_dir / f"{operation}_latest.json"
+
+
+def _get_log_history_path(episode_id: str, operation: str) -> Path:
+    """Get the path for storing/retrieving operation log history."""
+    from py_screenalytics.artifacts import get_path
+
+    manifests_dir = get_path(episode_id, "detections").parent
+    logs_dir = manifests_dir / "logs"
+    return logs_dir / f"{operation}_history.jsonl"
+
+
+def _append_log_history(
+    episode_id: str,
+    operation: str,
+    record: Dict[str, Any],
+) -> None:
+    """Append a log record to history (best effort)."""
+    try:
+        history_path = _get_log_history_path(episode_id, operation)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with history_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:  # pragma: no cover - best effort
+        LOGGER.debug("Failed to append log history for %s/%s: %s", episode_id, operation, exc)
+
+
+def _load_log_history(
+    episode_id: str,
+    operation: str,
+    limit: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Load historical log records (newest first)."""
+    history_path = _get_log_history_path(episode_id, operation)
+    if not history_path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    try:
+        with history_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        records = list(reversed(records))
+        if limit:
+            records = records[:limit]
+        return records
+    except Exception as exc:  # pragma: no cover - best effort
+        LOGGER.debug("Failed to load log history for %s/%s: %s", episode_id, operation, exc)
+        return []
 
 
 def save_operation_logs(
@@ -560,6 +614,8 @@ def save_operation_logs(
         log_path = _get_log_storage_path(episode_id, operation)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
+        updated_at = datetime.now(timezone.utc).isoformat()
+
         data = {
             "episode_id": episode_id,
             "operation": operation,
@@ -567,12 +623,18 @@ def save_operation_logs(
             "logs": formatted_logs,  # Primary formatted logs
             "raw_logs": raw_logs or formatted_logs,  # Raw logs for debugging
             "elapsed_seconds": elapsed_seconds,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": updated_at,
             **(extra or {}),
         }
 
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+
+        history_record = {
+            **data,
+            "history_id": updated_at,
+        }
+        _append_log_history(episode_id, operation, history_record)
 
         LOGGER.info(f"[{episode_id}] Saved {len(formatted_logs)} formatted + {len(raw_logs or [])} raw log lines for {operation}")
         return True
@@ -582,7 +644,13 @@ def save_operation_logs(
         return False
 
 
-def load_operation_logs(episode_id: str, operation: str) -> Dict[str, Any] | None:
+def load_operation_logs(
+    episode_id: str,
+    operation: str,
+    *,
+    include_history: bool = False,
+    limit: int | None = None,
+) -> Dict[str, Any] | None:
     """Load operation logs from persistent storage.
 
     Returns:
@@ -594,7 +662,12 @@ def load_operation_logs(episode_id: str, operation: str) -> Dict[str, Any] | Non
             return None
 
         with open(log_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            latest = json.load(f)
+
+        if include_history:
+            latest["history"] = _load_log_history(episode_id, operation, limit=limit)
+
+        return latest
 
     except Exception as e:
         LOGGER.warning(f"[{episode_id}] Failed to load logs for {operation}: {e}")
@@ -852,7 +925,7 @@ async def list_local_jobs(ep_id: str | None = None):
 
 
 @router.get("/logs/{ep_id}/{operation}")
-async def get_operation_logs(ep_id: str, operation: str):
+async def get_operation_logs(ep_id: str, operation: str, include_history: bool = True, limit: int = 10):
     """Get the most recent logs for an operation.
 
     This endpoint returns the last saved logs for a given episode and operation.
@@ -875,7 +948,7 @@ async def get_operation_logs(ep_id: str, operation: str):
             detail=f"Invalid operation '{operation}'. Must be one of: {', '.join(valid_operations)}"
         )
 
-    data = load_operation_logs(ep_id, operation)
+    data = load_operation_logs(ep_id, operation, include_history=include_history, limit=limit if limit and limit > 0 else None)
 
     if data is None:
         return {

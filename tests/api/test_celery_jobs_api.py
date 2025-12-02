@@ -403,6 +403,12 @@ class TestOperationLogsStorage:
         assert loaded["elapsed_seconds"] == pytest.approx(123.45)
         assert "updated_at" in loaded
 
+        # Load with history
+        loaded_history = load_operation_logs(ep_id, operation, include_history=True, limit=5)
+        assert loaded_history is not None
+        history = loaded_history.get("history") or []
+        assert history, "Expected history entry for saved logs"
+
     def test_load_nonexistent_logs(self, tmp_path, monkeypatch):
         """Test loading logs that don't exist returns None."""
         from apps.api.routers.celery_jobs import load_operation_logs
