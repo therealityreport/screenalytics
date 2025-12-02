@@ -48,6 +48,14 @@ class AudioPipelineRequest(BaseModel):
         None,
         description="Override ASR provider (gemini_3 and gemini are equivalent)",
     )
+    min_speakers: Optional[int] = Field(
+        None,
+        description="Minimum expected speakers (hint for diarization)",
+    )
+    max_speakers: Optional[int] = Field(
+        None,
+        description="Maximum expected speakers (hint for diarization)",
+    )
 
 
 class AudioFilesRequest(BaseModel):
@@ -315,6 +323,10 @@ async def start_audio_pipeline(req: AudioPipelineRequest) -> AudioPipelineRespon
         ]
         if req.overwrite:
             command.append("--overwrite")
+        if req.min_speakers is not None:
+            command.extend(["--min-speakers", str(req.min_speakers)])
+        if req.max_speakers is not None:
+            command.extend(["--max-speakers", str(req.max_speakers)])
 
         # Progress file for UI polling
         data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
@@ -1543,7 +1555,15 @@ class DiarizeOnlyRequest(BaseModel):
     """Request body for re-running diarization."""
     num_speakers: Optional[int] = Field(
         None,
-        description="Force exact speaker count. If None, uses min/max from config.",
+        description="Force exact speaker count. If None, uses min/max hints.",
+    )
+    min_speakers: Optional[int] = Field(
+        None,
+        description="Minimum expected speakers (hint to diarization model).",
+    )
+    max_speakers: Optional[int] = Field(
+        None,
+        description="Maximum expected speakers (hint to diarization model).",
     )
     run_mode: Literal["queue", "local", "redis"] = Field(
         "local",
@@ -1579,6 +1599,8 @@ async def diarize_only(ep_id: str, req: Optional[DiarizeOnlyRequest] = None):
     # Determine run mode (default to local for real-time feedback)
     run_mode = _normalize_run_mode((req and req.run_mode) or "local")
     num_speakers = (req and req.num_speakers) or None
+    min_speakers = (req and req.min_speakers) or None
+    max_speakers = (req and req.max_speakers) or None
 
     if run_mode == "local":
         # Run locally via streaming subprocess for real-time logs
@@ -1593,10 +1615,16 @@ async def diarize_only(ep_id: str, req: Optional[DiarizeOnlyRequest] = None):
         ]
         if num_speakers is not None:
             command.extend(["--num-speakers", str(num_speakers)])
+        if min_speakers is not None:
+            command.extend(["--min-speakers", str(min_speakers)])
+        if max_speakers is not None:
+            command.extend(["--max-speakers", str(max_speakers)])
 
         # Options for job tracking
         options = {
             "num_speakers": num_speakers,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
             "operation_type": "diarize_only",
         }
 
@@ -2608,6 +2636,31 @@ async def get_diarization_comparison(ep_id: str) -> dict:
                             "speaker": seg.get("speaker", ""),
                             "provider": "pyannote",
                         })
+            # First try to inject canonical_text from comparison if available
+            comp_segments = (result.get("summary") or {}).get("segments", {}).get("pyannote", [])
+            if comp_segments:
+                for seg in segments:
+                    for cseg in comp_segments:
+                        if abs(seg["start"] - cseg.get("start", 0)) < 1e-3 and abs(seg["end"] - cseg.get("end", 0)) < 1e-3:
+                            if cseg.get("canonical_text"):
+                                seg["canonical_text"] = cseg.get("canonical_text")
+                            break
+            # Fallback: compute canonical_text directly from transcript for segments without it
+            if transcript_path.exists():
+                try:
+                    from py_screenalytics.audio.diarization_comparison import get_canonical_text_for_segment
+                    for seg in segments:
+                        if not seg.get("canonical_text"):
+                            text = get_canonical_text_for_segment(
+                                transcript_path,
+                                seg["start"],
+                                seg["end"],
+                                min_words=1,  # Allow single-word segments
+                            )
+                            if text:
+                                seg["canonical_text"] = text
+                except Exception as exc:
+                    LOGGER.warning(f"Could not compute canonical text for pyannote segments: {exc}")
             result["pyannote_segments"] = segments
         except Exception as e:
             LOGGER.warning(f"Failed to load pyannote segments: {e}")
@@ -3218,3 +3271,181 @@ async def get_voice_analytics(show_id: str) -> dict:
         "episode_summaries": episode_summaries,
         "chart_data": chart_data,
     }
+
+
+# =============================================================================
+# PyannoteAI Webhook Endpoints
+# =============================================================================
+
+
+class PyannoteWebhookPayload(BaseModel):
+    """Webhook payload from PyannoteAI on job completion.
+
+    Per official docs, PyannoteAI sends:
+    - jobId: The job identifier
+    - status: succeeded, failed, or canceled
+    - output: Diarization results (only on success)
+
+    Webhook retry policy: immediate, 1 min, 5 min
+    Expected response: HTTP 200 within 10 seconds
+    """
+    jobId: str = Field(..., description="PyannoteAI job identifier")
+    status: str = Field(..., description="Job status: succeeded, failed, canceled")
+    output: Optional[dict] = Field(None, description="Diarization output (on success)")
+
+
+class PyannoteWebhookResponse(BaseModel):
+    """Response to PyannoteAI webhook."""
+    received: bool = True
+    status: str
+    segments_saved: Optional[int] = None
+    error: Optional[str] = None
+
+
+# In-memory registry for webhook job correlation
+# In production, this should use Redis or a database
+_webhook_job_registry: Dict[str, dict] = {}
+
+
+def register_pyannote_job(job_id: str, ep_id: str, output_path: str) -> None:
+    """Register a job for webhook correlation.
+
+    Call this when submitting a diarization job with webhook enabled.
+
+    Args:
+        job_id: PyannoteAI job ID
+        ep_id: Episode identifier
+        output_path: Path to save diarization output
+    """
+    _webhook_job_registry[job_id] = {
+        "ep_id": ep_id,
+        "output_path": output_path,
+        "registered_at": __import__("datetime").datetime.utcnow().isoformat(),
+    }
+    LOGGER.info(f"Registered PyannoteAI job {job_id} for {ep_id}")
+
+
+def get_pyannote_job_metadata(job_id: str) -> Optional[dict]:
+    """Get metadata for a registered job.
+
+    Args:
+        job_id: PyannoteAI job ID
+
+    Returns:
+        Job metadata dict or None if not found
+    """
+    return _webhook_job_registry.get(job_id)
+
+
+def mark_pyannote_job_complete(job_id: str) -> None:
+    """Mark a job as complete and remove from registry.
+
+    Args:
+        job_id: PyannoteAI job ID
+    """
+    if job_id in _webhook_job_registry:
+        del _webhook_job_registry[job_id]
+        LOGGER.info(f"Completed PyannoteAI job {job_id}")
+
+
+@router.post("/webhooks/pyannote/diarization", response_model=PyannoteWebhookResponse)
+async def receive_pyannote_webhook(payload: PyannoteWebhookPayload) -> PyannoteWebhookResponse:
+    """Receive webhook from PyannoteAI on diarization job completion.
+
+    This endpoint receives async notifications when a diarization job completes.
+    Persists output immediately since Pyannote deletes results after 24 hours.
+
+    Per official docs:
+    - Webhook retry policy: immediate, 1 min, 5 min
+    - Expected response: HTTP 200 within 10 seconds
+
+    Args:
+        payload: Webhook payload from PyannoteAI
+
+    Returns:
+        Acknowledgment response
+    """
+    LOGGER.info(f"Received PyannoteAI webhook: jobId={payload.jobId}, status={payload.status}")
+
+    # Handle non-success status
+    if payload.status != "succeeded":
+        LOGGER.warning(f"PyannoteAI job {payload.jobId} {payload.status}")
+        return PyannoteWebhookResponse(
+            received=True,
+            status=payload.status,
+            error=f"Job {payload.status}",
+        )
+
+    # Look up job metadata for correlation
+    job_metadata = get_pyannote_job_metadata(payload.jobId)
+    if not job_metadata:
+        LOGGER.warning(f"PyannoteAI job {payload.jobId} not found in registry")
+        return PyannoteWebhookResponse(
+            received=True,
+            status=payload.status,
+            error="job_not_found_in_registry",
+        )
+
+    ep_id = job_metadata.get("ep_id", "unknown")
+    output_path = job_metadata.get("output_path")
+
+    # Parse and save diarization output
+    try:
+        output = payload.output or {}
+
+        # Prefer exclusiveDiarization for clean segment merging
+        diar_data = output.get("exclusiveDiarization") or output.get("diarization", [])
+
+        if not diar_data:
+            LOGGER.warning(f"No diarization data in webhook for {payload.jobId}")
+            return PyannoteWebhookResponse(
+                received=True,
+                status=payload.status,
+                error="no_diarization_data",
+            )
+
+        # Save to JSONL manifest
+        from py_screenalytics.audio.models import DiarizationSegment
+
+        segments = []
+        for entry in diar_data:
+            if isinstance(entry, dict):
+                segments.append(DiarizationSegment(
+                    start=entry.get("start", 0),
+                    end=entry.get("end", 0),
+                    speaker=entry.get("speaker", "SPEAKER_00"),
+                    confidence=entry.get("confidence"),
+                ))
+
+        # Save JSONL manifest
+        if output_path:
+            output_file = Path(output_path)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with output_file.open("w", encoding="utf-8") as f:
+                for segment in segments:
+                    f.write(segment.model_dump_json() + "\n")
+
+            LOGGER.info(f"PyannoteAI diarization saved: {output_path} ({len(segments)} segments)")
+
+            # Also save raw response for debugging
+            raw_path = output_file.parent / "audio_diarization_pyannote_raw.json"
+            with raw_path.open("w", encoding="utf-8") as f:
+                json.dump({"jobId": payload.jobId, "status": payload.status, "output": output}, f, indent=2)
+
+        # Mark job complete
+        mark_pyannote_job_complete(payload.jobId)
+
+        return PyannoteWebhookResponse(
+            received=True,
+            status=payload.status,
+            segments_saved=len(segments),
+        )
+
+    except Exception as e:
+        LOGGER.exception(f"Failed to process PyannoteAI webhook: {e}")
+        return PyannoteWebhookResponse(
+            received=True,
+            status=payload.status,
+            error=str(e),
+        )
