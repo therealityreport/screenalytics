@@ -135,6 +135,21 @@ def _release_lock(episode_id: str, operation: str, job_id: str) -> None:
         LOGGER.warning(f"Failed to release lock: {e}")
 
 
+def _force_release_lock(episode_id: str, operation: str) -> None:
+    """Force release job lock regardless of owner.
+
+    Used when a task in a chain fails - the lock was acquired by the chain
+    but sub-tasks have different job_ids.
+    """
+    try:
+        r = _get_redis()
+        lock_key = _lock_key(episode_id, operation)
+        r.delete(lock_key)
+        LOGGER.info(f"Force released lock for {episode_id}:{operation}")
+    except Exception as e:
+        LOGGER.warning(f"Failed to force release lock: {e}")
+
+
 class GroupingTask(Task):
     """Base class for grouping tasks with lock management."""
 

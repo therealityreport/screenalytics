@@ -564,6 +564,23 @@ with st.expander("🎙️ Audio Pipeline", expanded=not has_voice_clusters):
 # Show previous logs for audio pipeline OUTSIDE the expander to avoid nesting
 helpers.render_previous_logs(ep_id, "audio_pipeline", expanded=False, show_if_none=True)
 
+# Previous runs history (audio pipeline + incremental)
+history = helpers.load_audio_run_history(ep_id, limit=15)
+if history:
+    status_icons = {"succeeded": "✅", "success": "✅", "completed": "✅", "error": "❌", "failed": "❌", "unknown": "❓"}
+    with st.expander("Previous Runs", expanded=False):
+        for rec in history:
+            op = rec.get("operation", "audio_pipeline")
+            status = rec.get("status", "unknown")
+            icon = status_icons.get(status, "ℹ️")
+            start_str = helpers.format_est(rec.get("start_ts"))
+            dur = rec.get("duration_seconds", 0)
+            dur_str = f"{dur/60:.1f}m" if dur >= 90 else f"{dur:.1f}s"
+            st.markdown(f"**{icon} {op.replace('_', ' ').title()}** · {start_str} · {dur_str}")
+            log_excerpt = rec.get("log_excerpt") or []
+            if log_excerpt:
+                st.code("\n".join(log_excerpt[-50:]), language="text")
+
 # =============================================================================
 # Incremental Pipeline Reruns (Feature #9)
 # =============================================================================
@@ -609,6 +626,7 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
             else:
                 # Queue mode - async request
                 with st.spinner("Re-running transcription..."):
+                    _start_ts = time.time()
                     try:
                         resp = helpers.api_post(
                             f"/jobs/episodes/{ep_id}/audio/transcribe_only",
@@ -616,12 +634,36 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
                         )
                         if resp.get("success"):
                             st.success(f"Re-transcribed! {resp.get('segment_count', 0)} segments")
+                            helpers.append_audio_run_history(
+                                ep_id,
+                                "transcribe_only",
+                                "succeeded",
+                                _start_ts,
+                                time.time(),
+                                [f"Queued transcription ({rerun_asr}) succeeded", f"Segments: {resp.get('segment_count', 0)}"],
+                            )
                             time.sleep(1)
                             st.rerun()
                         else:
                             st.error(f"Failed: {resp}")
+                            helpers.append_audio_run_history(
+                                ep_id,
+                                "transcribe_only",
+                                "error",
+                                _start_ts,
+                                time.time(),
+                                [f"Queued transcription failed: {resp}"],
+                            )
                     except requests.RequestException as exc:
                         st.error(f"API error: {exc}")
+                        helpers.append_audio_run_history(
+                            ep_id,
+                            "transcribe_only",
+                            "error",
+                            _start_ts,
+                            time.time(),
+                            [f"API error: {exc}"],
+                        )
 
     with rerun_col2:
         st.write("**Re-run Diarization Only**")
@@ -645,14 +687,20 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
             _cast_count = len(_rerun_cast)
         _suggested_speakers = _cast_count + 2 if _cast_count > 0 else 0
 
+        # Prime session state default once so the input is prefilled
+        _num_key = f"suggested_speakers_{ep_id}"
+        if _num_key not in st.session_state and _suggested_speakers > 0:
+            st.session_state[_num_key] = _suggested_speakers
+
         # Show suggested value and input
         _num_input_col, _use_suggested_col = st.columns([2, 1])
         with _num_input_col:
+            default_val = st.session_state.get(_num_key, _suggested_speakers if _suggested_speakers > 0 else 0)
             rerun_num_speakers = st.number_input(
                 "Force speaker count",
                 min_value=0,
                 max_value=30,
-                value=st.session_state.get(f"suggested_speakers_{ep_id}", 0),
+                value=default_val,
                 key=f"rerun_num_speakers_{ep_id}",
                 help=f"Set to 0 for auto-detect (often under-counts). Suggested: {_suggested_speakers} based on cast count + buffer for guests.",
             )
@@ -660,7 +708,7 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
             st.write("")  # spacing
             if _suggested_speakers > 0:
                 if st.button(f"Use {_suggested_speakers}", key=f"use_suggested_{ep_id}", help=f"{_cast_count} cast + 2 guests"):
-                    st.session_state[f"suggested_speakers_{ep_id}"] = _suggested_speakers
+                    st.session_state[_num_key] = _suggested_speakers
                     st.rerun()
 
         if _suggested_speakers > 0:
@@ -691,6 +739,7 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
             else:
                 # Queue mode - async request
                 with st.spinner("Re-running diarization..."):
+                    _start_ts = time.time()
                     try:
                         resp = helpers.api_post(
                             f"/jobs/episodes/{ep_id}/audio/diarize_only",
@@ -699,12 +748,36 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
                         )
                         if resp.get("success"):
                             st.success(f"Re-diarized! {resp.get('segment_count', 0)} segments, {resp.get('speaker_count', 0)} speakers")
+                            helpers.append_audio_run_history(
+                                ep_id,
+                                "diarize_only",
+                                "succeeded",
+                                _start_ts,
+                                time.time(),
+                                [f"Queued diarization succeeded", f"Segments: {resp.get('segment_count', 0)}, Speakers: {resp.get('speaker_count', 0)}"],
+                            )
                             time.sleep(1)
                             st.rerun()
                         else:
                             st.error(f"Failed: {resp}")
+                            helpers.append_audio_run_history(
+                                ep_id,
+                                "diarize_only",
+                                "error",
+                                _start_ts,
+                                time.time(),
+                                [f"Diarize queue failed: {resp}"],
+                            )
                     except requests.RequestException as exc:
                         st.error(f"API error: {exc}")
+                        helpers.append_audio_run_history(
+                            ep_id,
+                            "diarize_only",
+                            "error",
+                            _start_ts,
+                            time.time(),
+                            [f"API error: {exc}"],
+                        )
 
     st.markdown("---")
     st.caption("💡 Use these options to iterate on specific stages without losing prior work.")
@@ -819,18 +892,43 @@ with st.expander("🔧 Clustering Settings", expanded=False):
             else:
                 # Queue mode - async request
                 with st.spinner("Re-clustering voices..."):
+                    _start_ts = time.time()
                     try:
                         resp = helpers.api_post(f"/jobs/episodes/{ep_id}/audio/clusters/recluster", json=payload)
 
                         if resp.get("success"):
                             new_count = resp.get("cluster_count", 0)
                             st.success(f"Re-clustered! Now have {new_count} voice clusters.")
+                            helpers.append_audio_run_history(
+                                ep_id,
+                                "voices_only",
+                                "succeeded",
+                                _start_ts,
+                                time.time(),
+                                [f"Queued recluster succeeded: {new_count} clusters"],
+                            )
                             time.sleep(1)
                             st.rerun()
                         else:
                             st.error(f"Failed to recluster: {resp}")
+                            helpers.append_audio_run_history(
+                                ep_id,
+                                "voices_only",
+                                "error",
+                                _start_ts,
+                                time.time(),
+                                [f"Recluster queue failed: {resp}"],
+                            )
                     except requests.RequestException as exc:
                         st.error(f"API error: {exc}")
+                        helpers.append_audio_run_history(
+                            ep_id,
+                            "voices_only",
+                            "error",
+                            _start_ts,
+                            time.time(),
+                            [f"API error: {exc}"],
+                        )
 
 if not has_voice_clusters and not has_voice_mapping:
     st.info("Run the audio pipeline above to generate voice clusters for review.")
@@ -1162,14 +1260,53 @@ with st.expander("🔄 Diarization Comparison (Pyannote vs GPT-4o)", expanded=Fa
                             st.markdown(f"**Speaker {spk}** ({len(segs)} segments, {total_dur:.1f}s total)")
                             seg_rows = []
                             for s in segs[:20]:
-                                text_preview = s.get("text", "")[:50] + "..." if len(s.get("text", "")) > 50 else s.get("text", "")
+                                display_text = s.get("canonical_text") or s.get("text") or s.get("raw_text") or ""
+                                if len(display_text) > 80:
+                                    display_text = display_text[:80] + "..."
                                 seg_rows.append({
                                     "Start": f"{s['start']:.1f}s",
                                     "End": f"{s['end']:.1f}s",
                                     "Duration": f"{s['end'] - s['start']:.1f}s",
-                                    "Text": text_preview,
+                                    "Text": display_text,
+                                    "Mixed": "⚠️" if s.get("mixed_speaker") else "—",
                                 })
                             st.dataframe(seg_rows, use_container_width=True, hide_index=True)
+
+                            mixed_segments = [s for s in segs if s.get("mixed_speaker")]
+                            if mixed_segments:
+                                st.caption("⚠️ Mixed-speaker segments detected. Use Smart Split to correct.")
+                                for s in mixed_segments[:5]:
+                                    seg_id = s.get("segment_id") or f"gpt4o_{int(s.get('start',0)*1000):07d}"
+                                    canonical = s.get("canonical_text")
+                                    raw_text = s.get("text") or s.get("raw_text")
+                                    with st.expander(f"{seg_id}: {s.get('start',0):.2f}s → {s.get('end',0):.2f}s", expanded=False):
+                                        if canonical:
+                                            st.write(f"**Canonical (Whisper):** {canonical}")
+                                        if raw_text and raw_text != canonical:
+                                            st.caption(f"Model raw: {raw_text}")
+                                        if st.button(
+                                            "Smart Split",
+                                            key=f"smart_split_gpt4o_{seg_id}",
+                                            use_container_width=True,
+                                        ):
+                                            payload = {
+                                                "source": "gpt4o",
+                                                "speaker_group_id": f"gpt4o:{spk}",
+                                                "segment_id": seg_id,
+                                                "start": s.get("start"),
+                                                "end": s.get("end"),
+                                                "expected_voices": 2,
+                                            }
+                                            try:
+                                                resp = helpers.api_post(f"/episodes/{ep_id}/audio/smart_split", json=payload)
+                                                if resp.get("error"):
+                                                    st.error(resp.get("error"))
+                                                else:
+                                                    st.success("Smart split started")
+                                                    time.sleep(1)
+                                                    st.rerun()
+                                            except requests.RequestException as exc:
+                                                st.error(helpers.describe_error("Smart Split", exc))
                             if len(segs) > 20:
                                 st.caption(f"... and {len(segs) - 20} more segments")
                     else:
@@ -1672,6 +1809,77 @@ else:
         "- `episode_vocals_enhanced.wav`\n"
         "- `episode_vocals.wav`"
     )
+
+# Detailed segment lists per provider
+try:
+    diar_cmp = helpers.api_get(f"/jobs/episodes/{ep_id}/audio/diarization/comparison")
+except requests.RequestException:
+    diar_cmp = {}
+
+has_pyannote = diar_cmp.get("has_pyannote")
+has_gpt4o = diar_cmp.get("has_gpt4o")
+pyannote_segments = diar_cmp.get("pyannote_segments", []) if diar_cmp else []
+gpt4o_segments = diar_cmp.get("gpt4o_segments", []) if diar_cmp else []
+voice_clusters_gpt4o: list[dict] = []
+gpt_clusters_path = paths.get("voice_clusters_gpt4o")
+if gpt_clusters_path and gpt_clusters_path.exists():
+    try:
+        with gpt_clusters_path.open("r", encoding="utf-8") as f:
+            voice_clusters_gpt4o = json.load(f)
+    except Exception:
+        voice_clusters_gpt4o = []
+
+if has_pyannote or has_gpt4o:
+    with st.expander("📋 Detailed Segment Lists", expanded=False):
+        summary = diar_cmp.get("summary", {})
+        col_a, col_b = st.columns(2)
+        with col_a:
+            py_info = summary.get("pyannote", {})
+            st.markdown("🔵 **Pyannote Details**")
+            st.caption(
+                f"Speakers: {py_info.get('speaker_count', '?')} • "
+                f"Segments: {py_info.get('segment_count', '?')} • "
+                f"Speech: {py_info.get('total_speech_duration_s', 0):.1f}s"
+            )
+        with col_b:
+            gpt_info = summary.get("gpt4o", {})
+            st.markdown("🟢 **GPT-4o Details**")
+            st.caption(
+                f"Speakers: {gpt_info.get('speaker_count', '?')} • "
+                f"Segments: {gpt_info.get('segment_count', '?')} • "
+                f"Speech: {gpt_info.get('total_speech_duration_s', 0):.1f}s"
+            )
+
+        def _segment_table(rows: list[dict], provider: str, max_rows: int = 150):
+            if not rows:
+                st.caption(f"No segments for {provider}.")
+                return
+            trimmed = rows[:max_rows]
+            display_rows = []
+            for seg in trimmed:
+                display_rows.append({
+                    "start": round(seg.get("start", 0), 2),
+                    "end": round(seg.get("end", 0), 2),
+                    "speaker": seg.get("speaker", ""),
+                    "text": (seg.get("text", "") or "")[:80],
+                })
+            st.dataframe(display_rows, hide_index=True, use_container_width=True)
+            if len(rows) > max_rows:
+                st.caption(f"Showing first {max_rows} of {len(rows)} segments.")
+
+        st.markdown("🔵 **Pyannote Segments**")
+        _segment_table(pyannote_segments, "Pyannote")
+
+        st.markdown("🟢 **GPT-4o Segments**")
+        _segment_table(gpt4o_segments, "GPT-4o")
+
+        if voice_clusters_gpt4o:
+            st.markdown("🟢 **GPT-4o Speaker Clusters (by diarization label)**")
+            for vc in voice_clusters_gpt4o:
+                st.caption(
+                    f"{vc.get('voice_cluster_id')}: {len(vc.get('segments', []))} segments, "
+                    f"{vc.get('total_duration', 0):.1f}s"
+                )
 
 if not voice_clusters:
     st.info("No voice clusters found.")

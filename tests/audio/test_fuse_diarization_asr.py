@@ -98,6 +98,7 @@ class TestFuseTranscript:
                 asr_segments,
                 voice_clusters,
                 voice_mapping,
+                None,
                 jsonl_path,
                 vtt_path,
                 include_speaker_notes=True,
@@ -162,6 +163,7 @@ class TestFuseTranscript:
                 asr_segments,
                 voice_clusters,
                 voice_mapping,
+                None,
                 jsonl_path,
                 vtt_path,
                 overwrite=True,
@@ -229,6 +231,7 @@ class TestFuseTranscript:
                 asr_segments,
                 voice_clusters,
                 voice_mapping,
+                None,
                 jsonl_path,
                 vtt_path,
                 include_speaker_notes=True,
@@ -244,6 +247,91 @@ class TestFuseTranscript:
             assert "voice_cluster_id=VC_01" in vtt_content
             assert "voice_bank_id=voice_lisa" in vtt_content
             assert "<v Lisa>Hello world" in vtt_content
+
+    def test_rows_split_when_speaker_changes(self):
+        """Transcript rows split when words have different speaker_ids."""
+        from py_screenalytics.audio.fuse_diarization_asr import fuse_transcript
+        from py_screenalytics.audio.models import (
+            ASRSegment,
+            DiarizationSegment,
+            VoiceBankMatchResult,
+            VoiceCluster,
+            VoiceClusterSegment,
+            WordTiming,
+        )
+
+        diarization_segments = [
+            DiarizationSegment(start=0.0, end=2.0, speaker="SPEAKER_00"),
+            DiarizationSegment(start=2.0, end=4.0, speaker="SPEAKER_01"),
+        ]
+
+        asr_segments = [
+            ASRSegment(
+                start=0.0,
+                end=4.0,
+                text="hello there friend",
+                confidence=0.9,
+                words=[
+                    WordTiming(w="hello", t0=0.0, t1=0.5),
+                    WordTiming(w="there", t0=0.6, t1=1.0),
+                    WordTiming(w="friend", t0=2.2, t1=2.8),
+                ],
+            )
+        ]
+
+        voice_clusters = [
+            VoiceCluster(
+                voice_cluster_id="VC_01",
+                segments=[VoiceClusterSegment(start=0.0, end=2.0, diar_speaker="SPEAKER_00")],
+                speaker_group_ids=["pyannote:SPEAKER_00"],
+                total_duration=2.0,
+                segment_count=1,
+            ),
+            VoiceCluster(
+                voice_cluster_id="VC_02",
+                segments=[VoiceClusterSegment(start=2.0, end=4.0, diar_speaker="SPEAKER_01")],
+                speaker_group_ids=["pyannote:SPEAKER_01"],
+                total_duration=2.0,
+                segment_count=1,
+            ),
+        ]
+
+        voice_mapping = [
+            VoiceBankMatchResult(
+                voice_cluster_id="VC_01",
+                voice_bank_id="voice_a",
+                speaker_id="SPK_A",
+                speaker_display_name="Speaker A",
+                similarity=0.8,
+            ),
+            VoiceBankMatchResult(
+                voice_cluster_id="VC_02",
+                voice_bank_id="voice_b",
+                speaker_id="SPK_B",
+                speaker_display_name="Speaker B",
+                similarity=0.8,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = Path(tmpdir) / "transcript.jsonl"
+            vtt_path = Path(tmpdir) / "transcript.vtt"
+
+            rows = fuse_transcript(
+                diarization_segments,
+                asr_segments,
+                voice_clusters,
+                voice_mapping,
+                None,
+                jsonl_path,
+                vtt_path,
+                include_speaker_notes=True,
+                overwrite=True,
+                diarization_source="pyannote",
+            )
+
+            assert len(rows) == 2, "Expected split rows when speakers change within ASR segment"
+            assert rows[0].speaker_id != rows[1].speaker_id
 
 
 class TestTimestampFormatting:

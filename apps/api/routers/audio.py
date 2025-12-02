@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from py_screenalytics.artifacts import get_path
 
 router = APIRouter(prefix="/jobs", tags=["audio"])
+edit_router = APIRouter(tags=["audio"])
 LOGGER = logging.getLogger(__name__)
 
 
@@ -107,6 +108,16 @@ class VoiceAssignResponse(BaseModel):
     error: Optional[str] = None
 
 
+class SmartSplitRequest(BaseModel):
+    """Request payload for smart split."""
+    source: Literal["pyannote", "gpt4o"]
+    speaker_group_id: str
+    segment_id: Optional[str] = Field(None, description="Segment identifier to split")
+    start: Optional[float] = Field(None, description="Start time (seconds) if segment_id not provided")
+    end: Optional[float] = Field(None, description="End time (seconds) if segment_id not provided")
+    expected_voices: int = Field(2, ge=2, le=5, description="Expected number of voices within the segment")
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -126,12 +137,15 @@ def _get_audio_paths(ep_id: str) -> dict:
         "audio_final": audio_dir / "episode_final_voice_only.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
         "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
+        "diarization_combined": manifests_dir / "audio_diarization_combined.jsonl",
         "voice_clusters": manifests_dir / "audio_voice_clusters.json",
+        "voice_clusters_gpt4o": manifests_dir / "audio_voice_clusters_gpt4o.json",
         "voice_mapping": manifests_dir / "audio_voice_mapping.json",
         "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
         "qc": manifests_dir / "audio_qc.json",
         "archived_segments": manifests_dir / "audio_archived_segments.json",
+        "speaker_groups": manifests_dir / "audio_speaker_groups.json",
     }
 
 
@@ -177,6 +191,34 @@ def _normalize_run_mode(run_mode: Optional[str]) -> str:
     if run_mode == "redis":
         return "queue"
     return run_mode
+
+
+@edit_router.post("/episodes/{ep_id}/audio/smart_split")
+async def smart_split_segment(ep_id: str, req: SmartSplitRequest) -> dict:
+    """Smart split a diarization segment into subsegments and reassign speakers."""
+    if not req.segment_id and (req.start is None or req.end is None):
+        raise HTTPException(status_code=400, detail="Provide segment_id or start/end to split")
+
+    try:
+        from py_screenalytics.audio.speaker_edit import smart_split_segment as _smart_split
+
+        result = _smart_split(
+            ep_id=ep_id,
+            source=req.source,
+            speaker_group_id=req.speaker_group_id,
+            segment_id=req.segment_id,
+            start=req.start,
+            end=req.end,
+            expected_voices=req.expected_voices,
+        )
+        return result.model_dump()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOGGER.exception("Smart split failed for %s: %s", ep_id, exc)
+        raise HTTPException(status_code=500, detail=f"Smart split failed: {exc}")
 
 
 # =============================================================================
@@ -1837,7 +1879,8 @@ async def recluster_voices(ep_id: str, req: ClusterReclusterRequest):
         show_id = ep_id.rsplit("-", 1)[0] if "-" in ep_id else ep_id
 
         # Load diarization
-        diarization_segments = _load_diarization_manifest(paths["diarization"])
+        diar_path = paths.get("diarization_combined", paths["diarization"])
+        diarization_segments = _load_diarization_manifest(diar_path if diar_path.exists() else paths["diarization"])
 
         # Get audio path
         audio_path = paths["audio_vocals_enhanced"]
@@ -2524,6 +2567,7 @@ async def get_diarization_comparison(ep_id: str) -> dict:
     comparison_path = manifests_dir / "audio_diarization_comparison.json"
     pyannote_path = manifests_dir / "audio_diarization_pyannote.jsonl"
     gpt4o_path = manifests_dir / "audio_diarization_gpt4o.jsonl"
+    transcript_path = manifests_dir / "episode_transcript.jsonl"
 
     result = {
         "ep_id": ep_id,
@@ -2536,7 +2580,16 @@ async def get_diarization_comparison(ep_id: str) -> dict:
     if comparison_path.exists():
         try:
             with comparison_path.open("r", encoding="utf-8") as f:
-                result["summary"] = json.load(f)
+                comparison_data = json.load(f)
+            # Optionally augment with canonical text + mixed-speaker flags if transcript exists
+            if transcript_path.exists():
+                try:
+                    from py_screenalytics.audio.diarization_comparison import augment_diarization_comparison
+
+                    comparison_data = augment_diarization_comparison(comparison_path, transcript_path) or comparison_data
+                except Exception as exc:
+                    LOGGER.warning("Could not augment diarization comparison: %s", exc)
+            result["summary"] = comparison_data
         except Exception as e:
             LOGGER.warning(f"Failed to load comparison: {e}")
 
@@ -2568,13 +2621,31 @@ async def get_diarization_comparison(ep_id: str) -> dict:
                     line = line.strip()
                     if line:
                         seg = json.loads(line)
-                        segments.append({
+                        seg_data = {
                             "start": seg.get("start", 0),
                             "end": seg.get("end", 0),
                             "speaker": seg.get("speaker", ""),
                             "text": seg.get("text", "")[:100],  # First 100 chars
                             "provider": "gpt4o",
-                        })
+                        }
+                        segments.append(seg_data)
+            for idx, seg in enumerate(segments):
+                seg.setdefault("segment_id", f"gpt4o_{idx+1:04d}")
+            # Inject canonical_text/mixed_speaker from comparison if available
+            comp_segments = (result.get("summary") or {}).get("segments", {}).get("gpt4o", [])
+            if comp_segments:
+                for seg in segments:
+                    for cseg in comp_segments:
+                        if abs(seg["start"] - cseg.get("start", 0)) < 1e-3 and abs(seg["end"] - cseg.get("end", 0)) < 1e-3:
+                            if cseg.get("canonical_text"):
+                                seg["canonical_text"] = cseg.get("canonical_text")
+                            if cseg.get("raw_text"):
+                                seg["raw_text"] = cseg.get("raw_text")
+                            if cseg.get("mixed_speaker") is not None:
+                                seg["mixed_speaker"] = cseg.get("mixed_speaker")
+                            if cseg.get("speakers") is not None:
+                                seg["speakers"] = cseg.get("speakers")
+                            break
             result["gpt4o_segments"] = segments
         except Exception as e:
             LOGGER.warning(f"Failed to load gpt4o segments: {e}")

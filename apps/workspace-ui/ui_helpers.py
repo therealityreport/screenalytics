@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -31,6 +34,8 @@ DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
 DEFAULT_STRIDE = 6  # Every 6th frame - balances accuracy vs false positives
 DEFAULT_DETECTOR = "retinaface"
 DEFAULT_TRACKER = "bytetrack"
+
+_TZ_EST = ZoneInfo("America/New_York")
 
 # Platform-aware device defaults
 # On macOS Apple Silicon: prefer CoreML for quiet, thermal-safe operation
@@ -438,7 +443,7 @@ def fetch_operation_logs(ep_id: str, operation: str) -> Dict[str, Any] | None:
         base = st.session_state.get("api_base")
         if not base:
             base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
-        url = f"{base}/celery_jobs/logs/{ep_id}/{operation}"
+        url = f"{base}/celery_jobs/logs/{ep_id}/{operation}?include_history=true&limit=25"
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
         data = resp.json()
@@ -492,6 +497,79 @@ def cache_logs(
         "elapsed_seconds": elapsed_seconds,
         **(extra or {}),
     }
+
+
+def _audio_history_path(ep_id: str) -> Path:
+    """Return path for persisted audio run history JSONL."""
+    manifests = DATA_ROOT / "manifests" / ep_id / "logs"
+    return manifests / "audio_runs.jsonl"
+
+
+def append_audio_run_history(
+    ep_id: str,
+    operation: str,
+    status: str,
+    start_ts: float,
+    end_ts: float,
+    log_lines: List[str],
+) -> None:
+    """Persist a single audio run entry locally for UI history."""
+    try:
+        path = _audio_history_path(ep_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        duration = max(0.0, end_ts - start_ts)
+        record = {
+            "ep_id": ep_id,
+            "operation": operation,
+            "status": status,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "duration_seconds": duration,
+            "log_excerpt": log_lines[-200:],
+            "created_at": _now_iso(),
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:  # best-effort; never block UI
+        LOGGER.debug("Failed to append audio history for %s/%s: %s", ep_id, operation, exc)
+
+
+def load_audio_run_history(ep_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Load recent audio runs for display."""
+    path = _audio_history_path(ep_id)
+    if not path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        # Newest entries are appended last
+        records = list(reversed(records))
+        return records[:limit]
+    except Exception as exc:
+        LOGGER.debug("Failed to load audio history for %s: %s", ep_id, exc)
+        return []
+
+
+def format_est(ts: float | str | None) -> str:
+    """Format timestamp in America/New_York for UI."""
+    if ts is None:
+        return ""
+    try:
+        if isinstance(ts, str):
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt.astimezone(_TZ_EST).strftime("%Y-%m-%d %I:%M %p ET")
+    except Exception:
+        return ""
 
 
 def hydrate_logs_for_episode(ep_id: str, force: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -795,10 +873,8 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     st.session_state.setdefault("scene_detector_choice", SCENE_DETECTOR_DEFAULT)
 
     sidebar = st.sidebar
-    # Episode selector at top of sidebar (with lock)
-    render_sidebar_episode_selector()
 
-    render_workspace_nav()
+    # API status at very top of sidebar
     sidebar.header("API")
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
@@ -809,6 +885,12 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     except requests.RequestException as exc:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
+    sidebar.divider()
+
+    # Episode selector
+    render_sidebar_episode_selector()
+
+    render_workspace_nav()
 
     # Render global episode selector in sidebar
     sidebar.divider()
@@ -1021,6 +1103,26 @@ def api_delete(path: str, **kwargs) -> Dict[str, Any]:
         raise RuntimeError("init_page() must be called before API access")
     timeout = kwargs.pop("timeout", 60)
     resp = requests.delete(f"{base}{path}", timeout=timeout, **kwargs)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_post_files(path: str, files: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+    """POST request with file upload.
+
+    Args:
+        path: API path
+        files: Dict of {name: (filename, file_bytes, content_type)}
+        **kwargs: Additional requests kwargs
+
+    Returns:
+        JSON response
+    """
+    base = st.session_state.get("api_base")
+    if not base:
+        raise RuntimeError("init_page() must be called before API access")
+    timeout = kwargs.pop("timeout", 120)
+    resp = requests.post(f"{base}{path}", files=files, timeout=timeout, **kwargs)
     resp.raise_for_status()
     return resp.json()
 
@@ -3364,24 +3466,10 @@ def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | N
         except Exception:
             pass  # Continue checking other sources
 
-    # Fallback: audio progress file indicates in-progress local pipeline even if job registry missed it
-    if job_type == "audio_pipeline":
-        progress_data = audio_progress_data or get_audio_progress(ep_id)
-        if progress_data:
-            overall = progress_data.get("overall_progress") or progress_data.get("progress")
-            if overall is not None and overall < 1:
-                pct = overall * 100 if overall <= 1 else overall
-                return {
-                    "job_id": f"{ep_id}-audio-local",
-                    "state": "running",
-                    "job_type": job_type,
-                    "source": "progress_file",
-                    "progress_pct": pct,
-                    "step_name": progress_data.get("step_name") or progress_data.get("step"),
-                    "step_order": progress_data.get("step_order", 0),
-                    "total_steps": progress_data.get("total_steps", 9),
-                    "message": progress_data.get("message", ""),
-                }
+    # NOTE: We previously had a fallback that trusted progress files even without job registry,
+    # but this caused stale progress bars after crashes/restarts. Progress files are only used
+    # to ENHANCE job info from actual registries, not as a standalone source of truth.
+    # If no actual job is found in any registry, don't show a progress bar.
 
     return None
 
@@ -3404,16 +3492,358 @@ def get_episode_progress(ep_id: str) -> Dict[str, Any] | None:
 
 
 def get_audio_progress(ep_id: str) -> Dict[str, Any] | None:
-    """Read audio_progress.json for an episode to show audio pipeline progress."""
+    """Read audio_progress.json for an episode to show audio pipeline progress.
+
+    Returns progress data only if there's actually a running job - prevents
+    showing stale progress from crashed/cancelled jobs.
+
+    NOTE: This function is now only used to ENHANCE progress info from actual
+    job registries. It does NOT standalone determine if a job is running.
+    The status field must be checked by callers.
+    """
     try:
         progress_path = DATA_ROOT / "manifests" / ep_id / "audio_progress.json"
         if not progress_path.exists():
             return None
         with open(progress_path, "r") as f:
             import json
-            return json.load(f)
+            data = json.load(f)
+
+        # Always ignore completed/errored/stale entries - these are terminal states
+        overall = data.get("overall_progress") or data.get("progress")
+        status = str(data.get("status", "")).lower()
+        if overall is not None and overall >= 1:
+            return None
+        if status in {"succeeded", "completed", "complete", "error", "cancelled", "timeout", "failed", "stale"}:
+            return None
+
+        # IMPORTANT: Progress files can become stale if jobs crash or are interrupted.
+        # ALWAYS verify with job registries before trusting progress data.
+        # Check file age and verify with Celery/local job tracker
+        timestamp = data.get("timestamp")
+        if timestamp is not None:
+            import time
+            age_seconds = time.time() - timestamp
+
+            # For ANY file with running status, verify there's actually a job
+            # (previously only checked for files older than 60s, but that's too permissive)
+            try:
+                # Check both Celery and local job registries
+                has_active_job = False
+
+                # Check Celery jobs
+                try:
+                    resp = requests.get(f"{_api_base()}/celery_jobs", timeout=2)
+                    if resp.ok:
+                        jobs = resp.json().get("jobs", [])
+                        has_active_job = any(
+                            j.get("ep_id") == ep_id and
+                            (j.get("operation") == "audio_pipeline" or
+                             str(j.get("name", "")).startswith("audio."))
+                            for j in jobs
+                        )
+                except requests.RequestException:
+                    pass
+
+                # Check local/subprocess jobs if Celery didn't find anything
+                if not has_active_job:
+                    try:
+                        resp = requests.get(f"{_api_base()}/celery_jobs/local", timeout=2)
+                        if resp.ok:
+                            jobs = resp.json().get("jobs", [])
+                            has_active_job = any(
+                                j.get("ep_id") == ep_id and
+                                (j.get("operation") == "audio_pipeline" or
+                                 j.get("job_type") == "audio_pipeline")
+                                for j in jobs
+                            )
+                    except requests.RequestException:
+                        pass
+
+                if not has_active_job:
+                    # No active job found in any registry - mark file as stale
+                    # Only mark stale if file is older than 10 seconds (give new jobs time to register)
+                    if age_seconds > 10:
+                        data["status"] = "stale"
+                        data["message"] = f"Marked stale: no active job found (age: {age_seconds:.0f}s)"
+                        progress_path.write_text(json.dumps(data), encoding="utf-8")
+                    return None
+
+            except Exception:
+                # If we can't verify, use conservative timeout
+                if age_seconds > 120:  # 2 minutes without verification = stale
+                    return None
+
+        return data
     except Exception:
         return None
+
+
+# =============================================================================
+# Audio Pipeline Phase Status Checks
+# =============================================================================
+
+
+def _get_audio_paths(ep_id: str) -> Dict[str, Path]:
+    """Get standard audio artifact paths for an episode."""
+    manifests_dir = DATA_ROOT / "manifests" / ep_id
+    return {
+        "original": manifests_dir / "episode_original.wav",
+        "vocals": manifests_dir / "episode_vocals.wav",
+        "vocals_enhanced": manifests_dir / "episode_vocals_enhanced.wav",
+        "diarization": manifests_dir / "audio_diarization.jsonl",
+        "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
+        "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
+        "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
+        "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
+        "voice_clusters": manifests_dir / "audio_voice_clusters.json",
+        "voice_mapping": manifests_dir / "audio_voice_mapping.json",
+        "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
+        "transcript_vtt": manifests_dir / "episode_transcript.vtt",
+        "qc": manifests_dir / "audio_qc.json",
+    }
+
+
+def check_audio_files_exist(ep_id: str) -> Dict[str, Any]:
+    """Check if audio files have been created (Phase 1).
+
+    Returns dict with:
+        - exists: bool - True if essential audio files exist
+        - original: bool - True if original audio exists
+        - vocals: bool - True if vocals (separated) exists
+        - vocals_enhanced: bool - True if enhanced vocals exists
+        - status: str - "complete", "partial", or "missing"
+    """
+    paths = _get_audio_paths(ep_id)
+    original = paths["original"].exists()
+    vocals = paths["vocals"].exists()
+    vocals_enhanced = paths["vocals_enhanced"].exists()
+
+    # Consider complete if we have at least vocals (enhanced is optional)
+    if vocals:
+        status = "complete" if vocals_enhanced else "partial"
+    else:
+        status = "missing"
+
+    return {
+        "exists": vocals,  # Minimum requirement
+        "original": original,
+        "vocals": vocals,
+        "vocals_enhanced": vocals_enhanced,
+        "status": status,
+    }
+
+
+def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
+    """Check if diarization + transcription has been run (Phase 2).
+
+    Returns dict with:
+        - complete: bool - True if diarization and ASR exist
+        - diarization: bool - True if diarization exists
+        - diarization_pyannote: bool - True if pyannote diarization exists
+        - diarization_gpt4o: bool - True if GPT-4o diarization exists
+        - asr: bool - True if ASR raw transcript exists
+        - voice_clusters: bool - True if initial voice clusters exist
+        - segment_count: int - Number of diarization segments
+        - cluster_count: int - Number of voice clusters
+        - status: str - "complete", "partial", or "not_run"
+    """
+    paths = _get_audio_paths(ep_id)
+
+    diarization = paths["diarization"].exists()
+    diarization_pyannote = paths["diarization_pyannote"].exists()
+    diarization_gpt4o = paths["diarization_gpt4o"].exists()
+    asr = paths["asr_raw"].exists()
+    voice_clusters = paths["voice_clusters"].exists()
+
+    # Count segments and clusters
+    segment_count = 0
+    cluster_count = 0
+
+    if diarization:
+        try:
+            with open(paths["diarization"], "r") as f:
+                segment_count = sum(1 for line in f if line.strip())
+        except Exception:
+            pass
+
+    if voice_clusters:
+        try:
+            with open(paths["voice_clusters"], "r") as f:
+                data = json.load(f)
+                cluster_count = len(data.get("clusters", []))
+        except Exception:
+            pass
+
+    # Determine status
+    if diarization and asr:
+        status = "complete"
+    elif diarization or asr:
+        status = "partial"
+    else:
+        status = "not_run"
+
+    return {
+        "complete": diarization and asr,
+        "diarization": diarization,
+        "diarization_pyannote": diarization_pyannote,
+        "diarization_gpt4o": diarization_gpt4o,
+        "asr": asr,
+        "voice_clusters": voice_clusters,
+        "segment_count": segment_count,
+        "cluster_count": cluster_count,
+        "status": status,
+    }
+
+
+def check_voice_assignments_complete(ep_id: str) -> Dict[str, Any]:
+    """Check if voice assignments have been made (Phase 3 - Manual Review).
+
+    Returns dict with:
+        - complete: bool - True if any voices have been assigned names
+        - voice_mapping_exists: bool - True if voice mapping file exists
+        - labeled_count: int - Number of labeled voice clusters
+        - unlabeled_count: int - Number of unlabeled voice clusters
+        - total_count: int - Total voice clusters
+        - status: str - "complete", "partial", or "not_started"
+    """
+    paths = _get_audio_paths(ep_id)
+
+    if not paths["voice_mapping"].exists():
+        return {
+            "complete": False,
+            "voice_mapping_exists": False,
+            "labeled_count": 0,
+            "unlabeled_count": 0,
+            "total_count": 0,
+            "status": "not_started",
+        }
+
+    try:
+        with open(paths["voice_mapping"], "r") as f:
+            mapping = json.load(f)
+
+        # Count labeled vs unlabeled
+        entries = mapping if isinstance(mapping, list) else mapping.get("mappings", [])
+        labeled = sum(1 for m in entries if m.get("is_labeled", False))
+        unlabeled = len(entries) - labeled
+
+        # Consider complete if at least some voices are labeled
+        if labeled > 0:
+            status = "complete" if unlabeled == 0 else "partial"
+        else:
+            status = "not_started"
+
+        return {
+            "complete": labeled > 0,
+            "voice_mapping_exists": True,
+            "labeled_count": labeled,
+            "unlabeled_count": unlabeled,
+            "total_count": len(entries),
+            "status": status,
+        }
+    except Exception:
+        return {
+            "complete": False,
+            "voice_mapping_exists": True,
+            "labeled_count": 0,
+            "unlabeled_count": 0,
+            "total_count": 0,
+            "status": "error",
+        }
+
+
+def check_transcript_finalized(ep_id: str) -> Dict[str, Any]:
+    """Check if transcript has been finalized (Phase 4).
+
+    Returns dict with:
+        - complete: bool - True if transcript and QC exist
+        - transcript_jsonl: bool - True if JSONL transcript exists
+        - transcript_vtt: bool - True if VTT subtitle exists
+        - qc: bool - True if QC report exists
+        - qc_status: str - QC status (ok, warn, needs_review, failed, unknown)
+        - transcript_row_count: int - Number of transcript rows
+        - status: str - "complete", "partial", or "not_run"
+    """
+    paths = _get_audio_paths(ep_id)
+
+    transcript_jsonl = paths["transcript_jsonl"].exists()
+    transcript_vtt = paths["transcript_vtt"].exists()
+    qc = paths["qc"].exists()
+
+    # Get QC status and transcript row count
+    qc_status = "unknown"
+    transcript_row_count = 0
+
+    if qc:
+        try:
+            with open(paths["qc"], "r") as f:
+                qc_data = json.load(f)
+                qc_status = qc_data.get("status", "unknown")
+        except Exception:
+            pass
+
+    if transcript_jsonl:
+        try:
+            with open(paths["transcript_jsonl"], "r") as f:
+                transcript_row_count = sum(1 for line in f if line.strip())
+        except Exception:
+            pass
+
+    # Determine status
+    if transcript_jsonl and qc:
+        status = "complete"
+    elif transcript_jsonl or qc:
+        status = "partial"
+    else:
+        status = "not_run"
+
+    return {
+        "complete": transcript_jsonl and qc,
+        "transcript_jsonl": transcript_jsonl,
+        "transcript_vtt": transcript_vtt,
+        "qc": qc,
+        "qc_status": qc_status,
+        "transcript_row_count": transcript_row_count,
+        "status": status,
+    }
+
+
+def get_audio_pipeline_status(ep_id: str) -> Dict[str, Any]:
+    """Get complete audio pipeline status for all phases.
+
+    Returns dict with status of all phases and recommended next action.
+    """
+    audio_files = check_audio_files_exist(ep_id)
+    diarization = check_diarization_complete(ep_id)
+    voice_assignments = check_voice_assignments_complete(ep_id)
+    transcript = check_transcript_finalized(ep_id)
+
+    # Determine next action
+    if not audio_files["exists"]:
+        next_action = "create_audio_files"
+        next_action_label = "Create Audio Files"
+    elif not diarization["complete"]:
+        next_action = "run_diarization"
+        next_action_label = "Run Diarization + Transcription"
+    elif not voice_assignments["complete"]:
+        next_action = "review_voices"
+        next_action_label = "Review & Assign Voices"
+    elif not transcript["complete"]:
+        next_action = "finalize_transcript"
+        next_action_label = "Finalize Transcript"
+    else:
+        next_action = "done"
+        next_action_label = "Audio Pipeline Complete"
+
+    return {
+        "audio_files": audio_files,
+        "diarization": diarization,
+        "voice_assignments": voice_assignments,
+        "transcript": transcript,
+        "next_action": next_action,
+        "next_action_label": next_action_label,
+    }
 
 
 def cancel_running_job(job_id: str) -> tuple[bool, str]:
@@ -3504,6 +3934,9 @@ def render_previous_logs(
                 st.caption("No previous logs available for this operation.")
         return False
 
+    history = data.get("history") or []
+    runs = history if history else [data]
+
     status = data.get("status", "unknown")
     formatted_logs = data.get("logs", [])
     elapsed_seconds = data.get("elapsed_seconds", 0)
@@ -3539,12 +3972,29 @@ def render_previous_logs(
     expander_label = f"{icon} Previous {operation} run ({status}, {elapsed_str}){timestamp_str}"
 
     with st.expander(expander_label, expanded=expanded):
-        if not formatted_logs:
+        # Run selector when history available
+        selected_run = runs[0]
+        if history:
+            options = []
+            for run in runs:
+                ts = run.get("updated_at")
+                ts_label = format_est(ts) or ts or "unknown time"
+                options.append(f"{ts_label} · {run.get('status', 'unknown')} · {run.get('elapsed_seconds', 0):.1f}s")
+            idx = st.selectbox(
+                "Choose run",
+                options=range(len(options)),
+                format_func=lambda i: options[i],
+                index=0,
+                key=f"{ep_id}::{operation}::log_history_select",
+            )
+            selected_run = runs[idx]
+
+        selected_logs = selected_run.get("logs", [])
+        if not selected_logs:
             st.caption("No log lines recorded.")
             return True
 
-        # Display formatted logs (no raw log toggle - cleaner UI)
-        st.code("\n".join(formatted_logs), language="text")
+        st.code("\n".join(selected_logs), language="text")
 
     return True
 
@@ -3919,6 +4369,15 @@ def run_audio_pipeline_with_streaming(
     start_time = time.time()
 
     try:
+        def _clean_msg(text: str) -> str:
+            """Remove demucs BagOfModels noise from user-facing messages."""
+            if not text:
+                return text
+            lowered = text.lower()
+            if "call apply_model on this" in lowered:
+                return "Demucs/MDX model failed to load (library noise suppressed)"
+            return text
+
         # Streaming request - reads lines as they arrive
         with requests.post(
             f"{_api_base()}{endpoint}",
@@ -3930,6 +4389,20 @@ def run_audio_pipeline_with_streaming(
 
             final_result: Dict[str, Any] = {}
 
+            # Noise patterns to filter from logs
+            noise_patterns = [
+                "Call apply_model on this",  # Demucs BagOfModels repr
+                "BagOfModels(",  # Demucs model repr
+                "<demucs.",  # Demucs internal repr
+            ]
+
+            def _is_noise(line: str) -> bool:
+                """Check if a log line is noise that should be filtered."""
+                for pattern in noise_patterns:
+                    if pattern.lower() in line.lower():
+                        return True
+                return False
+
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line:
                     continue
@@ -3937,19 +4410,45 @@ def run_audio_pipeline_with_streaming(
                 try:
                     msg = json.loads(raw_line)
                 except json.JSONDecodeError:
-                    # Treat non-JSON lines as plain log lines
-                    log_lines.append(raw_line)
-                    log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    # Treat non-JSON lines as plain log lines (filter noise)
+                    if not _is_noise(raw_line):
+                        log_lines.append(raw_line)
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
                     continue
 
-                # Audio pipeline emits: phase, progress, message, timestamp
-                phase = msg.get("phase", "")
-                progress = msg.get("progress", 0)
-                message = msg.get("message", "")
-                step_name = msg.get("step_name", "")
-                step_progress = msg.get("step_progress", 0)
-                step_order = msg.get("step_order", 0)
-                total_steps = msg.get("total_steps", 9)
+                # Handle different message types from _stream_local_subprocess
+                msg_type = msg.get("type", "")
+
+                # Handle log messages (from LogFormatter)
+                if msg_type == "log":
+                    line = msg.get("line", "")
+                    if line and not _is_noise(line):
+                        log_lines.append(line)
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    continue
+
+                # Handle audio_progress messages (new format for audio pipeline)
+                if msg_type == "audio_progress":
+                    phase = msg.get("phase", "")
+                    progress = msg.get("progress", 0)
+                    message = _clean_msg(msg.get("message", ""))
+                    step_name = msg.get("step_name", "")
+                    step_progress = msg.get("step_progress", 0)
+                    step_order = msg.get("step_order", 0)
+                    total_steps = msg.get("total_steps", 9)
+                else:
+                    # Legacy: direct phase/progress format (backward compatibility)
+                    phase = msg.get("phase", "")
+                    progress = msg.get("progress", 0)
+                    message = _clean_msg(msg.get("message", ""))
+                    step_name = msg.get("step_name", "")
+                    step_progress = msg.get("step_progress", 0)
+                    step_order = msg.get("step_order", 0)
+                    total_steps = msg.get("total_steps", 9)
+
+                # Skip if no phase (not a progress message)
+                if not phase and msg_type not in ("audio_progress", "summary"):
+                    continue
 
                 # Get human-readable step name
                 display_name = step_names.get(phase, step_name or phase.replace("_", " ").title())
@@ -3960,9 +4459,36 @@ def run_audio_pipeline_with_streaming(
                 elapsed_sec = int(elapsed_secs % 60)
                 elapsed_str = f"{elapsed_min}m {elapsed_sec}s" if elapsed_min > 0 else f"{elapsed_sec}s"
 
+                # Handle summary message (completion/error from _stream_local_subprocess)
+                if msg_type == "summary":
+                    status = msg.get("status", "")
+                    if status == "completed":
+                        progress_bar.progress(1.0)
+                        completion_msg = f"Audio pipeline completed in {elapsed_str}"
+                        log_lines.append(f"✅ {completion_msg}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                        progress_text.caption(f"**100%** - {completion_msg}")
+                        status_placeholder.success(f"✅ [LOCAL MODE] {completion_msg}")
+                        result = {"status": "succeeded", "logs": log_lines, "elapsed_seconds": elapsed_secs}
+                        cache_logs(ep_id, "audio_pipeline", log_lines, "completed", elapsed_secs)
+                        append_audio_run_history(ep_id, "audio_pipeline", "succeeded", start_time, time.time(), log_lines)
+                        return result, None
+                    elif status == "error":
+                        error_msg = msg.get("error", "Unknown error")
+                        log_lines.append(f"ERROR: {error_msg}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                        status_placeholder.error(f"❌ [LOCAL MODE] Audio pipeline failed: {error_msg}")
+                        progress_text.caption(f"❌ Failed after {elapsed_str}")
+                        result = {"status": "error", "error": error_msg, "logs": log_lines, "elapsed_seconds": elapsed_secs}
+                        cache_logs(ep_id, "audio_pipeline", log_lines, "error", elapsed_secs)
+                        append_audio_run_history(ep_id, "audio_pipeline", "error", start_time, time.time(), log_lines)
+                        return result, error_msg
+                    continue
+
                 # Handle error phase
                 if phase == "error":
                     error_msg = message or "Unknown error"
+                    error_msg = _clean_msg(error_msg)
                     log_lines.append(f"ERROR: {error_msg}")
                     log_placeholder.code("\n".join(log_lines[-100:]), language="text")
                     status_placeholder.error(f"❌ [LOCAL MODE] Audio pipeline failed: {error_msg}")
@@ -3975,6 +4501,7 @@ def run_audio_pipeline_with_streaming(
                         "elapsed_seconds": elapsed_secs,
                     }
                     cache_logs(ep_id, "audio_pipeline", log_lines, "error", elapsed_secs)
+                    append_audio_run_history(ep_id, "audio_pipeline", "error", start_time, time.time(), log_lines)
                     return result, error_msg
 
                 # Handle completion
@@ -4002,6 +4529,7 @@ def run_audio_pipeline_with_streaming(
                         "unlabeled_voices": unlabeled_voices,
                     }
                     cache_logs(ep_id, "audio_pipeline", log_lines, "completed", elapsed_secs)
+                    append_audio_run_history(ep_id, "audio_pipeline", "succeeded", start_time, time.time(), log_lines)
                     return result, None
 
                 # Regular progress update
@@ -4035,7 +4563,7 @@ def run_audio_pipeline_with_streaming(
 
                 # Add log line
                 if message:
-                    log_line = f"[{elapsed_str}] [{display_name}] {message}"
+                    log_line = f"[{elapsed_str}] [{display_name}] {_clean_msg(message)}"
                 else:
                     log_line = f"[{elapsed_str}] [{display_name}] Progress: {pct:.1f}%"
 
@@ -4050,8 +4578,8 @@ def run_audio_pipeline_with_streaming(
             status_placeholder.warning(f"⚠️ [LOCAL MODE] {error_msg}")
 
             cache_logs(ep_id, "audio_pipeline", log_lines, "unknown", elapsed_secs)
+            append_audio_run_history(ep_id, "audio_pipeline", "unknown", start_time, time.time(), log_lines)
             return {"status": "unknown", "logs": log_lines, "elapsed_seconds": elapsed_secs}, error_msg
-
     except requests.RequestException as exc:
         elapsed_secs = time.time() - start_time
         error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
@@ -4059,7 +4587,381 @@ def run_audio_pipeline_with_streaming(
         log_placeholder.code("\n".join(log_lines[-100:]), language="text")
         status_placeholder.error(f"❌ {error_msg}")
         cache_logs(ep_id, "audio_pipeline", log_lines, "error", elapsed_secs)
+        append_audio_run_history(ep_id, "audio_pipeline", "error", start_time, time.time(), log_lines)
         return None, error_msg
+
+    return {"status": "unknown", "logs": log_lines, "elapsed_seconds": elapsed_secs}, error_msg
+
+
+def run_audio_pipeline_with_celery_streaming(
+    ep_id: str,
+    overwrite: bool = False,
+    asr_provider: str = "openai_whisper",
+) -> tuple[Dict[str, Any] | None, str | None]:
+    """Queue audio pipeline via Celery and stream progress/logs without page reruns."""
+    # Start job
+    payload = {
+        "ep_id": ep_id,
+        "overwrite": overwrite,
+        "asr_provider": asr_provider,
+        "run_mode": "queue",
+    }
+
+    status_placeholder = st.empty()
+    progress_bar = st.progress(0.0)
+    progress_text = st.empty()
+    progress_text.caption("Queueing audio pipeline...")
+    st.markdown("**Detailed Log:**")
+    log_placeholder = st.empty()
+    log_lines: List[str] = []
+    pending_states = {"pending", "queued", "scheduled", "received"}
+    fallback_to_local = False
+
+    def _clean_msg(text: str) -> str:
+        if not text:
+            return text
+        if "call apply_model on this" in text.lower():
+            return "Demucs/MDX model noise suppressed"
+        return text
+
+    try:
+        start_resp = requests.post(f"{_api_base()}/jobs/episode_audio_pipeline", json=payload, timeout=30)
+        start_resp.raise_for_status()
+        start_data = start_resp.json()
+        job_id = start_data.get("job_id")
+        if not job_id:
+            status_placeholder.error(f"❌ Failed to start job: {start_data}")
+            return None, "Failed to start job"
+    except requests.RequestException as exc:
+        err = describe_error(f"{_api_base()}/jobs/episode_audio_pipeline", exc)
+        status_placeholder.error(f"❌ {err}")
+        return None, err
+
+    status_placeholder.info(f"⏳ [QUEUE MODE] Audio pipeline queued: {job_id}")
+    log_lines.append(f"[QUEUE] Job queued: {job_id}")
+    log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+
+    # Stream progress
+    def _cancel_job(job_id: str) -> tuple[bool, str]:
+        try:
+            resp = requests.post(f"{_api_base()}/celery_jobs/{job_id}/cancel", timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("status") in {"cancelled", "already_finished"}, data.get("status", "unknown")
+        except requests.RequestException as exc:
+            return False, describe_error(f"{_api_base()}/celery_jobs/{job_id}/cancel", exc)
+
+    try:
+        start_time = time.time()
+        last_progress_ts = start_time
+
+        # Pass ep_id to enable progress file polling for chain tasks
+        with requests.get(
+            f"{_api_base()}/celery_jobs/stream/{job_id}",
+            params={"ep_id": ep_id},
+            stream=True,
+            timeout=None,
+        ) as resp:
+            resp.raise_for_status()
+
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+
+                try:
+                    msg = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    log_lines.append(raw_line)
+                    log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+                    continue
+
+                mtype = msg.get("type", "")
+                if mtype == "progress":
+                    progress = msg.get("progress", 0)
+                    pct = progress * 100 if progress <= 1 else progress
+                    progress_bar.progress(min(progress, 1.0))
+                    step_name = msg.get("step_name") or msg.get("step") or "Running"
+                    message = _clean_msg(msg.get("message", ""))
+                    step_order = msg.get("step_order", 0)
+                    total_steps = msg.get("total_steps", 9)
+                    state = str(msg.get("state", "")).lower()
+                    elapsed = int(time.time() - start_time)
+                    elapsed_str = f"{elapsed//60}m {elapsed%60}s" if elapsed >= 60 else f"{elapsed}s"
+
+                    if progress > 0:
+                        last_progress_ts = time.time()
+
+                    # If still queued/pending with zero progress for too long, fallback to local
+                    if (state in pending_states and progress <= 0 and not fallback_to_local
+                            and time.time() - start_time > 12):
+                        fallback_to_local = True
+                        warn_msg = "Queue is stuck >12s with 0% progress. Cancelling and running locally..."
+                        log_lines.append(warn_msg)
+                        log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+                        status_placeholder.warning(warn_msg)
+                        _cancel_job(job_id)
+                        return run_audio_pipeline_with_streaming(
+                            ep_id=ep_id,
+                            overwrite=overwrite,
+                            asr_provider=asr_provider,
+                        )
+
+                    parts = [f"**{pct:.1f}%**"]
+                    if step_order and total_steps:
+                        parts.append(f"Step {step_order}/{total_steps}:")
+                    parts.append(step_name.replace("_", " ").title())
+                    if message:
+                        parts.append(f"- {message}")
+                    parts.append(f"({elapsed_str})")
+                    progress_text.caption(" ".join(parts))
+
+                    if message:
+                        log_lines.append(f"[{elapsed_str}] [{step_name}] {message}")
+                    else:
+                        log_lines.append(f"[{elapsed_str}] [{step_name}] {pct:.1f}%")
+                    log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+
+                elif mtype == "log":
+                    line = _clean_msg(msg.get("line", ""))
+                    if line:
+                        log_lines.append(line)
+                        log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+
+                elif mtype == "summary":
+                    status = msg.get("status", "unknown")
+                    elapsed = msg.get("elapsed_seconds", time.time() - start_time)
+                    elapsed_str = f"{int(elapsed)//60}m {int(elapsed)%60}s" if elapsed >= 60 else f"{elapsed:.1f}s"
+                    if status == "success" or status == "succeeded":
+                        progress_bar.progress(1.0)
+                        progress_text.caption(f"**100%** - Completed in {elapsed_str}")
+                        status_placeholder.success(f"✅ [QUEUE MODE] Audio pipeline completed in {elapsed_str}")
+                        log_lines.append(f"✅ Completed in {elapsed_str}")
+                        log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+                        cache_logs(ep_id, "audio_pipeline", log_lines, "completed", elapsed)
+                        append_audio_run_history(ep_id, "audio_pipeline", "succeeded", start_time, time.time(), log_lines)
+                        return {"status": "succeeded", "elapsed_seconds": elapsed}, None
+                    else:
+                        error_msg = _clean_msg(msg.get("error", "Unknown error"))
+                        progress_text.caption(f"❌ {error_msg}")
+                        status_placeholder.error(f"❌ [QUEUE MODE] Audio pipeline failed: {error_msg}")
+                        log_lines.append(f"ERROR: {error_msg}")
+                        log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+                        cache_logs(ep_id, "audio_pipeline", log_lines, status, elapsed, extra={"error": error_msg})
+                        append_audio_run_history(ep_id, "audio_pipeline", status, start_time, time.time(), log_lines)
+                        return {"status": status, "error": error_msg, "elapsed_seconds": elapsed}, error_msg
+
+                else:
+                    # Unknown type, just log raw
+                    log_lines.append(json.dumps(msg))
+                    log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+
+            # Stream ended unexpectedly
+            elapsed = time.time() - start_time
+            warn_msg = "Audio pipeline stream ended unexpectedly"
+            status_placeholder.warning(warn_msg)
+            log_lines.append(f"WARNING: {warn_msg}")
+            log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+            cache_logs(ep_id, "audio_pipeline", log_lines, "unknown", elapsed)
+            append_audio_run_history(ep_id, "audio_pipeline", "unknown", start_time, time.time(), log_lines)
+            return {"status": "unknown", "logs": log_lines, "elapsed_seconds": elapsed}, warn_msg
+
+    except requests.RequestException as exc:
+        err = describe_error(f"{_api_base()}/celery_jobs/stream/{job_id}", exc)
+        status_placeholder.error(f"❌ {err}")
+        log_lines.append(f"ERROR: {err}")
+        log_placeholder.code("\n".join(log_lines[-200:]), language="text")
+        append_audio_run_history(ep_id, "audio_pipeline", "error", start_time, time.time(), log_lines)
+        return None, err
+
+
+def run_incremental_with_streaming(
+    ep_id: str,
+    operation: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    operation_display_name: str = None,
+) -> tuple[Dict[str, Any] | None, str | None]:
+    """Run an incremental audio operation with real-time streaming logs and progress.
+
+    This function handles incremental operations (diarize_only, transcribe_only, voices_only)
+    in local mode with streaming output:
+    - Creates UI placeholders for status, progress bar, and logs
+    - Makes a streaming POST request to the API
+    - Updates progress and logs in real-time as data arrives
+    - Returns final result when complete
+
+    Args:
+        ep_id: Episode identifier
+        operation: Operation type (diarize_only, transcribe_only, voices_only)
+        endpoint: API endpoint to call
+        payload: Request payload dict
+        operation_display_name: Human-readable name for display (auto-generated if None)
+
+    Returns:
+        Tuple of (result dict, error message or None)
+    """
+    display_name = operation_display_name or operation.replace("_", " ").title()
+
+    # Create UI placeholders
+    status_placeholder = st.empty()
+
+    # Progress bar section
+    progress_container = st.container()
+    with progress_container:
+        progress_bar = st.progress(0.0)
+        progress_text = st.empty()
+        progress_text.caption(f"Starting {display_name}...")
+
+    # Log section
+    st.markdown("**Detailed Log:**")
+    log_placeholder = st.empty()
+
+    status_placeholder.info(f"⏳ [LOCAL MODE] Running {display_name} for {ep_id}...")
+    log_lines: List[str] = []
+    log_placeholder.code(
+        f"[LOCAL MODE] Starting {display_name} for {ep_id}...\n"
+        "Waiting for live logs...",
+        language="text",
+    )
+
+    start_time = time.time()
+
+    try:
+        # Streaming request - reads lines as they arrive
+        with requests.post(
+            f"{_api_base()}{endpoint}",
+            json=payload,
+            stream=True,
+            timeout=None,  # No timeout - operations can take a long time
+        ) as resp:
+            resp.raise_for_status()
+
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+
+                try:
+                    msg = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    # Treat non-JSON lines as plain log lines
+                    log_lines.append(raw_line)
+                    log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    continue
+
+                msg_type = msg.get("type", "")
+
+                # Handle log messages
+                if msg_type == "log":
+                    line = msg.get("line", "")
+                    if line:
+                        log_lines.append(line)
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    continue
+
+                # Handle error type
+                if msg_type == "error":
+                    error_msg = msg.get("message", "Unknown error")
+                    elapsed_secs = time.time() - start_time
+                    elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+                    log_lines.append(f"ERROR: {error_msg}")
+                    log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    status_placeholder.error(f"❌ [LOCAL MODE] {display_name} failed: {error_msg}")
+                    progress_text.caption(f"❌ Failed after {elapsed_str}")
+                    return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
+
+                # Handle summary message (completion/error)
+                if msg_type == "summary":
+                    status = msg.get("status", "")
+                    elapsed_secs = time.time() - start_time
+                    elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+
+                    if status in ("completed", "success", "succeeded"):
+                        progress_bar.progress(1.0)
+                        completion_msg = f"{display_name} completed in {elapsed_str}"
+                        log_lines.append(f"✅ {completion_msg}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                        progress_text.caption(f"**100%** - {completion_msg}")
+                        status_placeholder.success(f"✅ [LOCAL MODE] {completion_msg}")
+                        append_audio_run_history(ep_id, operation, "succeeded", start_time, time.time(), log_lines)
+                        return {"status": "succeeded", "logs": log_lines, "elapsed_seconds": elapsed_secs}, None
+                    else:
+                        error_msg = msg.get("error", "Unknown error")
+                        log_lines.append(f"ERROR: {error_msg}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                        status_placeholder.error(f"❌ [LOCAL MODE] {display_name} failed: {error_msg}")
+                        progress_text.caption(f"❌ Failed after {elapsed_str}")
+                        append_audio_run_history(ep_id, operation, "error", start_time, time.time(), log_lines)
+                        return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
+
+                # Handle progress messages (phase-based from audio_pipeline_run.py)
+                phase = msg.get("phase", "")
+                progress = msg.get("progress", 0)
+                message = msg.get("message", "")
+                step_name = msg.get("step_name", phase)
+
+                if phase == "error":
+                    error_msg = message or "Unknown error"
+                    elapsed_secs = time.time() - start_time
+                    elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+                    log_lines.append(f"ERROR: {error_msg}")
+                    log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    status_placeholder.error(f"❌ [LOCAL MODE] {display_name} failed: {error_msg}")
+                    progress_text.caption(f"❌ Failed after {elapsed_str}")
+                    append_audio_run_history(ep_id, operation, "error", start_time, time.time(), log_lines)
+                    return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
+
+                if phase == "complete":
+                    elapsed_secs = time.time() - start_time
+                    elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+                    progress_bar.progress(1.0)
+                    completion_msg = message or f"{display_name} completed"
+                    log_lines.append(f"✅ {completion_msg}")
+                    log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    progress_text.caption(f"**100%** - {completion_msg} ({elapsed_str})")
+                    status_placeholder.success(f"✅ [LOCAL MODE] {completion_msg}")
+                    append_audio_run_history(ep_id, operation, "succeeded", start_time, time.time(), log_lines)
+                    return {"status": "succeeded", "logs": log_lines, "elapsed_seconds": elapsed_secs, **msg}, None
+
+                # Update progress bar and text
+                if phase:
+                    pct = progress * 100 if progress <= 1 else progress
+                    progress_bar.progress(min(progress, 0.99))
+
+                    elapsed_secs = time.time() - start_time
+                    elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+
+                    progress_text.caption(f"**{pct:.1f}%** - {step_name or phase}: {message or 'Working...'} ({elapsed_str})")
+                    if message:
+                        log_lines.append(f"[{elapsed_str}] {message}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+
+            # Stream ended unexpectedly (no completion message)
+            elapsed_secs = time.time() - start_time
+            elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+
+            # Check if it was actually successful (sometimes stream just ends)
+            if progress_bar._delta_generator._cursor.index > 0:  # Progress was made
+                log_lines.append(f"Stream ended after {elapsed_str}")
+                log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                status_placeholder.warning(f"⚠️ [LOCAL MODE] {display_name} stream ended. Check results manually.")
+                append_audio_run_history(ep_id, operation, "unknown", start_time, time.time(), log_lines)
+                return {"status": "unknown", "logs": log_lines, "elapsed_seconds": elapsed_secs}, None
+
+            warn_msg = f"{display_name} stream ended unexpectedly"
+            status_placeholder.warning(warn_msg)
+            log_lines.append(f"WARNING: {warn_msg}")
+            log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+            append_audio_run_history(ep_id, operation, "unknown", start_time, time.time(), log_lines)
+            return {"status": "unknown", "logs": log_lines, "elapsed_seconds": elapsed_secs}, warn_msg
+
+    except requests.RequestException as exc:
+        elapsed_secs = time.time() - start_time
+        err = describe_error(f"{_api_base()}{endpoint}", exc)
+        status_placeholder.error(f"❌ {err}")
+        log_lines.append(f"ERROR: {err}")
+        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+        append_audio_run_history(ep_id, operation, "error", start_time, time.time(), log_lines)
+        return None, err
 
 
 def track_skeleton_html(num_frames: int = 12, thumb_width: int = 120) -> str:

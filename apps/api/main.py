@@ -56,6 +56,7 @@ app.include_router(grouping.router, tags=["grouping"])
 app.include_router(metadata.router)
 app.include_router(archive.router, tags=["archive"])
 app.include_router(audio.router, tags=["audio"])
+app.include_router(audio.edit_router, tags=["audio"])
 
 # Celery is optional in local dev; guard the import so /healthz stays alive even if
 # celery[redis] is not installed. Expose a 503 stub so callers see a clear error.
@@ -86,6 +87,61 @@ else:
         raise HTTPException(status_code=503, detail=_celery_detail)
 
     app.include_router(celery_disabled)
+
+
+@app.on_event("startup")
+async def _cleanup_stale_jobs() -> None:
+    """Clean up stale audio pipeline locks and progress files on startup.
+
+    When the API/worker crashes or restarts, locks can be left in Redis and
+    progress files can show stale "running" state. This clears them so new
+    jobs can start fresh.
+    """
+    import os
+    import json
+    from pathlib import Path
+
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+    manifests_dir = data_root / "manifests"
+
+    # Mark all in-progress audio_progress.json files as stale
+    if manifests_dir.exists():
+        for ep_dir in manifests_dir.iterdir():
+            if not ep_dir.is_dir():
+                continue
+            progress_file = ep_dir / "audio_progress.json"
+            if progress_file.exists():
+                try:
+                    data = json.loads(progress_file.read_text(encoding="utf-8"))
+                    status = str(data.get("status", "")).lower()
+                    # If it was "running" or missing status, mark as stale
+                    if status not in {"completed", "complete", "succeeded", "error", "failed", "cancelled", "stale"}:
+                        data["status"] = "stale"
+                        data["message"] = "Marked stale on API restart"
+                        progress_file.write_text(json.dumps(data), encoding="utf-8")
+                        LOGGER.info(f"Marked stale progress file: {progress_file}")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to check progress file {progress_file}: {e}")
+
+    # Clear audio pipeline locks from Redis
+    try:
+        from apps.api.tasks import _get_redis
+        r = _get_redis()
+        # Find all audio_pipeline lock keys
+        lock_pattern = "screanalytics:job_lock:*:audio_pipeline"
+        cursor = 0
+        cleared = 0
+        while True:
+            cursor, keys = r.scan(cursor=cursor, match=lock_pattern, count=100)
+            for key in keys:
+                r.delete(key)
+                cleared += 1
+            if cursor == 0:
+                break
+        if cleared > 0:
+            LOGGER.info(f"Cleared {cleared} stale audio pipeline locks from Redis")
+    except Exception as e:
+        LOGGER.warning(f"Failed to clear stale locks from Redis: {e}")
 
 
 @app.on_event("startup")

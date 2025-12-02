@@ -105,13 +105,16 @@ def _get_audio_paths(ep_id: str, data_root: Optional[Path] = None) -> dict:
         "diarization": manifests_dir / "audio_diarization.jsonl",
         "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
         "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
+        "diarization_combined": manifests_dir / "audio_diarization_combined.jsonl",
         "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
         "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
         "voice_clusters": manifests_dir / "audio_voice_clusters.json",
+        "voice_clusters_gpt4o": manifests_dir / "audio_voice_clusters_gpt4o.json",
         "voice_mapping": manifests_dir / "audio_voice_mapping.json",
         "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
         "qc": manifests_dir / "audio_qc.json",
+        "speaker_groups": manifests_dir / "audio_speaker_groups.json",
     }
 
 
@@ -180,6 +183,27 @@ def _save_diarization_comparison(
             "gpt4o_first_5": [
                 {"start": s.start, "end": s.end, "speaker": s.speaker, "text": s.text[:100] if hasattr(s, 'text') else ""}
                 for s in gpt4o_segments[:5]
+            ],
+        },
+        # Full segment lists for downstream UI/flagging
+        "segments": {
+            "pyannote": [
+                {
+                    "start": s.start,
+                    "end": s.end,
+                    "speaker": s.speaker,
+                }
+                for s in pyannote_segments
+            ],
+            "gpt4o": [
+                {
+                    "segment_id": f"gpt4o_{i+1:04d}",
+                    "start": s.start,
+                    "end": s.end,
+                    "speaker": getattr(s, "speaker", None),
+                    "raw_text": getattr(s, "text", None)[:400] if getattr(s, "text", None) else None,
+                }
+                for i, s in enumerate(gpt4o_segments)
             ],
         },
     }
@@ -334,6 +358,7 @@ def run_episode_audio_pipeline(
 
         # 4b: Run GPT-4o diarization (unified transcription + diarization)
         _update_progress("diarize", 0.5, "Running GPT-4o diarization...")
+        gpt4o_diar_segments = []
         try:
             from .asr_openai import transcribe_with_diarization, check_api_available
 
@@ -345,6 +370,20 @@ def run_episode_audio_pipeline(
                 )
                 gpt4o_speakers = len(set(s.speaker for s in gpt4o_segments if s.speaker))
                 LOGGER.info(f"GPT-4o diarization: {len(gpt4o_segments)} segments, {gpt4o_speakers} speakers")
+                # Convert GPT-4o diarization segments to DiarizationSegment for downstream use
+                from .models import DiarizationSegment
+                for seg in gpt4o_segments:
+                    if seg.start is None or seg.end is None:
+                        continue
+                    if seg.end <= seg.start:
+                        continue
+                    speaker_label = seg.speaker or "GPT4O_SPK"
+                    gpt4o_diar_segments.append(DiarizationSegment(
+                        start=float(seg.start),
+                        end=float(seg.end),
+                        speaker=speaker_label,
+                        confidence=seg.confidence,
+                    ))
             else:
                 LOGGER.warning("OpenAI API not available, skipping GPT-4o diarization")
                 gpt4o_segments = []
@@ -360,12 +399,38 @@ def run_episode_audio_pipeline(
             paths["diarization_comparison"],
         )
 
-        # Use pyannote as primary for now (copy to standard diarization path)
+        # Use pyannote as primary manifest, but create a combined manifest for clustering (pyannote + GPT-4o)
         import shutil
         if paths["diarization_pyannote"].exists():
             shutil.copy(paths["diarization_pyannote"], paths["diarization"])
+        result.manifest_artifacts.diarization_pyannote = paths["diarization_pyannote"]
+        clustering_segments = pyannote_segments
+        if gpt4o_diar_segments:
+            try:
+                from .diarization_pyannote import _save_diarization_manifest
+                clustering_segments = pyannote_segments + gpt4o_diar_segments
+                _save_diarization_manifest(clustering_segments, paths["diarization_combined"])
+                result.manifest_artifacts.diarization_gpt4o = paths["diarization_gpt4o"]
+            except Exception as err:
+                LOGGER.warning(f"Failed to save combined diarization manifest: {err}")
+                clustering_segments = pyannote_segments
         diarization_segments = pyannote_segments
         result.manifest_artifacts.diarization = paths["diarization"]
+
+        # 4d: Build speaker groups manifest (primary surface for UI)
+        from .speaker_groups import build_speaker_groups_manifest
+
+        speaker_group_sources = {"pyannote": pyannote_segments}
+        if gpt4o_diar_segments:
+            speaker_group_sources["gpt4o"] = gpt4o_diar_segments
+
+        speaker_groups_manifest = build_speaker_groups_manifest(
+            ep_id,
+            speaker_group_sources,
+            paths["speaker_groups"],
+            overwrite=overwrite,
+        )
+        result.manifest_artifacts.speaker_groups = paths["speaker_groups"]
 
         _update_progress("diarize", 1.0, f"Dual diarization complete: pyannote={len(pyannote_segments)}, gpt4o={len(gpt4o_segments)}")
 
@@ -377,12 +442,24 @@ def run_episode_audio_pipeline(
 
         voice_clusters = cluster_episode_voices(
             vocals_path,  # Use separated vocals for voice embedding extraction
-            diarization_segments,
+            clustering_segments,
             paths["voice_clusters"],
             config.voice_clustering,
             overwrite=overwrite,
+            speaker_groups_manifest=speaker_groups_manifest,
         )
         result.manifest_artifacts.voice_clusters = paths["voice_clusters"]
+
+        # Also produce GPT-4o-only clusters (one per diarization label) when available for diagnostics
+        if gpt4o_diar_segments:
+            try:
+                from .voice_clusters import _clusters_from_diarization_labels, _save_voice_clusters
+
+                gpt4o_clusters = _clusters_from_diarization_labels(gpt4o_diar_segments)
+                _save_voice_clusters(gpt4o_clusters, paths["voice_clusters_gpt4o"])
+                LOGGER.info(f"Saved GPT-4o-only clusters: {len(gpt4o_clusters)}")
+            except Exception as err:
+                LOGGER.warning(f"Failed to build GPT-4o-only clusters: {err}")
 
         _update_progress("voices", 0.5, f"Found {len(voice_clusters)} voice clusters")
 
@@ -434,14 +511,27 @@ def run_episode_audio_pipeline(
             asr_segments,
             voice_clusters,
             voice_mapping,
+            speaker_groups_manifest,
             paths["transcript_jsonl"],
             paths["transcript_vtt"],
             config.export.vtt_include_speaker_notes,
             overwrite=overwrite,
+            diarization_source="pyannote",
         )
         result.manifest_artifacts.transcript_jsonl = paths["transcript_jsonl"]
         result.manifest_artifacts.transcript_vtt = paths["transcript_vtt"]
         result.transcript_row_count = len(transcript_rows)
+
+        # Enrich diarization comparison with canonical text + mixed-speaker flags
+        try:
+            from .diarization_comparison import augment_diarization_comparison
+
+            augment_diarization_comparison(
+                paths["diarization_comparison"],
+                paths["transcript_jsonl"],
+            )
+        except Exception as exc:
+            LOGGER.warning(f"Failed to augment diarization comparison: {exc}")
 
         _update_progress("fuse", 1.0, f"Transcript generated: {len(transcript_rows)} rows")
 
@@ -617,6 +707,7 @@ def sync_audio_artifacts_to_s3(
         "audio": {},
         "transcripts": {},
         "qc": {},
+        "diagnostics": {},
     }
 
     # Upload audio files
@@ -648,12 +739,19 @@ def sync_audio_artifacts_to_s3(
         ("qc", result.manifest_artifacts.qc, f"{base_name}_audio_qc.json"),
         ("voice_clusters", result.manifest_artifacts.voice_clusters, f"{base_name}_audio_voice_clusters.json"),
         ("voice_mapping", result.manifest_artifacts.voice_mapping, f"{base_name}_audio_voice_mapping.json"),
+        ("speaker_groups", result.manifest_artifacts.speaker_groups, f"{base_name}_audio_speaker_groups.json"),
     ]
 
     for key, path, s3_name in qc_files:
         if path and path.exists():
             ok = STORAGE.put_artifact(ep_ctx, "audio_qc", path, s3_name)
             upload_status["qc"][key] = ok
+
+    # Upload diagnostic GPT-4o-only clusters if present
+    diag_path = paths.get("voice_clusters_gpt4o")
+    if diag_path and diag_path.exists():
+        ok = STORAGE.put_artifact(ep_ctx, "audio_qc", diag_path, f"{base_name}_audio_voice_clusters_gpt4o.json")
+        upload_status["diagnostics"]["voice_clusters_gpt4o"] = ok
 
     LOGGER.info(f"S3 sync complete for {ep_id}: {upload_status}")
     upload_status["status"] = "ok"

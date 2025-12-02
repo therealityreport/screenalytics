@@ -139,6 +139,10 @@ class LogFormatter:
         re.compile(r'^cpu_threads=\d+$'),  # cpu_threads=2 (standalone)
         re.compile(r'^save_crops='),  # save_crops=True, save_frames=False
         re.compile(r'^total_frames=\d+$'),  # total_frames=61494 (standalone)
+        # Demucs/MDX library noise - printed by BagOfModels.__repr__ during loading
+        re.compile(r'^Call apply_model on this', re.IGNORECASE),  # Demucs BagOfModels repr
+        re.compile(r'^BagOfModels\(', re.IGNORECASE),  # Demucs model repr
+        re.compile(r'^<demucs\.', re.IGNORECASE),  # Demucs internal repr
     ]
 
     # Pattern for warnings.warn( which appears as a standalone line

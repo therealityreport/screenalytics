@@ -189,10 +189,17 @@ fi
 
 # ============================================================================
 # Celery Worker (Phase 2 - Background Jobs)
+# Use explicit queues so audio tasks are consumed; allow override via env
 # ============================================================================
+CELERY_QUEUES="${CELERY_QUEUES:-SCREENALYTICS_AUDIO_PIPELINE,SCREENALYTICS_AUDIO_INGEST,SCREENALYTICS_AUDIO_SEPARATE,SCREENALYTICS_AUDIO_ENHANCE,SCREENALYTICS_AUDIO_DIARIZE,SCREENALYTICS_AUDIO_TRANSCRIBE,SCREENALYTICS_AUDIO_VOICES,SCREENALYTICS_AUDIO_ALIGN,SCREENALYTICS_AUDIO_QC,SCREENALYTICS_AUDIO_EXPORT,celery}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-2}"
+
+# Use unique hostname to avoid Celery naming collisions with stale Redis entries
+CELERY_HOSTNAME="celery_audio@%h"
+
 if [[ "$OPEN_IN_TERMINALS" == "true" ]]; then
     echo "[dev_auto] Starting Celery worker in new Terminal window..."
-    CELERY_CMD="source '$ROOT/.venv/bin/activate' && python -m celery -A apps.api.celery_app:celery_app worker --loglevel=info --concurrency=2"
+    CELERY_CMD="source '$ROOT/.venv/bin/activate' && python -m celery -A apps.api.celery_app:celery_app worker --loglevel=info --concurrency=$CELERY_CONCURRENCY --queues=$CELERY_QUEUES --hostname=$CELERY_HOSTNAME"
     if open_in_terminal "Celery Worker" "$CELERY_CMD"; then
         echo "[dev_auto] Celery worker started (in separate Terminal)"
         # We don't have a PID for the external terminal process
@@ -201,7 +208,9 @@ if [[ "$OPEN_IN_TERMINALS" == "true" ]]; then
         echo "[dev_auto] Could not open Terminal, starting Celery in background..."
         "$PYTHON" -m celery -A apps.api.celery_app:celery_app worker \
             --loglevel=info \
-            --concurrency=2 \
+            --concurrency="$CELERY_CONCURRENCY" \
+            --queues="$CELERY_QUEUES" \
+            --hostname="$CELERY_HOSTNAME" \
             >> "$CELERY_LOG" 2>&1 &
         CELERY_PID=$!
         echo "[dev_auto] Celery worker started (PID: $CELERY_PID, log: $CELERY_LOG)"
@@ -210,7 +219,9 @@ else
     echo "[dev_auto] Starting Celery worker..."
     "$PYTHON" -m celery -A apps.api.celery_app:celery_app worker \
         --loglevel=info \
-        --concurrency=2 \
+        --concurrency="$CELERY_CONCURRENCY" \
+        --queues="$CELERY_QUEUES" \
+        --hostname="$CELERY_HOSTNAME" \
         >> "$CELERY_LOG" 2>&1 &
     CELERY_PID=$!
     echo "[dev_auto] Celery worker started (PID: $CELERY_PID, log: $CELERY_LOG)"

@@ -32,8 +32,9 @@ audio_pipeline:
     min_speech: 0.2                  # Minimum speech duration (seconds)
     max_overlap: 0.1                 # Maximum allowed overlap ratio
     merge_gap_ms: 300                # Gap threshold for merging segments
-    min_speakers: 1
-    max_speakers: 10
+    min_speakers: 1                  # HINT: minimum expected speakers
+    max_speakers: 20                 # HINT: maximum expected (safe upper bound for reality TV)
+    # num_speakers: null             # FORCE exact count (uncomment to override min/max)
 
   # Automatic speech recognition settings
   asr:
@@ -49,8 +50,8 @@ audio_pipeline:
 
   # Voice clustering and bank settings
   voice_clustering:
-    similarity_threshold: 0.78       # Cosine similarity for matching to voice bank
-    min_segments_per_cluster: 2      # Minimum segments to form a cluster
+    similarity_threshold: 0.30       # Cosine similarity for clustering (higher = fewer clusters)
+    min_segments_per_cluster: 1      # Allow single-segment clusters for trailers/short content
     embedding_model: "pyannote/embedding"
     centroid_method: "mean"          # "mean" | "median"
 

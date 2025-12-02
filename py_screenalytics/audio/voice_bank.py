@@ -38,6 +38,7 @@ class VoiceBank:
         self.config = config or VoiceBankConfig()
         self.data_dir = Path(self.config.data_dir)
         self._entries_cache: Dict[str, List[VoiceBankEntry]] = {}
+        self._centroids_cache: Dict[str, List[tuple]] = {}  # show_id -> [(entry, normalized_centroid), ...]
 
     def get_entries(self, show_id: str) -> List[VoiceBankEntry]:
         """Get all voice bank entries for a show.
@@ -53,7 +54,38 @@ class VoiceBank:
 
         entries = self._load_bank(show_id)
         self._entries_cache[show_id] = entries
+        # Invalidate centroids cache when entries change
+        self._centroids_cache.pop(show_id, None)
         return entries
+
+    def _get_entry_centroids(self, show_id: str) -> List[tuple]:
+        """Get precomputed centroids for voice bank entries.
+
+        Args:
+            show_id: Show identifier
+
+        Returns:
+            List of (entry, normalized_centroid) tuples
+        """
+        if show_id in self._centroids_cache:
+            return self._centroids_cache[show_id]
+
+        entries = self.get_entries(show_id)
+        centroids = []
+
+        for entry in entries:
+            if not entry.embeddings:
+                continue
+
+            # Precompute and normalize centroid
+            entry_centroid = np.mean(entry.embeddings, axis=0)
+            norm = np.linalg.norm(entry_centroid)
+            if norm > 0:
+                entry_centroid = entry_centroid / norm
+                centroids.append((entry, entry_centroid))
+
+        self._centroids_cache[show_id] = centroids
+        return centroids
 
     def add_entry(self, entry: VoiceBankEntry, show_id: str) -> VoiceBankEntry:
         """Add an entry to the voice bank.
@@ -75,6 +107,8 @@ class VoiceBank:
 
         entries.append(entry)
         self._save_bank(show_id, entries)
+        # Invalidate centroids cache when entries change
+        self._centroids_cache.pop(show_id, None)
 
         return entry
 
@@ -99,21 +133,14 @@ class VoiceBank:
 
         cluster_embedding = np.array(cluster.centroid)
 
-        entries = self.get_entries(show_id)
+        # Use cached centroids for efficient matching
+        entry_centroids = self._get_entry_centroids(show_id)
 
         best_match: Optional[VoiceBankEntry] = None
         best_similarity = 0.0
 
-        for entry in entries:
-            if not entry.embeddings:
-                continue
-
-            # Compute similarity with entry's embeddings
-            entry_centroid = np.mean(entry.embeddings, axis=0)
-            norm = np.linalg.norm(entry_centroid)
-            if norm > 0:
-                entry_centroid = entry_centroid / norm
-
+        for entry, entry_centroid in entry_centroids:
+            # Use precomputed normalized centroids for efficient matching
             similarity = float(np.dot(cluster_embedding, entry_centroid))
 
             if similarity > best_similarity:

@@ -188,30 +188,50 @@ Cleaned transcript:"""
 
 def _parse_gemini_response(response_text: str) -> List[ASRSegment]:
     """Parse Gemini API response into ASRSegment objects."""
+    import re
+
     # Try to extract JSON from response
     text = response_text.strip()
 
-    # Handle markdown code blocks
-    if "```json" in text:
-        start = text.index("```json") + 7
-        end = text.index("```", start)
-        text = text[start:end].strip()
-    elif "```" in text:
-        start = text.index("```") + 3
-        end = text.index("```", start)
-        text = text[start:end].strip()
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # Try to find JSON object in response
-        import re
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            data = json.loads(match.group())
+    # Handle markdown code blocks - use regex for robustness
+    # Match ```json or ``` followed by content and ending ```
+    code_block_pattern = r'```(?:json)?\s*([\s\S]*?)```'
+    code_matches = re.findall(code_block_pattern, text)
+    if code_matches:
+        # Use the first code block that contains valid JSON
+        for match in code_matches:
+            try:
+                data = json.loads(match.strip())
+                break
+            except json.JSONDecodeError:
+                continue
         else:
-            LOGGER.error(f"Could not parse Gemini response: {text[:200]}...")
-            return []
+            # None of the code blocks were valid JSON, try the full text
+            data = None
+    else:
+        data = None
+
+    if data is None:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            # Try to find JSON object/array in response (non-greedy for nested objects)
+            # Look for both object {...} and array [...]
+            json_patterns = [
+                r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',  # Simple nested object
+                r'\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]',  # Simple nested array
+            ]
+            for pattern in json_patterns:
+                match = re.search(pattern, text)
+                if match:
+                    try:
+                        data = json.loads(match.group())
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            else:
+                LOGGER.error(f"Could not parse Gemini response: {text[:200]}...")
+                return []
 
     segments = []
     raw_segments = data.get("segments", [data]) if isinstance(data, dict) else data

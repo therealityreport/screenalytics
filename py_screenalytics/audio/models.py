@@ -52,7 +52,12 @@ class EnhanceConfig(BaseModel):
 
 
 class DiarizationConfig(BaseModel):
-    """Configuration for speaker diarization."""
+    """Configuration for speaker diarization.
+
+    Note: min_speakers/max_speakers are HINTS, not guarantees. Pyannote may still
+    detect fewer speakers if it determines they are similar. Use num_speakers to
+    force a specific count when you know it ahead of time.
+    """
     model_config = {"protected_namespaces": ()}
     provider: str = "pyannote"
     model_name: str = "pyannote/speaker-diarization-3.1"
@@ -60,19 +65,32 @@ class DiarizationConfig(BaseModel):
     max_overlap: float = 0.1
     merge_gap_ms: int = 300
     min_speakers: int = 1
-    max_speakers: int = 10
+    max_speakers: int = 20  # Safe upper bound for reality TV
+    # Force exact speaker count (overrides min/max if set)
+    num_speakers: Optional[int] = None
 
 
 class ASRConfig(BaseModel):
-    """Configuration for automatic speech recognition."""
+    """Configuration for automatic speech recognition.
+
+    OpenAI model options:
+    - whisper-1: Legacy model, supports word timestamps
+    - gpt-4o-transcribe: Higher quality, no word timestamps
+    - gpt-4o-mini-transcribe: Faster, good quality, no word timestamps
+    - gpt-4o-transcribe-diarize: Includes speaker diarization (can replace pyannote)
+    """
     provider: str = "openai_whisper"
-    model: str = "whisper-1"
+    model: str = "gpt-4o-transcribe"  # Default to higher quality model
     language: str = "en"
-    enable_word_timestamps: bool = True
+    enable_word_timestamps: bool = True  # Only works with whisper-1
     chunk_duration_seconds: int = 30
     temperature: float = 0.0
     gemini_model: str = "gemini-2.0-flash-exp"
     gemini_use_for_cleanup: bool = True
+    # For gpt-4o-transcribe-diarize: use known speaker references
+    use_diarization_model: bool = False  # Set True to use gpt-4o-transcribe-diarize
+    known_speaker_names: List[str] = Field(default_factory=list)
+    known_speaker_audio_paths: List[str] = Field(default_factory=list)
 
 
 class VoiceClusteringConfig(BaseModel):
@@ -147,6 +165,65 @@ class DiarizationSegment(BaseModel):
 
 
 # ============================================================================
+# Speaker Group Models
+# ============================================================================
+
+
+class SpeakerSegment(BaseModel):
+    """A diarization segment belonging to a speaker group."""
+    segment_id: str = Field(..., description="Stable segment identifier")
+    start: float = Field(..., description="Start time in seconds")
+    end: float = Field(..., description="End time in seconds")
+
+
+class SpeakerGroup(BaseModel):
+    """Collection of segments from a diarization speaker."""
+    speaker_label: str = Field(..., description="Original diarization speaker label")
+    speaker_group_id: str = Field(..., description="Unique group identifier (source-prefixed)")
+    total_duration: float = Field(0.0, description="Total duration of all segments in seconds")
+    segment_count: int = Field(0, description="Number of segments")
+    segments: List[SpeakerSegment] = Field(default_factory=list)
+    centroid: Optional[List[float]] = Field(None, description="Optional embedding centroid for the group")
+
+
+class SpeakerSourceSummary(BaseModel):
+    """Summary statistics for a diarization source."""
+    speakers: int = 0
+    segments: int = 0
+    speech_seconds: float = 0.0
+
+
+class SpeakerGroupSource(BaseModel):
+    """Speaker groups for a diarization source (e.g., pyannote, gpt4o)."""
+    source: str
+    summary: SpeakerSourceSummary
+    speakers: List[SpeakerGroup] = Field(default_factory=list)
+
+
+class AudioSpeakerGroupsManifest(BaseModel):
+    """Manifest of speaker groups per diarization source."""
+    ep_id: str
+    schema_version: str = "audio_sg_v1"
+    sources: List[SpeakerGroupSource] = Field(default_factory=list)
+
+
+class SmartSplitSegment(BaseModel):
+    """Resulting segment from a smart split operation."""
+    segment_id: str
+    start: float
+    end: float
+    speaker_group_id: str
+
+
+class SmartSplitResult(BaseModel):
+    """Smart split response payload."""
+    ep_id: str
+    source: str
+    original_segment_id: str
+    new_segments: List[SmartSplitSegment]
+
+
+# ============================================================================
 # ASR Models
 # ============================================================================
 
@@ -166,6 +243,7 @@ class ASRSegment(BaseModel):
     confidence: Optional[float] = Field(None, description="ASR confidence score")
     words: Optional[List[WordTiming]] = Field(None, description="Word-level timings")
     language: Optional[str] = Field(None, description="Detected language")
+    speaker: Optional[str] = Field(None, description="Speaker label (from gpt-4o-transcribe-diarize)")
 
 
 # ============================================================================
@@ -178,12 +256,23 @@ class VoiceClusterSegment(BaseModel):
     start: float
     end: float
     diar_speaker: str
+    speaker_group_id: Optional[str] = Field(None, description="Speaker group identifier for the segment")
+
+
+class VoiceClusterSourceGroup(BaseModel):
+    """A speaker group contributing to a voice cluster."""
+    source: str
+    speaker_group_id: str
+    speaker_label: Optional[str] = None
+    centroid: Optional[List[float]] = None
 
 
 class VoiceCluster(BaseModel):
     """A voice cluster representing a unique voice within an episode."""
     voice_cluster_id: str = Field(..., description="Cluster ID (e.g., VC_01)")
     segments: List[VoiceClusterSegment] = Field(default_factory=list)
+    sources: List[VoiceClusterSourceGroup] = Field(default_factory=list)
+    speaker_group_ids: List[str] = Field(default_factory=list, description="Speaker groups mapped to this cluster")
     total_duration: float = Field(0.0, description="Total speech duration")
     segment_count: int = Field(0, description="Number of segments")
     centroid: Optional[List[float]] = Field(None, description="Centroid embedding")
@@ -280,6 +369,9 @@ class AudioArtifacts:
 class ManifestArtifacts:
     """Paths to manifest artifacts."""
     diarization: Optional[Path] = None
+    diarization_pyannote: Optional[Path] = None
+    diarization_gpt4o: Optional[Path] = None
+    speaker_groups: Optional[Path] = None
     asr_raw: Optional[Path] = None
     voice_clusters: Optional[Path] = None
     voice_mapping: Optional[Path] = None
@@ -319,6 +411,9 @@ class AudioPipelineResult:
             },
             "manifest_artifacts": {
                 "diarization": str(self.manifest_artifacts.diarization) if self.manifest_artifacts.diarization else None,
+                "diarization_pyannote": str(self.manifest_artifacts.diarization_pyannote) if self.manifest_artifacts.diarization_pyannote else None,
+                "diarization_gpt4o": str(self.manifest_artifacts.diarization_gpt4o) if self.manifest_artifacts.diarization_gpt4o else None,
+                "speaker_groups": str(self.manifest_artifacts.speaker_groups) if self.manifest_artifacts.speaker_groups else None,
                 "asr_raw": str(self.manifest_artifacts.asr_raw) if self.manifest_artifacts.asr_raw else None,
                 "voice_clusters": str(self.manifest_artifacts.voice_clusters) if self.manifest_artifacts.voice_clusters else None,
                 "voice_mapping": str(self.manifest_artifacts.voice_mapping) if self.manifest_artifacts.voice_mapping else None,
