@@ -31,7 +31,7 @@ Group=screenalytics
 WorkingDirectory=/opt/screenalytics
 
 # Load environment variables from .env file
-EnvironmentFile=/opt/screanalytics/.env
+EnvironmentFile=/opt/screenalytics/.env
 
 # Run uvicorn binding to localhost only (nginx handles external traffic)
 ExecStart=/opt/screenalytics/.venv/bin/uvicorn apps.api.main:app \

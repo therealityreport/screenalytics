@@ -30,7 +30,7 @@ sudo apt install -y python3.11 python3.11-venv redis-server nginx certbot python
 # Create application user
 sudo useradd -m -s /bin/bash screenalytics
 sudo mkdir -p /opt/screenalytics
-sudo chown screenalytics:screenalytics /opt/screanalytics
+sudo chown screenalytics:screenalytics /opt/screenalytics
 
 # Clone repo and setup virtualenv
 sudo -u screenalytics git clone <repo-url> /opt/screenalytics
@@ -52,7 +52,7 @@ sudo cp infra/systemd/screenalytics-worker.service /etc/systemd/system/
 
 # Reload systemd and enable services
 sudo systemctl daemon-reload
-sudo systemctl enable screenalytics-api screanalytics-worker
+sudo systemctl enable screenalytics-api screenalytics-worker
 sudo systemctl start screenalytics-api screenalytics-worker
 
 # Check status
