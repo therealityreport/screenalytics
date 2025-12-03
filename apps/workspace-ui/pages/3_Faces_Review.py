@@ -85,7 +85,7 @@ VIEW_NAMES = {
 # Operator docs entry points; env overrides allow pointing at an internal wiki.
 FACES_REVIEW_GUIDE_URL = os.environ.get(
     "SCREENALYTICS_FACES_REVIEW_GUIDE_URL",
-    "http://127.0.0.1:8505/Faces_Review/Docs",
+    "/Faces_Review_Docs",  # Local page with full metrics documentation
 )
 FACES_REVIEW_GUIDE_FALLBACK = os.environ.get(
     "SCREENALYTICS_FACES_REVIEW_GUIDE_FALLBACK",

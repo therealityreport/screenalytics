@@ -99,6 +99,32 @@ LOCAL_MODE_INSTRUMENTATION = os.environ.get("LOCAL_MODE_INSTRUMENTATION", "").lo
 _APPLE_SILICON = sys.platform == "darwin" and platform.machine().lower().startswith(("arm", "aarch64"))
 APPLE_SILICON_HOST = _APPLE_SILICON
 
+# Performance profile defaults used when --profile is provided and a value is missing
+PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "low_power": {
+        "frame_stride": 8,
+        "detection_fps_limit": 8.0,
+        "coreml_input_size": 384,
+        "save_frames": False,
+        "save_crops": False,
+    },
+    "balanced": {
+        "frame_stride": 5,
+        "detection_fps_limit": 24.0,
+        "coreml_input_size": 480,
+        "save_frames": False,
+        "save_crops": False,
+    },
+    "high_accuracy": {
+        "frame_stride": 1,
+        "detection_fps_limit": 30.0,
+        "coreml_input_size": 640,
+        "save_frames": True,
+        "save_crops": True,
+    },
+}
+PROFILE_CHOICES = ("fast_cpu", "low_power", "balanced", "high_accuracy")
+
 
 class PhaseTracker:
     """Track timing and frame counts for each pipeline phase (for local mode diagnostics)."""
@@ -200,6 +226,42 @@ if _APPLE_SILICON and not COREML_PROVIDER_AVAILABLE:
     LOGGER.warning(
         "CoreMLExecutionProvider unavailable on Apple Silicon. Install onnxruntime-coreml to enable CoreML acceleration."
     )
+
+
+def _load_performance_profile(profile_name: str | None) -> Dict[str, Any]:
+    """Load performance profile config from YAML with sensible fallbacks."""
+    if not profile_name:
+        return {}
+    normalized = str(profile_name).strip().lower()
+    if normalized == "fast_cpu":
+        normalized = "low_power"
+
+    config_path = REPO_ROOT / "config" / "pipeline" / "performance_profiles.yaml"
+    loaded_profiles: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            import yaml
+
+            with config_path.open("r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
+                if isinstance(data, dict):
+                    loaded_profiles = data
+        except Exception as exc:  # pragma: no cover - optional dependency
+            LOGGER.warning("Failed to load performance profiles: %s", exc)
+
+    if normalized in loaded_profiles and isinstance(loaded_profiles[normalized], dict):
+        return loaded_profiles[normalized]
+
+    return PROFILE_DEFAULTS.get(normalized, {})
+
+
+def _flag_present(raw_argv: List[str], *flags: str) -> bool:
+    """Check if any of the given flags appear in the raw argv list."""
+    for token in raw_argv:
+        for flag in flags:
+            if token == flag or token.startswith(f"{flag}="):
+                return True
+    return False
 
 
 def _parse_retinaface_det_size(value: str | None) -> tuple[int, int] | None:
@@ -2813,7 +2875,13 @@ def _report_s3_upload(
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(description="Run detection + tracking locally.")
+    parser.add_argument(
+        "--profile",
+        choices=list(PROFILE_CHOICES),
+        help="Performance profile (fast_cpu/low_power/balanced/high_accuracy) to apply default stride/FPS/save options.",
+    )
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
     parser.add_argument(
@@ -3064,7 +3132,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=GATE_EMB_EVERY_DEFAULT,
         help="Frames between gate embeddings (0 uses detect stride)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv_list)
+    args._raw_argv = argv_list
+    return args
 
 
 def _configure_logging(quiet: bool, verbose: bool) -> None:
@@ -3087,6 +3157,32 @@ def _configure_logging(quiet: bool, verbose: bool) -> None:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
+    raw_argv: List[str] = getattr(args, "_raw_argv", [])
+
+    # Apply performance profile defaults when provided (explicit CLI flags win)
+    profile_cfg = _load_performance_profile(args.profile or os.environ.get("SCREENALYTICS_PERF_PROFILE"))
+    if profile_cfg:
+        if not _flag_present(raw_argv, "--stride"):
+            try:
+                args.stride = max(int(profile_cfg.get("frame_stride", args.stride)), 1)
+            except (TypeError, ValueError):
+                pass
+        if not _flag_present(raw_argv, "--fps"):
+            try:
+                fps_value = float(profile_cfg.get("detection_fps_limit") or profile_cfg.get("max_fps") or 0.0)
+            except (TypeError, ValueError):
+                fps_value = 0.0
+            if fps_value > 0:
+                args.fps = fps_value
+        if not _flag_present(raw_argv, "--save-frames") and "save_frames" in profile_cfg:
+            args.save_frames = bool(profile_cfg.get("save_frames"))
+        if not _flag_present(raw_argv, "--save-crops") and "save_crops" in profile_cfg:
+            args.save_crops = bool(profile_cfg.get("save_crops"))
+        if not _flag_present(raw_argv, "--coreml-det-size") and profile_cfg.get("coreml_input_size"):
+            coreml_size = profile_cfg.get("coreml_input_size")
+            if isinstance(coreml_size, (int, float)):
+                coreml_size = f"{int(coreml_size)}x{int(coreml_size)}"
+            args.coreml_det_size = str(coreml_size)
 
     # Configure logging based on --quiet/--verbose flags
     _configure_logging(getattr(args, "quiet", False), getattr(args, "verbose", False))

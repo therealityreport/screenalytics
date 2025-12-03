@@ -2241,6 +2241,23 @@ class GroupingService:
         except FileNotFoundError:
             centroids_map = {}
 
+        # Load track data for face count fallback (track_id -> faces_count)
+        tracks_by_id: Dict[int, int] = {}
+        tracks_path = get_path(ep_id, "tracks")
+        if tracks_path.exists():
+            try:
+                with tracks_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            track = json.loads(line.strip())
+                            tid = track.get("track_id")
+                            if tid is not None:
+                                tracks_by_id[tid] = track.get("faces_count") or 0
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                pass  # Fallback: empty tracks_by_id
+
         entities: Dict[str, Dict[str, Any]] = {}
 
         for identity in identities:
@@ -2273,10 +2290,16 @@ class GroupingService:
             entry["cluster_ids"].append(cluster_id)
             track_ids = identity.get("track_ids", []) or []
             entry["tracks"] += len(track_ids)
-            faces_count = identity.get("size") or 0
-            entry["faces"] += faces_count
 
+            # Get face count: prefer identity.size, fallback to centroids num_faces, then tracks.faces_count
             centroid_meta = centroids_map.get(cluster_id) or {}
+            faces_count = identity.get("size")
+            if faces_count is None:
+                faces_count = centroid_meta.get("num_faces")
+            if faces_count is None:
+                # Final fallback: sum faces_count from track data
+                faces_count = sum(tracks_by_id.get(tid, 0) for tid in track_ids)
+            entry["faces"] += faces_count
             cohesion = centroid_meta.get("cohesion")
             if cohesion is not None:
                 entry["cohesion_sum"] += cohesion

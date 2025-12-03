@@ -4,7 +4,7 @@ This component provides a consistent way to display similarity, quality, and
 cohesion metrics as a compact horizontal strip with tooltips.
 
 Usage:
-    from metrics_strip import render_metrics_strip, MetricData
+    from metrics_strip import render_metrics_strip, MetricData, METRIC_HELP
 
     metrics = [
         MetricData("identity", 0.75, "Identity Similarity"),
@@ -38,6 +38,116 @@ from similarity_badges import (
 )
 
 
+# ============================================================================
+# CENTRALIZED METRIC HELP CONFIGURATION
+# ============================================================================
+# This is the single source of truth for all metric descriptions, thresholds,
+# and help text. Used by both tooltips and documentation pages.
+
+METRIC_HELP: Dict[str, Dict[str, str]] = {
+    "identity": {
+        "title": "Identity Similarity",
+        "emoji": "🆔",
+        "description": "Measures how similar clusters are for an auto-generated person. Higher values indicate the clusters are likely the same person.",
+        "thresholds": "≥75%: Strong match · 70–74%: Good match · <70%: Needs review",
+        "interpretation": "High identity similarity means clusters assigned to this person are visually consistent. Low scores may indicate misassigned clusters.",
+        "where_shown": "Person cards, Cast View, Faces Review",
+    },
+    "cast": {
+        "title": "Cast Similarity",
+        "emoji": "🎭",
+        "description": "How similar this cluster is to the cast member's facebank (reference photos). Used for auto-assignment suggestions.",
+        "thresholds": "≥68%: Auto-assign candidate · 50–67%: Manual review · <50%: Weak match",
+        "interpretation": "The higher the cast similarity, the more confident we are this is the suggested cast member. Below 50% is unlikely to be correct.",
+        "where_shown": "Cluster cards, Smart Suggestions, Cast assignment UI",
+    },
+    "track": {
+        "title": "Track Similarity",
+        "emoji": "🎬",
+        "description": "How consistent the frames within a single track are. Measures frame-to-frame coherence within the same tracking sequence.",
+        "thresholds": "≥85%: Strong consistency · 70–84%: Good · <70%: Weak (possible tracking errors)",
+        "interpretation": "Low track similarity may indicate tracking errors (merged identities) or quality issues. Review tracks below 70%.",
+        "where_shown": "Track cards, Cluster View, Frames View",
+    },
+    "cluster": {
+        "title": "Cluster Cohesion",
+        "emoji": "📦",
+        "description": "How cohesive tracks within a cluster are. Measures whether all tracks in the cluster look like the same person.",
+        "thresholds": "≥80%: Tight cluster · 60–79%: Moderate · <60%: Loose (review for splits)",
+        "interpretation": "A tight cluster has tracks that all look similar. Loose clusters may contain different people and should be reviewed for splitting.",
+        "where_shown": "Cluster cards, Person View, Faces Review",
+    },
+    "person_cohesion": {
+        "title": "Person Cohesion",
+        "emoji": "👤",
+        "description": "How well a track fits with other tracks assigned to the same person. Detects outliers within a person's assignments.",
+        "thresholds": "≥70%: Strong fit · 50–69%: Good fit · <50%: Poor fit (possible misassignment)",
+        "interpretation": "Low person cohesion means this track may not belong with the other tracks. Consider reassigning or reviewing.",
+        "where_shown": "Track View, Person View, Cast member detail",
+    },
+    "fit": {
+        "title": "Person Fit",
+        "emoji": "👤",
+        "description": "Alias for Person Cohesion. How well a track fits with other tracks of the same person.",
+        "thresholds": "≥70%: Strong fit · 50–69%: Good fit · <50%: Poor fit",
+        "interpretation": "Low fit scores indicate potential misassignment.",
+        "where_shown": "Track View",
+    },
+    "temporal": {
+        "title": "Temporal Consistency",
+        "emoji": "⏱️",
+        "description": "How consistent a person's appearance is across different times in the episode. Detects costume changes, lighting variations, or misassignments.",
+        "thresholds": "≥80%: Consistent appearance · 60–79%: Variable (possible costume change) · <60%: Significant changes (review)",
+        "interpretation": "Low temporal consistency may indicate: costume/makeup changes (normal), lighting differences, or incorrectly merged identities.",
+        "where_shown": "Cluster cards, Person View, Cast View",
+    },
+    "ambiguity": {
+        "title": "Ambiguity Score",
+        "emoji": "❓",
+        "description": "The gap between the 1st and 2nd best match. A small gap means the assignment is risky—it could easily be either person.",
+        "thresholds": "≥15%: Clear winner · 8–14%: OK but verify · <8%: Risky (could be either person)",
+        "interpretation": "High ambiguity = clear assignment. LOW ambiguity (small gap) = risky, the 2nd best match is almost as good. Always review risky assignments.",
+        "where_shown": "Cluster cards, Smart Suggestions, Assignment UI",
+    },
+    "isolation": {
+        "title": "Cluster Isolation",
+        "emoji": "🔒",
+        "description": "Distance to the nearest cluster. Indicates how distinct this cluster is from others. Low isolation = potential merge candidate.",
+        "thresholds": "≥40%: Well isolated · 25–39%: Moderate · <25%: Close (merge candidate)",
+        "interpretation": "Clusters with low isolation look very similar to another cluster. Consider merging 'Close' clusters if they're the same person.",
+        "where_shown": "Cluster cards, Person View",
+    },
+    "trend": {
+        "title": "Confidence Trend",
+        "emoji": "📈",
+        "description": "Tracks whether assignment confidence is improving or degrading as more data is added. Early warning for problematic assignments.",
+        "thresholds": "↑ Improving · → Stable · ↓ Degrading (early warning)",
+        "interpretation": "A degrading trend means new evidence is lowering confidence. Investigate before the assignment becomes unreliable.",
+        "where_shown": "Person View, Cast View",
+    },
+    "confidence_trend": {
+        "title": "Confidence Trend",
+        "emoji": "📈",
+        "description": "Tracks whether assignment confidence is improving or degrading as more data is added.",
+        "thresholds": "↑ Improving · → Stable · ↓ Degrading",
+        "interpretation": "A degrading trend means new evidence is lowering confidence.",
+        "where_shown": "Person View, Cast View",
+    },
+    "quality": {
+        "title": "Quality Score",
+        "emoji": "⭐",
+        "description": "Composite score combining Detection confidence, Sharpness (crop standard deviation), and Face Area. Higher = better quality representative.",
+        "thresholds": "≥85%: High quality (green) · 60–84%: Medium (amber) · <60%: Low quality (red)",
+        "interpretation": "Quality affects how reliable face matching is. Low-quality faces may have poor detection, blurry crops, or small face areas.",
+        "breakdown": {
+            "det": "Detection confidence from the face detector (0-1)",
+            "sharp": "Sharpness score from crop standard deviation (higher = sharper)",
+            "area": "Face bounding box area in pixels (larger = more detail)",
+        },
+        "where_shown": "All views with face thumbnails",
+    },
+}
+
 # Metric type to SimilarityType mapping
 METRIC_TYPE_MAP = {
     "identity": SimilarityType.IDENTITY,
@@ -54,20 +164,36 @@ METRIC_TYPE_MAP = {
     "quality": None,  # Special handling
 }
 
-# Full descriptions for tooltips
+
+def get_metric_tooltip(metric_key: str) -> str:
+    """Get formatted tooltip text for a metric.
+
+    Args:
+        metric_key: The metric type key (e.g., "temporal", "ambiguity")
+
+    Returns:
+        Formatted tooltip string combining description and thresholds
+    """
+    help_data = METRIC_HELP.get(metric_key.lower(), {})
+    if not help_data:
+        return ""
+
+    title = help_data.get("title", metric_key.title())
+    desc = help_data.get("description", "")
+    thresholds = help_data.get("thresholds", "")
+
+    parts = [title]
+    if desc:
+        parts.append(desc)
+    if thresholds:
+        parts.append(f"Thresholds: {thresholds}")
+
+    return " | ".join(parts)
+
+
+# Legacy format for backward compatibility
 METRIC_DESCRIPTIONS = {
-    "identity": "How similar clusters are for this auto-generated person. ≥75%: Strong, ≥70%: Good, <70%: Review",
-    "cast": "How similar this cluster is to the cast member's facebank. ≥68%: Auto-assign, ≥50%: Review, <50%: Weak",
-    "track": "How consistent frames within this track are. ≥85%: Strong, ≥70%: Good, <70%: Weak",
-    "person_cohesion": "How well this track fits with other tracks of the same person. ≥70%: Strong, ≥50%: Good, <50%: Poor",
-    "fit": "How well this track fits with other tracks of the same person. ≥70%: Strong, ≥50%: Good, <50%: Poor",
-    "cluster": "How cohesive tracks in this cluster are. ≥80%: Tight, ≥60%: Moderate, <60%: Loose",
-    "temporal": "How consistent this person's appearance is across time. ≥80%: Consistent, ≥60%: Variable, <60%: Changes",
-    "ambiguity": "Gap between 1st and 2nd best match. ≥15%: Clear, ≥8%: OK, <8%: Risky",
-    "isolation": "Distance to nearest cluster. ≥40%: Isolated, ≥25%: Moderate, <25%: Merge candidate",
-    "trend": "Is confidence improving or degrading? ↑: Improving, →: Stable, ↓: Degrading",
-    "confidence_trend": "Is confidence improving or degrading? ↑: Improving, →: Stable, ↓: Degrading",
-    "quality": "Detection + Sharpness + Area score. ≥85%: High (green), ≥60%: Medium (amber), <60%: Low (red)",
+    key: get_metric_tooltip(key) for key in METRIC_HELP.keys()
 }
 
 
@@ -88,6 +214,7 @@ class MetricData:
     trend_direction: Optional[str] = None  # For trend: "up", "stable", "down"
     second_match: Optional[str] = None  # For ambiguity: 2nd best match name
     first_match: Optional[str] = None  # For ambiguity: 1st best match name
+    help_key: Optional[str] = None  # Override help lookup key (defaults to metric_type)
 
 
 def _render_metric_badge(metric: MetricData) -> str:
@@ -164,12 +291,50 @@ def _render_metric_badge(metric: MetricData) -> str:
     return ""
 
 
+def _build_help_tooltip_html(metric_key: str) -> str:
+    """Build HTML for a help tooltip with a '?' icon.
+
+    Args:
+        metric_key: The metric type key
+
+    Returns:
+        HTML string for the help icon with tooltip
+    """
+    help_data = METRIC_HELP.get(metric_key.lower(), {})
+    if not help_data:
+        return ""
+
+    # Build tooltip text (plain text for title attribute)
+    title = help_data.get("title", metric_key.title())
+    desc = help_data.get("description", "")
+    thresholds = help_data.get("thresholds", "")
+    interpretation = help_data.get("interpretation", "")
+
+    tooltip_parts = [title]
+    if desc:
+        tooltip_parts.append(desc)
+    if thresholds:
+        tooltip_parts.append(f"Thresholds: {thresholds}")
+    if interpretation:
+        tooltip_parts.append(f"Tip: {interpretation}")
+
+    tooltip_text = " | ".join(tooltip_parts)
+
+    # Return help icon HTML
+    return (
+        f'<span class="metric-help-icon" title="{tooltip_text}" '
+        f'style="cursor: help; font-size: 0.7em; opacity: 0.6; margin-left: 2px; '
+        f'vertical-align: super;">❓</span>'
+    )
+
+
 def render_metrics_strip(
     metrics: List[MetricData],
     *,
     compact: bool = False,
     show_na: bool = False,
     container_class: str = "metrics-strip",
+    show_help: bool = True,
 ) -> None:
     """Render a horizontal strip of metrics badges.
 
@@ -178,16 +343,27 @@ def render_metrics_strip(
         compact: Use smaller padding/font
         show_na: Show "N/A" for missing metrics instead of hiding them
         container_class: CSS class for the container
+        show_help: Show help icon with tooltip on each metric
     """
     # Filter out None values unless show_na is True
     badges_html = []
     for metric in metrics:
         badge = _render_metric_badge(metric)
         if badge:
-            # Wrap with tooltip
-            tooltip = METRIC_DESCRIPTIONS.get(metric.metric_type.lower(), "")
+            # Use help_key if provided, otherwise fall back to metric_type
+            help_key = metric.help_key or metric.metric_type.lower()
+
+            # Wrap badge with tooltip (hover on entire badge shows help)
+            tooltip = METRIC_DESCRIPTIONS.get(help_key, "")
             if tooltip:
                 badge = f'<span title="{tooltip}" style="cursor: help;">{badge}</span>'
+
+            # Add help icon if requested
+            if show_help:
+                help_icon = _build_help_tooltip_html(help_key)
+                if help_icon:
+                    badge = f'{badge}{help_icon}'
+
             badges_html.append(badge)
         elif show_na and metric.metric_type:
             label = SIMILARITY_LABELS.get(
@@ -233,12 +409,14 @@ def render_metrics_strip_inline(
     metrics: List[MetricData],
     *,
     compact: bool = True,
+    show_help: bool = True,
 ) -> str:
     """Return HTML for a metrics strip (for embedding in other HTML).
 
     Args:
         metrics: List of MetricData objects
         compact: Use smaller styling
+        show_help: Show help icon with tooltip on each metric
 
     Returns:
         HTML string for the metrics strip
@@ -247,9 +425,14 @@ def render_metrics_strip_inline(
     for metric in metrics:
         badge = _render_metric_badge(metric)
         if badge:
-            tooltip = METRIC_DESCRIPTIONS.get(metric.metric_type.lower(), "")
+            help_key = metric.help_key or metric.metric_type.lower()
+            tooltip = METRIC_DESCRIPTIONS.get(help_key, "")
             if tooltip:
                 badge = f'<span title="{tooltip}" style="cursor: help;">{badge}</span>'
+            if show_help:
+                help_icon = _build_help_tooltip_html(help_key)
+                if help_icon:
+                    badge = f'{badge}{help_icon}'
             badges_html.append(badge)
 
     if not badges_html:
@@ -257,6 +440,81 @@ def render_metrics_strip_inline(
 
     gap = "4px" if compact else "6px"
     return f'<span style="display: inline-flex; gap: {gap}; align-items: center;">{" ".join(badges_html)}</span>'
+
+
+def render_metrics_documentation(
+    metric_keys: Optional[List[str]] = None,
+    show_thresholds_table: bool = True,
+) -> None:
+    """Render complete metrics documentation using Streamlit.
+
+    This function renders documentation for the specified metrics using
+    the centralized METRIC_HELP config. Useful for docs pages and help
+    expanders.
+
+    Args:
+        metric_keys: List of metric keys to document. If None, shows all.
+        show_thresholds_table: Whether to show a summary table at the end.
+    """
+    keys_to_show = metric_keys or [
+        k for k in METRIC_HELP.keys()
+        if k not in ("fit", "confidence_trend")  # Skip aliases
+    ]
+
+    for key in keys_to_show:
+        help_data = METRIC_HELP.get(key, {})
+        if not help_data:
+            continue
+
+        title = help_data.get("title", key.title())
+        emoji = help_data.get("emoji", "📊")
+        description = help_data.get("description", "")
+        thresholds = help_data.get("thresholds", "")
+        interpretation = help_data.get("interpretation", "")
+        where_shown = help_data.get("where_shown", "")
+        breakdown = help_data.get("breakdown", {})
+
+        with st.container(border=True):
+            st.markdown(f"### {emoji} {title}")
+            st.markdown(f"**Description:** {description}")
+
+            if thresholds:
+                st.markdown(f"**Thresholds:** `{thresholds}`")
+
+            if interpretation:
+                st.info(f"💡 **Tip:** {interpretation}")
+
+            if breakdown and isinstance(breakdown, dict):
+                st.markdown("**Components:**")
+                for comp_key, comp_desc in breakdown.items():
+                    st.markdown(f"- **{comp_key.upper()}**: {comp_desc}")
+
+            if where_shown:
+                st.caption(f"📍 Shown in: {where_shown}")
+
+    # Summary table
+    if show_thresholds_table:
+        st.markdown("---")
+        st.markdown("### Quick Reference")
+        threshold_data = []
+        for key in keys_to_show:
+            data = METRIC_HELP.get(key, {})
+            if data:
+                threshold_data.append({
+                    "Metric": data.get("title", key.title()),
+                    "Thresholds": data.get("thresholds", "N/A"),
+                })
+        if threshold_data:
+            st.table(threshold_data)
+
+
+def get_all_metric_keys() -> List[str]:
+    """Get list of all metric keys (excluding aliases).
+
+    Returns:
+        List of metric type keys
+    """
+    return [k for k in METRIC_HELP.keys() if k not in ("fit", "confidence_trend")]
 
 
 # ============================================================================

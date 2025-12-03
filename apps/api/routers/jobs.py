@@ -487,8 +487,8 @@ def _build_detect_track_command(
         "--progress-file",
         str(progress_path),
     ]
-    # Note: profile_value is used internally for stride/fps defaults,
-    # but episode_run.py doesn't accept --profile as a command line argument
+    if profile_value:
+        command += ["--profile", profile_value]
     if fps_value is not None and fps_value > 0:
         command += ["--fps", str(fps_value)]
     if save_frames_value:
@@ -531,7 +531,8 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         "--progress-file",
         str(progress_path),
     ]
-    # Note: profile is used internally for defaults, but episode_run.py doesn't accept --profile
+    if req.profile:
+        command += ["--profile", req.profile]
     if req.save_frames:
         command.append("--save-frames")
     if req.save_crops:
@@ -561,7 +562,8 @@ def _build_cluster_command(req: ClusterRequest, progress_path: Path) -> List[str
         "--progress-file",
         str(progress_path),
     ]
-    # Note: profile is used internally for defaults, but episode_run.py doesn't accept --profile
+    if req.profile:
+        command += ["--profile", req.profile]
     command += ["--cluster-thresh", str(req.cluster_thresh)]
     command += ["--min-cluster-size", str(req.min_cluster_size)]
     command += ["--min-identity-sim", str(req.min_identity_sim)]
