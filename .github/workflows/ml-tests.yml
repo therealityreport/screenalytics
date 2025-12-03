@@ -33,7 +33,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libsm6 libxext6 libxrender-dev libgomp1
+          sudo apt-get install -y ffmpeg libsm6 libxext6 libxrender-dev libgomp1 \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
 
       - name: Install Python dependencies
         run: |
