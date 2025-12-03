@@ -861,31 +861,32 @@ def _persist_identity_name(
                     None,
                 )
 
+            new_person_id = None
             if existing_person:
                 # Add cluster to existing person (if not already present)
-                person_id = existing_person["person_id"]
+                new_person_id = existing_person["person_id"]
                 cluster_ids = existing_person.get("cluster_ids", [])
                 if cluster_id_with_prefix not in cluster_ids:
                     people_service.add_cluster_to_person(
                         show_slug,
-                        person_id,
+                        new_person_id,
                         cluster_id_with_prefix,
                         update_prototype=False,  # Don't update prototype from manual naming
                     )
                     LOGGER.info(
-                        f"Added cluster {identity_id} to existing person {person_id} ({existing_person.get('name')})"
+                        f"Added cluster {identity_id} to existing person {new_person_id} ({existing_person.get('name')})"
                     )
 
                 # Add the input name as an alias if it's different from the primary name
                 primary_name = existing_person.get("name") or ""
                 if people_service.normalize_name(trimmed_name) != people_service.normalize_name(primary_name):
-                    people_service.add_alias_to_person(show_slug, person_id, trimmed_name)
-                    LOGGER.info(f"Added alias '{trimmed_name}' to person {person_id}")
+                    people_service.add_alias_to_person(show_slug, new_person_id, trimmed_name)
+                    LOGGER.info(f"Added alias '{trimmed_name}' to person {new_person_id}")
 
                 # Ensure cast_id is set if provided
                 if cast_id and existing_person.get("cast_id") != cast_id:
-                    people_service.update_person(show_slug, person_id, cast_id=cast_id)
-                    LOGGER.info(f"Updated person {person_id} with cast_id {cast_id}")
+                    people_service.update_person(show_slug, new_person_id, cast_id=cast_id)
+                    LOGGER.info(f"Updated person {new_person_id} with cast_id {cast_id}")
             else:
                 # Create new person with cast_id
                 person = people_service.create_person(
@@ -895,7 +896,31 @@ def _persist_identity_name(
                     aliases=[],
                     cast_id=cast_id,  # Include cast_id when creating person
                 )
-                LOGGER.info(f"Created new person {person['person_id']} for {trimmed_name} with cluster {identity_id} and cast_id {cast_id}")
+                new_person_id = person["person_id"]
+                LOGGER.info(f"Created new person {new_person_id} for {trimmed_name} with cluster {identity_id} and cast_id {cast_id}")
+
+            # Update the identity's person_id to point to the new person
+            if new_person_id:
+                entries = _identity_rows(payload)
+                for entry in entries:
+                    if (entry.get("identity_id") or entry.get("id")) == identity_id:
+                        old_person_id = entry.get("person_id")
+                        if old_person_id != new_person_id:
+                            # Remove cluster from old person
+                            if old_person_id:
+                                try:
+                                    people_service.remove_cluster_from_all_people(show_slug, cluster_id_with_prefix)
+                                    LOGGER.info(f"Removed cluster {identity_id} from old person {old_person_id}")
+                                except Exception as remove_exc:
+                                    LOGGER.warning(f"Failed to remove cluster from old person: {remove_exc}")
+
+                            entry["person_id"] = new_person_id
+                            LOGGER.info(f"Updated identity {identity_id} person_id: {old_person_id} -> {new_person_id}")
+                            # Re-write identities to persist the person_id change
+                            update_identity_stats(ep_id, payload)
+                            identities_path = write_identities(ep_id, payload)
+                            sync_manifests(ep_id, identities_path)
+                        break
 
         except Exception as exc:
             # Don't fail the naming operation if People service fails
@@ -916,6 +941,10 @@ def _persist_identity_name(
 
 
 def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
+    """Assign a name to a cluster/identity.
+
+    After assignment, cleans up any orphaned unnamed persons and empty unnamed clusters.
+    """
     payload = load_identities(ep_id)
     entries = _identity_rows(payload)
     target = next(
@@ -927,11 +956,195 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
     trimmed = (name or "").strip()
     if not trimmed:
         raise ValueError("name_required")
+
+    # Capture source person info before assignment (for cascade logic)
+    source_person_id = target.get("person_id")
+    source_was_unnamed = not target.get("name")
+
     target["name"] = trimmed
-    return _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
+    result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
+
+    # If source was an unnamed cluster with a person_id, check if that person
+    # is now orphaned (has no more clusters) and clean it up
+    if source_person_id and source_was_unnamed:
+        try:
+            _cleanup_orphaned_unnamed_person(ep_id, source_person_id, show)
+        except Exception as exc:
+            LOGGER.warning(f"Failed to cleanup orphaned person {source_person_id}: {exc}")
+
+    # Always cleanup empty unnamed identities
+    try:
+        ctx = episode_context_from_id(ep_id)
+        show_id = show or ctx.show_slug
+    except ValueError:
+        show_id = show
+
+    if show_id:
+        cleanup_result = cleanup_empty_unnamed_identities(ep_id, show_id)
+        if cleanup_result.get("removed_clusters"):
+            result["cleaned_up"] = cleanup_result
+
+    return result
+
+
+def _cleanup_orphaned_unnamed_person(ep_id: str, person_id: str, show: str | None = None) -> Dict[str, Any]:
+    """Clean up a person record if they have no more clusters and are unnamed.
+
+    This handles the case where an auto-clustered (unnamed) person had only one
+    cluster, and that cluster was just assigned to a named cast member. The old
+    person record is now orphaned and should be deleted.
+
+    Args:
+        ep_id: Episode identifier (used to extract show_id if not provided)
+        person_id: The person_id to check and potentially clean up
+        show: Optional show identifier
+
+    Returns:
+        {"deleted": True/False, "person_id": str, "reason": str}
+    """
+    from apps.api.services.people import PeopleService
+
+    try:
+        ctx = episode_context_from_id(ep_id)
+        show_id = show or ctx.show_slug
+    except ValueError:
+        show_id = show
+
+    if not show_id:
+        return {"deleted": False, "person_id": person_id, "reason": "no_show_id"}
+
+    people_service = PeopleService()
+    people = people_service.list_people(show_id)
+
+    person = next((p for p in people if p.get("person_id") == person_id), None)
+    if not person:
+        return {"deleted": False, "person_id": person_id, "reason": "person_not_found"}
+
+    # Check if person is unnamed (no name or empty name)
+    person_name = (person.get("name") or "").strip()
+    if person_name:
+        return {"deleted": False, "person_id": person_id, "reason": "person_has_name"}
+
+    # Check if person has no remaining clusters
+    cluster_ids = person.get("cluster_ids", []) or []
+    if cluster_ids:
+        return {"deleted": False, "person_id": person_id, "reason": "person_has_clusters", "cluster_count": len(cluster_ids)}
+
+    # Person is unnamed and has no clusters - delete it
+    try:
+        people_service.delete_person(show_id, person_id)
+        LOGGER.info(f"Deleted orphaned unnamed person {person_id} from show {show_id}")
+        return {"deleted": True, "person_id": person_id, "reason": "orphaned_unnamed"}
+    except Exception as exc:
+        LOGGER.warning(f"Failed to delete orphaned person {person_id}: {exc}")
+        return {"deleted": False, "person_id": person_id, "reason": f"delete_failed: {exc}"}
+
+
+def cleanup_empty_unnamed_identities(ep_id: str, show_id: str | None = None) -> Dict[str, Any]:
+    """Remove identities (clusters) that have no tracks AND no name.
+
+    This is a stricter version of cleanup_empty_clusters that only removes
+    unnamed clusters. Named clusters with no tracks might be intentionally
+    preserved (e.g., a cast member with no visible face tracks yet).
+
+    Args:
+        ep_id: Episode identifier
+        show_id: Show identifier (extracted from ep_id if not provided)
+
+    Returns:
+        {
+            "removed_clusters": List of identity_ids that were removed,
+            "people_updated": List of person_ids that had clusters removed,
+            "identities_before": Count before cleanup,
+            "identities_after": Count after cleanup,
+        }
+    """
+    from apps.api.services.people import PeopleService
+
+    identities = load_identities(ep_id)
+    all_identities = identities.get("identities", [])
+    identities_before = len(all_identities)
+
+    # Find empty AND unnamed clusters
+    empty_unnamed_ids = []
+    kept_identities = []
+    for identity in all_identities:
+        track_ids = identity.get("track_ids", []) or []
+        has_name = bool((identity.get("name") or "").strip())
+
+        if not track_ids and not has_name:
+            # Empty and unnamed - remove it
+            empty_unnamed_ids.append(identity.get("identity_id"))
+            LOGGER.info(
+                "Removing empty unnamed cluster %s from episode %s",
+                identity.get("identity_id"),
+                ep_id,
+            )
+        else:
+            kept_identities.append(identity)
+
+    if not empty_unnamed_ids:
+        return {
+            "removed_clusters": [],
+            "people_updated": [],
+            "identities_before": identities_before,
+            "identities_after": identities_before,
+        }
+
+    # Update identities.json
+    identities["identities"] = kept_identities
+    update_identity_stats(ep_id, identities)
+    identities_path = write_identities(ep_id, identities)
+    sync_manifests(ep_id, identities_path)
+
+    # Remove from people.json
+    people_updated = []
+    if show_id is None:
+        try:
+            ctx = episode_context_from_id(ep_id)
+            show_id = ctx.show_slug
+        except ValueError:
+            show_id = None
+
+    if show_id:
+        people_service = PeopleService()
+        for cluster_id in empty_unnamed_ids:
+            full_cluster_id = f"{ep_id}:{cluster_id}"
+            try:
+                result = people_service.remove_cluster_from_all_people(show_id, full_cluster_id)
+                people_updated.extend(result.get("updated_people", []))
+            except Exception as exc:
+                LOGGER.warning(f"Failed to remove cluster {cluster_id} from people: {exc}")
+
+    LOGGER.info(
+        "Cleanup removed %d empty unnamed clusters from %s (was %d, now %d)",
+        len(empty_unnamed_ids),
+        ep_id,
+        identities_before,
+        len(kept_identities),
+    )
+
+    return {
+        "removed_clusters": empty_unnamed_ids,
+        "people_updated": list(set(people_updated)),
+        "identities_before": identities_before,
+        "identities_after": len(kept_identities),
+    }
 
 
 def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
+    """Assign a name to a track, with smart cluster handling.
+
+    Behavior:
+    - If the track is the ONLY track in the cluster: assign the entire cluster
+      (prevents empty clusters from being created)
+    - If the cluster has multiple tracks: SPLIT the track into a new cluster
+      for the target person, leaving the remaining tracks in the original cluster
+
+    Additionally:
+    - Any empty unnamed identities are automatically removed
+    - Orphaned unnamed persons are cleaned up
+    """
     trimmed = (name or "").strip()
     if not trimmed:
         raise ValueError("name_required")
@@ -964,29 +1177,56 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
         identity_id = _next_identity_id(entries)
         target_identity["identity_id"] = identity_id
 
+    # Capture source person info before assignment (for cascade logic)
+    source_person_id = target_identity.get("person_id")
+    source_was_unnamed = not target_identity.get("name")
+
+    # CASE 1: Only one track in cluster - assign entire cluster (prevents empty clusters)
     if len(track_ids_for_identity) <= 1:
         target_identity["name"] = trimmed
         result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
         result["track_id"] = track_id_int
         result["split"] = False
-        return result
+    else:
+        # CASE 2: Multiple tracks - split this track into a new cluster
+        remaining_ids = [tid for tid in track_ids_for_identity if tid != track_id_int]
+        target_identity["track_ids"] = remaining_ids
 
-    remaining_ids = [tid for tid in track_ids_for_identity if tid != track_id_int]
-    target_identity["track_ids"] = remaining_ids
+        new_identity_id = _next_identity_id(entries)
+        new_identity = {
+            "identity_id": new_identity_id,
+            "label": None,
+            "track_ids": [track_id_int],
+            "name": trimmed,
+        }
+        payload.setdefault("identities", []).append(new_identity)
 
-    new_identity_id = _next_identity_id(entries)
-    new_identity = {
-        "identity_id": new_identity_id,
-        "label": None,
-        "track_ids": [track_id_int],
-        "name": trimmed,
-    }
-    payload.setdefault("identities", []).append(new_identity)
+        result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
+        result["track_id"] = track_id_int
+        result["split"] = True
+        result["source_identity_id"] = identity_id
+        result["remaining_tracks"] = len(remaining_ids)
 
-    result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
-    result["track_id"] = track_id_int
-    result["split"] = True
-    result["source_identity_id"] = identity_id
+    # If source was an unnamed cluster with a person_id, check if that person
+    # is now orphaned (has no more clusters) and clean it up
+    if source_person_id and source_was_unnamed:
+        try:
+            _cleanup_orphaned_unnamed_person(ep_id, source_person_id, show)
+        except Exception as exc:
+            LOGGER.warning(f"Failed to cleanup orphaned person {source_person_id}: {exc}")
+
+    # Always cleanup empty unnamed identities
+    try:
+        ctx = episode_context_from_id(ep_id)
+        show_id = show or ctx.show_slug
+    except ValueError:
+        show_id = show
+
+    if show_id:
+        cleanup_result = cleanup_empty_unnamed_identities(ep_id, show_id)
+        if cleanup_result.get("removed_clusters"):
+            result["cleaned_up"] = cleanup_result
+
     return result
 
 

@@ -50,18 +50,13 @@ def get_canonical_text_for_segment(
         return None
 
     tokens: List[str] = []
-    last_end = None
     for w in words:
         token = w.get("w", "").strip()
         if not token:
             continue
-        # Basic spacing: add a space if there is a small gap
-        if last_end is not None and w.get("t0", 0.0) - last_end > 0.02:
-            tokens.append(" ")
         tokens.append(token)
-        last_end = w.get("t1", last_end)
 
-    text = "".join(tokens).strip()
+    text = " ".join(tokens)
     return text or None
 
 
@@ -102,17 +97,19 @@ def augment_diarization_comparison(
     rows = _load_transcript_rows(transcript_path)
     segments = data.get("segments", {})
     gpt4o_segments = segments.get("gpt4o", []) if isinstance(segments, dict) else []
+    pyannote_segments = segments.get("pyannote", []) if isinstance(segments, dict) else []
 
     updated = False
+
+    # Augment GPT-4o segments
     for seg in gpt4o_segments:
         start = float(seg.get("start", 0))
         end = float(seg.get("end", 0))
-        canonical = seg.get("canonical_text")
-        if not canonical:
-            canonical = get_canonical_text_for_segment(transcript_path, start, end)
-            if canonical:
-                seg["canonical_text"] = canonical
-                updated = True
+        # Always regenerate canonical_text to ensure proper spacing
+        new_canonical = get_canonical_text_for_segment(transcript_path, start, end)
+        if new_canonical and new_canonical != seg.get("canonical_text"):
+            seg["canonical_text"] = new_canonical
+            updated = True
         speakers = seg.get("speakers")
         if speakers is None:
             speaker_ids = list(_speaker_ids_in_range(rows, start, end))
@@ -123,8 +120,18 @@ def augment_diarization_comparison(
             seg["mixed_speaker"] = len(speakers) > 1
             updated = True
 
+    # Augment Pyannote segments with canonical text
+    for seg in pyannote_segments:
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", 0))
+        new_canonical = get_canonical_text_for_segment(transcript_path, start, end)
+        if new_canonical and new_canonical != seg.get("canonical_text"):
+            seg["canonical_text"] = new_canonical
+            updated = True
+
     if updated:
         data.setdefault("segments", {})["gpt4o"] = gpt4o_segments
+        data.setdefault("segments", {})["pyannote"] = pyannote_segments
         comparison_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     return data

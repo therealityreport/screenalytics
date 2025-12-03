@@ -9,11 +9,13 @@ apply_global_cpu_limits()
 import asyncio
 import logging
 import os
+from typing import Dict, Tuple
 
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from apps.api.config import REDIS_URL
 from apps.api.errors import install_error_handlers
 from apps.api.routers import (
     archive,
@@ -172,54 +174,113 @@ def health() -> dict:
 
 @app.get("/healthz")
 def healthz() -> JSONResponse:
-    """Lightweight health check - must not block on heavy imports or GIL-holding operations."""
+    """Lightweight health check for load balancers and uptime probes."""
 
-    import sys
+    redis_status, redis_detail = _check_redis()
+    storage_status, storage_detail, storage_backend = _check_storage()
+    db_status, db_detail = _check_db()
 
-    errors: list[str] = []
-    coreml_available = None
-    apple_silicon = None
-    storage_backend = None
-    storage_error = None
+    # Consider the service healthy when required dependencies respond quickly
+    dependencies_ok = [
+        redis_status == "ok",
+        storage_status == "ok",
+        db_status in {"ok", "unconfigured"},
+    ]
+    overall_ok = all(dependencies_ok)
+    status_code = 200 if overall_ok else 503
 
-    # Avoid accessing episode_run during startup warmup - it can block due to GIL contention
-    if "tools.episode_run" in sys.modules:
-        try:
-            er = sys.modules["tools.episode_run"]
-            coreml_available = bool(getattr(er, "COREML_PROVIDER_AVAILABLE", False))
-            apple_silicon = bool(getattr(er, "APPLE_SILICON_HOST", False))
-        except Exception:
-            coreml_available = None
-            apple_silicon = None
-
-    if celery_import_error:
-        errors.append(f"celery: {celery_import_error}")
-
-    if "apps.api.routers.episodes" in sys.modules:
-        try:
-            eps_mod = sys.modules["apps.api.routers.episodes"]
-            storage = getattr(eps_mod, "STORAGE", None)
-            storage_backend = getattr(storage, "backend", None) if storage is not None else None
-            storage_error = getattr(storage, "init_error", None) if storage is not None else None
-            if storage_error:
-                errors.append(f"storage: {storage_error}")
-        except Exception:
-            storage_error = None
-
-    ok = not errors
-    payload = {
-        "ok": ok,
-        "coreml_available": coreml_available,
-        "apple_silicon": apple_silicon,
-        "celery_available": celery_router is not None,
-        "storage_backend": storage_backend,
+    payload: Dict[str, object] = {
+        "status": "ok" if overall_ok else "error",
+        "version": app.version or "unknown",
+        "redis": redis_status,
+        "storage": storage_status,
+        "db": db_status,
     }
-    if storage_error:
-        payload["storage_error"] = storage_error
-    if celery_import_error:
-        payload["celery_error"] = str(celery_import_error)
-    if errors:
-        payload["errors"] = errors
+    if storage_backend:
+        payload["storage_backend"] = storage_backend
 
-    status = 200 if ok else 503
-    return JSONResponse(status_code=status, content=payload)
+    details: Dict[str, str] = {}
+    if redis_detail:
+        details["redis"] = redis_detail
+    if storage_detail:
+        details["storage"] = storage_detail
+    if db_detail:
+        details["db"] = db_detail
+    if details:
+        payload["details"] = details
+
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _check_redis(timeout: float = 0.5) -> Tuple[str, str | None]:
+    """Ping Redis with a short timeout; no dependency on Celery."""
+    try:
+        import redis  # type: ignore
+    except Exception as exc:
+        return "error", f"redis import error: {exc}"
+
+    try:
+        client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+        )
+        client.ping()
+        return "ok", None
+    except Exception as exc:  # pragma: no cover - network dependent
+        return "error", str(exc)
+
+
+def _check_storage() -> Tuple[str, str | None, str | None]:
+    """Validate storage configuration without heavy S3 operations."""
+    storage_backend: str | None = None
+    try:
+        from apps.api.routers import episodes as episodes_router
+
+        storage = getattr(episodes_router, "STORAGE", None)
+    except Exception as exc:  # pragma: no cover - defensive import
+        return "error", f"storage import failed: {exc}", storage_backend
+
+    if storage is None:
+        return "error", "storage service unavailable", storage_backend
+
+    storage_backend = getattr(storage, "backend", None)
+    init_error = getattr(storage, "init_error", None)
+    if init_error:
+        return "degraded", str(init_error), storage_backend
+
+    if storage_backend not in {"s3", "minio", "local"}:
+        return "error", f"unsupported backend {storage_backend}", storage_backend
+
+    # For S3/MinIO, consider the client present and bucket configured as healthy
+    if storage_backend in {"s3", "minio"}:
+        client = getattr(storage, "_client", None)
+        bucket = getattr(storage, "bucket", None)
+        if client is None or not bucket:
+            return "error", "storage client or bucket not initialized", storage_backend
+    return "ok", None, storage_backend
+
+
+def _check_db(timeout: int = 2) -> Tuple[str, str | None]:
+    """Validate optional Postgres connectivity with a short SELECT 1."""
+    db_url = os.environ.get("TRR_DB_URL")
+    if not db_url:
+        return "unconfigured", None
+
+    try:
+        import psycopg2  # type: ignore
+    except Exception as exc:
+        return "error", f"psycopg2 import error: {exc}"
+
+    try:
+        conn = psycopg2.connect(db_url, connect_timeout=timeout)  # type: ignore[arg-type]
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+        finally:
+            conn.close()
+        return "ok", None
+    except Exception as exc:  # pragma: no cover - network dependent
+        return "error", str(exc)

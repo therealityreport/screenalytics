@@ -4300,6 +4300,8 @@ def run_audio_pipeline_with_streaming(
     ep_id: str,
     overwrite: bool = False,
     asr_provider: str = "openai_whisper",
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> tuple[Dict[str, Any] | None, str | None]:
     """Run audio pipeline with real-time streaming logs and progress.
 
@@ -4313,6 +4315,8 @@ def run_audio_pipeline_with_streaming(
         ep_id: Episode identifier
         overwrite: Whether to overwrite existing artifacts
         asr_provider: ASR provider to use (openai_whisper or gemini)
+        min_speakers: Minimum expected speakers (hint for diarization)
+        max_speakers: Maximum expected speakers (hint for diarization)
 
     Returns:
         Tuple of (result dict, error message or None)
@@ -4324,6 +4328,10 @@ def run_audio_pipeline_with_streaming(
         "asr_provider": asr_provider,
         "run_mode": "local",
     }
+    if min_speakers is not None:
+        payload["min_speakers"] = min_speakers
+    if max_speakers is not None:
+        payload["max_speakers"] = max_speakers
 
     # Create UI placeholders
     status_placeholder = st.empty()
@@ -4597,6 +4605,8 @@ def run_audio_pipeline_with_celery_streaming(
     ep_id: str,
     overwrite: bool = False,
     asr_provider: str = "openai_whisper",
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> tuple[Dict[str, Any] | None, str | None]:
     """Queue audio pipeline via Celery and stream progress/logs without page reruns."""
     # Start job
@@ -4606,6 +4616,10 @@ def run_audio_pipeline_with_celery_streaming(
         "asr_provider": asr_provider,
         "run_mode": "queue",
     }
+    if min_speakers is not None:
+        payload["min_speakers"] = min_speakers
+    if max_speakers is not None:
+        payload["max_speakers"] = max_speakers
 
     status_placeholder = st.empty()
     progress_bar = st.progress(0.0)
@@ -4867,6 +4881,7 @@ def run_incremental_with_streaming(
                     log_placeholder.code("\n".join(log_lines[-100:]), language="text")
                     status_placeholder.error(f"❌ [LOCAL MODE] {display_name} failed: {error_msg}")
                     progress_text.caption(f"❌ Failed after {elapsed_str}")
+                    append_audio_run_history(ep_id, operation, "error", start_time, time.time(), log_lines)
                     return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
 
                 # Handle summary message (completion/error)
@@ -4893,7 +4908,51 @@ def run_incremental_with_streaming(
                         append_audio_run_history(ep_id, operation, "error", start_time, time.time(), log_lines)
                         return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
 
-                # Handle progress messages (phase-based from audio_pipeline_run.py)
+                # Handle audio_progress messages (from diarize_only, transcribe_only, etc.)
+                if msg_type == "audio_progress":
+                    phase = msg.get("phase", "")
+                    progress = msg.get("progress", 0)
+                    message = msg.get("message", "")
+                    step_name = msg.get("step_name", phase)
+
+                    # Handle completion
+                    if phase == "complete":
+                        elapsed_secs = time.time() - start_time
+                        elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+                        progress_bar.progress(1.0)
+                        completion_msg = message or f"{display_name} completed"
+                        log_lines.append(f"✅ {completion_msg}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                        progress_text.caption(f"**100%** - {completion_msg} ({elapsed_str})")
+                        status_placeholder.success(f"✅ [LOCAL MODE] {completion_msg}")
+                        append_audio_run_history(ep_id, operation, "succeeded", start_time, time.time(), log_lines)
+                        return {"status": "succeeded", "logs": log_lines, "elapsed_seconds": elapsed_secs, **msg}, None
+
+                    # Handle error
+                    if phase == "error":
+                        elapsed_secs = time.time() - start_time
+                        elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+                        error_msg = message or "Unknown error"
+                        log_lines.append(f"ERROR: {error_msg}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                        status_placeholder.error(f"❌ [LOCAL MODE] {display_name} failed: {error_msg}")
+                        progress_text.caption(f"❌ Failed after {elapsed_str}")
+                        append_audio_run_history(ep_id, operation, "error", start_time, time.time(), log_lines)
+                        return {"status": "error", "error": error_msg, "logs": log_lines}, error_msg
+
+                    # Update progress
+                    if message:
+                        log_lines.append(f"[{step_name}] {message}")
+                        log_placeholder.code("\n".join(log_lines[-100:]), language="text")
+                    if progress > 0:
+                        pct = progress * 100 if progress <= 1 else progress
+                        progress_bar.progress(min(progress, 0.99))
+                        elapsed_secs = time.time() - start_time
+                        elapsed_str = f"{int(elapsed_secs)//60}m {int(elapsed_secs)%60}s" if elapsed_secs >= 60 else f"{elapsed_secs:.1f}s"
+                        progress_text.caption(f"**{pct:.1f}%** - {step_name or phase}: {message or 'Working...'} ({elapsed_str})")
+                    continue
+
+                # Handle legacy progress messages (phase-based from audio_pipeline_run.py)
                 phase = msg.get("phase", "")
                 progress = msg.get("progress", 0)
                 message = msg.get("message", "")

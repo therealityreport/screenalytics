@@ -18,6 +18,7 @@ from typing import Optional
 import numpy as np
 
 from .models import EnhanceConfig
+from .circuit_breaker import get_resemble_breaker, CircuitBreakerError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -150,31 +151,36 @@ def _enhance_chunk(
         "mode": config.mode,
     }
 
-    # Retry logic
+    # Get circuit breaker for API protection
+    breaker = get_resemble_breaker()
+
+    # Retry logic with circuit breaker protection
     last_error = None
     for attempt in range(config.max_retries):
         try:
-            response = requests.post(
-                api_url,
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=120,
-            )
+            # Check circuit breaker before making request
+            with breaker:
+                response = requests.post(
+                    api_url,
+                    headers=headers,
+                    files=files,
+                    data=data,
+                    timeout=120,
+                )
 
-            if response.status_code == 429:
-                # Rate limited
-                retry_after = int(response.headers.get("Retry-After", config.retry_delay_seconds))
-                LOGGER.warning(f"Rate limited, waiting {retry_after}s before retry")
-                time.sleep(retry_after)
-                continue
+                if response.status_code == 429:
+                    # Rate limited - don't count as circuit breaker failure
+                    retry_after = int(response.headers.get("Retry-After", config.retry_delay_seconds))
+                    LOGGER.warning(f"Rate limited, waiting {retry_after}s before retry")
+                    time.sleep(retry_after)
+                    continue
 
-            response.raise_for_status()
+                response.raise_for_status()
 
-            # Parse response
-            enhanced_bytes = response.content
+                # Parse response
+                enhanced_bytes = response.content
 
-            # Load enhanced audio
+            # Load enhanced audio (outside circuit breaker - local processing)
             enhanced_buffer = io.BytesIO(enhanced_bytes)
             enhanced_data, enhanced_sr = sf.read(enhanced_buffer)
 
@@ -193,6 +199,9 @@ def _enhance_chunk(
 
             return enhanced_data
 
+        except CircuitBreakerError as e:
+            LOGGER.warning(f"Circuit breaker open for Resemble API: {e}")
+            raise  # Don't retry when circuit is open
         except requests.RequestException as e:
             last_error = e
             LOGGER.warning(f"Enhancement attempt {attempt + 1} failed: {e}")

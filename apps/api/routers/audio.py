@@ -126,6 +126,128 @@ class SmartSplitRequest(BaseModel):
     expected_voices: int = Field(2, ge=2, le=5, description="Expected number of voices within the segment")
 
 
+class SpeakerAssignmentItem(BaseModel):
+    """A single speaker group assignment.
+
+    Supports both group-level and time-range-level assignments:
+    - Group-level: start and end are omitted → applies to entire speaker group
+    - Time-range: start and end are provided → applies only to that time window
+    """
+    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID (e.g., pyannote:SPEAKER_00)")
+    cast_id: str = Field(..., description="Cast member ID to assign to")
+    cast_display_name: Optional[str] = Field(None, description="Cast member display name")
+    # Time-range fields for segment-level assignments
+    start: Optional[float] = Field(None, description="Segment start time (for time-range assignment)")
+    end: Optional[float] = Field(None, description="Segment end time (for time-range assignment)")
+
+
+class SpeakerAssignmentsRequest(BaseModel):
+    """Request to set speaker assignments.
+
+    Can include both group-level and time-range assignments.
+    Time-range assignments take precedence over group-level.
+    """
+    assignments: List[SpeakerAssignmentItem] = Field(
+        default_factory=list,
+        description="List of speaker group to cast member assignments (supports time-range)"
+    )
+
+
+class SpeakerAssignmentsResponse(BaseModel):
+    """Response containing speaker assignments."""
+    ep_id: str
+    assignments: List[Dict[str, Any]] = Field(default_factory=list)
+    cast_members: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Available cast members for assignment"
+    )
+    speaker_groups: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Available speaker groups"
+    )
+
+
+class VoiceprintOverrideRequest(BaseModel):
+    """Request to set a voiceprint override for a segment."""
+    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID (e.g., pyannote:SPEAKER_00)")
+    segment_id: str = Field(..., description="Segment ID (e.g., py_0007)")
+    voiceprint_override: Optional[str] = Field(
+        None,
+        description="Override value: 'force_include', 'force_exclude', or null to clear"
+    )
+
+
+class VoiceprintOverrideResponse(BaseModel):
+    """Response after setting a voiceprint override."""
+    status: str = Field(..., description="Status (ok, error)")
+    segment: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Segment state after override"
+    )
+    message: Optional[str] = Field(None, description="Optional message")
+
+
+class SplitAtUtteranceRequest(BaseModel):
+    """Request to split a speaker group segment at an utterance boundary."""
+    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID (e.g., pyannote:SPEAKER_00)")
+    segment_id: str = Field(..., description="Segment ID to split (e.g., py_0007)")
+    split_time: float = Field(..., description="Time to split at (typically utterance start)")
+    target_speaker_group_id: Optional[str] = Field(
+        None,
+        description="Optional: move the second part to this speaker group. If not provided, stays in same group."
+    )
+
+
+class WordSplitRequest(BaseModel):
+    """Request to split a segment at specific word boundaries."""
+    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID")
+    segment_id: str = Field(..., description="Segment ID to split")
+    split_word_indices: List[int] = Field(
+        ...,
+        description="Word indices AFTER which to split (0-based). E.g., [5] splits after word 5."
+    )
+    rebuild_downstream: bool = Field(
+        True,
+        description="Rebuild voice clusters and transcript after split"
+    )
+
+
+class WordSplitResponse(BaseModel):
+    """Response after word-level smart split."""
+    status: str = Field(..., description="Status (ok, error)")
+    ep_id: str = Field(..., description="Episode ID")
+    source: str = Field(..., description="Diarization source")
+    original_segment_id: str = Field(..., description="Original segment that was split")
+    new_segments: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="New segments created from the split"
+    )
+    message: Optional[str] = Field(None, description="Status message")
+
+
+class SegmentWordsRequest(BaseModel):
+    """Request to get word-level info for a segment."""
+    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID")
+    segment_id: str = Field(..., description="Segment ID")
+
+
+class SegmentWordsResponse(BaseModel):
+    """Response with word-level info for a segment."""
+    segment_id: str
+    start: float
+    end: float
+    text: str
+    words: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Word list with timing [{w, t0, t1}, ...]"
+    )
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -154,6 +276,8 @@ def _get_audio_paths(ep_id: str) -> dict:
         "qc": manifests_dir / "audio_qc.json",
         "archived_segments": manifests_dir / "audio_archived_segments.json",
         "speaker_groups": manifests_dir / "audio_speaker_groups.json",
+        "speaker_assignments": manifests_dir / "audio_speaker_assignments.json",
+        "voiceprint_overrides": manifests_dir / "audio_voiceprint_overrides.json",
     }
 
 
@@ -164,6 +288,13 @@ def _check_artifacts_exist(ep_id: str) -> dict:
         key: str(path) if path.exists() else None
         for key, path in paths.items()
     }
+
+
+def _get_show_id_from_ep_id(ep_id: str) -> str:
+    """Extract show_id from episode id (e.g., 'RHOSLC-S05E01' -> 'RHOSLC')."""
+    if "-" in ep_id:
+        return ep_id.split("-")[0].upper()
+    return ep_id.upper()
 
 
 def _load_qc_status(ep_id: str) -> tuple[str, dict]:
@@ -601,6 +732,817 @@ async def assign_voice_cluster(
             status_code=500,
             detail=f"Failed to assign voice cluster: {e}",
         )
+
+
+# =============================================================================
+# Speaker Group Assignment Endpoints
+# =============================================================================
+
+
+@router.get("/episodes/{ep_id}/audio/speaker-assignments", response_model=SpeakerAssignmentsResponse)
+async def get_speaker_assignments(ep_id: str) -> SpeakerAssignmentsResponse:
+    """Get current speaker group assignments and available cast members.
+
+    Returns:
+        - Current assignments from audio_speaker_assignments.json
+        - Available cast members from show's cast profiles
+        - Speaker groups from audio_speaker_groups.json with utterance analysis
+    """
+    import json
+    from datetime import datetime
+
+    from apps.api.services.cast import CastService
+    from py_screenalytics.audio.models import ASRSegment
+    from py_screenalytics.audio.speaker_groups import load_speaker_groups_manifest
+    from py_screenalytics.audio.voiceprint_selection import (
+        load_speaker_assignments,
+        load_voiceprint_overrides,
+        analyze_segment_utterances,
+        analyze_speaker_group_purity,
+    )
+
+    paths = _get_audio_paths(ep_id)
+
+    # Load ASR segments for utterance analysis
+    asr_segments = []
+    asr_path = paths.get("asr_raw")
+    if asr_path and asr_path.exists():
+        try:
+            with open(asr_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        seg_data = json.loads(line.strip())
+                        asr_segments.append(ASRSegment(**seg_data))
+        except Exception as e:
+            LOGGER.warning(f"Failed to load ASR for {ep_id}: {e}")
+
+    # Load voiceprint overrides
+    override_lookup = {}
+    overrides_manifest = load_voiceprint_overrides(paths["voiceprint_overrides"])
+    if overrides_manifest:
+        override_lookup = overrides_manifest.get_override_lookup()
+
+    # Load current assignments
+    assignments_list = []
+    assignments_manifest = load_speaker_assignments(paths["speaker_assignments"])
+    if assignments_manifest:
+        assignments_list = [a.to_dict() for a in assignments_manifest.assignments]
+
+    # Load cast members for this show
+    show_id = _get_show_id_from_ep_id(ep_id)
+    cast_service = CastService()
+    try:
+        cast_members = cast_service.list_cast(show_id)
+        # Simplify to just what UI needs
+        cast_list = [
+            {
+                "cast_id": m.get("cast_id"),
+                "name": m.get("name"),
+                "role": m.get("role"),
+                "status": m.get("status"),
+                "has_voiceprint": bool(m.get("voiceprint_blob")),
+            }
+            for m in cast_members
+        ]
+    except Exception as e:
+        LOGGER.warning(f"Failed to load cast for {show_id}: {e}")
+        cast_list = []
+
+    # Load speaker groups
+    speaker_groups_list = []
+    sg_path = paths["speaker_groups"]
+    if sg_path.exists():
+        try:
+            sg_manifest = load_speaker_groups_manifest(sg_path)
+            for source in sg_manifest.sources:
+                for group in source.speakers:
+                    # Calculate mean diar_confidence for the group
+                    confidences = [
+                        seg.diar_confidence for seg in group.segments
+                        if seg.diar_confidence is not None
+                    ]
+                    mean_conf = sum(confidences) / len(confidences) if confidences else None
+
+                    # Include segment details with utterance analysis for UI display
+                    segments_data = []
+                    for seg in sorted(group.segments, key=lambda s: s.start):
+                        seg_data = {
+                            "segment_id": seg.segment_id,
+                            "start": seg.start,
+                            "end": seg.end,
+                            "duration": round(seg.end - seg.start, 2),
+                            "diar_confidence": seg.diar_confidence,
+                        }
+
+                        # Add utterance analysis if ASR available
+                        is_clean = True
+                        if asr_segments:
+                            analysis = analyze_segment_utterances(
+                                asr_segments=asr_segments,
+                                seg_start=seg.start,
+                                seg_end=seg.end,
+                            )
+                            seg_data["utterance_count"] = analysis.utterance_count
+                            seg_data["dialogue_risk"] = analysis.dialogue_risk
+                            seg_data["dialogue_reasons"] = analysis.dialogue_reasons
+                            seg_data["has_narrator_speech"] = analysis.has_narrator_speech
+                            seg_data["is_clean_for_voiceprint"] = analysis.is_clean_for_voiceprint
+                            seg_data["rejection_reason"] = analysis.rejection_reason
+                            is_clean = analysis.is_clean_for_voiceprint
+
+                        # Add voiceprint override and computed selected value
+                        override = override_lookup.get(seg.segment_id)
+                        seg_data["voiceprint_override"] = override
+
+                        # Compute effective voiceprint_selected based on override precedence
+                        if override == "force_exclude":
+                            voiceprint_selected = False
+                        elif override == "force_include":
+                            voiceprint_selected = True
+                        else:
+                            voiceprint_selected = is_clean
+                        seg_data["voiceprint_selected"] = voiceprint_selected
+
+                        # Find applicable assignment for this segment (time-range > group-level)
+                        seg_assignment = None
+                        if assignments_manifest:
+                            assignment = assignments_manifest.find_assignment_for_segment(
+                                speaker_group_id=group.speaker_group_id,
+                                seg_start=seg.start,
+                                seg_end=seg.end,
+                            )
+                            if assignment:
+                                seg_assignment = {
+                                    "cast_id": assignment.cast_id,
+                                    "cast_display_name": assignment.cast_display_name,
+                                    "is_time_range": assignment.is_time_range_assignment(),
+                                    "start": assignment.start,
+                                    "end": assignment.end,
+                                }
+                        seg_data["segment_assignment"] = seg_assignment
+
+                        segments_data.append(seg_data)
+
+                    # Analyze group purity (cross-segment speaker mixing)
+                    group_purity = "high"
+                    group_purity_warnings = []
+                    if asr_segments:
+                        group_segs = [{"start": s.start, "end": s.end} for s in group.segments]
+                        group_purity, group_purity_warnings = analyze_speaker_group_purity(
+                            group_segs, asr_segments
+                        )
+
+                    speaker_groups_list.append({
+                        "speaker_group_id": group.speaker_group_id,
+                        "speaker_label": group.speaker_label,
+                        "source": source.source,
+                        "segment_count": group.segment_count,
+                        "total_duration": round(group.total_duration, 2),
+                        "mean_diar_confidence": round(mean_conf, 3) if mean_conf else None,
+                        "segments": segments_data,
+                        "group_purity": group_purity,
+                        "group_purity_warnings": group_purity_warnings,
+                    })
+        except Exception as e:
+            LOGGER.warning(f"Failed to load speaker groups for {ep_id}: {e}")
+
+    return SpeakerAssignmentsResponse(
+        ep_id=ep_id,
+        assignments=assignments_list,
+        cast_members=cast_list,
+        speaker_groups=speaker_groups_list,
+    )
+
+
+@router.post("/episodes/{ep_id}/audio/speaker-assignments", response_model=SpeakerAssignmentsResponse)
+async def set_speaker_assignments(
+    ep_id: str,
+    req: SpeakerAssignmentsRequest,
+) -> SpeakerAssignmentsResponse:
+    """Set or update speaker group assignments.
+
+    Supports both group-level and time-range-level assignments:
+    - Group-level: start and end are omitted → applies to entire speaker group
+    - Time-range: start and end are provided → applies only to that time window
+
+    Time-range assignments take precedence over group-level assignments.
+
+    Replaces all assignments with the provided list.
+    To remove an assignment, simply omit it from the list.
+
+    Args:
+        ep_id: Episode identifier
+        req: List of speaker group to cast member assignments (supports time-range)
+
+    Returns:
+        Updated assignments and available options
+    """
+    from datetime import datetime, timezone
+
+    from apps.api.services.cast import CastService
+    from py_screenalytics.audio.voiceprint_selection import (
+        SpeakerAssignment,
+        SpeakerAssignmentsManifest,
+        save_speaker_assignments,
+    )
+
+    paths = _get_audio_paths(ep_id)
+
+    # Build new assignments
+    new_assignments = []
+    for item in req.assignments:
+        # Resolve cast display name if not provided
+        cast_display_name = item.cast_display_name
+        if not cast_display_name:
+            show_id = _get_show_id_from_ep_id(ep_id)
+            try:
+                cast_service = CastService()
+                cast_member = cast_service.get_cast_member(show_id, item.cast_id)
+                if cast_member:
+                    cast_display_name = cast_member.get("name")
+            except Exception:
+                pass
+
+        new_assignments.append(SpeakerAssignment(
+            source=item.source,
+            speaker_group_id=item.speaker_group_id,
+            cast_id=item.cast_id,
+            cast_display_name=cast_display_name,
+            assigned_by="user",
+            assigned_at=datetime.now(timezone.utc).isoformat(),
+            start=item.start,  # Time-range support
+            end=item.end,  # Time-range support
+        ))
+
+    # Create and save manifest
+    manifest = SpeakerAssignmentsManifest(
+        ep_id=ep_id,
+        assignments=new_assignments,
+    )
+    save_speaker_assignments(manifest, paths["speaker_assignments"])
+
+    # Log assignment breakdown
+    group_level = sum(1 for a in new_assignments if a.start is None)
+    time_range = len(new_assignments) - group_level
+    LOGGER.info(
+        f"Saved {len(new_assignments)} speaker assignments for {ep_id}: "
+        f"{group_level} group-level, {time_range} time-range"
+    )
+
+    # Return updated state
+    return await get_speaker_assignments(ep_id)
+
+
+class SingleAssignmentRequest(BaseModel):
+    """Request to upsert a single speaker assignment."""
+    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID")
+    cast_id: Optional[str] = Field(None, description="Cast member ID (null to remove)")
+    start: Optional[float] = Field(None, description="Segment start time (for time-range)")
+    end: Optional[float] = Field(None, description="Segment end time (for time-range)")
+
+
+class SingleAssignmentResponse(BaseModel):
+    """Response after upserting a single assignment."""
+    status: str = Field(..., description="Status (ok, removed, error)")
+    assignment: Optional[Dict[str, Any]] = Field(None, description="Created/updated assignment")
+    message: Optional[str] = Field(None, description="Optional message")
+
+
+@router.post("/episodes/{ep_id}/audio/speaker-assignment")
+async def upsert_single_speaker_assignment(
+    ep_id: str,
+    req: SingleAssignmentRequest,
+) -> SingleAssignmentResponse:
+    """Upsert or remove a single speaker assignment.
+
+    This is a convenience endpoint for per-segment cast assignment in the UI.
+    It handles both group-level and time-range assignments.
+
+    - If cast_id is provided: creates/updates an assignment
+    - If cast_id is null/empty: removes the matching assignment
+
+    For time-range assignments (start/end provided):
+    - Creates a segment-specific assignment that takes precedence over group-level
+
+    Args:
+        ep_id: Episode identifier
+        req: Assignment details
+
+    Returns:
+        Status and the created/updated assignment
+    """
+    from datetime import datetime, timezone
+
+    from apps.api.services.cast import CastService
+    from py_screenalytics.audio.voiceprint_selection import (
+        SpeakerAssignmentsManifest,
+        load_speaker_assignments,
+        save_speaker_assignments,
+    )
+
+    paths = _get_audio_paths(ep_id)
+
+    # Load or create manifest
+    manifest = load_speaker_assignments(paths["speaker_assignments"])
+    if not manifest:
+        manifest = SpeakerAssignmentsManifest(ep_id=ep_id)
+
+    # Handle removal
+    if not req.cast_id:
+        removed = manifest.remove_assignment(
+            speaker_group_id=req.speaker_group_id,
+            start=req.start,
+            end=req.end,
+        )
+        if removed:
+            save_speaker_assignments(manifest, paths["speaker_assignments"])
+            LOGGER.info(
+                f"Removed assignment for {req.speaker_group_id} "
+                f"[{req.start}-{req.end}] in {ep_id}"
+            )
+            return SingleAssignmentResponse(
+                status="removed",
+                message=f"Assignment removed for {req.speaker_group_id}"
+            )
+        else:
+            return SingleAssignmentResponse(
+                status="ok",
+                message="No matching assignment found to remove"
+            )
+
+    # Resolve cast display name
+    cast_display_name = None
+    show_id = _get_show_id_from_ep_id(ep_id)
+    try:
+        cast_service = CastService()
+        cast_member = cast_service.get_cast_member(show_id, req.cast_id)
+        if cast_member:
+            cast_display_name = cast_member.get("name")
+    except Exception:
+        pass
+
+    # Upsert the assignment
+    new_assignment = manifest.upsert_assignment(
+        source=req.source,
+        speaker_group_id=req.speaker_group_id,
+        cast_id=req.cast_id,
+        cast_display_name=cast_display_name,
+        start=req.start,
+        end=req.end,
+    )
+
+    save_speaker_assignments(manifest, paths["speaker_assignments"])
+
+    assignment_type = "time-range" if req.start is not None else "group-level"
+    LOGGER.info(
+        f"Upserted {assignment_type} assignment: {req.speaker_group_id} -> {req.cast_id} "
+        f"[{req.start}-{req.end}] in {ep_id}"
+    )
+
+    return SingleAssignmentResponse(
+        status="ok",
+        assignment=new_assignment.to_dict(),
+        message=f"Assignment saved: {req.speaker_group_id} -> {cast_display_name or req.cast_id}"
+    )
+
+
+@router.post("/episodes/{ep_id}/audio/voiceprint-overrides", response_model=VoiceprintOverrideResponse)
+async def set_voiceprint_override(
+    ep_id: str,
+    req: VoiceprintOverrideRequest,
+) -> VoiceprintOverrideResponse:
+    """Set or clear a voiceprint override for a specific segment.
+
+    Overrides control whether a segment is used for voiceprint creation:
+    - force_include: Always use this segment (overrides heuristics)
+    - force_exclude: Never use this segment
+    - null/None: Clear override, use heuristic auto-selection
+
+    Args:
+        ep_id: Episode identifier
+        req: Override request with source, speaker_group_id, segment_id, and override value
+
+    Returns:
+        Status and updated segment state
+    """
+    from py_screenalytics.audio.models import ASRSegment
+    from py_screenalytics.audio.voiceprint_selection import (
+        VoiceprintOverridesManifest,
+        load_voiceprint_overrides,
+        save_voiceprint_overrides,
+        analyze_segment_utterances,
+    )
+    from py_screenalytics.audio.speaker_groups import load_speaker_groups_manifest
+    import json
+
+    paths = _get_audio_paths(ep_id)
+
+    # Validate override value
+    if req.voiceprint_override not in (None, "force_include", "force_exclude"):
+        return VoiceprintOverrideResponse(
+            status="error",
+            segment={},
+            message=f"Invalid override value: {req.voiceprint_override}. Must be 'force_include', 'force_exclude', or null."
+        )
+
+    # Load or create overrides manifest
+    overrides_manifest = load_voiceprint_overrides(paths["voiceprint_overrides"])
+    if overrides_manifest is None:
+        overrides_manifest = VoiceprintOverridesManifest(ep_id=ep_id)
+
+    # Set the override
+    overrides_manifest.set_override(
+        source=req.source,
+        speaker_group_id=req.speaker_group_id,
+        segment_id=req.segment_id,
+        override=req.voiceprint_override,
+        reason="Manual override from Voices Review UI",
+    )
+
+    # Save the manifest
+    save_voiceprint_overrides(overrides_manifest, paths["voiceprint_overrides"])
+
+    # Find the segment to return its updated state
+    segment_data = {
+        "source": req.source,
+        "speaker_group_id": req.speaker_group_id,
+        "segment_id": req.segment_id,
+        "voiceprint_override": req.voiceprint_override,
+        "voiceprint_selected": None,  # Will be computed below
+    }
+
+    # Load speaker groups to get segment details
+    sg_path = paths["speaker_groups"]
+    if sg_path.exists():
+        sg_manifest = load_speaker_groups_manifest(sg_path)
+        for source in sg_manifest.sources:
+            for group in source.speakers:
+                if group.speaker_group_id == req.speaker_group_id:
+                    for seg in group.segments:
+                        if seg.segment_id == req.segment_id:
+                            segment_data["start"] = seg.start
+                            segment_data["end"] = seg.end
+                            segment_data["duration"] = round(seg.end - seg.start, 2)
+                            segment_data["diar_confidence"] = seg.diar_confidence
+                            break
+
+    # Load ASR for analysis
+    asr_segments = []
+    asr_path = paths.get("asr_raw")
+    if asr_path and asr_path.exists():
+        try:
+            with open(asr_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        seg_data = json.loads(line.strip())
+                        asr_segments.append(ASRSegment(**seg_data))
+        except Exception:
+            pass
+
+    # Compute is_clean and voiceprint_selected
+    is_clean = True
+    if asr_segments and "start" in segment_data:
+        analysis = analyze_segment_utterances(
+            asr_segments=asr_segments,
+            seg_start=segment_data["start"],
+            seg_end=segment_data["end"],
+        )
+        is_clean = analysis.is_clean_for_voiceprint
+        segment_data["utterance_count"] = analysis.utterance_count
+        segment_data["dialogue_risk"] = analysis.dialogue_risk
+        segment_data["is_clean_for_voiceprint"] = is_clean
+
+    # Compute voiceprint_selected based on override
+    if req.voiceprint_override == "force_exclude":
+        segment_data["voiceprint_selected"] = False
+    elif req.voiceprint_override == "force_include":
+        segment_data["voiceprint_selected"] = True
+    else:
+        segment_data["voiceprint_selected"] = is_clean
+
+    LOGGER.info(
+        f"Set voiceprint override for {ep_id}/{req.segment_id}: "
+        f"override={req.voiceprint_override}, selected={segment_data['voiceprint_selected']}"
+    )
+
+    return VoiceprintOverrideResponse(
+        status="ok",
+        segment=segment_data,
+        message=f"Override {'set' if req.voiceprint_override else 'cleared'} successfully"
+    )
+
+
+@router.post("/episodes/{ep_id}/audio/speaker-groups/split-at-utterance")
+async def split_segment_at_utterance(ep_id: str, req: SplitAtUtteranceRequest) -> dict:
+    """Split a speaker group segment at a specific time (utterance boundary).
+
+    This allows splitting a diarization segment when it contains multiple speakers.
+    The original segment is split into two parts at the specified time.
+
+    Use case: A segment shows 3 utterances, but utterance 2 is actually a different
+    speaker. Split at utterance 2's start time, then reassign the second part.
+
+    Args:
+        ep_id: Episode identifier
+        req: Split request with source, speaker_group_id, segment_id, and split_time
+
+    Returns:
+        Dict with new segment details
+    """
+    from py_screenalytics.audio.speaker_groups import (
+        load_speaker_groups_manifest,
+        save_speaker_groups_manifest,
+        update_summaries,
+    )
+    from py_screenalytics.audio.models import SpeakerSegment
+
+    paths = _get_audio_paths(ep_id)
+    speaker_groups_path = paths.get("speaker_groups")
+
+    if not speaker_groups_path or not speaker_groups_path.exists():
+        raise HTTPException(status_code=404, detail="Speaker groups manifest not found")
+
+    try:
+        manifest = load_speaker_groups_manifest(speaker_groups_path)
+
+        # Find the source and speaker group
+        target_source = None
+        target_group = None
+        target_segment = None
+        segment_idx = -1
+
+        for source in manifest.sources:
+            if source.source == req.source:
+                target_source = source
+                for group in source.speakers:
+                    if group.speaker_group_id == req.speaker_group_id:
+                        target_group = group
+                        for idx, seg in enumerate(group.segments):
+                            if seg.segment_id == req.segment_id:
+                                target_segment = seg
+                                segment_idx = idx
+                                break
+                        break
+                break
+
+        if target_source is None:
+            raise HTTPException(status_code=404, detail=f"Source '{req.source}' not found")
+        if target_group is None:
+            raise HTTPException(status_code=404, detail=f"Speaker group '{req.speaker_group_id}' not found")
+        if target_segment is None:
+            raise HTTPException(status_code=404, detail=f"Segment '{req.segment_id}' not found in group")
+
+        # Validate split time is within segment bounds
+        if req.split_time <= target_segment.start or req.split_time >= target_segment.end:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Split time {req.split_time} must be between segment bounds ({target_segment.start}, {target_segment.end})"
+            )
+
+        # Create two new segments from the split
+        # Generate new segment IDs - use original ID with suffixes
+        base_id = req.segment_id.rsplit("_", 1)[0] if "_" in req.segment_id else req.segment_id
+        # Find max existing segment number for this prefix to avoid collisions
+        existing_nums = []
+        for group in target_source.speakers:
+            for seg in group.segments:
+                if seg.segment_id.startswith(base_id):
+                    try:
+                        num_part = seg.segment_id.split("_")[-1]
+                        existing_nums.append(int(num_part))
+                    except (ValueError, IndexError):
+                        pass
+
+        next_num = max(existing_nums, default=0) + 1
+
+        seg1 = SpeakerSegment(
+            segment_id=f"{base_id}_{next_num:04d}",
+            start=target_segment.start,
+            end=req.split_time,
+            diar_confidence=target_segment.diar_confidence,
+        )
+
+        seg2 = SpeakerSegment(
+            segment_id=f"{base_id}_{next_num + 1:04d}",
+            start=req.split_time,
+            end=target_segment.end,
+            diar_confidence=target_segment.diar_confidence,
+        )
+
+        # Remove original segment
+        target_group.segments.pop(segment_idx)
+
+        # Add first part to original group
+        target_group.segments.insert(segment_idx, seg1)
+
+        # Handle second part - either same group or move to target
+        if req.target_speaker_group_id and req.target_speaker_group_id != req.speaker_group_id:
+            # Find target group and add segment there
+            moved_to_group = None
+            for group in target_source.speakers:
+                if group.speaker_group_id == req.target_speaker_group_id:
+                    moved_to_group = group
+                    group.segments.append(seg2)
+                    group.segments.sort(key=lambda s: s.start)
+                    break
+
+            if moved_to_group is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Target speaker group '{req.target_speaker_group_id}' not found"
+                )
+        else:
+            # Keep in same group
+            target_group.segments.insert(segment_idx + 1, seg2)
+
+        # Re-sort segments in both groups
+        target_group.segments.sort(key=lambda s: s.start)
+
+        # Update summaries
+        manifest = update_summaries(manifest)
+
+        # Save manifest
+        save_speaker_groups_manifest(manifest, speaker_groups_path)
+
+        LOGGER.info(
+            f"Split segment {req.segment_id} at {req.split_time}: "
+            f"created {seg1.segment_id} ({seg1.start:.2f}-{seg1.end:.2f}) and "
+            f"{seg2.segment_id} ({seg2.start:.2f}-{seg2.end:.2f})"
+        )
+
+        return {
+            "status": "ok",
+            "original_segment": {
+                "segment_id": req.segment_id,
+                "start": target_segment.start,
+                "end": target_segment.end,
+            },
+            "new_segments": [
+                {
+                    "segment_id": seg1.segment_id,
+                    "start": seg1.start,
+                    "end": seg1.end,
+                    "speaker_group_id": req.speaker_group_id,
+                },
+                {
+                    "segment_id": seg2.segment_id,
+                    "start": seg2.start,
+                    "end": seg2.end,
+                    "speaker_group_id": req.target_speaker_group_id or req.speaker_group_id,
+                },
+            ],
+            "message": f"Split at {req.split_time:.2f}s - segment divided into 2 parts"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to split segment at utterance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/audio/segments/{segment_id}/words", response_model=SegmentWordsResponse)
+async def get_segment_words(
+    ep_id: str,
+    segment_id: str,
+    source: str = "pyannote",
+    speaker_group_id: Optional[str] = None,
+) -> SegmentWordsResponse:
+    """Get word-level timing information for a segment.
+
+    This is useful for the Smart Split UI to show word boundaries
+    and let users select where to split.
+
+    Args:
+        ep_id: Episode identifier
+        segment_id: Segment ID to get words for
+        source: Diarization source (pyannote, gpt4o)
+        speaker_group_id: Optional speaker group ID (inferred if not provided)
+
+    Returns:
+        SegmentWordsResponse with word list and timing
+    """
+    from py_screenalytics.audio.speaker_groups import (
+        load_speaker_groups_manifest,
+        speaker_group_lookup,
+    )
+    from py_screenalytics.audio.speaker_edit import _load_asr_words_for_segment
+
+    paths = _get_audio_paths(ep_id)
+    speaker_groups_path = paths.get("speaker_groups")
+    asr_path = paths.get("asr_raw")
+
+    if not speaker_groups_path or not speaker_groups_path.exists():
+        raise HTTPException(status_code=404, detail="Speaker groups manifest not found")
+    if not asr_path or not asr_path.exists():
+        raise HTTPException(status_code=404, detail="ASR data not found")
+
+    try:
+        manifest = load_speaker_groups_manifest(speaker_groups_path)
+        groups = speaker_group_lookup(manifest)
+
+        # Find the segment
+        target_segment = None
+        found_group_id = speaker_group_id
+
+        for gid, group in groups.items():
+            if speaker_group_id and gid != speaker_group_id:
+                continue
+            for seg in group.segments:
+                if seg.segment_id == segment_id:
+                    target_segment = seg
+                    found_group_id = gid
+                    break
+            if target_segment:
+                break
+
+        if target_segment is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Segment '{segment_id}' not found"
+            )
+
+        # Load words
+        words = _load_asr_words_for_segment(
+            asr_path, target_segment.start, target_segment.end
+        )
+        text = " ".join(w.get("w", "") for w in words)
+
+        return SegmentWordsResponse(
+            segment_id=segment_id,
+            start=target_segment.start,
+            end=target_segment.end,
+            text=text,
+            words=words,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.exception(f"Failed to get segment words: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/episodes/{ep_id}/audio/segments/word-split", response_model=WordSplitResponse)
+async def word_level_smart_split(ep_id: str, req: WordSplitRequest) -> WordSplitResponse:
+    """Split a diarization segment at specific word boundaries.
+
+    This is a user-driven split that creates subsegments at precise word
+    boundaries. Use this when a single diarization segment contains multiple
+    speakers (e.g., "I didn't make out with someone and neither did Todd."
+    where two different people are speaking).
+
+    Workflow:
+    1. Call GET /episodes/{ep_id}/audio/segments/{segment_id}/words to see words
+    2. User selects split point(s) in UI (e.g., after word 5 "someone")
+    3. Call this endpoint with split_word_indices=[5]
+    4. Original segment is replaced with 2+ new segments
+    5. User can then assign each segment to different cast members
+
+    Args:
+        ep_id: Episode identifier
+        req: WordSplitRequest with source, speaker_group_id, segment_id, split_word_indices
+
+    Returns:
+        WordSplitResponse with new segment details
+    """
+    from py_screenalytics.audio.speaker_edit import smart_split_segment_by_words
+
+    try:
+        result = smart_split_segment_by_words(
+            ep_id=ep_id,
+            source=req.source,
+            speaker_group_id=req.speaker_group_id,
+            segment_id=req.segment_id,
+            split_word_indices=req.split_word_indices,
+            rebuild_downstream=req.rebuild_downstream,
+        )
+
+        return WordSplitResponse(
+            status="ok",
+            ep_id=result.ep_id,
+            source=result.source,
+            original_segment_id=result.original_segment_id,
+            new_segments=[
+                {
+                    "segment_id": s.segment_id,
+                    "start": s.start,
+                    "end": s.end,
+                    "speaker_group_id": s.speaker_group_id,
+                }
+                for s in result.new_segments
+            ],
+            message=f"Split into {len(result.new_segments)} segments at word boundaries"
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        LOGGER.exception(f"Failed to word-split segment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================

@@ -103,7 +103,12 @@ def _build_groups_for_source(
     for idx, seg in enumerate(sorted_segments, start=1):
         segment_id = f"{prefix}_{idx:04d}"
         speaker_groups[seg.speaker].append(
-            SpeakerSegment(segment_id=segment_id, start=seg.start, end=seg.end)
+            SpeakerSegment(
+                segment_id=segment_id,
+                start=seg.start,
+                end=seg.end,
+                diar_confidence=seg.confidence,
+            )
         )
 
     speaker_group_objs: List[SpeakerGroup] = []

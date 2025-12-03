@@ -413,7 +413,9 @@ def run_voiceprint_refresh(args):
 
         result = asyncio.run(run_with_progress())
 
-        if result.get("status") == "succeeded":
+        status = result.get("status")
+
+        if status == "succeeded" or status == "success":
             summary = result.get("summary", {})
             emit_progress(
                 "complete", 1.0,
@@ -425,6 +427,29 @@ def run_voiceprint_refresh(args):
                 review_queue_count=summary.get("review_queue_count", 0),
             )
             logger.info(f"Voiceprint refresh complete for {ep_id}")
+            sys.exit(0)
+        elif status == "skipped":
+            # No manual assignments - not an error, but nothing to do
+            reason = result.get("reason", "unknown")
+            message = result.get("message", f"Voiceprint refresh skipped: {reason}")
+            emit_progress(
+                "skipped", 1.0,
+                message,
+                step_name="Skipped", step_order=1, total_steps=1,
+                reason=reason,
+            )
+            logger.info(f"Voiceprint refresh skipped for {ep_id}: {reason}")
+            sys.exit(0)
+        elif status == "queued":
+            # Task was queued via Celery
+            job_id = result.get("job_id", "unknown")
+            emit_progress(
+                "queued", 0.0,
+                f"Voiceprint refresh queued (job_id: {job_id})",
+                step_name="Queued", step_order=1, total_steps=1,
+                job_id=job_id,
+            )
+            logger.info(f"Voiceprint refresh queued for {ep_id}: job_id={job_id}")
             sys.exit(0)
         else:
             emit_progress("error", 0, f"Voiceprint refresh failed: {result.get('error', 'Unknown error')}")

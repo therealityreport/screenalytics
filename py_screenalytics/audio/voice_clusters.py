@@ -240,6 +240,12 @@ def _cluster_from_segments_legacy(
 ) -> List[VoiceCluster]:
     """Legacy segment-level clustering retained for backwards compatibility."""
     LOGGER.info("Clustering %d segments into voice clusters (legacy path)", len(diarization_segments))
+
+    # If use_diarization_labels is set, skip embedding clustering entirely
+    if config.use_diarization_labels:
+        LOGGER.info("Using pyannote speaker labels directly (use_diarization_labels=True)")
+        return _clusters_from_diarization_labels(diarization_segments)
+
     from .diarization_pyannote import extract_speaker_embeddings
 
     segment_embeddings = extract_speaker_embeddings(

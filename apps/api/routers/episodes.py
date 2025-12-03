@@ -26,6 +26,7 @@ from tools import episode_run
 
 from apps.api.services import roster as roster_service
 from apps.api.services import identities as identity_service
+from apps.api.services import metrics as metrics_service
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
 from apps.api.services.storage import (
@@ -1181,11 +1182,30 @@ def _discover_crop_entries(ep_id: str, track_id: int) -> List[Dict[str, Any]]:
     return []
 
 
-def _list_track_frame_media(ep_id: str, track_id: int, sample: int, page: int, page_size: int) -> Dict[str, Any]:
+def _list_track_frame_media(
+    ep_id: str,
+    track_id: int,
+    sample: int,
+    page: int,
+    page_size: int,
+    include_skipped: bool = False,
+) -> Dict[str, Any]:
     sample = max(1, sample)
     page = max(1, page)
     page_size = max(1, min(page_size, TRACK_LIST_MAX_LIMIT))
-    face_rows = _track_face_rows(ep_id, track_id)
+
+    # Load faces with or without skipped entries based on parameter
+    all_faces = _load_faces(ep_id, include_skipped=include_skipped)
+    face_rows: Dict[int, Dict[str, Any]] = {}
+    for row in all_faces:
+        try:
+            tid = int(row.get("track_id", -1))
+            frame_idx = int(row.get("frame_idx", -1))
+        except (TypeError, ValueError):
+            continue
+        if tid != track_id:
+            continue
+        face_rows.setdefault(frame_idx, row)
     crops = _discover_crop_entries(ep_id, track_id)
     ctx, prefixes = _require_episode_context(ep_id)
     crops_prefix = (prefixes or {}).get("crops") if prefixes else None
@@ -3117,6 +3137,128 @@ def identity_detail(ep_id: str, identity_id: str) -> dict:
     }
 
 
+# ============================================================================
+# METRICS ENDPOINTS
+# ============================================================================
+
+
+@router.get("/episodes/{ep_id}/clusters/{cluster_id}/metrics")
+def get_cluster_metrics(ep_id: str, cluster_id: str) -> dict:
+    """Get computed metrics for a cluster (cohesion, isolation, ambiguity, temporal, quality)."""
+    try:
+        return metrics_service.compute_all_cluster_metrics(ep_id, cluster_id)
+    except Exception as exc:
+        LOGGER.error(f"Failed to compute cluster metrics for {cluster_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute metrics: {exc}") from exc
+
+
+@router.get("/episodes/{ep_id}/tracks/{track_id}/metrics")
+def get_track_metrics(ep_id: str, track_id: int) -> dict:
+    """Get computed metrics for a track (consistency, person cohesion, quality)."""
+    try:
+        return metrics_service.compute_all_track_metrics(ep_id, track_id)
+    except Exception as exc:
+        LOGGER.error(f"Failed to compute track metrics for track {track_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute metrics: {exc}") from exc
+
+
+@router.get("/episodes/{ep_id}/identities_with_metrics")
+def list_identities_with_metrics(
+    ep_id: str,
+    include_metrics: bool = Query(True, description="Include computed metrics"),
+) -> dict:
+    """List identities with optional metrics for each cluster.
+
+    Returns standard identity listing plus metrics for each cluster:
+    - cohesion: Average similarity of tracks to centroid (with min/max range)
+    - isolation: Distance to nearest cluster (higher = more isolated)
+    - ambiguity: Gap between 1st and 2nd best match (higher = clearer)
+    - temporal_consistency: Appearance consistency over time
+    - avg_quality: Average quality score
+    """
+    payload = _load_identities(ep_id)
+    track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id)}
+    first_faces = _first_face_lookup(ep_id)
+
+    # Pre-load metrics data if needed
+    if include_metrics:
+        from apps.api.services.track_reps import load_track_reps, load_cluster_centroids
+        track_reps = load_track_reps(ep_id)
+        cluster_centroids = load_cluster_centroids(ep_id)
+    else:
+        track_reps = None
+        cluster_centroids = None
+
+    identities = []
+    for identity in payload.get("identities", []):
+        identity_id = identity.get("identity_id")
+        track_ids = []
+        for raw_tid in identity.get("track_ids", []) or []:
+            try:
+                track_ids.append(int(raw_tid))
+            except (TypeError, ValueError):
+                continue
+
+        faces_total = identity.get("size")
+        if faces_total is None:
+            faces_total = sum(int(track_lookup.get(tid, {}).get("faces_count", 0)) for tid in track_ids)
+
+        preview_url = None
+        if track_ids:
+            preview_url = _resolve_face_media_url(ep_id, first_faces.get(track_ids[0]))
+        if not preview_url:
+            preview_url = _resolve_thumb_url(
+                ep_id,
+                identity.get("rep_thumb_rel_path"),
+                identity.get("rep_thumb_s3_key"),
+            )
+
+        entry = {
+            "identity_id": identity_id,
+            "label": identity.get("label"),
+            "name": identity.get("name"),
+            "person_id": identity.get("person_id"),
+            "track_ids": track_ids,
+            "faces": faces_total,
+            "rep_thumbnail_url": preview_url,
+            "rep_media_url": preview_url,
+        }
+
+        # Add metrics if requested
+        if include_metrics and identity_id:
+            try:
+                cohesion = metrics_service.compute_cluster_cohesion(
+                    ep_id, identity_id, track_reps, cluster_centroids
+                )
+                isolation = metrics_service.compute_cluster_isolation(
+                    ep_id, identity_id, cluster_centroids
+                )
+                ambiguity = metrics_service.compute_cluster_ambiguity(
+                    ep_id, identity_id, cluster_centroids
+                )
+                temporal = metrics_service.compute_temporal_consistency(ep_id, cluster_id=identity_id)
+                quality = metrics_service.compute_aggregate_quality(ep_id, cluster_id=identity_id)
+
+                entry["metrics"] = {
+                    "cohesion": cohesion.get("cohesion"),
+                    "min_similarity": cohesion.get("min_similarity"),
+                    "max_similarity": cohesion.get("max_similarity"),
+                    "isolation": isolation.get("isolation"),
+                    "nearest_cluster": isolation.get("nearest_cluster"),
+                    "ambiguity": ambiguity.get("ambiguity"),
+                    "temporal_consistency": temporal.get("temporal_consistency"),
+                    "avg_quality": quality.get("avg_quality"),
+                    "quality_breakdown": quality.get("quality_breakdown"),
+                }
+            except Exception as exc:
+                LOGGER.warning(f"Failed to compute metrics for {identity_id}: {exc}")
+                entry["metrics"] = None
+
+        identities.append(entry)
+
+    return {"identities": identities, "stats": payload.get("stats", {})}
+
+
 @router.get("/episodes/{ep_id}/tracks/{track_id}")
 def track_detail(ep_id: str, track_id: int) -> dict:
     faces = [row for row in _load_faces(ep_id, include_skipped=False) if int(row.get("track_id", -1)) == track_id]
@@ -3210,22 +3352,88 @@ def list_track_frames(
     sample: int = Query(1, ge=1, le=100, description="Return every Nth frame"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=TRACK_LIST_MAX_LIMIT),
+    include_skipped: bool = Query(False, description="Include faces marked as skipped"),
 ) -> Dict[str, Any]:
-    return _list_track_frame_media(ep_id, track_id, sample, page, page_size)
+    return _list_track_frame_media(ep_id, track_id, sample, page, page_size, include_skipped)
 
 
 @router.get("/episodes/{ep_id}/tracks/{track_id}/integrity")
 def track_integrity(ep_id: str, track_id: int) -> Dict[str, Any]:
-    face_rows = _track_face_rows(ep_id, track_id)
+    """Check integrity of a track's faces manifest vs crops on disk.
+
+    Returns counts for all faces (including skipped) to properly detect
+    cases where all faces were auto-skipped due to quality filters.
+    """
+    # Load ALL faces including skipped to get accurate counts
+    all_faces = _load_faces(ep_id, include_skipped=True)
+    track_faces = [f for f in all_faces if f.get("track_id") == track_id]
+
+    total_faces = len(track_faces)
+    skipped_faces = sum(1 for f in track_faces if f.get("skip"))
+    active_faces = total_faces - skipped_faces
+
     ctx, _ = _require_episode_context(ep_id)
     crops = _count_track_crops(ctx, track_id)
-    faces_count = len(face_rows)
+
+    # Track is OK if it has ANY faces (even if all skipped) and crops exist
+    ok = crops >= total_faces > 0
+
     return {
         "track_id": track_id,
-        "faces_manifest": faces_count,
+        "faces_manifest": total_faces,
+        "faces_active": active_faces,
+        "faces_skipped": skipped_faces,
         "crops_files": crops,
-        "ok": crops >= faces_count > 0,
+        "ok": ok,
+        "all_skipped": skipped_faces == total_faces and total_faces > 0,
     }
+
+
+@router.post("/episodes/{ep_id}/faces/{face_id}/unskip")
+def unskip_face(ep_id: str, face_id: str) -> Dict[str, Any]:
+    """Remove skip flag from a face, making it active again.
+
+    This allows manual override of auto-skip quality filters for faces
+    that were incorrectly marked as low quality.
+    """
+    faces = _load_faces(ep_id, include_skipped=True)
+    updated = False
+    for face in faces:
+        if face.get("face_id") == face_id:
+            if "skip" in face:
+                del face["skip"]
+                updated = True
+                break
+            else:
+                # Face exists but wasn't skipped
+                return {"status": "already_active", "face_id": face_id}
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="face_not_found")
+
+    _write_faces(ep_id, faces)
+    return {"status": "unskipped", "face_id": face_id}
+
+
+@router.post("/episodes/{ep_id}/tracks/{track_id}/unskip_all")
+def unskip_all_track_faces(ep_id: str, track_id: int) -> Dict[str, Any]:
+    """Remove skip flag from all faces in a track.
+
+    Convenience endpoint to unskip all faces in a track at once,
+    useful when the entire track was incorrectly marked as low quality.
+    """
+    faces = _load_faces(ep_id, include_skipped=True)
+    unskipped_count = 0
+    for face in faces:
+        if face.get("track_id") == track_id and "skip" in face:
+            del face["skip"]
+            unskipped_count += 1
+
+    if unskipped_count == 0:
+        return {"status": "no_skipped_faces", "track_id": track_id, "unskipped": 0}
+
+    _write_faces(ep_id, faces)
+    return {"status": "unskipped", "track_id": track_id, "unskipped": unskipped_count}
 
 
 @router.post("/episodes/{ep_id}/tracks/{track_id}/frames/move")

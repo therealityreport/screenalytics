@@ -8,6 +8,9 @@ MANUAL-FIRST, ML-SECOND RULES:
    AND ident_confidence >= high_conf_override_threshold (80%)
 2. If no manual assignment: assign if confidence >= ident_conf_threshold (60%)
 3. Otherwise: mark as uncertain and add to review queue
+
+IMPORTANT: This module uses speaker groups (from audio_speaker_groups.json) and
+manual assignments (from audio_speaker_assignments.json), NOT voice clusters.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .models import (
     ASRSegment,
+    AudioSpeakerGroupsManifest,
+    SpeakerGroup,
     TranscriptRow,
     VoiceprintIdentificationConfig,
     WordTiming,
@@ -28,6 +33,10 @@ from .pyannote_api import (
     IdentificationJobResult,
     PyannoteAPIClient,
     PyannoteAPIError,
+)
+from .voiceprint_selection import (
+    SpeakerAssignmentsManifest,
+    load_speaker_assignments,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -303,12 +312,87 @@ def _get_best_match(
     return best_cast, cast_confidences.get(best_cast)
 
 
+def _build_time_based_manual_assignments(
+    speaker_groups: AudioSpeakerGroupsManifest,
+    manual_assignments: SpeakerAssignmentsManifest,
+) -> List[Tuple[float, float, str, str]]:
+    """Build time-based list of manual assignments: [(start, end, cast_id, speaker_group_id), ...].
+
+    This allows us to look up manual assignments by time range rather than segment ID,
+    which is necessary because ASR segments may not align exactly with speaker group segments.
+    """
+    time_assignments: List[Tuple[float, float, str, str]] = []
+
+    user_assignments = manual_assignments.get_user_assignments()
+
+    # Build speaker_group_id -> SpeakerGroup lookup
+    group_lookup: Dict[str, SpeakerGroup] = {}
+    for source in speaker_groups.sources:
+        for group in source.speakers:
+            group_lookup[group.speaker_group_id] = group
+
+    # For each assignment, add all segments with time ranges
+    for speaker_group_id, assignment in user_assignments.items():
+        group = group_lookup.get(speaker_group_id)
+        if not group:
+            continue
+
+        cast_id = assignment.cast_id
+        for seg in group.segments:
+            time_assignments.append((seg.start, seg.end, cast_id, speaker_group_id))
+
+    # Sort by start time for efficient lookup
+    time_assignments.sort(key=lambda x: x[0])
+
+    return time_assignments
+
+
+def _find_manual_assignment_for_time(
+    start: float,
+    end: float,
+    time_assignments: List[Tuple[float, float, str, str]],
+    min_overlap_ratio: float = 0.5,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Find manual assignment that overlaps with given time range.
+
+    Returns (cast_id, speaker_group_id) or (None, None) if no match.
+    """
+    best_overlap = 0.0
+    best_cast_id = None
+    best_group_id = None
+
+    segment_duration = end - start
+    if segment_duration <= 0:
+        return None, None
+
+    for (seg_start, seg_end, cast_id, group_id) in time_assignments:
+        # Quick skip if no possible overlap
+        if seg_end <= start:
+            continue
+        if seg_start >= end:
+            break  # Since sorted by start, no more overlaps possible
+
+        # Calculate overlap
+        overlap_start = max(start, seg_start)
+        overlap_end = min(end, seg_end)
+        overlap = max(0, overlap_end - overlap_start)
+
+        overlap_ratio = overlap / segment_duration
+
+        if overlap_ratio >= min_overlap_ratio and overlap > best_overlap:
+            best_overlap = overlap
+            best_cast_id = cast_id
+            best_group_id = group_id
+
+    return best_cast_id, best_group_id
+
+
 def regenerate_transcript_from_identification(
     ep_id: str,
     identification_result: IdentificationResult,
     asr_segments: List[ASRSegment],
-    manual_assignments: Dict[str, Dict[str, Any]],
-    voice_clusters: List[Any],  # VoiceCluster
+    speaker_groups: AudioSpeakerGroupsManifest,
+    manual_assignments: SpeakerAssignmentsManifest,
     cast_lookup: Dict[str, str],  # cast_id -> name
     config: Optional[VoiceprintIdentificationConfig] = None,
     output_dir: Optional[Path] = None,
@@ -321,12 +405,14 @@ def regenerate_transcript_from_identification(
     2. If no manual assignment: assign if confidence >= ident_conf_threshold (60%)
     3. Otherwise: mark as uncertain
 
+    IMPORTANT: This uses speaker groups and manual assignments, NOT voice clusters.
+
     Args:
         ep_id: Episode identifier
         identification_result: Result from run_identification_pass
         asr_segments: ASR transcript segments
-        manual_assignments: Dict mapping cluster_id -> {cast_id, assigned_by, ...}
-        voice_clusters: Voice cluster data
+        speaker_groups: Speaker groups from audio_speaker_groups.json
+        manual_assignments: Manual assignments from audio_speaker_assignments.json
         cast_lookup: Dict mapping cast_id -> display name
         config: Optional configuration
         output_dir: Directory to save output artifacts
@@ -347,22 +433,9 @@ def regenerate_transcript_from_identification(
     # Build confidence lookup
     confidence_lookup = _build_confidence_lookup(identification_result.voiceprints)
 
-    # Build manual assignment lookup: segment_id -> cast_id
-    # First, build cluster_id -> cast_id from manual assignments
-    cluster_to_cast: Dict[str, str] = {}
-    for cluster_id, assignment in manual_assignments.items():
-        if assignment.get("assigned_by") == "user":
-            cast_id = assignment.get("cast_id")
-            if cast_id:
-                cluster_to_cast[cluster_id] = cast_id
-
-    # Build segment_id -> cluster_id lookup
-    segment_to_cluster: Dict[str, str] = {}
-    for vc in voice_clusters:
-        cluster_id = vc.voice_cluster_id
-        for seg in vc.segments:
-            seg_id = seg.get_segment_id()
-            segment_to_cluster[seg_id] = cluster_id
+    # Build time-based manual assignment lookup
+    time_assignments = _build_time_based_manual_assignments(speaker_groups, manual_assignments)
+    LOGGER.info(f"[{ep_id}] Built {len(time_assignments)} time-based manual assignment entries")
 
     # Process each ASR segment
     transcript_rows: List[TranscriptRow] = []
@@ -374,9 +447,10 @@ def regenerate_transcript_from_identification(
         end = asr_seg.end
         text = asr_seg.text
 
-        # Check for manual assignment
-        cluster_id = segment_to_cluster.get(seg_id)
-        manual_cast_id = cluster_to_cast.get(cluster_id) if cluster_id else None
+        # Check for manual assignment by time overlap
+        manual_cast_id, speaker_group_id = _find_manual_assignment_for_time(
+            start, end, time_assignments
+        )
         manual_cast_name = cast_lookup.get(manual_cast_id) if manual_cast_id else None
         had_manual = manual_cast_id is not None
 
@@ -456,7 +530,7 @@ def regenerate_transcript_from_identification(
             end=end,
             speaker_id=final_cast_id or "UNKNOWN",
             speaker_display_name=final_cast_name or "Unknown Speaker",
-            voice_cluster_id=cluster_id or "",
+            voice_cluster_id=speaker_group_id or "",  # Use speaker_group_id instead of cluster_id
             voice_bank_id="",
             text=text,
             conf=ident_confidence / 100.0 if ident_confidence else None,
@@ -496,7 +570,7 @@ def regenerate_transcript_from_identification(
         json.dump(
             {
                 "ep_id": ep_id,
-                "schema_version": "transcript_decisions_v1",
+                "schema_version": "transcript_decisions_v2",  # Updated version for speaker groups
                 "summary": {
                     "total": len(decisions),
                     "keep_manual": keep_manual,

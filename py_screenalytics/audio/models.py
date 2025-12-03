@@ -260,6 +260,7 @@ class SpeakerSegment(BaseModel):
     segment_id: str = Field(..., description="Stable segment identifier")
     start: float = Field(..., description="Start time in seconds")
     end: float = Field(..., description="End time in seconds")
+    diar_confidence: Optional[float] = Field(None, description="Diarization confidence from pyannote (0-1)")
 
 
 class SpeakerGroup(BaseModel):

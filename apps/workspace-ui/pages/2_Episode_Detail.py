@@ -2633,12 +2633,53 @@ if running_audio_job:
 # Audio pipeline controls (when not running)
 audio_job_running = running_audio_job is not None
 with st.expander("Audio Pipeline (Phased)", expanded=not audio_status == "complete"):
-    audio_overwrite = st.checkbox(
-        "Overwrite existing artifacts",
-        value=False,
-        key=f"audio_overwrite_{ep_id}",
-        disabled=audio_job_running,
-    )
+    # Controls row: overwrite checkbox and clear cache button
+    ctrl_col1, ctrl_col2 = st.columns([3, 1])
+    with ctrl_col1:
+        audio_overwrite = st.checkbox(
+            "Overwrite existing artifacts",
+            value=False,
+            key=f"audio_overwrite_{ep_id}",
+            disabled=audio_job_running,
+        )
+    with ctrl_col2:
+        clear_cache_clicked = st.button(
+            "🗑️ Clear Cache",
+            key=f"clear_audio_cache_detail_{ep_id}",
+            disabled=audio_job_running,
+            use_container_width=True,
+            help="Delete diarization, clustering, and transcript files (keeps audio files)",
+        )
+
+    # Handle Clear Cache button
+    if clear_cache_clicked:
+        manifest_dir = helpers.DATA_ROOT / "manifests" / ep_id
+        files_to_clear = [
+            "audio_diarization_pyannote.jsonl",
+            "audio_diarization_gpt4o.jsonl",
+            "audio_diarization.jsonl",
+            "audio_diarization_comparison.json",
+            "audio_speaker_groups.json",
+            "audio_voice_clusters.json",
+            "audio_voice_clusters_gpt4o_only.json",
+            "audio_voice_mapping.json",
+            "audio_asr_raw.jsonl",
+            "episode_transcript.jsonl",
+            "episode_transcript.vtt",
+            "audio_qc.json",
+        ]
+        deleted = []
+        for fname in files_to_clear:
+            fpath = manifest_dir / fname
+            if fpath.exists():
+                fpath.unlink()
+                deleted.append(fname)
+        if deleted:
+            st.success(f"Cleared {len(deleted)} cache files: {', '.join(deleted)}")
+            time.sleep(1)
+            st.rerun()
+        else:
+            st.info("No cache files to clear")
 
     # Phase 1: Create Audio Files
     st.markdown("---")

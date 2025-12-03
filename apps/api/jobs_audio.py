@@ -1160,11 +1160,14 @@ def episode_voiceprint_refresh_task(
 
     This task:
     1. Validates prerequisites (diarized, transcribed, manual assignments)
-    2. Selects voiceprint segments per cast
+    2. Selects voiceprint segments per cast (from speaker groups, not voice clusters)
     3. Creates/updates voiceprints via Pyannote API
     4. Runs identification on the episode
     5. Regenerates speaker-attributed transcript
     6. Generates review queue for low-confidence segments
+
+    IMPORTANT: This task requires manual speaker assignments (audio_speaker_assignments.json).
+    If no manual assignments exist, the task returns status="skipped" with reason="no_manual_assignments".
 
     Args:
         ep_id: Episode identifier
@@ -1187,14 +1190,16 @@ def episode_voiceprint_refresh_task(
 
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
+        import json
 
         from py_screenalytics.audio.models import (
-            DiarizationSegment,
             VoiceprintIdentificationConfig,
         )
         from py_screenalytics.audio.voiceprint_selection import (
             select_voiceprint_segments,
             save_selection_artifact,
+            load_speaker_assignments,
+            SpeakerAssignmentsManifest,
         )
         from py_screenalytics.audio.voiceprint_manager import (
             create_voiceprints_for_episode,
@@ -1207,9 +1212,9 @@ def episode_voiceprint_refresh_task(
         from py_screenalytics.audio.review_queue import (
             generate_review_queue,
         )
+        from py_screenalytics.audio.speaker_groups import load_speaker_groups_manifest
         from py_screenalytics.audio.episode_audio_pipeline import _get_audio_paths
         from apps.api.services.cast import CastService
-        from apps.api.services.grouping import GroupingService
 
         # Detect show_id from ep_id if not provided
         if show_id is None:
@@ -1224,12 +1229,53 @@ def episode_voiceprint_refresh_task(
 
         paths = _get_audio_paths(ep_id)
         data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+        manifest_dir = data_root / "manifests" / ep_id
 
-        # Validate prerequisites
+        # =========================================================================
+        # HARD GATE: Check for manual speaker assignments FIRST
+        # =========================================================================
+        speaker_assignments_path = manifest_dir / "audio_speaker_assignments.json"
+        manual_assignments = load_speaker_assignments(speaker_assignments_path)
+
+        # Check if there are ANY user-confirmed assignments
+        if manual_assignments is None:
+            LOGGER.info(f"[{ep_id}] No manual assignments file; skipping voiceprint refresh")
+            return {
+                "status": "skipped",
+                "reason": "no_manual_assignments",
+                "ep_id": ep_id,
+                "message": "No audio_speaker_assignments.json found. Please assign speaker groups to cast members first.",
+            }
+
+        user_assignments = manual_assignments.get_user_assignments()
+        if not user_assignments:
+            LOGGER.info(f"[{ep_id}] Manual assignments file exists but has no user-confirmed assignments; skipping")
+            return {
+                "status": "skipped",
+                "reason": "no_manual_assignments",
+                "ep_id": ep_id,
+                "message": "No user-confirmed speaker assignments found. Please assign speaker groups to cast members first.",
+            }
+
+        LOGGER.info(f"[{ep_id}] Found {len(user_assignments)} user-confirmed speaker assignments")
+
+        # =========================================================================
+        # Load speaker groups manifest
+        # =========================================================================
+        speaker_groups_path = paths.get("speaker_groups") or (manifest_dir / "audio_speaker_groups.json")
+        if not speaker_groups_path.exists():
+            raise FileNotFoundError(
+                f"Speaker groups manifest not found at {speaker_groups_path}. "
+                f"Run diarization first to generate speaker groups."
+            )
+
+        _write_progress(ep_id, "voiceprint_refresh", "Loading speaker groups...", 0.05)
+        speaker_groups = load_speaker_groups_manifest(speaker_groups_path)
+
+        # Validate other prerequisites
         required = [
             (paths["diarization"], "diarization manifest"),
             (paths["asr_raw"], "ASR transcript"),
-            (paths["voice_clusters"], "voice clusters"),
         ]
         missing = [desc for path, desc in required if not path.exists()]
         if missing:
@@ -1244,43 +1290,17 @@ def episode_voiceprint_refresh_task(
             config.voiceprint_overwrite_policy = "always"
         config.ident_matching_threshold = ident_threshold
 
-        # Load diarization segments
-        _write_progress(ep_id, "voiceprint_refresh", "Loading diarization...", 0.05)
-        import json
-        diarization_segments = []
-        with open(paths["diarization"], "r", encoding="utf-8") as f:
-            for line in f:
-                seg_data = json.loads(line.strip())
-                diarization_segments.append(DiarizationSegment(**seg_data))
-
-        # Load voice clusters
-        _write_progress(ep_id, "voiceprint_refresh", "Loading voice clusters...", 0.08)
-        from py_screenalytics.audio.voice_clusters import load_voice_clusters_manifest
-        voice_clusters = load_voice_clusters_manifest(paths["voice_clusters"])
-
-        # Load manual assignments
-        _write_progress(ep_id, "voiceprint_refresh", "Loading manual assignments...", 0.10)
-        grouping_service = GroupingService()
-        manual_assignments = grouping_service._load_manual_assignments(ep_id)
-
-        if not manual_assignments:
-            raise ValueError(
-                "No manual assignments found. "
-                "Please assign some diarization segments to cast members first."
-            )
-
         # Build cast lookup
         cast_service = CastService()
         cast_members = cast_service.list_cast(show_id)
         cast_lookup = {m["cast_id"]: m.get("name", "Unknown") for m in cast_members}
 
-        # Step 1: Select voiceprint segments
+        # Step 1: Select voiceprint segments (from speaker groups, not voice clusters)
         _write_progress(ep_id, "voiceprint_refresh", "Selecting voiceprint segments...", 0.15)
         selections = select_voiceprint_segments(
             ep_id=ep_id,
-            diarization_segments=diarization_segments,
+            speaker_groups=speaker_groups,
             manual_assignments=manual_assignments,
-            voice_clusters=voice_clusters,
             cast_lookup=cast_lookup,
             config=config,
         )
@@ -1346,14 +1366,24 @@ def episode_voiceprint_refresh_task(
             ep_id=ep_id,
             identification_result=ident_result,
             asr_segments=asr_segments,
+            speaker_groups=speaker_groups,
             manual_assignments=manual_assignments,
-            voice_clusters=voice_clusters,
             cast_lookup=cast_lookup,
             config=config,
+            output_dir=manifest_dir,
         )
 
         # Step 5: Generate review queue
         _write_progress(ep_id, "voiceprint_refresh", "Generating review queue...", 0.90)
+
+        # Load diarization segments for review queue confidence lookup
+        from py_screenalytics.audio.models import DiarizationSegment
+        diarization_segments = []
+        with open(paths["diarization"], "r", encoding="utf-8") as f:
+            for line in f:
+                seg_data = json.loads(line.strip())
+                diarization_segments.append(DiarizationSegment(**seg_data))
+
         review_queue = generate_review_queue(
             ep_id=ep_id,
             decisions=decisions,
