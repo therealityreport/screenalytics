@@ -161,13 +161,23 @@ def _build_cluster_mapping(
 def _build_group_cluster_lookup(
     voice_clusters: List[VoiceCluster],
 ) -> Dict[str, str]:
-    """Map speaker_group_id -> voice_cluster_id."""
+    """Map speaker_group_id -> voice_cluster_id.
+
+    Handles multiple speaker ID formats for cross-source lookups:
+    - Raw speaker label: "SPEAKER_00"
+    - Pyannote prefixed: "pyannote:SPEAKER_00"
+    - GPT-4o prefixed: "gpt4o:Speaker 1"
+    """
     mapping: Dict[str, str] = {}
     for cluster in voice_clusters:
         for seg in cluster.segments:
             if seg.diar_speaker:
+                # Map raw speaker label
                 mapping[seg.diar_speaker] = cluster.voice_cluster_id
+                # Map with pyannote prefix (common format)
                 mapping[f"pyannote:{seg.diar_speaker}"] = cluster.voice_cluster_id
+                # Map with gpt4o prefix for cross-source compatibility
+                mapping[f"gpt4o:{seg.diar_speaker}"] = cluster.voice_cluster_id
         for gid in cluster.speaker_group_ids:
             mapping[gid] = cluster.voice_cluster_id
         for source_group in cluster.sources:
@@ -217,6 +227,138 @@ def _find_best_diarization_match(
             best_match = diar_seg
 
     return best_match
+
+
+def _find_nearest_speaker(
+    segment_start: float,
+    segment_end: float,
+    diarization_segments: List[DiarizationSegment],
+) -> Optional[str]:
+    """Find the nearest speaker when there's no direct overlap.
+
+    Used as fallback in WhisperX-style merge when no diarization segment
+    overlaps with the ASR segment.
+
+    Args:
+        segment_start: Start time of the ASR segment
+        segment_end: End time of the ASR segment
+        diarization_segments: List of diarization segments
+
+    Returns:
+        Speaker label from nearest segment, or None if no segments
+    """
+    if not diarization_segments:
+        return None
+
+    segment_mid = (segment_start + segment_end) / 2
+    nearest_speaker = None
+    min_distance = float("inf")
+
+    for diar_seg in diarization_segments:
+        # Distance to segment midpoint
+        diar_mid = (diar_seg.start + diar_seg.end) / 2
+        distance = abs(segment_mid - diar_mid)
+
+        if distance < min_distance:
+            min_distance = distance
+            nearest_speaker = diar_seg.speaker
+
+    return nearest_speaker
+
+
+def assign_speakers_whisperx_style(
+    asr_segments: List[ASRSegment],
+    diarization_segments: List[DiarizationSegment],
+    fill_nearest: bool = True,
+) -> List[ASRSegment]:
+    """Assign speakers using WhisperX timestamp intersection algorithm.
+
+    This implements the official WhisperX-based algorithm from PyannoteAI docs:
+    1. For each ASR segment/word, find all overlapping diarization segments
+    2. Compute intersection duration with each
+    3. Assign speaker with maximum overlap
+    4. If no overlap and fill_nearest=True, use nearest segment by time
+
+    This is more accurate than simple best-overlap matching because it
+    considers total intersection duration across potentially multiple
+    overlapping diarization segments.
+
+    Args:
+        asr_segments: List of ASR segments with text and timestamps
+        diarization_segments: List of diarization segments with speaker labels
+        fill_nearest: If True, use nearest speaker when no overlap (default True)
+
+    Returns:
+        List of ASRSegment objects with speaker field populated
+    """
+    LOGGER.info("Merging diarization with ASR transcripts using WhisperX-style intersection...")
+
+    if not diarization_segments:
+        LOGGER.warning("No diarization segments provided, cannot assign speakers")
+        return asr_segments
+
+    # Sort diarization segments by start time for efficient lookup
+    sorted_diar = sorted(diarization_segments, key=lambda s: s.start)
+
+    assigned_segments = []
+    unknown_count = 0
+
+    for asr_seg in asr_segments:
+        # Find all overlapping diarization segments
+        overlaps = []
+        for diar_seg in sorted_diar:
+            # Check for overlap: segments overlap if start < other_end and end > other_start
+            if diar_seg.start < asr_seg.end and diar_seg.end > asr_seg.start:
+                # Calculate intersection duration
+                intersection_start = max(asr_seg.start, diar_seg.start)
+                intersection_end = min(asr_seg.end, diar_seg.end)
+                duration = intersection_end - intersection_start
+
+                if duration > 0:
+                    overlaps.append({
+                        "speaker": diar_seg.speaker,
+                        "duration": duration,
+                    })
+
+        # Assign speaker based on overlaps
+        if overlaps:
+            # Sum durations per speaker (handles multiple segments from same speaker)
+            speaker_durations: Dict[str, float] = {}
+            for overlap in overlaps:
+                speaker = overlap["speaker"]
+                speaker_durations[speaker] = speaker_durations.get(speaker, 0) + overlap["duration"]
+
+            # Assign speaker with maximum total overlap
+            assigned_speaker = max(speaker_durations.items(), key=lambda x: x[1])[0]
+        elif fill_nearest:
+            # No overlap - use nearest speaker
+            assigned_speaker = _find_nearest_speaker(
+                asr_seg.start, asr_seg.end, sorted_diar
+            )
+            if not assigned_speaker:
+                assigned_speaker = "UNKNOWN"
+                unknown_count += 1
+        else:
+            assigned_speaker = "UNKNOWN"
+            unknown_count += 1
+
+        # Create new segment with speaker assigned
+        assigned_segments.append(ASRSegment(
+            segment_id=asr_seg.segment_id,
+            start=asr_seg.start,
+            end=asr_seg.end,
+            text=asr_seg.text,
+            confidence=asr_seg.confidence,
+            words=asr_seg.words,
+            language=asr_seg.language,
+            speaker=assigned_speaker,
+        ))
+
+    if unknown_count > 0:
+        LOGGER.warning(f"Could not assign speaker to {unknown_count} segments")
+
+    LOGGER.info(f"WhisperX-style speaker assignment complete: {len(assigned_segments)} segments")
+    return assigned_segments
 
 
 def _find_best_diarization_match_word(

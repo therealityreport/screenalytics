@@ -1135,6 +1135,342 @@ def episode_audio_finalize_async(
     }
 
 
+# =============================================================================
+# Voiceprint Identification Task
+# =============================================================================
+
+
+# Add voiceprint_refresh to stage info
+STAGE_INFO["voiceprint_refresh"] = {
+    "order": 10,
+    "name": "Voiceprint Identification",
+    "progress_start": 0.0,
+}
+
+
+@celery_app.task(bind=True, base=AudioPipelineTask, name="audio.voiceprint_refresh")
+def episode_voiceprint_refresh_task(
+    self,
+    ep_id: str,
+    show_id: Optional[str] = None,
+    overwrite_voiceprints: bool = False,
+    ident_threshold: int = 60,
+) -> Dict[str, Any]:
+    """Run voiceprint identification refresh for an episode.
+
+    This task:
+    1. Validates prerequisites (diarized, transcribed, manual assignments)
+    2. Selects voiceprint segments per cast (from speaker groups, not voice clusters)
+    3. Creates/updates voiceprints via Pyannote API
+    4. Runs identification on the episode
+    5. Regenerates speaker-attributed transcript
+    6. Generates review queue for low-confidence segments
+
+    IMPORTANT: This task requires manual speaker assignments (audio_speaker_assignments.json).
+    If no manual assignments exist, the task returns status="skipped" with reason="no_manual_assignments".
+
+    Args:
+        ep_id: Episode identifier
+        show_id: Show identifier (auto-detected from ep_id if not provided)
+        overwrite_voiceprints: Whether to overwrite existing voiceprints
+        ident_threshold: Identification confidence threshold (0-100)
+
+    Returns:
+        Result dict with status and metrics
+    """
+    job_id = self.request.id
+    LOGGER.info(f"[{job_id}] Starting voiceprint refresh for {ep_id}")
+
+    if not _acquire_lock(ep_id, "voiceprint_refresh", job_id):
+        return {
+            "status": "error",
+            "error": "Another voiceprint refresh job is already running",
+            "ep_id": ep_id,
+        }
+
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        import json
+
+        from py_screenalytics.audio.models import (
+            VoiceprintIdentificationConfig,
+        )
+        from py_screenalytics.audio.voiceprint_selection import (
+            select_voiceprint_segments,
+            save_selection_artifact,
+            load_speaker_assignments,
+            SpeakerAssignmentsManifest,
+        )
+        from py_screenalytics.audio.voiceprint_manager import (
+            create_voiceprints_for_episode,
+            save_voiceprint_summary,
+        )
+        from py_screenalytics.audio.identification_pass import (
+            run_identification_pass,
+            regenerate_transcript_from_identification,
+        )
+        from py_screenalytics.audio.review_queue import (
+            generate_review_queue,
+        )
+        from py_screenalytics.audio.speaker_groups import load_speaker_groups_manifest
+        from py_screenalytics.audio.episode_audio_pipeline import _get_audio_paths
+        from apps.api.services.cast import CastService
+
+        # Detect show_id from ep_id if not provided
+        if show_id is None:
+            # Extract show_id from ep_id pattern like "rhoslc-s06e02"
+            parts = ep_id.split("-")
+            if len(parts) >= 2:
+                show_id = parts[0].upper()
+            else:
+                show_id = ep_id.split("_")[0].upper()
+
+        _write_progress(ep_id, "voiceprint_refresh", "Loading prerequisites...", 0.0)
+
+        paths = _get_audio_paths(ep_id)
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+        manifest_dir = data_root / "manifests" / ep_id
+
+        # =========================================================================
+        # HARD GATE: Check for manual speaker assignments FIRST
+        # =========================================================================
+        speaker_assignments_path = manifest_dir / "audio_speaker_assignments.json"
+        manual_assignments = load_speaker_assignments(speaker_assignments_path)
+
+        # Check if there are ANY user-confirmed assignments
+        if manual_assignments is None:
+            LOGGER.info(f"[{ep_id}] No manual assignments file; skipping voiceprint refresh")
+            return {
+                "status": "skipped",
+                "reason": "no_manual_assignments",
+                "ep_id": ep_id,
+                "message": "No audio_speaker_assignments.json found. Please assign speaker groups to cast members first.",
+            }
+
+        user_assignments = manual_assignments.get_user_assignments()
+        if not user_assignments:
+            LOGGER.info(f"[{ep_id}] Manual assignments file exists but has no user-confirmed assignments; skipping")
+            return {
+                "status": "skipped",
+                "reason": "no_manual_assignments",
+                "ep_id": ep_id,
+                "message": "No user-confirmed speaker assignments found. Please assign speaker groups to cast members first.",
+            }
+
+        LOGGER.info(f"[{ep_id}] Found {len(user_assignments)} user-confirmed speaker assignments")
+
+        # =========================================================================
+        # Load speaker groups manifest
+        # =========================================================================
+        speaker_groups_path = paths.get("speaker_groups") or (manifest_dir / "audio_speaker_groups.json")
+        if not speaker_groups_path.exists():
+            raise FileNotFoundError(
+                f"Speaker groups manifest not found at {speaker_groups_path}. "
+                f"Run diarization first to generate speaker groups."
+            )
+
+        _write_progress(ep_id, "voiceprint_refresh", "Loading speaker groups...", 0.05)
+        speaker_groups = load_speaker_groups_manifest(speaker_groups_path)
+
+        # Validate other prerequisites
+        required = [
+            (paths["diarization"], "diarization manifest"),
+            (paths["asr_raw"], "ASR transcript"),
+        ]
+        missing = [desc for path, desc in required if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing required artifacts: {', '.join(missing)}. "
+                f"Run audio pipeline first."
+            )
+
+        # Load configuration
+        config = VoiceprintIdentificationConfig()
+        if overwrite_voiceprints:
+            config.voiceprint_overwrite_policy = "always"
+        config.ident_matching_threshold = ident_threshold
+
+        # Build cast lookup
+        cast_service = CastService()
+        cast_members = cast_service.list_cast(show_id)
+        cast_lookup = {m["cast_id"]: m.get("name", "Unknown") for m in cast_members}
+
+        # Step 1: Select voiceprint segments (from speaker groups, not voice clusters)
+        _write_progress(ep_id, "voiceprint_refresh", "Selecting voiceprint segments...", 0.15)
+        selections = select_voiceprint_segments(
+            ep_id=ep_id,
+            speaker_groups=speaker_groups,
+            manual_assignments=manual_assignments,
+            cast_lookup=cast_lookup,
+            config=config,
+        )
+
+        # Save selection artifact
+        selection_path = data_root / "manifests" / ep_id / "voiceprint_selection.json"
+        save_selection_artifact(ep_id, selections, selection_path)
+
+        ready_count = sum(1 for s in selections.values() if s.status == "ready")
+        if ready_count == 0:
+            raise ValueError(
+                "No cast members have enough clean speech for voiceprint creation. "
+                f"Minimum required: {config.min_total_clean_speech_per_cast}s per cast member."
+            )
+
+        # Step 2: Create voiceprints
+        _write_progress(ep_id, "voiceprint_refresh", f"Creating voiceprints for {ready_count} cast members...", 0.25)
+
+        # Determine audio path (prefer enhanced vocals)
+        audio_path = paths["vocals_enhanced"]
+        if not audio_path.exists():
+            audio_path = paths["vocals"]
+        if not audio_path.exists():
+            audio_path = paths["original"]
+
+        voiceprint_results = create_voiceprints_for_episode(
+            ep_id=ep_id,
+            show_id=show_id,
+            selections=selections,
+            audio_path=audio_path,
+            config=config,
+        )
+
+        # Save voiceprint summary
+        voiceprint_summary_path = data_root / "manifests" / ep_id / "voiceprint_creation_summary.json"
+        save_voiceprint_summary(ep_id, voiceprint_results, voiceprint_summary_path)
+
+        success_count = sum(1 for r in voiceprint_results.values() if r.status == "success")
+
+        # Step 3: Run identification
+        _write_progress(ep_id, "voiceprint_refresh", f"Running identification with {success_count} voiceprints...", 0.50)
+        ident_result = run_identification_pass(
+            ep_id=ep_id,
+            show_id=show_id,
+            audio_path=audio_path,
+            config=config,
+        )
+
+        if ident_result.status != "success":
+            raise RuntimeError(f"Identification failed: {ident_result.error}")
+
+        # Step 4: Load ASR segments and regenerate transcript
+        _write_progress(ep_id, "voiceprint_refresh", "Regenerating transcript...", 0.70)
+
+        from py_screenalytics.audio.models import ASRSegment
+        asr_segments = []
+        with open(paths["asr_raw"], "r", encoding="utf-8") as f:
+            for line in f:
+                seg_data = json.loads(line.strip())
+                asr_segments.append(ASRSegment(**seg_data))
+
+        transcript_rows, decisions = regenerate_transcript_from_identification(
+            ep_id=ep_id,
+            identification_result=ident_result,
+            asr_segments=asr_segments,
+            speaker_groups=speaker_groups,
+            manual_assignments=manual_assignments,
+            cast_lookup=cast_lookup,
+            config=config,
+            output_dir=manifest_dir,
+        )
+
+        # Step 5: Generate review queue
+        _write_progress(ep_id, "voiceprint_refresh", "Generating review queue...", 0.90)
+
+        # Load diarization segments for review queue confidence lookup
+        from py_screenalytics.audio.models import DiarizationSegment
+        diarization_segments = []
+        with open(paths["diarization"], "r", encoding="utf-8") as f:
+            for line in f:
+                seg_data = json.loads(line.strip())
+                diarization_segments.append(DiarizationSegment(**seg_data))
+
+        review_queue = generate_review_queue(
+            ep_id=ep_id,
+            decisions=decisions,
+            diarization_segments=diarization_segments,
+            identification_result=ident_result,
+            config=config,
+            output_path=data_root / "manifests" / ep_id / "review_queue.voiceprints.json",
+        )
+
+        # Complete
+        _write_progress_complete(ep_id, "Voiceprint identification complete")
+
+        # Build summary
+        keep_manual = sum(1 for d in decisions if d.decision == "keep_manual")
+        override_manual = sum(1 for d in decisions if d.decision == "override_manual")
+        assign_ident = sum(1 for d in decisions if d.decision == "assign_ident")
+        uncertain = sum(1 for d in decisions if d.decision == "uncertain")
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "show_id": show_id,
+            "voiceprints_created": success_count,
+            "identification_segments": len(ident_result.identification),
+            "transcript_rows": len(transcript_rows),
+            "decisions": {
+                "keep_manual": keep_manual,
+                "override_manual": override_manual,
+                "assign_ident": assign_ident,
+                "uncertain": uncertain,
+            },
+            "review_queue_entries": len(review_queue),
+        }
+
+    except Exception as e:
+        LOGGER.exception(f"[{job_id}] Voiceprint refresh failed: {e}")
+        _write_progress_error(ep_id, "voiceprint_refresh", str(e))
+        return {
+            "status": "error",
+            "ep_id": ep_id,
+            "error": str(e),
+        }
+    finally:
+        _release_lock(ep_id, "voiceprint_refresh", job_id)
+
+
+def episode_voiceprint_refresh_async(
+    ep_id: str,
+    show_id: Optional[str] = None,
+    overwrite_voiceprints: bool = False,
+    ident_threshold: int = 60,
+) -> Dict[str, Any]:
+    """Queue voiceprint identification refresh job.
+
+    Args:
+        ep_id: Episode identifier
+        show_id: Show identifier (auto-detected if not provided)
+        overwrite_voiceprints: Whether to overwrite existing voiceprints
+        ident_threshold: Identification confidence threshold (0-100)
+
+    Returns:
+        Dict with job_id and status
+    """
+    existing = check_active_job(ep_id, "voiceprint_refresh")
+    if existing:
+        return {
+            "status": "error",
+            "error": "Another voiceprint refresh job is already running",
+            "existing_job_id": existing,
+            "ep_id": ep_id,
+        }
+
+    result = episode_voiceprint_refresh_task.delay(
+        ep_id=ep_id,
+        show_id=show_id,
+        overwrite_voiceprints=overwrite_voiceprints,
+        ident_threshold=ident_threshold,
+    )
+
+    return {
+        "job_id": result.id,
+        "status": "queued",
+        "ep_id": ep_id,
+        "task": "voiceprint_refresh",
+    }
+
+
 # Export public API
 __all__ = [
     "episode_audio_ingest_task",
@@ -1152,5 +1488,8 @@ __all__ = [
     "episode_audio_files_async",
     "episode_audio_diarize_transcribe_async",
     "episode_audio_finalize_async",
+    # Voiceprint identification
+    "episode_voiceprint_refresh_task",
+    "episode_voiceprint_refresh_async",
     "AUDIO_QUEUES",
 ]

@@ -57,17 +57,38 @@ class DiarizationConfig(BaseModel):
     Note: min_speakers/max_speakers are HINTS, not guarantees. Pyannote may still
     detect fewer speakers if it determines they are similar. Use num_speakers to
     force a specific count when you know it ahead of time.
+
+    Backend options:
+    - "precision-2": pyannoteAI cloud API (requires PYANNOTEAI_API_KEY)
+    - "oss-3.1": Local open-source pyannote/speaker-diarization-3.1 model
+
+    When backend="precision-2" and PYANNOTEAI_API_KEY is not set, falls back to oss-3.1.
+
+    Official API workflow:
+    - Speaker range is automatically calculated from cast count (cast ± 3)
+    - exclusive=True for clean segment merging (non-overlapping speakers)
+    - Poll interval is 5-8 seconds per official docs
+    - Webhook support for async completion
     """
     model_config = {"protected_namespaces": ()}
     provider: str = "pyannote"
-    model_name: str = "pyannote/speaker-diarization-3.1"
+    backend: str = "precision-2"  # "precision-2" (API) | "oss-3.1" (local)
+    model_name: str = "pyannote/speaker-diarization-precision-2"
     min_speech: float = 0.2
     max_overlap: float = 0.1
     merge_gap_ms: int = 300
     min_speakers: int = 1
-    max_speakers: int = 20  # Safe upper bound for reality TV
+    max_speakers: int = 10  # Safe upper bound for reality TV
     # Force exact speaker count (overrides min/max if set)
     num_speakers: Optional[int] = None
+    # API timeout in seconds for cloud diarization (precision-2)
+    api_timeout_seconds: int = 900  # 15 minutes - allows for long episodes and API load
+
+    # Official API workflow fields
+    use_exclusive_diarization: bool = True  # Always use exclusive mode for clean merging
+    webhook_url: Optional[str] = None  # Optional webhook URL for async notification
+    api_poll_interval_base: float = 6.0  # Base polling interval (5-8s per docs)
+    api_poll_interval_jitter: float = 2.0  # Random jitter for polling
 
 
 class ASRConfig(BaseModel):
@@ -102,6 +123,9 @@ class VoiceClusteringConfig(BaseModel):
     min_segments_per_cluster: int = 1  # Allow single-segment clusters for trailers
     embedding_model: str = "pyannote/embedding"
     centroid_method: str = "mean"
+    # Skip embedding-based clustering and use pyannote speaker labels directly
+    # Set True when pyannote diarization is accurate and clustering causes over-merging
+    use_diarization_labels: bool = False
 
 
 class VoiceBankConfig(BaseModel):
@@ -109,6 +133,44 @@ class VoiceBankConfig(BaseModel):
     data_dir: str = "data/voice_bank"
     auto_create_unlabeled: bool = True
     max_unlabeled_per_episode: int = 20
+
+
+class VoiceprintIdentificationConfig(BaseModel):
+    """Configuration for voiceprint identification pass.
+
+    HARD RULES (Manual-First, ML-Second):
+    1. Manual assignments are preserved unless allow_high_conf_override=True
+       AND ident_confidence >= high_conf_override_threshold (80%)
+    2. "if_better" policy requires 10%+ improvement in score
+    3. Minimum 10s clean speech required to create voiceprint
+    4. Identification never silently relabels - low confidence goes to review queue
+    """
+
+    # Segment selection for voiceprint creation
+    min_segment_duration: float = 4.0  # Minimum segment duration in seconds
+    max_segment_duration: float = 20.0  # Maximum segment duration (Pyannote limit is 30s)
+    max_segments_per_cast: int = 3  # Max segments to use for voiceprint creation
+    min_total_clean_speech_per_cast: float = 10.0  # Must have 10s+ to create voiceprint
+
+    # Voiceprint creation policy
+    voiceprint_overwrite_policy: str = "if_missing"  # "if_missing" | "always" | "if_better"
+    # For "if_better": score = total_duration_s * mean_confidence
+    # Only overwrite if new_score > old_score * improvement_threshold
+    if_better_improvement_threshold: float = 1.1  # Require 10% improvement
+
+    # Identification matching (Pyannote API params)
+    ident_matching_threshold: int = 60  # Minimum confidence for matching (0-100)
+    ident_matching_exclusive: bool = True  # Prevent multiple speakers matching same voiceprint
+
+    # Transcript regeneration - MANUAL-FIRST, ML-SECOND
+    ident_conf_threshold: float = 60.0  # Minimum confidence to assign cast from identification
+    high_conf_override_threshold: float = 80.0  # Threshold to override MANUAL assignments
+    allow_high_conf_override: bool = False  # Must explicitly enable overriding manual assignments
+    preserve_manual_assignments: bool = True  # HARD RULE: manual corrections always win
+
+    # Review queue generation
+    diar_conf_threshold: float = 70.0  # Flag segments below this diarization confidence
+    review_queue_enabled: bool = True  # Generate review queue artifact
 
 
 class QCConfig(BaseModel):
@@ -155,13 +217,37 @@ class AudioPipelineConfig(BaseModel):
 # ============================================================================
 
 
+def generate_segment_id(start: float, end: float, prefix: str = "seg") -> str:
+    """
+    Generate a stable segment ID based on timestamps.
+
+    Args:
+        start: Start time in seconds
+        end: End time in seconds
+        prefix: ID prefix (e.g., "diar", "asr", "vc")
+
+    Returns:
+        Stable segment ID like "diar_12345_67890" (start/end in ms)
+    """
+    start_ms = int(start * 1000)
+    end_ms = int(end * 1000)
+    return f"{prefix}_{start_ms}_{end_ms}"
+
+
 class DiarizationSegment(BaseModel):
     """A single diarization segment."""
+    segment_id: Optional[str] = Field(None, description="Stable segment identifier")
     start: float = Field(..., description="Start time in seconds")
     end: float = Field(..., description="End time in seconds")
     speaker: str = Field(..., description="Raw speaker label from diarization")
     confidence: Optional[float] = Field(None, description="Diarization confidence")
     overlap_ratio: Optional[float] = Field(None, description="Overlap ratio with other speakers")
+
+    def get_segment_id(self) -> str:
+        """Get or generate stable segment ID."""
+        if self.segment_id:
+            return self.segment_id
+        return generate_segment_id(self.start, self.end, "diar")
 
 
 # ============================================================================
@@ -174,6 +260,7 @@ class SpeakerSegment(BaseModel):
     segment_id: str = Field(..., description="Stable segment identifier")
     start: float = Field(..., description="Start time in seconds")
     end: float = Field(..., description="End time in seconds")
+    diar_confidence: Optional[float] = Field(None, description="Diarization confidence from pyannote (0-1)")
 
 
 class SpeakerGroup(BaseModel):
@@ -237,6 +324,7 @@ class WordTiming(BaseModel):
 
 class ASRSegment(BaseModel):
     """A single ASR segment."""
+    segment_id: Optional[str] = Field(None, description="Stable segment identifier")
     start: float = Field(..., description="Segment start time")
     end: float = Field(..., description="Segment end time")
     text: str = Field(..., description="Transcribed text")
@@ -244,6 +332,12 @@ class ASRSegment(BaseModel):
     words: Optional[List[WordTiming]] = Field(None, description="Word-level timings")
     language: Optional[str] = Field(None, description="Detected language")
     speaker: Optional[str] = Field(None, description="Speaker label (from gpt-4o-transcribe-diarize)")
+
+    def get_segment_id(self) -> str:
+        """Get or generate stable segment ID."""
+        if self.segment_id:
+            return self.segment_id
+        return generate_segment_id(self.start, self.end, "asr")
 
 
 # ============================================================================
@@ -253,10 +347,17 @@ class ASRSegment(BaseModel):
 
 class VoiceClusterSegment(BaseModel):
     """A segment belonging to a voice cluster."""
+    segment_id: Optional[str] = Field(None, description="Stable segment identifier")
     start: float
     end: float
     diar_speaker: str
     speaker_group_id: Optional[str] = Field(None, description="Speaker group identifier for the segment")
+
+    def get_segment_id(self) -> str:
+        """Get or generate stable segment ID."""
+        if self.segment_id:
+            return self.segment_id
+        return generate_segment_id(self.start, self.end, "vc")
 
 
 class VoiceClusterSourceGroup(BaseModel):

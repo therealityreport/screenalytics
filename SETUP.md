@@ -61,6 +61,27 @@ S3_BUCKET=screenalytics
 OPENAI_API_KEY=sk-xxxx
 ```
 
+### pyannoteAI Setup (Recommended for Diarization)
+
+The audio pipeline supports two diarization backends:
+
+| Backend | Description | Env Var |
+|---------|-------------|---------|
+| `precision-2` | **Recommended.** pyannoteAI cloud API with superior accuracy for overlapping speech | `PYANNOTEAI_API_KEY` |
+| `oss-3.1` | Local open-source pyannote 3.1 model (fallback) | `PYANNOTE_AUTH_TOKEN` |
+
+**To use Precision-2 (recommended):**
+1. Sign up at [https://www.pyannote.ai/](https://www.pyannote.ai/)
+2. Get your API key from the dashboard
+3. Add to `.env`:
+   ```
+   PYANNOTEAI_API_KEY=your-api-key-here
+   ```
+
+The pipeline defaults to `precision-2`. If `PYANNOTEAI_API_KEY` is not set, it automatically falls back to the local OSS 3.1 model.
+
+**Cost notes:** pyannoteAI charges per audio minute processed. Check their pricing at [pyannote.ai](https://www.pyannote.ai/).
+
 ---
 
 ## 3️⃣ Local services (Docker)

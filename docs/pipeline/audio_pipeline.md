@@ -82,21 +82,23 @@ audio_pipeline:
 
   diarization:
     provider: "pyannote"
-    model_name: "pyannote/speaker-diarization-3.1"
+    backend: "precision-2"           # "precision-2" (cloud API) | "oss-3.1" (local)
+    model_name: "pyannote/speaker-diarization-precision-2"
     min_speech: 0.2
-    merge_gap_ms: 300
-    min_speakers: 1
-    max_speakers: 10
+    merge_gap_ms: 150
+    min_speakers: 4                  # Reality TV usually has 4+ speakers
+    max_speakers: 15                 # Increased for large casts
+    api_timeout_seconds: 900         # 15 min timeout for long episodes
 
   asr:
-    provider: "openai_whisper"  # or "gemini"
-    model: "whisper-1"
+    provider: "openai_whisper"       # or "gemini"
+    model: "gpt-4o-transcribe"       # Higher quality than whisper-1
     language: "en"
     timestamp_granularity: "word"
 
   voice_clustering:
-    similarity_threshold: 0.78
-    min_samples_per_cluster: 2
+    similarity_threshold: 0.30       # Lower = more aggressive clustering
+    min_samples_per_cluster: 1       # Allow single-segment clusters
     merge_gap_ms: 500
 
   qc:
@@ -111,6 +113,39 @@ audio_pipeline:
     bit_depth: 24
     format: "wav"
 ```
+
+### 4.1 Diarization Backend
+
+The audio pipeline supports two diarization backends for the Pyannote provider:
+
+| Backend | Model | Description |
+|---------|-------|-------------|
+| `precision-2` | `pyannote/speaker-diarization-precision-2` | **Recommended.** pyannoteAI cloud API with superior accuracy for overlapping speech, cross-talk, and multi-speaker reality TV content. |
+| `oss-3.1` | `pyannote/speaker-diarization-3.1` | Local open-source model. Good baseline accuracy, runs entirely on your machine. |
+
+**Configuration:**
+```yaml
+diarization:
+  backend: "precision-2"  # or "oss-3.1"
+```
+
+**Environment Variables:**
+- `PYANNOTEAI_API_KEY` — Required for `precision-2` backend. Get from [pyannote.ai](https://www.pyannote.ai/)
+- `PYANNOTE_AUTH_TOKEN` — Required for `oss-3.1` backend. Get from [HuggingFace](https://huggingface.co/settings/tokens)
+
+**Fallback Behavior:**
+When `backend: "precision-2"` is configured but `PYANNOTEAI_API_KEY` is not set, the pipeline automatically falls back to `oss-3.1` and logs a warning.
+
+**When to use Precision-2:**
+- Multi-speaker scenes with overlapping speech
+- Reality TV with cross-talk and interruptions
+- Content requiring accurate speaker counts
+- Production transcripts where accuracy matters most
+
+**When to use OSS 3.1:**
+- Development and testing without API costs
+- Offline processing environments
+- Budget-constrained batch processing
 
 ---
 
@@ -376,7 +411,12 @@ Add to `.env`:
 # Resemble AI (audio enhancement)
 RESEMBLE_API_KEY=your_resemble_api_key
 
-# Pyannote (speaker diarization)
+# pyannoteAI Precision-2 (recommended diarization backend)
+# Sign up at https://www.pyannote.ai/ for API access
+PYANNOTEAI_API_KEY=your_pyannoteai_api_key
+
+# Pyannote OSS (fallback diarization backend)
+# Only needed if not using Precision-2
 PYANNOTE_AUTH_TOKEN=your_huggingface_token
 
 # OpenAI (primary ASR)

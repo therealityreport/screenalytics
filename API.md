@@ -724,10 +724,17 @@ Health check.
 ```json
 {
   "status": "ok",
-  "version": "2.0.0",
-  "uptime_sec": 12345
+  "version": "0.1.0",
+  "redis": "ok",
+  "storage": "ok",
+  "db": "ok",
+  "details": {
+    "storage": "optional detail on degraded/error state"
+  }
 }
 ```
+
+Returns HTTP 200 when Redis, storage, and (if configured) Postgres respond quickly; returns HTTP 503 with a `details` map when any dependency is unavailable.
 
 ---
 

@@ -42,6 +42,7 @@ from .models import (
     ManifestArtifacts,
     QCStatus,
 )
+from .pipeline_checkpoint import CheckpointManager, compute_config_hash
 
 LOGGER = logging.getLogger(__name__)
 
@@ -125,6 +126,49 @@ def _get_show_id(ep_id: str) -> str:
     if parts:
         return parts[0].upper()
     return ep_id.upper()
+
+
+def _get_season_from_ep_id(ep_id: str) -> Optional[str]:
+    """Extract season identifier from episode ID.
+
+    Args:
+        ep_id: Episode identifier like 'rhoslc-s06e02'
+
+    Returns:
+        Season string like 'S06' or None if not found
+    """
+    import re
+    # Match sXX pattern in ep_id
+    match = re.search(r"(s\d{2})", ep_id.lower())
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def _get_cast_count_for_episode(ep_id: str) -> int:
+    """Get cast member count for the episode's show/season.
+
+    Used to automatically determine speaker range for diarization.
+
+    Args:
+        ep_id: Episode identifier like 'rhoslc-s06e02'
+
+    Returns:
+        Number of cast members (0 if cast data not available)
+    """
+    try:
+        from apps.api.services.cast import CastService
+
+        show_id = _get_show_id(ep_id)
+        season = _get_season_from_ep_id(ep_id)
+
+        cast_service = CastService()
+        cast_members = cast_service.list_cast(show_id, season)
+
+        return len(cast_members) if cast_members else 0
+    except Exception as e:
+        LOGGER.warning(f"Could not get cast count for {ep_id}: {e}")
+        return 0
 
 
 def _save_diarization_comparison(
@@ -227,6 +271,10 @@ def run_episode_audio_pipeline(
     config_path: Optional[Path] = None,
     data_root: Optional[Path] = None,
     progress_callback: Optional[Callable[[str, float, str], None]] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    resume: bool = False,
+    checkpoint_dir: Optional[Path] = None,
 ) -> AudioPipelineResult:
     """Run the complete audio pipeline for an episode.
 
@@ -238,6 +286,10 @@ def run_episode_audio_pipeline(
         data_root: Optional data root directory
         progress_callback: Optional callback for progress updates
             Signature: callback(step: str, progress: float, message: str)
+        min_speakers: Override minimum expected speakers for diarization
+        max_speakers: Override maximum expected speakers for diarization
+        resume: If True, resume from last checkpoint (skip completed stages)
+        checkpoint_dir: Directory for checkpoint files (default: data/checkpoints)
 
     Returns:
         AudioPipelineResult with all paths and metrics
@@ -252,6 +304,28 @@ def run_episode_audio_pipeline(
         # Normalize aliases for backwards compatibility (CLI uses "gemini")
         provider_override = "gemini_3" if asr_provider == "gemini" else asr_provider
         config.asr.provider = provider_override
+
+    # Auto-calculate speaker range from cast count if not provided
+    # Uses cast ±3 rule per official PyannoteAI workflow
+    if min_speakers is None and max_speakers is None:
+        cast_count = _get_cast_count_for_episode(ep_id)
+        if cast_count > 0:
+            min_speakers = max(1, cast_count - 3)
+            max_speakers = cast_count + 3
+            LOGGER.info(f"Using cast-based speaker range: {min_speakers}-{max_speakers} (cast_count={cast_count})")
+        else:
+            # Fallback when no cast data available
+            min_speakers = 1
+            max_speakers = 6
+            LOGGER.info("No cast data, using fallback speaker range: 1-6")
+
+    # Override speaker count hints for diarization if specified (or auto-calculated)
+    if min_speakers is not None:
+        config.diarization.min_speakers = min_speakers
+        LOGGER.info(f"Using min_speakers: {min_speakers}")
+    if max_speakers is not None:
+        config.diarization.max_speakers = max_speakers
+        LOGGER.info(f"Using max_speakers: {max_speakers}")
 
     # Get paths
     paths = _get_audio_paths(ep_id, data_root)
@@ -268,92 +342,151 @@ def run_episode_audio_pipeline(
         manifest_artifacts=ManifestArtifacts(),
     )
 
+    # Initialize checkpoint manager for recovery
+    config_hash = compute_config_hash(config) if resume else None
+    checkpoint_mgr = CheckpointManager(
+        ep_id=ep_id,
+        checkpoint_dir=checkpoint_dir or (data_root or Path("data")) / "checkpoints",
+        config_hash=config_hash,
+    )
+
+    # If not resuming, reset checkpoint to start fresh
+    if not resume:
+        checkpoint_mgr.reset()
+    else:
+        # Log resume status
+        last_stage = checkpoint_mgr.get_last_completed_stage()
+        if last_stage:
+            LOGGER.info(f"Resuming from checkpoint: last completed stage was '{last_stage}'")
+        else:
+            LOGGER.info("No previous checkpoint found, starting from beginning")
+
     def _update_progress(step: str, progress: float, message: str):
         LOGGER.info(f"[{step}] {progress*100:.0f}% - {message}")
         if progress_callback:
             progress_callback(step, progress, message)
 
+    def _should_run_stage(stage_name: str) -> bool:
+        """Check if stage should run based on resume mode and checkpoint."""
+        if not resume:
+            return True
+        if overwrite:
+            return True
+        return not checkpoint_mgr.is_stage_complete(stage_name)
+
     try:
         # Step 1: Extract original audio
-        _update_progress("extract", 0.0, "Extracting audio from video...")
+        if _should_run_stage("extract"):
+            checkpoint_mgr.start_stage("extract")
+            _update_progress("extract", 0.0, "Extracting audio from video...")
 
-        from .io import extract_audio_from_video
+            from .io import extract_audio_from_video
 
-        if not paths["video"].exists():
-            raise FileNotFoundError(f"Video not found: {paths['video']}")
+            if not paths["video"].exists():
+                raise FileNotFoundError(f"Video not found: {paths['video']}")
 
-        original_path, original_stats = extract_audio_from_video(
-            paths["video"],
-            paths["original"],
-            sample_rate=config.export.sample_rate,
-            bit_depth=config.export.bit_depth,
-            overwrite=overwrite,
-        )
-        result.audio_artifacts.original = original_path
-        result.duration_original_s = original_stats.duration_seconds
+            original_path, original_stats = extract_audio_from_video(
+                paths["video"],
+                paths["original"],
+                sample_rate=config.export.sample_rate,
+                bit_depth=config.export.bit_depth,
+                overwrite=overwrite,
+            )
+            result.audio_artifacts.original = original_path
+            result.duration_original_s = original_stats.duration_seconds
 
-        _update_progress("extract", 1.0, f"Audio extracted: {original_stats.duration_seconds:.1f}s")
+            checkpoint_mgr.complete_stage("extract", output_paths={
+                "original": str(original_path),
+            }, metrics={"duration_s": original_stats.duration_seconds})
+            _update_progress("extract", 1.0, f"Audio extracted: {original_stats.duration_seconds:.1f}s")
+        else:
+            # Load from checkpoint
+            _update_progress("extract", 1.0, "Skipping extract (already complete)")
+            original_path = Path(checkpoint_mgr.get_stage_output("extract", "original") or paths["original"])
+            result.audio_artifacts.original = original_path
+            from .io import get_audio_duration
+            result.duration_original_s = get_audio_duration(original_path)
 
         # Step 2: Separation (MDX-Extra)
-        _update_progress("separate", 0.0, "Separating vocals from accompaniment...")
+        if _should_run_stage("separate"):
+            checkpoint_mgr.start_stage("separate")
+            _update_progress("separate", 0.0, "Separating vocals from accompaniment...")
 
-        from .separation_mdx import separate_vocals
+            from .separation_mdx import separate_vocals
 
-        vocals_path, _ = separate_vocals(
-            original_path,
-            paths["audio_dir"],
-            config.separation,
-            overwrite=overwrite,
-        )
-        result.audio_artifacts.vocals = vocals_path
+            vocals_path, _ = separate_vocals(
+                original_path,
+                paths["audio_dir"],
+                config.separation,
+                overwrite=overwrite,
+            )
+            result.audio_artifacts.vocals = vocals_path
 
-        _update_progress("separate", 1.0, "Vocal separation complete")
+            checkpoint_mgr.complete_stage("separate", output_paths={
+                "vocals": str(vocals_path),
+            })
+            _update_progress("separate", 1.0, "Vocal separation complete")
+        else:
+            _update_progress("separate", 1.0, "Skipping separate (already complete)")
+            vocals_path = Path(checkpoint_mgr.get_stage_output("separate", "vocals") or paths["vocals"])
+            result.audio_artifacts.vocals = vocals_path
 
         # Step 3: Enhance (Resemble)
-        _update_progress("enhance", 0.0, "Enhancing vocals...")
+        if _should_run_stage("enhance"):
+            checkpoint_mgr.start_stage("enhance")
+            _update_progress("enhance", 0.0, "Enhancing vocals...")
 
-        try:
-            from .enhance_resemble import enhance_audio_resemble, check_api_available
+            try:
+                from .enhance_resemble import enhance_audio_resemble, check_api_available
 
-            if check_api_available():
-                enhanced_path = enhance_audio_resemble(
-                    vocals_path,
-                    paths["vocals_enhanced"],
-                    config.enhance,
-                    overwrite=overwrite,
-                )
-            else:
-                LOGGER.warning("Resemble API not available, using local enhancement")
-                from .enhance_resemble import enhance_audio_local
-                enhanced_path = enhance_audio_local(
-                    vocals_path,
-                    paths["vocals_enhanced"],
-                    overwrite=overwrite,
-                )
-        except Exception as e:
-            LOGGER.warning(f"Enhancement failed, using vocals directly: {e}")
-            enhanced_path = vocals_path
+                if check_api_available():
+                    enhanced_path = enhance_audio_resemble(
+                        vocals_path,
+                        paths["vocals_enhanced"],
+                        config.enhance,
+                        overwrite=overwrite,
+                    )
+                else:
+                    LOGGER.warning("Resemble API not available, using local enhancement")
+                    from .enhance_resemble import enhance_audio_local
+                    enhanced_path = enhance_audio_local(
+                        vocals_path,
+                        paths["vocals_enhanced"],
+                        overwrite=overwrite,
+                    )
+            except Exception as e:
+                LOGGER.warning(f"Enhancement failed, using vocals directly: {e}")
+                enhanced_path = vocals_path
 
-        result.audio_artifacts.vocals_enhanced = enhanced_path
+            result.audio_artifacts.vocals_enhanced = enhanced_path
 
-        _update_progress("enhance", 1.0, "Enhancement complete")
+            checkpoint_mgr.complete_stage("enhance", output_paths={
+                "enhanced": str(enhanced_path),
+            })
+            _update_progress("enhance", 1.0, "Enhancement complete")
+        else:
+            _update_progress("enhance", 1.0, "Skipping enhance (already complete)")
+            enhanced_path = Path(checkpoint_mgr.get_stage_output("enhance", "enhanced") or paths["vocals_enhanced"])
+            result.audio_artifacts.vocals_enhanced = enhanced_path
 
         # Step 4: Diarization (dual mode: pyannote + GPT-4o for comparison)
         # Use vocals (separated, no music) for diarization - better for speaker detection
         # Enhancement can alter voice characteristics, so we use the cleaner separated vocals
-        _update_progress("diarize", 0.0, "Running dual diarization (pyannote + GPT-4o)...")
+        backend_name = getattr(config.diarization, "backend", "oss-3.1")
+        _update_progress("diarize", 0.0, f"Running dual diarization (pyannote {backend_name} + GPT-4o)...")
 
-        # 4a: Run pyannote diarization
-        from .diarization_pyannote import run_diarization
+        # 4a: Run pyannote diarization (Precision-2 API or OSS 3.1 based on config)
+        from .diarization_pyannote import run_diarization, get_current_backend
 
-        _update_progress("diarize", 0.1, "Running pyannote diarization...")
+        _update_progress("diarize", 0.1, f"Running pyannote diarization ({backend_name})...")
         pyannote_segments = run_diarization(
             vocals_path,  # Use separated vocals (no music) for better speaker detection
             paths["diarization_pyannote"],
             config.diarization,
             overwrite=overwrite,
         )
-        LOGGER.info(f"Pyannote diarization: {len(pyannote_segments)} segments, "
+        actual_backend = get_current_backend() or backend_name
+        LOGGER.info(f"Pyannote diarization ({actual_backend}): {len(pyannote_segments)} segments, "
                    f"{len(set(s.speaker for s in pyannote_segments))} speakers")
 
         # 4b: Run GPT-4o diarization (unified transcription + diarization)
@@ -432,7 +565,7 @@ def run_episode_audio_pipeline(
         )
         result.manifest_artifacts.speaker_groups = paths["speaker_groups"]
 
-        _update_progress("diarize", 1.0, f"Dual diarization complete: pyannote={len(pyannote_segments)}, gpt4o={len(gpt4o_segments)}")
+        _update_progress("diarize", 1.0, f"Dual diarization complete: pyannote ({actual_backend})={len(pyannote_segments)}, gpt4o={len(gpt4o_segments)}")
 
         # Step 5: Voice clustering + voice bank mapping
         _update_progress("voices", 0.0, "Clustering voices...")

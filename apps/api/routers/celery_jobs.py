@@ -2369,8 +2369,9 @@ def _stream_local_subprocess(
                 try:
                     progress_data = json.loads(stripped)
                     if isinstance(progress_data, dict) and "phase" in progress_data:
-                        # Audio pipeline uses different progress format with more fields
-                        if operation == "audio_pipeline":
+                        # Audio operations use different progress format with step info
+                        audio_ops = ("audio_pipeline", "diarize_only", "transcribe_only", "voices_only")
+                        if operation in audio_ops:
                             # Pass through audio pipeline progress with all fields intact
                             yield json.dumps({
                                 "type": "audio_progress",
@@ -2381,6 +2382,8 @@ def _stream_local_subprocess(
                                 "step_progress": progress_data.get("step_progress", 0),
                                 "step_order": progress_data.get("step_order", 0),
                                 "total_steps": progress_data.get("total_steps", 9),
+                                "speaker_count": progress_data.get("speaker_count"),
+                                "segment_count": progress_data.get("segment_count"),
                                 "voice_clusters": progress_data.get("voice_clusters"),
                                 "labeled_voices": progress_data.get("labeled_voices"),
                                 "unlabeled_voices": progress_data.get("unlabeled_voices"),

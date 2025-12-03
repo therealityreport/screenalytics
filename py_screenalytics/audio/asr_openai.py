@@ -20,8 +20,45 @@ from typing import List, Optional
 import numpy as np
 
 from .models import ASRConfig, ASRSegment, WordTiming
+from .circuit_breaker import get_openai_breaker, CircuitBreakerError
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _safe_get_attr(obj, attr: str, default=None):
+    """Safely get attribute from object or dict.
+
+    Handles:
+    - Pydantic models / dataclasses (use getattr)
+    - Dicts (use .get())
+    - Attributes that exist but are None/0 (don't fall through)
+    """
+    if isinstance(obj, dict):
+        return obj.get(attr, default)
+    # For objects, check if attribute exists and return it (even if falsy)
+    if hasattr(obj, attr):
+        val = getattr(obj, attr)
+        return val if val is not None else default
+    return default
+
+
+def _invalidate_dependent_files(asr_output_path: Path) -> None:
+    """Delete files that depend on ASR data so they get regenerated.
+
+    When ASR is re-run due to partial coverage, the transcript and other
+    dependent files need to be regenerated with the new ASR data.
+    """
+    manifests_dir = asr_output_path.parent
+    dependent_files = [
+        manifests_dir / "episode_transcript.jsonl",
+        manifests_dir / "episode_transcript.vtt",
+        manifests_dir / "episode_transcript.srt",
+    ]
+
+    for dep_file in dependent_files:
+        if dep_file.exists():
+            LOGGER.info(f"Invalidating dependent file: {dep_file.name}")
+            dep_file.unlink()
 
 
 def _get_openai_client():
@@ -60,20 +97,40 @@ def transcribe_audio(
     Returns:
         List of ASRSegment objects
     """
-    if output_path.exists() and not overwrite:
-        LOGGER.info(f"ASR results already exist: {output_path}")
-        return _load_asr_manifest(output_path)
-
     config = config or ASRConfig()
+
+    # Get audio duration first - needed for cache validation
+    from .io import get_audio_duration
+    total_duration = get_audio_duration(audio_path)
+
+    if output_path.exists() and not overwrite:
+        # Validate cached result covers the full audio
+        cached_segments = _load_asr_manifest(output_path)
+        if cached_segments:
+            # Check if the last segment end time is close to audio duration
+            # Allow 10% tolerance for silence at the end
+            max_end = max((s.end for s in cached_segments), default=0.0)
+            coverage_ratio = max_end / total_duration if total_duration > 0 else 0
+
+            if coverage_ratio >= 0.9:
+                LOGGER.info(f"ASR results already exist: {output_path} (coverage: {coverage_ratio*100:.0f}%)")
+                return cached_segments
+            else:
+                LOGGER.warning(
+                    f"Cached ASR covers only {coverage_ratio*100:.0f}% of audio "
+                    f"({max_end:.1f}s / {total_duration:.1f}s). Re-running transcription..."
+                )
+                # Delete dependent files so they get regenerated with new ASR data
+                _invalidate_dependent_files(output_path)
+        else:
+            LOGGER.warning(f"Cached ASR is empty. Re-running transcription...")
+            _invalidate_dependent_files(output_path)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     client = _get_openai_client()
 
-    LOGGER.info(f"Transcribing audio: {audio_path}")
-
-    # Get audio duration
-    from .io import get_audio_duration
-    total_duration = get_audio_duration(audio_path)
+    LOGGER.info(f"Transcribing audio: {audio_path} ({total_duration:.1f}s)")
 
     # Check if we need to chunk
     chunk_duration = config.chunk_duration_seconds
@@ -112,40 +169,46 @@ def _transcribe_file(
 ) -> List[ASRSegment]:
     """Transcribe a single audio file."""
     model = config.model
+    breaker = get_openai_breaker()
 
     with audio_path.open("rb") as f:
-        if _is_diarize_model(model):
-            # gpt-4o-transcribe-diarize: use diarized_json format
-            # Requires chunking_strategy for audio > 30s
-            response = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                response_format="diarized_json",
-                chunking_strategy="auto",  # Required for audio > 30s
-            )
-            return _parse_diarized_response(response)
+        try:
+            with breaker:
+                if _is_diarize_model(model):
+                    # gpt-4o-transcribe-diarize: use diarized_json format
+                    # Requires chunking_strategy for audio > 30s
+                    response = client.audio.transcriptions.create(
+                        model=model,
+                        file=f,
+                        response_format="diarized_json",
+                        chunking_strategy="auto",  # Required for audio > 30s
+                    )
+                    return _parse_diarized_response(response)
 
-        elif _is_gpt4o_model(model):
-            # gpt-4o-transcribe / gpt-4o-mini-transcribe: only json or text
-            # No timestamp_granularities support
-            response = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                response_format="json",
-            )
-            return _parse_gpt4o_response(response, offset=0.0, duration=total_duration)
+                elif _is_gpt4o_model(model):
+                    # gpt-4o-transcribe / gpt-4o-mini-transcribe: only json or text
+                    # No timestamp_granularities support
+                    response = client.audio.transcriptions.create(
+                        model=model,
+                        file=f,
+                        response_format="json",
+                    )
+                    return _parse_gpt4o_response(response, offset=0.0, duration=total_duration)
 
-        else:
-            # whisper-1: supports verbose_json with timestamps
-            response = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                language=config.language,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"] if config.enable_word_timestamps else ["segment"],
-                temperature=config.temperature,
-            )
-            return _parse_response(response, config.enable_word_timestamps)
+                else:
+                    # whisper-1: supports verbose_json with timestamps
+                    response = client.audio.transcriptions.create(
+                        model=model,
+                        file=f,
+                        language=config.language,
+                        response_format="verbose_json",
+                        timestamp_granularities=["word", "segment"] if config.enable_word_timestamps else ["segment"],
+                        temperature=config.temperature,
+                    )
+                    return _parse_response(response, config.enable_word_timestamps)
+        except CircuitBreakerError as e:
+            LOGGER.error(f"Circuit breaker open for OpenAI API: {e}")
+            raise RuntimeError(f"OpenAI API unavailable (circuit breaker open): {e}") from e
 
 
 def _transcribe_chunked(
@@ -156,6 +219,7 @@ def _transcribe_chunked(
 ) -> List[ASRSegment]:
     """Transcribe audio in chunks."""
     model = config.model
+    breaker = get_openai_breaker()
 
     # GPT-4o diarize model handles chunking internally, no need to chunk manually
     if _is_diarize_model(model):
@@ -189,40 +253,44 @@ def _transcribe_chunked(
         buffer.seek(0)
         buffer.name = "chunk.wav"
 
-        # Transcribe chunk
+        # Transcribe chunk (with circuit breaker protection)
         try:
-            if _is_gpt4o_model(model):
-                # gpt-4o-transcribe / gpt-4o-mini-transcribe
-                response = client.audio.transcriptions.create(
-                    model=model,
-                    file=buffer,
-                    response_format="json",
-                )
-                chunk_duration = (end - start) / sample_rate
-                chunk_segments = _parse_gpt4o_response(response, offset, duration=chunk_duration)
-            else:
-                # whisper-1
-                response = client.audio.transcriptions.create(
-                    model=model,
-                    file=buffer,
-                    language=config.language,
-                    response_format="verbose_json",
-                    timestamp_granularities=["word", "segment"] if config.enable_word_timestamps else ["segment"],
-                    temperature=config.temperature,
-                )
-                chunk_segments = _parse_response(response, config.enable_word_timestamps)
+            with breaker:
+                if _is_gpt4o_model(model):
+                    # gpt-4o-transcribe / gpt-4o-mini-transcribe
+                    response = client.audio.transcriptions.create(
+                        model=model,
+                        file=buffer,
+                        response_format="json",
+                    )
+                    chunk_duration = (end - start) / sample_rate
+                    chunk_segments = _parse_gpt4o_response(response, offset, duration=chunk_duration)
+                else:
+                    # whisper-1
+                    response = client.audio.transcriptions.create(
+                        model=model,
+                        file=buffer,
+                        language=config.language,
+                        response_format="verbose_json",
+                        timestamp_granularities=["word", "segment"] if config.enable_word_timestamps else ["segment"],
+                        temperature=config.temperature,
+                    )
+                    chunk_segments = _parse_response(response, config.enable_word_timestamps)
 
-                # Adjust timestamps with offset for whisper-1
-                for segment in chunk_segments:
-                    segment.start += offset
-                    segment.end += offset
-                    if segment.words:
-                        for word in segment.words:
-                            word.t0 += offset
-                            word.t1 += offset
+                    # Adjust timestamps with offset for whisper-1
+                    for segment in chunk_segments:
+                        segment.start += offset
+                        segment.end += offset
+                        if segment.words:
+                            for word in segment.words:
+                                word.t0 += offset
+                                word.t1 += offset
 
-            all_segments.extend(chunk_segments)
+                all_segments.extend(chunk_segments)
 
+        except CircuitBreakerError as e:
+            LOGGER.error(f"Circuit breaker open for OpenAI API: {e}")
+            raise RuntimeError(f"OpenAI API unavailable (circuit breaker open): {e}") from e
         except Exception as e:
             LOGGER.warning(f"Failed to transcribe chunk at {offset:.1f}s: {e}")
 
@@ -274,8 +342,8 @@ def _parse_response(response, include_words: bool) -> List[ASRSegment]:
 
             # Find which segment this word belongs to
             for i, seg in enumerate(raw_segments):
-                seg_start = getattr(seg, "start", None) or seg.get("start", 0)
-                seg_end = getattr(seg, "end", None) or seg.get("end", 0)
+                seg_start = _safe_get_attr(seg, "start", 0)
+                seg_end = _safe_get_attr(seg, "end", 0)
 
                 if seg_start <= word_start < seg_end:
                     if i not in words_by_segment:
@@ -288,9 +356,9 @@ def _parse_response(response, include_words: bool) -> List[ASRSegment]:
                     break
 
     for i, seg in enumerate(raw_segments):
-        start = getattr(seg, "start", None) or seg.get("start", 0)
-        end = getattr(seg, "end", None) or seg.get("end", 0)
-        text = getattr(seg, "text", None) or seg.get("text", "")
+        start = _safe_get_attr(seg, "start", 0)
+        end = _safe_get_attr(seg, "end", 0)
+        text = _safe_get_attr(seg, "text", "")
 
         # Get confidence if available
         confidence = None
@@ -378,10 +446,10 @@ def _parse_diarized_response(response) -> List[ASRSegment]:
         return []
 
     for seg in raw_segments:
-        start = getattr(seg, "start", None) or seg.get("start", 0)
-        end = getattr(seg, "end", None) or seg.get("end", 0)
-        text = getattr(seg, "text", None) or seg.get("text", "")
-        speaker = getattr(seg, "speaker", None) or seg.get("speaker", "")
+        start = _safe_get_attr(seg, "start", 0)
+        end = _safe_get_attr(seg, "end", 0)
+        text = _safe_get_attr(seg, "text", "")
+        speaker = _safe_get_attr(seg, "speaker", "")
 
         segment = ASRSegment(
             start=start,

@@ -26,15 +26,23 @@ audio_pipeline:
     retry_delay_seconds: 2
 
   # Speaker diarization settings
+  # Uses official PyannoteAI v1 API workflow
   diarization:
     provider: "pyannote"
-    model_name: "pyannote/speaker-diarization-3.1"
-    min_speech: 0.2                  # Minimum speech duration (seconds)
+    backend: "precision-2"           # "precision-2" (cloud API) | "oss-3.1" (local)
+    model_name: "pyannote/speaker-diarization-precision-2"
+    min_speech: 0.8                  # Minimum speech duration (seconds) - filters out very short segments
     max_overlap: 0.1                 # Maximum allowed overlap ratio
-    merge_gap_ms: 300                # Gap threshold for merging segments
-    min_speakers: 1                  # HINT: minimum expected speakers
-    max_speakers: 20                 # HINT: maximum expected (safe upper bound for reality TV)
+    merge_gap_ms: 150                # Gap threshold for merging segments (lower = less merging)
+    min_speakers: 4                  # HINT: minimum expected speakers (auto-calculated from cast ±3)
+    max_speakers: 15                 # HINT: maximum expected (auto-calculated from cast ±3)
     # num_speakers: null             # FORCE exact count (uncomment to override min/max)
+
+    # Official API workflow settings (precision-2 only)
+    use_exclusive_diarization: true  # Always use exclusive mode for clean segment merging
+    webhook_url: null                # Optional: webhook URL for async job completion
+    api_poll_interval_base: 6.0      # Base polling interval in seconds (5-8s per official docs)
+    api_poll_interval_jitter: 2.0    # Random jitter added to polling interval
 
   # Automatic speech recognition settings
   asr:
@@ -50,7 +58,8 @@ audio_pipeline:
 
   # Voice clustering and bank settings
   voice_clustering:
-    similarity_threshold: 0.30       # Cosine similarity for clustering (higher = fewer clusters)
+    use_diarization_labels: true     # Use pyannote speaker labels directly (skip embedding clustering)
+    similarity_threshold: 0.30       # Cosine similarity for clustering (only if use_diarization_labels=false)
     min_segments_per_cluster: 1      # Allow single-segment clusters for trailers/short content
     embedding_model: "pyannote/embedding"
     centroid_method: "mean"          # "mean" | "median"
@@ -64,8 +73,8 @@ audio_pipeline:
   # Quality control thresholds
   qc:
     max_duration_drift_pct: 1.0      # Max % drift between original and final audio
-    min_snr_db: 14.0                 # Minimum signal-to-noise ratio (dB)
-    warn_snr_db: 12.0                # Warning threshold for SNR
+    min_snr_db: 14.0                 # Error threshold: SNR below this = QC error
+    warn_snr_db: 18.0                # Warning threshold: SNR below this = QC warning (must be > min)
     min_diarization_conf: 0.65       # Minimum diarization confidence
     max_der_sample_pct: 12.0         # Maximum diarization error rate sample %
     min_asr_conf: 0.60               # Minimum ASR confidence threshold

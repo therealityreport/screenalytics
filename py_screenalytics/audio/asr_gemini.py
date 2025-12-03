@@ -23,6 +23,25 @@ from .models import ASRConfig, ASRSegment, WordTiming
 LOGGER = logging.getLogger(__name__)
 
 
+def _invalidate_dependent_files(asr_output_path: Path) -> None:
+    """Delete files that depend on ASR data so they get regenerated.
+
+    When ASR is re-run due to partial coverage, the transcript and other
+    dependent files need to be regenerated with the new ASR data.
+    """
+    manifests_dir = asr_output_path.parent
+    dependent_files = [
+        manifests_dir / "episode_transcript.jsonl",
+        manifests_dir / "episode_transcript.vtt",
+        manifests_dir / "episode_transcript.srt",
+    ]
+
+    for dep_file in dependent_files:
+        if dep_file.exists():
+            LOGGER.info(f"Invalidating dependent file: {dep_file.name}")
+            dep_file.unlink()
+
+
 def _get_gemini_client():
     """Get Gemini client."""
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
@@ -60,11 +79,35 @@ def transcribe_audio(
     Returns:
         List of ASRSegment objects
     """
-    if output_path.exists() and not overwrite:
-        LOGGER.info(f"ASR results already exist: {output_path}")
-        return _load_asr_manifest(output_path)
-
     config = config or ASRConfig()
+
+    # Get audio duration first - needed for cache validation
+    from .io import get_audio_duration
+    total_duration = get_audio_duration(audio_path)
+
+    if output_path.exists() and not overwrite:
+        # Validate cached result covers the full audio
+        cached_segments = _load_asr_manifest(output_path)
+        if cached_segments:
+            # Check if the last segment end time is close to audio duration
+            # Allow 10% tolerance for silence at the end
+            max_end = max((s.end for s in cached_segments), default=0.0)
+            coverage_ratio = max_end / total_duration if total_duration > 0 else 0
+
+            if coverage_ratio >= 0.9:
+                LOGGER.info(f"ASR results already exist: {output_path} (coverage: {coverage_ratio*100:.0f}%)")
+                return cached_segments
+            else:
+                LOGGER.warning(
+                    f"Cached ASR covers only {coverage_ratio*100:.0f}% of audio "
+                    f"({max_end:.1f}s / {total_duration:.1f}s). Re-running transcription..."
+                )
+                # Delete dependent files so they get regenerated with new ASR data
+                _invalidate_dependent_files(output_path)
+        else:
+            LOGGER.warning(f"Cached ASR is empty. Re-running transcription...")
+            _invalidate_dependent_files(output_path)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     genai = _get_gemini_client()

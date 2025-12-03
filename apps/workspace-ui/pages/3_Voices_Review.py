@@ -6,6 +6,7 @@ by the audio pipeline for an episode.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import sys
@@ -80,8 +81,14 @@ def _extract_segment_audio(ep_id: str, cluster_id: str, segment_idx: int, start:
     """Extract a segment from the source audio and save it as a clip.
 
     Returns the path to the segment file, or None if extraction fails.
+    Errors are stored in session state for UI display.
     """
     segment_path = _get_segment_audio_path(ep_id, cluster_id, start, end)
+    error_key = f"audio_extract_error::{ep_id}::{cluster_id}::{segment_idx}"
+
+    # Clear any previous error for this segment
+    if error_key in st.session_state:
+        del st.session_state[error_key]
 
     # Return cached file if it exists
     if segment_path.exists():
@@ -90,6 +97,7 @@ def _extract_segment_audio(ep_id: str, cluster_id: str, segment_idx: int, start:
     # Get source audio
     audio_path = _get_audio_file_for_playback(ep_id)
     if not audio_path or not audio_path.exists():
+        st.session_state[error_key] = "Source audio file not found"
         return None
 
     try:
@@ -113,11 +121,25 @@ def _extract_segment_audio(ep_id: str, cluster_id: str, segment_idx: int, start:
         subprocess.run(cmd, check=True, capture_output=True, timeout=max(10, duration + 5))
 
         return segment_path if segment_path.exists() else None
-    except Exception as e:
-        # Log error but don't crash
-        import logging
-        logging.warning(f"Failed to extract segment audio: {e}")
+    except subprocess.TimeoutExpired:
+        st.session_state[error_key] = f"Extraction timed out (segment too long: {duration:.1f}s)"
         return None
+    except FileNotFoundError:
+        st.session_state[error_key] = "ffmpeg not found - please install ffmpeg"
+        return None
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if e.stderr else "Unknown error"
+        st.session_state[error_key] = f"ffmpeg error: {stderr[:100]}"
+        return None
+    except Exception as e:
+        st.session_state[error_key] = f"Extraction failed: {str(e)[:100]}"
+        return None
+
+
+def _get_audio_extract_error(ep_id: str, cluster_id: str, segment_idx: int) -> Optional[str]:
+    """Get any stored extraction error for a segment."""
+    error_key = f"audio_extract_error::{ep_id}::{cluster_id}::{segment_idx}"
+    return st.session_state.get(error_key)
 
 
 @lru_cache(maxsize=8)
@@ -248,21 +270,51 @@ def _get_transcript_for_segment(
     asr_rows: List[Dict],
     seg_start: float,
     seg_end: float,
-    tolerance: float = 0.5,
+    tolerance: float = 0.3,
+    min_overlap_ratio: float = 0.3,
 ) -> List[Dict]:
     """Get ASR segments that overlap with a voice cluster segment.
 
     Returns list of ASR segments with their text, sorted by start time.
     Each ASR segment represents a distinct utterance (potentially different speaker).
     Includes confidence scores for highlighting.
+
+    Args:
+        asr_rows: List of ASR segment dictionaries
+        seg_start: Voice cluster segment start time
+        seg_end: Voice cluster segment end time
+        tolerance: Time tolerance for edge cases (seconds)
+        min_overlap_ratio: Minimum overlap as ratio of ASR duration (0.0-1.0)
+            E.g., 0.3 means ASR segment must have at least 30% of its duration
+            overlapping with the voice cluster segment to be included.
     """
     matching = []
+    seg_duration = seg_end - seg_start
+
     for row in asr_rows:
         asr_start = row.get("start", 0)
         asr_end = row.get("end", 0)
+        asr_duration = asr_end - asr_start
 
-        # Check for overlap (with tolerance)
-        if asr_start < (seg_end + tolerance) and asr_end > (seg_start - tolerance):
+        # Calculate actual overlap duration
+        overlap_start = max(asr_start, seg_start)
+        overlap_end = min(asr_end, seg_end)
+        overlap_duration = max(0.0, overlap_end - overlap_start)
+
+        # Check if there's meaningful overlap
+        # Either: significant overlap relative to ASR duration, OR within tolerance at edges
+        if asr_duration > 0:
+            overlap_ratio = overlap_duration / asr_duration
+        else:
+            overlap_ratio = 0.0
+
+        # Include if:
+        # 1. Overlap ratio meets minimum threshold, OR
+        # 2. ASR segment is mostly contained within voice segment (edge case for short ASR)
+        # 3. But NOT if there's essentially no real overlap (just tolerance matching)
+        has_real_overlap = overlap_duration > 0.1  # At least 100ms real overlap
+
+        if has_real_overlap and (overlap_ratio >= min_overlap_ratio or overlap_duration >= seg_duration * 0.5):
             matching.append({
                 "start": asr_start,
                 "end": asr_end,
@@ -336,6 +388,27 @@ def _assign_voice(ep_id: str, voice_cluster_id: str, cast_id: Optional[str], cus
 
     try:
         resp = helpers.api_post(f"/jobs/episodes/{ep_id}/audio/voices/assign", json=payload)
+        return resp
+    except requests.RequestException as e:
+        return {"error": str(e)}
+
+
+def _load_speaker_assignments_data(ep_id: str) -> Dict[str, Any]:
+    """Load speaker group assignments and available cast/groups from API."""
+    try:
+        resp = helpers.api_get(f"/jobs/episodes/{ep_id}/audio/speaker-assignments")
+        return resp
+    except requests.RequestException:
+        return {"assignments": [], "cast_members": [], "speaker_groups": []}
+
+
+def _save_speaker_assignments(ep_id: str, assignments: List[Dict]) -> Dict:
+    """Save speaker group assignments via API."""
+    try:
+        resp = helpers.api_post(
+            f"/jobs/episodes/{ep_id}/audio/speaker-assignments",
+            json={"assignments": assignments},
+        )
         return resp
     except requests.RequestException as e:
         return {"error": str(e)}
@@ -509,22 +582,80 @@ with st.expander("🎙️ Audio Pipeline", expanded=not has_voice_clusters):
         key=f"audio_overwrite_voices_{ep_id}",
         disabled=audio_job_running,
     )
-    asr_provider = st.selectbox(
-        "ASR Provider",
-        options=["openai_whisper", "gemini"],
-        index=0,
-        key=f"audio_asr_provider_voices_{ep_id}",
-        disabled=audio_job_running,
-    )
+    # ASR provider fixed to openai_whisper
+    asr_provider = "openai_whisper"
 
-    if st.button(
-        "🎙️ Generate Audio + Transcript",
-        key=f"run_audio_pipeline_voices_{ep_id}",
-        disabled=audio_job_running,
-        use_container_width=True,
-    ):
+    # Button row: Generate and Clear Cache
+    btn_col1, btn_col2 = st.columns([3, 1])
+    with btn_col1:
+        generate_clicked = st.button(
+            "🎙️ Generate Audio + Transcript",
+            key=f"run_audio_pipeline_voices_{ep_id}",
+            disabled=audio_job_running,
+            use_container_width=True,
+        )
+    with btn_col2:
+        clear_cache_clicked = st.button(
+            "🗑️ Clear Cache",
+            key=f"clear_audio_cache_{ep_id}",
+            disabled=audio_job_running,
+            use_container_width=True,
+            help="Delete diarization, clustering, and transcript files (keeps audio files)",
+        )
+
+    # Handle Clear Cache button
+    if clear_cache_clicked:
+        manifest_dir = DATA_ROOT / "manifests" / ep_id
+        files_to_clear = [
+            "audio_diarization_pyannote.jsonl",
+            "audio_diarization.jsonl",
+            "audio_speaker_groups.json",
+            "audio_voice_clusters.json",
+            "audio_voice_mapping.json",
+            "audio_asr_raw.jsonl",
+            "episode_transcript.jsonl",
+            "episode_transcript.vtt",
+            "audio_qc.json",
+        ]
+        deleted = []
+        for fname in files_to_clear:
+            fpath = manifest_dir / fname
+            if fpath.exists():
+                fpath.unlink()
+                deleted.append(fname)
+        if deleted:
+            st.success(f"Cleared {len(deleted)} cache files: {', '.join(deleted)}")
+            time.sleep(1)
+            st.rerun()
+        else:
+            st.info("No cache files to clear")
+
+    if generate_clicked:
         # Use the execution_mode from the selector above
         run_mode = "local" if execution_mode == "local" else "queue"
+
+        # Calculate speaker range from cast count (-2/+5)
+        _pipeline_show_id = _get_show_id(ep_id)
+        _pipeline_cast = _load_cast_members(_pipeline_show_id)
+        _pipeline_season_match = None
+        for part in ep_id.split("-"):
+            if part.startswith("s") and len(part) >= 3:
+                _pipeline_season_match = part[:3].upper()
+                break
+        if _pipeline_season_match and _pipeline_cast:
+            _pipeline_season_cast = [c for c in _pipeline_cast if _pipeline_season_match in (c.get("seasons") or [])]
+            _pipeline_cast_count = len(_pipeline_season_cast) if _pipeline_season_cast else len(_pipeline_cast)
+        else:
+            _pipeline_cast_count = len(_pipeline_cast) if _pipeline_cast else 0
+
+        # Set min/max speakers based on cast count (-2/+5)
+        if _pipeline_cast_count > 0:
+            _pipeline_min_speakers = max(1, _pipeline_cast_count - 2)
+            _pipeline_max_speakers = _pipeline_cast_count + 5
+            st.info(f"Using speaker range **{_pipeline_min_speakers}-{_pipeline_max_speakers}** based on {_pipeline_cast_count} cast members")
+        else:
+            _pipeline_min_speakers = None
+            _pipeline_max_speakers = None
 
         # If a job is already running, cancel it before starting a new one
         existing = helpers.get_running_job_for_episode(ep_id, "audio_pipeline")
@@ -542,6 +673,8 @@ with st.expander("🎙️ Audio Pipeline", expanded=not has_voice_clusters):
                 ep_id=ep_id,
                 overwrite=audio_overwrite,
                 asr_provider=asr_provider,
+                min_speakers=_pipeline_min_speakers,
+                max_speakers=_pipeline_max_speakers,
             )
 
             if result and result.get("status") == "succeeded":
@@ -556,6 +689,8 @@ with st.expander("🎙️ Audio Pipeline", expanded=not has_voice_clusters):
                 ep_id=ep_id,
                 overwrite=audio_overwrite,
                 asr_provider=asr_provider,
+                min_speakers=_pipeline_min_speakers,
+                max_speakers=_pipeline_max_speakers,
             )
             if result and result.get("status") == "succeeded":
                 time.sleep(1)
@@ -595,189 +730,136 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
     _exec_mode = helpers.get_execution_mode(ep_id)
     run_mode = "local" if _exec_mode == "local" else "queue"
 
-    rerun_col1, rerun_col2 = st.columns(2)
+    st.write("**Re-run Diarization Only**")
+    st.caption("Keep audio files, re-do speaker segmentation")
 
-    with rerun_col1:
-        st.write("**Re-run Transcription Only**")
-        st.caption("Keep existing diarization, just re-transcribe")
-        rerun_asr = st.selectbox(
-            "ASR Provider",
-            options=["openai_whisper", "gemini_3"],
-            key=f"rerun_asr_{ep_id}",
-        )
-        if st.button("🎙️ Re-transcribe", key=f"rerun_transcribe_{ep_id}", use_container_width=True):
-            payload = {"asr_provider": rerun_asr, "run_mode": run_mode}
+    # Calculate speaker range from cast count (-2/+5)
+    _rerun_show_id = _get_show_id(ep_id)
+    _rerun_cast = _load_cast_members(_rerun_show_id)
+    # Parse season from ep_id (e.g., "rhoslc-s06e02" -> "S06")
+    _season_match = None
+    for part in ep_id.split("-"):
+        if part.startswith("s") and len(part) >= 3:
+            _season_match = part[:3].upper()  # "s06" -> "S06"
+            break
+    # Filter cast by season if available
+    _season_cast = []
+    if _season_match and _rerun_cast:
+        _season_cast = [c for c in _rerun_cast if _season_match in (c.get("seasons") or [])]
+        _cast_count = len(_season_cast) if _season_cast else len(_rerun_cast)
+    else:
+        _cast_count = len(_rerun_cast)
 
-            if run_mode == "local":
-                # Use streaming for real-time progress
-                result, error = helpers.run_incremental_with_streaming(
-                    ep_id=ep_id,
-                    operation="transcribe_only",
-                    endpoint=f"/jobs/episodes/{ep_id}/audio/transcribe_only",
-                    payload=payload,
-                    operation_display_name="Re-transcription",
-                )
-                if result and result.get("status") == "succeeded":
-                    st.success(f"Re-transcribed! {result.get('segment_count', '?')} segments")
-                    time.sleep(1)
-                    st.rerun()
-                elif error:
-                    st.error(f"Failed: {error}")
-            else:
-                # Queue mode - async request
-                with st.spinner("Re-running transcription..."):
-                    _start_ts = time.time()
-                    try:
-                        resp = helpers.api_post(
-                            f"/jobs/episodes/{ep_id}/audio/transcribe_only",
-                            json=payload,
-                        )
-                        if resp.get("success"):
-                            st.success(f"Re-transcribed! {resp.get('segment_count', 0)} segments")
-                            helpers.append_audio_run_history(
-                                ep_id,
-                                "transcribe_only",
-                                "succeeded",
-                                _start_ts,
-                                time.time(),
-                                [f"Queued transcription ({rerun_asr}) succeeded", f"Segments: {resp.get('segment_count', 0)}"],
-                            )
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(f"Failed: {resp}")
-                            helpers.append_audio_run_history(
-                                ep_id,
-                                "transcribe_only",
-                                "error",
-                                _start_ts,
-                                time.time(),
-                                [f"Queued transcription failed: {resp}"],
-                            )
-                    except requests.RequestException as exc:
-                        st.error(f"API error: {exc}")
+    # Calculate min/max speakers based on cast count (-2/+5)
+    if _cast_count > 0:
+        _min_speakers = max(1, _cast_count - 2)
+        _max_speakers = _cast_count + 5
+        st.info(f"**Speaker range: {_min_speakers} - {_max_speakers}** (based on {_cast_count} cast members)")
+    else:
+        _min_speakers = None
+        _max_speakers = None
+        st.caption("No cast data available - using config defaults")
+
+    if st.button("👥 Re-diarize", key=f"rerun_diarize_{ep_id}", use_container_width=True):
+        payload = {"run_mode": run_mode}
+        if _min_speakers is not None:
+            payload["min_speakers"] = _min_speakers
+        if _max_speakers is not None:
+            payload["max_speakers"] = _max_speakers
+
+        if run_mode == "local":
+            # Use streaming for real-time progress
+            result, error = helpers.run_incremental_with_streaming(
+                ep_id=ep_id,
+                operation="diarize_only",
+                endpoint=f"/jobs/episodes/{ep_id}/audio/diarize_only",
+                payload=payload,
+                operation_display_name="Re-diarization",
+            )
+            if result and result.get("status") == "succeeded":
+                speaker_count = result.get("speaker_count", "?")
+                segment_count = result.get("segment_count", "?")
+                st.success(f"Re-diarized! {segment_count} segments, {speaker_count} speakers")
+                time.sleep(1)
+                st.rerun()
+            elif error:
+                st.error(f"Failed: {error}")
+        else:
+            # Queue mode - async request
+            with st.spinner("Re-running diarization..."):
+                _start_ts = time.time()
+                try:
+                    resp = helpers.api_post(
+                        f"/jobs/episodes/{ep_id}/audio/diarize_only",
+                        json=payload,
+                        timeout=600,
+                    )
+                    if resp.get("success"):
+                        st.success(f"Re-diarized! {resp.get('segment_count', 0)} segments, {resp.get('speaker_count', 0)} speakers")
                         helpers.append_audio_run_history(
                             ep_id,
-                            "transcribe_only",
-                            "error",
+                            "diarize_only",
+                            "succeeded",
                             _start_ts,
                             time.time(),
-                            [f"API error: {exc}"],
+                            [f"Queued diarization succeeded", f"Segments: {resp.get('segment_count', 0)}, Speakers: {resp.get('speaker_count', 0)}"],
                         )
-
-    with rerun_col2:
-        st.write("**Re-run Diarization Only**")
-        st.caption("Keep audio files, re-do speaker segmentation")
-
-        # Calculate suggested speaker count from cast
-        _rerun_show_id = _get_show_id(ep_id)
-        _rerun_cast = _load_cast_members(_rerun_show_id)
-        # Parse season from ep_id (e.g., "rhoslc-s06e02" -> "S06")
-        _season_match = None
-        for part in ep_id.split("-"):
-            if part.startswith("s") and len(part) >= 3:
-                _season_match = part[:3].upper()  # "s06" -> "S06"
-                break
-        # Filter cast by season if available
-        _season_cast = []
-        if _season_match and _rerun_cast:
-            _season_cast = [c for c in _rerun_cast if _season_match in (c.get("seasons") or [])]
-            _cast_count = len(_season_cast) if _season_cast else len(_rerun_cast)
-        else:
-            _cast_count = len(_rerun_cast)
-        _suggested_speakers = _cast_count + 2 if _cast_count > 0 else 0
-
-        # Prime session state default once so the input is prefilled
-        _num_key = f"suggested_speakers_{ep_id}"
-        if _num_key not in st.session_state and _suggested_speakers > 0:
-            st.session_state[_num_key] = _suggested_speakers
-
-        # Show suggested value and input
-        _num_input_col, _use_suggested_col = st.columns([2, 1])
-        with _num_input_col:
-            default_val = st.session_state.get(_num_key, _suggested_speakers if _suggested_speakers > 0 else 0)
-            rerun_num_speakers = st.number_input(
-                "Force speaker count",
-                min_value=0,
-                max_value=30,
-                value=default_val,
-                key=f"rerun_num_speakers_{ep_id}",
-                help=f"Set to 0 for auto-detect (often under-counts). Suggested: {_suggested_speakers} based on cast count + buffer for guests.",
-            )
-        with _use_suggested_col:
-            st.write("")  # spacing
-            if _suggested_speakers > 0:
-                if st.button(f"Use {_suggested_speakers}", key=f"use_suggested_{ep_id}", help=f"{_cast_count} cast + 2 guests"):
-                    st.session_state[_num_key] = _suggested_speakers
-                    st.rerun()
-
-        if _suggested_speakers > 0:
-            st.caption(f"💡 {_cast_count} cast members for this season + 2 buffer for guests")
-
-        if st.button("👥 Re-diarize", key=f"rerun_diarize_{ep_id}", use_container_width=True):
-            payload = {"run_mode": run_mode}
-            if rerun_num_speakers > 0:
-                payload["num_speakers"] = rerun_num_speakers
-
-            if run_mode == "local":
-                # Use streaming for real-time progress
-                result, error = helpers.run_incremental_with_streaming(
-                    ep_id=ep_id,
-                    operation="diarize_only",
-                    endpoint=f"/jobs/episodes/{ep_id}/audio/diarize_only",
-                    payload=payload,
-                    operation_display_name="Re-diarization",
-                )
-                if result and result.get("status") == "succeeded":
-                    speaker_count = result.get("speaker_count", "?")
-                    segment_count = result.get("segment_count", "?")
-                    st.success(f"Re-diarized! {segment_count} segments, {speaker_count} speakers")
-                    time.sleep(1)
-                    st.rerun()
-                elif error:
-                    st.error(f"Failed: {error}")
-            else:
-                # Queue mode - async request
-                with st.spinner("Re-running diarization..."):
-                    _start_ts = time.time()
-                    try:
-                        resp = helpers.api_post(
-                            f"/jobs/episodes/{ep_id}/audio/diarize_only",
-                            json=payload,
-                            timeout=600,
-                        )
-                        if resp.get("success"):
-                            st.success(f"Re-diarized! {resp.get('segment_count', 0)} segments, {resp.get('speaker_count', 0)} speakers")
-                            helpers.append_audio_run_history(
-                                ep_id,
-                                "diarize_only",
-                                "succeeded",
-                                _start_ts,
-                                time.time(),
-                                [f"Queued diarization succeeded", f"Segments: {resp.get('segment_count', 0)}, Speakers: {resp.get('speaker_count', 0)}"],
-                            )
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(f"Failed: {resp}")
-                            helpers.append_audio_run_history(
-                                ep_id,
-                                "diarize_only",
-                                "error",
-                                _start_ts,
-                                time.time(),
-                                [f"Diarize queue failed: {resp}"],
-                            )
-                    except requests.RequestException as exc:
-                        st.error(f"API error: {exc}")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"Failed: {resp}")
                         helpers.append_audio_run_history(
                             ep_id,
                             "diarize_only",
                             "error",
                             _start_ts,
                             time.time(),
-                            [f"API error: {exc}"],
+                            [f"Diarize queue failed: {resp}"],
                         )
+                except requests.RequestException as exc:
+                    st.error(f"API error: {exc}")
+                    helpers.append_audio_run_history(
+                        ep_id,
+                        "diarize_only",
+                        "error",
+                        _start_ts,
+                        time.time(),
+                        [f"API error: {exc}"],
+                    )
+
+    # Show previous logs for incremental operations
+    st.markdown("---")
+    st.markdown("**📋 Recent Incremental Run Logs**")
+    _recent_runs = helpers.load_audio_run_history(ep_id, limit=5)
+    _incremental_ops = [r for r in _recent_runs if r.get("operation") in ("diarize_only", "transcribe_only", "voices_only")]
+    if _incremental_ops:
+        for _run_idx, _run in enumerate(_incremental_ops[:3]):  # Show up to 3 most recent
+            _op = _run.get("operation", "unknown")
+            _status = _run.get("status", "unknown")
+            _icon = {"succeeded": "✅", "error": "❌", "unknown": "⚠️"}.get(_status, "ℹ️")
+            _start_str = helpers.format_est(_run.get("start_ts"))
+            _dur = _run.get("duration_seconds", 0)
+            _dur_str = f"{_dur/60:.1f}m" if _dur >= 90 else f"{_dur:.1f}s"
+
+            # Use button toggle instead of nested expander
+            _log_key = f"incr_log_{ep_id}_{_run_idx}"
+            _log_expanded = st.session_state.get(_log_key, False)
+            _header_cols = st.columns([4, 1])
+            with _header_cols[0]:
+                st.markdown(f"{_icon} **{_op.replace('_', ' ').title()}** · {_start_str} · {_dur_str}")
+            with _header_cols[1]:
+                if st.button("📋" if not _log_expanded else "▲", key=f"btn_{_log_key}", help="Toggle log"):
+                    st.session_state[_log_key] = not _log_expanded
+                    st.rerun()
+
+            if _log_expanded:
+                _log_excerpt = _run.get("log_excerpt") or []
+                if _log_excerpt:
+                    st.code("\n".join(_log_excerpt[-50:]), language="text")
+                else:
+                    st.caption("No log details available")
+    else:
+        st.caption("No recent incremental runs")
 
     st.markdown("---")
     st.caption("💡 Use these options to iterate on specific stages without losing prior work.")
@@ -987,336 +1069,6 @@ st.markdown(
     "> **Voice segments** generated via MDX-Extra stem separation, "
     "Resemble-enhanced vocals, and pyannote.audio diarization + speaker embeddings."
 )
-
-st.markdown("---")
-
-# =============================================================================
-# A/B Diarization Comparison (Feature #3)
-# =============================================================================
-
-with st.expander("🔄 Diarization Comparison (Pyannote vs GPT-4o)", expanded=False):
-    st.markdown(
-        "Compare speaker segmentation from different diarization providers. "
-        "Useful for understanding which provider works better for your content."
-    )
-
-    try:
-        comparison_resp = helpers.api_get(f"/jobs/episodes/{ep_id}/audio/diarization/comparison")
-
-        has_pyannote = comparison_resp.get("has_pyannote", False)
-        has_gpt4o = comparison_resp.get("has_gpt4o", False)
-        summary = comparison_resp.get("summary", {})
-
-        if has_pyannote or has_gpt4o:
-            # Show summary comparison
-            cmp_col1, cmp_col2 = st.columns(2)
-
-            with cmp_col1:
-                st.markdown("**📊 Pyannote**")
-                pyannote_info = summary.get("pyannote", {})
-                if pyannote_info:
-                    st.write(f"- Speakers: {pyannote_info.get('speaker_count', '?')}")
-                    st.write(f"- Segments: {pyannote_info.get('segment_count', '?')}")
-                    st.write(f"- Speech duration: {pyannote_info.get('total_speech_duration_s', 0):.1f}s")
-                    st.write(f"- Avg segment: {pyannote_info.get('avg_segment_duration_s', 0):.1f}s")
-                elif has_pyannote:
-                    pyannote_segs = comparison_resp.get("pyannote_segments", [])
-                    speakers = set(s.get("speaker") for s in pyannote_segs)
-                    st.write(f"- Speakers: {len(speakers)}")
-                    st.write(f"- Segments: {len(pyannote_segs)}")
-                else:
-                    st.caption("Pyannote data not available")
-
-            with cmp_col2:
-                st.markdown("**🤖 GPT-4o**")
-                gpt4o_info = summary.get("gpt4o", {})
-                if gpt4o_info:
-                    st.write(f"- Speakers: {gpt4o_info.get('speaker_count', '?')}")
-                    st.write(f"- Segments: {gpt4o_info.get('segment_count', '?')}")
-                    st.write(f"- Speech duration: {gpt4o_info.get('total_speech_duration_s', 0):.1f}s")
-                    st.write(f"- Avg segment: {gpt4o_info.get('avg_segment_duration_s', 0):.1f}s")
-                elif has_gpt4o:
-                    gpt4o_segs = comparison_resp.get("gpt4o_segments", [])
-                    speakers = set(s.get("speaker") for s in gpt4o_segs)
-                    st.write(f"- Speakers: {len(speakers)}")
-                    st.write(f"- Segments: {len(gpt4o_segs)}")
-                else:
-                    st.caption("GPT-4o data not available")
-
-            # Show comparison metrics if available
-            cmp_metrics = summary.get("comparison", {})
-            if cmp_metrics:
-                st.markdown("---")
-                st.markdown("**Comparison:**")
-                speaker_diff = cmp_metrics.get("speaker_count_diff", 0)
-                if speaker_diff > 0:
-                    st.write(f"- GPT-4o found **{speaker_diff} more** speakers")
-                elif speaker_diff < 0:
-                    st.write(f"- Pyannote found **{abs(speaker_diff)} more** speakers")
-                else:
-                    st.write("- Both found the same number of speakers")
-
-                duration_diff = cmp_metrics.get("duration_diff_s", 0)
-                if abs(duration_diff) > 1:
-                    if duration_diff > 0:
-                        st.write(f"- GPT-4o detected **{duration_diff:.1f}s more** speech")
-                    else:
-                        st.write(f"- Pyannote detected **{abs(duration_diff):.1f}s more** speech")
-
-            # Show timeline-aligned segments comparison
-            if has_pyannote and has_gpt4o:
-                st.markdown("---")
-                st.markdown("**📊 Speaker Segmentation Comparison**")
-                st.caption("Compare speaker detection between Pyannote (SPEAKER_XX) vs GPT-4o (A, B, C). Disagreements show where providers differ on who is speaking.")
-
-                pyannote_segs = comparison_resp.get("pyannote_segments", [])
-                gpt4o_segs = comparison_resp.get("gpt4o_segments", [])
-
-                # Build unified timeline events
-                events = []
-                for s in pyannote_segs:
-                    events.append({"time": s["start"], "type": "start", "provider": "pyannote", "seg": s})
-                    events.append({"time": s["end"], "type": "end", "provider": "pyannote", "seg": s})
-                for s in gpt4o_segs:
-                    events.append({"time": s["start"], "type": "start", "provider": "gpt4o", "seg": s})
-                    events.append({"time": s["end"], "type": "end", "provider": "gpt4o", "seg": s})
-
-                # Sort by time
-                events.sort(key=lambda x: (x["time"], 0 if x["type"] == "start" else 1))
-
-                # Find time windows where segments overlap/differ
-                time_windows = []
-                active_pyannote = []
-                active_gpt4o = []
-                last_time = 0.0
-
-                for evt in events:
-                    if evt["time"] > last_time and (active_pyannote or active_gpt4o):
-                        time_windows.append({
-                            "start": last_time,
-                            "end": evt["time"],
-                            "pyannote": list(active_pyannote),
-                            "gpt4o": list(active_gpt4o),
-                        })
-
-                    if evt["provider"] == "pyannote":
-                        if evt["type"] == "start":
-                            active_pyannote.append(evt["seg"])
-                        else:
-                            active_pyannote = [s for s in active_pyannote if s != evt["seg"]]
-                    else:
-                        if evt["type"] == "start":
-                            active_gpt4o.append(evt["seg"])
-                        else:
-                            active_gpt4o = [s for s in active_gpt4o if s != evt["seg"]]
-
-                    last_time = evt["time"]
-
-                # Helper to determine if a window has a disagreement
-                def is_disagreement(window):
-                    has_pyannote = bool(window["pyannote"])
-                    has_gpt4o = bool(window["gpt4o"])
-                    # Disagreement if one has speech and other doesn't
-                    if has_pyannote != has_gpt4o:
-                        return True
-                    # Both have speech - could compare speaker counts as proxy for disagreement
-                    if has_pyannote and has_gpt4o:
-                        pyannote_speakers = set(s.get("speaker", "?") for s in window["pyannote"])
-                        gpt4o_speakers = set(s.get("speaker", "?") for s in window["gpt4o"])
-                        # Different number of speakers in same window = disagreement
-                        if len(pyannote_speakers) != len(gpt4o_speakers):
-                            return True
-                    return False
-
-                # Filter toggle
-                show_only_disagreements = st.checkbox(
-                    "🔍 Show only disagreements",
-                    value=False,
-                    help="Filter to show only time windows where Pyannote and GPT-4o detected different results"
-                )
-
-                # Filter windows
-                filtered_windows = []
-                for window in time_windows:
-                    if window["end"] - window["start"] < 0.3:
-                        continue  # Skip very short windows
-                    if show_only_disagreements and not is_disagreement(window):
-                        continue
-                    filtered_windows.append(window)
-
-                # Count stats
-                total_disagreements = sum(1 for w in time_windows if w["end"] - w["start"] >= 0.3 and is_disagreement(w))
-                total_valid_windows = sum(1 for w in time_windows if w["end"] - w["start"] >= 0.3)
-
-                if show_only_disagreements:
-                    st.info(f"Showing {len(filtered_windows)} disagreements out of {total_valid_windows} total time windows")
-                else:
-                    st.caption(f"{total_disagreements} disagreements out of {total_valid_windows} time windows")
-
-                # Build table data
-                table_rows = []
-                max_rows = 25
-                for window in filtered_windows[:max_rows]:
-                    w_start = window["start"]
-                    w_end = window["end"]
-                    w_duration = w_end - w_start
-                    disagreement = is_disagreement(window)
-
-                    # Format Pyannote column
-                    if window["pyannote"]:
-                        pyannote_speakers = [s.get("speaker", "?") for s in window["pyannote"]]
-                        pyannote_text = ", ".join(pyannote_speakers)
-                    else:
-                        pyannote_text = "—"
-
-                    # Format GPT-4o column (speaker labels only for fair diarization comparison)
-                    if window["gpt4o"]:
-                        gpt4o_speakers = [s.get("speaker", "?") for s in window["gpt4o"]]
-                        gpt4o_text = ", ".join(gpt4o_speakers)
-                    else:
-                        gpt4o_text = "—"
-
-                    table_rows.append({
-                        "Time": f"{w_start:.1f}–{w_end:.1f}s",
-                        "Duration": f"{w_duration:.1f}s",
-                        "🔵 Pyannote": pyannote_text,
-                        "🟢 GPT-4o": gpt4o_text,
-                        "⚠️": "⚠️" if disagreement else "✓",
-                    })
-
-                if table_rows:
-                    import pandas as pd
-                    df = pd.DataFrame(table_rows)
-                    st.dataframe(
-                        df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Time": st.column_config.TextColumn("Time", width="small"),
-                            "Duration": st.column_config.TextColumn("Dur", width="small"),
-                            "🔵 Pyannote": st.column_config.TextColumn("🔵 Pyannote", width="medium"),
-                            "🟢 GPT-4o": st.column_config.TextColumn("🟢 GPT-4o", width="medium"),
-                            "⚠️": st.column_config.TextColumn("", width="small"),
-                        }
-                    )
-
-                    if len(filtered_windows) > max_rows:
-                        st.caption(f"... and {len(filtered_windows) - max_rows} more time windows")
-                else:
-                    if show_only_disagreements:
-                        st.success("✅ No disagreements found! Both providers agree on all time windows.")
-                    else:
-                        st.info("No time windows to display.")
-
-                # Detailed segment lists for each provider
-                st.markdown("---")
-                st.markdown("**📋 Detailed Segment Lists**")
-                st.caption("View all segments detected by each provider")
-
-                seg_tab1, seg_tab2 = st.tabs(["🔵 Pyannote Segments", "🟢 GPT-4o Segments"])
-
-                with seg_tab1:
-                    if pyannote_segs:
-                        # Group by speaker
-                        pyannote_by_speaker = {}
-                        for seg in pyannote_segs:
-                            spk = seg.get("speaker", "?")
-                            if spk not in pyannote_by_speaker:
-                                pyannote_by_speaker[spk] = []
-                            pyannote_by_speaker[spk].append(seg)
-
-                        st.write(f"**{len(pyannote_segs)} segments** from **{len(pyannote_by_speaker)} speakers**")
-
-                        for spk, segs in sorted(pyannote_by_speaker.items()):
-                            total_dur = sum(s["end"] - s["start"] for s in segs)
-                            st.markdown(f"**{spk}** ({len(segs)} segments, {total_dur:.1f}s total)")
-                            seg_rows = []
-                            for s in segs[:20]:
-                                seg_rows.append({
-                                    "Start": f"{s['start']:.1f}s",
-                                    "End": f"{s['end']:.1f}s",
-                                    "Duration": f"{s['end'] - s['start']:.1f}s",
-                                })
-                            st.dataframe(seg_rows, use_container_width=True, hide_index=True)
-                            if len(segs) > 20:
-                                st.caption(f"... and {len(segs) - 20} more segments")
-                    else:
-                        st.info("No Pyannote segments available")
-
-                with seg_tab2:
-                    if gpt4o_segs:
-                        # Group by speaker
-                        gpt4o_by_speaker = {}
-                        for seg in gpt4o_segs:
-                            spk = seg.get("speaker", "?")
-                            if spk not in gpt4o_by_speaker:
-                                gpt4o_by_speaker[spk] = []
-                            gpt4o_by_speaker[spk].append(seg)
-
-                        st.write(f"**{len(gpt4o_segs)} segments** from **{len(gpt4o_by_speaker)} speakers**")
-
-                        for spk, segs in sorted(gpt4o_by_speaker.items()):
-                            total_dur = sum(s["end"] - s["start"] for s in segs)
-                            st.markdown(f"**Speaker {spk}** ({len(segs)} segments, {total_dur:.1f}s total)")
-                            seg_rows = []
-                            for s in segs[:20]:
-                                display_text = s.get("canonical_text") or s.get("text") or s.get("raw_text") or ""
-                                if len(display_text) > 80:
-                                    display_text = display_text[:80] + "..."
-                                seg_rows.append({
-                                    "Start": f"{s['start']:.1f}s",
-                                    "End": f"{s['end']:.1f}s",
-                                    "Duration": f"{s['end'] - s['start']:.1f}s",
-                                    "Text": display_text,
-                                    "Mixed": "⚠️" if s.get("mixed_speaker") else "—",
-                                })
-                            st.dataframe(seg_rows, use_container_width=True, hide_index=True)
-
-                            mixed_segments = [s for s in segs if s.get("mixed_speaker")]
-                            if mixed_segments:
-                                st.caption("⚠️ Mixed-speaker segments detected. Use Smart Split to correct.")
-                                for s in mixed_segments[:5]:
-                                    seg_id = s.get("segment_id") or f"gpt4o_{int(s.get('start',0)*1000):07d}"
-                                    canonical = s.get("canonical_text")
-                                    raw_text = s.get("text") or s.get("raw_text")
-                                    with st.expander(f"{seg_id}: {s.get('start',0):.2f}s → {s.get('end',0):.2f}s", expanded=False):
-                                        if canonical:
-                                            st.write(f"**Canonical (Whisper):** {canonical}")
-                                        if raw_text and raw_text != canonical:
-                                            st.caption(f"Model raw: {raw_text}")
-                                        if st.button(
-                                            "Smart Split",
-                                            key=f"smart_split_gpt4o_{seg_id}",
-                                            use_container_width=True,
-                                        ):
-                                            payload = {
-                                                "source": "gpt4o",
-                                                "speaker_group_id": f"gpt4o:{spk}",
-                                                "segment_id": seg_id,
-                                                "start": s.get("start"),
-                                                "end": s.get("end"),
-                                                "expected_voices": 2,
-                                            }
-                                            try:
-                                                resp = helpers.api_post(f"/episodes/{ep_id}/audio/smart_split", json=payload)
-                                                if resp.get("error"):
-                                                    st.error(resp.get("error"))
-                                                else:
-                                                    st.success("Smart split started")
-                                                    time.sleep(1)
-                                                    st.rerun()
-                                            except requests.RequestException as exc:
-                                                st.error(helpers.describe_error("Smart Split", exc))
-                            if len(segs) > 20:
-                                st.caption(f"... and {len(segs) - 20} more segments")
-                    else:
-                        st.info("No GPT-4o segments available")
-
-        else:
-            st.info("No diarization comparison data available. Run the full pipeline to generate comparison.")
-
-    except requests.RequestException as e:
-        st.warning(f"Could not load diarization comparison: {e}")
 
 st.markdown("---")
 
@@ -1534,6 +1286,578 @@ with st.expander("🔗 Suggested Merges", expanded=False):
 st.markdown("---")
 
 # =============================================================================
+# Speaker Group Assignments Section
+# =============================================================================
+
+st.subheader("🎭 Speaker Group Assignments")
+st.markdown(
+    "Assign diarization speaker groups to cast members. "
+    "These assignments are used for voiceprint creation and identification. "
+    "Groups with higher confidence scores are typically more reliable."
+)
+
+# Load speaker assignments data from API
+speaker_data = _load_speaker_assignments_data(ep_id)
+speaker_groups_data = speaker_data.get("speaker_groups", [])
+current_assignments = speaker_data.get("assignments", [])
+api_cast_members = speaker_data.get("cast_members", [])
+
+# Build lookup for current assignments
+assignment_lookup = {a["speaker_group_id"]: a for a in current_assignments}
+
+if not speaker_groups_data:
+    st.info("No speaker groups available. Run the audio pipeline first.")
+else:
+    # Show groups by source
+    sources = {}
+    for grp in speaker_groups_data:
+        src = grp.get("source", "unknown")
+        if src not in sources:
+            sources[src] = []
+        sources[src].append(grp)
+
+    # Build cast options for dropdowns
+    if api_cast_members:
+        cast_options = ["(Unassigned)"] + [
+            f"{m.get('name', m.get('cast_id', 'Unknown'))}"
+            for m in api_cast_members
+        ]
+        cast_values = [None] + [m.get("cast_id") for m in api_cast_members]
+    else:
+        cast_options = ["(No cast members)"]
+        cast_values = [None]
+
+    # Track pending changes
+    pending_changes_key = f"pending_speaker_assignments_{ep_id}"
+    if pending_changes_key not in st.session_state:
+        st.session_state[pending_changes_key] = {}
+
+    for source_name, source_groups in sorted(sources.items()):
+        st.markdown(f"**Source: {source_name}** ({len(source_groups)} groups)")
+
+        # Sort by duration descending
+        source_groups_sorted = sorted(
+            source_groups,
+            key=lambda g: g.get("total_duration", 0),
+            reverse=True,
+        )
+
+        for grp in source_groups_sorted:
+            grp_id = grp.get("speaker_group_id", "")
+            grp_label = grp.get("speaker_label", "")
+            seg_count = grp.get("segment_count", 0)
+            duration = grp.get("total_duration", 0)
+            mean_conf = grp.get("mean_diar_confidence")
+            segments = grp.get("segments", [])
+
+            # Current assignment
+            current_assign = assignment_lookup.get(grp_id, {})
+            current_cast_id = current_assign.get("cast_id")
+
+            # Determine dropdown index
+            try:
+                current_idx = cast_values.index(current_cast_id) if current_cast_id else 0
+            except ValueError:
+                current_idx = 0
+
+            # Build confidence display
+            if mean_conf is not None:
+                conf_pct = mean_conf * 100
+                if conf_pct >= 80:
+                    conf_icon = "🟢"
+                elif conf_pct >= 60:
+                    conf_icon = "🟡"
+                else:
+                    conf_icon = "🔴"
+                conf_display = f"{conf_icon} {conf_pct:.0f}%"
+            else:
+                conf_display = "—"
+
+            # Check group purity (cross-segment speaker mixing)
+            group_purity = grp.get("group_purity", "high")
+            group_purity_warnings = grp.get("group_purity_warnings", [])
+
+            # Build purity indicator
+            purity_badge = ""
+            if group_purity == "low":
+                purity_badge = " 🔴 Mixed speakers"
+            elif group_purity == "medium":
+                purity_badge = " 🟡 Possible mix"
+
+            # Build expander title with assignment info
+            assign_badge = f" → {current_assign['cast_display_name']}" if current_assign.get("cast_display_name") else ""
+            expander_title = (
+                f"**{grp_label}** {seg_count} segs | {_format_duration(duration)} | "
+                f"Conf: {conf_display}{purity_badge}{assign_badge}"
+            )
+
+            with st.expander(expander_title, expanded=False):
+                # Assignment dropdown at top
+                assign_col1, assign_col2 = st.columns([2, 3])
+                with assign_col1:
+                    st.write("**Assign to:**")
+                with assign_col2:
+                    selected_idx = st.selectbox(
+                        f"Assign {grp_label}",
+                        options=range(len(cast_options)),
+                        index=current_idx,
+                        format_func=lambda i: cast_options[i],
+                        key=f"spk_assign_{ep_id}_{grp_id}",
+                        label_visibility="collapsed",
+                    )
+
+                    # Track change
+                    selected_cast_id = cast_values[selected_idx]
+                    if selected_cast_id != current_cast_id:
+                        if selected_cast_id:
+                            st.session_state[pending_changes_key][grp_id] = {
+                                "source": source_name,
+                                "speaker_group_id": grp_id,
+                                "cast_id": selected_cast_id,
+                                "cast_display_name": cast_options[selected_idx],
+                            }
+                        elif grp_id in st.session_state[pending_changes_key]:
+                            del st.session_state[pending_changes_key][grp_id]
+                    elif grp_id in st.session_state[pending_changes_key] and selected_cast_id == current_cast_id:
+                        del st.session_state[pending_changes_key][grp_id]
+
+                st.markdown("---")
+
+                # Show group purity warnings if any
+                if group_purity_warnings:
+                    for warn in group_purity_warnings:
+                        st.warning(f"⚠️ {warn}")
+
+                st.write(f"**Segments ({len(segments)}):**")
+
+                # Show each segment with transcript and audio
+                for seg_idx, seg in enumerate(segments):
+                    seg_start = seg.get("start", 0)
+                    seg_end = seg.get("end", 0)
+                    seg_duration = seg.get("duration", seg_end - seg_start)
+                    seg_conf = seg.get("diar_confidence")
+
+                    # Get utterance analysis from API (falls back to local calculation)
+                    utterance_count = seg.get("utterance_count", 0)
+                    dialogue_risk = seg.get("dialogue_risk", "none")
+                    dialogue_reasons = seg.get("dialogue_reasons", [])
+                    has_narrator = seg.get("has_narrator_speech", False)
+                    is_clean = seg.get("is_clean_for_voiceprint", True)
+                    rejection_reason = seg.get("rejection_reason")
+
+                    # Voiceprint override fields (from API)
+                    seg_id = seg.get("segment_id", f"seg_{seg_idx}")
+                    voiceprint_override = seg.get("voiceprint_override")  # "force_include" | "force_exclude" | None
+                    voiceprint_selected = seg.get("voiceprint_selected", is_clean)
+
+                    # Get matching transcripts for this segment (for display)
+                    seg_transcripts = _get_transcript_for_segment(asr_raw, seg_start, seg_end)
+
+                    # Build segment warnings
+                    warnings_html = ""
+
+                    # Multi-utterance warning (use API count if available, fallback to local)
+                    utt_count = utterance_count if utterance_count > 0 else len(seg_transcripts)
+                    if utt_count > 1:
+                        warnings_html += f"<span style='color:#f39c12'> ⚠️ {utt_count} utterances</span>"
+
+                    # Dialogue risk indicator
+                    if dialogue_risk == "high":
+                        warnings_html += "<span style='color:#e74c3c'> 🔴 Dialogue detected</span>"
+                    elif dialogue_risk == "low":
+                        warnings_html += "<span style='color:#f39c12'> 🟡 Possible dialogue</span>"
+
+                    # Narrator speech indicator
+                    if has_narrator:
+                        warnings_html += "<span style='color:#9b59b6'> 🎙️ Narrator</span>"
+
+                    # Voiceprint eligibility - use effective value (with override applied)
+                    if voiceprint_override == "force_include":
+                        warnings_html += "<span style='color:#27ae60'> ✅ Voiceprint (override)</span>"
+                    elif voiceprint_override == "force_exclude":
+                        warnings_html += "<span style='color:#e74c3c'> ❌ Excluded (override)</span>"
+                    elif not is_clean:
+                        warnings_html += "<span style='color:#f39c12'> ⚠️ Check voiceprint</span>"
+
+                    # Build segment header
+                    conf_str = f" | Conf: {seg_conf*100:.0f}%" if seg_conf else ""
+
+                    st.markdown(
+                        f"<div style='background:#1a1a2e;padding:8px;border-radius:4px;margin-bottom:8px'>"
+                        f"<strong>Seg {seg_idx+1}:</strong> "
+                        f"<span style='color:#888'>{_format_duration(seg_start)} - {_format_duration(seg_end)} "
+                        f"({seg_duration:.1f}s){conf_str}</span>"
+                        f"{warnings_html}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Show dialogue reasons as tooltip/details
+                    if dialogue_reasons:
+                        with st.container():
+                            st.caption(f"💬 {'; '.join(dialogue_reasons[:2])}")
+
+                    # Smart Split UI for high dialogue risk segments
+                    show_smart_split = dialogue_risk == "high" or utt_count >= 3
+                    if show_smart_split:
+                        smart_split_key = f"smart_split_{ep_id}_{grp_id}_{seg_id}"
+                        split_expanded_key = f"split_expanded_{ep_id}_{grp_id}_{seg_id}"
+                        if split_expanded_key not in st.session_state:
+                            st.session_state[split_expanded_key] = False
+
+                        # Toggle button instead of expander (avoids nested expander error)
+                        toggle_cols = st.columns([3, 1])
+                        with toggle_cols[1]:
+                            toggle_label = "▼ Close" if st.session_state[split_expanded_key] else "✂️ Smart Split"
+                            if st.button(toggle_label, key=f"toggle_{smart_split_key}", help="Split at word boundary"):
+                                st.session_state[split_expanded_key] = not st.session_state[split_expanded_key]
+                                st.rerun()
+
+                    if show_smart_split and st.session_state.get(split_expanded_key, False):
+                        with st.container():
+                            st.caption(
+                                "This segment may contain multiple speakers. "
+                                "Click between words to set split points, then confirm."
+                            )
+
+                            # Fetch words for this segment
+                            try:
+                                words_resp = helpers.api_get(
+                                    f"/jobs/episodes/{ep_id}/audio/segments/{seg_id}/words",
+                                    params={"source": source_name, "speaker_group_id": grp_id}
+                                )
+                                words = words_resp.get("words", [])
+                            except Exception as e:
+                                words = []
+                                st.warning(f"Could not load words: {e}")
+
+                            if words:
+                                # Display words with clickable boundaries
+                                st.write("**Click between words to mark split point:**")
+
+                                # Initialize or get split state
+                                split_state_key = f"split_indices_{ep_id}_{grp_id}_{seg_id}"
+                                if split_state_key not in st.session_state:
+                                    st.session_state[split_state_key] = []
+
+                                current_splits = st.session_state[split_state_key]
+
+                                # Build word display with split markers
+                                cols_per_row = 8
+                                word_buttons = []
+
+                                for w_idx, word_data in enumerate(words):
+                                    word_text = word_data.get("w", "")
+                                    word_t0 = word_data.get("t0", 0)
+                                    word_t1 = word_data.get("t1", 0)
+
+                                    # Check if there's a split after this word
+                                    has_split = w_idx in current_splits
+                                    word_buttons.append({
+                                        "idx": w_idx,
+                                        "text": word_text,
+                                        "t0": word_t0,
+                                        "t1": word_t1,
+                                        "split_after": has_split,
+                                    })
+
+                                # Display words in rows with split toggles
+                                num_rows = (len(word_buttons) + cols_per_row - 1) // cols_per_row
+                                for row_idx in range(num_rows):
+                                    start_idx = row_idx * cols_per_row
+                                    end_idx = min(start_idx + cols_per_row, len(word_buttons))
+                                    row_words = word_buttons[start_idx:end_idx]
+
+                                    # Create columns for this row (word + split button pairs)
+                                    cols = st.columns(len(row_words) * 2)
+                                    for i, wb in enumerate(row_words):
+                                        with cols[i * 2]:
+                                            # Show word with timing
+                                            st.markdown(
+                                                f"<span title='{wb['t0']:.2f}s-{wb['t1']:.2f}s'>"
+                                                f"<b>{wb['text']}</b></span>",
+                                                unsafe_allow_html=True
+                                            )
+                                        with cols[i * 2 + 1]:
+                                            # Split toggle (not for last word)
+                                            if wb["idx"] < len(words) - 1:
+                                                split_btn_key = f"split_btn_{ep_id}_{grp_id}_{seg_id}_{wb['idx']}"
+                                                if wb["split_after"]:
+                                                    if st.button("✂️", key=split_btn_key, help="Remove split"):
+                                                        st.session_state[split_state_key].remove(wb["idx"])
+                                                        st.rerun()
+                                                else:
+                                                    if st.button("|", key=split_btn_key, help="Add split here"):
+                                                        st.session_state[split_state_key].append(wb["idx"])
+                                                        st.rerun()
+
+                                # Show current splits summary
+                                if current_splits:
+                                    sorted_splits = sorted(current_splits)
+                                    split_preview = []
+                                    prev_idx = 0
+                                    for split_idx in sorted_splits + [len(words) - 1]:
+                                        segment_words = [words[i].get("w", "") for i in range(prev_idx, split_idx + 1)]
+                                        split_preview.append(" ".join(segment_words[:5]) + ("..." if len(segment_words) > 5 else ""))
+                                        prev_idx = split_idx + 1
+
+                                    st.write("**Preview of segments after split:**")
+                                    for i, preview in enumerate(split_preview):
+                                        st.caption(f"  {i+1}. \"{preview}\"")
+
+                                    # Confirm split button
+                                    confirm_cols = st.columns([2, 1])
+                                    with confirm_cols[0]:
+                                        if st.button(
+                                            f"✅ Confirm Split ({len(sorted_splits)} cut{'s' if len(sorted_splits) > 1 else ''})",
+                                            key=f"confirm_split_{ep_id}_{grp_id}_{seg_id}",
+                                            type="primary"
+                                        ):
+                                            try:
+                                                resp = helpers.api_post(
+                                                    f"/jobs/episodes/{ep_id}/audio/segments/word-split",
+                                                    json={
+                                                        "source": source_name,
+                                                        "speaker_group_id": grp_id,
+                                                        "segment_id": seg_id,
+                                                        "split_word_indices": sorted_splits,
+                                                        "rebuild_downstream": False,  # Don't rebuild for UI responsiveness
+                                                    },
+                                                )
+                                                if resp.get("status") == "ok":
+                                                    new_segs = resp.get("new_segments", [])
+                                                    st.success(f"✅ Split into {len(new_segs)} segments!")
+                                                    # Clear split state
+                                                    st.session_state[split_state_key] = []
+                                                    time.sleep(0.5)
+                                                    st.rerun()
+                                                else:
+                                                    st.error(f"Split failed: {resp.get('message', 'Unknown error')}")
+                                            except Exception as e:
+                                                st.error(f"API error: {e}")
+                                    with confirm_cols[1]:
+                                        if st.button("❌ Clear", key=f"clear_split_{ep_id}_{grp_id}_{seg_id}"):
+                                            st.session_state[split_state_key] = []
+                                            st.rerun()
+                                else:
+                                    st.caption("Click '|' between words to mark where to split.")
+                            else:
+                                st.warning("No word-level timing data available for this segment.")
+
+                    # Per-segment cast assignment (for mixed speaker groups)
+                    # Check if there's a time-range assignment for this specific segment
+                    seg_assignment = seg.get("segment_assignment")  # From API if enriched
+                    seg_cast_id = seg_assignment.get("cast_id") if seg_assignment else None
+                    has_segment_level_assignment = seg_assignment is not None and seg_assignment.get("start") is not None
+
+                    # Show segment-level cast dropdown for mixed/low purity groups
+                    if group_purity in ("low", "medium") or has_segment_level_assignment:
+                        seg_assign_cols = st.columns([1, 2, 1])
+                        with seg_assign_cols[0]:
+                            st.caption("Cast:")
+                        with seg_assign_cols[1]:
+                            # Build options: (Use group default), then all cast members
+                            seg_cast_options = ["(Use group default)"] + [
+                                f"{cm.get('name', cm.get('cast_id', 'Unknown'))}"
+                                for cm in api_cast_members
+                            ]
+                            seg_cast_values = [None] + [cm.get("cast_id") for cm in api_cast_members]
+
+                            # Find current selection
+                            seg_current_idx = 0
+                            if seg_cast_id:
+                                for idx, val in enumerate(seg_cast_values):
+                                    if val == seg_cast_id:
+                                        seg_current_idx = idx
+                                        break
+
+                            seg_assign_key = f"seg_cast_{ep_id}_{grp_id}_{seg_id}"
+                            new_seg_cast_idx = st.selectbox(
+                                f"Segment {seg_idx+1} cast",
+                                options=range(len(seg_cast_options)),
+                                index=seg_current_idx,
+                                format_func=lambda i: seg_cast_options[i],
+                                key=seg_assign_key,
+                                label_visibility="collapsed",
+                            )
+
+                            # Handle segment-level cast change
+                            new_seg_cast_id = seg_cast_values[new_seg_cast_idx]
+                            if new_seg_cast_id != seg_cast_id:
+                                try:
+                                    resp = helpers.api_post(
+                                        f"/jobs/episodes/{ep_id}/audio/speaker-assignment",
+                                        json={
+                                            "source": source_name,
+                                            "speaker_group_id": grp_id,
+                                            "cast_id": new_seg_cast_id,
+                                            "start": seg_start,
+                                            "end": seg_end,
+                                        },
+                                    )
+                                    if resp.get("status") in ("ok", "removed"):
+                                        action = "removed" if not new_seg_cast_id else "set"
+                                        st.toast(f"✅ Segment cast {action}")
+                                        time.sleep(0.3)
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Failed: {resp.get('message', 'Unknown error')}")
+                                except Exception as e:
+                                    st.error(f"API error: {e}")
+                        with seg_assign_cols[2]:
+                            if has_segment_level_assignment:
+                                st.caption("📌 Override")
+
+                    # Voiceprint toggle checkbox
+                    vp_checkbox_key = f"vp_toggle_{ep_id}_{grp_id}_{seg_id}"
+                    vp_cols = st.columns([3, 1])
+                    with vp_cols[0]:
+                        # Show rejection reason if applicable and not overridden
+                        if rejection_reason and not voiceprint_override:
+                            st.caption(f"ℹ️ {rejection_reason}")
+                    with vp_cols[1]:
+                        current_vp_state = voiceprint_selected
+                        new_vp_state = st.checkbox(
+                            "🎤 Voiceprint",
+                            value=current_vp_state,
+                            key=vp_checkbox_key,
+                            help="Include this segment when creating voiceprints for this cast member"
+                        )
+                        # Handle toggle change
+                        if new_vp_state != current_vp_state:
+                            # Determine the override value
+                            if new_vp_state:
+                                # User wants to include - set force_include if not naturally clean
+                                new_override = "force_include" if not is_clean else None
+                            else:
+                                # User wants to exclude - always force_exclude
+                                new_override = "force_exclude"
+
+                            try:
+                                resp = helpers.api_post(
+                                    f"/jobs/episodes/{ep_id}/audio/voiceprint-overrides",
+                                    json={
+                                        "source": source_name,
+                                        "speaker_group_id": grp_id,
+                                        "segment_id": seg_id,
+                                        "voiceprint_override": new_override,
+                                    },
+                                )
+                                if resp.get("status") == "ok":
+                                    st.toast(f"✅ Voiceprint {'enabled' if new_vp_state else 'disabled'} for segment")
+                                    time.sleep(0.3)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Failed: {resp.get('message', 'Unknown error')}")
+                            except Exception as e:
+                                st.error(f"API error: {str(e)[:100]}")
+
+                    # Audio player for segment
+                    seg_audio_path = _extract_segment_audio(
+                        ep_id, grp_id.replace(":", "_"), seg_idx, seg_start, seg_end
+                    )
+                    if seg_audio_path and seg_audio_path.exists():
+                        try:
+                            audio_bytes = seg_audio_path.read_bytes()
+                            st.audio(audio_bytes, format="audio/wav")
+                        except Exception:
+                            st.caption("🔇 Audio unavailable")
+                    else:
+                        st.caption("🔇 Audio not extracted")
+
+                    # Show transcripts with split buttons
+                    if seg_transcripts:
+                        for utt_idx, utt in enumerate(seg_transcripts):
+                            utt_start = utt.get("start", 0)
+                            utt_end = utt.get("end", 0)
+                            utt_text = utt.get("text", "")
+                            utt_conf = utt.get("confidence")
+                            conf_warn = "⚠️ " if utt_conf and utt_conf < 0.6 else ""
+
+                            # Layout: transcript text + split button (for utterances after first)
+                            utt_cols = st.columns([6, 1])
+                            with utt_cols[0]:
+                                st.markdown(
+                                    f"<span style='color:#666;font-size:0.85em'>"
+                                    f"[{_format_duration(utt_start)}-{_format_duration(utt_end)}]</span> "
+                                    f"{conf_warn}\"{html.escape(utt_text)}\"",
+                                    unsafe_allow_html=True,
+                                )
+                            with utt_cols[1]:
+                                # Show split button for utterances after the first one
+                                # (can't split before the first utterance - that's the segment start)
+                                if utt_idx > 0 and utt_start > seg_start + 0.2:
+                                    split_key = f"split_{ep_id}_{seg_id}_{utt_idx}"
+                                    if st.button("✂️", key=split_key, help=f"Split segment at {_format_duration(utt_start)}"):
+                                        try:
+                                            resp = helpers.api_post(
+                                                f"/jobs/episodes/{ep_id}/audio/speaker-groups/split-at-utterance",
+                                                json={
+                                                    "source": source_name,
+                                                    "speaker_group_id": grp_id,
+                                                    "segment_id": seg_id,
+                                                    "split_time": utt_start,
+                                                },
+                                            )
+                                            if resp.get("status") == "ok":
+                                                new_segs = resp.get("new_segments", [])
+                                                st.toast(f"✅ Split into {len(new_segs)} segments")
+                                                time.sleep(0.5)
+                                                st.rerun()
+                                            else:
+                                                st.error(f"Split failed: {resp.get('detail', 'Unknown error')}")
+                                        except Exception as e:
+                                            st.error(f"API error: {str(e)[:100]}")
+                    else:
+                        st.caption("(no transcript)")
+
+                    if seg_idx < len(segments) - 1:
+                        st.markdown("<hr style='margin:8px 0;opacity:0.3'>", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+    # Save button
+    pending_count = len(st.session_state.get(pending_changes_key, {}))
+    if pending_count > 0:
+        st.warning(f"**{pending_count}** pending assignment change(s)")
+
+    save_col1, save_col2 = st.columns([1, 2])
+    with save_col1:
+        if st.button(
+            "💾 Save Assignments",
+            key="save_speaker_assignments",
+            use_container_width=True,
+            disabled=pending_count == 0,
+        ):
+            # Merge pending changes with existing assignments
+            final_assignments = []
+
+            # Start with current assignments that aren't being changed
+            for a in current_assignments:
+                if a["speaker_group_id"] not in st.session_state[pending_changes_key]:
+                    final_assignments.append(a)
+
+            # Add pending changes
+            for grp_id, change in st.session_state[pending_changes_key].items():
+                final_assignments.append(change)
+
+            # Save via API
+            result = _save_speaker_assignments(ep_id, final_assignments)
+            if "error" in result:
+                st.error(f"Save failed: {result['error']}")
+            else:
+                st.success(f"Saved {len(final_assignments)} assignment(s)!")
+                st.session_state[pending_changes_key] = {}
+                time.sleep(0.5)
+                st.rerun()
+
+    with save_col2:
+        assigned_count = len([a for a in current_assignments if a.get("cast_id")])
+        st.caption(f"{assigned_count} / {len(speaker_groups_data)} groups assigned")
+
+st.markdown("---")
+
+# =============================================================================
 # Archived Segments Section
 # =============================================================================
 
@@ -1558,7 +1882,7 @@ if archived_segments:
                 st.markdown(
                     f'<span style="color:#888;font-size:0.85em">'
                     f'[{_format_duration(arc_start)}-{_format_duration(arc_end)}]</span> '
-                    f'<span style="color:#666">"{arc_text}"</span>',
+                    f'<span style="color:#666">"{html.escape(arc_text)}"</span>',
                     unsafe_allow_html=True,
                 )
                 cluster_info = f"Cluster: {arc_cluster}" if arc_cluster else ""
@@ -1810,77 +2134,6 @@ else:
         "- `episode_vocals.wav`"
     )
 
-# Detailed segment lists per provider
-try:
-    diar_cmp = helpers.api_get(f"/jobs/episodes/{ep_id}/audio/diarization/comparison")
-except requests.RequestException:
-    diar_cmp = {}
-
-has_pyannote = diar_cmp.get("has_pyannote")
-has_gpt4o = diar_cmp.get("has_gpt4o")
-pyannote_segments = diar_cmp.get("pyannote_segments", []) if diar_cmp else []
-gpt4o_segments = diar_cmp.get("gpt4o_segments", []) if diar_cmp else []
-voice_clusters_gpt4o: list[dict] = []
-gpt_clusters_path = paths.get("voice_clusters_gpt4o")
-if gpt_clusters_path and gpt_clusters_path.exists():
-    try:
-        with gpt_clusters_path.open("r", encoding="utf-8") as f:
-            voice_clusters_gpt4o = json.load(f)
-    except Exception:
-        voice_clusters_gpt4o = []
-
-if has_pyannote or has_gpt4o:
-    with st.expander("📋 Detailed Segment Lists", expanded=False):
-        summary = diar_cmp.get("summary", {})
-        col_a, col_b = st.columns(2)
-        with col_a:
-            py_info = summary.get("pyannote", {})
-            st.markdown("🔵 **Pyannote Details**")
-            st.caption(
-                f"Speakers: {py_info.get('speaker_count', '?')} • "
-                f"Segments: {py_info.get('segment_count', '?')} • "
-                f"Speech: {py_info.get('total_speech_duration_s', 0):.1f}s"
-            )
-        with col_b:
-            gpt_info = summary.get("gpt4o", {})
-            st.markdown("🟢 **GPT-4o Details**")
-            st.caption(
-                f"Speakers: {gpt_info.get('speaker_count', '?')} • "
-                f"Segments: {gpt_info.get('segment_count', '?')} • "
-                f"Speech: {gpt_info.get('total_speech_duration_s', 0):.1f}s"
-            )
-
-        def _segment_table(rows: list[dict], provider: str, max_rows: int = 150):
-            if not rows:
-                st.caption(f"No segments for {provider}.")
-                return
-            trimmed = rows[:max_rows]
-            display_rows = []
-            for seg in trimmed:
-                display_rows.append({
-                    "start": round(seg.get("start", 0), 2),
-                    "end": round(seg.get("end", 0), 2),
-                    "speaker": seg.get("speaker", ""),
-                    "text": (seg.get("text", "") or "")[:80],
-                })
-            st.dataframe(display_rows, hide_index=True, use_container_width=True)
-            if len(rows) > max_rows:
-                st.caption(f"Showing first {max_rows} of {len(rows)} segments.")
-
-        st.markdown("🔵 **Pyannote Segments**")
-        _segment_table(pyannote_segments, "Pyannote")
-
-        st.markdown("🟢 **GPT-4o Segments**")
-        _segment_table(gpt4o_segments, "GPT-4o")
-
-        if voice_clusters_gpt4o:
-            st.markdown("🟢 **GPT-4o Speaker Clusters (by diarization label)**")
-            for vc in voice_clusters_gpt4o:
-                st.caption(
-                    f"{vc.get('voice_cluster_id')}: {len(vc.get('segments', []))} segments, "
-                    f"{vc.get('total_duration', 0):.1f}s"
-                )
-
 if not voice_clusters:
     st.info("No voice clusters found.")
     st.stop()
@@ -1916,7 +2169,7 @@ segment_quality_lookup = {}
 try:
     quality_resp = helpers.api_get(f"/jobs/episodes/{ep_id}/audio/segments/quality")
     for q in quality_resp.get("segments", []):
-        key = (round(q["start"], 1), round(q["end"], 1))
+        key = (round(q["start"], 2), round(q["end"], 2))
         segment_quality_lookup[key] = q
     quality_summary = quality_resp.get("summary", {})
     if quality_summary.get("poor", 0) > 0:
@@ -1982,7 +2235,7 @@ for cluster in sorted_clusters:
 
         # Guardrails: default to first 5 clips to avoid spiking CPU with dozens of ffmpeg extractions
         default_clip_count = 5
-        clip_limit_key = f"voice_clip_limit::{cluster_id}"
+        clip_limit_key = f"{ep_id}:voice_clip_limit::{cluster_id}"
         if clip_limit_key not in st.session_state:
             st.session_state[clip_limit_key] = default_clip_count
 
@@ -2051,7 +2304,7 @@ for cluster in sorted_clusters:
 
                     # Check poor quality filter
                     if show_poor_quality:
-                        quality_key = (round(seg_start, 1), round(seg_end, 1))
+                        quality_key = (round(seg_start, 2), round(seg_end, 2))
                         quality = segment_quality_lookup.get(quality_key, {})
                         if quality.get("status") in ("poor", "fair"):
                             passes_filter = True
@@ -2069,7 +2322,7 @@ for cluster in sorted_clusters:
                 seg_duration = seg_end - seg_start
 
                 # Get quality info for this segment (Feature #5)
-                quality_key = (round(seg_start, 1), round(seg_end, 1))
+                quality_key = (round(seg_start, 2), round(seg_end, 2))
                 seg_quality = segment_quality_lookup.get(quality_key, {})
                 quality_badge = seg_quality.get("badge", "")
                 quality_snr = seg_quality.get("snr_db")
@@ -2103,7 +2356,8 @@ for cluster in sorted_clusters:
                             if audio_bytes:
                                 st.audio(audio_bytes, format="audio/wav", start_time=int(seg_start))
                             else:
-                                st.caption("Audio unavailable")
+                                extract_err = _get_audio_extract_error(ep_id, cluster_id, i)
+                                st.caption(f"⚠️ {extract_err}" if extract_err else "Audio unavailable")
                 with col_move:
                     # Move segment dropdown - shows cast members and unlabeled clusters
                     move_idx = st.selectbox(
@@ -2240,14 +2494,14 @@ for cluster in sorted_clusters:
                                 st.markdown(
                                     f'<span style="color:#888;font-size:0.8em">{time_badge}</span> '
                                     f'<span style="color:#666;font-size:0.75em">🗄️</span> '
-                                    f'<span style="color:#666;text-decoration:line-through">"{t_text}"</span>',
+                                    f'<span style="color:#666;text-decoration:line-through">"{html.escape(t_text)}"</span>',
                                     unsafe_allow_html=True,
                                 )
                             else:
                                 st.markdown(
                                     f'<span style="color:#888;font-size:0.8em">{time_badge}</span> '
                                     f'<span style="color:{conf_color};font-size:0.75em" title="Confidence: {conf_pct}">{conf_badge}</span> '
-                                    f'<span style="color:{conf_color}">"{t_text}"</span>',
+                                    f'<span style="color:{conf_color}">"{html.escape(t_text)}"</span>',
                                     unsafe_allow_html=True,
                                 )
 

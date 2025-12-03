@@ -260,16 +260,19 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
             if embedding:
                 embeddings.append(np.array(embedding, dtype=np.float32))
 
-    if not embeddings:
-        LOGGER.warning(f"No embeddings found for track {track_id} in {ep_id}")
-        return None
-
-    # Compute track centroid as mean of embeddings
-    mean_embed = np.mean(embeddings, axis=0)
-    track_centroid = l2_normalize(mean_embed)
+    # Compute track centroid if we have embeddings
+    track_centroid: Optional[np.ndarray] = None
+    no_embeddings = False
+    if embeddings:
+        mean_embed = np.mean(embeddings, axis=0)
+        track_centroid = l2_normalize(mean_embed)
+    else:
+        LOGGER.info(f"No embeddings found for track {track_id} in {ep_id}, selecting by quality only")
+        no_embeddings = True
 
     # STEP 2: Score all candidate frames and select the BEST one
     candidates: List[Tuple[Dict[str, Any], str, float, float]] = []  # (face, crop_path, quality_score, similarity)
+    skipped_candidates: List[Tuple[Dict[str, Any], str, float, float]] = []  # Fallback for all-skipped tracks
 
     for face in faces:
         frame_idx = face.get("frame_idx")
@@ -280,26 +283,35 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         if not crop_path:
             continue
 
-        # Skip flagged frames
-        if face.get("skip"):
-            continue
-
         # Extract quality metrics
         det_score, crop_std, box_area = _extract_quality_metrics(face)
         quality_score = _compute_quality_score(det_score, crop_std, box_area)
 
-        # Compute similarity to track centroid
+        # Compute similarity to track centroid (if we have one)
         embedding = face.get("embedding")
         similarity = 0.0
-        if embedding:
+        if embedding and track_centroid is not None:
             face_embed = np.array(embedding, dtype=np.float32)
             similarity = cosine_similarity(face_embed, track_centroid)
 
+        # Separate skipped faces into fallback list
+        if face.get("skip"):
+            skipped_candidates.append((face, crop_path, quality_score, similarity))
+            continue
+
         candidates.append((face, crop_path, quality_score, similarity))
 
+    # Fall back to skipped candidates if no non-skipped candidates exist
+    # This ensures tracks with all-skipped faces still get a representative
+    all_skipped_fallback = False
     if not candidates:
-        LOGGER.warning(f"No valid candidates for track {track_id} in {ep_id}")
-        return None
+        if skipped_candidates:
+            LOGGER.info(f"Track {track_id}: using skipped faces as fallback (all faces were auto-skipped)")
+            candidates = skipped_candidates
+            all_skipped_fallback = True
+        else:
+            LOGGER.warning(f"No valid candidates for track {track_id} in {ep_id}")
+            return None
 
     # First pass: find best frame that passes BOTH quality gates AND similarity threshold
     high_quality_candidates = [
@@ -380,7 +392,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         "track_id": f"track_{track_id:04d}",
         "rep_frame": rep_face.get("frame_idx"),
         "crop_key": rep_crop_key,
-        "embed": track_centroid.tolist(),
+        "embed": track_centroid.tolist() if track_centroid is not None else None,
         "quality": {
             "det": round(float(det_score), 3),
             "std": round(float(crop_std), 1),
@@ -397,6 +409,12 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
 
     if rep_low_quality:
         result["rep_low_quality"] = True
+
+    if all_skipped_fallback:
+        result["all_skipped"] = True
+
+    if no_embeddings:
+        result["no_embeddings"] = True
 
     return result
 
@@ -737,6 +755,17 @@ def build_cluster_track_reps(
         for track_id in track_ids:
             rep = track_reps.get(track_id)
             if not rep:
+                # Try to compute on-the-fly for tracks missing from track_reps.jsonl
+                # This handles tracks with all-skipped faces that weren't included before
+                try:
+                    tid_int = int(track_id.replace("track_", "")) if isinstance(track_id, str) else int(track_id)
+                    computed_rep = compute_track_representative(ep_id, tid_int)
+                    if computed_rep:
+                        rep = computed_rep
+                        LOGGER.info(f"Computed on-the-fly rep for {track_id}")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to compute rep for {track_id}: {e}")
+            if not rep:
                 tracks_output.append(
                     {
                         "track_id": track_id,
@@ -776,6 +805,17 @@ def build_cluster_track_reps(
     tracks_output: List[Dict[str, Any]] = []
     for track_id in track_ids:
         rep = track_reps.get(track_id)
+        if not rep:
+            # Try to compute on-the-fly for tracks missing from track_reps.jsonl
+            # This handles tracks with all-skipped faces that weren't included before
+            try:
+                tid_int = int(track_id.replace("track_", "")) if isinstance(track_id, str) else int(track_id)
+                computed_rep = compute_track_representative(ep_id, tid_int)
+                if computed_rep:
+                    rep = computed_rep
+                    LOGGER.info(f"Computed on-the-fly rep for {track_id} in cluster {cluster_id}")
+            except Exception as e:
+                LOGGER.warning(f"Failed to compute rep for {track_id}: {e}")
         if not rep:
             # Include missing tracks with placeholder data
             tracks_output.append(
