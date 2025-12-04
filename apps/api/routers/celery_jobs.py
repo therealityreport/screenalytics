@@ -285,8 +285,8 @@ def _kill_process_tree_by_pid(pid: int) -> tuple[bool, str]:
         os.killpg(pgid, signal.SIGTERM)
         try:
             os.waitpid(-pgid, os.WNOHANG)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[process-kill] waitpid for pgid %d failed (expected if already reaped): %s", pgid, exc)
         return True, "terminated"
     except ProcessLookupError:
         return False, "not_found"
@@ -1007,8 +1007,8 @@ async def stream_celery_job(job_id: str, ep_id: str | None = None):
         if progress_file.exists():
             try:
                 return json.loads(progress_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[audio-progress] Failed to read progress file %s: %s", progress_file, exc)
         return None
 
     def _gen():
@@ -1158,8 +1158,8 @@ async def cancel_celery_job(job_id: str):
                             try:
                                 progress_path = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")) / "manifests" / ep_id / "audio_progress.json"
                                 progress_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                LOGGER.debug("[cancel-job] Failed to clear progress file: %s", exc)
 
                         if success:
                             LOGGER.info(f"Killed local job PID {pid} ({ep_id}::{operation})")
@@ -1636,8 +1636,8 @@ def _run_local_subprocess_blocking(
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cleanup] Failed to kill/wait on process (expected if already dead): %s", exc)
 
     try:
         # Start subprocess in a new process group so we can kill all children
@@ -1851,8 +1851,8 @@ async def _run_local_subprocess_async(
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cleanup] Failed to kill/wait on process (expected if already dead): %s", exc)
 
     try:
         # Use Popen with start_new_session=True to create a new process group
@@ -2279,8 +2279,8 @@ def _stream_local_subprocess(
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cleanup] Failed to kill/wait on process (expected if already dead): %s", exc)
 
     def _save_logs_always(status: str, elapsed: float, extra: Dict[str, Any] | None = None) -> None:
         """Always persist logs, even on crash/cancel. Called from finally block."""

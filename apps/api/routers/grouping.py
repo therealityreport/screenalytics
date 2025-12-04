@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from apps.api.services.grouping import GroupingService, _parse_ep_id
 from apps.api.services.cast import CastService
+from apps.api.services.dismissed_suggestions import dismissed_suggestions_service
 from apps.api.routers.episodes import _refresh_similarity_indexes
 
 LOGGER = logging.getLogger(__name__)
@@ -1226,6 +1227,117 @@ def merge_all_duplicates(ep_id: str, req: MergeAllRequest) -> dict:
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to merge duplicates: {str(e)}")
+
+
+# =============================================================================
+# Dismissed Suggestions Endpoints
+# =============================================================================
+
+
+class DismissRequest(BaseModel):
+    """Request to dismiss one or more suggestions."""
+
+    suggestion_ids: List[str] = Field(..., description="List of suggestion IDs to dismiss")
+
+
+@router.get("/episodes/{ep_id}/dismissed_suggestions")
+def get_dismissed_suggestions(ep_id: str) -> dict:
+    """Get all dismissed suggestions for an episode.
+
+    Returns:
+        {
+            "status": "success",
+            "ep_id": "show-S01E01",
+            "dismissed": ["cluster_id_1", "person:person_id_1", ...]
+        }
+    """
+    try:
+        dismissed = dismissed_suggestions_service.get_dismissed(ep_id)
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "dismissed": dismissed,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get dismissed suggestions: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/dismissed_suggestions")
+def dismiss_suggestions(ep_id: str, req: DismissRequest) -> dict:
+    """Dismiss one or more suggestions.
+
+    Request body:
+        suggestion_ids: List of suggestion IDs (cluster_id or "person:{person_id}")
+
+    Returns:
+        {"status": "success", "dismissed_count": N}
+    """
+    try:
+        if not req.suggestion_ids:
+            raise HTTPException(status_code=400, detail="suggestion_ids required")
+
+        success = dismissed_suggestions_service.dismiss_many(ep_id, req.suggestion_ids)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to persist dismissed suggestions")
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "dismissed_count": len(req.suggestion_ids),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to dismiss suggestions: {str(e)}")
+
+
+@router.delete("/episodes/{ep_id}/dismissed_suggestions/{suggestion_id}")
+def restore_suggestion(ep_id: str, suggestion_id: str) -> dict:
+    """Restore a previously dismissed suggestion.
+
+    Args:
+        suggestion_id: The suggestion ID to restore (URL encoded if contains special chars)
+
+    Returns:
+        {"status": "success", "restored": "suggestion_id"}
+    """
+    try:
+        success = dismissed_suggestions_service.restore(ep_id, suggestion_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to persist restored suggestion")
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "restored": suggestion_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to restore suggestion: {str(e)}")
+
+
+@router.delete("/episodes/{ep_id}/dismissed_suggestions")
+def clear_dismissed_suggestions(ep_id: str) -> dict:
+    """Clear all dismissed suggestions for an episode.
+
+    Returns:
+        {"status": "success", "message": "All dismissed suggestions cleared"}
+    """
+    try:
+        success = dismissed_suggestions_service.clear_all(ep_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to clear dismissed suggestions")
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "message": "All dismissed suggestions cleared",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear dismissed suggestions: {str(e)}")
 
 
 __all__ = ["router"]

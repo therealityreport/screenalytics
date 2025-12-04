@@ -68,13 +68,7 @@ def _crops_root(ep_id: str) -> Path:
 
 
 def _crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    """Resolve a crop URL, preferring S3 with local fallback.
-
-    Priority:
-    1. Use provided s3_key if available
-    2. Construct S3 key from rel_path if s3_key not provided
-    3. Fall back to local file if S3 fails
-    """
+    """Resolve a crop URL via S3 presigning only. Artifacts must be in S3."""
     constructed_s3_key = s3_key
 
     # If no S3 key provided, try to construct one from rel_path
@@ -91,33 +85,17 @@ def _crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | Non
         except (ValueError, KeyError):
             pass
 
-    # Try S3 first
+    # S3 presigning only - no local fallback
     if constructed_s3_key:
         url = STORAGE.presign_get(str(constructed_s3_key))
         if url:
             return url
 
-    # Local fallback
-    if rel_path:
-        frames_root = get_path(ep_id, "frames_root")
-        if rel_path.startswith("crops/"):
-            local = frames_root / rel_path
-        else:
-            local = _crops_root(ep_id) / rel_path
-        if local.exists():
-            return str(local)
-
     return None
 
 
 def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
-    """Resolve a thumbnail URL, preferring S3 with local fallback.
-
-    Priority:
-    1. Use provided s3_key if available
-    2. Construct S3 key from rel_path if s3_key not provided
-    3. Fall back to local file if S3 fails
-    """
+    """Resolve a thumbnail URL via S3 presigning only. Artifacts must be in S3."""
     constructed_s3_key = s3_key
 
     # If no S3 key provided, try to construct one from rel_path
@@ -131,23 +109,11 @@ def _thumbnail_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str 
         except (ValueError, KeyError):
             pass
 
-    # Try S3 first
+    # S3 presigning only - no local fallback
     if constructed_s3_key:
         url = STORAGE.presign_get(str(constructed_s3_key))
         if url:
             return url
-
-    # Local fallback - try crop path first if it looks like a crop
-    if rel_path and (rel_path.startswith("crops/") or "crops/" in rel_path):
-        frames_root = get_path(ep_id, "frames_root")
-        crop_path = frames_root / rel_path
-        if crop_path.exists():
-            return str(crop_path)
-
-    if rel_path:
-        local = _thumbs_root(ep_id) / rel_path
-        if local.exists():
-            return str(local)
 
     return None
 
@@ -434,7 +400,8 @@ def cluster_track_summary(
             norm_a = np.linalg.norm(a_vec) + 1e-12
             norm_b = np.linalg.norm(b_vec) + 1e-12
             return float(np.dot(a_vec / norm_a, b_vec / norm_b))
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("[cosine-sim] Failed to compute similarity: %s", exc)
             return None
 
     clusters: List[Dict[str, Any]] = []
@@ -493,6 +460,18 @@ def cluster_track_summary(
         if limit_per_cluster:
             limit = max(1, int(limit_per_cluster))
             tracks_payload = tracks_payload[:limit]
+        track_count = len(track_ids)
+        face_total = identity.get("faces") or sum(face_counts.get(int(tid), 0) for tid in track_ids)
+
+        # Compute singleton risk level for this cluster
+        singleton_origin = identity.get("origin")  # May be set during clustering
+        if track_count == 1 and face_total == 1:
+            singleton_risk = "HIGH"
+        elif track_count == 1:
+            singleton_risk = "MEDIUM"
+        else:
+            singleton_risk = "LOW"
+
         clusters.append(
             {
                 "identity_id": identity_id,
@@ -501,13 +480,42 @@ def cluster_track_summary(
                 "person_id": identity.get("person_id"),  # For filtering assigned vs unassigned
                 "cohesion": cluster_cohesion.get(identity_id),  # Add cohesion from centroids
                 "counts": {
-                    "tracks": len(track_ids),
-                    "faces": identity.get("faces") or sum(face_counts.get(int(tid), 0) for tid in track_ids),
+                    "tracks": track_count,
+                    "faces": face_total,
                 },
                 "tracks": tracks_payload,
+                # Singleton metrics
+                "singleton_risk": singleton_risk,
+                "singleton_origin": singleton_origin,
             }
         )
-    return {"ep_id": ep_id, "clusters": clusters}
+
+    # Compute aggregate singleton health metrics
+    total_clusters = len(clusters)
+    singleton_clusters = sum(1 for c in clusters if c["counts"]["tracks"] == 1)
+    single_frame_tracks = sum(
+        1 for c in clusters
+        for t in c.get("tracks", [])
+        if t.get("faces", 0) == 1
+    )
+    high_risk_count = sum(1 for c in clusters if c.get("singleton_risk") == "HIGH")
+    medium_risk_count = sum(1 for c in clusters if c.get("singleton_risk") == "MEDIUM")
+
+    singleton_health = {
+        "total_clusters": total_clusters,
+        "singleton_clusters": singleton_clusters,
+        "singleton_fraction": round(singleton_clusters / total_clusters, 3) if total_clusters > 0 else 0,
+        "single_frame_tracks": single_frame_tracks,
+        "high_risk_count": high_risk_count,
+        "medium_risk_count": medium_risk_count,
+        "health_status": (
+            "healthy" if total_clusters == 0 or singleton_clusters / total_clusters <= 0.25
+            else "warning" if singleton_clusters / total_clusters <= 0.40
+            else "critical"
+        ),
+    }
+
+    return {"ep_id": ep_id, "clusters": clusters, "singleton_health": singleton_health}
 
 
 def _rebuild_track_entry(track_entry: Dict[str, Any], face_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:

@@ -21,6 +21,7 @@ from apps.api.routers import (
     archive,
     audio,
     cast,
+    config,
     episodes,
     facebank,
     files,
@@ -46,6 +47,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(config.router, tags=["config"])
 app.include_router(episodes.router, tags=["episodes"])
 app.include_router(identities.router)
 app.include_router(roster.router)
@@ -210,6 +212,63 @@ def healthz() -> JSONResponse:
         payload["details"] = details
 
     return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/storage/status")
+def storage_status() -> Dict[str, Any]:
+    """Get detailed storage configuration and status.
+
+    Returns information about the current storage backend, S3 configuration,
+    and overall status useful for the Settings UI.
+    """
+    result: Dict[str, Any] = {
+        "backend": os.environ.get("STORAGE_BACKEND", "s3"),
+        "s3_enabled": False,
+        "bucket": "",
+        "region": "",
+        "endpoint": "",
+        "write_enabled": False,
+        "status": "unknown",
+    }
+
+    try:
+        from apps.api.routers import episodes as episodes_router
+
+        storage = getattr(episodes_router, "STORAGE", None)
+    except Exception:
+        result["status"] = "error"
+        result["error"] = "Could not import storage service"
+        return result
+
+    if storage is None:
+        result["status"] = "error"
+        result["error"] = "Storage service not initialized"
+        return result
+
+    # Extract storage configuration
+    result["backend"] = getattr(storage, "backend", "unknown")
+    result["s3_enabled"] = getattr(storage, "s3_enabled", lambda: False)()
+    result["bucket"] = getattr(storage, "bucket", "") or ""
+    result["write_enabled"] = getattr(storage, "write_enabled", False)
+
+    # Get endpoint/region from environment
+    result["endpoint"] = os.environ.get("MINIO_ENDPOINT", "") or os.environ.get("AWS_ENDPOINT_URL", "")
+    result["region"] = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT_REGION", "")
+
+    # Check for init errors
+    init_error = getattr(storage, "init_error", None)
+    if init_error:
+        result["status"] = "degraded"
+        result["error"] = str(init_error)
+    elif result["s3_enabled"]:
+        result["status"] = "ok"
+    elif result["backend"] == "local":
+        result["status"] = "ok"
+    else:
+        result["status"] = "degraded"
+        result["error"] = "S3 not configured"
+
+    return result
 
 
 def _check_redis(timeout: float = 0.5) -> Tuple[str, str | None]:

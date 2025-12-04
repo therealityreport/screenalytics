@@ -108,26 +108,32 @@ def _crops_root(ep_id: str) -> Path:
 
 
 def _resolve_crop_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    """Resolve crop URL via S3 presigning only. Artifacts must be in S3."""
+    # Try provided S3 key first
     if s3_key:
         url = STORAGE.presign_get(s3_key)
         if url:
             return url
-    if not rel_path:
-        return None
-    normalized = rel_path.strip()
-    if not normalized:
-        return None
-    frames_root = get_path(ep_id, "frames_root")
-    local = frames_root / normalized
-    if local.exists():
-        return str(local)
-    rel_parts = Path(normalized)
-    if rel_parts.parts and rel_parts.parts[0] == "crops":
-        rel_parts = Path(*rel_parts.parts[1:])
-    fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-    legacy = fallback_root / ep_id / "tracks" / rel_parts
-    if legacy.exists():
-        return str(legacy)
+
+    # Construct S3 key from rel_path if not provided
+    if rel_path:
+        normalized = rel_path.strip()
+        if normalized:
+            try:
+                ep_ctx = episode_context_from_id(ep_id)
+                prefixes = artifact_prefixes(ep_ctx)
+                crops_prefix = prefixes.get("crops")
+                if crops_prefix:
+                    crop_rel = normalized
+                    if crop_rel.startswith("crops/"):
+                        crop_rel = crop_rel[6:]
+                    constructed_key = f"{crops_prefix}{crop_rel}"
+                    url = STORAGE.presign_get(constructed_key)
+                    if url:
+                        return url
+            except (ValueError, KeyError):
+                pass
+
     return None
 
 
@@ -986,15 +992,27 @@ def _refresh_similarity_indexes(
 
 
 def _resolve_thumb_url(ep_id: str, rel_path: str | None, s3_key: str | None) -> str | None:
+    """Resolve thumbnail URL via S3 presigning only. Artifacts must be in S3."""
+    # Try provided S3 key first
     if s3_key:
         url = STORAGE.presign_get(s3_key)
         if url:
             return url
-    if not rel_path:
-        return None
-    local = _thumbs_root(ep_id) / rel_path
-    if local.exists():
-        return str(local)
+
+    # Construct S3 key from rel_path if not provided
+    if rel_path:
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = artifact_prefixes(ep_ctx)
+            thumbs_prefix = prefixes.get("thumbs")
+            if thumbs_prefix:
+                constructed_key = f"{thumbs_prefix}{rel_path}"
+                url = STORAGE.presign_get(constructed_key)
+                if url:
+                    return url
+        except (ValueError, KeyError):
+            pass
+
     return None
 
 
@@ -3436,6 +3454,118 @@ def unskip_all_track_faces(ep_id: str, track_id: int) -> Dict[str, Any]:
     return {"status": "unskipped", "track_id": track_id, "unskipped": unskipped_count}
 
 
+class ForceEmbedRequest(BaseModel):
+    """Request body for force embed track endpoint."""
+
+    quality_profile: str = "inclusive"  # inclusive, bypass, balanced, strict
+    recompute_centroid: bool = True
+
+
+@router.post("/episodes/{ep_id}/tracks/{track_id}/force_embed")
+def force_embed_track(ep_id: str, track_id: int, body: ForceEmbedRequest = None) -> Dict[str, Any]:
+    """Force embed low-quality faces in a track (Quality Rescue).
+
+    This endpoint enables "quality rescue" for tracks where all faces were skipped
+    by the quality gate (blurry faces). It:
+
+    1. Removes skip flags from all faces in the track
+    2. Marks faces as "rescued" with the quality profile used
+    3. Optionally triggers centroid recomputation for the cluster
+
+    After calling this endpoint, run the faces_embed job to generate embeddings
+    for the newly unskipped faces.
+
+    Args:
+        ep_id: Episode identifier
+        track_id: Track ID to force embed
+        body: Optional request body with quality_profile and recompute_centroid flags
+
+    Returns:
+        Status with count of rescued faces and next steps
+    """
+    from apps.api.config import get_quality_profile, QUALITY_PROFILES
+
+    body = body or ForceEmbedRequest()
+
+    # Validate quality profile
+    if body.quality_profile not in QUALITY_PROFILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality_profile. Must be one of: {list(QUALITY_PROFILES.keys())}",
+        )
+
+    profile = get_quality_profile(body.quality_profile)
+
+    # Load all faces including skipped
+    faces = _load_faces(ep_id, include_skipped=True)
+    track_faces = [f for f in faces if f.get("track_id") == track_id]
+
+    if not track_faces:
+        raise HTTPException(status_code=404, detail="track_not_found")
+
+    # Collect stats before modification
+    total_faces = len(track_faces)
+    skipped_faces = [f for f in track_faces if f.get("skip")]
+    faces_with_embeddings = [f for f in track_faces if f.get("embedding")]
+
+    if not skipped_faces:
+        return {
+            "status": "no_skipped_faces",
+            "track_id": track_id,
+            "total_faces": total_faces,
+            "faces_with_embeddings": len(faces_with_embeddings),
+            "message": "Track has no skipped faces to rescue",
+        }
+
+    # Collect skip reasons for reporting
+    skip_reasons = [f.get("skip") for f in skipped_faces if f.get("skip")]
+
+    # Remove skip flags and mark as rescued
+    rescued_count = 0
+    for face in faces:
+        if face.get("track_id") == track_id and "skip" in face:
+            original_skip = face.pop("skip")
+            face["rescued"] = {
+                "original_skip_reason": original_skip,
+                "quality_profile": body.quality_profile,
+                "rescued_at": datetime.utcnow().isoformat() + "Z",
+            }
+            rescued_count += 1
+
+    _write_faces(ep_id, faces)
+
+    # Determine if cluster centroid should be recomputed
+    centroid_status = None
+    if body.recompute_centroid and faces_with_embeddings:
+        # Try to update the cluster centroid if there are any embeddings
+        try:
+            from apps.api.services.grouping import GroupingService
+
+            grouping = GroupingService()
+            centroid_result = grouping.compute_cluster_centroids(ep_id)
+            centroid_status = f"Recomputed {len(centroid_result.get('centroids', {}))} centroids"
+        except Exception as e:
+            centroid_status = f"Centroid recomputation skipped: {str(e)}"
+
+    return {
+        "status": "rescued",
+        "track_id": track_id,
+        "rescued_faces": rescued_count,
+        "total_faces": total_faces,
+        "faces_with_embeddings": len(faces_with_embeddings),
+        "quality_profile": body.quality_profile,
+        "quality_warning": profile.get("warning"),
+        "skip_reasons": list(set(skip_reasons))[:5],  # Sample of original reasons
+        "centroid_status": centroid_status,
+        "next_steps": (
+            "Faces have been unskipped. Run 'faces_embed' job to generate embeddings, "
+            "then 'Refresh Suggestions' to get cast matches."
+            if not faces_with_embeddings
+            else "Faces rescued. Centroid updated. Run 'Refresh Suggestions' to get cast matches."
+        ),
+    }
+
+
 @router.post("/episodes/{ep_id}/tracks/{track_id}/frames/move")
 def move_track_frames(ep_id: str, track_id: int, body: TrackFrameMoveRequest) -> dict:
     frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
@@ -4157,3 +4287,207 @@ def leave_presence(ep_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
             _PRESENCE_STORE.pop(ep_id, None)
 
     return {"status": "ok", "ep_id": ep_id}
+
+
+@router.post("/episodes/{ep_id}/sync_thumbnails_to_s3", tags=["episodes"])
+def sync_thumbnails_to_s3(ep_id: str) -> Dict[str, Any]:
+    """Sync local thumbnail and crop files to S3.
+
+    Scans the local thumbs/ and crops/ directories and uploads any files
+    that exist locally but are missing from S3. Use this when thumbnails
+    aren't loading due to missing S3 artifacts.
+
+    Returns:
+        uploaded_thumbs: Number of thumbnails uploaded
+        uploaded_crops: Number of crops uploaded
+        errors: List of any upload errors
+    """
+    ep_id = normalize_ep_id(ep_id)
+
+    try:
+        ep_ctx = episode_context_from_id(ep_id)
+        prefixes = artifact_prefixes(ep_ctx)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    frames_root = get_path(ep_id, "frames_root")
+    thumbs_dir = frames_root / "thumbs"
+    crops_dir = frames_root / "crops"
+
+    # Separate prefixes for track thumbs and identity thumbs
+    thumbs_tracks_prefix = prefixes.get("thumbs_tracks", "")
+    thumbs_identities_prefix = prefixes.get("thumbs_identities", "")
+    crops_prefix = prefixes.get("crops", "")
+
+    uploaded_thumbs = 0
+    uploaded_crops = 0
+    errors: List[str] = []
+
+    # Sync track thumbnails (thumbs/track_xxxx/*.jpg)
+    if thumbs_dir.exists() and thumbs_tracks_prefix:
+        tracks_subdir = thumbs_dir
+        for thumb_file in tracks_subdir.rglob("track_*/*.jpg"):
+            # rel_path is like "track_0001/thumb_000120.jpg"
+            rel_path = thumb_file.relative_to(thumbs_dir)
+            s3_key = f"{thumbs_tracks_prefix}{rel_path}"
+
+            # Check if already exists in S3 using proper existence check
+            if STORAGE.object_exists(s3_key):
+                continue  # Already in S3
+
+            # Upload to S3
+            success = STORAGE.put_artifact(ep_ctx, "thumbs_tracks", thumb_file, str(rel_path))
+            if success:
+                uploaded_thumbs += 1
+            else:
+                errors.append(f"Failed to upload thumb: {rel_path}")
+
+    # Sync identity thumbnails (thumbs/identities/*.jpg)
+    if thumbs_dir.exists() and thumbs_identities_prefix:
+        identities_subdir = thumbs_dir / "identities"
+        if identities_subdir.exists():
+            for thumb_file in identities_subdir.rglob("*.jpg"):
+                # rel_path is like "id_0001.jpg"
+                rel_path = thumb_file.relative_to(identities_subdir)
+                s3_key = f"{thumbs_identities_prefix}{rel_path}"
+
+                # Check if already exists in S3 using proper existence check
+                if STORAGE.object_exists(s3_key):
+                    continue  # Already in S3
+
+                # Upload to S3
+                success = STORAGE.put_artifact(ep_ctx, "thumbs_identities", thumb_file, str(rel_path))
+                if success:
+                    uploaded_thumbs += 1
+                else:
+                    errors.append(f"Failed to upload identity thumb: {rel_path}")
+
+    # Sync crops
+    if crops_dir.exists() and crops_prefix:
+        for crop_file in crops_dir.rglob("*.jpg"):
+            rel_path = crop_file.relative_to(crops_dir)
+            s3_key = f"{crops_prefix}{rel_path}"
+
+            # Check if already exists in S3 using proper existence check
+            if STORAGE.object_exists(s3_key):
+                continue  # Already in S3
+
+            # Upload to S3
+            success = STORAGE.put_artifact(ep_ctx, "crops", crop_file, str(rel_path))
+            if success:
+                uploaded_crops += 1
+            else:
+                errors.append(f"Failed to upload crop: {rel_path}")
+
+    return {
+        "status": "success",
+        "ep_id": ep_id,
+        "uploaded_thumbs": uploaded_thumbs,
+        "uploaded_crops": uploaded_crops,
+        "errors": errors[:20] if errors else [],  # Limit error list
+        "total_errors": len(errors),
+    }
+
+
+@router.get("/episodes/{ep_id}/artifact_status", tags=["episodes"])
+def get_artifact_status(ep_id: str) -> Dict[str, Any]:
+    """Get detailed artifact status for an episode (local and S3 counts).
+
+    Returns counts of frames, crops, thumbnails, and manifests both locally and in S3.
+    Useful for displaying sync status in the UI.
+    """
+    from apps.api.services.storage import artifact_prefixes, episode_context_from_id
+
+    result: Dict[str, Any] = {
+        "ep_id": ep_id,
+        "local": {
+            "frames": 0,
+            "crops": 0,
+            "thumbs_tracks": 0,
+            "thumbs_identities": 0,
+            "manifests": 0,
+        },
+        "s3": {
+            "frames": 0,
+            "crops": 0,
+            "thumbs_tracks": 0,
+            "thumbs_identities": 0,
+            "manifests": 0,
+        },
+        "sync_status": "unknown",
+        "s3_enabled": STORAGE.s3_enabled(),
+    }
+
+    # Get local artifact counts
+    try:
+        frames_root = get_path(ep_id, "frames_root")
+        frames_dir = frames_root / "frames"
+        crops_dir = frames_root / "crops"
+        thumbs_tracks_dir = frames_root / "thumbs" / "tracks"
+        thumbs_identities_dir = frames_root / "thumbs" / "identities"
+        manifests_dir = get_path(ep_id, "detections").parent
+
+        if frames_dir.exists():
+            result["local"]["frames"] = len(list(frames_dir.glob("*.jpg")))
+        if crops_dir.exists():
+            result["local"]["crops"] = len(list(crops_dir.rglob("*.jpg")))
+        if thumbs_tracks_dir.exists():
+            result["local"]["thumbs_tracks"] = len(list(thumbs_tracks_dir.rglob("*.jpg")))
+        if thumbs_identities_dir.exists():
+            result["local"]["thumbs_identities"] = len(list(thumbs_identities_dir.rglob("*.jpg")))
+        if manifests_dir.exists():
+            manifest_extensions = {".json", ".jsonl", ".ndjson"}
+            result["local"]["manifests"] = len([
+                f for f in manifests_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in manifest_extensions
+            ])
+    except Exception as exc:
+        LOGGER.warning("Failed to count local artifacts for %s: %s", ep_id, exc)
+
+    # Get S3 artifact counts if S3 is enabled
+    if STORAGE.s3_enabled():
+        try:
+            ep_ctx = episode_context_from_id(ep_id)
+            prefixes = artifact_prefixes(ep_ctx)
+
+            # Count frames in S3 (sample to avoid listing all)
+            frames_keys = STORAGE.list_objects(prefixes["frames"], suffix=".jpg", max_items=1000)
+            result["s3"]["frames"] = len(frames_keys)
+
+            # Count crops in S3
+            crops_keys = STORAGE.list_objects(prefixes["crops"], suffix=".jpg", max_items=1000)
+            result["s3"]["crops"] = len(crops_keys)
+
+            # Count track thumbnails in S3
+            thumbs_tracks_keys = STORAGE.list_objects(prefixes["thumbs_tracks"], suffix=".jpg", max_items=1000)
+            result["s3"]["thumbs_tracks"] = len(thumbs_tracks_keys)
+
+            # Count identity thumbnails in S3
+            thumbs_identities_keys = STORAGE.list_objects(prefixes["thumbs_identities"], suffix=".jpg", max_items=1000)
+            result["s3"]["thumbs_identities"] = len(thumbs_identities_keys)
+
+            # Count manifests in S3
+            manifests_keys = STORAGE.list_objects(prefixes["manifests"], max_items=100)
+            result["s3"]["manifests"] = len(manifests_keys)
+
+        except Exception as exc:
+            LOGGER.warning("Failed to count S3 artifacts for %s: %s", ep_id, exc)
+
+    # Determine sync status
+    local_total = sum(result["local"].values())
+    s3_total = sum(result["s3"].values())
+
+    if not STORAGE.s3_enabled():
+        result["sync_status"] = "s3_disabled"
+    elif local_total == 0 and s3_total == 0:
+        result["sync_status"] = "empty"
+    elif s3_total >= local_total and local_total > 0:
+        result["sync_status"] = "synced"
+    elif s3_total > 0 and s3_total < local_total:
+        result["sync_status"] = "partial"
+    elif local_total > 0 and s3_total == 0:
+        result["sync_status"] = "pending"
+    else:
+        result["sync_status"] = "unknown"
+
+    return result

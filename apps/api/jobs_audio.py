@@ -734,8 +734,8 @@ def episode_audio_qc_task(
         snr_db = None
         try:
             snr_db = compute_snr(paths["vocals_enhanced"])
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[audio-qc] Failed to compute SNR for %s: %s", paths.get("vocals_enhanced"), exc)
 
         # Run QC
         _write_progress(ep_id, "qc", "Validating results...", 0.7)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -11,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
+
+LOGGER = logging.getLogger("episode_detail")
 
 PAGE_PATH = Path(__file__).resolve()
 WORKSPACE_DIR = PAGE_PATH.parents[1]
@@ -108,6 +111,124 @@ def _runtime_from_iso(start: str | None, end: str | None) -> float | None:
     return delta if delta >= 0 else None
 
 
+def _estimate_storage_bytes(
+    duration_sec: float | None,
+    fps: float,
+    save_frames: bool,
+    save_crops: bool,
+    avg_faces_per_frame: float = AVG_FACES_PER_FRAME,
+) -> Dict[str, int]:
+    """Estimate storage requirements for a detect/track job.
+
+    Returns dict with 'frames_bytes', 'crops_bytes', 'total_bytes', and 'sampled_frames'.
+    """
+    result = {
+        "frames_bytes": 0,
+        "crops_bytes": 0,
+        "thumbs_bytes": 0,
+        "total_bytes": 0,
+        "sampled_frames": 0,
+    }
+
+    if not duration_sec or duration_sec <= 0 or fps <= 0:
+        return result
+
+    # Calculate sampled frame count
+    sampled_frames = int(duration_sec * fps)
+    result["sampled_frames"] = sampled_frames
+
+    if save_frames:
+        result["frames_bytes"] = sampled_frames * FRAME_JPEG_SIZE_EST_BYTES
+
+    if save_crops:
+        # Estimate faces detected across all frames
+        total_faces = int(sampled_frames * avg_faces_per_frame)
+        result["crops_bytes"] = total_faces * CROP_JPEG_SIZE_EST_BYTES
+        # Thumbnails are generated per unique track (roughly 1 thumb per face)
+        result["thumbs_bytes"] = total_faces * 20_000  # ~20KB per thumb
+
+    result["total_bytes"] = (
+        result["frames_bytes"] + result["crops_bytes"] + result["thumbs_bytes"]
+    )
+
+    return result
+
+
+def _format_storage_size(bytes_val: int) -> str:
+    """Format bytes as human-readable string (e.g., '1.5 GB', '234 MB')."""
+    if bytes_val < 1024:
+        return f"{bytes_val} B"
+    if bytes_val < 1024 * 1024:
+        return f"{bytes_val / 1024:.1f} KB"
+    if bytes_val < 1024 * 1024 * 1024:
+        return f"{bytes_val / (1024 * 1024):.1f} MB"
+    return f"{bytes_val / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _render_storage_estimate(
+    duration_sec: float | None,
+    fps: float,
+    save_frames: bool,
+    save_crops: bool,
+) -> None:
+    """Render storage impact estimate in the UI."""
+    estimate = _estimate_storage_bytes(duration_sec, fps, save_frames, save_crops)
+
+    if estimate["total_bytes"] == 0:
+        return
+
+    # Build estimate string
+    parts = []
+    if estimate["frames_bytes"] > 0:
+        parts.append(f"Frames: {_format_storage_size(estimate['frames_bytes'])}")
+    if estimate["crops_bytes"] > 0:
+        parts.append(f"Crops: {_format_storage_size(estimate['crops_bytes'])}")
+    if estimate["thumbs_bytes"] > 0:
+        parts.append(f"Thumbs: {_format_storage_size(estimate['thumbs_bytes'])}")
+
+    total_str = _format_storage_size(estimate["total_bytes"])
+    parts_str = " + ".join(parts) if parts else ""
+
+    # Display in a subtle info box
+    st.caption(
+        f"**Est. Storage:** {total_str} ({parts_str}) • "
+        f"{estimate['sampled_frames']:,} frames @ {fps:.1f} FPS"
+    )
+
+
+def _fetch_artifact_status(ep_id: str) -> Dict[str, Any] | None:
+    """Fetch artifact sync status from API."""
+    try:
+        return helpers.api_get(f"/episodes/{ep_id}/artifact_status")
+    except requests.RequestException:
+        return None
+
+
+def _render_sync_status_badge(status: str) -> str:
+    """Return a styled badge for sync status."""
+    badges = {
+        "synced": "✅ Synced",
+        "partial": "⚠️ Partial",
+        "pending": "🔄 Pending",
+        "empty": "📭 Empty",
+        "s3_disabled": "⚙️ S3 Disabled",
+        "unknown": "❓ Unknown",
+    }
+    return badges.get(status, status)
+
+
+def _render_artifact_counts(local: Dict[str, int], s3: Dict[str, int]) -> str:
+    """Format artifact counts as a summary string."""
+    parts = []
+    for key in ["frames", "crops", "thumbs_tracks", "manifests"]:
+        local_count = local.get(key, 0)
+        s3_count = s3.get(key, 0)
+        label = key.replace("_", " ").title()
+        if local_count > 0 or s3_count > 0:
+            parts.append(f"{label}: {local_count} local / {s3_count} S3")
+    return " | ".join(parts) if parts else "No artifacts"
+
+
 def _choose_value(*candidates: Any, fallback: str) -> str:
     for candidate in candidates:
         if isinstance(candidate, str):
@@ -142,6 +263,85 @@ def _set_job_active(ep_id: str, active: bool) -> None:
 
 def _job_active(ep_id: str) -> bool:
     return bool(st.session_state.get(_job_activity_key(ep_id), False))
+
+
+# Stale job detection constants
+JOB_STALE_TIMEOUT_SECONDS = 300  # 5 minutes without progress update = stale
+
+
+def _get_progress_file_age(ep_id: str) -> float | None:
+    """Get the age of the progress file in seconds, or None if not found."""
+    progress_path = helpers.DATA_ROOT / "manifests" / ep_id / "progress.json"
+    try:
+        if progress_path.exists():
+            return time.time() - progress_path.stat().st_mtime
+    except OSError:
+        pass
+    return None
+
+
+def _sync_job_state_with_api(
+    ep_id: str,
+    running_job_key: str,
+    running_detect_job: dict | None,
+    running_faces_job: dict | None,
+    running_cluster_job: dict | None,
+    running_audio_job: dict | None,
+) -> tuple[bool, str | None]:
+    """Synchronize session state with API-based job status.
+
+    This is the single source of truth for job status. If the API says no job
+    is running but session state says one is, this clears the session state
+    and returns information about the stale job.
+
+    Returns:
+        Tuple of (any_job_running, stale_job_warning)
+    """
+    api_says_running = any([
+        running_detect_job,
+        running_faces_job,
+        running_cluster_job,
+        running_audio_job,
+    ])
+    session_says_running = (
+        st.session_state.get(running_job_key, False) or
+        _job_active(ep_id)
+    )
+
+    stale_warning = None
+
+    if api_says_running:
+        # API confirms job is running - trust it
+        return True, None
+
+    if session_says_running and not api_says_running:
+        # Session thinks a job is running but API disagrees
+        # This could mean the job crashed, was cancelled externally, or completed
+        progress_age = _get_progress_file_age(ep_id)
+
+        if progress_age is not None and progress_age < 30:
+            # Progress file was updated recently - job may have just finished
+            # Give it a moment before declaring it stale
+            pass
+        else:
+            # Clear the stale session state
+            st.session_state[running_job_key] = False
+            _set_job_active(ep_id, False)
+
+            # Generate a warning if progress is old
+            if progress_age is not None and progress_age > JOB_STALE_TIMEOUT_SECONDS:
+                stale_warning = (
+                    f"A previous job appears to have stalled or crashed "
+                    f"(no progress update for {int(progress_age // 60)} minutes). "
+                    f"Controls have been re-enabled."
+                )
+            else:
+                LOGGER.debug(
+                    "Cleared stale session state for %s - API says no job running",
+                    ep_id
+                )
+
+    return api_says_running, stale_warning
 
 
 def _status_cache_key(ep_id: str) -> str:
@@ -264,7 +464,8 @@ def _load_speaker_groups_manifest(path_str: str, mtime: float) -> Dict[str, Any]
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("Failed to load speaker groups manifest %s: %s", path, exc)
         return None
 
 
@@ -281,7 +482,8 @@ def _load_transcript_rows(path_str: str, mtime: float) -> list[dict]:
                 line = line.strip()
                 if line:
                     rows.append(json.loads(line))
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("Failed to load transcript rows from %s: %s", path, exc)
         return []
     return rows
 
@@ -739,6 +941,45 @@ else:
 
 
 # =============================================================================
+# System Status Check (A16-A17, A20: Storage backend and device validation)
+# =============================================================================
+def _render_system_status():
+    """Show system configuration warnings at page load."""
+    try:
+        # Check storage backend status
+        storage_status = helpers.api_get("/config/storage")
+        if storage_status and storage_status.get("status") == "success":
+            validation = storage_status.get("validation")
+            if validation:
+                # Show warning if using fallback backend
+                if validation.get("is_fallback"):
+                    original = validation.get("original_backend", "unknown")
+                    current = validation.get("backend", "local")
+                    st.warning(
+                        f"⚠️ **Storage Fallback Active**: STORAGE_BACKEND='{original}' is invalid. "
+                        f"Using '{current}' instead. Fix configuration to avoid data loss."
+                    )
+                # Show any validation warnings
+                for warning in validation.get("warnings") or []:
+                    st.warning(f"⚠️ {warning}")
+
+            # Check S3 credentials if using S3-based backend
+            backend_type = storage_status.get("backend_type")
+            if backend_type in ("s3", "minio", "hybrid"):
+                s3_preflight = storage_status.get("s3_preflight")
+                if s3_preflight and not s3_preflight.get("success"):
+                    error = s3_preflight.get("error", "Unknown error")
+                    st.error(f"🔴 **S3 Credentials Invalid**: {error}")
+
+    except Exception as exc:
+        LOGGER.debug("[system-status] Failed to fetch storage status: %s", exc)
+
+
+# Show system status warnings at top of page
+_render_system_status()
+
+
+# =============================================================================
 # Execution Mode Selector
 # =============================================================================
 # Store execution mode globally for this episode so all actions respect it
@@ -858,6 +1099,31 @@ with st.expander(f"Episode {ep_id}", expanded=False):
     if tracks_path.exists():
         st.caption(f"Latest detector: {helpers.tracks_detector_label(ep_id)}")
         st.caption(f"Latest tracker: {helpers.tracks_tracker_label(ep_id)}")
+
+    # S3 Sync Status Section
+    artifact_status = _fetch_artifact_status(ep_id)
+    if artifact_status:
+        sync_status = artifact_status.get("sync_status", "unknown")
+        st.markdown("---")
+        st.markdown(f"**Artifact Sync Status:** {_render_sync_status_badge(sync_status)}")
+        local_counts = artifact_status.get("local", {})
+        s3_counts = artifact_status.get("s3", {})
+        st.caption(_render_artifact_counts(local_counts, s3_counts))
+
+        # Show sync button if artifacts need syncing
+        if sync_status in ["pending", "partial"]:
+            if st.button("🔄 Sync to S3", key=f"sync_artifacts_{ep_id}", help="Upload local artifacts to S3"):
+                with st.spinner("Syncing artifacts to S3..."):
+                    try:
+                        sync_resp = helpers.api_post(f"/episodes/{ep_id}/sync_thumbnails_to_s3", timeout=300)
+                        uploaded = sync_resp.get("uploaded_thumbs", 0) + sync_resp.get("uploaded_crops", 0)
+                        if uploaded > 0:
+                            st.success(f"Uploaded {uploaded} artifacts to S3")
+                        else:
+                            st.info("No new artifacts to upload")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Sync failed: {e}")
 
 manifest_state = _detect_track_manifests_ready(detections_path, tracks_path)
 
@@ -1439,6 +1705,19 @@ running_faces_job = helpers.get_running_job_for_episode(ep_id, "faces_embed")
 running_cluster_job = helpers.get_running_job_for_episode(ep_id, "cluster")
 running_audio_job = helpers.get_running_job_for_episode(ep_id, "audio_pipeline")
 
+# Synchronize session state with API-based job status
+# This is the single source of truth - clears stale session flags if API says no job running
+job_running, stale_job_warning = _sync_job_state_with_api(
+    ep_id,
+    running_job_key,
+    running_detect_job,
+    running_faces_job,
+    running_cluster_job,
+    running_audio_job,
+)
+if stale_job_warning:
+    st.warning(f"⚠️ {stale_job_warning}")
+
 # Session state keys for cancel confirmation dialogs
 confirm_cancel_detect_key = f"{ep_id}::confirm_cancel_detect"
 confirm_cancel_faces_key = f"{ep_id}::confirm_cancel_faces"
@@ -1605,6 +1884,35 @@ with col_detect:
         help="Exports aligned face crops during detect/track. Disable when reusing previous crops.",
         key=save_crops_key,
     )
+
+    # Show storage impact estimate
+    video_duration_sec = None
+    video_fps = None
+    if video_meta and isinstance(video_meta, dict):
+        video_duration_sec = video_meta.get("duration_sec")
+        video_fps = video_meta.get("fps")
+    _render_storage_estimate(video_duration_sec, fps_value, save_frames, save_crops)
+
+    # Validate stride/FPS combination (A19)
+    effective_video_fps = fps_value if fps_value > 0 else (video_fps or 24.0)
+    if stride_value > 0 and effective_video_fps > 0:
+        effective_fps = effective_video_fps / stride_value
+        if effective_fps < 0.1:
+            st.error(
+                f"⚠️ **Sampling too sparse**: stride={int(stride_value)} @ {effective_video_fps:.0f}fps = "
+                f"{effective_fps:.2f} effective fps. This may miss most faces. Lower stride or increase FPS."
+            )
+        elif effective_fps < 0.5:
+            st.warning(
+                f"⚠️ **Low sampling rate**: stride={int(stride_value)} @ {effective_video_fps:.0f}fps = "
+                f"{effective_fps:.2f} effective fps. Consider lowering stride for better coverage."
+            )
+        elif effective_fps > 30:
+            st.warning(
+                f"⚠️ **High sampling rate**: stride={int(stride_value)} @ {effective_video_fps:.0f}fps = "
+                f"{effective_fps:.1f} effective fps. This will significantly increase processing time and storage."
+            )
+
     cpu_options = [1, 2, 4]
     cpu_seed = int(st.session_state.get(cpu_threads_key, cpu_threads_default or 2))
     if cpu_seed not in cpu_options:
@@ -1741,14 +2049,21 @@ with col_detect:
                 "Lower thresholds increase recall but may introduce more false tracks; higher thresholds are stricter."
             )
 
+    # Only show devices that are actually supported on this host
+    supported_detect_devices = helpers.list_supported_devices()
+    detect_device_default_idx = (
+        supported_detect_devices.index(detect_device_label_default)
+        if detect_device_label_default in supported_detect_devices
+        else 0
+    )
     detect_device_choice = st.selectbox(
         "Device (for face detection/tracking)",
-        helpers.DEVICE_LABELS,
-        index=helpers.device_label_index(detect_device_label_default),
+        supported_detect_devices,
+        index=detect_device_default_idx,
         key=f"{ep_id}::detect_device_choice",
     )
     st.caption("CPU recommended for detection; GPU/CoreML may bottleneck on M-series chips for YOLOv8.")
-    detect_device_value = helpers.DEVICE_VALUE_MAP[detect_device_choice]
+    detect_device_value = helpers.DEVICE_VALUE_MAP.get(detect_device_choice, "auto")
     detect_device_label = helpers.device_label_from_value(detect_device_value)
 
     if detect_tracker_value != "bytetrack":
@@ -2003,14 +2318,21 @@ with col_faces:
                 f"{helpers.tracker_label_from_value(tracker_name)}"
             )
 
+    # Only show devices that are actually supported on this host
+    supported_faces_devices = helpers.list_supported_devices()
+    faces_device_default_idx = (
+        supported_faces_devices.index(faces_device_label_default)
+        if faces_device_label_default in supported_faces_devices
+        else 0
+    )
     faces_device_choice = st.selectbox(
         "Device (for face embeddings)",
-        helpers.DEVICE_LABELS,
-        index=helpers.device_label_index(faces_device_label_default),
+        supported_faces_devices,
+        index=faces_device_default_idx,
         key=f"{ep_id}::faces_device_choice",
     )
     st.caption("CoreML/GPU strongly recommended for ArcFace embeddings; significantly faster than CPU.")
-    faces_device_value = helpers.DEVICE_VALUE_MAP[faces_device_choice]
+    faces_device_value = helpers.DEVICE_VALUE_MAP.get(faces_device_choice, "auto")
     faces_save_frames = st.toggle(
         "Save full frames",
         value=bool(faces_save_frames_default),
@@ -2249,14 +2571,21 @@ with col_cluster:
 
         st.divider()
 
+    # Only show devices that are actually supported on this host
+    supported_cluster_devices = helpers.list_supported_devices()
+    cluster_device_default_idx = (
+        supported_cluster_devices.index(cluster_device_label_default)
+        if cluster_device_label_default in supported_cluster_devices
+        else 0
+    )
     cluster_device_choice = st.selectbox(
         "Device (for clustering)",
-        helpers.DEVICE_LABELS,
-        index=helpers.device_label_index(cluster_device_label_default),
+        supported_cluster_devices,
+        index=cluster_device_default_idx,
         key=f"{ep_id}::cluster_device_choice",
     )
     st.caption("Device for similarity comparisons during clustering; GPU/CoreML provides faster batch processing.")
-    cluster_device_value = helpers.DEVICE_VALUE_MAP[cluster_device_choice]
+    cluster_device_value = helpers.DEVICE_VALUE_MAP.get(cluster_device_choice, "auto")
     cluster_thresh_value = st.slider(
         "Cluster similarity threshold",
         min_value=0.4,
@@ -2540,7 +2869,8 @@ if has_audio_qc:
         labeled_voices = audio_qc_data.get("labeled_voices", 0)
         unlabeled_voices = audio_qc_data.get("unlabeled_voices", 0)
         audio_status = "complete"
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("Failed to parse audio QC file %s: %s", audio_qc_path, exc)
         audio_status = "error"
 elif has_voice_mapping:
     # Fallback: read voice stats from voice_mapping.json if QC not available
@@ -2550,8 +2880,9 @@ elif has_voice_mapping:
         labeled_voices = sum(1 for m in voice_mapping_data if m.get("similarity") is not None)
         unlabeled_voices = voice_cluster_count - labeled_voices
         audio_status = "in_progress"  # QC not complete yet
-    except Exception:
-        pass
+    except Exception as exc:
+        LOGGER.warning("Failed to parse voice mapping file %s: %s", voice_mapping_path, exc)
+        audio_status = "error"
 elif has_transcript_jsonl:
     audio_status = "complete"  # Transcript exists but no QC
 elif running_audio_job:
@@ -2598,8 +2929,9 @@ with audio_col2:
                 mime="text/vtt",
                 key=f"download_vtt_{ep_id}",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.warning("Failed to read VTT file %s: %s", transcript_vtt_path, exc)
+            st.caption("⚠️ VTT unavailable")
     if has_transcript_jsonl:
         try:
             jsonl_content = transcript_jsonl_path.read_text(encoding="utf-8")
@@ -2610,8 +2942,9 @@ with audio_col2:
                 mime="application/jsonl",
                 key=f"download_jsonl_{ep_id}",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.warning("Failed to read JSONL file %s: %s", transcript_jsonl_path, exc)
+            st.caption("⚠️ JSONL unavailable")
 
 # Running job controls
 if running_audio_job:
@@ -2749,12 +3082,17 @@ with st.expander("Audio Pipeline (Phased)", expanded=not audio_status == "comple
     st.markdown("**Phase 3: Review Voices**")
     if has_voice_clusters:
         cluster_count = 0
+        cluster_load_error = False
         try:
             cluster_data = json.loads(voice_clusters_path.read_text(encoding="utf-8"))
             cluster_count = len(cluster_data)
-        except Exception:
-            pass
-        st.caption(f"✅ {cluster_count} voice clusters ready for review")
+        except Exception as exc:
+            LOGGER.warning("Failed to parse voice clusters file %s: %s", voice_clusters_path, exc)
+            cluster_load_error = True
+        if cluster_load_error:
+            st.caption("⚠️ Voice clusters file exists but could not be read")
+        else:
+            st.caption(f"✅ {cluster_count} voice clusters ready for review")
         st.page_link("pages/3_Voices_Review.py", label="🔊 Go to Voices Review", icon="🔊")
     else:
         st.caption("⏳ Run diarization first to create voice clusters")

@@ -102,7 +102,8 @@ MIN_BOX_AREA_DEFAULT = max(
 
 # Thumbnail constants
 THUMB_W, THUMB_H = 200, 250
-_PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
+# Use absolute path for placeholder to work regardless of working directory
+_PLACEHOLDER = str(Path(__file__).parent / "assets" / "placeholder_face.svg")
 _THUMB_CACHE_STATE_KEY = "_thumb_async_cache"
 _THUMB_JOB_STATE_KEY = "_thumb_async_jobs"
 _MAX_ASYNC_THUMB_WORKERS = 8

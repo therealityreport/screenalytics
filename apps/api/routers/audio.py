@@ -960,8 +960,8 @@ async def set_speaker_assignments(
                 cast_member = cast_service.get_cast_member(show_id, item.cast_id)
                 if cast_member:
                     cast_display_name = cast_member.get("name")
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cast-lookup] Failed to get cast member %s: %s", item.cast_id, exc)
 
         new_assignments.append(SpeakerAssignment(
             source=item.source,
@@ -1079,8 +1079,8 @@ async def upsert_single_speaker_assignment(
         cast_member = cast_service.get_cast_member(show_id, req.cast_id)
         if cast_member:
             cast_display_name = cast_member.get("name")
-    except Exception:
-        pass
+    except Exception as exc:
+        LOGGER.debug("[cast-lookup] Failed to get cast member %s: %s", req.cast_id, exc)
 
     # Upsert the assignment
     new_assignment = manifest.upsert_assignment(
@@ -1197,8 +1197,8 @@ async def set_voiceprint_override(
                     if line.strip():
                         seg_data = json.loads(line.strip())
                         asr_segments.append(ASRSegment(**seg_data))
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[asr-load] Failed to load ASR segments from %s: %s", asr_path, exc)
 
     # Compute is_clean and voiceprint_selected
     is_clean = True
@@ -3185,8 +3185,8 @@ async def assign_segment_to_cast(ep_id: str, req: SegmentAssignCastRequest) -> d
             cast_info = await get_cast_member(show_id, req.cast_id)
             if cast_info and cast_info.get("name"):
                 speaker_display_name = cast_info["name"]
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[cast-lookup] Failed to get cast member %s: %s", req.cast_id, exc)
 
         # Add new mapping entry
         new_mapping = {
@@ -3341,8 +3341,8 @@ async def get_voice_reference_status(show_id: str, cast_id: str) -> dict:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 duration = float(result.stdout.strip())
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[ffprobe] Failed to get audio duration for %s: %s", ref_path, exc)
 
         return {
             "exists": True,
@@ -4295,8 +4295,8 @@ async def refresh_voiceprint_identification(
         try:
             parsed = parse_ep_id(ep_id)
             show_id = parsed.get("show_id")
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[parse-ep-id] Failed to parse ep_id '%s': %s", ep_id, exc)
 
     if not show_id:
         raise HTTPException(

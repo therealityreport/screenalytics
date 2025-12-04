@@ -1299,3 +1299,109 @@ def render_temporal_badge(consistency: float | None) -> str:
         f'title="{tooltip}">'
         f"TIME: {pct}%</span>"
     )
+
+
+def render_singleton_risk_badge(
+    track_count: int,
+    face_count: int,
+    origin: str | None = None,
+) -> str:
+    """Render singleton risk badge based on track and frame counts.
+
+    Risk levels:
+    - HIGH (red): Single-track cluster with single frame - unreliable
+    - MEDIUM (orange): Single-track cluster with multiple frames - limited
+    - LOW (green): Multi-track cluster - reliable
+
+    Args:
+        track_count: Number of tracks in the cluster
+        face_count: Total number of faces/frames across all tracks
+        origin: Optional origin reason (outlier_removal, mixed_identity, etc.)
+
+    Returns:
+        HTML badge showing singleton risk level
+    """
+    # Determine risk level
+    if track_count == 1 and face_count == 1:
+        risk_level = "HIGH"
+        color = "#F44336"  # Red
+        tooltip = "Single-track, single-frame cluster - unreliable embedding"
+    elif track_count == 1:
+        risk_level = "MEDIUM"
+        color = "#FF9800"  # Orange
+        tooltip = f"Single-track cluster ({face_count} frames) - limited matching confidence"
+    else:
+        risk_level = "LOW"
+        color = "#4CAF50"  # Green
+        tooltip = f"Multi-track cluster ({track_count} tracks) - reliable"
+
+    # Add origin info to tooltip
+    if origin:
+        origin_labels = {
+            "outlier_removal": "Split due to outlier detection",
+            "mixed_identity": "Split due to high embedding variance",
+            "no_embeddings": "No accepted embeddings",
+            "clustering_edge": "Natural clustering result",
+            "manual_split": "User action",
+        }
+        origin_text = origin_labels.get(origin, origin)
+        tooltip += f" | Origin: {origin_text}"
+
+    return (
+        f'<span class="sim-badge sim-badge-singleton-risk" '
+        f'style="background-color: {color}; color: white; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"🎯 {risk_level}</span>"
+    )
+
+
+def render_singleton_fraction_badge(
+    singleton_count: int,
+    total_count: int,
+    single_frame_count: int | None = None,
+) -> str:
+    """Render singleton fraction badge for episode health.
+
+    Thresholds:
+    - <25%: Healthy (green)
+    - 25-40%: Warning (orange)
+    - >40%: High (red)
+
+    Args:
+        singleton_count: Number of single-track clusters
+        total_count: Total number of clusters
+        single_frame_count: Optional count of single-frame tracks
+
+    Returns:
+        HTML badge showing singleton fraction health
+    """
+    if total_count == 0:
+        return ""
+
+    fraction = singleton_count / total_count
+    pct = int(round(fraction * 100))
+
+    # Determine health status
+    if fraction <= 0.25:
+        color = "#4CAF50"  # Green
+        status = "Healthy"
+    elif fraction <= 0.40:
+        color = "#FF9800"  # Orange
+        status = "Warning"
+    else:
+        color = "#F44336"  # Red
+        status = "High"
+
+    tooltip = f"Singleton fraction: {singleton_count}/{total_count} ({pct}%) - {status}"
+    if single_frame_count is not None:
+        sf_pct = int(round(single_frame_count / total_count * 100)) if total_count > 0 else 0
+        tooltip += f" | Single-frame tracks: {single_frame_count} ({sf_pct}%)"
+
+    return (
+        f'<span class="sim-badge sim-badge-singleton-frac" '
+        f'style="background-color: {color}; color: white; '
+        f'padding: 2px 6px; border-radius: 3px; font-size: 0.8em; font-weight: bold; cursor: help;" '
+        f'title="{tooltip}">'
+        f"🎯 {pct}%</span>"
+    )
