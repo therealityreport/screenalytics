@@ -665,6 +665,11 @@ def get_cast_suggestions(ep_id: str, min_similarity: float = 0.50, top_k: int = 
     Query params:
         min_similarity: Minimum similarity threshold (default 0.50)
         top_k: Number of suggestions per cluster (default 3)
+
+    Returns:
+        suggestions: List of cluster suggestions
+        mismatched_embeddings: List of clusters skipped due to embedding dimension mismatch
+        message: Optional message (e.g., "No centroids found")
     """
     try:
         result = grouping_service.suggest_cast_for_unassigned_clusters(
@@ -672,12 +677,19 @@ def get_cast_suggestions(ep_id: str, min_similarity: float = 0.50, top_k: int = 
             min_similarity=min_similarity,
             top_k=top_k,
         )
-        return {
+        response = {
             "status": "success",
             "ep_id": ep_id,
             "suggestions": result.get("suggestions", []),
-            "message": result.get("message"),
         }
+        # Include dimension mismatch warnings if any clusters were skipped
+        mismatched = result.get("mismatched_embeddings", [])
+        if mismatched:
+            response["mismatched_embeddings"] = mismatched
+        # Include any message (e.g., "No assigned clusters available")
+        if result.get("message"):
+            response["message"] = result["message"]
+        return response
     except FileNotFoundError as e:
         return {
             "status": "success",
@@ -718,6 +730,57 @@ def list_unlinked_entities(ep_id: str) -> dict:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to load unlinked entities: {str(e)}",
+        )
+
+
+@router.get("/episodes/{ep_id}/analyze_unassigned")
+def analyze_unassigned_clusters(
+    ep_id: str,
+    similarity_threshold: float = 0.70,
+    min_cast_similarity: float = 0.50,
+    top_k: int = 3,
+) -> dict:
+    """Analyze unassigned clusters: group similar ones and recommend cast members.
+
+    Groups unassigned clusters by their similarity to each other, then provides
+    cast member recommendations for each group. Useful for bulk review/assignment.
+
+    Query params:
+        similarity_threshold: Min similarity to group clusters together (default 0.70)
+        min_cast_similarity: Min similarity for cast recommendations (default 0.50)
+        top_k: Number of cast suggestions per group (default 3)
+
+    Returns:
+        - groups: List of cluster groups with cast recommendations
+        - singletons: Clusters that don't match any others
+        - summary: Stats about the analysis
+    """
+    try:
+        result = grouping_service.analyze_unassigned_clusters(
+            ep_id,
+            similarity_threshold=similarity_threshold,
+            min_cast_similarity=min_cast_similarity,
+            top_k_cast=top_k,
+        )
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            **result,
+        }
+    except FileNotFoundError as e:
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "groups": [],
+            "singletons": [],
+            "message": str(e),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to analyze unassigned clusters: {str(e)}",
         )
 
 
