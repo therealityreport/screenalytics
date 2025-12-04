@@ -4235,6 +4235,174 @@ def run_pipeline_job_with_mode(
         )
 
 
+def run_episode_pipeline_job(
+    ep_id: str,
+    *,
+    device: str = "auto",
+    stride: int = 1,
+    det_thresh: float = 0.65,
+    cluster_thresh: float = 0.75,
+    save_crops: bool = True,
+    save_frames: bool = False,
+    reuse_detections: bool = False,
+    reuse_embeddings: bool = False,
+    profile: str | None = None,
+    poll_interval: float = 2.0,
+    timeout: int = 7200,
+) -> tuple[Dict[str, Any] | None, str | None]:
+    """Run the full episode processing pipeline via the job API.
+
+    This function uses the new /jobs/episode-run endpoint which runs the
+    engine (detect_track -> faces_embed -> cluster) as a single job.
+
+    Args:
+        ep_id: Episode identifier (e.g., 'rhobh-s05e14')
+        device: Compute device ('auto', 'cpu', 'cuda', 'coreml')
+        stride: Frame stride for detection (higher = faster but less accurate)
+        det_thresh: Face detection confidence threshold
+        cluster_thresh: Clustering distance threshold
+        save_crops: Whether to save face crops
+        save_frames: Whether to save full frames
+        reuse_detections: Skip detect_track if artifacts exist
+        reuse_embeddings: Skip faces_embed if artifacts exist
+        profile: Optional preset profile ('fast', 'balanced', 'quality')
+        poll_interval: Seconds between status polls
+        timeout: Maximum seconds to wait for completion
+
+    Returns:
+        Tuple of (result dict with summary, error message or None)
+    """
+    endpoint = "/jobs/episode-run"
+    payload = {
+        "ep_id": ep_id,
+        "device": device,
+        "stride": stride,
+        "det_thresh": det_thresh,
+        "cluster_thresh": cluster_thresh,
+        "save_crops": save_crops,
+        "save_frames": save_frames,
+        "reuse_detections": reuse_detections,
+        "reuse_embeddings": reuse_embeddings,
+    }
+    if profile:
+        payload["profile"] = profile
+
+    # UI elements for progress display
+    status_placeholder = st.empty()
+    progress_container = st.container()
+    with progress_container:
+        progress_bar = st.progress(0.0)
+        progress_text = st.empty()
+        progress_text.caption("Starting episode pipeline...")
+
+    # Build context string for display
+    context_parts = [f"device={device}"]
+    if stride > 1:
+        context_parts.append(f"stride={stride}")
+    if profile:
+        context_parts.append(f"profile={profile}")
+    context_str = ", ".join(context_parts)
+
+    status_placeholder.info(f"⏳ Starting episode pipeline ({context_str})...")
+
+    try:
+        # Start the job
+        resp = requests.post(
+            f"{_api_base()}{endpoint}",
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        job_info = resp.json()
+        job_id = job_info.get("job_id")
+
+        if not job_id:
+            error_msg = "No job_id returned from API"
+            status_placeholder.error(f"❌ {error_msg}")
+            return None, error_msg
+
+        status_placeholder.info(f"⏳ Job {job_id[:8]}... running ({context_str})")
+
+        # Poll for completion
+        start_time = time.time()
+        stage_idx = 0
+        stages = ["detect_track", "faces_embed", "cluster"]
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                error_msg = f"Job timed out after {timeout}s"
+                status_placeholder.error(f"❌ {error_msg}")
+                return {"job_id": job_id, "status": "timeout"}, error_msg
+
+            # Get job status
+            status_resp = requests.get(
+                f"{_api_base()}/jobs/{job_id}",
+                timeout=10,
+            )
+            status_resp.raise_for_status()
+            job_status = status_resp.json()
+
+            state = job_status.get("state", "unknown")
+
+            if state == "running":
+                # Update progress based on estimated stage
+                # Rough estimate: detect_track=60%, faces_embed=30%, cluster=10%
+                pct = min(elapsed / (timeout * 0.5), 0.95)  # Cap at 95% until done
+                progress_bar.progress(pct)
+
+                elapsed_min = int(elapsed // 60)
+                elapsed_sec = int(elapsed % 60)
+                if elapsed_min > 0:
+                    elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+                else:
+                    elapsed_str = f"{elapsed_sec}s"
+                progress_text.caption(f"Running... {elapsed_str} elapsed")
+
+            elif state == "succeeded":
+                progress_bar.progress(1.0)
+                summary = job_status.get("summary", {})
+                runtime = summary.get("runtime_sec", elapsed)
+
+                if runtime >= 60:
+                    runtime_min = int(runtime // 60)
+                    runtime_sec = int(runtime % 60)
+                    runtime_str = f"{runtime_min}m {runtime_sec}s"
+                else:
+                    runtime_str = f"{runtime:.1f}s"
+
+                identities = summary.get("identities_count", 0)
+                tracks = summary.get("tracks_count", 0)
+                faces = summary.get("faces_count", 0)
+
+                progress_text.caption(
+                    f"**100%** - Completed in {runtime_str} "
+                    f"({tracks} tracks, {faces} faces, {identities} identities)"
+                )
+                status_placeholder.success(
+                    f"✅ Episode pipeline completed in {runtime_str} - "
+                    f"Found {identities} identities from {tracks} tracks"
+                )
+                return {"job_id": job_id, "status": "succeeded", **summary}, None
+
+            elif state == "failed":
+                error_msg = job_status.get("error", "Unknown error")
+                progress_text.caption(f"❌ Failed after {elapsed:.0f}s")
+                status_placeholder.error(f"❌ Episode pipeline failed: {error_msg}")
+                return {"job_id": job_id, "status": "failed", "error": error_msg}, error_msg
+
+            else:
+                # Unknown state - keep polling
+                progress_text.caption(f"Status: {state}")
+
+            time.sleep(poll_interval)
+
+    except requests.RequestException as exc:
+        error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+        status_placeholder.error(f"❌ {error_msg}")
+        return None, error_msg
+
+
 def run_async_job_with_mode(
     ep_id: str,
     endpoint: str,
