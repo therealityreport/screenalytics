@@ -85,7 +85,13 @@ async def _reject_legacy_payload(request: Request) -> None:
 
 
 DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
-PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "high_accuracy"]
+# Performance profiles:
+# - low_power: Lower resource usage for laptops/quiet operation (stride 12, 15fps)
+# - balanced: Default setting for most workloads (stride 6, 24fps)
+# - performance: Higher quality/faster processing with more resources (stride 4, 30fps)
+# - fast_cpu: Alias for low_power
+# - high_accuracy: Alias for performance
+PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "performance", "high_accuracy"]
 
 
 class DetectRequest(BaseModel):
@@ -291,7 +297,7 @@ class EpisodeRunRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier (e.g., 'rhobh-s05e14')")
     profile: PROFILE_LITERAL | None = Field(
         None,
-        description="Performance profile (low_power/balanced/performance). Overrides stride defaults.",
+        description="Performance profile: low_power, balanced, performance (or aliases fast_cpu, high_accuracy). Overrides stride defaults.",
     )
     device: DEVICE_LITERAL = Field(
         "auto",

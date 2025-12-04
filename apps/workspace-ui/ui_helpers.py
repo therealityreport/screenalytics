@@ -2056,6 +2056,67 @@ def _guess_device_label() -> str:
     return "CPU"
 
 
+@lru_cache(maxsize=1)
+def list_supported_devices() -> list[str]:
+    """Return list of device labels supported on the current host.
+
+    This is the single source of truth for which devices are available.
+    The UI should use this to filter the device selector options.
+
+    Returns:
+        List of device labels (e.g., ["Auto", "CPU", "CUDA"])
+    """
+    supported = ["Auto", "CPU"]  # Always available
+
+    # Check for CUDA
+    if _cuda_provider_present():
+        supported.append("CUDA")
+    else:
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                supported.append("CUDA")
+        except Exception:
+            pass
+
+    # Check for Apple Silicon / CoreML / MPS
+    if is_apple_silicon():
+        if _coreml_provider_present():
+            supported.append("CoreML")
+        # Check for MPS
+        try:
+            import torch  # type: ignore
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is not None and mps_backend.is_available():
+                supported.append("MPS")
+        except Exception:
+            pass
+
+    return supported
+
+
+def validate_device(device_label: str) -> tuple[bool, str | None]:
+    """Validate that a device is supported on the current host.
+
+    Args:
+        device_label: Device label (e.g., "CUDA", "CoreML")
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    supported = list_supported_devices()
+    if device_label in supported:
+        return True, None
+
+    # Provide helpful error message
+    if device_label == "CUDA":
+        return False, "CUDA is not available on this host. No CUDA-enabled GPU detected."
+    elif device_label in ("CoreML", "MPS"):
+        return False, f"{device_label} is only available on Apple Silicon Macs."
+    else:
+        return False, f"Unknown device: {device_label}. Supported: {', '.join(supported)}"
+
+
 def parse_ep_id(ep_id: str) -> Optional[Dict[str, int | str]]:
     match = _EP_ID_REGEX.match(ep_id)
     if not match:

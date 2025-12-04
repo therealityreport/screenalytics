@@ -69,15 +69,8 @@ def parse_v2_episode_key(key: str) -> Dict[str, object] | None:
 
 import ui_helpers as helpers  # noqa: E402
 
-# When opened via sidebar, always start in NEW EPISODE mode (no ep_id).
-# Clear any lingering episode state so the upload page does not reuse it.
-params = st.query_params
-if "ep_id" in params:
-    params.pop("ep_id", None)
-    st.query_params = params
-st.session_state.pop("ep_id", None)
-st.session_state.pop("_ep_id_query_origin", None)
-st.session_state.pop("upload_ep_params_cleaned", None)
+# NOTE: Do NOT access st.* here before helpers.init_page()
+# Streamlit requires st.set_page_config to be the first Streamlit call.
 
 
 def _get_video_meta(ep_id: str) -> Dict[str, Any] | None:
@@ -267,6 +260,23 @@ def _launch_default_detect_track(ep_id: str, *, label: str) -> Dict[str, Any] | 
 
 
 cfg = helpers.init_page("Screenalytics Upload")
+
+# Handle ep_id query parameter AFTER init_page (set_page_config must be first st call)
+# If ?ep_id=<id> is present, enter "replace existing episode" mode
+# If no ep_id, clear any lingering state for fresh upload
+_replace_mode_ep_id: str | None = None
+_query_ep_id = st.query_params.get("ep_id")
+if _query_ep_id:
+    # Keep ep_id in query params and session state for replace mode
+    _replace_mode_ep_id = str(_query_ep_id)
+    st.session_state["ep_id"] = _replace_mode_ep_id
+    st.session_state["_ep_id_query_origin"] = True
+else:
+    # Clear lingering episode state for fresh upload
+    st.session_state.pop("ep_id", None)
+    st.session_state.pop("_ep_id_query_origin", None)
+    st.session_state.pop("upload_ep_params_cleaned", None)
+
 st.title("Upload & Run")
 
 # Handle deferred navigation after state flush
@@ -283,6 +293,22 @@ st.cache_data.clear()
 flash_message = st.session_state.pop("upload_flash", None)
 if flash_message:
     st.success(flash_message)
+
+# Show replace mode banner if ep_id was provided in query params
+if _replace_mode_ep_id:
+    st.warning(
+        f"**Replace Mode**: Uploading will replace the video for episode `{_replace_mode_ep_id}`. "
+        "Existing artifacts will be overwritten."
+    )
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("Cancel Replace", key="cancel_replace_mode"):
+            # Remove ep_id from query params and reload
+            st.query_params.pop("ep_id", None)
+            st.session_state.pop("ep_id", None)
+            st.rerun()
+    st.divider()
+
 jobs_running = _render_job_sections()
 
 
@@ -412,15 +438,27 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
     status_text.empty()
 
 
-def _upload_presigned(upload_url: str, file_obj, headers: dict, content_type: str = "video/mp4") -> None:
-    """Upload file using presigned URL with requests.put (no boto3 required).
+def _upload_presigned(
+    upload_url: str,
+    file_obj,
+    headers: dict,
+    content_type: str = "video/mp4",
+    chunk_size: int = 8 * 1024 * 1024,  # 8 MB default chunk size
+) -> None:
+    """Upload file using presigned URL with streaming (no boto3 required).
+
+    Streams the upload in chunks to avoid loading the entire file into memory.
+    This is critical for multi-GB video uploads that would otherwise OOM.
 
     Args:
         upload_url: Presigned S3 PUT URL
-        file_obj: File-like object supporting read()
+        file_obj: File-like object supporting read() and seek()
         headers: Headers to include in the PUT request
         content_type: MIME type for the uploaded file (default: video/mp4)
+        chunk_size: Size of chunks to stream (default: 8 MB)
     """
+    from urllib.parse import urlparse
+
     # Get file size for progress tracking
     file_obj.seek(0, 2)  # Seek to end
     file_size = file_obj.tell()
@@ -431,15 +469,31 @@ def _upload_presigned(upload_url: str, file_obj, headers: dict, content_type: st
     status_text = st.empty()
     status_text.text(f"Uploading: 0 MB / {file_size / (1024**2):.1f} MB (0%)")
 
-    # Read file data
-    data = file_obj.read()
-
-    # Merge content-type into headers
+    # Merge content-type and content-length into headers
     request_headers = dict(headers)
     request_headers["Content-Type"] = content_type
+    request_headers["Content-Length"] = str(file_size)
 
-    # Upload using requests.put with presigned URL
-    response = requests.put(upload_url, data=data, headers=request_headers)
+    # Create a streaming generator that yields chunks and updates progress
+    def _streaming_generator():
+        bytes_sent = 0
+        while True:
+            chunk = file_obj.read(chunk_size)
+            if not chunk:
+                break
+            bytes_sent += len(chunk)
+            # Update progress (will be displayed after each chunk is sent)
+            progress = bytes_sent / file_size if file_size > 0 else 0
+            progress_bar.progress(min(progress, 1.0))
+            mb_sent = bytes_sent / (1024**2)
+            mb_total = file_size / (1024**2)
+            status_text.text(
+                f"Uploading: {mb_sent:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)"
+            )
+            yield chunk
+
+    # Upload using requests.put with streaming data
+    response = requests.put(upload_url, data=_streaming_generator(), headers=request_headers)
     response.raise_for_status()
 
     # Complete the progress bar

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -206,8 +207,17 @@ class EpisodeRunConfig:
     reuse_embeddings: bool = False
     """If True and face embeddings exist, skip faces_embed stage"""
 
+    skip_disk_check: bool = False
+    """If True, skip disk space pre-check (warn instead of error)"""
+
     force_recluster: bool = True
     """Always rerun clustering (for threshold tuning). Default True."""
+
+    resume: bool = False
+    """If True, resume from last checkpoint (skip already completed stages)"""
+
+    checkpoint_file: Optional[Path] = None
+    """Custom path for checkpoint file (default: checkpoint.json in episode manifests dir)"""
 
     def __post_init__(self) -> None:
         """Validate and normalize configuration values."""
@@ -372,6 +382,178 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Disk space constants
+MIN_DISK_SPACE_GB = 5.0  # Minimum free space required to start
+SPACE_MULTIPLIER = 3.0  # Estimated output is ~3x video size (crops, frames, manifests)
+
+
+def _check_disk_space(
+    video_path: Path,
+    data_root: Optional[Path] = None,
+    warn_only: bool = False,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """Check if there's enough disk space for processing.
+
+    Estimates required space based on video file size and checks available space
+    on the target filesystem (data_root or current directory).
+
+    Args:
+        video_path: Path to the source video file
+        data_root: Optional data root directory (defaults to current directory)
+        warn_only: If True, returns warning instead of error
+
+    Returns:
+        Tuple of (ok, message, details):
+        - ok: True if sufficient space
+        - message: None if ok, otherwise error/warning message
+        - details: Dict with space information for logging
+    """
+    # Determine check path (use data_root or video parent directory)
+    check_path = data_root if data_root else video_path.parent
+    if not check_path.exists():
+        check_path = Path.cwd()
+
+    try:
+        # Get disk usage statistics
+        usage = shutil.disk_usage(check_path)
+        free_gb = usage.free / (1024**3)
+        total_gb = usage.total / (1024**3)
+
+        # Estimate required space from video size
+        video_size_gb = video_path.stat().st_size / (1024**3) if video_path.exists() else 0.0
+        estimated_required_gb = max(video_size_gb * SPACE_MULTIPLIER, MIN_DISK_SPACE_GB)
+
+        details = {
+            "free_gb": round(free_gb, 2),
+            "total_gb": round(total_gb, 2),
+            "video_size_gb": round(video_size_gb, 2),
+            "estimated_required_gb": round(estimated_required_gb, 2),
+            "check_path": str(check_path),
+        }
+
+        if free_gb < MIN_DISK_SPACE_GB:
+            message = (
+                f"Critically low disk space: {free_gb:.1f}GB available, "
+                f"minimum {MIN_DISK_SPACE_GB:.1f}GB required. "
+                f"Free up space on {check_path} before processing."
+            )
+            return False, message, details
+
+        if free_gb < estimated_required_gb:
+            message = (
+                f"Potentially insufficient disk space: {free_gb:.1f}GB available, "
+                f"estimated {estimated_required_gb:.1f}GB needed for video ({video_size_gb:.1f}GB). "
+                f"Processing may fail partway through."
+            )
+            if warn_only:
+                LOGGER.warning(message)
+                return True, message, details
+            return False, message, details
+
+        return True, None, details
+
+    except OSError as exc:
+        LOGGER.warning("Could not check disk space: %s", exc)
+        return True, None, {"error": str(exc)}  # Proceed on check failure
+
+
+# ============================================================================
+# Checkpoint/Resume helpers
+# ============================================================================
+
+def _get_checkpoint_path(
+    episode_id: str,
+    data_root: Optional[Path] = None,
+    custom_path: Optional[Path] = None,
+) -> Path:
+    """Get the path to the checkpoint file for an episode."""
+    if custom_path:
+        return custom_path
+    # Use the episode manifests directory
+    manifests_dir = get_artifact_path(episode_id, ArtifactKind.MANIFESTS, data_root)
+    return manifests_dir / "checkpoint.json"
+
+
+def _load_checkpoint(
+    episode_id: str,
+    data_root: Optional[Path] = None,
+    custom_path: Optional[Path] = None,
+) -> dict[str, Any] | None:
+    """Load checkpoint for an episode if it exists.
+
+    Returns:
+        Checkpoint dict with keys like 'completed_stages', 'last_stage', 'started_at',
+        or None if no checkpoint exists.
+    """
+    checkpoint_path = _get_checkpoint_path(episode_id, data_root, custom_path)
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        with checkpoint_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            LOGGER.info(
+                "Loaded checkpoint for %s: completed stages = %s",
+                episode_id,
+                data.get("completed_stages", []),
+            )
+            return data
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning("Failed to load checkpoint for %s: %s", episode_id, exc)
+        return None
+
+
+def _save_checkpoint(
+    episode_id: str,
+    completed_stages: list[str],
+    last_stage: str,
+    data_root: Optional[Path] = None,
+    custom_path: Optional[Path] = None,
+) -> None:
+    """Save checkpoint after a successful stage.
+
+    Args:
+        episode_id: Episode identifier
+        completed_stages: List of completed stage names
+        last_stage: Name of the most recently completed stage
+        data_root: Optional data root directory
+        custom_path: Optional custom checkpoint file path
+    """
+    checkpoint_path = _get_checkpoint_path(episode_id, data_root, custom_path)
+
+    checkpoint_data = {
+        "episode_id": episode_id,
+        "completed_stages": completed_stages,
+        "last_stage": last_stage,
+        "updated_at": _utcnow_iso(),
+        "pipeline_version": PIPELINE_VERSION,
+    }
+
+    try:
+        # Ensure directory exists
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        with checkpoint_path.open("w", encoding="utf-8") as f:
+            json.dump(checkpoint_data, f, indent=2)
+        LOGGER.debug("Saved checkpoint: %s completed", completed_stages)
+    except OSError as exc:
+        LOGGER.warning("Failed to save checkpoint: %s", exc)
+
+
+def _clear_checkpoint(
+    episode_id: str,
+    data_root: Optional[Path] = None,
+    custom_path: Optional[Path] = None,
+) -> None:
+    """Clear checkpoint file after successful completion."""
+    checkpoint_path = _get_checkpoint_path(episode_id, data_root, custom_path)
+    try:
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            LOGGER.debug("Cleared checkpoint for %s", episode_id)
+    except OSError as exc:
+        LOGGER.warning("Failed to clear checkpoint: %s", exc)
+
+
 def run_stage(
     episode_id: str,
     video_path: str | Path,
@@ -471,6 +653,56 @@ def run_stage(
         )
 
 
+def _load_metrics_from_artifacts(
+    episode_id: str,
+    data_root: Optional[Path] = None,
+) -> Dict[str, int]:
+    """Load aggregate metrics from existing artifacts.
+
+    This is used when stages are skipped due to reuse flags, to ensure
+    EpisodeRunResult still has correct metric counts.
+
+    Args:
+        episode_id: Episode identifier
+        data_root: Optional data root override
+
+    Returns:
+        Dictionary with tracks_count, faces_count, identities_count
+    """
+    metrics: Dict[str, int] = {}
+
+    # Load tracks count from tracks.jsonl
+    tracks_path = get_artifact_path(episode_id, ArtifactKind.TRACKS, data_root)
+    if tracks_path.exists():
+        try:
+            with tracks_path.open("r", encoding="utf-8") as f:
+                metrics["tracks_count"] = sum(1 for line in f if line.strip())
+        except Exception:
+            pass
+
+    # Load faces count from faces.jsonl
+    faces_path = get_artifact_path(episode_id, ArtifactKind.FACES, data_root)
+    if faces_path.exists():
+        try:
+            with faces_path.open("r", encoding="utf-8") as f:
+                metrics["faces_count"] = sum(1 for line in f if line.strip())
+        except Exception:
+            pass
+
+    # Load identities count from identities.json
+    identities_path = get_artifact_path(episode_id, ArtifactKind.IDENTITIES, data_root)
+    if identities_path.exists():
+        try:
+            with identities_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                identities_list = data.get("identities", [])
+                metrics["identities_count"] = len(identities_list)
+        except Exception:
+            pass
+
+    return metrics
+
+
 def run_episode(
     episode_id: str,
     video_path: str | Path,
@@ -515,6 +747,32 @@ def run_episode(
             error=f"Video file not found: {video_path}",
         )
 
+    # Pre-flight disk space check
+    space_ok, space_msg, space_details = _check_disk_space(
+        video_path,
+        data_root=config.data_root,
+        warn_only=config.skip_disk_check,
+    )
+    if space_details:
+        LOGGER.info(
+            "Disk space check: %.1fGB free of %.1fGB total, "
+            "estimated %.1fGB needed for %.1fGB video",
+            space_details.get("free_gb", 0),
+            space_details.get("total_gb", 0),
+            space_details.get("estimated_required_gb", 0),
+            space_details.get("video_size_gb", 0),
+        )
+    if not space_ok:
+        return EpisodeRunResult(
+            episode_id=episode_id,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            config=config,
+            error=space_msg or "Insufficient disk space",
+        )
+
     # Set up data root
     if config.data_root:
         os.environ["SCREENALYTICS_DATA_ROOT"] = str(config.data_root)
@@ -524,6 +782,20 @@ def run_episode(
 
     stage_results: List[StageResult] = []
     final_artifacts: Dict[str, str] = {}
+    completed_stages: List[str] = []
+
+    # Load checkpoint if resume enabled
+    checkpoint_data: dict[str, Any] | None = None
+    if config.resume:
+        checkpoint_data = _load_checkpoint(
+            episode_id, config.data_root, config.checkpoint_file
+        )
+        if checkpoint_data:
+            completed_stages = checkpoint_data.get("completed_stages", [])
+            LOGGER.info(
+                "Resuming from checkpoint: %d stages already completed",
+                len(completed_stages),
+            )
 
     # Determine which stages to run
     if config.stages == PipelineStage.ALL:
@@ -537,11 +809,16 @@ def run_episode(
 
     # Run each stage
     for stage in stages_to_run:
-        # Check if we should skip this stage due to reuse flags
+        # Check if we should skip this stage due to reuse flags or checkpoint
         should_skip = False
         skip_reason = None
 
-        if stage == PipelineStage.DETECT_TRACK and config.reuse_detections:
+        # Check checkpoint first (if resuming)
+        if config.resume and stage.value in completed_stages:
+            should_skip = True
+            skip_reason = f"already completed (checkpoint resume)"
+
+        elif stage == PipelineStage.DETECT_TRACK and config.reuse_detections:
             # Check if detections and tracks exist
             from py_screenalytics.pipeline.stages import check_artifacts_exist
             artifacts = check_artifacts_exist(episode_id, "detect_track", config.data_root)
@@ -556,6 +833,14 @@ def run_episode(
             if artifacts.get("faces") and artifacts.get("faces_embeddings"):
                 should_skip = True
                 skip_reason = "reuse_embeddings enabled and artifacts exist"
+
+        elif stage == PipelineStage.CLUSTER and not config.force_recluster:
+            # Check if clustering artifacts exist and force_recluster is False
+            from py_screenalytics.pipeline.stages import check_artifacts_exist
+            artifacts = check_artifacts_exist(episode_id, "cluster", config.data_root)
+            if artifacts.get("identities"):
+                should_skip = True
+                skip_reason = "force_recluster=False and identities.json exists"
 
         if should_skip:
             LOGGER.info("Skipping stage %s: %s", stage.value, skip_reason)
@@ -609,12 +894,65 @@ def run_episode(
             LOGGER.error("Stage %s failed, stopping pipeline", stage.value)
             break
 
+        # Save checkpoint after successful stage
+        completed_stages.append(stage.value)
+        _save_checkpoint(
+            episode_id,
+            completed_stages,
+            stage.value,
+            config.data_root,
+            config.checkpoint_file,
+        )
+
     finished_at = _utcnow_iso()
     runtime_sec = time.time() - start_time
 
-    # Aggregate results from final stage
+    # Aggregate metrics from appropriate stages (not just the last one)
+    # Each metric comes from the stage that actually produces it:
+    # - frames_processed, detections_count, tracks_count: detect_track stage
+    # - faces_count: faces_embed stage
+    # - identities_count: cluster stage
+    aggregated_frames = 0
+    aggregated_tracks = 0
+    aggregated_faces = 0
+    aggregated_identities = 0
+
+    for result in stage_results:
+        if result.stage == PipelineStage.DETECT_TRACK.value:
+            if result.frames_processed > 0:
+                aggregated_frames = result.frames_processed
+            if result.tracks_count > 0:
+                aggregated_tracks = result.tracks_count
+        elif result.stage == PipelineStage.FACES_EMBED.value:
+            if result.faces_count > 0:
+                aggregated_faces = result.faces_count
+        elif result.stage == PipelineStage.CLUSTER.value:
+            if result.identities_count > 0:
+                aggregated_identities = result.identities_count
+            # Clustering may also report faces if it read them from artifacts
+            if result.faces_count > 0 and aggregated_faces == 0:
+                aggregated_faces = result.faces_count
+
+    # If stages were skipped due to reuse flags, try to load metrics from artifacts
+    if aggregated_tracks == 0 or aggregated_faces == 0 or aggregated_identities == 0:
+        try:
+            loaded_metrics = _load_metrics_from_artifacts(episode_id, config.data_root)
+            if aggregated_tracks == 0 and loaded_metrics.get("tracks_count", 0) > 0:
+                aggregated_tracks = loaded_metrics["tracks_count"]
+            if aggregated_faces == 0 and loaded_metrics.get("faces_count", 0) > 0:
+                aggregated_faces = loaded_metrics["faces_count"]
+            if aggregated_identities == 0 and loaded_metrics.get("identities_count", 0) > 0:
+                aggregated_identities = loaded_metrics["identities_count"]
+        except Exception as exc:
+            LOGGER.debug("Could not load metrics from artifacts: %s", exc)
+
     last_result = stage_results[-1] if stage_results else None
     all_success = all(r.success for r in stage_results)
+
+    # Clear checkpoint after successful completion of all stages
+    if all_success and len(completed_stages) == len(stages_to_run):
+        _clear_checkpoint(episode_id, config.data_root, config.checkpoint_file)
+        LOGGER.info("Pipeline completed successfully, checkpoint cleared")
 
     return EpisodeRunResult(
         episode_id=episode_id,
@@ -622,10 +960,10 @@ def run_episode(
         started_at=started_at,
         finished_at=finished_at,
         runtime_sec=runtime_sec,
-        frames_processed=last_result.frames_processed if last_result else 0,
-        tracks_count=last_result.tracks_count if last_result else 0,
-        faces_count=last_result.faces_count if last_result else 0,
-        identities_count=last_result.identities_count if last_result else 0,
+        frames_processed=aggregated_frames,
+        tracks_count=aggregated_tracks,
+        faces_count=aggregated_faces,
+        identities_count=aggregated_identities,
         config=config,
         stages=stage_results,
         artifacts=final_artifacts,

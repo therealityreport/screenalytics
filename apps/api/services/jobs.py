@@ -115,10 +115,20 @@ def default_profile_for_device(device: str | None, resolved_device: str | None =
 
 
 def load_performance_profile(profile_value: str | None) -> dict:
-    """Load performance profile configuration by name."""
+    """Load performance profile configuration by name.
+
+    Supports aliases:
+      - fast_cpu -> low_power
+      - high_accuracy -> performance
+    """
     if not profile_value:
         return PROFILE_DEFAULTS.get("balanced", {})
     normalized = str(profile_value).strip().lower()
+    # Handle aliases
+    if normalized == "fast_cpu":
+        normalized = "low_power"
+    elif normalized == "high_accuracy":
+        normalized = "performance"
     return PROFILE_DEFAULTS.get(normalized, PROFILE_DEFAULTS.get("balanced", {}))
 
 
