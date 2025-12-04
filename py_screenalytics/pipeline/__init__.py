@@ -16,14 +16,26 @@ from py_screenalytics.pipeline.episode_engine import (
 )
 from py_screenalytics.pipeline.constants import (
     ARTIFACT_KINDS,
+    ArtifactKind,
     get_artifact_path,
+    ensure_artifact_dirs,
     PIPELINE_VERSION,
+)
+from py_screenalytics.pipeline.stages import (
+    run_detect_track,
+    run_faces_embed,
+    run_cluster,
+    check_artifacts_exist,
 )
 
 __all__ = [
     # Main API
     "run_episode",
     "run_stage",
+    # Individual stage functions
+    "run_detect_track",
+    "run_faces_embed",
+    "run_cluster",
     # Config and Results
     "EpisodeRunConfig",
     "EpisodeRunResult",
@@ -31,6 +43,10 @@ __all__ = [
     "PipelineStage",
     # Constants
     "ARTIFACT_KINDS",
+    "ArtifactKind",
     "get_artifact_path",
+    "ensure_artifact_dirs",
     "PIPELINE_VERSION",
+    # Utilities
+    "check_artifacts_exist",
 ]

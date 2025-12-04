@@ -2083,8 +2083,17 @@ class GroupingService:
         if not all_embeddings_by_cast:
             return {"suggestions": [], "message": "No assigned clusters or facebank seeds available for comparison"}
 
-        # Generate suggestions
+        # Determine reference embedding dimension from cast embeddings
+        reference_dim: int | None = None
+        for cast_embeddings in all_embeddings_by_cast.values():
+            if cast_embeddings:
+                reference_dim = cast_embeddings[0].shape[0]
+                break
+
+        # Generate suggestions with dimension mismatch tracking
         suggestions = []
+        mismatched_embeddings: List[Dict[str, Any]] = []
+
         for cluster_id in clusters_needing_suggestions:
             centroid_data = centroids_map.get(cluster_id)
             if not centroid_data:
@@ -2095,6 +2104,23 @@ class GroupingService:
             cluster_face_embeddings: List[np.ndarray] = []
             for tid in cluster_track_ids:
                 cluster_face_embeddings.extend(unassigned_track_embeddings.get(int(tid), []))
+
+            # Check for dimension mismatch before computing similarity
+            centroid_dim = centroid_vec.shape[0]
+            if reference_dim is not None and centroid_dim != reference_dim:
+                warning_msg = (
+                    f"Cluster {cluster_id} has embedding dimension {centroid_dim}, "
+                    f"expected {reference_dim}. Different embedding models may have been used."
+                )
+                LOGGER.warning(f"[{ep_id}] {warning_msg}")
+                mismatched_embeddings.append({
+                    "type": "dimension_mismatch",
+                    "cluster_id": cluster_id,
+                    "cluster_dim": centroid_dim,
+                    "expected_dim": reference_dim,
+                    "message": warning_msg,
+                })
+                continue  # Skip this cluster instead of crashing
 
             use_frame_matching = len(cluster_track_ids) == 1 and len(cluster_face_embeddings) > 0
 
@@ -2108,13 +2134,26 @@ class GroupingService:
                 if use_frame_matching:
                     faces_used = len(cluster_face_embeddings)
                     for face_emb in cluster_face_embeddings:
+                        # Check face embedding dimension too
+                        if face_emb.shape[0] != reference_dim:
+                            continue  # Skip mismatched face embeddings
                         for emb in cast_embeddings:
+                            if emb.shape[0] != reference_dim:
+                                continue  # Skip mismatched cast embeddings
                             sim = cosine_similarity(face_emb, emb)
                             if sim > best_sim:
                                 best_sim = sim
                     source = "frame"
                 else:
                     for emb in cast_embeddings:
+                        # Verify dimensions match before computing similarity
+                        if emb.shape[0] != centroid_dim:
+                            # Track individual cast member dimension mismatches (less critical)
+                            LOGGER.debug(
+                                f"[{ep_id}] Skipping cast embedding for {cast_id}: "
+                                f"dim {emb.shape[0]} != centroid dim {centroid_dim}"
+                            )
+                            continue
                         sim = cosine_similarity(centroid_vec, emb)
                         if sim > best_sim:
                             best_sim = sim
@@ -2149,8 +2188,15 @@ class GroupingService:
                 "cast_suggestions": top_matches,
             })
 
-        LOGGER.info(f"[{ep_id}] Generated cast suggestions for {len(suggestions)} clusters needing assignment")
-        return {"suggestions": suggestions}
+        # Log summary
+        LOGGER.info(
+            f"[{ep_id}] Generated cast suggestions for {len(suggestions)} clusters; "
+            f"{len(mismatched_embeddings)} skipped due to dimension mismatch"
+        )
+        return {
+            "suggestions": suggestions,
+            "mismatched_embeddings": mismatched_embeddings,
+        }
 
     def auto_link_high_confidence_matches(
         self,
@@ -2719,6 +2765,249 @@ class GroupingService:
             "count": len(pairs),
             "threshold": similarity_threshold,
             "total_clusters": len(cluster_ids),
+        }
+
+    def analyze_unassigned_clusters(
+        self,
+        ep_id: str,
+        similarity_threshold: float = 0.70,
+        min_cast_similarity: float = 0.50,
+        top_k_cast: int = 3,
+    ) -> Dict[str, Any]:
+        """Analyze unassigned clusters: group similar ones and recommend cast members.
+
+        This groups unassigned clusters by their similarity to each other, then
+        provides cast member recommendations for each group.
+
+        Args:
+            ep_id: Episode ID
+            similarity_threshold: Min similarity to group clusters together (default 0.70)
+            min_cast_similarity: Min similarity for cast recommendations (default 0.50)
+            top_k_cast: Number of cast suggestions per group (default 3)
+
+        Returns:
+            {
+                "groups": [
+                    {
+                        "group_id": "grp_001",
+                        "clusters": ["id_001", "id_003"],
+                        "avg_internal_similarity": 0.82,
+                        "total_tracks": 5,
+                        "total_faces": 47,
+                        "cast_recommendations": [
+                            {"cast_id": "...", "name": "Kyle", "similarity": 0.78, "confidence": "high"},
+                            ...
+                        ]
+                    },
+                    ...
+                ],
+                "singletons": [...],  # Clusters that don't match others
+                "summary": {...}
+            }
+        """
+        from apps.api.services.facebank import cosine_similarity
+        from collections import defaultdict
+
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
+
+        # Load identities to find unassigned clusters
+        identities_path = self._identities_path(ep_id)
+        if not identities_path.exists():
+            return {"groups": [], "singletons": [], "message": "No identities found"}
+
+        identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+        identities = identities_data.get("identities", [])
+
+        # Load centroids
+        try:
+            centroids_data = self.load_cluster_centroids(ep_id)
+            centroids_map = _normalize_centroids_to_map(centroids_data.get("centroids", {}), validate=True)
+        except FileNotFoundError:
+            return {"groups": [], "singletons": [], "message": "No centroids found. Run clustering first."}
+
+        # Get cast member lookup
+        cast_members = self.cast_service.list_cast(show_id)
+        cast_lookup = {member["cast_id"]: member for member in cast_members if member.get("cast_id")}
+
+        # Load people to get person_id -> cast_id mapping
+        people = self.people_service.list_people(show_id)
+        person_to_cast: Dict[str, str] = {}
+        for p in people:
+            if p.get("person_id") and p.get("cast_id"):
+                person_to_cast[p["person_id"]] = p["cast_id"]
+        people_with_cast = set(person_to_cast.keys())
+
+        # Find unassigned clusters (not linked to a cast member)
+        unassigned_clusters = []
+        cluster_meta: Dict[str, Dict[str, Any]] = {}
+
+        for identity in identities:
+            cluster_id = identity.get("identity_id")
+            person_id = identity.get("person_id")
+            track_ids = identity.get("track_ids", [])
+
+            if cluster_id not in centroids_map:
+                continue
+
+            # Store metadata
+            cluster_meta[cluster_id] = {
+                "track_ids": track_ids,
+                "tracks_count": len(track_ids),
+                "person_id": person_id,
+                "name": identity.get("name"),
+            }
+
+            # Check if unassigned (no person_id or person not linked to cast)
+            if not person_id or person_id not in people_with_cast:
+                unassigned_clusters.append(cluster_id)
+
+        if not unassigned_clusters:
+            return {
+                "groups": [],
+                "singletons": [],
+                "message": "No unassigned clusters found",
+                "total_unassigned": 0,
+            }
+
+        # Compute pairwise similarities between unassigned clusters
+        # Use Union-Find to group similar clusters
+        parent: Dict[str, str] = {cid: cid for cid in unassigned_clusters}
+
+        def find(x: str) -> str:
+            if parent[x] != x:
+                parent[x] = find(parent[x])  # Path compression
+            return parent[x]
+
+        def union(x: str, y: str) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        # Compare all pairs of unassigned clusters
+        similarity_edges: List[tuple] = []
+        for i, cid_i in enumerate(unassigned_clusters):
+            centroid_i = centroids_map[cid_i]["centroid"]
+            for j in range(i + 1, len(unassigned_clusters)):
+                cid_j = unassigned_clusters[j]
+                centroid_j = centroids_map[cid_j]["centroid"]
+                sim = float(np.dot(centroid_i, centroid_j))
+                if sim >= similarity_threshold:
+                    union(cid_i, cid_j)
+                    similarity_edges.append((cid_i, cid_j, sim))
+
+        # Group clusters by their root
+        groups_dict: Dict[str, List[str]] = defaultdict(list)
+        for cid in unassigned_clusters:
+            root = find(cid)
+            groups_dict[root].append(cid)
+
+        # Load facebank for cast recommendations
+        try:
+            facebank_seeds = self.facebank_service.get_all_seeds(show_id)
+        except Exception:
+            facebank_seeds = {}
+
+        # Build result groups
+        groups = []
+        singletons = []
+
+        for group_idx, (root, cluster_ids) in enumerate(sorted(groups_dict.items(), key=lambda x: -len(x[1]))):
+            # Calculate group stats
+            total_tracks = sum(cluster_meta.get(cid, {}).get("tracks_count", 0) for cid in cluster_ids)
+
+            # Compute average internal similarity for multi-cluster groups
+            avg_internal_sim = None
+            if len(cluster_ids) > 1:
+                sims = []
+                for i, cid_i in enumerate(cluster_ids):
+                    for j in range(i + 1, len(cluster_ids)):
+                        cid_j = cluster_ids[j]
+                        centroid_i = centroids_map[cid_i]["centroid"]
+                        centroid_j = centroids_map[cid_j]["centroid"]
+                        sims.append(float(np.dot(centroid_i, centroid_j)))
+                if sims:
+                    avg_internal_sim = round(sum(sims) / len(sims), 4)
+
+            # Compute group centroid (average of cluster centroids)
+            group_centroid = np.mean([centroids_map[cid]["centroid"] for cid in cluster_ids], axis=0)
+
+            # Get cast recommendations for the group
+            cast_recommendations = []
+            for cast_id, cast_data in cast_lookup.items():
+                seeds = facebank_seeds.get(cast_id, [])
+                if not seeds:
+                    continue
+
+                # Compare group centroid to each seed
+                best_sim = -1.0
+                for seed in seeds:
+                    seed_emb = seed.get("embedding")
+                    if seed_emb is not None:
+                        seed_vec = np.array(seed_emb)
+                        if np.linalg.norm(seed_vec) > 0:
+                            seed_vec = seed_vec / np.linalg.norm(seed_vec)
+                            sim = float(np.dot(group_centroid, seed_vec))
+                            if sim > best_sim:
+                                best_sim = sim
+
+                if best_sim >= min_cast_similarity:
+                    confidence = "high" if best_sim >= 0.80 else "medium" if best_sim >= 0.65 else "low"
+                    cast_recommendations.append({
+                        "cast_id": cast_id,
+                        "name": cast_data.get("name", cast_id),
+                        "similarity": round(best_sim, 3),
+                        "confidence": confidence,
+                    })
+
+            # Sort cast recommendations by similarity
+            cast_recommendations.sort(key=lambda x: -x["similarity"])
+            cast_recommendations = cast_recommendations[:top_k_cast]
+
+            group_entry = {
+                "group_id": f"grp_{group_idx:03d}",
+                "clusters": cluster_ids,
+                "cluster_count": len(cluster_ids),
+                "total_tracks": total_tracks,
+                "avg_internal_similarity": avg_internal_sim,
+                "cast_recommendations": cast_recommendations,
+                "cluster_details": [
+                    {
+                        "cluster_id": cid,
+                        "name": cluster_meta.get(cid, {}).get("name"),
+                        "tracks": cluster_meta.get(cid, {}).get("tracks_count", 0),
+                        "cohesion": centroids_map.get(cid, {}).get("cohesion"),
+                    }
+                    for cid in cluster_ids
+                ],
+            }
+
+            if len(cluster_ids) == 1:
+                singletons.append(group_entry)
+            else:
+                groups.append(group_entry)
+
+        LOGGER.info(
+            f"[{ep_id}] Analyzed {len(unassigned_clusters)} unassigned clusters: "
+            f"{len(groups)} groups, {len(singletons)} singletons"
+        )
+
+        return {
+            "ep_id": ep_id,
+            "groups": groups,
+            "singletons": singletons,
+            "summary": {
+                "total_unassigned": len(unassigned_clusters),
+                "grouped_clusters": sum(len(g["clusters"]) for g in groups),
+                "singleton_clusters": len(singletons),
+                "group_count": len(groups),
+            },
+            "thresholds": {
+                "similarity_threshold": similarity_threshold,
+                "min_cast_similarity": min_cast_similarity,
+            },
         }
 
     def merge_clusters(

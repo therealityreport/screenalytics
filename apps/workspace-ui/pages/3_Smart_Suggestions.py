@@ -8,10 +8,12 @@ Each suggestion is displayed as its own row with up to 6 frame thumbnails.
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 import streamlit as st
@@ -24,8 +26,33 @@ if str(WORKSPACE_DIR) not in sys.path:
 import ui_helpers as helpers  # noqa: E402
 from similarity_badges import SimilarityType, render_similarity_badge  # noqa: E402
 
+LOGGER = logging.getLogger(__name__)
+
 cfg = helpers.init_page("Smart Suggestions")
 st.title("Smart Suggestions")
+
+
+# --- API Result Types ---
+@dataclass
+class ApiResult:
+    """Structured result from API calls with explicit error handling."""
+
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    status_code: Optional[int] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.data is not None
+
+    @property
+    def error_message(self) -> str:
+        """Human-readable error message."""
+        if not self.error:
+            return ""
+        if self.status_code:
+            return f"API error {self.status_code}: {self.error}"
+        return f"API error: {self.error}"
 
 # Episode selector
 sidebar_ep_id = None
@@ -51,69 +78,163 @@ if not ep_id:
 _api_base = st.session_state.get("api_base", "http://localhost:8000")
 
 
-def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    """Fetch from API, return None on error."""
+def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> ApiResult:
+    """Fetch from API with structured error handling.
+
+    Returns ApiResult with data on success, or error details on failure.
+    Never silently swallows errors.
+    """
+    url = f"{_api_base}{path}"
     try:
-        resp = requests.get(f"{_api_base}{path}", params=params, timeout=30)
+        resp = requests.get(url, params=params, timeout=30)
         if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
-    return None
+            return ApiResult(data=resp.json())
+        # Non-200 status - extract error detail
+        try:
+            error_detail = resp.json().get("detail", resp.text or resp.reason)
+        except Exception:
+            error_detail = resp.text or resp.reason or "Unknown error"
+        LOGGER.warning(f"[Smart Suggestions] GET {path} returned {resp.status_code}: {error_detail}")
+        return ApiResult(error=error_detail, status_code=resp.status_code)
+    except requests.Timeout:
+        LOGGER.error(f"[Smart Suggestions] GET {path} timed out")
+        return ApiResult(error="Request timed out (30s)")
+    except requests.ConnectionError as e:
+        LOGGER.error(f"[Smart Suggestions] GET {path} connection error: {e}")
+        return ApiResult(error="Connection failed - API may be unavailable")
+    except Exception as e:
+        LOGGER.exception(f"[Smart Suggestions] GET {path} unexpected error: {e}")
+        return ApiResult(error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
-def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    """POST to API, return response or None on error."""
+def _api_post(path: str, payload: Dict[str, Any] | None = None) -> ApiResult:
+    """POST to API with structured error handling.
+
+    Returns ApiResult with data on success, or error details on failure.
+    Never silently swallows errors.
+    """
+    url = f"{_api_base}{path}"
     try:
-        resp = requests.post(f"{_api_base}{path}", json=payload or {}, timeout=30)
+        resp = requests.post(url, json=payload or {}, timeout=30)
         if resp.status_code in (200, 201):
-            return resp.json()
-    except Exception:
-        pass
-    return None
+            return ApiResult(data=resp.json())
+        # Non-success status - extract error detail
+        try:
+            error_detail = resp.json().get("detail", resp.text or resp.reason)
+        except Exception:
+            error_detail = resp.text or resp.reason or "Unknown error"
+        LOGGER.warning(f"[Smart Suggestions] POST {path} returned {resp.status_code}: {error_detail}")
+        return ApiResult(error=error_detail, status_code=resp.status_code)
+    except requests.Timeout:
+        LOGGER.error(f"[Smart Suggestions] POST {path} timed out")
+        return ApiResult(error="Request timed out (30s)")
+    except requests.ConnectionError as e:
+        LOGGER.error(f"[Smart Suggestions] POST {path} connection error: {e}")
+        return ApiResult(error="Connection failed - API may be unavailable")
+    except Exception as e:
+        LOGGER.exception(f"[Smart Suggestions] POST {path} unexpected error: {e}")
+        return ApiResult(error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
-def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    """PATCH to API, return response or None on error."""
+def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> ApiResult:
+    """PATCH to API with structured error handling.
+
+    Returns ApiResult with data on success, or error details on failure.
+    Never silently swallows errors.
+    """
+    url = f"{_api_base}{path}"
     try:
-        resp = requests.patch(f"{_api_base}{path}", json=payload or {}, timeout=30)
+        resp = requests.patch(url, json=payload or {}, timeout=30)
         if resp.status_code in (200, 201):
-            return resp.json()
-    except Exception:
-        pass
-    return None
+            return ApiResult(data=resp.json())
+        # Non-success status - extract error detail
+        try:
+            error_detail = resp.json().get("detail", resp.text or resp.reason)
+        except Exception:
+            error_detail = resp.text or resp.reason or "Unknown error"
+        LOGGER.warning(f"[Smart Suggestions] PATCH {path} returned {resp.status_code}: {error_detail}")
+        return ApiResult(error=error_detail, status_code=resp.status_code)
+    except requests.Timeout:
+        LOGGER.error(f"[Smart Suggestions] PATCH {path} timed out")
+        return ApiResult(error="Request timed out (30s)")
+    except requests.ConnectionError as e:
+        LOGGER.error(f"[Smart Suggestions] PATCH {path} connection error: {e}")
+        return ApiResult(error="Connection failed - API may be unavailable")
+    except Exception as e:
+        LOGGER.exception(f"[Smart Suggestions] PATCH {path} unexpected error: {e}")
+        return ApiResult(error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
-def _recompute_cast_suggestions(ep_id: str, show_slug: str | None) -> Dict[str, List[Dict[str, Any]]]:
-    """Persist assignments and recompute cast suggestions from latest embeddings."""
-    st.session_state.pop(f"cast_suggestions:{ep_id}", None)
+@dataclass
+class RecomputeResult:
+    """Result of recomputing suggestions with explicit success/error status."""
+
+    suggestions: Dict[str, List[Dict[str, Any]]]
+    mismatched_embeddings: List[Dict[str, Any]]
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def _recompute_cast_suggestions(ep_id: str, show_slug: str | None) -> RecomputeResult:
+    """Persist assignments and recompute cast suggestions from latest embeddings.
+
+    Atomic state update: only clears old state AFTER new data is successfully fetched.
+    Returns structured result with error information and dimension mismatch warnings.
+    """
+    # First, persist current assignments (don't clear state yet)
+    save_result = _api_post(f"/episodes/{ep_id}/save_assignments", {})
+    if not save_result.ok:
+        # Non-fatal: log warning but continue with suggestion fetch
+        LOGGER.warning(f"[{ep_id}] Failed to save assignments before recompute: {save_result.error}")
+
+    # Fetch new suggestions into local variables (NOT directly into session_state)
+    cache_buster = int(time.time() * 1000)
+    suggestions_result = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions", params={"_t": cache_buster})
+
+    if not suggestions_result.ok:
+        # API failed - return error, keep existing state intact
+        return RecomputeResult(
+            suggestions={},
+            mismatched_embeddings=[],
+            error=suggestions_result.error_message,
+        )
+
+    suggestions_data = suggestions_result.data or {}
+    suggestions_map: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in suggestions_data.get("suggestions", []):
+        cid = entry.get("cluster_id")
+        if not cid:
+            continue
+        suggestions_map[cid] = entry.get("cast_suggestions", []) or []
+
+    # Extract dimension mismatch warnings from API response
+    mismatched_embeddings = suggestions_data.get("mismatched_embeddings", [])
+
+    # SUCCESS: Now atomically update session state
+    # Clear old state and replace with new data in one consistent operation
+    st.session_state[f"cast_suggestions:{ep_id}"] = suggestions_map
+    st.session_state[f"embedding_mismatches:{ep_id}"] = mismatched_embeddings
     st.session_state.pop(f"dismissed_suggestions:{ep_id}", None)
     if show_slug:
         st.session_state.pop(f"people_cache:{show_slug}", None)
     st.session_state.pop(f"cluster_tracks:{ep_id}", None)
     st.session_state.pop(f"identities:{ep_id}", None)
-    _api_post(f"/episodes/{ep_id}/save_assignments", {})
 
-    cache_buster = int(time.time() * 1000)
-    suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions", params={"_t": cache_buster})
-    suggestions_map: Dict[str, List[Dict[str, Any]]] = {}
-    if suggestions_resp:
-        for entry in suggestions_resp.get("suggestions", []):
-            cid = entry.get("cluster_id")
-            if not cid:
-                continue
-            suggestions_map[cid] = entry.get("cast_suggestions", []) or []
-
-    if suggestions_map:
-        st.session_state[f"cast_suggestions:{ep_id}"] = suggestions_map
-    return suggestions_map
+    return RecomputeResult(
+        suggestions=suggestions_map,
+        mismatched_embeddings=mismatched_embeddings,
+    )
 
 
 def _fetch_people_cached(show_id: str) -> Dict[str, Any] | None:
     """Fetch people for a show (cached)."""
     cache_key = f"people_cache:{show_id}"
     if cache_key not in st.session_state:
-        st.session_state[cache_key] = _safe_api_get(f"/shows/{show_id}/people")
+        result = _safe_api_get(f"/shows/{show_id}/people")
+        st.session_state[cache_key] = result.data if result.ok else None
     return st.session_state.get(cache_key)
 
 
@@ -151,11 +272,29 @@ season_value = ep_meta.get("season")
 if isinstance(season_value, int):
     season_label = f"S{season_value:02d}"
 
-# Fetch required data
-cluster_payload = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks") or {"clusters": []}
-cast_api_resp = _safe_api_get(f"/shows/{show_slug}/cast" + (f"?season={season_label}" if season_label else ""))
+# Fetch required data with proper error handling
+cluster_result = _safe_api_get(f"/episodes/{ep_id}/cluster_tracks")
+cast_result = _safe_api_get(f"/shows/{show_slug}/cast" + (f"?season={season_label}" if season_label else ""))
 people_resp = _fetch_people_cached(show_slug)
-unlinked_resp = _safe_api_get(f"/episodes/{ep_id}/unlinked_entities")
+unlinked_result = _safe_api_get(f"/episodes/{ep_id}/unlinked_entities")
+
+# Track API errors for display
+_api_errors: List[str] = []
+if not cluster_result.ok:
+    _api_errors.append(f"Failed to load clusters: {cluster_result.error}")
+if not cast_result.ok:
+    _api_errors.append(f"Failed to load cast: {cast_result.error}")
+if not unlinked_result.ok:
+    _api_errors.append(f"Failed to load unlinked entities: {unlinked_result.error}")
+
+# Show critical API errors
+if _api_errors:
+    for err in _api_errors:
+        st.error(f"⚠️ {err}")
+
+cluster_payload = cluster_result.data if cluster_result.ok else {"clusters": []}
+cast_api_resp = cast_result.data if cast_result.ok else None
+unlinked_resp = unlinked_result.data if unlinked_result.ok else None
 
 # Build cluster lookup
 cluster_lookup: Dict[str, Dict[str, Any]] = {}
@@ -205,21 +344,78 @@ with col1:
 
 st.markdown("---")
 
-# Get or fetch cast suggestions
+# --- State Management Keys ---
 suggestions_key = f"cast_suggestions:{ep_id}"
+dismissed_key = f"dismissed_suggestions:{ep_id}"
+mismatches_key = f"embedding_mismatches:{ep_id}"
+status_key = f"smart_suggestions_status:{ep_id}"
+error_key = f"smart_suggestions_error:{ep_id}"
+auto_attempt_key = f"cast_suggestions_attempted:{ep_id}"
+
+# Get or fetch cast suggestions with proper status tracking
 cast_suggestions = st.session_state.get(suggestions_key, {})
+embedding_mismatches = st.session_state.get(mismatches_key, [])
 
 # Dismissed suggestions tracking
-dismissed_key = f"dismissed_suggestions:{ep_id}"
 dismissed = st.session_state.setdefault(dismissed_key, set())
 
+# Status: "idle" | "loading" | "loaded" | "error"
+suggestions_status = st.session_state.get(status_key, "idle")
+suggestions_error = st.session_state.get(error_key)
+
 # Auto-refresh suggestions once when none are cached
-auto_attempt_key = f"cast_suggestions_attempted:{ep_id}"
 if not cast_suggestions and not st.session_state.get(auto_attempt_key, False):
+    st.session_state[status_key] = "loading"
     with st.spinner("Analyzing cast vs unassigned clusters..."):
-        cast_suggestions = _recompute_cast_suggestions(ep_id, show_slug)
+        result = _recompute_cast_suggestions(ep_id, show_slug)
         st.session_state[auto_attempt_key] = True
+        if result.ok:
+            cast_suggestions = result.suggestions
+            embedding_mismatches = result.mismatched_embeddings
+            st.session_state[status_key] = "loaded"
+            st.session_state.pop(error_key, None)
+        else:
+            # Error state - keep existing suggestions (if any), show error banner
+            st.session_state[status_key] = "error"
+            st.session_state[error_key] = result.error
+            suggestions_error = result.error
         dismissed = st.session_state.setdefault(dismissed_key, set())
+
+# Show error banner if in error state
+if suggestions_status == "error" and suggestions_error:
+    st.error(f"⚠️ **Smart Suggestions API failed:** {suggestions_error}")
+    col_retry, col_spacer = st.columns([1, 4])
+    with col_retry:
+        if st.button("🔄 Retry", key="retry_suggestions_top"):
+            st.session_state[status_key] = "loading"
+            with st.spinner("Retrying..."):
+                result = _recompute_cast_suggestions(ep_id, show_slug)
+                if result.ok:
+                    cast_suggestions = result.suggestions
+                    embedding_mismatches = result.mismatched_embeddings
+                    st.session_state[status_key] = "loaded"
+                    st.session_state.pop(error_key, None)
+                    st.rerun()
+                else:
+                    st.session_state[error_key] = result.error
+
+# Show embedding mismatch warnings if any clusters were skipped
+if embedding_mismatches:
+    mismatch_count = len(embedding_mismatches)
+    with st.expander(f"⚠️ {mismatch_count} cluster(s) skipped due to embedding dimension mismatch", expanded=False):
+        st.warning(
+            "Some clusters couldn't be suggested because their embeddings are incompatible "
+            "with the current facebank. This usually means different embedding models were used. "
+            "Re-run clustering with a consistent model to resolve."
+        )
+        # Show diagnostics
+        st.markdown("**Affected clusters:**")
+        for mismatch in embedding_mismatches[:10]:  # Show first 10
+            cluster_id = mismatch.get("cluster_id", "unknown")
+            message = mismatch.get("message", "Dimension mismatch")
+            st.text(f"  • {cluster_id}: {message}")
+        if mismatch_count > 10:
+            st.caption(f"... and {mismatch_count - 10} more")
 
 # Collect clusters with suggestions, sorted by confidence
 suggestion_entries = []
@@ -355,16 +551,26 @@ with col3:
 with col4:
     st.metric("Dismissed", dismissed_count)
 with col5:
-    # Refresh button
+    # Refresh button with proper error handling
     if st.button("Refresh Suggestions", key="refresh_all_suggestions", use_container_width=True):
+        st.session_state[status_key] = "loading"
         with st.spinner("Recomputing suggestions from latest cast assignments..."):
-            new_suggestions = _recompute_cast_suggestions(ep_id, show_slug)
-            if new_suggestions:
-                st.toast(f"Found {len(new_suggestions)} cluster(s) with suggestions")
-                st.session_state[auto_attempt_key] = True
-                st.rerun()
+            result = _recompute_cast_suggestions(ep_id, show_slug)
+            st.session_state[auto_attempt_key] = True
+            if result.ok:
+                st.session_state[status_key] = "loaded"
+                st.session_state.pop(error_key, None)
+                if result.suggestions:
+                    st.toast(f"Found {len(result.suggestions)} cluster(s) with suggestions")
+                    if result.mismatched_embeddings:
+                        st.toast(f"⚠️ {len(result.mismatched_embeddings)} cluster(s) skipped (embedding mismatch)", icon="⚠️")
+                    st.rerun()
+                else:
+                    st.info("No suggestions available - all clusters may already be assigned")
             else:
-                st.info("No suggestions available yet - all clusters may already be assigned")
+                st.session_state[status_key] = "error"
+                st.session_state[error_key] = result.error
+                st.error(f"⚠️ Failed to refresh: {result.error}")
 
 st.markdown("---")
 
@@ -383,7 +589,12 @@ sort_key, sort_reverse = SORT_OPTIONS[selected_sort]
 suggestion_entries = _sort_entries(suggestion_entries, sort_key, sort_reverse)
 
 if not suggestion_entries and not person_suggestion_entries:
-    st.info("No pending suggestions. Click 'Refresh Suggestions' to find matches for unassigned clusters.")
+    # Distinguish between "no suggestions available" (success) and "API failed" (error)
+    if suggestions_status == "error":
+        # Error state already shown above; don't show "no suggestions" message
+        pass
+    else:
+        st.info("No pending suggestions. Click 'Refresh Suggestions' to find matches for unassigned clusters.")
     # Clear dismissed button if there are dismissed entries
     if dismissed:
         if st.button("Clear All Dismissed", key="clear_all_dismissed", use_container_width=True):
@@ -515,15 +726,19 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                     "target_person_id": target_person_id,
                     "cast_id": cast_id,
                 }
-                resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                if resp and resp.get("status") == "success":
+                # ATOMIC: Call API first, only remove suggestion if successful
+                result = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+                if result.ok and result.data and result.data.get("status") == "success":
+                    # SUCCESS: Now safe to remove from suggestions
                     st.toast(f"Assigned to {cast_name}")
-                    # Remove from suggestions
                     if cluster_id in cast_suggestions:
                         del cast_suggestions[cluster_id]
                     st.rerun()
                 else:
-                    st.error("Failed to assign")
+                    # FAILURE: Keep suggestion visible, show detailed error
+                    error_detail = result.error_message if result.error else "Unknown error"
+                    st.error(f"⚠️ Assignment failed: {error_detail}")
+                    LOGGER.error(f"[{ep_id}] Failed to accept suggestion for cluster {cluster_id}: {error_detail}")
 
             if st.button("👁 View", key=f"sp_view_{cluster_id}", use_container_width=True):
                 # Navigate to Faces Review with this cluster selected
@@ -621,15 +836,19 @@ if suggestion_entries or person_suggestion_entries:
 
                     if st.button("✓ Link", key=f"sp_link_person_{person_id}", use_container_width=True):
                         payload = {"cast_id": cast_id}
-                        resp = _api_patch(f"/shows/{show_slug}/people/{person_id}", payload)
-                        if resp:
+                        # ATOMIC: Call API first, only update state if successful
+                        result = _api_patch(f"/shows/{show_slug}/people/{person_id}", payload)
+                        if result.ok:
+                            # SUCCESS: Now safe to update state
                             st.toast(f"Linked {person_name} to {cast_name}")
                             people_cache_key = f"people_cache:{show_slug}"
                             if people_cache_key in st.session_state:
                                 del st.session_state[people_cache_key]
                             st.rerun()
                         else:
-                            st.error("Failed to link")
+                            # FAILURE: Keep person visible, show detailed error
+                            st.error(f"⚠️ Link failed: {result.error_message}")
+                            LOGGER.error(f"[{ep_id}] Failed to link person {person_id}: {result.error_message}")
 
                 if st.button("👁 View", key=f"sp_view_person_{person_id}", use_container_width=True):
                     st.session_state["facebank_ep"] = ep_id

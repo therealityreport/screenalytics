@@ -85,7 +85,13 @@ async def _reject_legacy_payload(request: Request) -> None:
 
 
 DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
-PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "high_accuracy"]
+# Performance profiles:
+# - low_power: Lower resource usage for laptops/quiet operation (stride 12, 15fps)
+# - balanced: Default setting for most workloads (stride 6, 24fps)
+# - performance: Higher quality/faster processing with more resources (stride 4, 30fps)
+# - fast_cpu: Alias for low_power
+# - high_accuracy: Alias for performance
+PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "performance", "high_accuracy"]
 
 
 class DetectRequest(BaseModel):
@@ -283,6 +289,90 @@ class FacebankBackfillRequest(BaseModel):
         False,
         description="When True, report actions without writing files or uploading to S3",
     )
+
+
+class EpisodeRunRequest(BaseModel):
+    """Request model for running the full episode processing pipeline."""
+
+    ep_id: str = Field(..., description="Episode identifier (e.g., 'rhobh-s05e14')")
+    profile: PROFILE_LITERAL | None = Field(
+        None,
+        description="Performance profile: low_power, balanced, performance (or aliases fast_cpu, high_accuracy). Overrides stride defaults.",
+    )
+    device: DEVICE_LITERAL = Field(
+        "auto",
+        description="Execution device (auto, cpu, cuda, coreml)",
+    )
+    stride: int = Field(
+        1,
+        ge=1,
+        le=30,
+        description="Frame stride for detection (1 = every frame)",
+    )
+    det_thresh: float = Field(
+        0.65,
+        ge=0.0,
+        le=1.0,
+        description="Detection confidence threshold",
+    )
+    cluster_thresh: float = Field(
+        0.75,
+        ge=0.2,
+        le=0.99,
+        description="Clustering similarity threshold",
+    )
+    save_crops: bool = Field(False, description="Save per-track face crops")
+    save_frames: bool = Field(False, description="Save full frame JPGs")
+    reuse_detections: bool = Field(
+        False,
+        description="Skip detect_track if artifacts exist (dev mode)",
+    )
+    reuse_embeddings: bool = Field(
+        False,
+        description="Skip faces_embed if artifacts exist (dev mode)",
+    )
+
+
+@router.post("/jobs/episode-run")
+def start_episode_run(req: EpisodeRunRequest) -> dict:
+    """Start a full episode processing pipeline job.
+
+    This endpoint runs the complete pipeline:
+    1. detect_track - Face detection and tracking
+    2. faces_embed - Face embedding extraction
+    3. cluster - Identity clustering
+
+    The job runs asynchronously. Use GET /jobs/{job_id} to poll status.
+
+    Args:
+        req: Episode run configuration
+
+    Returns:
+        {"job_id": "...", "status": "running"}
+    """
+    video_path = _validate_episode_ready(req.ep_id)
+
+    try:
+        record = JOB_SERVICE.start_episode_run_job(
+            ep_id=req.ep_id,
+            video_path=video_path,
+            device=req.device,
+            stride=req.stride,
+            det_thresh=req.det_thresh,
+            cluster_thresh=req.cluster_thresh,
+            save_crops=req.save_crops,
+            save_frames=req.save_frames,
+            reuse_detections=req.reuse_detections,
+            reuse_embeddings=req.reuse_embeddings,
+            profile=req.profile,
+        )
+        return {"job_id": record["job_id"], "status": "running"}
+
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        LOGGER.exception("Failed to start episode run job: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/jobs/facebank/backfill_display")
