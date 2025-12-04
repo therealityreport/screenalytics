@@ -197,6 +197,18 @@ class EpisodeRunConfig:
     stages: PipelineStage = PipelineStage.ALL
     """Which stages to run"""
 
+    # =========================================================================
+    # Dev-mode options (for faster iteration)
+    # =========================================================================
+    reuse_detections: bool = False
+    """If True and detections/tracks exist, skip detect_track stage"""
+
+    reuse_embeddings: bool = False
+    """If True and face embeddings exist, skip faces_embed stage"""
+
+    force_recluster: bool = True
+    """Always rerun clustering (for threshold tuning). Default True."""
+
     def __post_init__(self) -> None:
         """Validate and normalize configuration values."""
         # Normalize device strings
@@ -360,88 +372,6 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_stage_args(
-    episode_id: str,
-    video_path: Path,
-    config: EpisodeRunConfig,
-    stage: PipelineStage,
-) -> List[str]:
-    """Build command-line arguments for the episode_run.py script.
-
-    This is a transitional approach - we call the existing CLI implementation
-    until the stage functions are fully refactored into the engine.
-    """
-    args = [
-        "--ep-id", episode_id,
-        "--device", config.device,
-        "--detector", config.detector,
-        "--tracker", config.tracker,
-    ]
-
-    if config.embed_device:
-        args.extend(["--embed-device", config.embed_device])
-
-    if config.allow_cpu_fallback:
-        args.append("--allow-cpu-fallback")
-
-    if config.data_root:
-        args.extend(["--out-root", str(config.data_root)])
-
-    if config.progress_file:
-        args.extend(["--progress-file", str(config.progress_file)])
-
-    if stage == PipelineStage.DETECT_TRACK:
-        args.extend([
-            "--video", str(video_path),
-            "--stride", str(config.stride),
-            "--det-thresh", str(config.det_thresh),
-            "--track-buffer", str(config.track_buffer),
-            "--track-high-thresh", str(config.track_high_thresh),
-            "--new-track-thresh", str(config.new_track_thresh),
-            "--min-box-area", str(config.min_box_area),
-            "--max-gap", str(config.max_gap),
-            "--scene-detector", config.scene_detector,
-            "--scene-threshold", str(config.scene_threshold),
-            "--scene-min-len", str(config.scene_min_len),
-            "--scene-warmup-dets", str(config.scene_warmup_dets),
-            "--thumb-size", str(config.thumb_size),
-            "--jpeg-quality", str(config.jpeg_quality),
-        ])
-        if config.target_fps:
-            args.extend(["--fps", str(config.target_fps)])
-        if config.coreml_det_size:
-            args.extend(["--coreml-det-size", f"{config.coreml_det_size[0]}x{config.coreml_det_size[1]}"])
-        if config.save_frames:
-            args.append("--save-frames")
-        if config.save_crops:
-            args.append("--save-crops")
-
-    elif stage == PipelineStage.FACES_EMBED:
-        args.extend([
-            "--faces-embed",
-            "--video", str(video_path),
-            "--max-samples-per-track", str(config.max_samples_per_track),
-            "--min-samples-per-track", str(config.min_samples_per_track),
-            "--sample-every-n-frames", str(config.sample_every_n_frames),
-            "--thumb-size", str(config.thumb_size),
-            "--jpeg-quality", str(config.jpeg_quality),
-        ])
-        if config.save_frames:
-            args.append("--save-frames")
-        if config.save_crops:
-            args.append("--save-crops")
-
-    elif stage == PipelineStage.CLUSTER:
-        args.extend([
-            "--cluster",
-            "--cluster-thresh", str(config.cluster_thresh),
-            "--min-identity-sim", str(config.min_identity_sim),
-            "--min-cluster-size", str(config.min_cluster_size),
-        ])
-
-    return args
-
-
 def run_stage(
     episode_id: str,
     video_path: str | Path,
@@ -451,8 +381,7 @@ def run_stage(
     """Run a single pipeline stage.
 
     This function provides a clean interface to run individual stages.
-    Internally it delegates to the existing episode_run.py implementations
-    but presents a clean result structure.
+    It calls the stage implementations in py_screenalytics.pipeline.stages.
 
     Args:
         episode_id: Episode identifier (e.g., "rhobh-s05e14")
@@ -478,35 +407,36 @@ def run_stage(
     ensure_artifact_dirs(episode_id, config.data_root)
 
     try:
-        # Import and run the appropriate stage function from episode_run
-        # This is a transitional approach - eventually the logic will be here
-        from tools.episode_run import (
-            _run_detect_track_stage,
-            _run_faces_embed_stage,
-            _run_cluster_stage,
-            _storage_context,
-            parse_args,
+        # Import stage implementations from the stages module
+        from py_screenalytics.pipeline.stages import (
+            run_detect_track,
+            run_faces_embed,
+            run_cluster,
         )
-
-        # Build args and parse them to get the namespace expected by stage functions
-        args_list = _build_stage_args(episode_id, video_path, config, stage)
-        args = parse_args(args_list)
-
-        # Get storage context
-        storage, ep_ctx, s3_prefixes = _storage_context(episode_id)
 
         # Run the appropriate stage
         if stage == PipelineStage.DETECT_TRACK:
-            summary = _run_detect_track_stage(args, storage, ep_ctx, s3_prefixes)
+            summary = run_detect_track(episode_id, video_path, config)
         elif stage == PipelineStage.FACES_EMBED:
-            summary = _run_faces_embed_stage(args, storage, ep_ctx, s3_prefixes)
+            summary = run_faces_embed(episode_id, video_path, config)
         elif stage == PipelineStage.CLUSTER:
-            summary = _run_cluster_stage(args, storage, ep_ctx, s3_prefixes)
+            summary = run_cluster(episode_id, video_path, config)
         else:
             raise ValueError(f"Unknown stage: {stage}")
 
         finished_at = _utcnow_iso()
         runtime_sec = time.time() - start_time
+
+        # Check for stage-level failure
+        if not summary.get("success", True):
+            return StageResult(
+                stage=stage.value,
+                success=False,
+                started_at=started_at,
+                finished_at=finished_at,
+                runtime_sec=runtime_sec,
+                error=summary.get("error", "Unknown error"),
+            )
 
         # Extract results from summary
         return StageResult(
@@ -607,6 +537,46 @@ def run_episode(
 
     # Run each stage
     for stage in stages_to_run:
+        # Check if we should skip this stage due to reuse flags
+        should_skip = False
+        skip_reason = None
+
+        if stage == PipelineStage.DETECT_TRACK and config.reuse_detections:
+            # Check if detections and tracks exist
+            from py_screenalytics.pipeline.stages import check_artifacts_exist
+            artifacts = check_artifacts_exist(episode_id, "detect_track", config.data_root)
+            if artifacts.get("detections") and artifacts.get("tracks"):
+                should_skip = True
+                skip_reason = "reuse_detections enabled and artifacts exist"
+
+        elif stage == PipelineStage.FACES_EMBED and config.reuse_embeddings:
+            # Check if face embeddings exist
+            from py_screenalytics.pipeline.stages import check_artifacts_exist
+            artifacts = check_artifacts_exist(episode_id, "faces_embed", config.data_root)
+            if artifacts.get("faces") and artifacts.get("faces_embeddings"):
+                should_skip = True
+                skip_reason = "reuse_embeddings enabled and artifacts exist"
+
+        if should_skip:
+            LOGGER.info("Skipping stage %s: %s", stage.value, skip_reason)
+            # Create a skipped stage result
+            stage_results.append(StageResult(
+                stage=stage.value,
+                success=True,
+                started_at=_utcnow_iso(),
+                finished_at=_utcnow_iso(),
+                runtime_sec=0.0,
+                metadata={"skipped": True, "reason": skip_reason},
+            ))
+            if config.progress_callback:
+                config.progress_callback({
+                    "type": "stage_skipped",
+                    "stage": stage.value,
+                    "episode_id": episode_id,
+                    "reason": skip_reason,
+                })
+            continue
+
         LOGGER.info("Running stage: %s for episode %s", stage.value, episode_id)
 
         # Emit progress callback if configured

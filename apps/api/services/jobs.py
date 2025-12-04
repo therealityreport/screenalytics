@@ -832,6 +832,156 @@ class JobService:
             requested=requested,
         )
 
+    def start_episode_run_job(
+        self,
+        *,
+        ep_id: str,
+        video_path: Path | str,
+        device: str = "auto",
+        stride: int = 1,
+        det_thresh: float = 0.65,
+        cluster_thresh: float = 0.75,
+        save_crops: bool = False,
+        save_frames: bool = False,
+        reuse_detections: bool = False,
+        reuse_embeddings: bool = False,
+        profile: str | None = None,
+    ) -> JobRecord:
+        """Start an episode processing job using the engine.
+
+        This method runs the full episode pipeline (detect_track → faces_embed → cluster)
+        using the py_screenalytics.pipeline engine in a background thread.
+
+        Args:
+            ep_id: Episode identifier (e.g., "rhobh-s05e14")
+            video_path: Path to the source video file
+            device: Execution device (auto, cpu, cuda, coreml)
+            stride: Frame stride for detection
+            det_thresh: Detection confidence threshold
+            cluster_thresh: Clustering similarity threshold
+            save_crops: Save per-track face crops
+            save_frames: Save full frame JPGs
+            reuse_detections: Skip detect_track if artifacts exist
+            reuse_embeddings: Skip faces_embed if artifacts exist
+            profile: Optional performance profile override
+
+        Returns:
+            JobRecord with job metadata and job_id for polling
+        """
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        ensure_dirs(ep_id)
+
+        # Apply profile defaults if specified
+        if profile and profile in PROFILE_DEFAULTS:
+            profile_config = PROFILE_DEFAULTS[profile]
+            if stride == 1:  # Only override if not explicitly set
+                stride = profile_config.get("frame_stride", stride)
+
+        job_id = uuid.uuid4().hex
+        progress_path = self._progress_path(ep_id)
+
+        # Build the requested config for tracking
+        requested: Dict[str, Any] = {
+            "ep_id": ep_id,
+            "video_path": str(video_path),
+            "device": device,
+            "stride": stride,
+            "det_thresh": det_thresh,
+            "cluster_thresh": cluster_thresh,
+            "save_crops": save_crops,
+            "save_frames": save_frames,
+            "reuse_detections": reuse_detections,
+            "reuse_embeddings": reuse_embeddings,
+        }
+        if profile:
+            requested["profile"] = profile
+
+        record: JobRecord = {
+            "job_id": job_id,
+            "job_type": "episode_run",
+            "ep_id": ep_id,
+            "pid": None,  # No subprocess PID for engine-based jobs
+            "state": "running",
+            "started_at": self._now(),
+            "ended_at": None,
+            "progress_file": str(progress_path),
+            "stderr_log": None,
+            "command": None,  # Not a subprocess command
+            "requested": requested,
+            "summary": None,
+            "error": None,
+            "return_code": None,
+            "data_root": str(self.data_root),
+        }
+
+        with self._lock:
+            self._write_job(record)
+
+        # Run the engine in a background thread
+        def _run_engine() -> None:
+            try:
+                # Import the engine
+                from py_screenalytics.pipeline import run_episode, EpisodeRunConfig
+
+                # Build config from parameters
+                config = EpisodeRunConfig(
+                    device=device,
+                    stride=stride,
+                    det_thresh=det_thresh,
+                    cluster_thresh=cluster_thresh,
+                    save_crops=save_crops,
+                    save_frames=save_frames,
+                    reuse_detections=reuse_detections,
+                    reuse_embeddings=reuse_embeddings,
+                    data_root=self.data_root,
+                    progress_file=progress_path,
+                )
+
+                # Run the pipeline
+                result = run_episode(ep_id, video_path, config)
+
+                # Update job record with result
+                def _apply(rec: JobRecord) -> None:
+                    if rec.get("state") == "canceled":
+                        return
+                    rec["state"] = "succeeded" if result.success else "failed"
+                    rec["ended_at"] = self._now()
+                    rec["return_code"] = 0 if result.success else 1
+                    rec["summary"] = result.to_dict()
+                    if not result.success and result.error:
+                        rec["error"] = result.error
+
+                self._mutate_job(job_id, _apply)
+
+            except Exception as exc:
+                LOGGER.exception("Episode run job %s failed: %s", job_id, exc)
+
+                def _apply_error(rec: JobRecord) -> None:
+                    if rec.get("state") == "canceled":
+                        return
+                    rec["state"] = "failed"
+                    rec["ended_at"] = self._now()
+                    rec["return_code"] = -1
+                    rec["error"] = str(exc)
+
+                try:
+                    self._mutate_job(job_id, _apply_error)
+                except JobNotFoundError:
+                    pass
+
+        thread = threading.Thread(
+            target=_run_engine,
+            name=f"episode-run-{job_id}",
+            daemon=True,
+        )
+        thread.start()
+        self._monitors[job_id] = thread
+
+        return record
+
     def _monitor_process(self, job_id: str, proc: subprocess.Popen) -> None:
         error_msg: str | None = None
         try:
