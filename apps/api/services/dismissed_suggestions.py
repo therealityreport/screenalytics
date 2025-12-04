@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from apps.api.services import storage
+from py_screenalytics.artifacts import get_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,9 +24,9 @@ class DismissedSuggestionsService:
 
     def _get_dismissed_file_path(self, ep_id: str) -> Path:
         """Get the path to the dismissed suggestions file for an episode."""
-        # Store alongside identities.json in the episode's working directory
-        ep_path = storage.working_dir_for_ep(ep_id, create=True)
-        return ep_path / "dismissed_suggestions.json"
+        # Store alongside identities.json in the episode's manifests directory
+        manifests_dir = get_path(ep_id, "detections").parent
+        return manifests_dir / "dismissed_suggestions.json"
 
     def _load_dismissed(self, ep_id: str) -> Set[str]:
         """Load dismissed suggestions from disk."""
