@@ -354,3 +354,308 @@ export type EpisodeQuickStats = {
   singleton_after: number;
   screen_time_calculated: boolean;
 };
+
+// ============================================================================
+// Faces Review Page Types
+// ============================================================================
+
+// Similarity score types
+export type SimilarityType =
+  | "identity"    // How similar clusters are within an identity
+  | "cast"        // How similar to facebank reference
+  | "track"       // Frame-to-frame consistency within track
+  | "cluster"     // Cohesion of tracks in a cluster
+  | "temporal"    // Consistency across episode timeline
+  | "ambiguity"   // Gap between 1st and 2nd best match
+  | "isolation"   // Distance to nearest cluster
+  | "confidence"; // Assignment confidence trend
+
+// Quality score breakdown
+export type QualityBreakdown = {
+  detection: number;  // Detection confidence (0-1)
+  sharpness: number;  // Image sharpness (0-1)
+  area: number;       // Face area relative to frame (0-1)
+  score: number;      // Combined quality score (0-1)
+};
+
+// Cast member from facebank
+export type CastMember = {
+  cast_id: string;
+  name: string;
+  featured_thumbnail_url?: string;
+  cluster_count?: number;
+  track_count?: number;
+  face_count?: number;
+};
+
+// Cast suggestion for a cluster
+export type CastSuggestion = {
+  cast_id: string;
+  cast_name: string;
+  similarity: number;
+  rank: number;
+  thumbnail_url?: string;
+};
+
+// Identity/Cluster in the episode
+export type Identity = {
+  identity_id: string;
+  name?: string;
+  cast_id?: string;
+  cast_name?: string;
+  is_assigned: boolean;
+  track_count: number;
+  face_count: number;
+  thumbnail_url?: string;
+  cohesion?: number;
+  isolation?: number;
+  ambiguity?: number;
+  temporal_consistency?: number;
+  cast_similarity?: number;
+  cast_suggestions?: CastSuggestion[];
+};
+
+// Track within an identity/cluster
+export type Track = {
+  track_id: number;
+  identity_id: string;
+  frame_count: number;
+  face_count: number;
+  thumbnail_url?: string;
+  crop_url?: string;
+  start_frame?: number;
+  end_frame?: number;
+  similarity?: number;        // Track similarity (internal consistency)
+  person_cohesion?: number;   // How well track fits with other tracks
+  quality?: QualityBreakdown;
+  excluded_frames?: number;   // Frames excluded from centroid
+};
+
+// Frame within a track
+export type Frame = {
+  frame_idx: number;
+  face_idx: number;
+  crop_url: string;
+  thumbnail_url?: string;
+  quality?: QualityBreakdown;
+  similarity?: number;        // Similarity to track centroid
+  is_outlier?: boolean;
+  is_skipped?: boolean;
+  bbox?: [number, number, number, number];
+};
+
+// People response (cast members with clusters)
+export type PeopleResponse = {
+  people: Array<{
+    person_id: string;
+    name: string;
+    cast_id?: string;
+    cluster_ids: string[];
+    track_count: number;
+    face_count: number;
+    thumbnail_url?: string;
+    cohesion?: number;
+  }>;
+};
+
+// Identities response (all clusters in episode)
+export type IdentitiesResponse = {
+  identities: Identity[];
+  total_tracks: number;
+  total_faces: number;
+  assigned_count: number;
+  unassigned_count: number;
+};
+
+// Unlinked entities (needs assignment)
+export type UnlinkedEntitiesResponse = {
+  unassigned_clusters: Identity[];
+  auto_people: Array<{
+    person_id: string;
+    name?: string;
+    clusters: Identity[];
+  }>;
+  total_unassigned: number;
+};
+
+// Track representatives for a cluster
+export type ClusterTrackRepsResponse = {
+  cluster_id: string;
+  identity_id: string;
+  tracks: Track[];
+  total_tracks: number;
+  cohesion?: number;
+  isolation?: number;
+};
+
+// Cluster metrics
+export type ClusterMetrics = {
+  cluster_id: string;
+  cohesion: number;
+  isolation: number;
+  ambiguity: number;
+  temporal_consistency: number;
+  quality_avg: number;
+  track_count: number;
+  face_count: number;
+  min_similarity?: number;
+  max_similarity?: number;
+};
+
+// Track metrics
+export type TrackMetrics = {
+  track_id: number;
+  similarity: number;
+  person_cohesion: number;
+  quality: QualityBreakdown;
+  excluded_frames: number;
+  frame_count: number;
+};
+
+// Track frames response
+export type TrackFramesResponse = {
+  track_id: number;
+  frames: Frame[];
+  total_frames: number;
+  page: number;
+  page_size: number;
+  has_more: boolean;
+};
+
+// Cast suggestions response
+export type CastSuggestionsResponse = {
+  suggestions: Array<{
+    cluster_id: string;
+    identity_id: string;
+    cast_suggestions: CastSuggestion[];
+  }>;
+};
+
+// Assignment request
+export type AssignTrackRequest = {
+  name: string;
+  show?: string;
+  cast_id?: string;
+};
+
+// Bulk assign request
+export type BulkAssignRequest = {
+  track_ids: number[];
+  name: string;
+  show?: string;
+  cast_id?: string;
+};
+
+// Assignment response
+export type AssignmentResponse = {
+  success: boolean;
+  identity_id?: string;
+  split?: boolean;
+  message?: string;
+};
+
+// Bulk assignment response
+export type BulkAssignmentResponse = {
+  assigned: number;
+  failed: number;
+  identity_id?: string;
+  errors?: string[];
+};
+
+// Move frames request
+export type MoveFramesRequest = {
+  frame_ids: number[];
+  target_identity_id?: string;
+  new_identity_name?: string;
+  show_id?: string;
+};
+
+// Delete frames request
+export type DeleteFramesRequest = {
+  frame_ids: number[];
+  delete_assets?: boolean;
+};
+
+// Refresh similarity response
+export type RefreshSimilarityResponse = {
+  status: "success" | "error";
+  tracks_processed: number;
+  centroids_computed: number;
+  message?: string;
+};
+
+// Auto-link cast response
+export type AutoLinkCastResponse = {
+  auto_assigned: number;
+  assignments: Array<{
+    cluster_id: string;
+    cast_id: string;
+    cast_name: string;
+    similarity: number;
+  }>;
+};
+
+// Cleanup actions
+export type CleanupAction = "split_tracks" | "reembed" | "group_clusters";
+
+// Cleanup request
+export type CleanupRequest = {
+  actions: CleanupAction[];
+  protected_identity_ids?: string[];
+};
+
+// Cleanup preview response
+export type CleanupPreviewResponse = {
+  preview: {
+    total_clusters: number;
+    assigned_clusters: number;
+    unassigned_clusters: number;
+    manual_assignments_count: number;
+    potential_merges: number;
+    warning_level: "low" | "medium" | "high";
+    warnings: string[];
+  };
+};
+
+// Cleanup response
+export type CleanupResponse = {
+  summary: {
+    tracks_before: number;
+    tracks_after: number;
+    clusters_before: number;
+    clusters_after: number;
+    faces_after: number;
+  };
+};
+
+// Faces review view state
+export type FacesReviewView =
+  | "main"           // Cast Members + Unnamed Clusters
+  | "cast_member"    // Single cast member's clusters/tracks
+  | "cluster"        // Single cluster's tracks
+  | "track";         // Single track's frames
+
+// Faces review sort options
+export type IdentitySortOption =
+  | "name"
+  | "track_count"
+  | "face_count"
+  | "cohesion"
+  | "similarity";
+
+export type TrackSortOption =
+  | "track_id"
+  | "frame_count"
+  | "similarity"
+  | "quality"
+  | "start_frame";
+
+// Review progress stats
+export type ReviewProgress = {
+  total_clusters: number;
+  assigned_clusters: number;
+  unassigned_clusters: number;
+  total_tracks: number;
+  singleton_count: number;
+  percent_complete: number;
+};

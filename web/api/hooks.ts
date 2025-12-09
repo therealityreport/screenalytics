@@ -1,30 +1,56 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  assignTrack,
+  autoLinkCast,
+  bulkAssignTracks,
   bulkDeleteEpisodes,
   cancelJob,
+  createBackup,
+  createCastMember,
   createEpisode,
   createShow,
   deleteEpisode,
+  deleteFrames,
   eventsUrl,
   fetchAllRunningJobs,
   fetchArtifactStatus,
+  fetchBackups,
+  fetchCastSuggestions,
+  fetchCleanupPreview,
+  fetchClusterMetrics,
+  fetchClusterTrackReps,
   fetchEpisodeDetail,
   fetchEpisodeDetails,
+  fetchEpisodeIdentities,
   fetchEpisodeJobHistory,
   fetchEpisodes,
   fetchEpisodeStatus,
   fetchJobs,
+  fetchReviewProgress,
+  fetchRosterNames,
   fetchS3Videos,
+  fetchShowCast,
+  fetchShowPeople,
   fetchShows,
   fetchStorageConfig,
   fetchTimestampPreview,
+  fetchTrackDetail,
+  fetchTrackFrames,
+  fetchTrackMetrics,
+  fetchUnlinkedEntities,
   fetchVideoMeta,
   mapEventStream,
   mirrorEpisodeFromS3,
+  moveFrames,
   presignEpisodeAssets,
+  refreshSimilarity,
+  restoreBackup,
+  runCleanup,
+  saveAssignments,
+  saveIdentityName,
   setFeaturedThumbnail,
   triggerAudioPipeline,
   triggerCluster,
@@ -35,9 +61,22 @@ import {
 } from "./client";
 import type {
   ApiError,
+  AssignmentResponse,
+  AssignTrackRequest,
   AssetUploadResponse,
   AudioPipelineRequest,
+  AutoLinkCastResponse,
+  BulkAssignmentResponse,
+  BulkAssignRequest,
+  CastMember,
+  CastSuggestionsResponse,
+  CleanupAction,
+  CleanupPreviewResponse,
+  CleanupResponse,
   ClusterJobRequest,
+  ClusterMetrics,
+  ClusterTrackRepsResponse,
+  DeleteFramesRequest,
   DetectTrackJobRequest,
   EpisodeArtifactStatus,
   EpisodeCreateRequest,
@@ -48,13 +87,24 @@ import type {
   EpisodeStatus,
   EpisodeSummary,
   FacesJobRequest,
+  FacesReviewView,
+  IdentitiesResponse,
+  Identity,
   Job,
+  MoveFramesRequest,
+  PeopleResponse,
   PipelineSettings,
+  RefreshSimilarityResponse,
+  ReviewProgress,
   S3VideoItem,
   Show,
   ShowCreateRequest,
   StorageStatus,
   TimestampPreviewResponse,
+  Track,
+  TrackFramesResponse,
+  TrackMetrics,
+  UnlinkedEntitiesResponse,
   VideoMeta,
 } from "./types";
 import { DEFAULT_PIPELINE_SETTINGS } from "./types";
@@ -550,4 +600,557 @@ export function usePipelineSettings() {
   }, []);
 
   return { getSettings, saveSettings, resetSettings };
+}
+
+// ============================================================================
+// Faces Review Hooks
+// ============================================================================
+
+// Show cast members
+export function useShowCast(showSlug?: string, seasonLabel?: string) {
+  return useQuery<CastMember[], ApiError>({
+    queryKey: ["show-cast", showSlug, seasonLabel],
+    queryFn: () => fetchShowCast(showSlug!, seasonLabel),
+    enabled: !!showSlug,
+    staleTime: 15 * 1000, // 15 seconds (may be mutated by assignments)
+  });
+}
+
+// Show people (cast with clusters)
+export function useShowPeople(showSlug?: string) {
+  return useQuery<PeopleResponse, ApiError>({
+    queryKey: ["show-people", showSlug],
+    queryFn: () => fetchShowPeople(showSlug!),
+    enabled: !!showSlug,
+    staleTime: 15 * 1000,
+  });
+}
+
+// Episode identities (all clusters)
+export function useEpisodeIdentities(episodeId: string, options?: { enabled?: boolean }) {
+  return useQuery<IdentitiesResponse, ApiError>({
+    queryKey: ["episode-identities", episodeId],
+    queryFn: () => fetchEpisodeIdentities(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 15 * 1000,
+  });
+}
+
+// Unlinked entities (needs assignment)
+export function useUnlinkedEntities(episodeId: string, options?: { enabled?: boolean }) {
+  return useQuery<UnlinkedEntitiesResponse, ApiError>({
+    queryKey: ["unlinked-entities", episodeId],
+    queryFn: () => fetchUnlinkedEntities(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 15 * 1000,
+  });
+}
+
+// Cluster track representatives
+export function useClusterTrackReps(
+  episodeId: string,
+  clusterId?: string,
+  framesPerTrack: number = 0
+) {
+  return useQuery<ClusterTrackRepsResponse, ApiError>({
+    queryKey: ["cluster-track-reps", episodeId, clusterId, framesPerTrack],
+    queryFn: () => fetchClusterTrackReps(episodeId, clusterId!, framesPerTrack),
+    enabled: !!episodeId && !!clusterId,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Cluster metrics
+export function useClusterMetrics(episodeId: string, clusterId?: string) {
+  return useQuery<ClusterMetrics, ApiError>({
+    queryKey: ["cluster-metrics", episodeId, clusterId],
+    queryFn: () => fetchClusterMetrics(episodeId, clusterId!),
+    enabled: !!episodeId && !!clusterId,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Track detail
+export function useTrackDetail(episodeId: string, trackId?: number) {
+  return useQuery<Track, ApiError>({
+    queryKey: ["track-detail", episodeId, trackId],
+    queryFn: () => fetchTrackDetail(episodeId, trackId!),
+    enabled: !!episodeId && trackId !== undefined,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Track metrics
+export function useTrackMetrics(episodeId: string, trackId?: number) {
+  return useQuery<TrackMetrics, ApiError>({
+    queryKey: ["track-metrics", episodeId, trackId],
+    queryFn: () => fetchTrackMetrics(episodeId, trackId!),
+    enabled: !!episodeId && trackId !== undefined,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Track frames (paginated)
+export function useTrackFrames(
+  episodeId: string,
+  trackId?: number,
+  options?: {
+    page?: number;
+    pageSize?: number;
+    sample?: number;
+    includeSkipped?: boolean;
+    enabled?: boolean;
+  }
+) {
+  return useQuery<TrackFramesResponse, ApiError>({
+    queryKey: [
+      "track-frames",
+      episodeId,
+      trackId,
+      options?.page,
+      options?.pageSize,
+      options?.sample,
+      options?.includeSkipped,
+    ],
+    queryFn: () =>
+      fetchTrackFrames(episodeId, trackId!, {
+        page: options?.page,
+        pageSize: options?.pageSize,
+        sample: options?.sample,
+        includeSkipped: options?.includeSkipped,
+      }),
+    enabled: (options?.enabled ?? true) && !!episodeId && trackId !== undefined,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Cast suggestions
+export function useCastSuggestions(episodeId: string, options?: { enabled?: boolean }) {
+  return useQuery<CastSuggestionsResponse, ApiError>({
+    queryKey: ["cast-suggestions", episodeId],
+    queryFn: () => fetchCastSuggestions(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 30 * 1000,
+  });
+}
+
+// Review progress
+export function useReviewProgress(episodeId: string, options?: { enabled?: boolean }) {
+  return useQuery<ReviewProgress, ApiError>({
+    queryKey: ["review-progress", episodeId],
+    queryFn: () => fetchReviewProgress(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 15 * 1000,
+  });
+}
+
+// Roster names for autocomplete
+export function useRosterNames(showSlug?: string) {
+  return useQuery<string[], ApiError>({
+    queryKey: ["roster-names", showSlug],
+    queryFn: () => fetchRosterNames(showSlug!),
+    enabled: !!showSlug,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Cleanup preview
+export function useCleanupPreview(episodeId: string, options?: { enabled?: boolean }) {
+  return useQuery<CleanupPreviewResponse, ApiError>({
+    queryKey: ["cleanup-preview", episodeId],
+    queryFn: () => fetchCleanupPreview(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 30 * 1000,
+  });
+}
+
+// Backups list
+export function useBackups(episodeId: string, options?: { enabled?: boolean }) {
+  return useQuery<{ backups: Array<{ backup_id: string; created_at?: string }> }, ApiError>({
+    queryKey: ["backups", episodeId],
+    queryFn: () => fetchBackups(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 30 * 1000,
+  });
+}
+
+// Assign track mutation
+export function useAssignTrack() {
+  const client = useQueryClient();
+  return useMutation<
+    AssignmentResponse,
+    ApiError,
+    { episodeId: string; trackId: number; payload: AssignTrackRequest }
+  >({
+    mutationFn: ({ episodeId, trackId, payload }) => assignTrack(episodeId, trackId, payload),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["cast-suggestions", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["review-progress", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["show-people"] });
+    },
+  });
+}
+
+// Bulk assign tracks mutation
+export function useBulkAssignTracks() {
+  const client = useQueryClient();
+  return useMutation<
+    BulkAssignmentResponse,
+    ApiError,
+    { episodeId: string; payload: BulkAssignRequest }
+  >({
+    mutationFn: ({ episodeId, payload }) => bulkAssignTracks(episodeId, payload),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["cast-suggestions", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["review-progress", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["show-people"] });
+    },
+  });
+}
+
+// Save identity name mutation
+export function useSaveIdentityName() {
+  const client = useQueryClient();
+  return useMutation<
+    AssignmentResponse,
+    ApiError,
+    { episodeId: string; identityId: string; name: string; show?: string }
+  >({
+    mutationFn: ({ episodeId, identityId, name, show }) =>
+      saveIdentityName(episodeId, identityId, name, show),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["cast-suggestions", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["roster-names"] });
+    },
+  });
+}
+
+// Move frames mutation
+export function useMoveFrames() {
+  const client = useQueryClient();
+  return useMutation<
+    { moved: number; target_name?: string; target_identity_id?: string },
+    ApiError,
+    { episodeId: string; trackId: number; payload: MoveFramesRequest }
+  >({
+    mutationFn: ({ episodeId, trackId, payload }) => moveFrames(episodeId, trackId, payload),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["track-frames", variables.episodeId, variables.trackId] });
+      client.invalidateQueries({ queryKey: ["track-detail", variables.episodeId, variables.trackId] });
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+    },
+  });
+}
+
+// Delete frames mutation
+export function useDeleteFrames() {
+  const client = useQueryClient();
+  return useMutation<
+    { deleted: number },
+    ApiError,
+    { episodeId: string; trackId: number; payload: DeleteFramesRequest }
+  >({
+    mutationFn: ({ episodeId, trackId, payload }) => deleteFrames(episodeId, trackId, payload),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["track-frames", variables.episodeId, variables.trackId] });
+      client.invalidateQueries({ queryKey: ["track-detail", variables.episodeId, variables.trackId] });
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+    },
+  });
+}
+
+// Refresh similarity mutation
+export function useRefreshSimilarity() {
+  const client = useQueryClient();
+  return useMutation<RefreshSimilarityResponse, ApiError, string>({
+    mutationFn: refreshSimilarity,
+    onSuccess: (_data, episodeId) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", episodeId] });
+      client.invalidateQueries({ queryKey: ["cast-suggestions", episodeId] });
+      client.invalidateQueries({ queryKey: ["cluster-metrics"] });
+      client.invalidateQueries({ queryKey: ["track-metrics"] });
+    },
+  });
+}
+
+// Auto-link cast mutation
+export function useAutoLinkCast() {
+  const client = useQueryClient();
+  return useMutation<AutoLinkCastResponse, ApiError, string>({
+    mutationFn: autoLinkCast,
+    onSuccess: (_data, episodeId) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", episodeId] });
+      client.invalidateQueries({ queryKey: ["cast-suggestions", episodeId] });
+      client.invalidateQueries({ queryKey: ["review-progress", episodeId] });
+    },
+  });
+}
+
+// Run cleanup mutation
+export function useRunCleanup() {
+  const client = useQueryClient();
+  return useMutation<
+    CleanupResponse,
+    ApiError,
+    { episodeId: string; actions: CleanupAction[]; protectedIds?: string[] }
+  >({
+    mutationFn: ({ episodeId, actions, protectedIds }) =>
+      runCleanup(episodeId, { actions, protected_identity_ids: protectedIds }),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["cleanup-preview", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["backups", variables.episodeId] });
+    },
+  });
+}
+
+// Create backup mutation
+export function useCreateBackup() {
+  const client = useQueryClient();
+  return useMutation<{ backup_id: string }, ApiError, string>({
+    mutationFn: createBackup,
+    onSuccess: (_data, episodeId) => {
+      client.invalidateQueries({ queryKey: ["backups", episodeId] });
+    },
+  });
+}
+
+// Restore backup mutation
+export function useRestoreBackup() {
+  const client = useQueryClient();
+  return useMutation<
+    { files_restored: number },
+    ApiError,
+    { episodeId: string; backupId: string }
+  >({
+    mutationFn: ({ episodeId, backupId }) => restoreBackup(episodeId, backupId),
+    onSuccess: (_data, variables) => {
+      // Invalidate everything
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["cast-suggestions", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["cluster-metrics"] });
+      client.invalidateQueries({ queryKey: ["track-metrics"] });
+      client.invalidateQueries({ queryKey: ["review-progress", variables.episodeId] });
+    },
+  });
+}
+
+// Save assignments mutation
+export function useSaveAssignments() {
+  return useMutation<{ saved_count: number }, ApiError, string>({
+    mutationFn: saveAssignments,
+  });
+}
+
+// Create cast member mutation
+export function useCreateCastMember() {
+  const client = useQueryClient();
+  return useMutation<{ cast_id: string }, ApiError, { showSlug: string; name: string }>({
+    mutationFn: ({ showSlug, name }) => createCastMember(showSlug, name),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["show-cast", variables.showSlug] });
+      client.invalidateQueries({ queryKey: ["roster-names", variables.showSlug] });
+    },
+  });
+}
+
+// Faces Review view state (stored in URL and localStorage)
+const FACES_VIEW_KEY = "screenalytics_faces_view";
+
+export function useFacesReviewState(episodeId: string) {
+  const [view, setViewState] = useState<FacesReviewView>("main");
+  const [selectedCastId, setSelectedCastId] = useState<string | null>(null);
+  const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
+  const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  const [selectedFrameIds, setSelectedFrameIds] = useState<Set<number>>(new Set());
+
+  // Load state from localStorage on mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const stored = localStorage.getItem(`${FACES_VIEW_KEY}:${episodeId}`);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed.view) setViewState(parsed.view);
+        if (parsed.castId) setSelectedCastId(parsed.castId);
+        if (parsed.clusterId) setSelectedClusterId(parsed.clusterId);
+        if (parsed.trackId) setSelectedTrackId(parsed.trackId);
+      }
+    } catch {
+      // Ignore
+    }
+  }, [episodeId]);
+
+  // Save state to localStorage
+  const saveState = useCallback(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(
+      `${FACES_VIEW_KEY}:${episodeId}`,
+      JSON.stringify({
+        view,
+        castId: selectedCastId,
+        clusterId: selectedClusterId,
+        trackId: selectedTrackId,
+      })
+    );
+  }, [episodeId, view, selectedCastId, selectedClusterId, selectedTrackId]);
+
+  // Navigation helpers
+  const goToMain = useCallback(() => {
+    setViewState("main");
+    setSelectedCastId(null);
+    setSelectedClusterId(null);
+    setSelectedTrackId(null);
+    setSelectedFrameIds(new Set());
+  }, []);
+
+  const goToCastMember = useCallback((castId: string) => {
+    setViewState("cast_member");
+    setSelectedCastId(castId);
+    setSelectedClusterId(null);
+    setSelectedTrackId(null);
+    setSelectedFrameIds(new Set());
+  }, []);
+
+  const goToCluster = useCallback((clusterId: string) => {
+    setViewState("cluster");
+    setSelectedClusterId(clusterId);
+    setSelectedTrackId(null);
+    setSelectedFrameIds(new Set());
+  }, []);
+
+  const goToTrack = useCallback((trackId: number) => {
+    setViewState("track");
+    setSelectedTrackId(trackId);
+    setSelectedFrameIds(new Set());
+  }, []);
+
+  const goBack = useCallback(() => {
+    if (view === "track") {
+      setViewState("cluster");
+      setSelectedTrackId(null);
+      setSelectedFrameIds(new Set());
+    } else if (view === "cluster") {
+      if (selectedCastId) {
+        setViewState("cast_member");
+      } else {
+        setViewState("main");
+      }
+      setSelectedClusterId(null);
+    } else if (view === "cast_member") {
+      setViewState("main");
+      setSelectedCastId(null);
+    }
+  }, [view, selectedCastId]);
+
+  // Frame selection helpers
+  const toggleFrameSelection = useCallback((frameId: number) => {
+    setSelectedFrameIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(frameId)) {
+        next.delete(frameId);
+      } else {
+        next.add(frameId);
+      }
+      return next;
+    });
+  }, []);
+
+  const selectAllFrames = useCallback((frameIds: number[]) => {
+    setSelectedFrameIds(new Set(frameIds));
+  }, []);
+
+  const clearFrameSelection = useCallback(() => {
+    setSelectedFrameIds(new Set());
+  }, []);
+
+  // Save state when it changes
+  useEffect(() => {
+    saveState();
+  }, [saveState]);
+
+  return {
+    view,
+    selectedCastId,
+    selectedClusterId,
+    selectedTrackId,
+    selectedFrameIds,
+    goToMain,
+    goToCastMember,
+    goToCluster,
+    goToTrack,
+    goBack,
+    toggleFrameSelection,
+    selectAllFrames,
+    clearFrameSelection,
+  };
+}
+
+// Bulk track selection for assignments
+export function useBulkTrackSelection() {
+  const [selectedTracks, setSelectedTracks] = useState<Set<number>>(new Set());
+
+  const toggleTrack = useCallback((trackId: number) => {
+    setSelectedTracks((prev) => {
+      const next = new Set(prev);
+      if (next.has(trackId)) {
+        next.delete(trackId);
+      } else {
+        next.add(trackId);
+      }
+      return next;
+    });
+  }, []);
+
+  const selectAllTracks = useCallback((trackIds: number[]) => {
+    setSelectedTracks(new Set(trackIds));
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    setSelectedTracks(new Set());
+  }, []);
+
+  const isSelected = useCallback((trackId: number) => selectedTracks.has(trackId), [selectedTracks]);
+
+  return {
+    selectedTracks,
+    toggleTrack,
+    selectAllTracks,
+    clearSelection,
+    isSelected,
+    count: selectedTracks.size,
+  };
+}
+
+// Undo stack for tracking actions
+export function useUndoStack(episodeId: string) {
+  const [stack, setStack] = useState<Array<{ backup_id: string; action: string; timestamp: string }>>([]);
+  const restoreBackupMutation = useRestoreBackup();
+
+  const pushAction = useCallback((backupId: string, action: string) => {
+    setStack((prev) => [
+      { backup_id: backupId, action, timestamp: new Date().toISOString() },
+      ...prev.slice(0, 9), // Keep last 10
+    ]);
+  }, []);
+
+  const undo = useCallback(async () => {
+    if (stack.length === 0) return;
+    const [latest, ...rest] = stack;
+    await restoreBackupMutation.mutateAsync({ episodeId, backupId: latest.backup_id });
+    setStack(rest);
+  }, [stack, episodeId, restoreBackupMutation]);
+
+  const canUndo = stack.length > 0;
+
+  return { stack, pushAction, undo, canUndo, isUndoing: restoreBackupMutation.isPending };
 }

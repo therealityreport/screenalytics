@@ -1,8 +1,21 @@
 import type {
   ApiError,
   AssetUploadResponse,
+  AssignmentResponse,
+  AssignTrackRequest,
   AudioPipelineRequest,
+  AutoLinkCastResponse,
+  BulkAssignmentResponse,
+  BulkAssignRequest,
+  CastMember,
+  CastSuggestionsResponse,
+  CleanupPreviewResponse,
+  CleanupRequest,
+  CleanupResponse,
   ClusterJobRequest,
+  ClusterMetrics,
+  ClusterTrackRepsResponse,
+  DeleteFramesRequest,
   DetectTrackJobRequest,
   EpisodeArtifactStatus,
   EpisodeCreateRequest,
@@ -16,13 +29,22 @@ import type {
   EpisodePhase,
   EpisodeSummary,
   FacesJobRequest,
+  IdentitiesResponse,
   Job,
   JobsResponse,
+  MoveFramesRequest,
+  PeopleResponse,
+  RefreshSimilarityResponse,
+  ReviewProgress,
   S3VideosResponse,
   Show,
   ShowCreateRequest,
   StorageStatus,
   TimestampPreviewResponse,
+  Track,
+  TrackFramesResponse,
+  TrackMetrics,
+  UnlinkedEntitiesResponse,
   VideoMeta,
 } from "./types";
 
@@ -365,3 +387,314 @@ export async function fetchEpisodeQuickStats(
 }
 
 export { normalizeError };
+
+// ============================================================================
+// Faces Review API Functions
+// ============================================================================
+
+// Fetch cast members for a show
+export async function fetchShowCast(
+  showSlug: string,
+  seasonLabel?: string
+): Promise<CastMember[]> {
+  const params = new URLSearchParams({ include_featured: "1" });
+  if (seasonLabel) params.set("season", seasonLabel);
+  const response = await apiFetch<{ cast: CastMember[] }>(
+    `/shows/${showSlug}/cast?${params.toString()}`
+  );
+  return response.cast || [];
+}
+
+// Fetch people (cast members with their clusters) for a show
+export async function fetchShowPeople(showSlug: string): Promise<PeopleResponse> {
+  return apiFetch<PeopleResponse>(`/shows/${showSlug}/people`);
+}
+
+// Fetch identities (all clusters) for an episode
+export async function fetchEpisodeIdentities(
+  episodeId: string
+): Promise<IdentitiesResponse> {
+  return apiFetch<IdentitiesResponse>(`/episodes/${episodeId}/identities`);
+}
+
+// Fetch unlinked entities (needs assignment)
+export async function fetchUnlinkedEntities(
+  episodeId: string
+): Promise<UnlinkedEntitiesResponse> {
+  return apiFetch<UnlinkedEntitiesResponse>(`/episodes/${episodeId}/unlinked_entities`);
+}
+
+// Fetch track representatives for a cluster
+export async function fetchClusterTrackReps(
+  episodeId: string,
+  clusterId: string,
+  framesPerTrack: number = 0
+): Promise<ClusterTrackRepsResponse> {
+  const params = framesPerTrack > 0 ? `?frames_per_track=${framesPerTrack}` : "";
+  return apiFetch<ClusterTrackRepsResponse>(
+    `/episodes/${episodeId}/clusters/${clusterId}/track_reps${params}`
+  );
+}
+
+// Fetch cluster metrics
+export async function fetchClusterMetrics(
+  episodeId: string,
+  clusterId: string
+): Promise<ClusterMetrics> {
+  return apiFetch<ClusterMetrics>(
+    `/episodes/${episodeId}/clusters/${clusterId}/metrics`
+  );
+}
+
+// Fetch track detail
+export async function fetchTrackDetail(
+  episodeId: string,
+  trackId: number
+): Promise<Track> {
+  return apiFetch<Track>(`/episodes/${episodeId}/tracks/${trackId}`);
+}
+
+// Fetch track metrics
+export async function fetchTrackMetrics(
+  episodeId: string,
+  trackId: number
+): Promise<TrackMetrics> {
+  return apiFetch<TrackMetrics>(
+    `/episodes/${episodeId}/tracks/${trackId}/metrics`
+  );
+}
+
+// Fetch track frames (paginated)
+export async function fetchTrackFrames(
+  episodeId: string,
+  trackId: number,
+  options?: {
+    page?: number;
+    pageSize?: number;
+    sample?: number;
+    includeSkipped?: boolean;
+  }
+): Promise<TrackFramesResponse> {
+  const params = new URLSearchParams();
+  if (options?.page) params.set("page", String(options.page));
+  if (options?.pageSize) params.set("page_size", String(options.pageSize));
+  if (options?.sample) params.set("sample", String(options.sample));
+  if (options?.includeSkipped) params.set("include_skipped", "true");
+
+  const queryString = params.toString();
+  return apiFetch<TrackFramesResponse>(
+    `/episodes/${episodeId}/tracks/${trackId}/frames${queryString ? `?${queryString}` : ""}`
+  );
+}
+
+// Fetch cast suggestions for episode
+export async function fetchCastSuggestions(
+  episodeId: string
+): Promise<CastSuggestionsResponse> {
+  return apiFetch<CastSuggestionsResponse>(
+    `/episodes/${episodeId}/cast_suggestions`
+  );
+}
+
+// Assign track to a name/cast
+export async function assignTrack(
+  episodeId: string,
+  trackId: number,
+  payload: AssignTrackRequest
+): Promise<AssignmentResponse> {
+  return apiFetch<AssignmentResponse>(
+    `/episodes/${episodeId}/tracks/${trackId}/name`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+// Bulk assign tracks
+export async function bulkAssignTracks(
+  episodeId: string,
+  payload: BulkAssignRequest
+): Promise<BulkAssignmentResponse> {
+  return apiFetch<BulkAssignmentResponse>(
+    `/episodes/${episodeId}/tracks/bulk_assign`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+// Save identity name
+export async function saveIdentityName(
+  episodeId: string,
+  identityId: string,
+  name: string,
+  show?: string
+): Promise<AssignmentResponse> {
+  const payload: { name: string; show?: string } = { name };
+  if (show) payload.show = show;
+  return apiFetch<AssignmentResponse>(
+    `/episodes/${episodeId}/identities/${identityId}/name`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+// Move frames between tracks/identities
+export async function moveFrames(
+  episodeId: string,
+  trackId: number,
+  payload: MoveFramesRequest
+): Promise<{ moved: number; target_name?: string; target_identity_id?: string }> {
+  return apiFetch<{ moved: number; target_name?: string; target_identity_id?: string }>(
+    `/episodes/${episodeId}/tracks/${trackId}/frames/move`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+// Delete frames from a track
+export async function deleteFrames(
+  episodeId: string,
+  trackId: number,
+  payload: DeleteFramesRequest
+): Promise<{ deleted: number }> {
+  return apiFetch<{ deleted: number }>(
+    `/episodes/${episodeId}/tracks/${trackId}/frames`,
+    {
+      method: "DELETE",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+// Refresh similarity scores
+export async function refreshSimilarity(
+  episodeId: string
+): Promise<RefreshSimilarityResponse> {
+  return apiFetch<RefreshSimilarityResponse>(
+    `/episodes/${episodeId}/refresh_similarity`,
+    { method: "POST" }
+  );
+}
+
+// Auto-link clusters to cast
+export async function autoLinkCast(
+  episodeId: string
+): Promise<AutoLinkCastResponse> {
+  return apiFetch<AutoLinkCastResponse>(
+    `/episodes/${episodeId}/auto_link_cast`,
+    { method: "POST" }
+  );
+}
+
+// Get cleanup preview
+export async function fetchCleanupPreview(
+  episodeId: string
+): Promise<CleanupPreviewResponse> {
+  return apiFetch<CleanupPreviewResponse>(
+    `/episodes/${episodeId}/cleanup_preview`
+  );
+}
+
+// Run cleanup job
+export async function runCleanup(
+  episodeId: string,
+  payload: CleanupRequest
+): Promise<CleanupResponse> {
+  return apiFetch<CleanupResponse>(
+    `/jobs/episode_cleanup_async`,
+    {
+      method: "POST",
+      body: JSON.stringify({ ep_id: episodeId, ...payload }),
+    }
+  );
+}
+
+// Create backup before cleanup
+export async function createBackup(
+  episodeId: string
+): Promise<{ backup_id: string }> {
+  return apiFetch<{ backup_id: string }>(
+    `/episodes/${episodeId}/backup`,
+    { method: "POST" }
+  );
+}
+
+// Restore from backup
+export async function restoreBackup(
+  episodeId: string,
+  backupId: string
+): Promise<{ files_restored: number }> {
+  return apiFetch<{ files_restored: number }>(
+    `/episodes/${episodeId}/restore/${backupId}`,
+    { method: "POST" }
+  );
+}
+
+// List backups
+export async function fetchBackups(
+  episodeId: string
+): Promise<{ backups: Array<{ backup_id: string; created_at?: string }> }> {
+  return apiFetch<{ backups: Array<{ backup_id: string; created_at?: string }> }>(
+    `/episodes/${episodeId}/backups`
+  );
+}
+
+// Save assignments (persist to manifest)
+export async function saveAssignments(
+  episodeId: string
+): Promise<{ saved_count: number }> {
+  return apiFetch<{ saved_count: number }>(
+    `/episodes/${episodeId}/save_assignments`,
+    { method: "POST" }
+  );
+}
+
+// Fetch review progress stats
+export async function fetchReviewProgress(
+  episodeId: string
+): Promise<ReviewProgress> {
+  // Derive from identities endpoint
+  const identities = await fetchEpisodeIdentities(episodeId);
+  const assignedCount = identities.identities.filter(i => i.is_assigned).length;
+  const unassignedCount = identities.identities.filter(i => !i.is_assigned).length;
+  const singletonCount = identities.identities.filter(i => i.track_count === 1).length;
+  const total = identities.identities.length;
+
+  return {
+    total_clusters: total,
+    assigned_clusters: assignedCount,
+    unassigned_clusters: unassignedCount,
+    total_tracks: identities.total_tracks,
+    singleton_count: singletonCount,
+    percent_complete: total > 0 ? (assignedCount / total) * 100 : 0,
+  };
+}
+
+// Fetch roster names for autocomplete
+export async function fetchRosterNames(showSlug: string): Promise<string[]> {
+  const response = await apiFetch<{ names: string[] }>(
+    `/shows/${showSlug}/cast_names`
+  );
+  return response.names || [];
+}
+
+// Create new cast member
+export async function createCastMember(
+  showSlug: string,
+  name: string
+): Promise<{ cast_id: string }> {
+  return apiFetch<{ cast_id: string }>(
+    `/shows/${showSlug}/cast`,
+    {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }
+  );
+}
