@@ -4005,6 +4005,8 @@ def _render_people_view(
         return
 
     # Include legacy cast/person pairs (absent from cast.json) when they have clusters
+    # Build lookup for cast entries by cast_id to get featured_thumbnail_url
+    cast_entry_by_id = {e.get("cast_id"): e for e in raw_cast_entries if e.get("cast_id")}
     seen_cast_ids = {card.get("cast", {}).get("cast_id") for card in cast_gallery_cards}
     for person in people:
         cast_id = person.get("cast_id")
@@ -4015,8 +4017,13 @@ def _render_people_view(
         episode_clusters = _episode_cluster_ids(person, ep_id)
         if not episode_clusters:
             continue
-        # Use rep_crop if available, otherwise find best quality crop from tracks
-        featured_thumb = person.get("rep_crop")
+        # Try to get featured_thumbnail_url from cast API first, then rep_crop, then episode crops
+        cast_entry_match = cast_entry_by_id.get(cast_id)
+        featured_thumb = None
+        if cast_entry_match:
+            featured_thumb = cast_entry_match.get("featured_thumbnail_url")
+        if not featured_thumb:
+            featured_thumb = person.get("rep_crop")
         if not featured_thumb:
             featured_thumb = _get_best_crop_from_clusters(ep_id, episode_clusters)
         cast_gallery_cards.append(
