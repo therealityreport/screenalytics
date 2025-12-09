@@ -23,6 +23,10 @@ import {
   useSaveAssignments,
   useMoveFrames,
   useDeleteFrames,
+  useCleanupPreview,
+  useRunCleanup,
+  useBackups,
+  useRestoreBackup,
 } from "@/api/hooks";
 import type {
   Identity,
@@ -30,6 +34,7 @@ import type {
   Frame,
   CastSuggestion,
   FacesReviewView,
+  CleanupAction,
 } from "@/api/types";
 import styles from "./faces-review.module.css";
 
@@ -408,6 +413,238 @@ function QuickAssignModal({
             disabled={isAssigning || (!selectedRoster && !customName.trim())}
           >
             {isAssigning ? "Assigning..." : "Assign"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// Cluster Cleanup Panel component
+function ClusterCleanupPanel({
+  episodeId,
+  isOpen,
+  onClose,
+}: {
+  episodeId: string;
+  isOpen: boolean;
+  onClose: () => void;
+}) {
+  const [selectedActions, setSelectedActions] = useState<Set<CleanupAction>>(
+    new Set(["split_tracks", "reembed", "group_clusters"])
+  );
+  const [preset, setPreset] = useState<"quick" | "standard">("standard");
+
+  const previewQuery = useCleanupPreview(episodeId, { enabled: isOpen });
+  const backupsQuery = useBackups(episodeId, { enabled: isOpen });
+  const runCleanup = useRunCleanup();
+  const restoreBackup = useRestoreBackup();
+
+  // Apply preset
+  const applyPreset = (newPreset: "quick" | "standard") => {
+    setPreset(newPreset);
+    if (newPreset === "quick") {
+      setSelectedActions(new Set(["split_tracks"]));
+    } else {
+      setSelectedActions(new Set(["split_tracks", "reembed", "group_clusters"]));
+    }
+  };
+
+  const toggleAction = (action: CleanupAction) => {
+    setSelectedActions((prev) => {
+      const next = new Set(prev);
+      if (next.has(action)) {
+        next.delete(action);
+      } else {
+        next.add(action);
+      }
+      return next;
+    });
+  };
+
+  const handleRunCleanup = async () => {
+    if (selectedActions.size === 0) return;
+    await runCleanup.mutateAsync({
+      episodeId,
+      actions: Array.from(selectedActions),
+    });
+    onClose();
+  };
+
+  const handleRestoreBackup = async () => {
+    const backups = backupsQuery.data?.backups || [];
+    if (backups.length === 0) return;
+    const latest = backups[0];
+    if (!confirm("Restore to the last backup? This will undo recent changes.")) return;
+    await restoreBackup.mutateAsync({ episodeId, backupId: latest.backup_id });
+  };
+
+  if (!isOpen) return null;
+
+  const preview = previewQuery.data?.preview;
+  const backups = backupsQuery.data?.backups || [];
+
+  // Estimated time calculation
+  const timeMap: Record<CleanupAction, number> = {
+    split_tracks: 30,
+    reembed: 90,
+    group_clusters: 60,
+  };
+  const totalSeconds = Array.from(selectedActions).reduce(
+    (sum, action) => sum + (timeMap[action] || 0),
+    0
+  );
+  const estTimeStr =
+    totalSeconds >= 60
+      ? `~${Math.floor(totalSeconds / 60)}min ${totalSeconds % 60 ? `${totalSeconds % 60}s` : ""}`
+      : `~${totalSeconds}s`;
+
+  const cleanupActions: Array<{
+    key: CleanupAction;
+    label: string;
+    help: string;
+    risk: "low" | "medium";
+    estTime: string;
+  }> = [
+    {
+      key: "split_tracks",
+      label: "Fix tracking issues",
+      help: "Splits tracks with multiple identities. Low risk - usually beneficial.",
+      risk: "low",
+      estTime: "~30s",
+    },
+    {
+      key: "reembed",
+      label: "Regenerate embeddings",
+      help: "Recalculates face embeddings for unassigned clusters. Low risk.",
+      risk: "low",
+      estTime: "~1-2min",
+    },
+    {
+      key: "group_clusters",
+      label: "Auto-group clusters",
+      help: "Groups similar unassigned clusters into draft people.",
+      risk: "medium",
+      estTime: "~1min",
+    },
+  ];
+
+  return (
+    <>
+      <div className={styles.modalOverlay} onClick={onClose} />
+      <div className={styles.cleanupPanel}>
+        <div className={styles.modalHeader}>
+          <div className={styles.modalTitle}>🧹 Cluster Cleanup</div>
+          <button className={styles.modalClose} onClick={onClose}>×</button>
+        </div>
+        <div className={styles.modalBody}>
+          <div className={styles.cleanupInfo}>
+            Cleanup focuses on <strong>unassigned clusters only</strong>. It fixes noisy tracks,
+            regenerates embeddings, and regroups without touching named cast links.
+          </div>
+
+          {/* Preview stats */}
+          {preview && (
+            <div className={styles.cleanupPreview}>
+              {preview.warning_level === "high" && (
+                <div className={styles.cleanupWarningHigh}>⚠️ High Impact Warning</div>
+              )}
+              {preview.warning_level === "medium" && (
+                <div className={styles.cleanupWarningMedium}>⚡ Medium Impact</div>
+              )}
+              <div className={styles.cleanupStats}>
+                <span>📊 {preview.total_clusters} clusters</span>
+                <span>✅ {preview.assigned_clusters} assigned</span>
+                <span>❓ {preview.unassigned_clusters} unassigned</span>
+              </div>
+              {preview.manual_assignments_count > 0 && (
+                <div className={styles.cleanupProtected}>
+                  🔒 {preview.manual_assignments_count} manually assigned cluster(s) protected
+                </div>
+              )}
+              {preview.potential_merges > 0 && (
+                <div className={styles.cleanupMerges}>
+                  🔄 {preview.potential_merges} potential merge(s)
+                </div>
+              )}
+              {preview.warnings.map((warning, i) => (
+                <div key={i} className={styles.cleanupWarningText}>{warning}</div>
+              ))}
+            </div>
+          )}
+
+          {/* Quick presets */}
+          <div className={styles.cleanupPresets}>
+            <div className={styles.inputLabel}>Quick Presets</div>
+            <div className={styles.presetButtons}>
+              <button
+                className={`${styles.presetBtn} ${preset === "quick" ? styles.presetBtnActive : ""}`}
+                onClick={() => applyPreset("quick")}
+              >
+                🚀 Quick Fix
+              </button>
+              <button
+                className={`${styles.presetBtn} ${preset === "standard" ? styles.presetBtnActive : ""}`}
+                onClick={() => applyPreset("standard")}
+              >
+                ⚡ Standard
+              </button>
+            </div>
+          </div>
+
+          {/* Action checkboxes */}
+          <div className={styles.cleanupActions}>
+            <div className={styles.inputLabel}>Select Actions</div>
+            {cleanupActions.map((action) => (
+              <label key={action.key} className={styles.cleanupActionItem}>
+                <input
+                  type="checkbox"
+                  checked={selectedActions.has(action.key)}
+                  onChange={() => toggleAction(action.key)}
+                />
+                <div className={styles.cleanupActionInfo}>
+                  <div className={styles.cleanupActionLabel}>
+                    {action.label}
+                    {action.risk === "medium" && <span className={styles.riskBadgeMedium}>⚡</span>}
+                    <span className={styles.estTime}>{action.estTime}</span>
+                  </div>
+                  <div className={styles.cleanupActionHelp}>{action.help}</div>
+                </div>
+              </label>
+            ))}
+          </div>
+
+          {/* Estimated time */}
+          {selectedActions.size > 0 && (
+            <div className={styles.cleanupEstTime}>
+              ⏱️ Estimated total: {estTimeStr}
+            </div>
+          )}
+
+          {/* Backup info */}
+          {backups.length > 0 && (
+            <div className={styles.cleanupBackup}>
+              <span>💾 Last backup: {backups[0].backup_id.slice(-20)}</span>
+              <button
+                className={styles.cleanupRestoreBtn}
+                onClick={handleRestoreBackup}
+                disabled={restoreBackup.isPending}
+              >
+                {restoreBackup.isPending ? "Restoring..." : "↩️ Undo Last"}
+              </button>
+            </div>
+          )}
+        </div>
+        <div className={styles.modalFooter}>
+          <button className={`${styles.btn} ${styles.btnSecondary}`} onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className={`${styles.btn} ${styles.btnPrimary}`}
+            onClick={handleRunCleanup}
+            disabled={runCleanup.isPending || selectedActions.size === 0}
+          >
+            {runCleanup.isPending ? "Running Cleanup..." : "Run Cleanup"}
           </button>
         </div>
       </div>
@@ -875,6 +1112,9 @@ export default function FacesReviewPage({
   // Undo stack
   const undoStack = useUndoStack(episodeId);
 
+  // Cleanup panel state
+  const [showCleanupPanel, setShowCleanupPanel] = useState(false);
+
   const details = detailsQuery.data;
   const showSlug = details?.show_slug;
   const progress = progressQuery.data;
@@ -976,6 +1216,12 @@ export default function FacesReviewPage({
         >
           {saveAssignments.isPending ? "Saving..." : "💾 Save Progress"}
         </button>
+        <button
+          className={styles.actionBtn}
+          onClick={() => setShowCleanupPanel(true)}
+        >
+          🧹 Cluster Cleanup
+        </button>
         {undoStack.canUndo && (
           <button
             className={styles.actionBtn}
@@ -1032,6 +1278,13 @@ export default function FacesReviewPage({
           onBack={viewState.goBack}
         />
       )}
+
+      {/* Cluster Cleanup Panel */}
+      <ClusterCleanupPanel
+        episodeId={episodeId}
+        isOpen={showCleanupPanel}
+        onClose={() => setShowCleanupPanel(false)}
+      />
     </div>
   );
 }

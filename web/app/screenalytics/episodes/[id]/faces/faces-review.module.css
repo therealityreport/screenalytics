@@ -1067,3 +1067,217 @@
     flex-shrink: 0;
   }
 }
+
+/* ============================================================================
+   Cluster Cleanup Panel Styles
+   ============================================================================ */
+
+.cleanupPanel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+  width: 90%;
+  max-width: 520px;
+  max-height: 85vh;
+  overflow-y: auto;
+  z-index: 1001;
+}
+
+.cleanupInfo {
+  background: #f0f9ff;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #0369a1;
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.cleanupPreview {
+  background: #f8fafc;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.cleanupStats {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #475569;
+  margin-bottom: 8px;
+}
+
+.cleanupProtected {
+  font-size: 12px;
+  color: #059669;
+  margin-top: 8px;
+}
+
+.cleanupMerges {
+  font-size: 12px;
+  color: #7c3aed;
+  margin-top: 4px;
+}
+
+.cleanupWarningHigh {
+  background: #fef2f2;
+  color: #b91c1c;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.cleanupWarningMedium {
+  background: #fef3c7;
+  color: #b45309;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.cleanupWarningText {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 4px;
+}
+
+.cleanupPresets {
+  margin-bottom: 16px;
+}
+
+.presetButtons {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.presetBtn {
+  flex: 1;
+  padding: 10px 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.presetBtn:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.presetBtnActive {
+  background: #f0f9ff;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+}
+
+.cleanupActions {
+  margin-bottom: 16px;
+}
+
+.cleanupActionItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-top: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.cleanupActionItem:hover {
+  background: #f8fafc;
+}
+
+.cleanupActionItem input[type="checkbox"] {
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  accent-color: #3b82f6;
+}
+
+.cleanupActionInfo {
+  flex: 1;
+}
+
+.cleanupActionLabel {
+  font-size: 14px;
+  font-weight: 500;
+  color: #1e293b;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cleanupActionHelp {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.riskBadgeMedium {
+  background: #fef3c7;
+  color: #b45309;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.estTime {
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 400;
+}
+
+.cleanupEstTime {
+  font-size: 13px;
+  color: #64748b;
+  margin-bottom: 16px;
+}
+
+.cleanupBackup {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #f8fafc;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #64748b;
+}
+
+.cleanupRestoreBtn {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.cleanupRestoreBtn:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.cleanupRestoreBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
