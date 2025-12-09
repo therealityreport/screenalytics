@@ -1,11 +1,18 @@
 import type {
   ApiError,
   AssetUploadResponse,
+  AudioPipelineRequest,
   EpisodeCreateRequest,
   EpisodeCreateResponse,
+  EpisodeDetail,
   EpisodeEvent,
   EpisodeStatus,
   EpisodePhase,
+  Job,
+  JobsResponse,
+  S3VideosResponse,
+  Show,
+  ShowCreateRequest,
 } from "./types";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/$/, "");
@@ -112,6 +119,81 @@ export function mapEventStream(event: MessageEvent<string>): EpisodeEvent | null
     console.warn("Failed to parse event", err);
     return null;
   }
+}
+
+// Shows API
+export async function fetchShows(): Promise<Show[]> {
+  const response = await apiFetch<{ shows: Show[] } | Show[]>("/shows");
+  return Array.isArray(response) ? response : response.shows || [];
+}
+
+export async function createShow(payload: ShowCreateRequest): Promise<Show> {
+  return apiFetch<Show>("/shows", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// S3 Videos API
+export async function fetchS3Videos(): Promise<S3VideosResponse> {
+  return apiFetch<S3VideosResponse>("/episodes/s3_videos");
+}
+
+// Jobs API
+export async function fetchJobs(episodeId?: string): Promise<Job[]> {
+  const path = episodeId ? `/jobs?ep_id=${episodeId}` : "/jobs";
+  const response = await apiFetch<JobsResponse | Job[]>(path);
+  return Array.isArray(response) ? response : response.jobs || [];
+}
+
+export async function fetchAllRunningJobs(): Promise<Job[]> {
+  const response = await apiFetch<JobsResponse | Job[]>("/jobs?state=running");
+  return Array.isArray(response) ? response : response.jobs || [];
+}
+
+export async function fetchJobProgress(jobId: string): Promise<Job> {
+  return apiFetch<Job>(`/jobs/${jobId}/progress`);
+}
+
+export async function cancelJob(jobId: string): Promise<void> {
+  await apiFetch<void>(`/jobs/${jobId}/cancel`, { method: "POST" });
+}
+
+// Episode Detail API
+export async function fetchEpisodeDetail(episodeId: string): Promise<EpisodeDetail> {
+  return apiFetch<EpisodeDetail>(`/episodes/${episodeId}`);
+}
+
+export async function deleteEpisode(episodeId: string): Promise<void> {
+  await apiFetch<void>(`/episodes/${episodeId}`, { method: "DELETE" });
+}
+
+// Mirror from S3
+export async function mirrorEpisodeFromS3(episodeId: string): Promise<{ local_video_path: string; bytes?: number }> {
+  return apiFetch<{ local_video_path: string; bytes?: number }>(`/episodes/${episodeId}/mirror`, {
+    method: "POST",
+  });
+}
+
+// Audio Pipeline
+export async function triggerAudioPipeline(payload: AudioPipelineRequest): Promise<JobTriggerResponse> {
+  return apiFetch<JobTriggerResponse>("/jobs/episode_audio_pipeline", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// Upsert episode by ID (for S3 browser "create in store" action)
+export async function upsertEpisodeById(payload: {
+  ep_id: string;
+  show_slug: string;
+  season: number;
+  episode: number;
+}): Promise<{ ep_id: string; created: boolean }> {
+  return apiFetch<{ ep_id: string; created: boolean }>("/episodes/upsert_by_id", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 export { normalizeError };

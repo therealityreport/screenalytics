@@ -801,6 +801,17 @@ if submit:
     flash_lines.append(f"Video -> {helpers.link_local(artifacts['video'])}")
     flash_lines.append("Go to Episode Detail to run detect/track processing.")
 
+    # Validate video codec support (H.264/H.265)
+    if video_meta:
+        codec = video_meta.get("codec") or video_meta.get("video_codec", "")
+        codec_lower = codec.lower() if codec else ""
+        supported_codecs = ["h264", "h.264", "avc", "h265", "h.265", "hevc", "vp9"]
+        if codec_lower and not any(supported in codec_lower for supported in supported_codecs):
+            st.warning(
+                f"Video codec '{codec}' may not be fully supported. "
+                "Recommended codecs: H.264 (AVC), H.265 (HEVC), VP9."
+            )
+
     # Trigger audio pipeline if requested
     if run_audio_after_upload:
         try:
@@ -1009,5 +1020,14 @@ else:
     st.info("No S3 videos found (or API error).")
 
 if jobs_running:
-    time.sleep(0.5)
+    # Use exponential backoff for polling to reduce API load
+    # Track consecutive polls in session state
+    poll_count = st.session_state.get("_upload_poll_count", 0) + 1
+    st.session_state["_upload_poll_count"] = poll_count
+    # Backoff: 0.5s, 1s, 1.5s, 2s (max)
+    sleep_time = min(0.5 + (poll_count * 0.25), 2.0)
+    time.sleep(sleep_time)
     st.rerun()
+else:
+    # Reset poll count when no jobs are running
+    st.session_state.pop("_upload_poll_count", None)

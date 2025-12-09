@@ -2,7 +2,94 @@
 
 > **Goal:** Migrate the Streamlit UI to a standalone Next.js web application that runs async without requiring VS Code to be open.
 
-## Current State Summary
+**Last Updated:** 2025-12-09
+
+---
+
+## Why Migrate? Streamlit Limitations vs. React/Next.js Capabilities
+
+### Current Streamlit Pain Points
+
+| Limitation | Impact | How React/Next.js Solves It |
+|------------|--------|----------------------------|
+| **Full-page reruns** | Every interaction re-runs the entire script (~6400 lines in Faces Review). Slow, state resets. | Component-level state + React Query caching. Only changed components re-render. |
+| **No true routing** | URL params are fragile; deep-linking is hacky | Next.js App Router with proper URLs, back/forward navigation, bookmarkable views |
+| **Widget key collisions** | Cryptic duplicate widget key errors | React keys are natural; no global namespace pollution |
+| **Session state fragility** | State lost on refresh, tab switching, or server restart | React Query persistence, localStorage, URL state |
+| **Single-threaded rendering** | Can't parallelize UI work | React concurrent rendering, Suspense boundaries |
+| **No real-time without polling** | Expensive `time.sleep()` loops | Native SSE/WebSocket support, React Query subscriptions |
+| **No offline capability** | Requires active server connection | Service workers, optimistic updates, offline-first patterns |
+| **Limited mobile UX** | Touch interactions are clunky | Responsive CSS, touch events, gesture support |
+| **No keyboard shortcuts** | Limited hotkey support | Full keyboard event handling, accessibility |
+| **No virtualization** | Loads all thumbnails at once (OOM risk) | react-window/TanStack Virtual for 1000s of items |
+
+### What You'll Be Able to Do After Migration
+
+#### 1. **Real-time Collaboration & Multi-Device Access**
+- Open Faces Review on your phone while processing runs on desktop
+- Share episode URLs with collaborators
+- Work from any browser without VS Code running
+- Multiple tabs without state conflicts
+
+#### 2. **Dramatically Faster Faces Review**
+- **Virtualized grid**: Render 10,000+ faces smoothly (currently crashes Streamlit)
+- **Instant view switching**: Cast → Cluster → Frames with no reload
+- **Optimistic mutations**: Merge clusters instantly, sync in background
+- **Prefetching**: Preload adjacent clusters while you review current one
+
+#### 3. **True Keyboard-First Workflow**
+- `J/K` or arrows to navigate grid
+- `Space` to select, `Shift+Space` for range select
+- `M` to merge selected clusters
+- `A` to assign to cast
+- `Cmd+Z` to undo
+- `/` to search/filter
+- Tab through views without mouse
+
+#### 4. **Advanced Selection & Batch Operations**
+- Multi-select with `Shift+Click` range, `Cmd+Click` toggle
+- Drag-select lasso tool
+- Select all in current filter
+- Batch operations with preview before commit
+
+#### 5. **Rich Visual Timeline**
+- Scrubbing timeline showing when faces appear in episode
+- Click timeline to jump to that frame
+- Visual gaps showing track dropout
+- Side-by-side track comparison
+
+#### 6. **Offline-First Resilience**
+- Queue operations when offline
+- Sync when reconnected
+- Never lose work to network blips
+
+#### 7. **Custom Dashboards & Layouts**
+- Resizable panels (like VS Code)
+- Save layout preferences
+- Drag/drop column reordering
+- Hide/show metric badges per preference
+
+#### 8. **Better Error Recovery**
+- Errors don't crash the whole UI
+- Error boundaries catch failures per component
+- Retry buttons on failed requests
+- Detailed error messages with context
+
+#### 9. **Progressive Enhancement**
+- Basic functionality works on slow connections
+- Images lazy-load with blur placeholders
+- Skeleton loaders instead of spinners
+- Background sync for heavy operations
+
+#### 10. **Integration-Ready**
+- Embed analytics widgets elsewhere
+- API for external tools
+- Webhook triggers
+- Slack/Discord notifications
+
+---
+
+## Current State Summary (Dec 2025)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -11,24 +98,29 @@
 | **API Client** | Solid foundation | `apiFetch`, error normalization, types |
 | **Upload Page** | 80% complete | Needs S3 browser, audio pipeline trigger |
 | **Episode Detail** | 40% complete | Missing job history, audio, cluster UI |
-| **Faces Review** | Stub only | Full implementation needed |
+| **Faces Review** | Stub only | Full implementation needed (6400 lines to port) |
 | **Voices Review** | Not started | New page |
 | **Cast Management** | Not started | New page |
+| **Screen Time Dashboard** | Not started | Charts, export, comparisons |
 
-## Migration Priority Order
+## Revised Migration Priority Order
 
-1. **Upload + Episode Detail** - Harden existing pages
-2. **Faces Review** - Most critical UI (clustering, cast assignment)
-3. **Voices Review** - Audio pipeline UI
-4. **Cast Management** - Facebank seeds, identity prototypes
+1. **Phase 1: Foundation** - Harden Upload + Episode Detail + Episodes List
+2. **Phase 2: Faces Review** - Most critical (virtualized grid, keyboard nav, batch ops)
+3. **Phase 3: Screen Time** - Charts and export (high business value)
+4. **Phase 4: Cast Management** - Facebank seeds, identity prototypes
+5. **Phase 5: Voices Review** - Audio pipeline UI (lower priority)
 
 ## Architecture Decisions
 
 - **Extend existing Next.js app** in `web/` (not a new app)
 - **All pages under** `/screenalytics/*`
-- **Real-time:** SSE only (no WebSockets)
+- **Real-time:** SSE only (no WebSockets) initially; WebSocket upgrade optional
 - **Deployment:** Vercel (frontend), existing server (FastAPI + Celery)
 - **Branch strategy:** `feature/web-app/<feature-name>`
+- **Component library:** Radix UI primitives + custom CSS modules
+- **State management:** React Query for server state, Zustand for UI state
+- **Virtualization:** TanStack Virtual for large grids
 
 ---
 
@@ -420,8 +512,163 @@ Located in `web/mocks/handlers.ts` - already mocks:
 
 ---
 
+---
+
+## Phase 3: Screen Time Dashboard (NEW)
+
+**Branch:** `feature/web-app/screen-time`
+
+### 3.1 File Structure
+
+```
+web/app/screenalytics/screentime/
+├── page.tsx                      # Main dashboard
+├── [episodeId]/page.tsx          # Episode-specific view
+├── components/
+│   ├── ScreenTimeChart.tsx       # Bar/line chart for cast
+│   ├── CastRanking.tsx           # Ranked list with percentages
+│   ├── TimelineHeatmap.tsx       # Episode timeline heatmap
+│   ├── ComparisonView.tsx        # Compare across episodes
+│   ├── ExportPanel.tsx           # CSV/JSON export
+│   └── FilterBar.tsx             # Date range, show, season filters
+└── hooks/
+    ├── useScreenTime.ts
+    ├── useShowStats.ts
+    └── useExport.ts
+```
+
+### 3.2 Features
+
+- [ ] Episode screen time breakdown (bar chart per cast member)
+- [ ] Season aggregation (total minutes per cast across episodes)
+- [ ] Timeline heatmap (when each person appears)
+- [ ] Export to CSV/JSON for external analysis
+- [ ] Compare episodes side-by-side
+- [ ] Filter by show, season, date range
+- [ ] Percentage vs absolute time toggle
+- [ ] Chart annotations for key moments
+
+### 3.3 API Endpoints
+
+```typescript
+useEpisodeScreenTime(episodeId)     // GET /episodes/{ep_id}/screentime
+useShowScreenTime(showId, season?)  // GET /shows/{show_id}/screentime
+useExportScreenTime()               // GET /episodes/{ep_id}/screentime/export
+```
+
+### 3.4 Charts Library
+
+Recommend: **Recharts** (lightweight, React-native) or **Nivo** (more features)
+
+---
+
+## Revised TODO Checklist
+
+### Phase 1: Foundation (Weeks 1-2)
+- [ ] **Upload Page**
+  - [ ] S3 video browser with show/season filter
+  - [ ] Audio pipeline trigger checkbox
+  - [ ] ASR provider selection (Whisper/Gemini)
+  - [ ] Upload speed display + ETA
+  - [ ] Job cancellation support
+- [ ] **Episodes List Page** (NEW)
+  - [ ] Paginated list with search
+  - [ ] Show/season grouping
+  - [ ] Status badges (processed, pending, error)
+  - [ ] Quick actions (delete, reprocess)
+- [ ] **Episode Detail Page**
+  - [ ] Job history panel with all phases
+  - [ ] Progress bars for running jobs
+  - [ ] Video metadata display
+  - [ ] Navigation to Faces Review
+
+### Phase 2: Faces Review (Weeks 3-5)
+- [ ] **Core Grid**
+  - [ ] TanStack Virtual grid (10k+ faces)
+  - [ ] Thumbnail lazy loading with blurhash
+  - [ ] Similarity badge component (7 types)
+  - [ ] Quality indicator component
+- [ ] **View Modes** (6 views)
+  - [ ] Cast Members list
+  - [ ] Person (auto-generated) view
+  - [ ] Cast Tracks view
+  - [ ] Cluster view
+  - [ ] Frames view (track deep-dive)
+  - [ ] Smart Suggestions batch panel
+- [ ] **Interactions**
+  - [ ] Keyboard navigation (J/K, Space, M, A, D)
+  - [ ] Multi-select (Shift+Click, Cmd+Click)
+  - [ ] Merge clusters modal with preview
+  - [ ] Assign to cast dropdown
+  - [ ] Bulk operations toolbar
+- [ ] **State Machine**
+  - [ ] View transition logic
+  - [ ] Selection state
+  - [ ] Undo/redo stack
+  - [ ] URL sync for deep-linking
+
+### Phase 3: Screen Time (Week 6)
+- [ ] Episode screen time bar chart
+- [ ] Cast ranking table
+- [ ] Season aggregation view
+- [ ] Export to CSV
+
+### Phase 4: Cast Management (Week 7)
+- [ ] Cast member CRUD
+- [ ] Facebank seed upload with preview
+- [ ] Voice reference upload
+- [ ] Show management
+
+### Phase 5: Voices Review (Week 8+)
+- [ ] Voice cluster grid
+- [ ] Audio segment player
+- [ ] Transcript display
+- [ ] Speaker assignment
+
+---
+
+## Migration Strategy
+
+### Incremental Approach
+
+1. **Keep Streamlit running** alongside Next.js during migration
+2. **Feature flags** to enable Next.js pages incrementally
+3. **Shared API** - both UIs use same FastAPI backend
+4. **Redirect when ready** - update links to point to Next.js
+
+### Data Migration
+
+No data migration needed - both UIs read same manifests/S3 buckets.
+
+### Testing Strategy
+
+1. **Visual regression**: Screenshot comparison Streamlit vs Next.js
+2. **E2E tests**: Playwright for critical flows
+3. **API contract tests**: Ensure endpoint compatibility
+
+---
+
+## Dependencies to Install
+
+```bash
+cd web
+npm install @tanstack/react-virtual  # Virtualization
+npm install recharts                  # Charts
+npm install zustand                   # UI state
+npm install cmdk                      # Command palette
+npm install @radix-ui/react-dialog   # Modals
+npm install @radix-ui/react-dropdown-menu
+npm install @radix-ui/react-tooltip
+npm install react-hotkeys-hook        # Keyboard shortcuts
+npm install blurhash                  # Image placeholders
+```
+
+---
+
 ## Status
 
-**Current:** On hold - fixing local Streamlit features first
+**Current:** Ready to begin Phase 1
 
-**Last updated:** 2024-12-02
+**Next Action:** Create branch `feature/web-app/upload-episode-hardening`
+
+**Last updated:** 2025-12-09
