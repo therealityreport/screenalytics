@@ -10,6 +10,8 @@ import numbers
 import os
 import platform
 import re
+import signal
+import subprocess
 import threading
 import time
 from functools import lru_cache
@@ -49,7 +51,7 @@ DEFAULT_DEVICE_LABEL = "CoreML (Apple Silicon)" if _IS_MACOS_APPLE_SILICON else 
 
 DEFAULT_DET_THRESH = 0.65  # Raised from 0.5 to reduce false positive face detections
 DEFAULT_MAX_GAP = 60
-DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
+DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.58"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
 
 LOGGER = logging.getLogger(__name__)
@@ -102,7 +104,8 @@ MIN_BOX_AREA_DEFAULT = max(
 
 # Thumbnail constants
 THUMB_W, THUMB_H = 200, 250
-_PLACEHOLDER = "apps/workspace-ui/assets/placeholder_face.svg"
+# Use absolute path for placeholder to work regardless of working directory
+_PLACEHOLDER = str(Path(__file__).parent / "assets" / "placeholder_face.svg")
 _THUMB_CACHE_STATE_KEY = "_thumb_async_cache"
 _THUMB_JOB_STATE_KEY = "_thumb_async_jobs"
 _MAX_ASYNC_THUMB_WORKERS = 8
@@ -677,6 +680,67 @@ def render_cached_logs(ep_id: str, operation: str) -> bool:
     return True
 
 
+def _restart_api_server() -> bool:
+    """Kill any existing API server on port 8000 and start a new one.
+
+    Returns True if restart was initiated successfully.
+    """
+    project_root = Path(__file__).parent.parent.parent  # workspace-ui -> apps -> project root
+
+    # Kill any existing process on port 8000
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", ":8000"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    LOGGER.info(f"Killed process {pid} on port 8000")
+                except (ProcessLookupError, ValueError):
+                    pass
+            time.sleep(0.5)  # Give OS time to release the port
+    except subprocess.TimeoutExpired:
+        LOGGER.warning("Timeout checking for processes on port 8000")
+    except Exception as e:
+        LOGGER.warning(f"Error checking port 8000: {e}")
+
+    # Start the API server in background
+    api_script = project_root / "apps" / "api" / "main.py"
+    if not api_script.exists():
+        LOGGER.error(f"API script not found: {api_script}")
+        return False
+
+    try:
+        # Start uvicorn in background
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        subprocess.Popen(
+            [
+                str(project_root / ".venv" / "bin" / "python"),
+                "-m", "uvicorn",
+                "apps.api.main:app",
+                "--host", "0.0.0.0",
+                "--port", "8000",
+                "--reload"
+            ],
+            cwd=str(project_root),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        LOGGER.info("API server restart initiated")
+        return True
+    except Exception as e:
+        LOGGER.error(f"Failed to start API server: {e}")
+        return False
+
+
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
@@ -847,13 +911,13 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     inject_custom_fonts()
 
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
-    st.session_state.setdefault("api_base", api_base)
+    st.session_state["api_base"] = api_base  # Always set (setdefault doesn't overwrite "")
     backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
-    st.session_state.setdefault("backend", backend)
+    st.session_state["backend"] = backend
     bucket = st.session_state.get("bucket") or (
         _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "screenalytics")
     )
-    st.session_state.setdefault("bucket", bucket)
+    st.session_state["bucket"] = bucket
 
     query_ep_id = st.query_params.get("ep_id", "")
     stored_ep_id = st.session_state.get("ep_id")
@@ -878,13 +942,26 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     sidebar.header("API")
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
+    api_healthy = False
     try:
         resp = requests.get(health_url, timeout=5)
         resp.raise_for_status()
         sidebar.success("/healthz OK")
+        api_healthy = True
     except requests.RequestException as exc:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
+    # Buttons: refresh status or restart API
+    btn_col1, btn_col2 = sidebar.columns(2)
+    with btn_col1:
+        if st.button("🔄 Refresh", key="sidebar_refresh_api", use_container_width=True):
+            st.rerun()
+    with btn_col2:
+        if st.button("⚡ Restart API", key="sidebar_restart_api", use_container_width=True):
+            _restart_api_server()
+            import time
+            time.sleep(2)  # Give API time to start
+            st.rerun()
     sidebar.divider()
 
     # Episode selector
@@ -2054,6 +2131,67 @@ def _guess_device_label() -> str:
     except Exception:  # pragma: no cover
         pass
     return "CPU"
+
+
+@lru_cache(maxsize=1)
+def list_supported_devices() -> list[str]:
+    """Return list of device labels supported on the current host.
+
+    This is the single source of truth for which devices are available.
+    The UI should use this to filter the device selector options.
+
+    Returns:
+        List of device labels (e.g., ["Auto", "CPU", "CUDA"])
+    """
+    supported = ["Auto", "CPU"]  # Always available
+
+    # Check for CUDA
+    if _cuda_provider_present():
+        supported.append("CUDA")
+    else:
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                supported.append("CUDA")
+        except Exception:
+            pass
+
+    # Check for Apple Silicon / CoreML / MPS
+    if is_apple_silicon():
+        if _coreml_provider_present():
+            supported.append("CoreML")
+        # Check for MPS
+        try:
+            import torch  # type: ignore
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is not None and mps_backend.is_available():
+                supported.append("MPS")
+        except Exception:
+            pass
+
+    return supported
+
+
+def validate_device(device_label: str) -> tuple[bool, str | None]:
+    """Validate that a device is supported on the current host.
+
+    Args:
+        device_label: Device label (e.g., "CUDA", "CoreML")
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    supported = list_supported_devices()
+    if device_label in supported:
+        return True, None
+
+    # Provide helpful error message
+    if device_label == "CUDA":
+        return False, "CUDA is not available on this host. No CUDA-enabled GPU detected."
+    elif device_label in ("CoreML", "MPS"):
+        return False, f"{device_label} is only available on Apple Silicon Macs."
+    else:
+        return False, f"Unknown device: {device_label}. Supported: {', '.join(supported)}"
 
 
 def parse_ep_id(ep_id: str) -> Optional[Dict[str, int | str]]:
@@ -4235,6 +4373,174 @@ def run_pipeline_job_with_mode(
         )
 
 
+def run_episode_pipeline_job(
+    ep_id: str,
+    *,
+    device: str = "auto",
+    stride: int = 1,
+    det_thresh: float = 0.65,
+    cluster_thresh: float = 0.75,
+    save_crops: bool = True,
+    save_frames: bool = False,
+    reuse_detections: bool = False,
+    reuse_embeddings: bool = False,
+    profile: str | None = None,
+    poll_interval: float = 2.0,
+    timeout: int = 7200,
+) -> tuple[Dict[str, Any] | None, str | None]:
+    """Run the full episode processing pipeline via the job API.
+
+    This function uses the new /jobs/episode-run endpoint which runs the
+    engine (detect_track -> faces_embed -> cluster) as a single job.
+
+    Args:
+        ep_id: Episode identifier (e.g., 'rhobh-s05e14')
+        device: Compute device ('auto', 'cpu', 'cuda', 'coreml')
+        stride: Frame stride for detection (higher = faster but less accurate)
+        det_thresh: Face detection confidence threshold
+        cluster_thresh: Clustering distance threshold
+        save_crops: Whether to save face crops
+        save_frames: Whether to save full frames
+        reuse_detections: Skip detect_track if artifacts exist
+        reuse_embeddings: Skip faces_embed if artifacts exist
+        profile: Optional preset profile ('fast', 'balanced', 'quality')
+        poll_interval: Seconds between status polls
+        timeout: Maximum seconds to wait for completion
+
+    Returns:
+        Tuple of (result dict with summary, error message or None)
+    """
+    endpoint = "/jobs/episode-run"
+    payload = {
+        "ep_id": ep_id,
+        "device": device,
+        "stride": stride,
+        "det_thresh": det_thresh,
+        "cluster_thresh": cluster_thresh,
+        "save_crops": save_crops,
+        "save_frames": save_frames,
+        "reuse_detections": reuse_detections,
+        "reuse_embeddings": reuse_embeddings,
+    }
+    if profile:
+        payload["profile"] = profile
+
+    # UI elements for progress display
+    status_placeholder = st.empty()
+    progress_container = st.container()
+    with progress_container:
+        progress_bar = st.progress(0.0)
+        progress_text = st.empty()
+        progress_text.caption("Starting episode pipeline...")
+
+    # Build context string for display
+    context_parts = [f"device={device}"]
+    if stride > 1:
+        context_parts.append(f"stride={stride}")
+    if profile:
+        context_parts.append(f"profile={profile}")
+    context_str = ", ".join(context_parts)
+
+    status_placeholder.info(f"⏳ Starting episode pipeline ({context_str})...")
+
+    try:
+        # Start the job
+        resp = requests.post(
+            f"{_api_base()}{endpoint}",
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        job_info = resp.json()
+        job_id = job_info.get("job_id")
+
+        if not job_id:
+            error_msg = "No job_id returned from API"
+            status_placeholder.error(f"❌ {error_msg}")
+            return None, error_msg
+
+        status_placeholder.info(f"⏳ Job {job_id[:8]}... running ({context_str})")
+
+        # Poll for completion
+        start_time = time.time()
+        stage_idx = 0
+        stages = ["detect_track", "faces_embed", "cluster"]
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                error_msg = f"Job timed out after {timeout}s"
+                status_placeholder.error(f"❌ {error_msg}")
+                return {"job_id": job_id, "status": "timeout"}, error_msg
+
+            # Get job status
+            status_resp = requests.get(
+                f"{_api_base()}/jobs/{job_id}",
+                timeout=10,
+            )
+            status_resp.raise_for_status()
+            job_status = status_resp.json()
+
+            state = job_status.get("state", "unknown")
+
+            if state == "running":
+                # Update progress based on estimated stage
+                # Rough estimate: detect_track=60%, faces_embed=30%, cluster=10%
+                pct = min(elapsed / (timeout * 0.5), 0.95)  # Cap at 95% until done
+                progress_bar.progress(pct)
+
+                elapsed_min = int(elapsed // 60)
+                elapsed_sec = int(elapsed % 60)
+                if elapsed_min > 0:
+                    elapsed_str = f"{elapsed_min}m {elapsed_sec}s"
+                else:
+                    elapsed_str = f"{elapsed_sec}s"
+                progress_text.caption(f"Running... {elapsed_str} elapsed")
+
+            elif state == "succeeded":
+                progress_bar.progress(1.0)
+                summary = job_status.get("summary", {})
+                runtime = summary.get("runtime_sec", elapsed)
+
+                if runtime >= 60:
+                    runtime_min = int(runtime // 60)
+                    runtime_sec = int(runtime % 60)
+                    runtime_str = f"{runtime_min}m {runtime_sec}s"
+                else:
+                    runtime_str = f"{runtime:.1f}s"
+
+                identities = summary.get("identities_count", 0)
+                tracks = summary.get("tracks_count", 0)
+                faces = summary.get("faces_count", 0)
+
+                progress_text.caption(
+                    f"**100%** - Completed in {runtime_str} "
+                    f"({tracks} tracks, {faces} faces, {identities} identities)"
+                )
+                status_placeholder.success(
+                    f"✅ Episode pipeline completed in {runtime_str} - "
+                    f"Found {identities} identities from {tracks} tracks"
+                )
+                return {"job_id": job_id, "status": "succeeded", **summary}, None
+
+            elif state == "failed":
+                error_msg = job_status.get("error", "Unknown error")
+                progress_text.caption(f"❌ Failed after {elapsed:.0f}s")
+                status_placeholder.error(f"❌ Episode pipeline failed: {error_msg}")
+                return {"job_id": job_id, "status": "failed", "error": error_msg}, error_msg
+
+            else:
+                # Unknown state - keep polling
+                progress_text.caption(f"Status: {state}")
+
+            time.sleep(poll_interval)
+
+    except requests.RequestException as exc:
+        error_msg = describe_error(f"{_api_base()}{endpoint}", exc)
+        status_placeholder.error(f"❌ {error_msg}")
+        return None, error_msg
+
+
 def run_async_job_with_mode(
     ep_id: str,
     endpoint: str,
@@ -5254,6 +5560,215 @@ def track_carousel_html(
             const scrollAmount = frameWidth * 4; // scroll 4 frames at a time
             track.scrollBy({{ left: direction * scrollAmount, behavior: 'smooth' }});
         }}
+    </script>
+    '''
+
+
+def cluster_track_row_carousel_html(
+    cluster_id: str,
+    track_id: int,
+    frames: List[Dict[str, Any]],
+    track_similarity: float | None = None,
+    track_faces: int = 0,
+    *,
+    thumb_width: int = 100,
+    max_visible: int = 6,
+) -> str:
+    """Generate a compact carousel row for a single track within a cluster view.
+
+    Shows up to max_visible frames with arrows to scroll if more frames exist.
+    Uses 4:5 aspect ratio thumbnails.
+
+    Args:
+        cluster_id: Cluster ID for unique element IDs
+        track_id: Track ID for display and unique keys
+        frames: List of frame dicts with 'crop_url' or 'url' and 'frame_idx'
+        track_similarity: Track similarity score (0-1) for badge display
+        track_faces: Total number of faces in track
+        thumb_width: Width of each thumbnail in pixels
+        max_visible: Maximum number of frames visible at once
+
+    Returns:
+        HTML string for the track row with carousel navigation
+    """
+    carousel_id = f"cluster_{cluster_id}_track_{track_id}"
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio
+
+    # Build similarity badge
+    sim_badge = ""
+    if track_similarity is not None:
+        pct = int(track_similarity * 100)
+        color = "#4CAF50" if pct >= 75 else "#FF9800" if pct >= 60 else "#F44336"
+        sim_badge = f'<span style="background:{color};color:white;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:bold;">{pct}%</span>'
+
+    # Build frame thumbnails
+    frame_items = []
+    for i, frame in enumerate(frames):
+        url = frame.get("crop_url") or frame.get("url") or frame.get("thumbnail_url") or frame.get("rep_thumb_url")
+        frame_idx = frame.get("frame_idx", i)
+        similarity = frame.get("similarity")
+
+        if url:
+            src = html.escape(str(url))
+            alt_text = html.escape(f"Track {track_id} frame {frame_idx}")
+
+            # Similarity badge for individual frame
+            badge = ""
+            if similarity is not None:
+                fpct = int(similarity * 100)
+                badge = f'<span class="ctr-frame-badge">{fpct}%</span>'
+
+            frame_items.append(f'''
+                <div class="ctr-frame">
+                    <img src="{src}" alt="{alt_text}" loading="lazy" />
+                    {badge}
+                </div>
+            ''')
+
+    if not frame_items:
+        # No frames - show placeholder
+        return f'''
+        <div class="ctr-row" id="{carousel_id}">
+            <div class="ctr-header">
+                <span class="ctr-track-label">Track {track_id}</span>
+                {sim_badge}
+                <span class="ctr-face-count">{track_faces} faces</span>
+            </div>
+            <div class="ctr-empty">No frames available</div>
+        </div>
+        '''
+
+    frames_html = "".join(frame_items)
+    total_frames = len(frame_items)
+    show_arrows = total_frames > max_visible
+
+    # Arrow buttons (only if needed)
+    prev_btn = f'<button class="ctr-arrow ctr-prev" onclick="scrollClusterTrack(\'{carousel_id}\', -1)">◀</button>' if show_arrows else ''
+    next_btn = f'<button class="ctr-arrow ctr-next" onclick="scrollClusterTrack(\'{carousel_id}\', 1)">▶</button>' if show_arrows else ''
+
+    return f'''
+    <div class="ctr-row" id="{carousel_id}">
+        <div class="ctr-header">
+            <span class="ctr-track-label">Track {track_id}</span>
+            {sim_badge}
+            <span class="ctr-face-count">{track_faces} faces</span>
+        </div>
+        <div class="ctr-carousel">
+            {prev_btn}
+            <div class="ctr-track">
+                {frames_html}
+            </div>
+            {next_btn}
+        </div>
+    </div>
+    '''
+
+
+def cluster_track_rows_css() -> str:
+    """Return CSS for cluster track row carousels. Include once per page."""
+    return '''
+    <style>
+        .ctr-row {
+            margin-bottom: 16px;
+            padding: 12px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+        }
+        .ctr-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .ctr-track-label {
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .ctr-face-count {
+            color: #888;
+            font-size: 12px;
+            margin-left: auto;
+        }
+        .ctr-carousel {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .ctr-arrow {
+            width: 32px;
+            height: 32px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(100,100,100,0.6);
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: background 0.2s;
+        }
+        .ctr-arrow:hover {
+            background: rgba(100,100,100,0.9);
+        }
+        .ctr-track {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            scroll-behavior: smooth;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+            padding: 4px 0;
+            flex: 1;
+        }
+        .ctr-track::-webkit-scrollbar {
+            display: none;
+        }
+        .ctr-frame {
+            position: relative;
+            flex-shrink: 0;
+            width: 100px;
+            height: 125px;
+            border-radius: 6px;
+            overflow: hidden;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            background: #333;
+        }
+        .ctr-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .ctr-frame-badge {
+            position: absolute;
+            top: 3px;
+            right: 3px;
+            background: rgba(33, 150, 243, 0.85);
+            color: white;
+            font-size: 9px;
+            font-weight: bold;
+            padding: 1px 4px;
+            border-radius: 3px;
+        }
+        .ctr-empty {
+            color: #666;
+            font-style: italic;
+            padding: 20px;
+            text-align: center;
+        }
+    </style>
+    <script>
+        function scrollClusterTrack(rowId, direction) {
+            const row = document.getElementById(rowId);
+            if (!row) return;
+            const track = row.querySelector('.ctr-track');
+            if (!track) return;
+            const frameWidth = 100 + 8; // width + gap
+            const scrollAmount = frameWidth * 4; // scroll 4 frames at a time
+            track.scrollBy({ left: direction * scrollAmount, behavior: 'smooth' });
+        }
     </script>
     '''
 

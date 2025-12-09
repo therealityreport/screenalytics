@@ -1,15 +1,17 @@
 # Default tracking configuration for single-person tracks
-# Higher thresholds for better accuracy, less multi-person contamination
+# Balanced thresholds - adjusted to include smaller faces while maintaining accuracy
 
 # ByteTrack spatial matching
-track_thresh: 0.70      # Min confidence to track (was 0.65) - filters low-quality detections
-match_thresh: 0.85      # T3: IoU threshold for bbox matching (increased from 0.80 for stricter consistency)
+# Lowered track_thresh from 0.70 to 0.55 to track smaller/lower-confidence faces
+track_thresh: 0.55      # Min confidence to track - lowered to include more faces
+match_thresh: 0.65      # T3: IoU threshold for bbox matching (lowered from 0.85 to reduce track fragmentation)
 track_buffer: 90        # Frames to keep track alive (≈3-4s at typical TV FPS) - reduces track fragmentation
 max_track_buffer: 300   # T10: Maximum buffer cap (prevents runaway memory on high-stride runs)
 
 # T4: Separate thresholds for new vs. continuing tracks
-new_track_thresh: 0.85  # Higher threshold for starting new tracks (makes false positives less persistent)
-# track_thresh (0.70) is used for continuing existing tracks (easier to maintain than to start)
+# Lowered new_track_thresh from 0.85 to 0.70 to start tracks for smaller faces
+new_track_thresh: 0.70  # Threshold for starting new tracks (was 0.85)
+# track_thresh (0.55) is used for continuing existing tracks (easier to maintain than to start)
 
 # T2: AppearanceGate enabled by default
 gate_enabled: true      # Enable appearance-based track splitting

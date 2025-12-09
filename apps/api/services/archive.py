@@ -304,16 +304,35 @@ class ArchiveService:
         total = len(items)
         paginated = items[offset : offset + limit]
 
+        # Calculate counts (filtered by episode if specified)
+        if episode_id:
+            people_filtered = [p for p in data.get("archived_people", []) if p.get("episode_id") == episode_id]
+            clusters_filtered = [c for c in data.get("archived_clusters", []) if c.get("episode_id") == episode_id]
+            tracks_filtered = [t for t in data.get("archived_tracks", []) if t.get("episode_id") == episode_id]
+            counts = {
+                "people": len(people_filtered),
+                "clusters": len(clusters_filtered),
+                "tracks": len(tracks_filtered),
+                "total": len(people_filtered) + len(clusters_filtered) + len(tracks_filtered),
+            }
+        else:
+            counts = {
+                "people": len(data.get("archived_people", [])),
+                "clusters": len(data.get("archived_clusters", [])),
+                "tracks": len(data.get("archived_tracks", [])),
+                "total": (
+                    len(data.get("archived_people", []))
+                    + len(data.get("archived_clusters", []))
+                    + len(data.get("archived_tracks", []))
+                ),
+            }
+
         return {
             "items": paginated,
             "total": total,
             "limit": limit,
             "offset": offset,
-            "counts": {
-                "people": len(data.get("archived_people", [])),
-                "clusters": len(data.get("archived_clusters", [])),
-                "tracks": len(data.get("archived_tracks", [])),
-            },
+            "counts": counts,
         }
 
     def get_archived_centroids(
@@ -321,8 +340,14 @@ class ArchiveService:
         show_id: str,
         *,
         item_type: Optional[str] = None,
+        episode_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get all archived items with their centroids for matching.
+
+        Args:
+            show_id: Show identifier
+            item_type: Filter by type ("person", "cluster", "track") or None for all
+            episode_id: Filter by episode ID or None for all episodes
 
         Returns list of {archive_id, type, centroid, ...} for items with centroids.
         Used to check if new faces match archived (rejected) faces.
@@ -333,6 +358,7 @@ class ArchiveService:
         if item_type is None or item_type == "person":
             for item in data.get("archived_people", []):
                 if item.get("centroid"):
+                    # People are show-level, not episode-specific
                     results.append({
                         "archive_id": item["archive_id"],
                         "type": "person",
@@ -344,6 +370,9 @@ class ArchiveService:
         if item_type is None or item_type == "cluster":
             for item in data.get("archived_clusters", []):
                 if item.get("centroid"):
+                    # Filter by episode_id if specified
+                    if episode_id and item.get("episode_id") != episode_id:
+                        continue
                     results.append({
                         "archive_id": item["archive_id"],
                         "type": "cluster",
@@ -356,6 +385,9 @@ class ArchiveService:
         if item_type is None or item_type == "track":
             for item in data.get("archived_tracks", []):
                 if item.get("centroid"):
+                    # Filter by episode_id if specified
+                    if episode_id and item.get("episode_id") != episode_id:
+                        continue
                     results.append({
                         "archive_id": item["archive_id"],
                         "type": "track",
@@ -374,6 +406,7 @@ class ArchiveService:
         *,
         threshold: float = 0.70,
         item_type: Optional[str] = None,
+        episode_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Find archived items that match a given centroid.
 
@@ -382,11 +415,12 @@ class ArchiveService:
             centroid: Face centroid to match
             threshold: Minimum cosine similarity (0.70 = 70% similar)
             item_type: Filter by type or None for all
+            episode_id: Filter by episode ID or None for all episodes
 
         Returns:
             List of matching archived items with similarity scores
         """
-        archived = self.get_archived_centroids(show_id, item_type=item_type)
+        archived = self.get_archived_centroids(show_id, item_type=item_type, episode_id=episode_id)
         if not archived:
             return []
 
@@ -459,6 +493,68 @@ class ArchiveService:
             "tracks_count": len(data.get("archived_tracks", [])),
             "total_archived": data.get("stats", {}).get("total_archived", 0),
             "last_updated": data.get("stats", {}).get("last_updated"),
+        }
+
+    def clear_all(self, show_id: str, episode_id: Optional[str] = None) -> Dict[str, Any]:
+        """Clear archived items for a show (or specific episode).
+
+        Args:
+            show_id: Show identifier
+            episode_id: Optional episode filter - if provided, only clear items from this episode
+
+        Returns the count of deleted items.
+        """
+        show_id = self.normalize_show_id(show_id)
+        data = self._load_archive(show_id)
+
+        if episode_id:
+            # Filter to only delete items from the specified episode
+            people_before = data.get("archived_people", [])
+            clusters_before = data.get("archived_clusters", [])
+            tracks_before = data.get("archived_tracks", [])
+
+            # Keep items NOT from this episode
+            data["archived_people"] = [p for p in people_before if p.get("episode_id") != episode_id]
+            data["archived_clusters"] = [c for c in clusters_before if c.get("episode_id") != episode_id]
+            data["archived_tracks"] = [t for t in tracks_before if t.get("episode_id") != episode_id]
+
+            people_deleted = len(people_before) - len(data["archived_people"])
+            clusters_deleted = len(clusters_before) - len(data["archived_clusters"])
+            tracks_deleted = len(tracks_before) - len(data["archived_tracks"])
+            total = people_deleted + clusters_deleted + tracks_deleted
+
+            # Update stats
+            remaining_total = (
+                len(data["archived_people"])
+                + len(data["archived_clusters"])
+                + len(data["archived_tracks"])
+            )
+            data["stats"] = {
+                "total_archived": remaining_total,
+                "last_updated": _now_iso(),
+            }
+        else:
+            # Clear ALL items (original behavior)
+            people_deleted = len(data.get("archived_people", []))
+            clusters_deleted = len(data.get("archived_clusters", []))
+            tracks_deleted = len(data.get("archived_tracks", []))
+            total = people_deleted + clusters_deleted + tracks_deleted
+
+            data["archived_people"] = []
+            data["archived_clusters"] = []
+            data["archived_tracks"] = []
+            data["stats"] = {
+                "total_archived": 0,
+                "last_updated": _now_iso(),
+            }
+
+        self._save_archive(show_id, data)
+
+        return {
+            "deleted_count": total,
+            "people_deleted": people_deleted,
+            "clusters_deleted": clusters_deleted,
+            "tracks_deleted": tracks_deleted,
         }
 
 

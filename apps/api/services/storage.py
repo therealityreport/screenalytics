@@ -7,10 +7,14 @@ import logging
 import os
 import re
 import shutil
+import ssl
+import time
 from dataclasses import dataclass
 from mimetypes import guess_type
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar
+
+from urllib3.exceptions import SSLError as Urllib3SSLError
 
 from py_screenalytics.artifacts import get_path
 
@@ -20,6 +24,78 @@ DEFAULT_EXPIRY = 900  # 15 minutes
 LOCAL_UPLOAD_BASE = "http://localhost/_local-storage"
 ARTIFACT_ROOT = "artifacts"
 CACHE_CONTROL_IMMUTABLE = "max-age=31536000,public"
+
+# Retry configuration for S3 uploads
+S3_UPLOAD_MAX_RETRIES = 3
+S3_UPLOAD_RETRY_BASE_DELAY = 1.0  # seconds
+S3_UPLOAD_RETRY_MAX_DELAY = 10.0  # seconds
+
+T = TypeVar("T")
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Check if an exception is a retryable network/SSL error."""
+    # SSL errors
+    if isinstance(exc, (ssl.SSLError, Urllib3SSLError)):
+        return True
+    # Check nested exceptions for SSL errors
+    if hasattr(exc, "__cause__") and exc.__cause__ is not None:
+        if isinstance(exc.__cause__, (ssl.SSLError, Urllib3SSLError)):
+            return True
+    # Botocore/requests SSL errors often wrapped
+    exc_str = str(exc).lower()
+    if any(kw in exc_str for kw in ("ssl", "connection reset", "connection aborted", "timeout")):
+        return True
+    return False
+
+
+def _retry_s3_operation(
+    operation: Callable[[], T],
+    description: str,
+    *,
+    max_retries: int = S3_UPLOAD_MAX_RETRIES,
+    base_delay: float = S3_UPLOAD_RETRY_BASE_DELAY,
+    max_delay: float = S3_UPLOAD_RETRY_MAX_DELAY,
+) -> T:
+    """Execute an S3 operation with exponential backoff retry for network errors.
+
+    Args:
+        operation: Callable that performs the S3 operation
+        description: Human-readable description for logging
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay between retries (seconds)
+        max_delay: Maximum delay between retries (seconds)
+
+    Returns:
+        Result of the operation
+
+    Raises:
+        Exception: Re-raises the last exception if all retries fail
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_error(exc) or attempt >= max_retries:
+                raise
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            LOGGER.warning(
+                "Retryable error on %s (attempt %d/%d), retrying in %.1fs: %s",
+                description,
+                attempt + 1,
+                max_retries + 1,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    # Should not reach here, but satisfy type checker
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Retry loop exited unexpectedly")
+
+
 _V2_KEY_RE = re.compile(r"raw/videos/(?P<show>[^/]+)/s(?P<season>\d{2})/e(?P<episode>\d{2})/episode\.mp4")
 _V1_KEY_RE = re.compile(r"raw/videos/(?P<ep_id>[^/]+)/episode\.mp4")
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
@@ -329,18 +405,25 @@ class StorageService:
         return self.backend in {"s3", "minio"} and self._client is not None
 
     def upload_bytes(self, data: bytes, key: str, *, content_type: str | None = None) -> bool:
-        """Directly upload a small object to S3/MinIO without touching disk."""
+        """Directly upload a small object to S3/MinIO without touching disk.
+
+        Includes retry logic with exponential backoff for SSL/network errors.
+        """
         if not self.s3_enabled() or not self.write_enabled or not self._client:
             return False
         extra_args: Dict[str, str] = {"Bucket": self.bucket, "Key": key, "Body": data}
         if content_type:
             extra_args["ContentType"] = content_type
         extra_args["CacheControl"] = CACHE_CONTROL_IMMUTABLE
-        try:
+
+        def do_upload() -> bool:
             self._client.put_object(**extra_args)  # type: ignore[union-attr]
             return True
+
+        try:
+            return _retry_s3_operation(do_upload, f"upload bytes to s3://{self.bucket}/{key}")
         except Exception as exc:  # pragma: no cover - network/service errors are env-specific
-            LOGGER.warning("Failed to upload bytes to s3://%s/%s: %s", self.bucket, key, exc)
+            LOGGER.warning("Failed to upload bytes to s3://%s/%s after retries: %s", self.bucket, key, exc)
             return False
 
     def download_bytes(self, key: str) -> bytes | None:
@@ -507,8 +590,10 @@ class StorageService:
 
     # ------------------------------------------------------------------
     def put_artifact(self, ep_ctx: EpisodeContext, kind: str, local_path: Path, key_rel: str) -> bool:
-        """Upload a single artifact file under the v2 hierarchy."""
+        """Upload a single artifact file under the v2 hierarchy.
 
+        Includes retry logic with exponential backoff for SSL/network errors.
+        """
         if self.backend not in {"s3", "minio"} or self._client is None:
             return False
         if not local_path.exists():
@@ -521,7 +606,8 @@ class StorageService:
         key_rel = key_rel.lstrip("/\ ")
         key = f"{prefix}{key_rel}" if prefix.endswith("/") else f"{prefix}/{key_rel}"
         extra_args = self._object_extra_args(local_path)
-        try:
+
+        def do_upload() -> bool:
             self._client.upload_file(  # type: ignore[union-attr]
                 str(local_path),
                 self.bucket,
@@ -529,9 +615,12 @@ class StorageService:
                 ExtraArgs=extra_args,
             )
             return True
+
+        try:
+            return _retry_s3_operation(do_upload, f"upload artifact {local_path} to s3://{self.bucket}/{key}")
         except Exception as exc:  # pragma: no cover - best-effort upload
             LOGGER.warning(
-                "Failed to upload artifact %s to s3://%s/%s: %s",
+                "Failed to upload artifact %s to s3://%s/%s after retries: %s",
                 local_path,
                 self.bucket,
                 key,
@@ -554,9 +643,12 @@ class StorageService:
         object_name: str | None = None,
         content_type_hint: str | None = None,
     ) -> str | None:
-        """Upload a facebank seed derivative to the shared artifacts bucket."""
+        """Upload a facebank seed derivative to the shared artifacts bucket.
+
+        Includes retry logic with exponential backoff for SSL/network errors.
+        """
         client = None
-        bucket = None
+        bucket: str | None = None
         write_ok = False
         if self.backend in {"s3", "minio"} and self._client is not None and self.write_enabled:
             client = self._client
@@ -581,21 +673,29 @@ class StorageService:
         key = f"{ARTIFACT_ROOT}/facebank/{show_id}/{cast_id}/{filename}"
         extra_args = self._object_extra_args(path, content_type_hint=content_type_hint)
         data = path.read_bytes()
+        put_kwargs: Dict[str, Any] = {
+            "Bucket": bucket,
+            "Key": key,
+            "Body": data,
+            "ContentLength": len(data),
+        }
+        put_kwargs.update(extra_args)
+
+        # Capture for closure
+        _client = client
+        _bucket = bucket
+
+        def do_upload() -> None:
+            _client.put_object(**put_kwargs)  # type: ignore[union-attr]
+
         try:
-            put_kwargs = {
-                "Bucket": bucket,
-                "Key": key,
-                "Body": data,
-                "ContentLength": len(data),
-            }
-            put_kwargs.update(extra_args)
-            client.put_object(**put_kwargs)  # type: ignore[union-attr]
+            _retry_s3_operation(do_upload, f"upload facebank seed {show_id}/{cast_id} to s3://{bucket}/{key}")
             if key.endswith(("_d.png", "_d.jpg", "_d.jpeg")):
-                self._log_display_object_size(client, bucket, key, len(data))
+                self._log_display_object_size(_client, _bucket, key, len(data))
             return key
         except Exception as exc:  # pragma: no cover - best effort
             LOGGER.warning(
-                "Failed to upload facebank seed %s/%s to s3://%s/%s: %s",
+                "Failed to upload facebank seed %s/%s to s3://%s/%s after retries: %s",
                 show_id,
                 cast_id,
                 bucket,
@@ -664,14 +764,18 @@ class StorageService:
                 continue
             key = f"{prefix}{rel}" if rel else prefix.rstrip("/")
             extra = self._object_extra_args(path) if guess_mime else None
-            try:
-                if extra:
-                    self._client.upload_file(str(path), self.bucket, key, ExtraArgs=extra)  # type: ignore[union-attr]
+
+            def do_upload(p: Path = path, k: str = key, e: dict | None = extra) -> None:
+                if e:
+                    self._client.upload_file(str(p), self.bucket, k, ExtraArgs=e)  # type: ignore[union-attr]
                 else:
-                    self._client.upload_file(str(path), self.bucket, key)  # type: ignore[union-attr]
+                    self._client.upload_file(str(p), self.bucket, k)  # type: ignore[union-attr]
+
+            try:
+                _retry_s3_operation(do_upload, f"upload {path} to s3://{self.bucket}/{key}")
                 uploaded += 1
             except Exception as exc:  # pragma: no cover
-                LOGGER.warning("Failed to upload %s to s3://%s/%s: %s", path, self.bucket, key, exc)
+                LOGGER.warning("Failed to upload %s to s3://%s/%s after retries: %s", path, self.bucket, key, exc)
         return uploaded
 
     def list_objects(self, prefix: str, suffix: str | None = None, max_items: int = 1000) -> List[str]:

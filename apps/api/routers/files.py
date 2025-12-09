@@ -39,7 +39,8 @@ def _is_safe_path(path_str: str) -> bool:
             except ValueError:
                 continue
         return False
-    except Exception:
+    except Exception as exc:
+        LOGGER.debug("[path-safety] Failed to validate path '%s': %s", path_str, exc)
         return False
 
 

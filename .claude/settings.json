@@ -1,0 +1,18 @@
+{
+  "model": "claude-sonnet-4-20250514",
+  "contextPaths": [
+    "CLAUDE.md",
+    "AGENTS.md",
+    "apps/api/CLAUDE.md",
+    "apps/workspace-ui/CLAUDE.md"
+  ],
+  "mcpServers": {},
+  "skills": {
+    "enabled": true,
+    "directory": ".claude/skills"
+  },
+  "commands": {
+    "enabled": true,
+    "directory": ".claude/commands"
+  }
+}

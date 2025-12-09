@@ -285,8 +285,8 @@ def _kill_process_tree_by_pid(pid: int) -> tuple[bool, str]:
         os.killpg(pgid, signal.SIGTERM)
         try:
             os.waitpid(-pgid, os.WNOHANG)
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("[process-kill] waitpid for pgid %d failed (expected if already reaped): %s", pgid, exc)
         return True, "terminated"
     except ProcessLookupError:
         return False, "not_found"
@@ -890,6 +890,11 @@ class ClusterCeleryRequest(BaseModel):
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
     )
+    clear_assignments: bool = Field(
+        True,
+        description="Clear all existing cluster-to-person assignments before clustering. "
+        "When True (default), all old assignments are removed and clusters start fresh."
+    )
 
 
 def _map_celery_state(state: str) -> str:
@@ -1007,8 +1012,8 @@ async def stream_celery_job(job_id: str, ep_id: str | None = None):
         if progress_file.exists():
             try:
                 return json.loads(progress_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[audio-progress] Failed to read progress file %s: %s", progress_file, exc)
         return None
 
     def _gen():
@@ -1158,8 +1163,8 @@ async def cancel_celery_job(job_id: str):
                             try:
                                 progress_path = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")) / "manifests" / ep_id / "audio_progress.json"
                                 progress_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                LOGGER.debug("[cancel-job] Failed to clear progress file: %s", exc)
 
                         if success:
                             LOGGER.info(f"Killed local job PID {pid} ({ep_id}::{operation})")
@@ -1636,8 +1641,8 @@ def _run_local_subprocess_blocking(
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cleanup] Failed to kill/wait on process (expected if already dead): %s", exc)
 
     try:
         # Start subprocess in a new process group so we can kill all children
@@ -1851,8 +1856,8 @@ async def _run_local_subprocess_async(
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cleanup] Failed to kill/wait on process (expected if already dead): %s", exc)
 
     try:
         # Use Popen with start_new_session=True to create a new process group
@@ -2279,8 +2284,8 @@ def _stream_local_subprocess(
             try:
                 proc.kill()
                 proc.wait(timeout=2)
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("[cleanup] Failed to kill/wait on process (expected if already dead): %s", exc)
 
     def _save_logs_always(status: str, elapsed: float, extra: Dict[str, Any] | None = None) -> None:
         """Always persist logs, even on crash/cancel. Called from finally block."""
@@ -2731,6 +2736,28 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
                     "state": "already_running",
                     "message": f"Cluster job {active_job} is already running for this episode",
                 },
+            )
+
+    # Clear all existing cluster-to-person assignments before clustering
+    # This ensures old cluster IDs and person links are removed so Faces Review starts fresh
+    cleared_count = 0
+    if req.clear_assignments:
+        try:
+            from apps.api.services.grouping import GroupingService
+
+            grouping_service = GroupingService()
+            cleared_count = grouping_service._clear_person_assignments(req.ep_id)
+            if cleared_count > 0:
+                LOGGER.info(
+                    "[%s] Cleared %d existing assignment(s) before clustering",
+                    req.ep_id,
+                    cleared_count,
+                )
+        except Exception as exc:
+            LOGGER.warning(
+                "[%s] Failed to clear assignments before clustering: %s",
+                req.ep_id,
+                exc,
             )
 
     # Resolve profile based on device

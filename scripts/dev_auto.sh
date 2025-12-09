@@ -230,7 +230,9 @@ fi
 # ============================================================================
 # FastAPI Server
 # ============================================================================
-echo "[dev_auto] Starting API (auto-reload)..."
+# Storage backend: s3 (production), local (offline dev)
+export STORAGE_BACKEND="${STORAGE_BACKEND:-s3}"
+echo "[dev_auto] Starting API (auto-reload, storage: $STORAGE_BACKEND)..."
 "$PYTHON" -m uvicorn apps.api.main:app \
     --host 127.0.0.1 \
     --port 8000 \

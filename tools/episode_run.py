@@ -16,7 +16,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import groupby
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import queue
+import threading
 
 import logging
 
@@ -31,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 from apps.common.cpu_limits import apply_global_cpu_limits
 apply_global_cpu_limits()
 
+import cv2
 import numpy as np
 
 from apps.api.services.storage import (
@@ -86,9 +90,14 @@ DEFAULT_TRACKER = TRACKER_CHOICES[0]
 ARC_FACE_MODEL_NAME = os.environ.get("ARCFACE_MODEL", "arcface_r100_v1")
 RETINAFACE_MODEL_NAME = os.environ.get("RETINAFACE_MODEL", "retinaface_r50_v1")
 FACE_CLASS_LABEL = "face"
-MIN_FACE_AREA = 20.0
+# Minimum face bounding box area in pixels
+# Lower values detect smaller faces but may increase false positives
+# Original: 20.0, Now: 10.0 to capture smaller background faces
+MIN_FACE_AREA = 10.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
-RETINAFACE_SCORE_THRESHOLD = 0.65
+# Detection confidence threshold - lower values catch more faces but may increase false positives
+# Original: 0.65, Now: 0.50 to capture smaller/distant faces
+RETINAFACE_SCORE_THRESHOLD = 0.50
 RETINAFACE_NMS = 0.45
 
 RUN_MARKERS_SUBDIR = "runs"
@@ -328,8 +337,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Minimum bounding box area for ByteTrack to consider a detection
+# Lower values allow tracking smaller faces. Original: 20.0, Now: 10.0
 BYTE_TRACK_MIN_BOX_AREA_DEFAULT = max(
-    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 10.0)),
     0.0,
 )
 DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
@@ -344,14 +355,15 @@ RETINAFACE_HELP = (
 )
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 # Strict tracking defaults (matching config/pipeline/tracking.yaml)
-GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.75"))
-GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.82"))
+# Tightened after multi-person track bug analysis (track 57 in rhoslc-s06e88)
+GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.70"))  # Was 0.75, lowered to catch more switches
+GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.78"))  # Was 0.82, lowered for faster streak detection
 GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1)
-GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.50"))  # Increased to prevent spatial jumps
-GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
+GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.55"))  # Was 0.50, raised to catch near-misses like 0.5013
+GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.85")), 0.0), 1.0)  # Was 0.90, reduced for faster adaptation
 GATE_EMB_EVERY_DEFAULT = max(
-    int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0
-)  # Reduced from 5 to 10 for better thermal performance
+    int(os.environ.get("TRACK_GATE_EMB_EVERY", "3")), 0
+)  # Was 10, reduced to catch more person switches (critical fix)
 # ByteTrack spatial matching - strict defaults
 TRACK_BUFFER_BASE_DEFAULT = max(
     _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
@@ -367,12 +379,12 @@ TRACK_NEW_THRESH_DEFAULT = _env_float(
     _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
 )
 TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
-TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
+TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "12")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
 DEFAULT_CLUSTER_SIMILARITY = float(
-    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75")
-)  # Increased to prevent multiple people in same cluster
+    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.68")
+)  # Stricter threshold (was 0.58) to prevent grouping different people
 
 # Load and apply YAML config overrides if available (only if env vars not set)
 _YAML_CONFIG = _load_tracking_config_yaml()
@@ -392,10 +404,18 @@ if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTIC
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
         LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
-MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
+MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREANALYTICS_MIN_IDENTITY_SIM", "0.55"))  # Stricter (was 0.50)
+# Minimum cohesion for a cluster to be kept together; below this, split into singletons
+MIN_CLUSTER_COHESION = float(os.environ.get("SCREENALYTICS_MIN_CLUSTER_COHESION", "0.55"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
+
+# Lower thresholds for single-face tracks (more permissive to avoid orphaned clusters)
+# Single-face tracks have no redundancy, so we accept lower quality to get at least one embedding
+FACE_MIN_CONFIDENCE_SINGLE = float(os.environ.get("FACES_MIN_CONF_SINGLE", "0.45"))
+FACE_MIN_BLUR_SINGLE = float(os.environ.get("FACES_MIN_BLUR_SINGLE", "15.0"))
+FACE_MIN_STD_SINGLE = float(os.environ.get("FACES_MIN_STD_SINGLE", "0.5"))
 BYTE_TRACK_BUFFER_DEFAULT = TRACK_BUFFER_BASE_DEFAULT
 BYTE_TRACK_HIGH_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
 BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = TRACK_NEW_THRESH_DEFAULT
@@ -991,6 +1011,29 @@ class AppearanceGate:
             if tracker_id not in active_ids:
                 self._states.pop(tracker_id, None)
 
+    def needs_embedding(self, tracker_id: int) -> bool:
+        """Check if a track needs an embedding computed.
+
+        Returns True if:
+        - Track is new (not in _states)
+        - Track exists but has no prototype yet (proto is None)
+
+        This ensures we always get an embedding for the first detection of a track,
+        regardless of the embedding stride. Critical fix for multi-person track bug.
+        """
+        if tracker_id not in self._states:
+            return True
+        state = self._states[tracker_id]
+        return state.proto is None
+
+    def tracks_needing_embedding(self, tracker_ids: list[int]) -> set[int]:
+        """Return set of track IDs that need embeddings computed.
+
+        Used to force embedding computation for new tracks even when
+        frame_idx % stride != 0.
+        """
+        return {tid for tid in tracker_ids if self.needs_embedding(tid)}
+
     def process(
         self,
         tracker_id: int,
@@ -1507,27 +1550,100 @@ class ArcFaceEmbedder:
         if not crops:
             return np.zeros((0, 512), dtype=np.float32)
         model = self._lazy_model()
-        embeddings: list[np.ndarray] = []
-        for crop in crops:
+
+        # Prepare batch: resize all crops and track valid indices
+        resized_batch: list[np.ndarray] = []
+        valid_indices: list[int] = []
+        embeddings: list[np.ndarray] = [np.zeros(512, dtype=np.float32)] * len(crops)
+
+        for i, crop in enumerate(crops):
             if crop is None or crop.size == 0:
-                embeddings.append(np.zeros(512, dtype=np.float32))
                 continue
             resized = _resize_for_arcface(crop)
-            feat = model.get_feat(resized)
-            vec = np.asarray(feat, dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            embeddings.append(vec)
+            if resized is None:
+                continue  # Skip faces too small to resize
+            resized_batch.append(resized)
+            valid_indices.append(i)
+
+        if not resized_batch:
+            return np.vstack(embeddings)
+
+        # Batch inference: stack images into (N, H, W, C) array
+        # InsightFace's get_feat supports batch processing via stacked arrays
+        try:
+            batch_array = np.stack(resized_batch, axis=0)
+            # Try batch inference first (much faster)
+            feats = model.get_feat(batch_array)
+            feats = np.asarray(feats, dtype=np.float32)
+            if feats.ndim == 1:
+                # Single image case
+                feats = feats.reshape(1, -1)
+
+            # L2 normalize each embedding
+            norms = np.linalg.norm(feats, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)  # Avoid division by zero
+            feats = feats / norms
+
+            # Place normalized embeddings back into result array
+            for idx, valid_idx in enumerate(valid_indices):
+                embeddings[valid_idx] = feats[idx]
+
+        except Exception as batch_err:
+            # Fallback to per-image inference if batch fails (common with mixed-size batches)
+            LOGGER.debug("Batch embedding using per-image mode: %s", batch_err)
+            for i, resized in zip(valid_indices, resized_batch):
+                try:
+                    feat = model.get_feat(resized)
+                    vec = np.asarray(feat, dtype=np.float32)
+                    norm = np.linalg.norm(vec)
+                    if norm > 0:
+                        vec = vec / norm
+                    embeddings[i] = vec
+                except Exception:
+                    # Skip faces that fail embedding (zero vector already in place)
+                    pass
+
         return np.vstack(embeddings)
 
 
 def _resize_for_arcface(image):
+    """Resize image to ArcFace input size (112x112).
+
+    Returns None if image has invalid dimensions (too small to resize).
+    """
     import cv2  # type: ignore
 
+    # Check for valid dimensions before resize
+    if image is None:
+        return None
+    if not hasattr(image, 'shape') or len(image.shape) < 2:
+        return None
+    if image.size == 0:
+        return None
+    h, w = image.shape[:2]
+    # Require minimum 10x10 pixels - tiny crops cause OpenCV resize errors
+    MIN_CROP_DIM = 10
+    if h < MIN_CROP_DIM or w < MIN_CROP_DIM:
+        return None
+
+    # Ensure image is contiguous and has correct dtype
+    if not image.flags['C_CONTIGUOUS']:
+        image = np.ascontiguousarray(image)
+
+    # Ensure 3-channel uint8 for proper resize
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8)
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
     target = (112, 112)
-    resized = cv2.resize(image, target)
-    return resized
+    try:
+        resized = cv2.resize(image, target)
+        return resized
+    except cv2.error:
+        return None
 
 
 def _letterbox_square(image, size: int = 112, pad_value: int = 127):
@@ -1594,6 +1710,134 @@ def _safe_bbox_or_none(
 
     except Exception as e:
         return None, f"bbox_validation_error_{e}"
+
+
+class VideoValidationError(Exception):
+    """Raised when video file validation fails."""
+
+    def __init__(self, path: Path, message: str, details: dict | None = None):
+        self.path = path
+        self.details = details or {}
+        super().__init__(f"Video validation failed for {path}: {message}")
+
+
+def validate_video_file(
+    video_path: Path,
+    check_first_frame: bool = True,
+    min_frames: int = 1,
+    min_duration_sec: float = 0.0,
+) -> tuple[bool, str | None, dict]:
+    """Validate video file is readable and has valid content.
+
+    Args:
+        video_path: Path to the video file
+        check_first_frame: If True, attempt to read first frame
+        min_frames: Minimum number of frames required
+        min_duration_sec: Minimum duration in seconds
+
+    Returns:
+        Tuple of (is_valid, error_message, video_info):
+        - is_valid: True if validation passed
+        - error_message: None if valid, otherwise specific error message
+        - video_info: Dict with video properties (width, height, fps, frame_count, duration)
+    """
+    video_info: dict = {"path": str(video_path)}
+
+    if not video_path.exists():
+        return False, f"Video file not found: {video_path}", video_info
+
+    # Try to get file size
+    try:
+        video_info["file_size_bytes"] = video_path.stat().st_size
+        if video_info["file_size_bytes"] == 0:
+            return False, "Video file is empty (0 bytes)", video_info
+    except OSError as e:
+        return False, f"Cannot read video file: {e}", video_info
+
+    cap = None
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return False, "Cannot open video file – file may be corrupted or use unsupported codec", video_info
+
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        video_info.update({
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame_count": frame_count,
+        })
+
+        # Validate dimensions
+        if width <= 0 or height <= 0:
+            return False, f"Invalid video dimensions: {width}x{height}", video_info
+
+        # Validate FPS
+        if fps <= 0:
+            return False, f"Invalid video FPS: {fps}", video_info
+
+        # Validate frame count
+        if frame_count < min_frames:
+            return False, f"Video has only {frame_count} frames, minimum {min_frames} required", video_info
+
+        # Calculate duration
+        duration_sec = frame_count / fps if fps > 0 else 0.0
+        video_info["duration_sec"] = duration_sec
+
+        if duration_sec < min_duration_sec:
+            return False, f"Video duration {duration_sec:.1f}s is less than minimum {min_duration_sec:.1f}s", video_info
+
+        # Try to read first frame if requested
+        if check_first_frame:
+            ok, first_frame = cap.read()
+            if not ok or first_frame is None:
+                return False, "Cannot read first frame – video may be corrupted", video_info
+            if first_frame.size == 0:
+                return False, "First frame is empty – video may be corrupted", video_info
+            video_info["first_frame_readable"] = True
+
+        return True, None, video_info
+
+    except cv2.error as e:
+        return False, f"OpenCV error reading video: {e}", video_info
+    except Exception as e:
+        return False, f"Unexpected error validating video: {e}", video_info
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def require_valid_video(
+    video_path: Path,
+    check_first_frame: bool = True,
+    min_frames: int = 1,
+    min_duration_sec: float = 0.0,
+) -> dict:
+    """Validate video file and raise VideoValidationError if invalid.
+
+    Args:
+        video_path: Path to the video file
+        check_first_frame: If True, attempt to read first frame
+        min_frames: Minimum number of frames required
+        min_duration_sec: Minimum duration in seconds
+
+    Returns:
+        Video info dict with properties
+
+    Raises:
+        VideoValidationError: If validation fails
+    """
+    is_valid, error_msg, video_info = validate_video_file(
+        video_path, check_first_frame, min_frames, min_duration_sec
+    )
+    if not is_valid:
+        raise VideoValidationError(video_path, error_msg or "Unknown validation error", video_info)
+    return video_info
 
 
 def _prepare_face_crop(
@@ -1723,6 +1967,10 @@ def _make_skip_face_row(
     crop_s3_key: str | None = None,
     thumb_rel_path: str | None = None,
     thumb_s3_key: str | None = None,
+    # Structured skip data for smarter rescue decisions
+    blur_score: float | None = None,
+    confidence: float | None = None,
+    contrast: float | None = None,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "ep_id": ep_id,
@@ -1735,6 +1983,17 @@ def _make_skip_face_row(
         "pipeline_ver": PIPELINE_VERSION,
         "skip": reason,
     }
+    # Store structured quality metrics for smarter rescue decisions
+    # This allows rescue logic to pick the "best" skipped face
+    skip_data: Dict[str, Any] = {"reason": reason.split(":")[0] if ":" in reason else reason}
+    if blur_score is not None:
+        skip_data["blur_score"] = round(blur_score, 2)
+    if confidence is not None:
+        skip_data["confidence"] = round(confidence, 3)
+    if contrast is not None:
+        skip_data["contrast"] = round(contrast, 2)
+    row["skip_data"] = skip_data
+
     if crop_rel_path:
         row["crop_rel_path"] = crop_rel_path
     if crop_s3_key:
@@ -1945,6 +2204,41 @@ def _normalize_to_uint8(image: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8, copy=False)
 
 
+def encode_jpeg_bytes(image, *, quality: int = 85, color: str = "bgr") -> bytes:
+    """Encode an image to JPEG bytes without writing to disk.
+
+    Args:
+        image: Input image (numpy array or array-like)
+        quality: JPEG quality (1-100)
+        color: Input color space ("bgr" or "rgb")
+
+    Returns:
+        JPEG-encoded bytes
+    """
+    import cv2  # type: ignore
+
+    arr = np.asarray(image)
+    if arr.size == 0:
+        raise ValueError("Cannot encode empty image")
+    arr = np.ascontiguousarray(_normalize_to_uint8(arr))
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        mode = color.lower()
+        if mode == "rgb":
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        elif mode not in {"bgr", "rgb"}:
+            raise ValueError(f"Unsupported color mode '{color}'")
+    else:
+        raise ValueError(f"Unsupported image shape for JPEG encode: {arr.shape}")
+    arr = np.ascontiguousarray(arr)
+    jpeg_quality = max(1, min(int(quality or 85), 100))
+    success, encoded = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    if not success:
+        raise RuntimeError("cv2.imencode failed")
+    return encoded.tobytes()
+
+
 def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr") -> None:
     """Normalize + persist an image to JPEG, ensuring non-blank uint8 BGR data."""
     import cv2  # type: ignore
@@ -1973,12 +2267,33 @@ def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr")
 
 
 class ThumbWriter:
-    def __init__(self, ep_id: str, size: int = 256, jpeg_quality: int = 85) -> None:
+    """Writes thumbnails for tracks, optionally using storage backend.
+
+    Supports two modes:
+    - Direct filesystem writes (default, for local/hybrid backends)
+    - Storage backend writes (when storage_backend is provided and backend_type is 's3')
+
+    For hybrid storage mode, thumbnails are written locally first for speed,
+    then synced to S3 after job completion via the storage backend's sync_to_s3().
+    """
+
+    def __init__(
+        self, ep_id: str, size: int = 256, jpeg_quality: int = 85, storage_backend=None
+    ) -> None:
         self.ep_id = ep_id
         self.size = size
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
-        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self._storage_backend = storage_backend
+        # Determine if we should use backend for writes (only for pure S3 mode)
+        self._use_backend_writes = (
+            storage_backend is not None
+            and hasattr(storage_backend, "backend_type")
+            and storage_backend.backend_type == "s3"
+        )
+        # For local/hybrid modes, still create local directories
+        if not self._use_backend_writes:
+            self.root_dir.mkdir(parents=True, exist_ok=True)
         self._stat_samples = 0
         self._stat_limit = 10
         try:
@@ -1988,6 +2303,9 @@ class ThumbWriter:
         except ImportError:
             self._cv2 = None
         self._last_thumb_meta: Dict[str, Any] = {}
+        # Track bytes written for progress reporting
+        self.bytes_written = 0
+        self.thumbs_written = 0
 
     def write(
         self,
@@ -2049,22 +2367,54 @@ class ThumbWriter:
             self._stat_samples += 1
         rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
         abs_path = self.root_dir / rel_path
-        ok, reason = safe_imwrite(abs_path, thumb, self.jpeg_quality)
-        if not ok:
-            LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
-            return None, None
-        self._last_thumb_meta = {
-            "source_shape": tuple(int(x) for x in source.shape[:2]),
-            "source_kind": source_kind,
-        }
-        return rel_path.as_posix(), abs_path
+
+        # Write thumbnail using storage backend (S3) or direct filesystem
+        if self._use_backend_writes and self._storage_backend is not None:
+            # Direct-to-S3 mode: encode to bytes and upload
+            try:
+                jpeg_data = encode_jpeg_bytes(thumb, quality=self.jpeg_quality, color="bgr")
+                # entity_id includes track and frame info
+                entity_id = f"track_{track_id:04d}/thumb_{frame_idx:06d}"
+                result = self._storage_backend.write_thumbnail(
+                    self.ep_id, "track", entity_id, jpeg_data
+                )
+                if result.success:
+                    self.thumbs_written += 1
+                    self.bytes_written += len(jpeg_data)
+                    self._last_thumb_meta = {
+                        "source_shape": tuple(int(x) for x in source.shape[:2]),
+                        "source_kind": source_kind,
+                    }
+                    return rel_path.as_posix(), None  # No local path in S3 mode
+                else:
+                    LOGGER.warning("Failed to upload thumb %s: %s", rel_path, result.error)
+                    return None, None
+            except Exception as exc:
+                LOGGER.warning("Failed to encode/upload thumb %s: %s", rel_path, exc)
+                return None, None
+        else:
+            # Local/hybrid mode: write directly to disk
+            ok, reason = safe_imwrite(abs_path, thumb, self.jpeg_quality)
+            if not ok:
+                LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
+                return None, None
+            self.thumbs_written += 1
+            if abs_path.exists():
+                self.bytes_written += abs_path.stat().st_size
+            self._last_thumb_meta = {
+                "source_shape": tuple(int(x) for x in source.shape[:2]),
+                "source_kind": source_kind,
+            }
+            return rel_path.as_posix(), abs_path
 
     def _letterbox(self, crop):
         if self._cv2 is None:
             return np.zeros((self.size, self.size, 3), dtype=np.uint8)
-        if crop.size == 0:
-            crop = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+        if crop is None or crop.size == 0:
+            return np.zeros((self.size, self.size, 3), dtype=np.uint8)
         h, w = crop.shape[:2]
+        if h <= 0 or w <= 0:
+            return np.zeros((self.size, self.size, 3), dtype=np.uint8)
         scale = min(self.size / max(w, 1), self.size / max(h, 1))
         new_w = max(int(w * scale), 1)
         new_h = max(int(h * scale), 1)
@@ -2083,7 +2433,15 @@ def _faces_embed_path(ep_id: str) -> Path:
 
 
 class ProgressEmitter:
-    """Emit structured progress to stdout + optional file for SSE/polling."""
+    """Emit structured progress to stdout + optional file for SSE/polling.
+
+    Supports two modes for file persistence:
+    - Direct filesystem writes (default, for local/hybrid backends)
+    - Storage backend writes (when storage_backend is provided)
+
+    The storage backend approach allows progress to be stored in S3 or other
+    backends for distributed systems where local filesystem isn't shared.
+    """
 
     VERSION = 3
 
@@ -2099,13 +2457,22 @@ class ProgressEmitter:
         fps_requested: float | None,
         frame_interval: int | None = None,
         run_id: str | None = None,
+        storage_backend=None,
     ) -> None:
         import uuid
 
         self.ep_id = ep_id
         self.run_id = run_id or str(uuid.uuid4())
         self.path = Path(file_path).expanduser() if file_path else None
-        if self.path:
+        self._storage_backend = storage_backend
+        # Use storage backend for progress writes only if S3-only mode
+        self._use_backend_writes = (
+            storage_backend is not None
+            and hasattr(storage_backend, "backend_type")
+            and storage_backend.backend_type == "s3"
+        )
+        # Still create local directory for local/hybrid modes
+        if self.path and not self._use_backend_writes:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.frames_total = max(int(frames_total or 0), 0)
         self.secs_total = float(secs_total) if secs_total else None
@@ -2228,7 +2595,15 @@ class ProgressEmitter:
             if LOCAL_MODE_INSTRUMENTATION:
                 print(log_msg, flush=True)
 
-        if self.path:
+        # Persist progress to storage backend or local filesystem
+        if self._use_backend_writes and self._storage_backend is not None:
+            # S3-only mode: write progress via storage backend
+            try:
+                self._storage_backend.write_progress(self.ep_id, dict(payload))
+            except Exception as exc:
+                LOGGER.warning("Failed to write progress to storage backend: %s", exc)
+        elif self.path:
+            # Local/hybrid mode: write directly to filesystem
             tmp_path = self.path.with_suffix(".tmp")
             tmp_path.write_text(line, encoding="utf-8")
             tmp_path.replace(self.path)
@@ -2404,7 +2779,15 @@ class CropQualityThresholdExceeded(RuntimeError):
 
 
 class FrameExporter:
-    """Handles optional frame + crop JPEG exports for S3 sync."""
+    """Handles optional frame + crop JPEG exports for S3 sync.
+
+    Supports two modes:
+    - Direct filesystem writes (default, for local/hybrid backends)
+    - Storage backend writes (when storage_backend is provided and supports it)
+
+    For hybrid storage mode, frames/crops are written locally first for speed,
+    then synced to S3 after job completion via the storage backend's sync_to_s3().
+    """
 
     def __init__(
         self,
@@ -2414,6 +2797,7 @@ class FrameExporter:
         save_crops: bool,
         jpeg_quality: int,
         debug_logger: JsonlLogger | NullLogger | None = None,
+        storage_backend=None,
     ) -> None:
         self.ep_id = ep_id
         self.save_frames = save_frames
@@ -2422,10 +2806,19 @@ class FrameExporter:
         self.root_dir = get_path(ep_id, "frames_root")
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
-        if self.save_frames:
-            self.frames_dir.mkdir(parents=True, exist_ok=True)
-        if self.save_crops:
-            self.crops_dir.mkdir(parents=True, exist_ok=True)
+        self._storage_backend = storage_backend
+        # Determine if we should use backend for writes (only for pure S3 mode)
+        self._use_backend_writes = (
+            storage_backend is not None
+            and hasattr(storage_backend, "backend_type")
+            and storage_backend.backend_type == "s3"
+        )
+        # For local/hybrid modes, still create local directories
+        if not self._use_backend_writes:
+            if self.save_frames:
+                self.frames_dir.mkdir(parents=True, exist_ok=True)
+            if self.save_crops:
+                self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.frames_written = 0
         self.crops_written = 0
         self._track_indexes: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
@@ -2437,6 +2830,8 @@ class FrameExporter:
         self._fail_fast_min_attempts = 50  # Require at least 50 attempts before checking
         self._fail_fast_reasons = {"near_uniform_gray", "tiny_file"}
         self.debug_logger = debug_logger
+        # Track bytes written for progress reporting
+        self.bytes_written = 0
 
     def _log_image_stats(self, kind: str, path: Path, image) -> None:
         if self._stat_samples >= self._stat_limit:
@@ -2467,8 +2862,23 @@ class FrameExporter:
             frame_path = self.frames_dir / f"frame_{frame_idx:06d}.jpg"
             try:
                 self._log_image_stats("frame", frame_path, image)
-                save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
-                self.frames_written += 1
+                if self._use_backend_writes and self._storage_backend is not None:
+                    # Direct-to-S3 mode: encode to bytes and upload
+                    jpeg_data = encode_jpeg_bytes(image, quality=self.jpeg_quality, color="bgr")
+                    result = self._storage_backend.write_frame(
+                        self.ep_id, frame_idx, jpeg_data
+                    )
+                    if result.success:
+                        self.frames_written += 1
+                        self.bytes_written += len(jpeg_data)
+                    else:
+                        LOGGER.warning("Failed to upload frame %d: %s", frame_idx, result.error)
+                else:
+                    # Local/hybrid mode: write directly to disk
+                    save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
+                    self.frames_written += 1
+                    if frame_path.exists():
+                        self.bytes_written += frame_path.stat().st_size
             except Exception as exc:  # pragma: no cover - best effort
                 LOGGER.warning("Failed to save frame %s: %s", frame_path, exc)
         if self.save_crops and crops:
@@ -2597,7 +3007,30 @@ class FrameExporter:
                 self._emit_debug(debug_payload)
             return False
 
-        ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
+        # Write crop using storage backend (S3) or direct filesystem
+        if self._use_backend_writes and self._storage_backend is not None:
+            # Direct-to-S3 mode: encode to bytes and upload
+            try:
+                jpeg_data = encode_jpeg_bytes(crop, quality=self.jpeg_quality, color="bgr")
+                result = self._storage_backend.write_crop(
+                    self.ep_id, track_id, frame_idx, jpeg_data
+                )
+                ok = result.success
+                save_err = result.error if not ok else None
+                file_size = len(jpeg_data) if ok else None
+                if ok:
+                    self.bytes_written += len(jpeg_data)
+            except Exception as exc:
+                ok = False
+                save_err = str(exc)
+                file_size = None
+        else:
+            # Local/hybrid mode: write directly to disk
+            ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
+            file_size = crop_path.stat().st_size if ok and crop_path.exists() else None
+            if ok and file_size:
+                self.bytes_written += file_size
+
         reason = save_err if not ok else None
         self._register_crop_attempt(reason)
 
@@ -2612,7 +3045,7 @@ class FrameExporter:
                     "mean": mean,
                     "save_ok": bool(ok),
                     "save_err": save_err,
-                    "file_size": (crop_path.stat().st_size if ok and crop_path.exists() else None),
+                    "file_size": file_size,
                     "ms": int((time.time() - start) * 1000),
                 }
             )
@@ -2795,82 +3228,802 @@ def _storage_context(
     return storage, ep_ctx, prefixes
 
 
-def _sync_artifacts_to_s3(
+@dataclass
+class DiskSpaceCheck:
+    """Result of disk space pre-check."""
+
+    ok: bool
+    available_bytes: int
+    required_bytes: int
+    path: str
+    warning: str | None = None
+
+
+# Typical file sizes for estimation (conservative estimates)
+BYTES_PER_FRAME_JPEG = 50_000  # ~50KB per frame JPEG
+BYTES_PER_CROP_JPEG = 10_000  # ~10KB per face crop JPEG
+BYTES_PER_THUMB_JPEG = 20_000  # ~20KB per thumbnail
+AVG_FACES_PER_FRAME = 2  # Average faces detected per frame
+DISK_SPACE_SAFETY_MULTIPLIER = 1.5  # 50% safety margin
+
+
+def estimate_disk_usage(
+    frame_count: int,
+    save_frames: bool = True,
+    save_crops: bool = True,
+    avg_faces_per_frame: float = AVG_FACES_PER_FRAME,
+) -> int:
+    """Estimate disk space required for processing an episode.
+
+    Args:
+        frame_count: Total frames to process
+        save_frames: Whether full frames will be saved
+        save_crops: Whether face crops will be saved
+        avg_faces_per_frame: Average faces per frame (for crop estimation)
+
+    Returns:
+        Estimated bytes required
+    """
+    total = 0
+
+    if save_frames:
+        total += frame_count * BYTES_PER_FRAME_JPEG
+
+    if save_crops:
+        estimated_crops = int(frame_count * avg_faces_per_frame)
+        total += estimated_crops * BYTES_PER_CROP_JPEG
+        # Also estimate thumbnails
+        total += estimated_crops * BYTES_PER_THUMB_JPEG
+
+    # Add safety margin
+    return int(total * DISK_SPACE_SAFETY_MULTIPLIER)
+
+
+def check_disk_space(
+    path: str | Path,
+    required_bytes: int,
+    *,
+    warn_threshold_gb: float = 5.0,
+    block_threshold_gb: float = 1.0,
+) -> DiskSpaceCheck:
+    """Check if sufficient disk space is available.
+
+    Args:
+        path: Path where files will be written
+        required_bytes: Estimated bytes needed
+        warn_threshold_gb: Warn if available space is below this (GB)
+        block_threshold_gb: Block job if available space is below this (GB)
+
+    Returns:
+        DiskSpaceCheck with status and details
+    """
+    target_path = Path(path)
+    # Find an existing parent directory to check space
+    check_path = target_path
+    while not check_path.exists() and check_path.parent != check_path:
+        check_path = check_path.parent
+
+    try:
+        stat = shutil.disk_usage(check_path)
+        available = stat.free
+    except Exception as exc:
+        LOGGER.warning("Unable to check disk space for %s: %s", path, exc)
+        # Assume OK if we can't check
+        return DiskSpaceCheck(
+            ok=True,
+            available_bytes=0,
+            required_bytes=required_bytes,
+            path=str(path),
+            warning=f"Unable to check disk space: {exc}",
+        )
+
+    available_gb = available / (1024 ** 3)
+    required_gb = required_bytes / (1024 ** 3)
+    block_threshold_bytes = int(block_threshold_gb * (1024 ** 3))
+    warn_threshold_bytes = int(warn_threshold_gb * (1024 ** 3))
+
+    # Check if we have enough space
+    if available < block_threshold_bytes:
+        return DiskSpaceCheck(
+            ok=False,
+            available_bytes=available,
+            required_bytes=required_bytes,
+            path=str(path),
+            warning=f"Critical: Only {available_gb:.1f}GB available (need {required_gb:.1f}GB, minimum {block_threshold_gb}GB)",
+        )
+
+    if available < required_bytes:
+        return DiskSpaceCheck(
+            ok=False,
+            available_bytes=available,
+            required_bytes=required_bytes,
+            path=str(path),
+            warning=f"Insufficient space: {available_gb:.1f}GB available but {required_gb:.1f}GB estimated needed",
+        )
+
+    warning = None
+    if available < warn_threshold_bytes:
+        warning = f"Low disk space: {available_gb:.1f}GB available"
+
+    return DiskSpaceCheck(
+        ok=True,
+        available_bytes=available,
+        required_bytes=required_bytes,
+        path=str(path),
+        warning=warning,
+    )
+
+
+def pre_check_disk_space(
+    ep_id: str,
+    frame_count: int,
+    save_frames: bool,
+    save_crops: bool,
+    *,
+    fail_on_insufficient: bool = True,
+) -> DiskSpaceCheck:
+    """Pre-check disk space before starting a job.
+
+    Args:
+        ep_id: Episode identifier
+        frame_count: Estimated total frames
+        save_frames: Whether frames will be saved
+        save_crops: Whether crops will be saved
+        fail_on_insufficient: If True, raise error on insufficient space
+
+    Returns:
+        DiskSpaceCheck result
+
+    Raises:
+        RuntimeError: If fail_on_insufficient=True and space is insufficient
+    """
+    required = estimate_disk_usage(frame_count, save_frames, save_crops)
+    data_root = get_path(ep_id, "frames_root")
+
+    check = check_disk_space(data_root, required)
+
+    if check.warning:
+        LOGGER.warning("Disk space check for %s: %s", ep_id, check.warning)
+
+    if not check.ok and fail_on_insufficient:
+        raise RuntimeError(
+            f"Insufficient disk space for {ep_id}: "
+            f"{check.available_bytes / (1024**3):.1f}GB available, "
+            f"{check.required_bytes / (1024**3):.1f}GB estimated needed"
+        )
+
+    return check
+
+
+@dataclass
+class S3SyncResult:
+    """Result of S3 sync operation."""
+
+    success: bool
+    stats: Dict[str, int]
+    errors: List[str]
+    partial: bool = False  # True if some uploads succeeded but others failed
+
+
+@dataclass
+class BackgroundUploadStatus:
+    """Status of background S3 upload operations."""
+
+    pending: int = 0
+    completed: int = 0
+    failed: int = 0
+    bytes_uploaded: int = 0
+    in_progress: bool = False
+    errors: List[str] = field(default_factory=list)
+
+
+class BackgroundS3Uploader:
+    """Non-blocking S3 uploader using a bounded queue and thread pool.
+
+    This allows the main pipeline to continue processing while uploads happen
+    in the background. Use wait_for_completion() at the end to ensure all
+    uploads finish and get final status.
+
+    Usage:
+        uploader = BackgroundS3Uploader(storage, max_workers=4, max_queue_size=100)
+        uploader.start()
+
+        # Submit uploads (non-blocking)
+        uploader.submit_file(local_path, s3_key)
+        uploader.submit_bytes(data, s3_key)
+
+        # At end of pipeline
+        status = uploader.wait_for_completion(timeout=300)
+        if status.failed > 0:
+            log.warning("Some uploads failed: %s", status.errors)
+    """
+
+    def __init__(
+        self,
+        storage: StorageService,
+        *,
+        max_workers: int = 4,
+        max_queue_size: int = 100,
+        max_retries: int = 3,
+    ):
+        """Initialize background uploader.
+
+        Args:
+            storage: StorageService instance for S3 operations
+            max_workers: Maximum concurrent upload threads
+            max_queue_size: Maximum pending uploads before submit blocks
+            max_retries: Number of retry attempts per upload
+        """
+        self._storage = storage
+        self._max_workers = max_workers
+        self._max_queue_size = max_queue_size
+        self._max_retries = max_retries
+
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: Dict[Future, str] = {}  # Future -> S3 key for tracking
+        self._lock = threading.Lock()
+
+        # Status tracking
+        self._pending = 0
+        self._completed = 0
+        self._failed = 0
+        self._bytes_uploaded = 0
+        self._errors: List[str] = []
+        self._started = False
+        self._shutdown = False
+
+    def start(self) -> None:
+        """Start the background uploader thread pool."""
+        if self._started:
+            return
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix="s3_upload",
+        )
+        self._started = True
+        self._shutdown = False
+
+    def _upload_file_with_retry(
+        self, local_path: Path, s3_key: str, content_type: str | None = None
+    ) -> Tuple[bool, int, str | None]:
+        """Upload a file with retry logic.
+
+        Returns: (success, bytes_uploaded, error_message)
+        """
+        if not local_path.exists():
+            return False, 0, f"File not found: {local_path}"
+
+        file_size = local_path.stat().st_size
+        last_error: str | None = None
+
+        for attempt in range(self._max_retries):
+            try:
+                if content_type:
+                    success = self._storage.upload_file(
+                        str(local_path), s3_key, content_type=content_type
+                    )
+                else:
+                    success = self._storage.upload_file(str(local_path), s3_key)
+
+                if success:
+                    return True, file_size, None
+                last_error = f"Upload returned False for {s3_key}"
+            except Exception as exc:
+                last_error = f"Upload failed (attempt {attempt + 1}/{self._max_retries}): {exc}"
+                if attempt < self._max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+
+        return False, 0, last_error
+
+    def _upload_bytes_with_retry(
+        self, data: bytes, s3_key: str, content_type: str = "application/octet-stream"
+    ) -> Tuple[bool, int, str | None]:
+        """Upload bytes with retry logic.
+
+        Returns: (success, bytes_uploaded, error_message)
+        """
+        last_error: str | None = None
+
+        for attempt in range(self._max_retries):
+            try:
+                success = self._storage.upload_bytes(data, s3_key, content_type=content_type)
+                if success:
+                    return True, len(data), None
+                last_error = f"Upload returned False for {s3_key}"
+            except Exception as exc:
+                last_error = f"Upload failed (attempt {attempt + 1}/{self._max_retries}): {exc}"
+                if attempt < self._max_retries - 1:
+                    time.sleep(2 ** attempt)
+
+        return False, 0, last_error
+
+    def submit_file(
+        self,
+        local_path: Path,
+        s3_key: str,
+        *,
+        content_type: str | None = None,
+        block_if_full: bool = True,
+    ) -> bool:
+        """Submit a file for background upload.
+
+        Args:
+            local_path: Path to local file
+            s3_key: Destination S3 key
+            content_type: Optional content type override
+            block_if_full: If True, block when queue is full; otherwise return False
+
+        Returns:
+            True if submitted, False if queue is full and block_if_full=False
+        """
+        if not self._started or self._shutdown:
+            raise RuntimeError("Uploader not started or already shutdown")
+
+        with self._lock:
+            if not block_if_full and self._pending >= self._max_queue_size:
+                return False
+            self._pending += 1
+
+        # Submit to thread pool
+        future = self._executor.submit(
+            self._upload_file_with_retry, local_path, s3_key, content_type
+        )
+        with self._lock:
+            self._futures[future] = s3_key
+
+        return True
+
+    def submit_bytes(
+        self,
+        data: bytes,
+        s3_key: str,
+        *,
+        content_type: str = "application/octet-stream",
+        block_if_full: bool = True,
+    ) -> bool:
+        """Submit bytes for background upload.
+
+        Args:
+            data: Bytes to upload
+            s3_key: Destination S3 key
+            content_type: Content type header
+            block_if_full: If True, block when queue is full; otherwise return False
+
+        Returns:
+            True if submitted, False if queue is full and block_if_full=False
+        """
+        if not self._started or self._shutdown:
+            raise RuntimeError("Uploader not started or already shutdown")
+
+        with self._lock:
+            if not block_if_full and self._pending >= self._max_queue_size:
+                return False
+            self._pending += 1
+
+        future = self._executor.submit(
+            self._upload_bytes_with_retry, data, s3_key, content_type
+        )
+        with self._lock:
+            self._futures[future] = s3_key
+
+        return True
+
+    def submit_directory(
+        self,
+        dir_path: Path,
+        s3_prefix: str,
+        *,
+        pattern: str = "*",
+        recursive: bool = True,
+        skip_subdirs: Tuple[str, ...] = (),
+    ) -> int:
+        """Submit all files in a directory for upload.
+
+        Args:
+            dir_path: Local directory path
+            s3_prefix: S3 key prefix (should end with /)
+            pattern: Glob pattern for files
+            recursive: Whether to recurse into subdirectories
+            skip_subdirs: Subdirectory names to skip
+
+        Returns:
+            Number of files submitted
+        """
+        if not dir_path.exists():
+            return 0
+
+        submitted = 0
+        glob_fn = dir_path.rglob if recursive else dir_path.glob
+
+        for file_path in glob_fn(pattern):
+            if not file_path.is_file():
+                continue
+
+            # Check if in skipped subdir
+            rel_parts = file_path.relative_to(dir_path).parts
+            if rel_parts and rel_parts[0] in skip_subdirs:
+                continue
+
+            rel_key = file_path.relative_to(dir_path).as_posix()
+            s3_key = f"{s3_prefix}{rel_key}"
+
+            # Determine content type
+            suffix = file_path.suffix.lower()
+            content_type = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".json": "application/json",
+                ".jsonl": "application/json",
+            }.get(suffix, "application/octet-stream")
+
+            self.submit_file(file_path, s3_key, content_type=content_type)
+            submitted += 1
+
+        return submitted
+
+    def get_status(self) -> BackgroundUploadStatus:
+        """Get current upload status (non-blocking)."""
+        # Process any completed futures
+        self._process_completed_futures()
+
+        with self._lock:
+            return BackgroundUploadStatus(
+                pending=self._pending,
+                completed=self._completed,
+                failed=self._failed,
+                bytes_uploaded=self._bytes_uploaded,
+                in_progress=self._pending > 0,
+                errors=list(self._errors),
+            )
+
+    def _process_completed_futures(self) -> None:
+        """Process completed futures and update stats."""
+        with self._lock:
+            completed_futures = [f for f in self._futures if f.done()]
+
+        for future in completed_futures:
+            with self._lock:
+                s3_key = self._futures.pop(future, "unknown")
+
+            try:
+                success, bytes_uploaded, error = future.result()
+                with self._lock:
+                    self._pending -= 1
+                    if success:
+                        self._completed += 1
+                        self._bytes_uploaded += bytes_uploaded
+                    else:
+                        self._failed += 1
+                        if error:
+                            self._errors.append(f"{s3_key}: {error}")
+            except Exception as exc:
+                with self._lock:
+                    self._pending -= 1
+                    self._failed += 1
+                    self._errors.append(f"{s3_key}: {exc}")
+
+    def wait_for_completion(self, *, timeout: float | None = None) -> BackgroundUploadStatus:
+        """Wait for all pending uploads to complete.
+
+        Args:
+            timeout: Maximum time to wait in seconds (None = no limit)
+
+        Returns:
+            Final upload status
+        """
+        if not self._started or self._executor is None:
+            return BackgroundUploadStatus()
+
+        start_time = time.time()
+
+        with self._lock:
+            pending_futures = list(self._futures.keys())
+
+        try:
+            # Wait for all futures with timeout
+            for future in as_completed(pending_futures, timeout=timeout):
+                self._process_completed_futures()
+
+                # Check overall timeout
+                if timeout is not None:
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout:
+                        break
+        except TimeoutError:
+            pass
+
+        # Final processing
+        self._process_completed_futures()
+
+        return self.get_status()
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Shutdown the uploader.
+
+        Args:
+            wait: If True, wait for pending uploads to complete
+        """
+        self._shutdown = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=wait)
+            self._executor = None
+        self._started = False
+
+    def __enter__(self) -> "BackgroundS3Uploader":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.shutdown(wait=True)
+
+
+def _sync_artifacts_to_s3_async(
     ep_id: str,
     storage: StorageService | None,
     ep_ctx: EpisodeContext | None,
     exporter: FrameExporter | None,
     thumb_dir: Path | None = None,
-) -> Dict[str, int]:
-    """Sync artifacts to S3 storage.
+    *,
+    max_workers: int = 4,
+    timeout: float = 600,
+) -> S3SyncResult:
+    """Sync artifacts to S3 using background uploads with ThreadPoolExecutor.
 
-    TODO(perf): Make uploads asynchronous using ThreadPoolExecutor to avoid blocking.
-    Current implementation uploads synchronously which blocks the worker. However, this
-    is called AFTER completion events are emitted (see line 3336), so users already see
-    "done" status. Making async would require: (1) thread pool management, (2) error
-    handling from background threads, (3) ensuring all uploads complete before exit, (4)
-    progress reporting across threads. Benefit is marginal since user must wait anyway.
+    This is a non-blocking alternative to _sync_artifacts_to_s3 that uses a
+    thread pool for parallel uploads. The pipeline continues while uploads
+    happen in background threads.
+
+    Args:
+        ep_id: Episode identifier
+        storage: StorageService instance
+        ep_ctx: Episode context for S3 key prefixes
+        exporter: FrameExporter with frames/crops to upload
+        thumb_dir: Optional thumbnail directory
+        max_workers: Number of concurrent upload threads
+        timeout: Maximum time to wait for all uploads (seconds)
+
+    Returns:
+        S3SyncResult with success status, stats, and any errors
     """
-    stats = {
+    stats: Dict[str, int] = {
         "manifests": 0,
         "frames": 0,
         "crops": 0,
         "thumbs_tracks": 0,
         "thumbs_identities": 0,
     }
+
     if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
-        return stats
+        return S3SyncResult(success=True, stats=stats, errors=[])
+
     prefixes = artifact_prefixes(ep_ctx)
+
+    with BackgroundS3Uploader(storage, max_workers=max_workers) as uploader:
+        # Submit manifests
+        manifests_dir = get_path(ep_id, "detections").parent
+        if manifests_dir.exists():
+            stats["manifests"] = uploader.submit_directory(
+                manifests_dir, prefixes["manifests"], pattern="*.json*"
+            )
+
+        # Submit frames
+        if exporter and exporter.save_frames and exporter.frames_dir.exists():
+            stats["frames"] = uploader.submit_directory(
+                exporter.frames_dir, prefixes["frames"]
+            )
+
+        # Submit crops
+        if exporter and exporter.save_crops and exporter.crops_dir.exists():
+            stats["crops"] = uploader.submit_directory(
+                exporter.crops_dir, prefixes["crops"]
+            )
+
+        # Submit thumbnails
+        if thumb_dir is not None and thumb_dir.exists():
+            stats["thumbs_tracks"] = uploader.submit_directory(
+                thumb_dir,
+                prefixes.get("thumbs_tracks", ""),
+                skip_subdirs=("identities",),
+            )
+
+            identities_dir = thumb_dir / "identities"
+            if identities_dir.exists():
+                stats["thumbs_identities"] = uploader.submit_directory(
+                    identities_dir, prefixes.get("thumbs_identities", "")
+                )
+
+        # Wait for completion
+        final_status = uploader.wait_for_completion(timeout=timeout)
+
+    # Convert to S3SyncResult
+    errors = final_status.errors
+    has_errors = len(errors) > 0 or final_status.failed > 0
+    has_uploads = final_status.completed > 0
+    partial = has_errors and has_uploads
+
+    if final_status.failed > 0 and not errors:
+        errors.append(f"{final_status.failed} uploads failed")
+
+    return S3SyncResult(
+        success=not has_errors,
+        stats=stats,
+        errors=errors,
+        partial=partial,
+    )
+
+
+def _sync_artifacts_to_s3(
+    ep_id: str,
+    storage: StorageService | None,
+    ep_ctx: EpisodeContext | None,
+    exporter: FrameExporter | None,
+    thumb_dir: Path | None = None,
+    *,
+    max_retries: int = 3,
+    required_for_success: bool = True,
+) -> S3SyncResult:
+    """Sync artifacts to S3 storage with retry support.
+
+    When required_for_success=True, the job should not be marked as complete
+    until S3 sync succeeds. This ensures artifacts are accessible via S3 presigned URLs.
+
+    Args:
+        ep_id: Episode identifier
+        storage: StorageService instance
+        ep_ctx: Episode context for S3 key prefixes
+        exporter: FrameExporter with frames/crops to upload
+        thumb_dir: Optional thumbnail directory
+        max_retries: Number of retry attempts for each upload type (default: 3)
+        required_for_success: If True, sync failures should fail the job
+
+    Returns:
+        S3SyncResult with success status, stats, and any errors
+    """
+    stats: Dict[str, int] = {
+        "manifests": 0,
+        "frames": 0,
+        "crops": 0,
+        "thumbs_tracks": 0,
+        "thumbs_identities": 0,
+    }
+    errors: List[str] = []
+
+    if storage is None or ep_ctx is None or not storage.s3_enabled() or not storage.write_enabled:
+        # No S3 configured - this is success if S3 not required
+        return S3SyncResult(success=True, stats=stats, errors=[])
+
+    prefixes = artifact_prefixes(ep_ctx)
+
+    def _upload_with_retry(
+        upload_fn, dir_path: Path, prefix: str, name: str, **kwargs
+    ) -> Tuple[int, str | None]:
+        """Upload with retry logic, returns (count, error_message)."""
+        if not dir_path.exists():
+            return 0, None
+
+        last_error: str | None = None
+        for attempt in range(max_retries):
+            try:
+                count = upload_fn(dir_path, prefix, **kwargs)
+                return count, None
+            except Exception as exc:
+                last_error = f"{name} upload failed (attempt {attempt + 1}/{max_retries}): {exc}"
+                LOGGER.warning(last_error)
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+
+        return 0, last_error
+
+    # Upload manifests (always required)
     manifests_dir = get_path(ep_id, "detections").parent
-    stats["manifests"] = storage.upload_dir(manifests_dir, prefixes["manifests"])
-    frames_root = get_path(ep_id, "frames_root")
-    frames_dir = frames_root / "frames"
-    crops_dir = frames_root / "crops"
-    # Only upload frames/crops if they were actually produced in this run
-    # The elif branches that uploaded stale artifacts have been removed to prevent
-    # publishing old frames/crops from prior runs when exports are disabled
+    count, err = _upload_with_retry(
+        storage.upload_dir, manifests_dir, prefixes["manifests"], "manifests"
+    )
+    stats["manifests"] = count
+    if err:
+        errors.append(err)
+
+    # Upload frames if exporter produced them
     if exporter and exporter.save_frames and exporter.frames_dir.exists():
-        stats["frames"] = storage.upload_dir(exporter.frames_dir, prefixes["frames"])
+        count, err = _upload_with_retry(
+            storage.upload_dir, exporter.frames_dir, prefixes["frames"], "frames"
+        )
+        stats["frames"] = count
+        if err:
+            errors.append(err)
+
+    # Upload crops if exporter produced them
     if exporter and exporter.save_crops and exporter.crops_dir.exists():
-        stats["crops"] = storage.upload_dir(exporter.crops_dir, prefixes["crops"])
+        count, err = _upload_with_retry(
+            storage.upload_dir, exporter.crops_dir, prefixes["crops"], "crops"
+        )
+        stats["crops"] = count
+        if err:
+            errors.append(err)
+
+    # Upload thumbnails
     if thumb_dir is not None and thumb_dir.exists():
         identities_dir = thumb_dir / "identities"
-        stats["thumbs_tracks"] = storage.upload_dir(
+        count, err = _upload_with_retry(
+            storage.upload_dir,
             thumb_dir,
             prefixes.get("thumbs_tracks", ""),
+            "track_thumbs",
             skip_subdirs=("identities",),
         )
+        stats["thumbs_tracks"] = count
+        if err:
+            errors.append(err)
+
         if identities_dir.exists():
-            stats["thumbs_identities"] = storage.upload_dir(
+            count, err = _upload_with_retry(
+                storage.upload_dir,
                 identities_dir,
                 prefixes.get("thumbs_identities", ""),
+                "identity_thumbs",
             )
-    return stats
+            stats["thumbs_identities"] = count
+            if err:
+                errors.append(err)
+
+    # Determine success
+    has_errors = len(errors) > 0
+    has_uploads = any(stats.values())
+    partial = has_errors and has_uploads
+
+    if required_for_success and has_errors:
+        return S3SyncResult(success=False, stats=stats, errors=errors, partial=partial)
+
+    return S3SyncResult(success=True, stats=stats, errors=errors, partial=partial)
 
 
 def _report_s3_upload(
     progress: ProgressEmitter | None,
-    stats: Dict[str, int],
+    sync_result: S3SyncResult | Dict[str, int],
     *,
     device: str | None,
     detector: str | None,
     tracker: str | None,
     resolved_device: str | None,
 ) -> None:
+    """Report S3 upload status to progress emitter.
+
+    Accepts either S3SyncResult (new format) or Dict[str, int] (legacy format).
+    """
     if not progress:
         return
-    if not any(stats.values()):
+
+    # Handle both new S3SyncResult and legacy dict format
+    if isinstance(sync_result, S3SyncResult):
+        stats = sync_result.stats
+        errors = sync_result.errors
+        success = sync_result.success
+    else:
+        stats = sync_result
+        errors = []
+        success = True
+
+    if not any(stats.values()) and not errors:
         return
+
     frames = progress.target_frames or 0
+    summary: Dict[str, Any] = {"s3_uploads": stats}
+    if errors:
+        summary["s3_errors"] = errors
+    if not success:
+        summary["s3_sync_failed"] = True
+
     progress.emit(
         frames,
         phase="mirror_s3",
         device=device,
-        summary={"s3_uploads": stats},
+        summary=summary,
         detector=detector,
         tracker=tracker,
         resolved_device=resolved_device,
         force=True,
+        error="; ".join(errors) if errors else None,
     )
 
 
@@ -3084,6 +4237,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--preserve-assigned",
         action="store_true",
         help="Preserve clusters that are assigned to cast members (don't recluster their tracks)",
+    )
+    parser.add_argument(
+        "--ignore-preservation-errors",
+        action="store_true",
+        help="Continue clustering even if cast-assigned cluster preservation fails (may lose assignments)",
     )
     parser.add_argument(
         "--quiet",
@@ -4000,6 +5158,9 @@ def _run_full_pipeline(
                     crop_records: list[tuple[int, list[float]]] = []
                     gate_embeddings: dict[int, np.ndarray | None] = {}
                     should_embed_gate = False
+                    # Tracks that MUST have embeddings computed (new tracks without prototypes)
+                    # This is critical to prevent multi-person track contamination
+                    tracks_needing_embed: set[int] = set()
                     if appearance_gate:
                         should_embed_gate = True if frames_since_cut < scene_warmup else False
                         stride_for_gate = gate_embed_stride or frame_stride
@@ -4007,7 +5168,22 @@ def _run_full_pipeline(
                             should_embed_gate = frame_idx % stride_for_gate == 0
                         else:
                             should_embed_gate = True
-                        if should_embed_gate and gate_embedder and tracked_objects:
+
+                        # CRITICAL FIX: Always compute embeddings for new tracks without prototypes
+                        # This prevents the bug where a track starts on a non-embedding frame,
+                        # then a different person enters on an embedding frame and becomes the prototype
+                        tracks_needing_embed = appearance_gate.tracks_needing_embedding(
+                            [obj.track_id for obj in tracked_objects]
+                        )
+                        if tracks_needing_embed and not should_embed_gate:
+                            LOGGER.debug(
+                                "[gate] Force embedding for %d new track(s) at frame %d: %s",
+                                len(tracks_needing_embed),
+                                frame_idx,
+                                list(tracks_needing_embed)[:5],  # Log first 5 to avoid spam
+                            )
+
+                        if (should_embed_gate or tracks_needing_embed) and gate_embedder and tracked_objects:
                             # DEBUG: Show gate embedding processing
                             if frames_sampled < 5:
                                 LOGGER.error(
@@ -4019,6 +5195,9 @@ def _run_full_pipeline(
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
                             for obj in tracked_objects:
+                                # Skip tracks that don't need embedding on non-embedding frames
+                                if not should_embed_gate and obj.track_id not in tracks_needing_embed:
+                                    continue
                                 # Validate bbox before cropping to prevent NoneType multiply errors
                                 validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
                                 if validated_bbox is None:
@@ -4457,6 +5636,23 @@ def _run_detect_track_stage(
     video_dest = get_path(args.ep_id, "video")
     _copy_video(video_src, video_dest)
 
+    # Validate video file before processing
+    LOGGER.info("Validating video file: %s", video_dest)
+    video_info = require_valid_video(
+        video_dest,
+        check_first_frame=True,
+        min_frames=10,  # Need at least a few frames for meaningful processing
+        min_duration_sec=0.5,  # At least half a second of video
+    )
+    LOGGER.info(
+        "Video validation passed: %dx%d, %.1f fps, %d frames, %.1f sec",
+        video_info.get("width", 0),
+        video_info.get("height", 0),
+        video_info.get("fps", 0),
+        video_info.get("frame_count", 0),
+        video_info.get("duration_sec", 0),
+    )
+
     source_fps, frame_count = _probe_video(video_dest)
     target_fps = args.fps if args.fps and args.fps > 0 else None
     duration_sec = _estimate_duration(frame_count, source_fps)
@@ -4550,15 +5746,17 @@ def _run_detect_track_stage(
                 det_count,
             )
 
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
+        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
         _report_s3_upload(
             progress,
-            s3_stats,
+            s3_sync_result,
             device=pipeline_device,
             detector=detector_choice,
             tracker=tracker_choice,
             resolved_device=detector_device,
         )
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
         track_ratio = round(track_count / det_count, 3) if det_count > 0 else 0.0
         summary: Dict[str, Any] = {
             "stage": "detect_track",
@@ -4595,7 +5793,6 @@ def _run_detect_track_stage(
                     ),
                 },
                 "s3_prefixes": s3_prefixes,
-                "s3_uploads": s3_stats,
             },
         }
         if detect_track_stats:
@@ -4703,8 +5900,13 @@ def _run_faces_embed_stage(
         print(f"  device={device}", flush=True)
 
     track_path = get_path(args.ep_id, "tracks")
-    if not track_path.exists():
-        raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
+    # Validate tracks.jsonl exists and has usable data
+    require_manifest(
+        track_path,
+        "tracks.jsonl",
+        required_fields=["track_id"],
+        hint="run detect/track first",
+    )
     # Sort samples by frame to enable batch embedding per frame
     # Apply per-track sampling to limit embedding/export volume
     samples = _load_track_samples(
@@ -4715,7 +5917,12 @@ def _run_faces_embed_stage(
         sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
     )
     if not samples:
-        raise RuntimeError("No track samples available for faces embedding")
+        raise ManifestValidationError(
+            "tracks.jsonl",
+            "File exists but contains no usable track samples – "
+            "detect/track likely produced tracks without valid bounding boxes",
+            track_path,
+        )
 
     faces_total = len(samples)
     if LOCAL_MODE_INSTRUMENTATION:
@@ -4948,13 +6155,23 @@ def _run_faces_embed_stage(
                 blur_score = _estimate_blur_score(crop)
                 skip_reason: str | None = None
                 skip_meta: str | None = None
-                if conf < FACE_MIN_CONFIDENCE:
+
+                # Use lower thresholds for single-face tracks to avoid orphaned clusters
+                # Single-face tracks have no redundancy, so we're more permissive
+                track_sample_count = sample.get("track_sample_count", 999)
+                is_single_face_track = track_sample_count == 1
+
+                min_conf = FACE_MIN_CONFIDENCE_SINGLE if is_single_face_track else FACE_MIN_CONFIDENCE
+                min_std = FACE_MIN_STD_SINGLE if is_single_face_track else FACE_MIN_STD
+                min_blur = FACE_MIN_BLUR_SINGLE if is_single_face_track else FACE_MIN_BLUR
+
+                if conf < min_conf:
                     skip_reason = "low_confidence"
                     skip_meta = f"{conf:.2f}"
-                elif crop_std < FACE_MIN_STD:
+                elif crop_std < min_std:
                     skip_reason = "low_contrast"
                     skip_meta = f"{crop_std:.2f}"
-                elif blur_score < FACE_MIN_BLUR:
+                elif blur_score < min_blur:
                     skip_reason = "blurry"
                     skip_meta = f"{blur_score:.1f}"
                 if skip_reason:
@@ -4972,6 +6189,10 @@ def _run_faces_embed_stage(
                             crop_s3_key=crop_s3_key,
                             thumb_rel_path=None,
                             thumb_s3_key=None,
+                            # Pass quality metrics for smarter rescue decisions
+                            blur_score=blur_score,
+                            confidence=conf,
+                            contrast=crop_std,
                         )
                     )
                     faces_done = min(faces_total, faces_done + 1)
@@ -5152,7 +6373,7 @@ def _run_faces_embed_stage(
         else:
             np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
 
-        _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
+        coherence_result = _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
         if exporter:
             exporter.write_indexes()
 
@@ -5183,7 +6404,11 @@ def _run_faces_embed_stage(
                 "s3_prefixes": s3_prefixes,
             },
             "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
+            "coherence": coherence_result.get("coherence_stats", {}),
         }
+        # Add mixed tracks if any were found
+        if coherence_result.get("mixed_tracks"):
+            summary["mixed_tracks"] = coherence_result["mixed_tracks"]
 
         # Emit completion BEFORE S3 sync (which might hang or take long)
         progress.emit(
@@ -5208,8 +6433,12 @@ def _run_faces_embed_stage(
         )
 
         # Now do S3 sync after completion is signaled
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
-        summary["artifacts"]["s3_uploads"] = s3_stats
+        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
+        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
+        if s3_sync_result.errors:
+            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
         _write_run_marker(
@@ -5313,16 +6542,43 @@ def _select_track_prototype(
     return proto, stack.shape[0], spread
 
 
+# Threshold for flagging a track as potentially containing multiple people
+# A spread ≥0.30 indicates the max pairwise cosine distance between embeddings
+# is quite high, suggesting the track may have different faces
+TRACK_COHERENCE_WARN_THRESHOLD = float(os.environ.get("TRACK_COHERENCE_WARN", "0.30"))
+
+
 def _update_track_embeddings(
     track_path: Path,
     track_embeddings: Dict[int, List[TrackEmbeddingSample]],
     track_best_thumb: Dict[int, tuple[float, str, str | None]],
     embedding_model: str,
-) -> None:
+) -> Dict[str, Any]:
+    """Update tracks with embedding info and return coherence validation stats.
+
+    Returns:
+        Dict with:
+        - mixed_tracks: list of track_ids with spread >= threshold
+        - coherence_stats: summary statistics
+    """
+    coherence_result: Dict[str, Any] = {
+        "mixed_tracks": [],
+        "coherence_stats": {
+            "total_tracks": 0,
+            "tracks_with_embeddings": 0,
+            "tracks_flagged_mixed": 0,
+            "max_spread": 0.0,
+            "avg_spread": 0.0,
+        },
+    }
     if not track_path.exists():
-        return
+        return coherence_result
+
     rows = list(_iter_jsonl(track_path))
     updated: List[dict] = []
+    spreads: List[float] = []
+    mixed_tracks: List[int] = []
+
     for row in rows:
         track_id = int(row.get("track_id", -1))
         samples = track_embeddings.get(track_id) or []
@@ -5334,7 +6590,21 @@ def _update_track_embeddings(
                 row["face_embedding_model"] = embedding_model
                 row["face_embedding_samples"] = sample_count
                 if spread is not None:
-                    row["face_embedding_spread"] = round(float(spread), 4)
+                    spread_rounded = round(float(spread), 4)
+                    row["face_embedding_spread"] = spread_rounded
+                    spreads.append(spread_rounded)
+
+                    # Flag tracks with high spread as potentially mixed
+                    if spread_rounded >= TRACK_COHERENCE_WARN_THRESHOLD:
+                        mixed_tracks.append(track_id)
+                        row["coherence_warning"] = "high_spread"
+                        LOGGER.warning(
+                            "[COHERENCE] Track %d has high embedding spread %.3f (threshold %.2f) - "
+                            "may contain multiple people",
+                            track_id,
+                            spread_rounded,
+                            TRACK_COHERENCE_WARN_THRESHOLD,
+                        )
         thumb_info = track_best_thumb.get(track_id)
         if thumb_info:
             _, rel_path, s3_key = thumb_info
@@ -5342,8 +6612,30 @@ def _update_track_embeddings(
             if s3_key:
                 row["thumb_s3_key"] = s3_key
         updated.append(row)
+
     if updated:
         _write_jsonl(track_path, updated)
+
+    # Compute coherence stats
+    coherence_result["mixed_tracks"] = mixed_tracks
+    coherence_result["coherence_stats"]["total_tracks"] = len(rows)
+    coherence_result["coherence_stats"]["tracks_with_embeddings"] = len(spreads)
+    coherence_result["coherence_stats"]["tracks_flagged_mixed"] = len(mixed_tracks)
+    if spreads:
+        coherence_result["coherence_stats"]["max_spread"] = round(max(spreads), 4)
+        coherence_result["coherence_stats"]["avg_spread"] = round(
+            sum(spreads) / len(spreads), 4
+        )
+
+    if mixed_tracks:
+        LOGGER.info(
+            "[COHERENCE] Embed stage flagged %d tracks as potentially mixed (spread >= %.2f): %s",
+            len(mixed_tracks),
+            TRACK_COHERENCE_WARN_THRESHOLD,
+            mixed_tracks[:10] if len(mixed_tracks) > 10 else mixed_tracks,
+        )
+
+    return coherence_result
 
 
 def _run_cluster_stage(
@@ -5361,16 +6653,28 @@ def _run_cluster_stage(
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
-    if not faces_path.exists():
-        raise FileNotFoundError("faces.jsonl not found; run faces embedding first")
+    # Validate faces.jsonl exists, is non-empty, and has required fields
+    faces_row_count = require_manifest(
+        faces_path,
+        "faces.jsonl",
+        required_fields=["track_id", "embedding"],
+        hint="run faces embedding first",
+    )
     faces_rows = list(_iter_jsonl(faces_path))
-    if not faces_rows:
-        raise RuntimeError("faces.jsonl is empty; cannot cluster")
-    faces_total = len(faces_rows)
+    # Double-check we have usable embeddings
+    usable_faces = [r for r in faces_rows if r.get("embedding") and len(r.get("embedding", [])) > 0]
+    if not usable_faces:
+        raise ManifestValidationError(
+            "faces.jsonl",
+            f"File has {len(faces_rows)} rows but none contain valid embeddings – "
+            "faces embedding stage may have failed to compute embeddings",
+            faces_path,
+        )
+    faces_total = len(usable_faces)
     if LOCAL_MODE_INSTRUMENTATION:
-        print(f"  faces_total={faces_total}", flush=True)
+        print(f"  faces_total={faces_total} (validated with embeddings)", flush=True)
     faces_per_track: Dict[int, int] = defaultdict(int)
-    for face_row in faces_rows:
+    for face_row in usable_faces:
         track_id_val = face_row.get("track_id")
         try:
             track_key = int(track_id_val)
@@ -5378,8 +6682,13 @@ def _run_cluster_stage(
             continue
         faces_per_track[track_key] += 1
     track_path = get_path(args.ep_id, "tracks")
-    if not track_path.exists():
-        raise FileNotFoundError("tracks.jsonl not found; run detect/track first")
+    # Validate tracks.jsonl for cross-reference
+    require_manifest(
+        track_path,
+        "tracks.jsonl",
+        required_fields=["track_id"],
+        hint="run detect/track first",
+    )
     track_rows = list(_iter_jsonl(track_path))
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
@@ -5414,12 +6723,23 @@ def _run_cluster_stage(
     preserved_identities: List[dict] = []
     preserved_track_ids: Set[int] = set()
     max_preserved_id: int = 0
+    ignore_preservation_errors = getattr(args, "ignore_preservation_errors", False)
+    preservation_error: str | None = None
 
     identities_path = manifests_dir / "identities.json"
     if identities_path.exists():
         try:
             existing_data = json.loads(identities_path.read_text(encoding="utf-8"))
             existing_identities = existing_data.get("identities", [])
+
+            # Count how many identities have person_id (cast-assigned)
+            assigned_count = sum(1 for i in existing_identities if i.get("person_id"))
+            if assigned_count > 0:
+                LOGGER.info(
+                    "Found %d existing identities, %d with cast assignments",
+                    len(existing_identities),
+                    assigned_count,
+                )
 
             # Load people service to check cast assignments
             try:
@@ -5463,12 +6783,53 @@ def _run_cluster_stage(
                             len(preserved_identities),
                             len(preserved_track_ids),
                         )
+                else:
+                    # Could not parse show slug - if there are assigned identities, this is a problem
+                    if assigned_count > 0:
+                        preservation_error = (
+                            f"Cannot preserve cast assignments: unable to parse show slug from "
+                            f"ep_id '{args.ep_id}' (expected format: 'showname-s##e##'). "
+                            f"{assigned_count} existing assignments may be lost."
+                        )
             except ImportError:
-                LOGGER.warning("PeopleService not available; skipping cast preservation check")
+                if assigned_count > 0:
+                    preservation_error = (
+                        f"Cannot preserve cast assignments: PeopleService not available. "
+                        f"{assigned_count} existing assignments may be lost."
+                    )
+                else:
+                    LOGGER.debug("PeopleService not available; no existing assignments to preserve")
             except Exception as exc:
-                LOGGER.warning("Failed to check cast assignments: %s; proceeding without preservation", exc)
-        except (json.JSONDecodeError, OSError) as exc:
-            LOGGER.warning("Failed to load existing identities.json: %s", exc)
+                if assigned_count > 0:
+                    preservation_error = (
+                        f"Cannot preserve cast assignments: {exc}. "
+                        f"{assigned_count} existing assignments may be lost."
+                    )
+                else:
+                    LOGGER.warning("Failed to check cast assignments: %s", exc)
+        except json.JSONDecodeError as exc:
+            preservation_error = (
+                f"Cannot preserve cast assignments: identities.json is corrupted ({exc}). "
+                "Existing assignments may be lost if you proceed."
+            )
+        except OSError as exc:
+            preservation_error = (
+                f"Cannot preserve cast assignments: failed to read identities.json ({exc}). "
+                "Existing assignments may be lost if you proceed."
+            )
+
+    # Handle preservation errors - fail hard unless explicitly ignored
+    if preservation_error:
+        if ignore_preservation_errors:
+            LOGGER.warning(
+                "CLUSTER PRESERVATION WARNING: %s (proceeding due to --ignore-preservation-errors)",
+                preservation_error,
+            )
+        else:
+            raise RuntimeError(
+                f"CLUSTER PRESERVATION FAILED: {preservation_error}\n"
+                "Use --ignore-preservation-errors to proceed anyway (may lose cast assignments)."
+            )
 
     progress = ProgressEmitter(
         args.ep_id,
@@ -5536,13 +6897,29 @@ def _run_cluster_stage(
         if not embedding_rows and not forced_singletons and not preserved_identities:
             raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
+        # === FIX 2: Pre-clustering validation ===
+        # Reject tracks with low internal similarity before they can pollute clusters
+        pre_cluster_rejected: List[Tuple[int, str]] = []
+        if embedding_rows and track_index:
+            track_ids, embedding_rows, pre_cluster_rejected = _validate_track_embeddings_for_clustering(
+                track_ids,
+                embedding_rows,
+                track_index,
+                min_internal_sim=0.70,  # Reject tracks with <70% internal consistency
+            )
+            if pre_cluster_rejected:
+                LOGGER.info(
+                    "Pre-clustering: rejected %d tracks with low internal similarity",
+                    len(pre_cluster_rejected),
+                )
+
         track_groups: Dict[int, List[int]] = defaultdict(list)
         if embedding_rows:
             labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
             for tid, label in zip(track_ids, labels):
                 track_groups[label].append(tid)
 
-        # Build track embeddings index for outlier removal
+        # Build track embeddings index for outlier removal and cohesion check
         track_embeddings: Dict[int, np.ndarray] = {}
         for tid, embed in zip(track_ids, embedding_rows):
             track_embeddings[tid] = embed
@@ -5562,6 +6939,26 @@ def _run_cluster_stage(
                     len(outlier_tracks),
                     min_identity_sim,
                 )
+
+        # === FIX 3: Cohesion quality gate ===
+        # Split clusters with low cohesion into singletons (likely different people)
+        split_clusters: List[Tuple[List[int], float, str]] = []
+        if track_groups:
+            track_groups, split_clusters = _split_low_cohesion_clusters(
+                track_groups,
+                track_embeddings,
+                min_cohesion=MIN_CLUSTER_COHESION,
+            )
+            if split_clusters:
+                total_tracks_split = sum(len(tracks) for tracks, _, _ in split_clusters)
+                LOGGER.info(
+                    "Cohesion quality gate: split %d low-cohesion clusters (%d tracks) into singletons",
+                    len(split_clusters),
+                    total_tracks_split,
+                )
+
+        # Add pre-cluster rejected tracks to outliers (they become singletons)
+        outlier_tracks.extend(pre_cluster_rejected)
 
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
@@ -5767,8 +7164,12 @@ def _run_cluster_stage(
         )
 
         # Now do S3 sync after completion is signaled
-        s3_stats = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
-        summary["artifacts"]["s3_uploads"] = s3_stats
+        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
+        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
+        if s3_sync_result.errors:
+            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
         _write_run_marker(
@@ -5818,6 +7219,152 @@ def _iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
                 continue
             if isinstance(obj, dict):
                 yield obj
+
+
+class ManifestValidationError(Exception):
+    """Raised when manifest validation fails with specific context."""
+
+    def __init__(self, manifest_type: str, message: str, path: Path | None = None):
+        self.manifest_type = manifest_type
+        self.path = path
+        super().__init__(f"{manifest_type}: {message}")
+
+
+def validate_manifest(
+    path: Path,
+    manifest_type: str,
+    required_fields: list[str] | None = None,
+    min_rows: int = 1,
+) -> tuple[bool, str | None, int]:
+    """Validate a JSONL manifest file with detailed error reporting.
+
+    Args:
+        path: Path to the manifest file
+        manifest_type: Human-readable name (e.g., "tracks.jsonl", "faces.jsonl")
+        required_fields: List of field names that must be present in each row
+        min_rows: Minimum number of valid rows required (default 1)
+
+    Returns:
+        Tuple of (is_valid, error_message, row_count)
+        - is_valid: True if validation passed
+        - error_message: None if valid, otherwise specific error message
+        - row_count: Number of valid rows found (0 if file doesn't exist or is invalid)
+
+    Raises:
+        ManifestValidationError: If validation fails (only if raise_on_error=True)
+    """
+    if not path.exists():
+        return False, f"{manifest_type} not found at {path}", 0
+
+    # Check for empty file
+    try:
+        file_size = path.stat().st_size
+        if file_size == 0:
+            return (
+                False,
+                f"{manifest_type} exists but is empty (0 bytes) – "
+                "the previous pipeline stage likely produced no valid output",
+                0,
+            )
+    except OSError as e:
+        return False, f"Cannot read {manifest_type}: {e}", 0
+
+    # Count rows and validate required fields
+    valid_rows = 0
+    invalid_rows = 0
+    missing_fields_examples: list[str] = []
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_num, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    invalid_rows += 1
+                    continue
+
+                if not isinstance(obj, dict):
+                    invalid_rows += 1
+                    continue
+
+                # Check required fields
+                if required_fields:
+                    missing = [f for f in required_fields if f not in obj]
+                    if missing:
+                        if len(missing_fields_examples) < 3:
+                            missing_fields_examples.append(
+                                f"line {line_num}: missing {missing}"
+                            )
+                        invalid_rows += 1
+                        continue
+
+                valid_rows += 1
+    except OSError as e:
+        return False, f"Error reading {manifest_type}: {e}", 0
+
+    # Build error message based on findings
+    if valid_rows == 0:
+        if invalid_rows > 0:
+            details = ""
+            if missing_fields_examples:
+                details = f" Examples: {'; '.join(missing_fields_examples)}"
+            return (
+                False,
+                f"{manifest_type} contains {invalid_rows} rows but none have required data.{details}",
+                0,
+            )
+        return (
+            False,
+            f"{manifest_type} exists but contains no valid data rows – "
+            "the previous pipeline stage likely produced no valid output",
+            0,
+        )
+
+    if valid_rows < min_rows:
+        return (
+            False,
+            f"{manifest_type} has only {valid_rows} valid rows, minimum {min_rows} required",
+            valid_rows,
+        )
+
+    # Validation passed
+    return True, None, valid_rows
+
+
+def require_manifest(
+    path: Path,
+    manifest_type: str,
+    required_fields: list[str] | None = None,
+    min_rows: int = 1,
+    hint: str | None = None,
+) -> int:
+    """Validate manifest and raise ManifestValidationError if invalid.
+
+    Args:
+        path: Path to the manifest file
+        manifest_type: Human-readable name (e.g., "tracks.jsonl")
+        required_fields: List of field names that must be present
+        min_rows: Minimum number of valid rows required
+        hint: Additional hint to add to error message (e.g., "run detect/track first")
+
+    Returns:
+        Number of valid rows found
+
+    Raises:
+        ManifestValidationError: If validation fails
+    """
+    is_valid, error_msg, row_count = validate_manifest(
+        path, manifest_type, required_fields, min_rows
+    )
+    if not is_valid:
+        full_msg = error_msg or f"{manifest_type} validation failed"
+        if hint:
+            full_msg = f"{full_msg}. Hint: {hint}"
+        raise ManifestValidationError(manifest_type, full_msg, path)
+    return row_count
 
 
 def _sample_track_uniformly(
@@ -5946,6 +7493,11 @@ def _load_track_samples(
             min_samples_per_track,
             sample_every_n_frames,
         )
+        # Add track_sample_count to each sample for adaptive quality thresholds
+        # Single-face tracks get more permissive quality gates to avoid orphaned clusters
+        track_sample_count = len(sampled)
+        for s in sampled:
+            s["track_sample_count"] = track_sample_count
         samples.extend(sampled)
 
     if sort_by_frame:
@@ -6009,18 +7561,48 @@ def _cluster_distance_threshold(similarity: float) -> float:
 
 
 def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
+    """Cluster embeddings using centroid-based hierarchical clustering.
+
+    Uses scipy's linkage with 'centroid' method, which compares cluster centroids
+    rather than averaging all pairwise distances. This is more robust when clusters
+    contain noisy embeddings (e.g., from single-frame tracks or extreme poses).
+
+    Args:
+        matrix: N x D embedding matrix (each row is a track's prototype embedding)
+        threshold: Similarity threshold (0-1). Clusters with centroid similarity
+                   above this threshold will be merged.
+
+    Returns:
+        Array of cluster labels for each input embedding.
+    """
     if matrix.shape[0] == 1:
         return np.array([0], dtype=int)
-    from sklearn.cluster import AgglomerativeClustering
 
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import pdist
+
+    # Normalize embeddings for cosine similarity
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)  # Avoid division by zero
+    normalized = matrix / norms
+
+    # Compute pairwise cosine distances (1 - similarity)
+    # For normalized vectors, cosine distance = 1 - dot product
+    distances = pdist(normalized, metric='cosine')
+
+    # Hierarchical clustering with centroid linkage
+    # 'centroid' method: distance between clusters is the distance between their centroids
+    # This is more robust than 'average' when clusters have noisy outliers
+    Z = linkage(distances, method='centroid')
+
+    # Convert similarity threshold to distance threshold
     distance_threshold = _cluster_distance_threshold(threshold)
-    model = AgglomerativeClustering(
-        n_clusters=None,
-        metric="cosine",
-        linkage="average",
-        distance_threshold=distance_threshold,
-    )
-    return model.fit_predict(matrix)
+
+    # Cut the dendrogram at the threshold
+    # fcluster returns labels starting from 1, convert to 0-indexed
+    labels = fcluster(Z, t=distance_threshold, criterion='distance')
+
+    return labels - 1  # Convert to 0-indexed labels
 
 
 # NOTE: Duplicate _cosine_similarity removed - using single definition at line ~590
@@ -6082,6 +7664,118 @@ def _remove_low_similarity_outliers(
             updated_groups[label] = kept_tracks
 
     return updated_groups, outliers
+
+
+def _validate_track_embeddings_for_clustering(
+    track_ids: List[int],
+    embedding_rows: List[np.ndarray],
+    track_index: Dict[int, Dict[str, Any]],
+    min_internal_sim: float = 0.70,
+) -> Tuple[List[int], List[np.ndarray], List[Tuple[int, str]]]:
+    """Pre-clustering validation: reject tracks with poor internal consistency.
+
+    Tracks with low internal similarity (intra-track sim) are unreliable and
+    can pollute clusters when grouped with others.
+
+    Args:
+        track_ids: List of track IDs to validate
+        embedding_rows: Corresponding embeddings for each track
+        track_index: Track metadata containing internal_sim scores
+        min_internal_sim: Minimum required internal similarity (default 0.70)
+
+    Returns:
+        - Filtered track_ids (those that passed)
+        - Filtered embedding_rows (corresponding embeddings)
+        - List of (track_id, reason) for rejected tracks
+    """
+    valid_track_ids = []
+    valid_embeddings = []
+    rejected: List[Tuple[int, str]] = []
+
+    for tid, embed in zip(track_ids, embedding_rows):
+        track_info = track_index.get(tid, {})
+        internal_sim = track_info.get("internal_sim")
+
+        # If no internal_sim available (single face track), allow through
+        if internal_sim is None:
+            valid_track_ids.append(tid)
+            valid_embeddings.append(embed)
+            continue
+
+        if internal_sim >= min_internal_sim:
+            valid_track_ids.append(tid)
+            valid_embeddings.append(embed)
+        else:
+            rejected.append((tid, f"low_internal_sim_{internal_sim:.3f}"))
+            LOGGER.info(
+                "Track %d rejected from clustering: internal_sim=%.3f < %.3f",
+                tid, internal_sim, min_internal_sim,
+            )
+
+    return valid_track_ids, valid_embeddings, rejected
+
+
+def _split_low_cohesion_clusters(
+    track_groups: Dict[int, List[int]],
+    track_embeddings: Dict[int, np.ndarray],
+    min_cohesion: float = MIN_CLUSTER_COHESION,
+) -> Tuple[Dict[int, List[int]], List[Tuple[List[int], float, str]]]:
+    """Quality gate: split clusters with cohesion below threshold into singletons.
+
+    Low cohesion indicates the tracks in a cluster are not similar enough
+    to each other - they are likely different people incorrectly grouped.
+
+    Args:
+        track_groups: Cluster label -> list of track IDs
+        track_embeddings: Track ID -> embedding vector
+        min_cohesion: Minimum cohesion threshold (default from MIN_CLUSTER_COHESION)
+
+    Returns:
+        - Updated track_groups with low-cohesion clusters split
+        - List of (original_track_ids, cohesion, reason) for split clusters
+    """
+    updated_groups: Dict[int, List[int]] = {}
+    split_clusters: List[Tuple[List[int], float, str]] = []
+    next_label = max(track_groups.keys()) + 1 if track_groups else 0
+
+    for label, track_ids in track_groups.items():
+        if len(track_ids) < 2:
+            # Single-track clusters always pass
+            updated_groups[label] = track_ids
+            continue
+
+        # Compute cluster cohesion (mean pairwise similarity)
+        cluster_embeds = [track_embeddings[tid] for tid in track_ids if tid in track_embeddings]
+        if len(cluster_embeds) < 2:
+            updated_groups[label] = track_ids
+            continue
+
+        # Compute centroid
+        centroid = np.mean(cluster_embeds, axis=0)
+        centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
+
+        # Compute cohesion as mean similarity to centroid
+        similarities = []
+        for embed in cluster_embeds:
+            sim = _cosine_similarity(embed, centroid_norm)
+            similarities.append(sim)
+        cohesion = float(np.mean(similarities)) if similarities else 0.0
+
+        if cohesion >= min_cohesion:
+            # Cluster passes quality gate
+            updated_groups[label] = track_ids
+        else:
+            # Split into singleton clusters
+            split_clusters.append((track_ids.copy(), cohesion, f"cohesion_{cohesion:.3f}_below_{min_cohesion:.2f}"))
+            LOGGER.warning(
+                "Splitting cluster %d into %d singletons: cohesion=%.3f < %.3f (tracks: %s)",
+                label, len(track_ids), cohesion, min_cohesion, track_ids,
+            )
+            for tid in track_ids:
+                updated_groups[next_label] = [tid]
+                next_label += 1
+
+    return updated_groups, split_clusters
 
 
 def _materialize_identity_thumb(

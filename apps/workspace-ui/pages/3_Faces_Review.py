@@ -492,6 +492,41 @@ def _show_local_fallback_banner(api_response: Dict[str, Any] | None) -> None:
                 st.caption(f"• ... and {remaining} more local file(s)")
 
 
+def _render_sync_to_s3_button(ep_id: str) -> None:
+    """Render a button to sync local thumbnails/crops to S3 when images aren't loading."""
+    sync_key = f"sync_s3_expanded:{ep_id}"
+    with st.expander("🔧 Thumbnails not loading?", expanded=st.session_state.get(sync_key, False)):
+        st.caption(
+            "If thumbnails are showing as placeholders, local files may need to be synced to S3. "
+            "Click below to upload any missing thumbnails and crops."
+        )
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            if st.button("📤 Sync to S3", key=f"sync_thumbs_s3_{ep_id}", use_container_width=True):
+                st.session_state[sync_key] = True
+                with st.spinner("Syncing thumbnails and crops to S3..."):
+                    try:
+                        api_base = st.session_state.get("api_base", "http://localhost:8000")
+                        resp = requests.post(f"{api_base}/episodes/{ep_id}/sync_thumbnails_to_s3", timeout=120)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            uploaded = data.get("uploaded_thumbs", 0) + data.get("uploaded_crops", 0)
+                            if uploaded > 0:
+                                st.success(f"✅ Uploaded {uploaded} file(s) to S3!")
+                                st.toast(f"Synced {uploaded} thumbnails/crops to S3")
+                                st.rerun()
+                            else:
+                                st.info("All thumbnails already in S3 (or no local files found).")
+                            if data.get("total_errors", 0) > 0:
+                                st.warning(f"⚠️ {data['total_errors']} upload error(s) - check API logs")
+                        else:
+                            st.error(f"Sync failed: {resp.status_code} - {resp.text[:200]}")
+                    except requests.Timeout:
+                        st.error("Sync timed out - try again or check S3 connectivity")
+                    except Exception as e:
+                        st.error(f"Sync failed: {e}")
+
+
 def _extract_s3_key_from_url(url: str) -> str:
     """Extract S3 key from presigned URL, handling multiple URL formats.
 
@@ -663,6 +698,7 @@ def _invalidate_assignment_caches() -> None:
     _fetch_people_cached.clear()
     _fetch_cast_cached.clear()
     _fetch_cluster_track_reps_cached.clear()
+    _fetch_unlinked_entities.clear()  # Critical: clears "Needs Assignment" cache
     # Clear session state caches if they exist
     for key in list(st.session_state.keys()):
         if key.startswith("cast_carousel_cache") or key.startswith("_thumb_result_cache"):
@@ -1118,9 +1154,22 @@ def _hydrate_view_from_query(ep_id: str) -> None:
     person_id = _single("person_id") or _single("person")
     identity_id = _single("identity_id") or _single("cluster_id") or _single("cluster")
     track_id = coerce_int(_single("track_id")) or coerce_int(_single("track"))
+    # low_quality param: auto-enable "Show skipped faces" for tracks from low-quality clusters
+    low_quality = _single("low_quality") in ("true", "1", "yes")
 
-    # Normalize view
-    if target_view not in {"people", "person_clusters", "cluster_tracks", "track"}:
+    # Normalize view - accept both internal names and URL slugs
+    # URL slugs from VIEW_NAMES: cast, person, cast-tracks, cluster, frames
+    URL_SLUG_TO_VIEW = {
+        "cast": "people",
+        "person": "person_clusters",
+        "cast-tracks": "cast_tracks",
+        "cluster": "cluster_tracks",
+        "frames": "track",
+    }
+    valid_views = {"people", "person_clusters", "cluster_tracks", "track", "cast_tracks"}
+    if target_view in URL_SLUG_TO_VIEW:
+        target_view = URL_SLUG_TO_VIEW[target_view]
+    elif target_view not in valid_views:
         target_view = None
 
     if person_id or identity_id or track_id is not None or target_view:
@@ -1138,6 +1187,7 @@ def _hydrate_view_from_query(ep_id: str) -> None:
             person_id=person_id,
             identity_id=identity_id,
             track_id=track_id,
+            low_quality=low_quality,
         )
         st.session_state["facebank_query_applied"] = ep_id
 
@@ -1148,6 +1198,7 @@ def _set_view(
     person_id: str | None = None,
     identity_id: str | None = None,
     track_id: int | None = None,
+    low_quality: bool = False,
 ) -> None:
     """Update view state and URL query params. Streamlit will auto-rerun after callback completes."""
     st.session_state["facebank_view"] = view
@@ -1161,6 +1212,11 @@ def _set_view(
         if ep_id:
             frames_load_key = f"load_frames_{ep_id}_{track_id}"
             st.session_state[frames_load_key] = True
+            # Auto-enable "Show skipped faces" for low-quality clusters (all faces skipped)
+            if low_quality:
+                show_skipped_key = f"show_skipped_{ep_id}_{track_id}"
+                st.session_state[show_skipped_key] = True
+                st.session_state[f"{show_skipped_key}::prev"] = True
 
     # Update URL with view name for easy reference
     _, view_slug = VIEW_NAMES.get(view, ("Unknown", "unknown"))
@@ -1315,8 +1371,9 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
         # Cluster Cleanup popover (flattened to avoid nested columns)
         with st.popover("🧹 Cluster Cleanup", help="Select which cleanup actions to run"):
             st.info(
-                "Cleanup focuses on **Needs Cast Assignment** items only: unassigned clusters, tracks, frames, and crops. "
-                "It fixes noisy tracks, refreshes embeddings, and regroups unassigned clusters into draft people without touching named cast links."
+                "Cleanup focuses on **Needs Cast Assignment** items only. "
+                "It fixes noisy tracks, regenerates embeddings for faces that have crops, and regroups unassigned clusters without touching named cast links. "
+                "**Note:** Faces marked as 'blurry' cannot be re-embedded without re-running detection."
             )
             # Show last cleanup timestamp if available
             last_cleanup = st.session_state.get(f"last_cleanup:{ep_id}")
@@ -2396,7 +2453,8 @@ def _render_cast_carousel(
 
     cast_api_resp = cache.get(show_key)
     if cast_api_resp is None:
-        cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast")
+        # Include featured seed thumbnails for cast gallery display
+        cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast", params={"include_featured": "1"})
         if cast_api_resp:
             cache[show_key] = cast_api_resp
     if not cast_api_resp:
@@ -2587,7 +2645,7 @@ def _render_unassigned_cluster_card(
     track_list = cluster_meta.get("tracks", [])
 
     # For single-track clusters, show even single-frame tracks (with low-confidence badge)
-    # For multi-track clusters, filter out single-frame tracks as noise
+    # For multi-track clusters, filter out single-frame tracks as noise UNLESS that would leave 0 tracks
     original_track_list = track_list
     is_single_track_cluster = len(track_list) == 1
     has_single_frame_track = any(t.get("faces", 0) <= 1 for t in track_list)
@@ -2597,8 +2655,14 @@ def _render_unassigned_cluster_card(
         filtered_tracks_count = 0
     else:
         # Filter out single-frame tracks for multi-track clusters
-        track_list = [t for t in track_list if t.get("faces", 0) > 1]
-        filtered_tracks_count = len(original_track_list) - len(track_list)
+        multi_frame_tracks = [t for t in track_list if t.get("faces", 0) > 1]
+        if multi_frame_tracks:
+            # We have some multi-frame tracks, filter out single-frame ones
+            track_list = multi_frame_tracks
+            filtered_tracks_count = len(original_track_list) - len(track_list)
+        else:
+            # ALL tracks are single-frame — show them with a warning rather than hiding everything
+            filtered_tracks_count = 0  # Don't filter, show all with warning
 
     # Recalculate counts after filtering
     tracks_count = len(track_list)
@@ -2663,7 +2727,7 @@ def _render_unassigned_cluster_card(
 
     with st.container(border=True):
         # Header with cluster info
-        col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
+        col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1, 1, 1])
         with col1:
             st.markdown(f"### 🔍 Cluster `{cluster_id}`")
             caption_parts = [f"{tracks_count} track(s) · {faces_count} frame(s)"]
@@ -2710,10 +2774,40 @@ def _render_unassigned_cluster_card(
             if quality_badges:
                 st.markdown(quality_badges, unsafe_allow_html=True)
 
-            # New metrics strip (Nov 2024) - temporal, ambiguity, isolation
+            # New metrics strip (Nov 2024) - temporal, ambiguity, isolation + track metrics for single-track
+            new_metrics = []
+
+            # For single-track clusters, add track-level metrics first
+            if is_single_track_cluster and track_list:
+                track_data = track_list[0]
+                track_id_val = track_data.get("track_id")
+                if track_id_val:
+                    track_metrics = _fetch_track_metrics_cached(ep_id, track_id_val)
+                    if track_metrics:
+                        # Track similarity (internal consistency)
+                        if track_metrics.get("track_similarity") is not None:
+                            new_metrics.append(MetricData(
+                                metric_type="track",
+                                value=track_metrics["track_similarity"],
+                                excluded=track_metrics.get("excluded_frames"),
+                            ))
+                        # Person cohesion (how well track fits with assigned person)
+                        if track_metrics.get("person_cohesion") is not None:
+                            new_metrics.append(MetricData(
+                                metric_type="person_cohesion",
+                                value=track_metrics["person_cohesion"],
+                            ))
+                    # Also use track-level data from cluster lookup if API didn't return
+                    elif track_data.get("internal_similarity") is not None:
+                        new_metrics.append(MetricData(
+                            metric_type="track",
+                            value=track_data["internal_similarity"],
+                            label="Track Consistency",
+                        ))
+
+            # Cluster-level metrics
             cluster_metrics = _fetch_cluster_metrics_cached(ep_id, cluster_id)
             if cluster_metrics:
-                new_metrics = []
                 # Temporal consistency
                 if cluster_metrics.get("temporal_consistency") is not None:
                     new_metrics.append(MetricData(
@@ -2734,8 +2828,8 @@ def _render_unassigned_cluster_card(
                         metric_type="isolation",
                         value=cluster_metrics["isolation"],
                     ))
-                if new_metrics:
-                    render_metrics_strip(new_metrics, compact=True)
+            if new_metrics:
+                render_metrics_strip(new_metrics, compact=True, strip_id=f"unassigned_{cluster_id}")
         with col2:
             # View cluster button
             if st.button("View", key=f"view_unassigned_{cluster_id}"):
@@ -2783,102 +2877,144 @@ def _render_unassigned_cluster_card(
                     st.rerun()
                 else:
                     st.error("Failed to delete cluster")
-
-        # Display one representative frame from each track in the cluster with scrollable carousel
-        if track_list:
-            num_tracks = len(track_list)
-            max_visible = 6  # Show up to 6 tracks at a time
-
-            # Track pagination state for this cluster (include ep_id to avoid collisions)
-            page_key = f"track_page_{ep_id}_{cluster_id}"
-            if page_key not in st.session_state:
-                st.session_state[page_key] = 0
-
-            current_page = st.session_state[page_key]
-            total_pages = (num_tracks + max_visible - 1) // max_visible
-
-            # Navigation controls if more than max_visible tracks
-            if total_pages > 1:
-                col_left, col_center, col_right = st.columns([1, 6, 1])
-                with col_left:
-                    if st.button("◀", key=f"prev_{ep_id}_{cluster_id}", disabled=current_page == 0):
-                        st.session_state[page_key] = max(0, current_page - 1)
-                        st.rerun()
-                with col_center:
-                    st.caption(
-                        f"Showing tracks {current_page * max_visible + 1}-{min((current_page + 1) * max_visible, num_tracks)} of {num_tracks}"
+        with col6:
+            # Copy debug info button
+            debug_info_lines = [
+                f"=== CLUSTER DEBUG INFO ===",
+                f"cluster_id: {cluster_id}",
+                f"episode_id: {ep_id}",
+                f"show_id: {show_id}",
+                f"",
+                f"--- COUNTS ---",
+                f"tracks: {tracks_count} (original: {original_tracks_count})",
+                f"faces: {faces_count} (original: {original_faces_count})",
+                f"filtered_single_frame_tracks: {filtered_tracks_count}",
+                f"",
+                f"--- CLUSTER META ---",
+                f"cohesion: {cluster_meta.get('cohesion')}",
+            ]
+            # Add metrics if available
+            cluster_metrics = _fetch_cluster_metrics_cached(ep_id, cluster_id)
+            if cluster_metrics:
+                debug_info_lines.append("")
+                debug_info_lines.append("--- METRICS (from API) ---")
+                debug_info_lines.append(f"temporal_consistency: {cluster_metrics.get('temporal_consistency')}")
+                debug_info_lines.append(f"ambiguity: {cluster_metrics.get('ambiguity')}")
+                debug_info_lines.append(f"isolation: {cluster_metrics.get('isolation')}")
+                debug_info_lines.append(f"first_match: {cluster_metrics.get('first_match')}")
+                debug_info_lines.append(f"second_match: {cluster_metrics.get('second_match')}")
+                if cluster_metrics.get("error"):
+                    debug_info_lines.append(f"error: {cluster_metrics.get('error')}")
+            else:
+                debug_info_lines.append("")
+                debug_info_lines.append("--- METRICS ---")
+                debug_info_lines.append("(no metrics returned from API)")
+            # Add track details
+            debug_info_lines.append("")
+            debug_info_lines.append("--- TRACKS ---")
+            debug_info_lines.append(f"is_single_track_cluster: {is_single_track_cluster}")
+            for i, t in enumerate(track_list[:10]):  # Limit to 10 tracks
+                debug_info_lines.append(
+                    f"  [{i}] track_id={t.get('track_id')}, faces={t.get('faces')}, "
+                    f"internal_sim={t.get('internal_similarity')}, sim={t.get('similarity')}"
+                )
+            if len(track_list) > 10:
+                debug_info_lines.append(f"  ... and {len(track_list) - 10} more tracks")
+            # For single-track clusters, include track-level API metrics
+            if is_single_track_cluster and track_list:
+                track_id_val = track_list[0].get("track_id")
+                if track_id_val:
+                    track_metrics = _fetch_track_metrics_cached(ep_id, track_id_val)
+                    debug_info_lines.append("")
+                    debug_info_lines.append("--- TRACK METRICS (single-track cluster) ---")
+                    if track_metrics:
+                        debug_info_lines.append(f"track_similarity: {track_metrics.get('track_similarity')}")
+                        debug_info_lines.append(f"person_cohesion: {track_metrics.get('person_cohesion')}")
+                        debug_info_lines.append(f"avg_quality: {track_metrics.get('avg_quality')}")
+                        debug_info_lines.append(f"excluded_frames: {track_metrics.get('excluded_frames')}")
+                        if track_metrics.get("error"):
+                            debug_info_lines.append(f"error: {track_metrics.get('error')}")
+                    else:
+                        debug_info_lines.append("(no track metrics from API)")
+            # Add suggestion info
+            if suggestion:
+                debug_info_lines.append("")
+                debug_info_lines.append("--- SUGGESTION ---")
+                debug_info_lines.append(f"suggested_person_id: {suggestion.get('suggested_person_id')}")
+                debug_info_lines.append(f"distance: {suggestion.get('distance')}")
+            if cast_suggestions:
+                debug_info_lines.append("")
+                debug_info_lines.append("--- CAST SUGGESTIONS ---")
+                for cs in cast_suggestions[:5]:
+                    debug_info_lines.append(
+                        f"  {cs.get('name')}: sim={cs.get('similarity')}, conf={cs.get('confidence')}"
                     )
-                with col_right:
-                    if st.button(
-                        "▶",
-                        key=f"next_{ep_id}_{cluster_id}",
-                        disabled=current_page >= total_pages - 1,
-                    ):
-                        st.session_state[page_key] = min(total_pages - 1, current_page + 1)
-                        st.rerun()
+            debug_info = "\n".join(debug_info_lines)
+            # Use st.code for copyable text with a popover
+            with st.popover("📋", help="Copy debug info"):
+                st.text_area("Debug Info", debug_info, height=300, key=f"debug_{cluster_id}")
+                st.caption("Select all (Cmd+A) and copy (Cmd+C)")
 
-            # Display current page of tracks in a single row
-            start_idx = current_page * max_visible
-            end_idx = min(start_idx + max_visible, num_tracks)
-            visible_tracks = track_list[start_idx:end_idx]
+        # Display each track as its own row with carousel of frames
+        if track_list:
+            import streamlit.components.v1 as components
 
-            # Create single-row columns for the visible tracks
-            if visible_tracks:
-                cols = st.columns(len(visible_tracks))
-                for idx, track in enumerate(visible_tracks):
-                    with cols[idx]:
-                        thumb_url = track.get("rep_thumb_url")
-                        track_id = track.get("track_id")
-                        track_faces = track.get("faces", 0)
-                        track_sim = track.get("similarity")
-                        track_internal_sim = track.get("internal_similarity")
-                        # Prefer explicit track similarity, else internal similarity as fallback
-                        track_sim_value = track_sim if track_sim is not None else track_internal_sim
-                        # Nov 2024: Enhanced with dropout indicator
-                        track_badge = None
-                        if track_sim_value is not None:
-                            excluded_frames = track.get("excluded_frames", 0)
-                            track_badge = render_track_with_dropout(track_sim_value, excluded_frames, track_faces)
+            # Inject CSS/JS once for all track carousels
+            st.markdown(helpers.cluster_track_rows_css(), unsafe_allow_html=True)
 
-                        # Show track info with similarity score if available
-                        caption = f"Track {track_id} · {track_faces} faces"
-                        if track_sim_value is not None:
-                            sim_pct = int(track_sim_value * 100)
-                            caption = f"Track {track_id} · {track_faces} faces · {sim_pct}% sim"
+            for track in track_list:
+                track_id_val = track.get("track_id")
+                track_faces = track.get("faces", 0)
+                track_sim = track.get("similarity")
+                track_internal_sim = track.get("internal_similarity")
+                track_sim_value = track_sim if track_sim is not None else track_internal_sim
 
-                        if thumb_url:
-                            # Use presigned URL directly if already HTTPS, otherwise extract key
-                            if thumb_url.startswith("https://"):
-                                thumb_src = thumb_url
-                            else:
-                                thumb_src = _extract_s3_key_from_url(thumb_url)
-                            thumb_markup = helpers.thumb_html(
-                                thumb_src,
-                                alt=f"Track {track_id}",
-                                hide_if_missing=False,
-                            )
-                            st.markdown(thumb_markup, unsafe_allow_html=True)
-                            if track_badge:
-                                st.markdown(track_badge, unsafe_allow_html=True)
-                        else:
-                            # Show placeholder when no thumbnail
-                            st.markdown(
-                                '<div style="width:147px;height:184px;background:#333;border-radius:6px;'
-                                'display:flex;align-items:center;justify-content:center;color:#666;">'
-                                '📷</div>',
-                                unsafe_allow_html=True,
-                            )
-                        st.caption(caption)
+                # Fetch frames for this track (sample every 1, up to 20 frames)
+                frames_data = _fetch_track_frames(
+                    ep_id,
+                    track_id_val,
+                    sample=1,
+                    page=1,
+                    page_size=20,
+                    include_skipped=False,
+                )
+                frames = frames_data.get("items", [])
+
+                # Build the carousel HTML for this track row
+                carousel_html = helpers.cluster_track_row_carousel_html(
+                    cluster_id=cluster_id,
+                    track_id=track_id_val,
+                    frames=frames,
+                    track_similarity=track_sim_value,
+                    track_faces=track_faces,
+                    thumb_width=100,
+                    max_visible=6,
+                )
+                st.markdown(carousel_html, unsafe_allow_html=True)
 
         # Show cast suggestions (Enhancement #1) if available
         if cast_suggestions:
             st.markdown("**🎯 Cast Suggestions:**")
             margin_pct = None
+            top_sim = cast_suggestions[0].get("similarity") or 0
+
+            # Filter suggestions: only show runners-up if they're close to top match
+            # - If delta >= 10%, only show the top suggestion (confident match)
+            # - If delta < 10%, show close runners-up (ambiguous, needs review)
+            filtered_suggestions = [cast_suggestions[0]]
             if len(cast_suggestions) > 1:
-                top = cast_suggestions[0].get("similarity") or 0
                 runner_up = cast_suggestions[1].get("similarity") or 0
-                margin_pct = int((max(top - runner_up, 0)) * 100)
-            for idx, cast_sugg in enumerate(cast_suggestions[:3]):
+                margin_pct = int((max(top_sim - runner_up, 0)) * 100)
+
+                # Only show runners-up if margin is small (< 10%) AND runner is decent (>= 40%)
+                if margin_pct < 10:
+                    for sugg in cast_suggestions[1:3]:
+                        sugg_sim = sugg.get("similarity") or 0
+                        # Include if within 10% of top AND at least 40% similarity
+                        if (top_sim - sugg_sim) < 0.10 and sugg_sim >= 0.40:
+                            filtered_suggestions.append(sugg)
+
+            for idx, cast_sugg in enumerate(filtered_suggestions):
                 sugg_cast_id = cast_sugg.get("cast_id")
                 sugg_name = cast_sugg.get("name", sugg_cast_id)
                 sugg_sim = cast_sugg.get("similarity", 0)
@@ -2886,8 +3022,8 @@ def _render_unassigned_cluster_card(
                 sugg_source = cast_sugg.get("source", "facebank")
                 faces_used = cast_sugg.get("faces_used")
 
-                # Nov 2024: Enhanced with rank context
-                total_suggs = min(len(cast_suggestions), 3)
+                # Nov 2024: Enhanced with rank context (use filtered list count)
+                total_suggs = len(filtered_suggestions)
                 sim_badge = render_cast_rank_badge(sugg_sim, rank=idx + 1, total_suggestions=total_suggs, cast_name=sugg_name)
                 # Confidence buckets aligned to cast thresholds (68/50)
                 conf_level = "high" if sugg_sim >= 0.68 else "medium" if sugg_sim >= 0.50 else "low"
@@ -2932,6 +3068,7 @@ def _render_unassigned_cluster_card(
                         }
                         resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                         if resp and resp.get("status") == "success":
+                            _invalidate_assignment_caches()
                             st.success(f"Assigned cluster to {sugg_name}!")
                             st.rerun()
                         else:
@@ -2996,6 +3133,7 @@ def _render_unassigned_cluster_card(
                     }
                     resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                     if resp and resp.get("status") == "success":
+                        _invalidate_assignment_caches()
                         st.success(f"Assigned cluster to {suggested_cast_name}!")
                         st.rerun()
                     else:
@@ -3054,6 +3192,7 @@ def _render_unassigned_cluster_card(
                                 }
                                 resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                                 if resp and resp.get("status") == "success":
+                                    _invalidate_assignment_caches()
                                     st.success(f"Assigned cluster to {cast_options.get(selected_cast_id, 'cast member')}!")
                                     st.rerun()
                                 else:
@@ -3062,28 +3201,31 @@ def _render_unassigned_cluster_card(
                 st.warning("No cast members available. Import cast first.")
 
         else:  # New person
-            new_name = st.text_input(
-                "Person name",
-                key=f"new_name_unassigned_{cluster_id}",
-                placeholder="Enter name...",
-            )
-            if st.button(
-                "Create person",
-                key=f"create_person_btn_{cluster_id}",
-                disabled=not new_name,
-            ):
-                with st.spinner("Creating person..."):
-                    payload = {
-                        "strategy": "manual",
-                        "cluster_ids": [cluster_id],
-                        "name": new_name,
-                    }
-                    resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                    if resp and resp.get("status") == "success":
-                        st.success(f"Created person '{new_name}' with this cluster!")
-                        st.rerun()
+            with st.form(key=f"create_person_form_{cluster_id}"):
+                new_name = st.text_input(
+                    "Person name",
+                    key=f"new_name_unassigned_{cluster_id}",
+                    placeholder="Enter name...",
+                )
+                submit_create = st.form_submit_button("Create person")
+
+                if submit_create:
+                    if not new_name:
+                        st.warning("Enter a name before creating.")
                     else:
-                        st.error("Failed to create person. Check logs.")
+                        with st.spinner("Creating person..."):
+                            payload = {
+                                "strategy": "manual",
+                                "cluster_ids": [cluster_id],
+                                "name": new_name,
+                            }
+                            resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+                            if resp and resp.get("status") == "success":
+                                _invalidate_assignment_caches()
+                                st.success(f"Created person '{new_name}' with this cluster!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to create person. Check logs.")
 
 
 def _render_auto_person_card(
@@ -3261,7 +3403,7 @@ def _render_auto_person_card(
                                     value=cluster_metrics["isolation"],
                                 ))
                             if new_metrics:
-                                render_metrics_strip(new_metrics, compact=True)
+                                render_metrics_strip(new_metrics, compact=True, strip_id=f"person_{person_id}_{cluster_id}")
 
                         # View and Delete cluster buttons
                         btn_cols = st.columns([1, 1])
@@ -3847,27 +3989,43 @@ def _render_people_view(
             _render_cast_gallery(ep_id, cast_gallery_cards, cluster_lookup, cast_cluster_centroids)
 
     # --- ARCHIVED ITEMS VIEWER ---
-    # Show archived items for this show (deleted people, clusters, tracks)
+    # Show archived items for THIS EPISODE only (not entire show)
     show_id_for_archive = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
-    archive_stats = _safe_api_get(f"/archive/shows/{show_id_for_archive}/stats")
-    total_archived = archive_stats.get("total_archived", 0) if archive_stats else 0
+
+    # Fetch archived items filtered by episode_id
+    archived_resp = _safe_api_get(
+        f"/archive/shows/{show_id_for_archive}",
+        params={"limit": 50, "episode_id": ep_id},
+    )
+    archived_items = archived_resp.get("items", []) if archived_resp else []
+    counts = archived_resp.get("counts", {}) if archived_resp else {}
+
+    # Use counts from filtered response (not show-wide stats)
+    total_archived = counts.get("total", 0) or len(archived_items)
 
     if total_archived > 0:
         with st.expander(f"🗃️ View Archived Items ({total_archived})", expanded=False):
             st.caption(
-                "Archived items are deleted faces that will be auto-matched in future episodes. "
+                "Archived items are deleted faces from this episode. "
                 "If the same face appears again, it can be automatically archived."
             )
 
-            # Fetch archived items
-            archived_resp = _safe_api_get(
-                f"/archive/shows/{show_id_for_archive}",
-                params={"limit": 50, "episode_id": ep_id},
-            )
-            archived_items = archived_resp.get("items", []) if archived_resp else []
-            counts = archived_resp.get("counts", {}) if archived_resp else {}
+            # Clear All button (clears only this episode's items)
+            clear_col1, clear_col2 = st.columns([3, 1])
+            with clear_col2:
+                if st.button("🗑️ Clear All", key="clear_all_archived", type="secondary"):
+                    # Clear only items from this episode
+                    clear_resp = helpers.api_delete(
+                        f"/archive/shows/{show_id_for_archive}/clear",
+                        params={"episode_id": ep_id}
+                    )
+                    if clear_resp:
+                        st.success(f"Cleared {clear_resp.get('deleted_count', 0)} archived items")
+                        st.rerun()
+                    else:
+                        st.error("Failed to clear archive")
 
-            # Show counts
+            # Show counts (already filtered by episode)
             stat_cols = st.columns(4)
             stat_cols[0].metric("People", counts.get("people", 0))
             stat_cols[1].metric("Clusters", counts.get("clusters", 0))
@@ -3974,11 +4132,24 @@ def _render_people_view(
             cluster_id = cluster_ids[0]
             cluster_info = cluster_lookup.get(cluster_id, {})
             counts = cluster_info.get("counts", {})
+            track_list = cluster_info.get("tracks", [])
+
+            # Calculate filtered track count (excluding single-frame tracks for multi-track clusters)
+            original_tracks = counts.get("tracks", 0)
+            if len(track_list) > 1:
+                # Multi-track cluster: count only multi-frame tracks
+                multi_frame_tracks = [t for t in track_list if t.get("faces", 0) > 1]
+                filtered_tracks = len(multi_frame_tracks) if multi_frame_tracks else len(track_list)
+            else:
+                # Single-track cluster: keep as-is
+                filtered_tracks = len(track_list) if track_list else original_tracks
+
             single_cluster_queue.append(
                 {
                     "kind": "cluster",
                     "cluster_id": cluster_id,
-                    "tracks": counts.get("tracks", 0),
+                    "tracks": filtered_tracks,  # Use filtered count for sorting
+                    "original_tracks": original_tracks,
                     "faces": counts.get("faces", 0),
                     "cohesion": cluster_info.get("cohesion"),
                 }
@@ -3999,6 +4170,149 @@ def _render_people_view(
     if total_items > 0:
         st.markdown("---")
         st.markdown(f"### 🔍 Needs Cast Assignment ({total_items})")
+
+        # Sort options for unassigned clusters
+        sort_col, analyze_col, spacer_col = st.columns([1.5, 1, 2])
+        with sort_col:
+            unassigned_sort_key = f"unassigned_sort:{ep_id}"
+            unassigned_sort_option = st.selectbox(
+                "Sort by",
+                UNASSIGNED_CLUSTER_SORT_OPTIONS,
+                index=0,  # Default: Face Count (High to Low)
+                key=unassigned_sort_key,
+                label_visibility="collapsed",
+            )
+
+            # Apply sorting based on selected option
+            def unassigned_sort_key_fn(item):
+                # Get faces - check direct key first, then counts dict
+                faces = item.get("faces")
+                if faces is None:
+                    faces = item.get("counts", {}).get("faces", 0)
+                # Get tracks - check direct key first, then counts dict
+                tracks = item.get("tracks")
+                if tracks is None:
+                    tracks = item.get("counts", {}).get("tracks", 0)
+                cohesion = item.get("cohesion") or item.get("avg_cohesion") or 0.0
+                cluster_id = item.get("cluster_id") or ""
+                # Get cast match score from suggestions if available
+                cid = item.get("cluster_id") or (item.get("episode_clusters", [None])[0])
+                cast_score = 0.0
+                if cid and cid in cast_suggestions_by_cluster:
+                    suggestions = cast_suggestions_by_cluster[cid]
+                    # Handle both list and dict formats
+                    if isinstance(suggestions, list) and suggestions:
+                        cast_score = suggestions[0].get("similarity", 0.0)
+                    elif isinstance(suggestions, dict):
+                        cast_score = suggestions.get("similarity", 0.0)
+
+                # Use negative values for descending, positive for ascending
+                # No reverse flag needed - just return appropriate tuple
+                if unassigned_sort_option == "Face Count (High to Low)":
+                    return (-faces, -tracks)
+                elif unassigned_sort_option == "Face Count (Low to High)":
+                    return (faces, tracks)
+                elif unassigned_sort_option == "Track Count (High to Low)":
+                    return (-tracks, -faces)
+                elif unassigned_sort_option == "Track Count (Low to High)":
+                    return (tracks, faces)
+                elif unassigned_sort_option == "Cast Match Score (High to Low)":
+                    return (-cast_score, -faces)
+                elif unassigned_sort_option == "Cast Match Score (Low to High)":
+                    return (cast_score, faces)
+                elif unassigned_sort_option == "Cluster Similarity (High to Low)":
+                    return (-cohesion if cohesion else 0, -faces)
+                elif unassigned_sort_option == "Cluster Similarity (Low to High)":
+                    return (cohesion if cohesion else 999, faces)
+                elif unassigned_sort_option == "Cluster ID (A-Z)":
+                    return (cluster_id, 0)
+                elif unassigned_sort_option == "Cluster ID (Z-A)":
+                    # Reverse by using negative ord values
+                    return tuple(-ord(c) for c in cluster_id) if cluster_id else (0,)
+                return (-faces, -tracks)
+
+            # Re-sort with user's chosen option (no reverse needed, handled in key)
+            multi_cluster_queue.sort(key=unassigned_sort_key_fn)
+            single_cluster_queue.sort(key=unassigned_sort_key_fn)
+
+        # Analyze & Group Similar button
+        with analyze_col:
+            if st.button("🔬 Analyze & Group Similar", key=f"analyze_unassigned_{ep_id}", help="Group similar unassigned clusters and suggest cast members"):
+                with st.spinner("Analyzing clusters..."):
+                    analysis_resp = _safe_api_get(f"/episodes/{ep_id}/analyze_unassigned")
+                    if analysis_resp and analysis_resp.get("status") == "success":
+                        st.session_state[f"unassigned_analysis:{ep_id}"] = analysis_resp
+                        st.rerun()
+                    else:
+                        msg = analysis_resp.get("message") if analysis_resp else "API error"
+                        st.error(f"Analysis failed: {msg}")
+
+        # Show analysis results if available
+        analysis_key = f"unassigned_analysis:{ep_id}"
+        if analysis_key in st.session_state:
+            analysis = st.session_state[analysis_key]
+            groups = analysis.get("groups", [])
+            singletons = analysis.get("singletons", [])
+            summary = analysis.get("summary", {})
+
+            with st.expander(f"📊 **Analysis Results** — {summary.get('group_count', 0)} groups found, {summary.get('singleton_clusters', 0)} singletons", expanded=True):
+                # Clear button
+                if st.button("✕ Clear Analysis", key=f"clear_analysis_{ep_id}"):
+                    del st.session_state[analysis_key]
+                    st.rerun()
+
+                if groups:
+                    st.markdown("#### 🔗 Similar Cluster Groups")
+                    st.caption("These clusters look similar and may be the same person. Consider merging them.")
+                    for grp in groups:
+                        grp_id = grp.get("group_id", "")
+                        cluster_ids = grp.get("clusters", [])
+                        cast_recs = grp.get("cast_recommendations", [])
+                        avg_sim = grp.get("avg_internal_similarity")
+
+                        with st.container(border=True):
+                            # Group header
+                            sim_str = f" · {int(avg_sim * 100)}% similar" if avg_sim else ""
+                            st.markdown(f"**{grp_id}** — {len(cluster_ids)} clusters{sim_str}")
+
+                            # Cast recommendations
+                            if cast_recs:
+                                rec_parts = []
+                                for rec in cast_recs[:3]:
+                                    conf_emoji = "🟢" if rec.get("confidence") == "high" else "🟡" if rec.get("confidence") == "medium" else "🔴"
+                                    rec_parts.append(f"{conf_emoji} {rec.get('name')} ({int(rec.get('similarity', 0) * 100)}%)")
+                                st.markdown(f"**Suggested:** {' · '.join(rec_parts)}")
+                            else:
+                                st.caption("No cast matches found")
+
+                            # Cluster details
+                            cluster_details = grp.get("cluster_details", [])
+                            details_str = ", ".join([
+                                f"`{d.get('cluster_id')}` ({d.get('tracks', 0)} tracks)"
+                                for d in cluster_details[:5]
+                            ])
+                            if len(cluster_details) > 5:
+                                details_str += f" +{len(cluster_details) - 5} more"
+                            st.caption(f"Clusters: {details_str}")
+
+                if singletons:
+                    st.markdown("#### 🔹 Unique Clusters (No Similar Matches)")
+                    st.caption("These clusters don't closely match other unassigned clusters.")
+                    singleton_info = []
+                    for s in singletons[:10]:
+                        cid = s.get("clusters", [""])[0]
+                        recs = s.get("cast_recommendations", [])
+                        if recs:
+                            top_rec = recs[0]
+                            singleton_info.append(f"`{cid}` → {top_rec.get('name')} ({int(top_rec.get('similarity', 0) * 100)}%)")
+                        else:
+                            singleton_info.append(f"`{cid}` → no matches")
+                    st.markdown("  \n".join(singleton_info))
+                    if len(singletons) > 10:
+                        st.caption(f"... and {len(singletons) - 10} more singletons")
+
+                if not groups and not singletons:
+                    st.info(analysis.get("message", "No unassigned clusters to analyze"))
 
         # Section 1: Multi-cluster identities (unnamed people with >1 cluster)
         if multi_cluster_queue:
@@ -4743,7 +5057,7 @@ def _render_cluster_tracks(
                 breakdown=cluster_metrics.get("quality_breakdown"),
             ))
         if metrics:
-            render_metrics_strip(metrics, compact=False)
+            render_metrics_strip(metrics, compact=False, strip_id=f"cluster_detail_{identity_id}")
 
     _identity_name_controls(
         ep_id=ep_id,
@@ -5129,7 +5443,7 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                 breakdown=track_metrics.get("quality_breakdown"),
             ))
         if metrics:
-            render_metrics_strip(metrics, compact=False)
+            render_metrics_strip(metrics, compact=False, strip_id=f"track_detail_{track_id}")
 
     roster_names = _fetch_roster_names(show_slug)
     sample_key = f"track_sample_{ep_id}_{track_id}"
@@ -5456,14 +5770,25 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                 f"crops={integrity.get('crops_files', 0)}"
             )
         elif integrity.get("all_skipped"):
-            info_col, btn_col = st.columns([3, 1])
-            with info_col:
-                st.info(
-                    f"All {integrity.get('faces_skipped', 0)} faces in this track were auto-skipped "
-                    f"(quality filters). Enable 'Show skipped' above to review them."
-                )
-            with btn_col:
-                if st.button("Unskip all", key=f"unskip_all_{ep_id}_{track_id}"):
+            faces_skipped = integrity.get("faces_skipped", 0)
+            # Check if show_skipped is already enabled
+            show_skipped_key = f"show_skipped_{ep_id}_{track_id}"
+            show_skipped_enabled = st.session_state.get(show_skipped_key, False)
+
+            st.warning(
+                f"**Low-Quality Track:** All {faces_skipped} face{'s' if faces_skipped != 1 else ''} "
+                "in this track were marked as too blurry for reliable embedding. "
+                "This cluster cannot receive automatic cast suggestions."
+            )
+
+            if show_skipped_enabled:
+                st.caption("'Show skipped faces' is enabled - the blurry frames are displayed below.")
+            else:
+                st.caption("Enable 'Show skipped faces' above to view these frames.")
+
+            action_cols_skip = st.columns([1, 1, 1, 1])
+            with action_cols_skip[0]:
+                if st.button("Unskip all", key=f"unskip_all_{ep_id}_{track_id}", help="Remove skip flag from all faces in this track"):
                     resp = _api_post(f"/episodes/{ep_id}/tracks/{track_id}/unskip_all", {})
                     if resp and resp.get("status") == "unskipped":
                         st.success(f"Unskipped {resp.get('unskipped', 0)} faces")
@@ -5471,6 +5796,27 @@ def _render_track_view(ep_id: str, track_id: int, identities_payload: Dict[str, 
                         st.rerun()
                     else:
                         st.error("Failed to unskip faces")
+            with action_cols_skip[1]:
+                if not show_skipped_enabled:
+                    if st.button("Show skipped", key=f"show_skipped_btn_{ep_id}_{track_id}"):
+                        st.session_state[show_skipped_key] = True
+                        st.session_state[f"{show_skipped_key}::prev"] = True
+                        _reset_track_media_state(ep_id, track_id)
+                        st.rerun()
+            with action_cols_skip[2]:
+                # Force Embed / Quality Rescue button
+                if st.button("🔧 Force Embed", key=f"force_embed_{ep_id}_{track_id}", help="Re-embed with lower quality threshold (inclusive profile)"):
+                    resp = _api_post(
+                        f"/episodes/{ep_id}/tracks/{track_id}/force_embed",
+                        {"quality_profile": "inclusive", "recompute_centroid": True},
+                    )
+                    if resp and resp.get("status") in ("rescued", "already_embedded"):
+                        unskipped = resp.get("unskipped", 0)
+                        st.success(f"Track rescued! Unskipped {unskipped} faces. Refresh Smart Suggestions to see results.")
+                        _reset_track_media_state(ep_id, track_id)
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to rescue: {resp.get('error', 'Unknown error')}")
     action_cols = st.columns([1.0, 1.0, 1.0])
     with action_cols[0]:
         targets = [ident.get("identity_id") for ident in identities if ident.get("identity_id") and ident.get("identity_id") != current_identity]
@@ -5879,6 +6225,9 @@ if not identities_payload:
 
 # Show local fallback banner if any local files are being used
 _show_local_fallback_banner(cluster_payload)
+
+# Show sync-to-S3 option for missing thumbnails
+_render_sync_to_s3_button(ep_id)
 
 cluster_lookup = _clusters_by_identity(cluster_payload)
 identities = identities_payload.get("identities", [])
