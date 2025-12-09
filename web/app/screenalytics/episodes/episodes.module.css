@@ -1,14 +1,25 @@
+/* Episodes List Page Styles */
+
 .page {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  padding-bottom: 40px;
 }
 
+/* Header */
 .header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
+}
+
+.headerLeft {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .title {
@@ -19,9 +30,15 @@
 }
 
 .subtitle {
-  margin: 4px 0 0;
+  margin: 0;
   color: #64748b;
   font-size: 14px;
+}
+
+.headerActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 .uploadBtn {
@@ -33,16 +50,24 @@
   font-weight: 600;
   font-size: 14px;
   white-space: nowrap;
+  border: none;
+  cursor: pointer;
 }
 
 .uploadBtn:hover {
   background: #1e293b;
 }
 
-.filters {
+/* Toolbar */
+.toolbar {
   display: flex;
+  align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
 }
 
 .searchInput {
@@ -53,6 +78,7 @@
   border-radius: 8px;
   font-size: 14px;
   outline: none;
+  background: #fff;
 }
 
 .searchInput:focus {
@@ -60,20 +86,187 @@
   box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.15);
 }
 
-.showSelect {
+.filterSelect {
   padding: 10px 14px;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   font-size: 14px;
   background: #fff;
   cursor: pointer;
-  min-width: 160px;
+  min-width: 140px;
 }
 
+.viewToggle {
+  display: flex;
+  gap: 4px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 4px;
+}
+
+.viewBtn {
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  border-radius: 6px;
+  font-size: 13px;
+  transition: all 0.15s;
+}
+
+.viewBtn:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+.viewBtnActive {
+  background: #0f172a;
+  color: #fff;
+}
+
+.viewBtnActive:hover {
+  background: #1e293b;
+  color: #fff;
+}
+
+/* Selection toolbar */
+.selectionToolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #eff6ff;
+  border-radius: 10px;
+  border: 1px solid #bfdbfe;
+}
+
+.selectionCount {
+  font-weight: 600;
+  color: #1d4ed8;
+  font-size: 14px;
+}
+
+.selectionActions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.selectAllBtn,
+.clearSelectionBtn {
+  padding: 6px 12px;
+  border: 1px solid #bfdbfe;
+  background: #fff;
+  color: #1d4ed8;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.selectAllBtn:hover,
+.clearSelectionBtn:hover {
+  background: #dbeafe;
+}
+
+.bulkDeleteBtn {
+  padding: 6px 12px;
+  border: none;
+  background: #dc2626;
+  color: #fff;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bulkDeleteBtn:hover {
+  background: #b91c1c;
+}
+
+.bulkDeleteBtn:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+/* Quick sections */
+.quickSection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.quickSectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.quickSectionTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.clearRecentBtn {
+  padding: 4px 8px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.clearRecentBtn:hover {
+  color: #64748b;
+}
+
+.quickList {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quickChip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  font-size: 13px;
+  color: #475569;
+  text-decoration: none;
+  transition: all 0.15s;
+}
+
+.quickChip:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+.quickChipFavorite {
+  background: #fef3c7;
+  border-color: #fcd34d;
+}
+
+.quickChipFavorite:hover {
+  background: #fde68a;
+}
+
+.starIcon {
+  color: #f59e0b;
+}
+
+/* Loading, error, empty states */
 .loading,
 .error,
 .empty {
-  padding: 40px;
+  padding: 60px 40px;
   text-align: center;
   color: #64748b;
   background: #f8fafc;
@@ -85,6 +278,41 @@
   background: #fef2f2;
 }
 
+.emptyIcon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.emptyTitle {
+  font-size: 18px;
+  font-weight: 600;
+  color: #0f172a;
+  margin: 0 0 8px;
+}
+
+.emptyText {
+  margin: 0 0 20px;
+  color: #64748b;
+}
+
+.emptyAction {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  background: #0f172a;
+  color: #fff;
+  border-radius: 8px;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.emptyAction:hover {
+  background: #1e293b;
+}
+
+/* Show groups (hierarchical view) */
 .showsList {
   display: flex;
   flex-direction: column;
@@ -130,6 +358,11 @@
   margin-left: auto;
   color: #94a3b8;
   font-size: 12px;
+  transition: transform 0.2s;
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
 }
 
 .seasonsContainer {
@@ -153,28 +386,120 @@
   border-bottom: 1px solid #e2e8f0;
 }
 
+/* Card grid */
 .episodesGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
 }
 
+/* Episode card */
 .episodeCard {
   position: relative;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border-radius: 12px;
   background: #fff;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
 }
 
 .episodeCard:hover {
   border-color: #cbd5e1;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.episodeCardSelected {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.episodeCardFocused {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+.cardCheckbox {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  width: 20px;
+  height: 20px;
+  cursor: pointer;
+  accent-color: #3b82f6;
+}
+
+.cardThumbnail {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #f1f5f9;
+  overflow: hidden;
+}
+
+.thumbnailImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.thumbnailPlaceholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%);
+  color: #94a3b8;
+  font-size: 32px;
+}
+
+.thumbnailOverlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 8px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.statusBadge {
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.statusPending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.statusProcessing {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.statusComplete {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.statusError {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.cardContent {
+  padding: 12px;
 }
 
 .episodeLink {
   display: block;
-  padding: 14px;
   text-decoration: none;
   color: inherit;
 }
@@ -183,12 +508,12 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
 .episodeNumber {
   font-weight: 700;
-  font-size: 16px;
+  font-size: 15px;
   color: #0f172a;
 }
 
@@ -198,81 +523,411 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
 }
 
 .episodeId {
-  font-size: 12px;
+  font-size: 11px;
   color: #94a3b8;
   font-family: monospace;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.airDate {
-  margin-top: 6px;
+.episodeStats {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
   font-size: 12px;
   color: #64748b;
 }
 
+.stat {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Progress bar for processing episodes */
+.progressBar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: #e2e8f0;
+}
+
+.progressFill {
+  height: 100%;
+  background: #3b82f6;
+  transition: width 0.3s ease;
+}
+
+/* Card actions */
 .cardActions {
   position: absolute;
   top: 8px;
   right: 8px;
-}
-
-.deleteBtn {
-  width: 24px;
-  height: 24px;
-  border: none;
-  background: transparent;
-  color: #94a3b8;
-  cursor: pointer;
-  font-size: 18px;
-  line-height: 1;
-  border-radius: 4px;
+  display: flex;
+  gap: 4px;
   opacity: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  transition: opacity 0.15s;
 }
 
-.episodeCard:hover .deleteBtn {
+.episodeCard:hover .cardActions {
   opacity: 1;
 }
 
-.deleteBtn:hover {
-  background: #fee2e2;
-  color: #b91c1c;
-}
-
-.confirmRow {
+.actionBtn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: rgba(255, 255, 255, 0.9);
+  color: #64748b;
+  cursor: pointer;
+  border-radius: 6px;
+  font-size: 14px;
   display: flex;
-  gap: 4px;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
 }
 
-.confirmDeleteBtn {
-  padding: 4px 8px;
+.actionBtn:hover {
+  background: #fff;
+  color: #0f172a;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.actionBtnFavorite {
+  color: #f59e0b;
+}
+
+.actionBtnDelete:hover {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+/* Table view */
+.tableContainer {
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+}
+
+.episodesTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.episodesTable th {
+  padding: 12px 16px;
+  text-align: left;
+  font-weight: 600;
+  color: #475569;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+  white-space: nowrap;
+}
+
+.episodesTable th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.episodesTable th.sortable:hover {
+  background: #f1f5f9;
+}
+
+.sortIndicator {
+  margin-left: 4px;
+  opacity: 0.5;
+}
+
+.sortActive {
+  opacity: 1;
+}
+
+.episodesTable td {
+  padding: 12px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #0f172a;
+}
+
+.episodesTable tr:hover {
+  background: #f8fafc;
+}
+
+.episodesTable tr.selected {
+  background: #eff6ff;
+}
+
+.tableEpisodeLink {
+  color: #0f172a;
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.tableEpisodeLink:hover {
+  color: #3b82f6;
+  text-decoration: underline;
+}
+
+.tableActions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Timeline view */
+.timelineContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.timelineMonth {
+  margin-top: 20px;
+  margin-bottom: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  color: #64748b;
+}
+
+.timelineItem {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  text-decoration: none;
+  color: inherit;
+  transition: all 0.15s;
+}
+
+.timelineItem:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.timelineDate {
+  width: 80px;
+  font-size: 13px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.timelineThumbnail {
+  width: 60px;
+  height: 34px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: #f1f5f9;
+}
+
+.timelineInfo {
+  flex: 1;
+  min-width: 0;
+}
+
+.timelineTitle {
+  font-weight: 600;
+  color: #0f172a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timelineSubtitle {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.timelineStatus {
+  flex-shrink: 0;
+}
+
+/* Keyboard shortcuts hint */
+.keyboardHint {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  padding: 8px 12px;
+  background: #0f172a;
+  color: #fff;
+  border-radius: 8px;
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+.keyboardHint kbd {
+  display: inline-block;
+  padding: 2px 6px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  margin: 0 2px;
+}
+
+/* Bulk delete modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modalContent {
+  background: #fff;
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 480px;
+  width: 90%;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.modalTitle {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0 0 8px;
+}
+
+.modalText {
+  color: #475569;
+  margin: 0 0 16px;
+  font-size: 14px;
+}
+
+.modalList {
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 13px;
+  font-family: monospace;
+}
+
+.modalActions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.modalCancelBtn {
+  padding: 10px 16px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #475569;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.modalCancelBtn:hover {
+  background: #f8fafc;
+}
+
+.modalDeleteBtn {
+  padding: 10px 16px;
   border: none;
   background: #dc2626;
   color: #fff;
-  border-radius: 4px;
-  font-size: 11px;
+  border-radius: 8px;
+  font-size: 14px;
   font-weight: 600;
   cursor: pointer;
 }
 
-.confirmDeleteBtn:hover {
+.modalDeleteBtn:hover {
   background: #b91c1c;
 }
 
-.cancelBtn {
-  padding: 4px 8px;
+.modalDeleteBtn:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+/* Thumbnail picker modal */
+.thumbnailPicker {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.timestampInput {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.timestampField {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.previewBtn {
+  padding: 10px 16px;
   border: 1px solid #e2e8f0;
   background: #fff;
-  color: #64748b;
-  border-radius: 4px;
-  font-size: 11px;
+  color: #0f172a;
+  border-radius: 8px;
   cursor: pointer;
 }
 
-.cancelBtn:hover {
+.previewBtn:hover {
   background: #f8fafc;
+}
+
+.thumbnailPreview {
+  aspect-ratio: 16 / 9;
+  background: #f1f5f9;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.thumbnailPreview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .searchInput {
+    min-width: 100%;
+  }
+
+  .viewToggle {
+    justify-content: center;
+  }
+
+  .episodesGrid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  }
+
+  .keyboardHint {
+    display: none;
+  }
 }

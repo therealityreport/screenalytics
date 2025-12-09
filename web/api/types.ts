@@ -139,3 +139,58 @@ export type EpisodeSummary = {
 export type EpisodeListResponse = {
   episodes: EpisodeSummary[];
 };
+
+// Extended episode with status for list view
+export type EpisodeWithStatus = EpisodeSummary & {
+  status?: EpisodeStatus;
+  thumbnail_url?: string | null;
+  featured_timestamp?: number | null;
+  processing_progress?: number | null;
+};
+
+// Episode sort options
+export type EpisodeSortOption =
+  | "show-season-episode"
+  | "newest-first"
+  | "oldest-first"
+  | "most-tracks"
+  | "alphabetical";
+
+// Episode view modes
+export type EpisodeViewMode = "card" | "table" | "timeline";
+
+// Bulk operation types
+export type BulkOperation = "delete" | "rerun-detect" | "rerun-cluster";
+
+// Featured thumbnail request
+export type SetFeaturedThumbnailRequest = {
+  ep_id: string;
+  timestamp_s: number;
+};
+
+// Timestamp preview response
+export type TimestampPreviewResponse = {
+  url: string;
+  timestamp_s: number;
+  frame_idx: number;
+  faces_count: number;
+  faces?: Array<{
+    track_id: number;
+    identity_id?: string;
+    cast_name?: string;
+    bbox: [number, number, number, number];
+  }>;
+};
+
+// Recently accessed episode (for localStorage)
+export type RecentEpisode = {
+  ep_id: string;
+  show_slug: string;
+  accessed_at: string;
+};
+
+// Favorite episode (for localStorage)
+export type FavoriteEpisode = {
+  ep_id: string;
+  added_at: string;
+};

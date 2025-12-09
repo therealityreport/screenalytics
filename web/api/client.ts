@@ -15,6 +15,7 @@ import type {
   S3VideosResponse,
   Show,
   ShowCreateRequest,
+  TimestampPreviewResponse,
 } from "./types";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/$/, "");
@@ -202,6 +203,55 @@ export async function upsertEpisodeById(payload: {
 export async function fetchEpisodes(): Promise<EpisodeSummary[]> {
   const response = await apiFetch<EpisodeListResponse>("/episodes");
   return response.episodes || [];
+}
+
+// Bulk delete episodes
+export async function bulkDeleteEpisodes(
+  episodeIds: string[],
+  includeS3: boolean = true
+): Promise<{ deleted: number; errors: string[] }> {
+  const results = await Promise.allSettled(
+    episodeIds.map((epId) =>
+      apiFetch<void>(`/episodes/${epId}/delete`, {
+        method: "POST",
+        body: JSON.stringify({ include_s3: includeS3 }),
+      })
+    )
+  );
+
+  const errors: string[] = [];
+  let deleted = 0;
+
+  results.forEach((result, idx) => {
+    if (result.status === "fulfilled") {
+      deleted++;
+    } else {
+      errors.push(`${episodeIds[idx]}: ${result.reason?.message || "Unknown error"}`);
+    }
+  });
+
+  return { deleted, errors };
+}
+
+// Timestamp preview (for featured thumbnail selection)
+export async function fetchTimestampPreview(
+  episodeId: string,
+  timestampS: number
+): Promise<TimestampPreviewResponse> {
+  return apiFetch<TimestampPreviewResponse>(
+    `/episodes/${episodeId}/timestamp/${timestampS}/preview`
+  );
+}
+
+// Set featured thumbnail for episode
+export async function setFeaturedThumbnail(
+  episodeId: string,
+  timestampS: number
+): Promise<{ url: string }> {
+  return apiFetch<{ url: string }>(`/episodes/${episodeId}/featured_thumbnail`, {
+    method: "POST",
+    body: JSON.stringify({ timestamp_s: timestampS }),
+  });
 }
 
 export { normalizeError };

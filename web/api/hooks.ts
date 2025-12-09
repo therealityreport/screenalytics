@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  bulkDeleteEpisodes,
   cancelJob,
   createEpisode,
   createShow,
@@ -15,9 +16,11 @@ import {
   fetchJobs,
   fetchS3Videos,
   fetchShows,
+  fetchTimestampPreview,
   mapEventStream,
   mirrorEpisodeFromS3,
   presignEpisodeAssets,
+  setFeaturedThumbnail,
   triggerAudioPipeline,
   triggerJob,
   upsertEpisodeById,
@@ -36,6 +39,7 @@ import type {
   S3VideoItem,
   Show,
   ShowCreateRequest,
+  TimestampPreviewResponse,
 } from "./types";
 
 export function useEpisodeStatus(
@@ -251,4 +255,135 @@ export function useEpisodes(options?: { enabled?: boolean }) {
     enabled: options?.enabled ?? true,
     staleTime: 30 * 1000, // 30 seconds
   });
+}
+
+// Bulk delete episodes
+export function useBulkDeleteEpisodes() {
+  const client = useQueryClient();
+  return useMutation<
+    { deleted: number; errors: string[] },
+    ApiError,
+    { episodeIds: string[]; includeS3?: boolean }
+  >({
+    mutationFn: ({ episodeIds, includeS3 }) => bulkDeleteEpisodes(episodeIds, includeS3),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["episodes"] });
+      client.invalidateQueries({ queryKey: ["s3-videos"] });
+    },
+  });
+}
+
+// Timestamp preview for featured thumbnail
+export function useTimestampPreview(
+  episodeId: string,
+  timestampS: number,
+  options?: { enabled?: boolean }
+) {
+  return useQuery<TimestampPreviewResponse, ApiError>({
+    queryKey: ["timestamp-preview", episodeId, timestampS],
+    queryFn: () => fetchTimestampPreview(episodeId, timestampS),
+    enabled: options?.enabled ?? true,
+    staleTime: 60 * 1000, // 1 minute
+  });
+}
+
+// Set featured thumbnail
+export function useSetFeaturedThumbnail() {
+  const client = useQueryClient();
+  return useMutation<{ url: string }, ApiError, { episodeId: string; timestampS: number }>({
+    mutationFn: ({ episodeId, timestampS }) => setFeaturedThumbnail(episodeId, timestampS),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episodes"] });
+      client.invalidateQueries({ queryKey: ["episode-detail", variables.episodeId] });
+    },
+  });
+}
+
+// Batch fetch episode statuses
+export function useEpisodeStatuses(
+  episodeIds: string[],
+  options?: { enabled?: boolean; refetchInterval?: number }
+) {
+  return useQuery<Map<string, EpisodeStatus>, ApiError>({
+    queryKey: ["episode-statuses", episodeIds.sort().join(",")],
+    queryFn: async () => {
+      const results = await Promise.allSettled(
+        episodeIds.map((epId) => fetchEpisodeStatus(epId))
+      );
+      const statusMap = new Map<string, EpisodeStatus>();
+      results.forEach((result, idx) => {
+        if (result.status === "fulfilled") {
+          statusMap.set(episodeIds[idx], result.value);
+        }
+      });
+      return statusMap;
+    },
+    enabled: (options?.enabled ?? true) && episodeIds.length > 0,
+    refetchInterval: options?.refetchInterval,
+    staleTime: 10 * 1000, // 10 seconds
+  });
+}
+
+// Local storage helpers for favorites and recent episodes
+const FAVORITES_KEY = "screenalytics_favorites";
+const RECENT_KEY = "screenalytics_recent";
+const MAX_RECENT = 10;
+
+export function useFavorites() {
+  const getFavorites = useCallback((): string[] => {
+    if (typeof window === "undefined") return [];
+    try {
+      const stored = localStorage.getItem(FAVORITES_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const addFavorite = useCallback((epId: string) => {
+    if (typeof window === "undefined") return;
+    const favorites = getFavorites();
+    if (!favorites.includes(epId)) {
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify([epId, ...favorites]));
+    }
+  }, [getFavorites]);
+
+  const removeFavorite = useCallback((epId: string) => {
+    if (typeof window === "undefined") return;
+    const favorites = getFavorites().filter((id) => id !== epId);
+    localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites));
+  }, [getFavorites]);
+
+  const isFavorite = useCallback(
+    (epId: string) => getFavorites().includes(epId),
+    [getFavorites]
+  );
+
+  return { getFavorites, addFavorite, removeFavorite, isFavorite };
+}
+
+export function useRecentEpisodes() {
+  const getRecent = useCallback((): string[] => {
+    if (typeof window === "undefined") return [];
+    try {
+      const stored = localStorage.getItem(RECENT_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const addRecent = useCallback((epId: string) => {
+    if (typeof window === "undefined") return;
+    const recent = getRecent().filter((id) => id !== epId);
+    const updated = [epId, ...recent].slice(0, MAX_RECENT);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+  }, [getRecent]);
+
+  const clearRecent = useCallback(() => {
+    if (typeof window === "undefined") return;
+    localStorage.removeItem(RECENT_KEY);
+  }, []);
+
+  return { getRecent, addRecent, clearRecent };
 }
