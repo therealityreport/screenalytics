@@ -3055,6 +3055,9 @@ def _render_unassigned_cluster_card(
                                 )
                             st.caption(caption)
 
+        # Visual separator between tracks and assignment controls
+        st.markdown("---")
+
         # Show cast suggestions (Enhancement #1) if available
         if cast_suggestions:
             st.markdown("**🎯 Cast Suggestions:**")
