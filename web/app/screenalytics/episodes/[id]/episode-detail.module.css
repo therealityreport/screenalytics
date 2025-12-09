@@ -837,6 +837,370 @@
   border-radius: 12px;
 }
 
+/* Auto-Run Pipeline Panel */
+.autoRunPanel {
+  padding: 20px;
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  border-radius: 12px;
+  color: #fff;
+}
+
+.autoRunHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.autoRunTitle {
+  font-size: 16px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.autoRunPhases {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.autoRunPhase {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.autoRunPhaseActive {
+  background: #3b82f6;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.autoRunPhaseComplete {
+  background: #10b981;
+}
+
+.autoRunPhasePending {
+  opacity: 0.6;
+}
+
+.autoRunArrow {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 14px;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.autoRunProgress {
+  margin-bottom: 16px;
+}
+
+.autoRunProgressBar {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.autoRunProgressFill {
+  height: 100%;
+  background: linear-gradient(90deg, #10b981, #3b82f6);
+  transition: width 0.3s ease;
+}
+
+.autoRunProgressText {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.autoRunActions {
+  display: flex;
+  gap: 12px;
+}
+
+.autoRunBtn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.autoRunBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.autoRunBtnStart {
+  background: #10b981;
+  color: #fff;
+}
+
+.autoRunBtnStart:hover:not(:disabled) {
+  background: #059669;
+}
+
+.autoRunBtnStop {
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.autoRunBtnStop:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.autoRunStatus {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.autoRunSuccess {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}
+
+.autoRunError {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+
+/* Improve Faces Modal */
+.improveFacesModal {
+  max-width: 700px;
+}
+
+.improveFacesProgress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.improveFacesProgressBar {
+  flex: 1;
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.improveFacesProgressFill {
+  height: 100%;
+  background: #3b82f6;
+  transition: width 0.3s ease;
+}
+
+.improveFacesProgressText {
+  font-size: 13px;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.improveFacesQuestion {
+  font-size: 18px;
+  font-weight: 600;
+  color: #0f172a;
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.improveFacesCompare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+
+.improveFacesCluster {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 20px;
+  background: #f8fafc;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+}
+
+.improveFacesImage {
+  width: 160px;
+  height: 160px;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 3px solid #fff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.improveFacesNoImage {
+  width: 160px;
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #e2e8f0;
+  border-radius: 12px;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.improveFacesClusterInfo {
+  text-align: center;
+}
+
+.improveFacesClusterId {
+  font-size: 11px;
+  color: #94a3b8;
+  font-family: monospace;
+}
+
+.improveFacesClusterStats {
+  font-size: 13px;
+  color: #64748b;
+  margin-top: 4px;
+}
+
+.improveFacesSimilarity {
+  text-align: center;
+  padding: 12px;
+  background: #f1f5f9;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.improveFacesSimilarityLabel {
+  font-size: 12px;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.improveFacesSimilarityValue {
+  font-size: 24px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.improveFacesActions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.improveFacesBtn {
+  padding: 12px 24px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  min-width: 100px;
+}
+
+.improveFacesBtnYes {
+  background: #10b981;
+  color: #fff;
+  border: none;
+}
+
+.improveFacesBtnYes:hover {
+  background: #059669;
+}
+
+.improveFacesBtnNo {
+  background: #fff;
+  color: #475569;
+  border: 1px solid #e2e8f0;
+}
+
+.improveFacesBtnNo:hover {
+  background: #f8fafc;
+}
+
+.improveFacesBtnSkip {
+  background: transparent;
+  color: #94a3b8;
+  border: none;
+  font-size: 13px;
+}
+
+.improveFacesBtnSkip:hover {
+  color: #64748b;
+}
+
+.improveFacesComplete {
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.improveFacesCompleteIcon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.improveFacesCompleteTitle {
+  font-size: 20px;
+  font-weight: 600;
+  color: #0f172a;
+  margin-bottom: 8px;
+}
+
+.improveFacesCompleteText {
+  color: #64748b;
+  margin-bottom: 24px;
+}
+
+.improveFacesCompleteActions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+/* Improve Faces Button in Phase Card */
+.phaseImproveFacesBtn {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #fef3c7;
+  color: #92400e;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.phaseImproveFacesBtn:hover {
+  background: #fde68a;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   .header {

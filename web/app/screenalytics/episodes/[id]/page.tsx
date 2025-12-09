@@ -17,7 +17,11 @@ import {
   useDeleteEpisode,
   usePipelineSettings,
   useRecentEpisodes,
+  useImproveFacesSuggestions,
+  useMarkInitialPassDone,
+  useSubmitFaceReviewDecision,
 } from "@/api/hooks";
+import type { ImproveFacesSuggestion } from "@/api/client";
 import type {
   EpisodePhase,
   PipelineSettings,
@@ -97,6 +101,7 @@ function PhaseCard({
   onRun,
   isRunning,
   disabled,
+  extraAction,
 }: {
   title: string;
   icon: string;
@@ -108,6 +113,7 @@ function PhaseCard({
   onRun: () => void;
   isRunning?: boolean;
   disabled?: boolean;
+  extraAction?: { label: string; onClick: () => void };
 }) {
   return (
     <div className={styles.phaseCard}>
@@ -161,6 +167,16 @@ function PhaseCard({
           {isRunning ? "Running..." : status === "success" || status === "done" ? "Rerun" : "Run"}
         </button>
       </div>
+
+      {/* Extra action button (e.g., Improve Faces after cluster) */}
+      {extraAction && (
+        <button
+          className={styles.phaseImproveFacesBtn}
+          onClick={extraAction.onClick}
+        >
+          🎯 {extraAction.label}
+        </button>
+      )}
     </div>
   );
 }
@@ -563,6 +579,316 @@ function DeleteModal({
   );
 }
 
+// Auto-Run Pipeline phases
+type AutoRunPhase = "detect" | "faces" | "cluster";
+
+// Phase weights for progress calculation
+const PHASE_WEIGHTS: Record<AutoRunPhase, number> = {
+  detect: 0.5,
+  faces: 0.3,
+  cluster: 0.2,
+};
+
+// Auto-Run Pipeline Panel Component
+function AutoRunPanel({
+  isActive,
+  currentPhase,
+  completedPhases,
+  progress,
+  onStart,
+  onStop,
+  disabled,
+  statusMessage,
+  isComplete,
+  error,
+}: {
+  isActive: boolean;
+  currentPhase: AutoRunPhase | null;
+  completedPhases: AutoRunPhase[];
+  progress: number;
+  onStart: () => void;
+  onStop: () => void;
+  disabled: boolean;
+  statusMessage?: string;
+  isComplete?: boolean;
+  error?: string;
+}) {
+  const allPhases: AutoRunPhase[] = ["detect", "faces", "cluster"];
+  const phaseLabels: Record<AutoRunPhase, string> = {
+    detect: "Detect/Track",
+    faces: "Faces Harvest",
+    cluster: "Cluster",
+  };
+
+  // Calculate overall progress
+  let overallProgress = 0;
+  for (const phase of completedPhases) {
+    overallProgress += PHASE_WEIGHTS[phase] * 100;
+  }
+  if (currentPhase) {
+    overallProgress += PHASE_WEIGHTS[currentPhase] * progress;
+  }
+
+  return (
+    <div className={styles.autoRunPanel}>
+      <div className={styles.autoRunHeader}>
+        <div className={styles.autoRunTitle}>
+          <span>🚀</span>
+          Auto-Run Pipeline
+        </div>
+      </div>
+
+      {/* Phase Indicators */}
+      <div className={styles.autoRunPhases}>
+        {allPhases.map((phase, idx) => {
+          const isComplete = completedPhases.includes(phase);
+          const isRunning = currentPhase === phase;
+          const isPending = !isComplete && !isRunning;
+
+          return (
+            <span key={phase}>
+              <span
+                className={`${styles.autoRunPhase} ${
+                  isComplete ? styles.autoRunPhaseComplete :
+                  isRunning ? styles.autoRunPhaseActive :
+                  styles.autoRunPhasePending
+                }`}
+              >
+                {isComplete ? "✓" : isRunning ? "⟳" : "○"} {phaseLabels[phase]}
+              </span>
+              {idx < allPhases.length - 1 && (
+                <span className={styles.autoRunArrow}>→</span>
+              )}
+            </span>
+          );
+        })}
+      </div>
+
+      {/* Progress Bar */}
+      {isActive && (
+        <div className={styles.autoRunProgress}>
+          <div className={styles.autoRunProgressBar}>
+            <div
+              className={styles.autoRunProgressFill}
+              style={{ width: `${Math.min(100, overallProgress)}%` }}
+            />
+          </div>
+          <div className={styles.autoRunProgressText}>
+            <span>{overallProgress.toFixed(0)}% overall</span>
+            {currentPhase && <span>Running: {phaseLabels[currentPhase]}</span>}
+          </div>
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className={styles.autoRunActions}>
+        {!isActive ? (
+          <button
+            className={`${styles.autoRunBtn} ${styles.autoRunBtnStart}`}
+            onClick={onStart}
+            disabled={disabled}
+          >
+            🚀 Start Auto-Run
+          </button>
+        ) : (
+          <button
+            className={`${styles.autoRunBtn} ${styles.autoRunBtnStop}`}
+            onClick={onStop}
+          >
+            ⏹️ Stop Auto-Run
+          </button>
+        )}
+      </div>
+
+      {/* Status Messages */}
+      {isComplete && (
+        <div className={`${styles.autoRunStatus} ${styles.autoRunSuccess}`}>
+          🎉 Auto-Run Pipeline Complete! All phases finished successfully.
+        </div>
+      )}
+      {error && (
+        <div className={`${styles.autoRunStatus} ${styles.autoRunError}`}>
+          ❌ Error: {error}
+        </div>
+      )}
+      {statusMessage && !isComplete && !error && (
+        <div className={styles.autoRunStatus}>
+          {statusMessage}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Improve Faces Modal Component
+function ImproveFacesModal({
+  isOpen,
+  suggestions,
+  currentIndex,
+  onMerge,
+  onReject,
+  onSkipAll,
+  onGoToFaces,
+  onClose,
+  isSubmitting,
+  episodeId,
+}: {
+  isOpen: boolean;
+  suggestions: ImproveFacesSuggestion[];
+  currentIndex: number;
+  onMerge: () => void;
+  onReject: () => void;
+  onSkipAll: () => void;
+  onGoToFaces: () => void;
+  onClose: () => void;
+  isSubmitting: boolean;
+  episodeId: string;
+}) {
+  if (!isOpen) return null;
+
+  const isComplete = currentIndex >= suggestions.length;
+  const current = suggestions[currentIndex];
+
+  return (
+    <div className={styles.modalOverlay} onClick={onClose}>
+      <div
+        className={`${styles.modal} ${styles.improveFacesModal}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className={styles.modalHeader}>
+          <h3 className={styles.modalTitle}>🎯 Improve Face Clustering</h3>
+          <button className={styles.modalClose} onClick={onClose}>×</button>
+        </div>
+
+        <div className={styles.modalBody}>
+          {isComplete ? (
+            <div className={styles.improveFacesComplete}>
+              <div className={styles.improveFacesCompleteIcon}>✅</div>
+              <h3 className={styles.improveFacesCompleteTitle}>All suggestions reviewed!</h3>
+              <p className={styles.improveFacesCompleteText}>
+                Click <strong>Go to Faces Review</strong> to continue assigning faces to cast members.
+              </p>
+              <div className={styles.improveFacesCompleteActions}>
+                <Link
+                  href={`/screenalytics/episodes/${episodeId}/faces`}
+                  className={`${styles.modalBtn} ${styles.modalBtnPrimary}`}
+                  onClick={onGoToFaces}
+                >
+                  Go to Faces Review
+                </Link>
+                <button
+                  className={`${styles.modalBtn} ${styles.modalBtnSecondary}`}
+                  onClick={onClose}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          ) : current ? (
+            <>
+              {/* Progress */}
+              <div className={styles.improveFacesProgress}>
+                <div className={styles.improveFacesProgressBar}>
+                  <div
+                    className={styles.improveFacesProgressFill}
+                    style={{ width: `${((currentIndex + 1) / suggestions.length) * 100}%` }}
+                  />
+                </div>
+                <span className={styles.improveFacesProgressText}>
+                  {currentIndex + 1} of {suggestions.length}
+                </span>
+              </div>
+
+              {/* Question */}
+              <h3 className={styles.improveFacesQuestion}>
+                Are they the same person?
+              </h3>
+
+              {/* Compare clusters */}
+              <div className={styles.improveFacesCompare}>
+                <div className={styles.improveFacesCluster}>
+                  {current.cluster_a.crop_url ? (
+                    <img
+                      src={`/api/proxy/thumb?url=${encodeURIComponent(current.cluster_a.crop_url)}`}
+                      alt="Cluster A"
+                      className={styles.improveFacesImage}
+                    />
+                  ) : (
+                    <div className={styles.improveFacesNoImage}>No image</div>
+                  )}
+                  <div className={styles.improveFacesClusterInfo}>
+                    <div className={styles.improveFacesClusterId}>
+                      {current.cluster_a.id.slice(0, 12)}...
+                    </div>
+                    <div className={styles.improveFacesClusterStats}>
+                      {current.cluster_a.tracks} tracks · {current.cluster_a.faces} faces
+                    </div>
+                  </div>
+                </div>
+
+                <div className={styles.improveFacesCluster}>
+                  {current.cluster_b.crop_url ? (
+                    <img
+                      src={`/api/proxy/thumb?url=${encodeURIComponent(current.cluster_b.crop_url)}`}
+                      alt="Cluster B"
+                      className={styles.improveFacesImage}
+                    />
+                  ) : (
+                    <div className={styles.improveFacesNoImage}>No image</div>
+                  )}
+                  <div className={styles.improveFacesClusterInfo}>
+                    <div className={styles.improveFacesClusterId}>
+                      {current.cluster_b.id.slice(0, 12)}...
+                    </div>
+                    <div className={styles.improveFacesClusterStats}>
+                      {current.cluster_b.tracks} tracks · {current.cluster_b.faces} faces
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Similarity */}
+              <div className={styles.improveFacesSimilarity}>
+                <div className={styles.improveFacesSimilarityLabel}>Similarity</div>
+                <div className={styles.improveFacesSimilarityValue}>
+                  {(current.similarity * 100).toFixed(1)}%
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className={styles.improveFacesActions}>
+                <button
+                  className={`${styles.improveFacesBtn} ${styles.improveFacesBtnYes}`}
+                  onClick={onMerge}
+                  disabled={isSubmitting}
+                >
+                  Yes, Merge
+                </button>
+                <button
+                  className={`${styles.improveFacesBtn} ${styles.improveFacesBtnNo}`}
+                  onClick={onReject}
+                  disabled={isSubmitting}
+                >
+                  No
+                </button>
+                <button
+                  className={`${styles.improveFacesBtn} ${styles.improveFacesBtnSkip}`}
+                  onClick={onSkipAll}
+                  disabled={isSubmitting}
+                >
+                  Skip All
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className={styles.loading}>Loading suggestions...</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Job history item component
 function JobHistoryItem({ job }: { job: Job }) {
   const duration = job.started_at && job.finished_at
@@ -595,6 +921,20 @@ export default function EpisodeDetailPage({
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [liveProgress, setLiveProgress] = useState<Record<string, { percent: number; frames?: number; total?: number; elapsed?: number }>>({});
 
+  // Auto-Run Pipeline State
+  const [autoRunActive, setAutoRunActive] = useState(false);
+  const [autoRunPhase, setAutoRunPhase] = useState<AutoRunPhase | null>(null);
+  const [autoRunCompletedPhases, setAutoRunCompletedPhases] = useState<AutoRunPhase[]>([]);
+  const [autoRunComplete, setAutoRunComplete] = useState(false);
+  const [autoRunError, setAutoRunError] = useState<string | undefined>();
+  const [autoRunStatusMessage, setAutoRunStatusMessage] = useState<string | undefined>();
+
+  // Improve Faces Modal State
+  const [showImproveFacesModal, setShowImproveFacesModal] = useState(false);
+  const [improveFacesSuggestions, setImproveFacesSuggestions] = useState<ImproveFacesSuggestion[]>([]);
+  const [improveFacesIndex, setImproveFacesIndex] = useState(0);
+  const [checkImproveFaces, setCheckImproveFaces] = useState(false);
+
   // Hooks
   const { getSettings, saveSettings, resetSettings } = usePipelineSettings();
   const { addRecent } = useRecentEpisodes();
@@ -623,6 +963,15 @@ export default function EpisodeDetailPage({
   const triggerCluster = useTriggerCluster();
   const triggerScreentime = useTriggerPhase();
   const deleteEpisode = useDeleteEpisode();
+
+  // Improve Faces mutations
+  const markInitialPassDone = useMarkInitialPassDone();
+  const submitFaceReviewDecision = useSubmitFaceReviewDecision();
+
+  // Improve Faces suggestions query (only fetch when needed)
+  const improveFacesSuggestionsQuery = useImproveFacesSuggestions(episodeId, {
+    enabled: checkImproveFaces && !showImproveFacesModal,
+  });
 
   // SSE events
   useEpisodeEvents(episodeId, {
@@ -720,6 +1069,95 @@ export default function EpisodeDetailPage({
     });
   }, [episodeId, deleteEpisode, router]);
 
+  // Auto-Run Pipeline handlers
+  const handleStartAutoRun = useCallback(() => {
+    setAutoRunActive(true);
+    setAutoRunComplete(false);
+    setAutoRunError(undefined);
+    setAutoRunCompletedPhases([]);
+    setAutoRunPhase("detect");
+    setAutoRunStatusMessage("Starting Detect/Track phase...");
+    // Trigger the first phase
+    handleRunDetectTrack();
+  }, [handleRunDetectTrack]);
+
+  const handleStopAutoRun = useCallback(() => {
+    setAutoRunActive(false);
+    setAutoRunPhase(null);
+    setAutoRunStatusMessage("Auto-run stopped");
+  }, []);
+
+  // Improve Faces handlers
+  const handleOpenImproveFaces = useCallback(() => {
+    setCheckImproveFaces(true);
+  }, []);
+
+  const handleImproveFacesMerge = useCallback(() => {
+    const current = improveFacesSuggestions[improveFacesIndex];
+    if (!current) return;
+
+    submitFaceReviewDecision.mutate({
+      episodeId,
+      payload: {
+        pair_type: "unassigned_unassigned",
+        cluster_a_id: current.cluster_a.id,
+        cluster_b_id: current.cluster_b.id,
+        decision: "merge",
+        execution_mode: "local",
+      },
+    }, {
+      onSuccess: () => {
+        setImproveFacesIndex((prev) => prev + 1);
+      },
+    });
+  }, [episodeId, improveFacesSuggestions, improveFacesIndex, submitFaceReviewDecision]);
+
+  const handleImproveFacesReject = useCallback(() => {
+    const current = improveFacesSuggestions[improveFacesIndex];
+    if (!current) return;
+
+    submitFaceReviewDecision.mutate({
+      episodeId,
+      payload: {
+        pair_type: "unassigned_unassigned",
+        cluster_a_id: current.cluster_a.id,
+        cluster_b_id: current.cluster_b.id,
+        decision: "reject",
+        execution_mode: "local",
+      },
+    }, {
+      onSuccess: () => {
+        setImproveFacesIndex((prev) => prev + 1);
+      },
+    });
+  }, [episodeId, improveFacesSuggestions, improveFacesIndex, submitFaceReviewDecision]);
+
+  const handleImproveFacesSkipAll = useCallback(() => {
+    markInitialPassDone.mutate(episodeId, {
+      onSuccess: () => {
+        setShowImproveFacesModal(false);
+        setImproveFacesSuggestions([]);
+        setImproveFacesIndex(0);
+        setCheckImproveFaces(false);
+      },
+    });
+  }, [episodeId, markInitialPassDone]);
+
+  const handleImproveFacesClose = useCallback(() => {
+    markInitialPassDone.mutate(episodeId, {
+      onSettled: () => {
+        setShowImproveFacesModal(false);
+        setImproveFacesSuggestions([]);
+        setImproveFacesIndex(0);
+        setCheckImproveFaces(false);
+      },
+    });
+  }, [episodeId, markInitialPassDone]);
+
+  const handleImproveFacesGoToFaces = useCallback(() => {
+    markInitialPassDone.mutate(episodeId);
+  }, [episodeId, markInitialPassDone]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -729,6 +1167,7 @@ export default function EpisodeDetailPage({
         case "Escape":
           setShowSettingsModal(false);
           setShowDeleteModal(false);
+          setShowImproveFacesModal(false);
           break;
         case "s":
           if (!e.metaKey && !e.ctrlKey) {
@@ -751,7 +1190,22 @@ export default function EpisodeDetailPage({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [episodeId, router]);
 
-  // Extract data
+  // Effect: Handle improve faces suggestions query result
+  useEffect(() => {
+    if (improveFacesSuggestionsQuery.data && checkImproveFaces) {
+      const { suggestions, initial_pass_done } = improveFacesSuggestionsQuery.data;
+      if (suggestions.length > 0 && !initial_pass_done) {
+        setImproveFacesSuggestions(suggestions);
+        setImproveFacesIndex(0);
+        setShowImproveFacesModal(true);
+        setCheckImproveFaces(false);
+      } else {
+        setCheckImproveFaces(false);
+      }
+    }
+  }, [improveFacesSuggestionsQuery.data, checkImproveFaces]);
+
+  // Extract data (moved before effects that depend on it)
   const details = detailsQuery.data;
   const videoMeta = videoMetaQuery.data;
   const status = statusQuery.data;
@@ -760,6 +1214,63 @@ export default function EpisodeDetailPage({
   const cluster = status?.cluster;
   const artifactStatus = artifactStatusQuery.data;
   const jobHistory = jobHistoryQuery.data || [];
+
+  // Effect: Auto-run phase advancement based on status changes
+  useEffect(() => {
+    if (!autoRunActive || !autoRunPhase) return;
+
+    const detectComplete = detectTrack?.status === "success" || detectTrack?.status === "done";
+    const facesComplete = faces?.status === "success" || faces?.status === "done";
+    const clusterComplete = cluster?.status === "success" || cluster?.status === "done";
+
+    // Handle phase transitions
+    if (autoRunPhase === "detect" && detectComplete && !autoRunCompletedPhases.includes("detect")) {
+      // Detect finished, advance to faces
+      setAutoRunCompletedPhases((prev) => [...prev, "detect"]);
+      setAutoRunPhase("faces");
+      setAutoRunStatusMessage("Detect/Track complete - starting Faces Harvest...");
+      handleRunFaces();
+    } else if (autoRunPhase === "faces" && facesComplete && !autoRunCompletedPhases.includes("faces")) {
+      // Faces finished, advance to cluster
+      setAutoRunCompletedPhases((prev) => [...prev, "faces"]);
+      setAutoRunPhase("cluster");
+      setAutoRunStatusMessage("Faces Harvest complete - starting Clustering...");
+      handleRunCluster();
+    } else if (autoRunPhase === "cluster" && clusterComplete && !autoRunCompletedPhases.includes("cluster")) {
+      // Cluster finished, pipeline complete
+      setAutoRunCompletedPhases((prev) => [...prev, "cluster"]);
+      setAutoRunActive(false);
+      setAutoRunPhase(null);
+      setAutoRunComplete(true);
+      setAutoRunStatusMessage(undefined);
+      // Trigger improve faces check after cluster completes
+      setCheckImproveFaces(true);
+    }
+
+    // Handle errors during auto-run
+    if (detectTrack?.status === "error" && autoRunPhase === "detect") {
+      setAutoRunError("Detect/Track phase failed");
+      setAutoRunActive(false);
+      setAutoRunPhase(null);
+    } else if (faces?.status === "error" && autoRunPhase === "faces") {
+      setAutoRunError("Faces Harvest phase failed");
+      setAutoRunActive(false);
+      setAutoRunPhase(null);
+    } else if (cluster?.status === "error" && autoRunPhase === "cluster") {
+      setAutoRunError("Cluster phase failed");
+      setAutoRunActive(false);
+      setAutoRunPhase(null);
+    }
+  }, [
+    autoRunActive,
+    autoRunPhase,
+    autoRunCompletedPhases,
+    detectTrack?.status,
+    faces?.status,
+    cluster?.status,
+    handleRunFaces,
+    handleRunCluster,
+  ]);
 
   // Check if any phase is running
   const isAnyRunning =
@@ -856,6 +1367,25 @@ export default function EpisodeDetailPage({
         </Link>
       </div>
 
+      {/* Auto-Run Pipeline Panel */}
+      <AutoRunPanel
+        isActive={autoRunActive}
+        currentPhase={autoRunPhase}
+        completedPhases={autoRunCompletedPhases}
+        progress={
+          autoRunPhase === "detect" ? (liveProgress["detect-track"]?.percent ?? 0) * 100 :
+          autoRunPhase === "faces" ? (liveProgress["faces"]?.percent ?? 0) * 100 :
+          autoRunPhase === "cluster" ? (liveProgress["cluster"]?.percent ?? 0) * 100 :
+          0
+        }
+        onStart={handleStartAutoRun}
+        onStop={handleStopAutoRun}
+        disabled={isAnyRunning && !autoRunActive}
+        statusMessage={autoRunStatusMessage}
+        isComplete={autoRunComplete}
+        error={autoRunError}
+      />
+
       {/* Video Metadata */}
       {videoMeta && (
         <div className={styles.metadataPanel}>
@@ -945,7 +1475,6 @@ export default function EpisodeDetailPage({
           status={faces?.status}
           metrics={[
             { label: "Faces", value: faces?.faces ?? 0 },
-            { label: "Embeddings", value: faces?.embeddings ?? 0 },
           ]}
           progress={
             liveProgress["faces"]
@@ -974,7 +1503,7 @@ export default function EpisodeDetailPage({
             { label: "Identities", value: cluster?.identities ?? 0 },
             {
               label: "Singletons",
-              value: cluster?.singleton_fraction_before !== undefined
+              value: cluster?.singleton_fraction_before != null
                 ? `${(cluster.singleton_fraction_before * 100).toFixed(0)}% → ${((cluster.singleton_fraction_after ?? 0) * 100).toFixed(0)}%`
                 : "—",
             },
@@ -992,27 +1521,34 @@ export default function EpisodeDetailPage({
           }
           onRun={handleRunCluster}
           isRunning={triggerCluster.isPending || cluster?.status === "running"}
-          disabled={isAnyRunning || !faces?.embeddings}
+          disabled={isAnyRunning || !faces?.faces}
+          extraAction={
+            (cluster?.status === "success" || cluster?.status === "done") && (cluster?.identities ?? 0) > 0
+              ? { label: "Improve Faces", onClick: handleOpenImproveFaces }
+              : undefined
+          }
         />
 
+        {/* Screen Time phase - commented out as it's not in current API schema
         <PhaseCard
           title="Screen Time"
           icon="⏱️"
-          status={status?.screentime?.status}
+          status={(status as any)?.screentime?.status}
           metrics={
-            status?.screentime?.total_screen_time !== undefined
+            (status as any)?.screentime?.total_screen_time !== undefined
               ? [
                   {
                     label: "Total",
-                    value: formatDuration(status.screentime.total_screen_time),
+                    value: formatDuration((status as any).screentime.total_screen_time),
                   },
                 ]
               : []
           }
           onRun={handleRunScreentime}
-          isRunning={triggerScreentime.isPending || status?.screentime?.status === "running"}
+          isRunning={triggerScreentime.isPending || (status as any)?.screentime?.status === "running"}
           disabled={isAnyRunning || !cluster?.identities}
         />
+        */}
       </div>
 
       {/* Quick Stats */}
@@ -1030,8 +1566,8 @@ export default function EpisodeDetailPage({
           <div className={styles.statLabel}>Identities</div>
         </div>
         <div className={styles.statCard}>
-          <div className={styles.statValue}>{faces?.embeddings ?? 0}</div>
-          <div className={styles.statLabel}>Embeddings</div>
+          <div className={styles.statValue}>{detectTrack?.detections ?? 0}</div>
+          <div className={styles.statLabel}>Detections</div>
         </div>
       </div>
 
@@ -1131,6 +1667,19 @@ export default function EpisodeDetailPage({
         onClose={() => setShowDeleteModal(false)}
         onConfirm={handleDelete}
         isDeleting={deleteEpisode.isPending}
+      />
+
+      <ImproveFacesModal
+        isOpen={showImproveFacesModal}
+        suggestions={improveFacesSuggestions}
+        currentIndex={improveFacesIndex}
+        onMerge={handleImproveFacesMerge}
+        onReject={handleImproveFacesReject}
+        onSkipAll={handleImproveFacesSkipAll}
+        onGoToFaces={handleImproveFacesGoToFaces}
+        onClose={handleImproveFacesClose}
+        isSubmitting={submitFaceReviewDecision.isPending}
+        episodeId={episodeId}
       />
     </div>
   );

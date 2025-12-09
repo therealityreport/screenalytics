@@ -698,3 +698,71 @@ export async function createCastMember(
     }
   );
 }
+
+// ============================================================================
+// Improve Faces API (Post-Cluster Suggestions)
+// ============================================================================
+
+export type ImproveFacesSuggestion = {
+  cluster_a: {
+    id: string;
+    crop_url?: string;
+    tracks: number;
+    faces: number;
+  };
+  cluster_b: {
+    id: string;
+    crop_url?: string;
+    tracks: number;
+    faces: number;
+  };
+  similarity: number;
+};
+
+export type ImproveFacesSuggestionsResponse = {
+  suggestions: ImproveFacesSuggestion[];
+  initial_pass_done: boolean;
+};
+
+export type FaceReviewDecision = "merge" | "reject";
+
+export type FaceReviewDecisionRequest = {
+  pair_type: "unassigned_unassigned" | "assigned_unassigned";
+  cluster_a_id: string;
+  cluster_b_id: string;
+  decision: FaceReviewDecision;
+  execution_mode?: "local" | "redis";
+};
+
+// Fetch initial unassigned suggestions for improve faces modal
+export async function fetchImproveFacesSuggestions(
+  episodeId: string
+): Promise<ImproveFacesSuggestionsResponse> {
+  return apiFetch<ImproveFacesSuggestionsResponse>(
+    `/episodes/${episodeId}/face_review/initial_unassigned_suggestions`
+  );
+}
+
+// Mark initial pass done (user has reviewed all suggestions or skipped)
+export async function markInitialPassDone(
+  episodeId: string
+): Promise<void> {
+  await apiFetch<void>(
+    `/episodes/${episodeId}/face_review/mark_initial_pass_done`,
+    { method: "POST", body: JSON.stringify({}) }
+  );
+}
+
+// Submit face review decision (merge or reject)
+export async function submitFaceReviewDecision(
+  episodeId: string,
+  payload: FaceReviewDecisionRequest
+): Promise<{ status: "queued" | "success"; job_id?: string }> {
+  return apiFetch<{ status: "queued" | "success"; job_id?: string }>(
+    `/episodes/${episodeId}/face_review/decision/start`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}

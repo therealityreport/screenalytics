@@ -1154,3 +1154,57 @@ export function useUndoStack(episodeId: string) {
 
   return { stack, pushAction, undo, canUndo, isUndoing: restoreBackupMutation.isPending };
 }
+
+// ============================================================================
+// Improve Faces Hooks (Post-Cluster Modal)
+// ============================================================================
+
+import {
+  fetchImproveFacesSuggestions,
+  markInitialPassDone,
+  submitFaceReviewDecision,
+  type ImproveFacesSuggestionsResponse,
+  type FaceReviewDecisionRequest,
+} from "./client";
+
+// Query hook for fetching improve faces suggestions
+export function useImproveFacesSuggestions(
+  episodeId: string,
+  options?: { enabled?: boolean }
+) {
+  return useQuery<ImproveFacesSuggestionsResponse, ApiError>({
+    queryKey: ["improve-faces-suggestions", episodeId],
+    queryFn: () => fetchImproveFacesSuggestions(episodeId),
+    enabled: options?.enabled ?? true,
+    staleTime: 60 * 1000, // 1 minute
+    retry: false,
+  });
+}
+
+// Mark initial pass done mutation
+export function useMarkInitialPassDone() {
+  const client = useQueryClient();
+  return useMutation<void, ApiError, string>({
+    mutationFn: markInitialPassDone,
+    onSuccess: (_data, episodeId) => {
+      client.invalidateQueries({ queryKey: ["improve-faces-suggestions", episodeId] });
+    },
+  });
+}
+
+// Submit face review decision mutation (merge or reject)
+export function useSubmitFaceReviewDecision() {
+  const client = useQueryClient();
+  return useMutation<
+    { status: "queued" | "success"; job_id?: string },
+    ApiError,
+    { episodeId: string; payload: FaceReviewDecisionRequest }
+  >({
+    mutationFn: ({ episodeId, payload }) => submitFaceReviewDecision(episodeId, payload),
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-identities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["unlinked-entities", variables.episodeId] });
+      client.invalidateQueries({ queryKey: ["episode-status", variables.episodeId] });
+    },
+  });
+}
