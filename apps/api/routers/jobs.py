@@ -682,18 +682,22 @@ def _parse_progress_line(line: str) -> dict | None:
 
 
 def _count_lines(path: Path) -> int:
-    if not path.exists():
+    # Bug 9 fix: Avoid TOCTOU race by catching exceptions instead of exists() check
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except (OSError, FileNotFoundError):
         return 0
-    with path.open("r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
 
 
 def _load_progress_payload(progress_path: Path | None) -> dict | None:
-    if not progress_path or not progress_path.exists():
+    # Bug 9 fix: Avoid TOCTOU race by catching exceptions instead of exists() check
+    if not progress_path:
         return None
     try:
         payload = json.loads(progress_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, FileNotFoundError):
+        # File may not exist, be empty, or contain invalid JSON
         return None
     return payload if isinstance(payload, dict) else None
 

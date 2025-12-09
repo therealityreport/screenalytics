@@ -47,7 +47,7 @@ _IS_MACOS_APPLE_SILICON = (
     platform.machine().lower().startswith(("arm", "aarch64"))
 )
 DEFAULT_DEVICE = "coreml" if _IS_MACOS_APPLE_SILICON else "auto"
-DEFAULT_DEVICE_LABEL = "CoreML (Apple Silicon)" if _IS_MACOS_APPLE_SILICON else "Auto"
+DEFAULT_DEVICE_LABEL = "CoreML" if _IS_MACOS_APPLE_SILICON else "Auto"
 
 DEFAULT_DET_THRESH = 0.65  # Raised from 0.5 to reduce false positive face detections
 DEFAULT_MAX_GAP = 60
@@ -189,7 +189,8 @@ SCENE_DETECTOR_OPTIONS = [
 SCENE_DETECTOR_LABELS = [label for label, _ in SCENE_DETECTOR_OPTIONS]
 SCENE_DETECTOR_VALUE_MAP = {label: value for label, value in SCENE_DETECTOR_OPTIONS}
 SCENE_DETECTOR_LABEL_MAP = {value: label for label, value in SCENE_DETECTOR_OPTIONS}
-_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "off").strip().lower()
+# Default to pyscenedetect (recommended for reality TV with many cuts)
+_SCENE_DETECTOR_ENV = os.environ.get("SCENE_DETECTOR", "pyscenedetect").strip().lower()
 SCENE_DETECTOR_DEFAULT = _SCENE_DETECTOR_ENV if _SCENE_DETECTOR_ENV in SCENE_DETECTOR_LABEL_MAP else "pyscenedetect"
 _EP_ID_REGEX = re.compile(r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$", re.IGNORECASE)
 _CUSTOM_SHOWS_SESSION_KEY = "_custom_show_registry"
@@ -943,11 +944,14 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
     api_healthy = False
+    health_timeout = float(os.environ.get("SCREENALYTICS_HEALTH_TIMEOUT", "1.0"))
     try:
-        resp = requests.get(health_url, timeout=5)
+        resp = requests.get(health_url, timeout=health_timeout)
         resp.raise_for_status()
         sidebar.success("/healthz OK")
         api_healthy = True
+    except requests.Timeout:
+        sidebar.warning(f"/healthz timed out after {health_timeout:.1f}s (continuing)")
     except requests.RequestException as exc:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
@@ -2822,7 +2826,7 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
                 break
         if value is not None:
             summary[key] = value
-    # Final local-manifest fallback for detect/track counts
+    # Final local-manifest fallback for counts
     # If a job returns a summary "stage" without counts, infer from artifacts.
     try:
         if summary.get("detections") is None and local.get("detections"):
@@ -2835,6 +2839,23 @@ def normalize_summary(ep_id: str, raw: Dict[str, Any] | None) -> Dict[str, Any]:
             if trk_path.exists():
                 with trk_path.open("r", encoding="utf-8") as fh:
                     summary["tracks"] = sum(1 for line in fh if line.strip())
+        # Fallback for faces count (critical for auto-run faces→cluster transition)
+        if summary.get("faces") is None and local.get("faces"):
+            faces_path = Path(str(local["faces"]))
+            if faces_path.exists():
+                with faces_path.open("r", encoding="utf-8") as fh:
+                    summary["faces"] = sum(1 for line in fh if line.strip())
+        # Fallback for identities count (for cluster phase completion)
+        if summary.get("identities") is None and local.get("identities"):
+            identities_path = Path(str(local["identities"]))
+            if identities_path.exists():
+                try:
+                    payload = json.loads(identities_path.read_text(encoding="utf-8"))
+                    identities_list = payload.get("identities") if isinstance(payload, dict) else None
+                    if isinstance(identities_list, list):
+                        summary["identities"] = len(identities_list)
+                except (json.JSONDecodeError, KeyError):
+                    pass
     except OSError:
         pass
     return summary
@@ -3373,6 +3394,117 @@ def get_stored_celery_job_id(ep_id: str, job_type: str) -> str | None:
     return st.session_state.get(key)
 
 
+# Cache for batch job fetches to avoid repeated API calls on page load
+# Suggestion 2: Use longer TTL during active jobs (10s) vs idle (3s)
+_running_jobs_cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any] | None]]] = {}
+_RUNNING_JOBS_CACHE_TTL_ACTIVE = 8.0  # 8 second TTL during active jobs
+_RUNNING_JOBS_CACHE_TTL_IDLE = 2.0  # 2 second TTL when idle
+
+
+def get_all_running_jobs_for_episode(ep_id: str) -> Dict[str, Dict[str, Any] | None]:
+    """Fetch all running jobs for an episode in a single batch.
+
+    This is much faster than calling get_running_job_for_episode 4 times
+    since it reuses API responses across job types.
+
+    Returns:
+        Dict mapping job_type -> job_info or None
+    """
+    import time as _time
+
+    cache_key = ep_id
+    now = _time.time()
+
+    # Check cache with adaptive TTL (longer during active jobs)
+    if cache_key in _running_jobs_cache:
+        cached_time, cached_data = _running_jobs_cache[cache_key]
+        # Use longer TTL if any job was found in last fetch
+        has_active_jobs = any(v is not None for v in cached_data.values())
+        ttl = _RUNNING_JOBS_CACHE_TTL_ACTIVE if has_active_jobs else _RUNNING_JOBS_CACHE_TTL_IDLE
+        if now - cached_time < ttl:
+            return cached_data
+
+    running_states = {"running", "in_progress", "queued", "started", "pending", "scheduled", "retrying"}
+    api_timeout = 2  # Reduced timeout for faster response
+    job_types = ["detect_track", "faces_embed", "cluster", "audio_pipeline"]
+    results: Dict[str, Dict[str, Any] | None] = {jt: None for jt in job_types}
+
+    # Fetch local jobs once (covers all job types)
+    local_jobs = []
+    try:
+        resp = requests.get(
+            f"{_api_base()}/celery_jobs/local",
+            params={"ep_id": ep_id},
+            timeout=api_timeout,
+        )
+        resp.raise_for_status()
+        local_jobs = resp.json().get("jobs", [])
+    except requests.RequestException:
+        pass
+
+    # Process local jobs
+    progress_data = get_episode_progress(ep_id)
+    for job in local_jobs:
+        op = job.get("operation", "")
+        if op in job_types:
+            state = str(job.get("state", "")).lower()
+            if state in running_states:
+                result = {
+                    "job_id": job.get("job_id"),
+                    "state": state,
+                    "started_at": job.get("started_at"),
+                    "job_type": op,
+                    "source": "celery_local",
+                    "pid": job.get("pid"),
+                }
+                if progress_data:
+                    frames_done = progress_data.get("frames_done", 0)
+                    frames_total = progress_data.get("frames_total", 1)
+                    if frames_total > 0:
+                        result["progress_pct"] = (frames_done / frames_total) * 100
+                    result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                    result["frames_done"] = frames_done
+                    result["frames_total"] = frames_total
+                results[op] = result
+
+    # Only check other sources if local didn't find everything
+    unfound = [jt for jt in job_types if results[jt] is None]
+    if unfound:
+        # Fetch Celery jobs once
+        try:
+            resp = requests.get(f"{_api_base()}/celery_jobs", timeout=api_timeout)
+            resp.raise_for_status()
+            celery_jobs = resp.json().get("jobs", [])
+
+            for job in celery_jobs:
+                job_ep_id = job.get("ep_id")
+                op = job.get("operation") or job.get("name", "").replace("local_", "")
+                state = str(job.get("state", "")).lower()
+
+                if job_ep_id == ep_id and op in unfound and state in running_states:
+                    results[op] = {
+                        "job_id": job.get("job_id"),
+                        "state": state,
+                        "started_at": job.get("started_at"),
+                        "job_type": op,
+                        "source": "celery_active",
+                    }
+        except requests.RequestException:
+            pass
+
+    # Cache the results
+    _running_jobs_cache[cache_key] = (now, results)
+    return results
+
+
+def invalidate_running_jobs_cache(ep_id: str | None = None) -> None:
+    """Invalidate the running jobs cache, optionally for a specific episode."""
+    if ep_id:
+        _running_jobs_cache.pop(ep_id, None)
+    else:
+        _running_jobs_cache.clear()
+
+
 def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | None:
     """Check if there's a running job of a specific type for an episode.
 
@@ -3384,10 +3516,45 @@ def get_running_job_for_episode(ep_id: str, job_type: str) -> Dict[str, Any] | N
         Job info dict with progress if running, None otherwise.
         Dict includes: job_id, state, progress_pct, message, started_at
 
-    Checks multiple sources in parallel for faster response:
-    1. Legacy /jobs API (subprocess jobs)
+    Uses batch fetching internally for better performance when called multiple times.
+    """
+    # Use batch fetch for efficiency
+    all_jobs = get_all_running_jobs_for_episode(ep_id)
+    result = all_jobs.get(job_type)
+
+    # For audio_pipeline, merge progress data
+    if result and job_type == "audio_pipeline":
+        audio_progress_data = get_audio_progress(ep_id)
+        if audio_progress_data:
+            overall = audio_progress_data.get("overall_progress") or audio_progress_data.get("progress")
+            if overall is not None:
+                pct = overall * 100 if overall <= 1 else overall
+                result["progress_pct"] = max(result.get("progress_pct", 0), pct)
+            result.setdefault("step_name", audio_progress_data.get("step_name") or audio_progress_data.get("step"))
+            if audio_progress_data.get("message"):
+                result["message"] = audio_progress_data["message"]
+
+    return result
+
+
+def get_running_job_for_episode_full(ep_id: str, job_type: str) -> Dict[str, Any] | None:
+    """Check if there's a running job of a specific type for an episode.
+
+    Full version that checks all sources including legacy APIs.
+    Use get_running_job_for_episode for faster cached lookups.
+
+    Args:
+        ep_id: Episode identifier
+        job_type: One of "detect_track", "faces_embed", "cluster", "audio_pipeline"
+
+    Returns:
+        Job info dict with progress if running, None otherwise.
+        Dict includes: job_id, state, progress_pct, message, started_at
+
+    Checks multiple sources in priority order:
+    1. /celery_jobs/local (local subprocess jobs)
     2. /celery_jobs (active Celery tasks)
-    3. /celery_jobs/local (local subprocess jobs)
+    3. Legacy /jobs API (subprocess jobs)
     4. Session state for stored job_id
     """
     running_states = {"running", "in_progress", "queued", "started", "pending", "scheduled", "retrying"}
@@ -4172,6 +4339,113 @@ def run_pipeline_job_with_mode(
     """
     execution_mode = get_execution_mode(ep_id)
 
+    def _ensure_local_completion_signals(ep_id: str, operation: str, summary: Dict[str, Any]) -> None:
+        """Best-effort: write run marker + progress.json when local job completes.
+
+        Local mode sometimes finishes without updating run markers; auto-run relies on
+        marker/progress mtimes to advance to the next phase. We defensively write them.
+        """
+        status = str(summary.get("status") or "").lower()
+        if status not in {"completed", "success"}:
+            return
+
+        LOGGER.info("[LOCAL MODE] Writing completion signals for %s/%s", ep_id, operation)
+
+        manifests_dir = DATA_ROOT / "manifests" / ep_id
+        run_dir = manifests_dir / "runs"
+        now_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+        def _count_lines(path: Path) -> int | None:
+            try:
+                if path.exists():
+                    with path.open("r", encoding="utf-8") as fh:
+                        return sum(1 for line in fh if line.strip())
+            except OSError:
+                pass
+            return None
+
+        def _write_progress_file(step_name: str) -> None:
+            progress_path = manifests_dir / "progress.json"
+            payload = {
+                "ep_id": ep_id,
+                "phase": "done",
+                "step": step_name,
+                "status": "completed",
+                "updated_at": now_iso,
+            }
+            try:
+                progress_path.parent.mkdir(parents=True, exist_ok=True)
+                progress_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+                # Signal to UI that this phase just finished (used by auto-run fallbacks)
+                st.session_state[f"{ep_id}::{step_name}_just_completed"] = True
+            except OSError as exc:
+                LOGGER.warning("[LOCAL MODE] Failed to write progress.json for %s/%s: %s", ep_id, step_name, exc)
+
+        def _write_run_marker(step_name: str, payload: Dict[str, Any]) -> None:
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                marker_path = run_dir / f"{step_name}.json"
+                marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except OSError as exc:
+                LOGGER.warning("[LOCAL MODE] Failed to write run marker for %s/%s: %s", ep_id, step_name, exc)
+
+        # Build marker payload with fallbacks for counts
+        marker_payload: Dict[str, Any] = {
+            "phase": operation,
+            "status": "success",
+            "ep_id": ep_id,
+            "finished_at": now_iso,
+            "started_at": summary.get("started_at") or summary.get("started") or summary.get("start_time"),
+            "device": summary.get("device") or summary.get("requested_device"),
+            "requested_device": summary.get("requested_device"),
+            "resolved_device": summary.get("resolved_device"),
+            "profile": summary.get("profile"),
+            "version": summary.get("version"),
+        }
+
+        manifests_counts = {
+            "detect_track": {
+                "detections": _count_lines(manifests_dir / "detections.jsonl"),
+                "tracks": _count_lines(manifests_dir / "tracks.jsonl"),
+            },
+            "faces_embed": {
+                "faces": _count_lines(manifests_dir / "faces.jsonl"),
+            },
+            "cluster": {
+                "identities": None,
+            },
+        }
+        # Identities count (json structure)
+        if operation == "cluster":
+            identities_path = manifests_dir / "identities.json"
+            try:
+                if identities_path.exists():
+                    data = json.loads(identities_path.read_text(encoding="utf-8"))
+                    ids_list = data.get("identities") if isinstance(data, dict) else None
+                    if isinstance(ids_list, list):
+                        manifests_counts["cluster"]["identities"] = len(ids_list)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        # Merge summary counts with manifest fallbacks
+        if operation == "detect_track":
+            marker_payload["detections"] = summary.get("detections") or manifests_counts["detect_track"]["detections"]
+            marker_payload["tracks"] = summary.get("tracks") or manifests_counts["detect_track"]["tracks"]
+            marker_payload["detector"] = summary.get("detector")
+            marker_payload["tracker"] = summary.get("tracker")
+            marker_payload["stride"] = summary.get("stride")
+        elif operation == "faces_embed":
+            marker_payload["faces"] = summary.get("faces") or manifests_counts["faces_embed"]["faces"]
+            marker_payload["device"] = summary.get("device") or summary.get("requested_device")
+        elif operation == "cluster":
+            marker_payload["identities"] = summary.get("identities") or manifests_counts["cluster"]["identities"]
+            marker_payload["faces"] = summary.get("faces") or manifests_counts["faces_embed"]["faces"]
+            marker_payload["cluster_thresh"] = summary.get("cluster_thresh")
+            marker_payload["min_cluster_size"] = summary.get("min_cluster_size")
+
+        _write_run_marker(operation, marker_payload)
+        _write_progress_file(operation)
+
     # Add execution_mode to payload
     payload = {**payload, "execution_mode": execution_mode}
 
@@ -4307,7 +4581,15 @@ def run_pipeline_job_with_mode(
 
                     elif msg_type == "summary":
                         summary = msg
+                        LOGGER.info("[LOCAL MODE] Received summary for %s: status=%s", operation, msg.get("status"))
                         break
+
+                # Check if we received a valid summary
+                # FIX 4: Check for empty dict explicitly - {} is falsy but may slip through
+                if not summary or summary == {} or not summary.get("status"):
+                    # Stream ended without summary - check if manifests exist
+                    LOGGER.warning("[LOCAL MODE] No/empty summary for %s/%s - using fallback", ep_id, operation)
+                    summary = {"status": "completed", "elapsed_seconds": 0, "fallback": True}
 
                 # Process summary
                 status = summary.get("status", "unknown")
@@ -4337,6 +4619,19 @@ def run_pipeline_job_with_mode(
                     progress_bar.progress(1.0)
                     progress_text.caption(f"**100%** - Completed in {elapsed_str}")
                     status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed in {elapsed_str}")
+                    _ensure_local_completion_signals(ep_id, operation, result)
+
+                    # CRITICAL: Set completion flags in session state BEFORE returning
+                    # This ensures phase advancement even if Streamlit interrupts the return
+                    # (Streamlit may restart script on widget updates)
+                    st.session_state[f"{ep_id}::{operation}_just_completed"] = True
+                    st.session_state[f"{ep_id}::{operation}_completed_at"] = time.time()
+                    st.session_state[f"{ep_id}::{operation}_summary"] = result
+                    LOGGER.info(
+                        "[LOCAL MODE] Set completion flags for %s/%s: just_completed=True, completed_at=%s",
+                        ep_id, operation, st.session_state[f"{ep_id}::{operation}_completed_at"]
+                    )
+
                     return result, None
                 elif status == "error":
                     progress_text.caption(f"❌ Failed after {elapsed_str}")
@@ -5572,7 +5867,7 @@ def cluster_track_row_carousel_html(
     track_faces: int = 0,
     *,
     thumb_width: int = 100,
-    max_visible: int = 6,
+    max_visible: int = 12,
 ) -> str:
     """Generate a compact carousel row for a single track within a cluster view.
 

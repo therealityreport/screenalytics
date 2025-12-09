@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
+from streamlit.runtime.scriptrunner import RerunException, StopException
 
 LOGGER = logging.getLogger("episode_detail")
 
@@ -30,6 +31,572 @@ AVG_FACES_PER_FRAME = 1.5
 JPEG_DEFAULT = int(os.environ.get("SCREENALYTICS_JPEG_QUALITY", "72"))
 MIN_FRAMES_BETWEEN_CROPS_DEFAULT = int(os.environ.get("SCREENALYTICS_MIN_FRAMES_BETWEEN_CROPS", "32"))
 EST_TZ = ZoneInfo("America/New_York")
+
+# =============================================================================
+# Pipeline Defaults (from config/pipeline/*.yaml)
+# These are the canonical defaults used when no prior run exists.
+# Session-only: changes reset on app restart.
+# =============================================================================
+
+# Detection defaults (config/pipeline/detection.yaml)
+DETECT_CONFIDENCE_DEFAULT = 0.50  # detection.yaml: confidence_th
+DETECT_MIN_SIZE_DEFAULT = 24  # detection.yaml: min_size
+DETECT_IOU_DEFAULT = 0.5  # detection.yaml: iou_th
+
+# Tracking defaults (config/pipeline/tracking.yaml)
+TRACK_THRESH_DEFAULT = 0.55  # tracking.yaml: track_thresh
+TRACK_MATCH_THRESH_DEFAULT = 0.65  # tracking.yaml: match_thresh
+TRACK_NEW_THRESH_DEFAULT = 0.60  # tracking.yaml: new_track_thresh
+TRACK_BUFFER_DEFAULT = 90  # tracking.yaml: track_buffer
+
+# Clustering defaults (config/pipeline/clustering.yaml)
+CLUSTER_THRESH_DEFAULT = 0.58  # clustering.yaml: cluster_thresh
+CLUSTER_MIN_SIZE_DEFAULT = 1  # clustering.yaml: min_cluster_size
+CLUSTER_MIN_IDENTITY_SIM_DEFAULT = 0.50  # clustering.yaml: min_identity_sim
+
+# Faces harvest defaults
+FACES_THUMB_SIZE_DEFAULT = 256
+FACES_MIN_FRAMES_BETWEEN_CROPS_DEFAULT = 32
+
+
+def _get_pipeline_settings_key(ep_id: str, category: str, field: str) -> str:
+    """Generate a session state key for pipeline settings."""
+    return f"pipeline_settings::{ep_id}::{category}::{field}"
+
+
+def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | None) -> None:
+    """Render the unified pipeline settings dialog with all phase settings."""
+
+    # Keys for settings dialog state
+    dialog_key = f"{ep_id}::pipeline_settings_dialog"
+
+    @st.dialog("Pipeline Settings", width="large")
+    def settings_dialog():
+        st.markdown("Configure settings for all pipeline phases. Changes apply to this session only.")
+
+        # Create tabs for each phase
+        tab_detect, tab_harvest, tab_cluster = st.tabs([
+            "Detect/Track",
+            "Faces Harvest",
+            "Cluster Identities"
+        ])
+
+        # ─── DETECT/TRACK SETTINGS ───────────────────────────────────────────
+        with tab_detect:
+            st.markdown("#### Detection & Tracking Settings")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Device selection
+                supported_devices = helpers.list_supported_devices()
+                device_key = _get_pipeline_settings_key(ep_id, "detect", "device")
+                device_default = helpers.DEFAULT_DEVICE_LABEL
+                if device_key not in st.session_state:
+                    st.session_state[device_key] = device_default
+                # Fix stale session state (e.g. old "CoreML (Apple Silicon)" format)
+                if st.session_state[device_key] not in supported_devices:
+                    st.session_state[device_key] = device_default if device_default in supported_devices else supported_devices[0]
+                device_idx = supported_devices.index(st.session_state[device_key])
+                st.selectbox(
+                    "Device",
+                    supported_devices,
+                    index=device_idx,
+                    key=device_key,
+                    help="Compute device for face detection and tracking",
+                )
+
+                # Detector selection
+                detector_key = _get_pipeline_settings_key(ep_id, "detect", "detector")
+                detector_options = list(helpers.DETECTOR_VALUE_MAP.keys())
+                if detector_key not in st.session_state:
+                    st.session_state[detector_key] = "RetinaFace (recommended)"
+                detector_idx = detector_options.index(st.session_state[detector_key]) if st.session_state[detector_key] in detector_options else 0
+                st.selectbox(
+                    "Detector",
+                    detector_options,
+                    index=detector_idx,
+                    key=detector_key,
+                    help="Face detection model to use",
+                )
+
+                # Tracker selection
+                tracker_key = _get_pipeline_settings_key(ep_id, "detect", "tracker")
+                tracker_options = list(helpers.TRACKER_VALUE_MAP.keys())
+                if tracker_key not in st.session_state:
+                    st.session_state[tracker_key] = "ByteTrack (default)"
+                tracker_idx = tracker_options.index(st.session_state[tracker_key]) if st.session_state[tracker_key] in tracker_options else 0
+                st.selectbox(
+                    "Tracker",
+                    tracker_options,
+                    index=tracker_idx,
+                    key=tracker_key,
+                    help="Multi-object tracker for linking faces across frames",
+                )
+
+            with col2:
+                # Stride
+                stride_key = _get_pipeline_settings_key(ep_id, "detect", "stride")
+                if stride_key not in st.session_state:
+                    st.session_state[stride_key] = helpers.DEFAULT_STRIDE
+                st.number_input(
+                    "Stride",
+                    min_value=1,
+                    max_value=50,
+                    step=1,
+                    key=stride_key,
+                    help="Process every Nth frame. Higher = faster but may miss faces.",
+                )
+
+                # FPS
+                fps_key = _get_pipeline_settings_key(ep_id, "detect", "fps")
+                fps_default = 0.0
+                if video_meta and video_meta.get("fps_detected"):
+                    fps_default = float(video_meta["fps_detected"])
+                if fps_key not in st.session_state:
+                    st.session_state[fps_key] = fps_default
+                st.number_input(
+                    "FPS",
+                    min_value=0.0,
+                    max_value=120.0,
+                    step=1.0,
+                    key=fps_key,
+                    help="Frames per second (0 = auto-detect from video)",
+                )
+
+                # Detection threshold
+                det_thresh_key = _get_pipeline_settings_key(ep_id, "detect", "det_thresh")
+                if det_thresh_key not in st.session_state:
+                    st.session_state[det_thresh_key] = helpers.DEFAULT_DET_THRESH
+                st.slider(
+                    "Detection threshold",
+                    min_value=0.1,
+                    max_value=0.9,
+                    step=0.01,
+                    key=det_thresh_key,
+                    help="Minimum confidence for face detections (higher = fewer false positives)",
+                )
+
+            st.divider()
+
+            col3, col4 = st.columns(2)
+
+            with col3:
+                # Save frames
+                save_frames_key = _get_pipeline_settings_key(ep_id, "detect", "save_frames")
+                if save_frames_key not in st.session_state:
+                    st.session_state[save_frames_key] = True
+                st.checkbox(
+                    "Save sampled frames",
+                    key=save_frames_key,
+                    help="Store full frames for QA and future crops",
+                )
+
+                # Save crops
+                save_crops_key = _get_pipeline_settings_key(ep_id, "detect", "save_crops")
+                if save_crops_key not in st.session_state:
+                    st.session_state[save_crops_key] = True
+                st.checkbox(
+                    "Save face crops",
+                    key=save_crops_key,
+                    help="Export aligned face crops during detection",
+                )
+
+            with col4:
+                # CPU threads
+                cpu_threads_key = _get_pipeline_settings_key(ep_id, "detect", "cpu_threads")
+                if cpu_threads_key not in st.session_state:
+                    st.session_state[cpu_threads_key] = 2
+                st.selectbox(
+                    "CPU threads (cap)",
+                    options=[1, 2, 4],
+                    index=1,  # Default to 2
+                    key=cpu_threads_key,
+                    help="Limit BLAS/ONNX threads for thermal safety",
+                )
+
+                # Max gap
+                max_gap_key = _get_pipeline_settings_key(ep_id, "detect", "max_gap")
+                if max_gap_key not in st.session_state:
+                    st.session_state[max_gap_key] = helpers.DEFAULT_MAX_GAP
+                st.number_input(
+                    "Max gap (frames)",
+                    min_value=1,
+                    max_value=240,
+                    step=1,
+                    key=max_gap_key,
+                    help="Max frames a face can be missing before track ends",
+                )
+
+            # Advanced: ByteTrack thresholds
+            with st.expander("Advanced Tracking", expanded=False):
+                adv_col1, adv_col2 = st.columns(2)
+                with adv_col1:
+                    track_high_key = _get_pipeline_settings_key(ep_id, "detect", "track_high_thresh")
+                    if track_high_key not in st.session_state:
+                        st.session_state[track_high_key] = TRACK_THRESH_DEFAULT
+                    st.slider(
+                        "Track high threshold",
+                        min_value=0.1,
+                        max_value=0.9,
+                        step=0.01,
+                        key=track_high_key,
+                        help="Min confidence to continue tracking (tracking.yaml: track_thresh)",
+                    )
+
+                with adv_col2:
+                    track_new_key = _get_pipeline_settings_key(ep_id, "detect", "new_track_thresh")
+                    if track_new_key not in st.session_state:
+                        st.session_state[track_new_key] = TRACK_NEW_THRESH_DEFAULT
+                    st.slider(
+                        "New track threshold",
+                        min_value=0.1,
+                        max_value=0.9,
+                        step=0.01,
+                        key=track_new_key,
+                        help="Min confidence to start new track (tracking.yaml: new_track_thresh)",
+                    )
+
+                adv_col3, adv_col4 = st.columns(2)
+                with adv_col3:
+                    jpeg_key = _get_pipeline_settings_key(ep_id, "detect", "jpeg_quality")
+                    if jpeg_key not in st.session_state:
+                        st.session_state[jpeg_key] = JPEG_DEFAULT
+                    st.number_input(
+                        "JPEG quality",
+                        min_value=50,
+                        max_value=100,
+                        step=5,
+                        key=jpeg_key,
+                        help="Compression quality for saved images",
+                    )
+
+                with adv_col4:
+                    match_thresh_key = _get_pipeline_settings_key(ep_id, "detect", "match_thresh")
+                    if match_thresh_key not in st.session_state:
+                        st.session_state[match_thresh_key] = TRACK_MATCH_THRESH_DEFAULT
+                    st.slider(
+                        "Match threshold (IoU)",
+                        min_value=0.3,
+                        max_value=0.95,
+                        step=0.01,
+                        key=match_thresh_key,
+                        help="IoU threshold for bbox matching (tracking.yaml: match_thresh)",
+                    )
+
+            # Scene Detection Settings - dedicated section
+            with st.expander("Scene Detection (PySceneDetect)", expanded=True):
+                st.markdown("""
+                **Scene detection** identifies hard cuts (camera changes) in the video.
+                When enabled, the tracker resets at each cut to prevent incorrectly linking
+                faces across scene changes. **Recommended ON for reality TV content.**
+                """)
+
+                scene_col1, scene_col2 = st.columns(2)
+
+                with scene_col1:
+                    # Scene detector selector
+                    scene_detector_key = _get_pipeline_settings_key(ep_id, "detect", "scene_detector")
+                    if scene_detector_key not in st.session_state:
+                        st.session_state[scene_detector_key] = "PySceneDetect (recommended)"
+                    scene_detector_options = helpers.SCENE_DETECTOR_LABELS
+                    scene_detector_idx = 0
+                    current_detector = st.session_state[scene_detector_key]
+                    if current_detector in scene_detector_options:
+                        scene_detector_idx = scene_detector_options.index(current_detector)
+                    st.selectbox(
+                        "Scene Detector",
+                        scene_detector_options,
+                        index=scene_detector_idx,
+                        key=scene_detector_key,
+                        help="Method for detecting scene cuts. PySceneDetect uses content-based detection; HSV is a lightweight fallback.",
+                    )
+
+                    # Scene threshold
+                    scene_thresh_key = _get_pipeline_settings_key(ep_id, "detect", "scene_threshold")
+                    if scene_thresh_key not in st.session_state:
+                        st.session_state[scene_thresh_key] = helpers.SCENE_THRESHOLD_DEFAULT
+                    st.number_input(
+                        "Scene Threshold",
+                        min_value=5.0,
+                        max_value=60.0,
+                        step=1.0,
+                        key=scene_thresh_key,
+                        help="Sensitivity for detecting cuts. Lower = more sensitive (default: 27.0)",
+                    )
+
+                with scene_col2:
+                    # Min scene length
+                    scene_min_key = _get_pipeline_settings_key(ep_id, "detect", "scene_min_len")
+                    if scene_min_key not in st.session_state:
+                        st.session_state[scene_min_key] = helpers.SCENE_MIN_LEN_DEFAULT
+                    st.number_input(
+                        "Min Scene Length",
+                        min_value=1,
+                        max_value=60,
+                        step=1,
+                        key=scene_min_key,
+                        help="Minimum frames between cuts to prevent rapid-fire detection (default: 12)",
+                    )
+
+                    # Warmup detections
+                    scene_warmup_key = _get_pipeline_settings_key(ep_id, "detect", "scene_warmup_dets")
+                    if scene_warmup_key not in st.session_state:
+                        st.session_state[scene_warmup_key] = helpers.SCENE_WARMUP_DETS_DEFAULT
+                    st.number_input(
+                        "Warmup Detections",
+                        min_value=0,
+                        max_value=10,
+                        step=1,
+                        key=scene_warmup_key,
+                        help="Forced detections after each cut to re-establish tracks (default: 3)",
+                    )
+
+        # ─── FACES HARVEST SETTINGS ──────────────────────────────────────────
+        with tab_harvest:
+            st.markdown("#### Faces Harvest Settings")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Device selection for embeddings
+                faces_device_key = _get_pipeline_settings_key(ep_id, "harvest", "device")
+                if faces_device_key not in st.session_state:
+                    st.session_state[faces_device_key] = helpers.DEFAULT_DEVICE_LABEL
+                # Fix stale session state (e.g. old "CoreML (Apple Silicon)" format)
+                if st.session_state[faces_device_key] not in supported_devices:
+                    st.session_state[faces_device_key] = helpers.DEFAULT_DEVICE_LABEL if helpers.DEFAULT_DEVICE_LABEL in supported_devices else supported_devices[0]
+                faces_device_idx = supported_devices.index(st.session_state[faces_device_key])
+                st.selectbox(
+                    "Device (embeddings)",
+                    supported_devices,
+                    index=faces_device_idx,
+                    key=faces_device_key,
+                    help="Device for ArcFace embeddings. CoreML/GPU recommended.",
+                )
+
+                # Min frames between crops
+                min_frames_key = _get_pipeline_settings_key(ep_id, "harvest", "min_frames_between_crops")
+                if min_frames_key not in st.session_state:
+                    st.session_state[min_frames_key] = FACES_MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+                st.number_input(
+                    "Min frames between crops",
+                    min_value=1,
+                    max_value=600,
+                    step=1,
+                    key=min_frames_key,
+                    help="Spacing between face crops to reduce duplicates",
+                )
+
+            with col2:
+                # Save frames
+                faces_save_frames_key = _get_pipeline_settings_key(ep_id, "harvest", "save_frames")
+                if faces_save_frames_key not in st.session_state:
+                    st.session_state[faces_save_frames_key] = False
+                st.checkbox(
+                    "Save full frames",
+                    key=faces_save_frames_key,
+                    help="Store full frames during harvest (increases storage)",
+                )
+
+                # Save crops
+                faces_save_crops_key = _get_pipeline_settings_key(ep_id, "harvest", "save_crops")
+                if faces_save_crops_key not in st.session_state:
+                    st.session_state[faces_save_crops_key] = True
+                st.checkbox(
+                    "Save face crops",
+                    key=faces_save_crops_key,
+                    help="Export aligned face crops for review",
+                )
+
+            st.divider()
+
+            col3, col4 = st.columns(2)
+            with col3:
+                # Thumbnail size
+                thumb_size_key = _get_pipeline_settings_key(ep_id, "harvest", "thumb_size")
+                if thumb_size_key not in st.session_state:
+                    st.session_state[thumb_size_key] = FACES_THUMB_SIZE_DEFAULT
+                st.number_input(
+                    "Thumbnail size",
+                    min_value=64,
+                    max_value=512,
+                    step=32,
+                    key=thumb_size_key,
+                    help="Size of face thumbnails in pixels",
+                )
+
+            with col4:
+                # JPEG quality
+                faces_jpeg_key = _get_pipeline_settings_key(ep_id, "harvest", "jpeg_quality")
+                if faces_jpeg_key not in st.session_state:
+                    st.session_state[faces_jpeg_key] = JPEG_DEFAULT
+                st.select_slider(
+                    "JPEG quality",
+                    options=[60, 70, 80, 90],
+                    value=st.session_state[faces_jpeg_key] if st.session_state[faces_jpeg_key] in [60, 70, 80, 90] else 70,
+                    key=faces_jpeg_key,
+                    help="Image quality for saved crops (lower = smaller files)",
+                )
+
+        # ─── CLUSTER SETTINGS ────────────────────────────────────────────────
+        with tab_cluster:
+            st.markdown("#### Clustering Settings")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Device selection
+                cluster_device_key = _get_pipeline_settings_key(ep_id, "cluster", "device")
+                if cluster_device_key not in st.session_state:
+                    st.session_state[cluster_device_key] = helpers.DEFAULT_DEVICE_LABEL
+                # Fix stale session state (e.g. old "CoreML (Apple Silicon)" format)
+                if st.session_state[cluster_device_key] not in supported_devices:
+                    st.session_state[cluster_device_key] = helpers.DEFAULT_DEVICE_LABEL if helpers.DEFAULT_DEVICE_LABEL in supported_devices else supported_devices[0]
+                cluster_device_idx = supported_devices.index(st.session_state[cluster_device_key])
+                st.selectbox(
+                    "Device",
+                    supported_devices,
+                    index=cluster_device_idx,
+                    key=cluster_device_key,
+                    help="Device for similarity computations",
+                )
+
+                # Cluster similarity threshold
+                cluster_thresh_key = _get_pipeline_settings_key(ep_id, "cluster", "cluster_thresh")
+                if cluster_thresh_key not in st.session_state:
+                    st.session_state[cluster_thresh_key] = CLUSTER_THRESH_DEFAULT
+                thresh_val = st.slider(
+                    "Similarity threshold",
+                    min_value=0.4,
+                    max_value=0.9,
+                    step=0.01,
+                    key=cluster_thresh_key,
+                    help="Higher = stricter clustering (clustering.yaml: cluster_thresh)",
+                )
+                # Threshold guidance
+                if thresh_val >= 0.80:
+                    st.caption("Very strict: May over-split same person")
+                elif thresh_val >= 0.70:
+                    st.caption("Strict: Good for similar-looking people")
+                elif thresh_val >= 0.55:
+                    st.caption("Balanced: Recommended for most content")
+                else:
+                    st.caption("Lenient: May merge different people")
+
+            with col2:
+                # Min cluster size
+                min_size_key = _get_pipeline_settings_key(ep_id, "cluster", "min_cluster_size")
+                if min_size_key not in st.session_state:
+                    st.session_state[min_size_key] = CLUSTER_MIN_SIZE_DEFAULT
+                st.number_input(
+                    "Min tracks per identity",
+                    min_value=1,
+                    max_value=50,
+                    step=1,
+                    key=min_size_key,
+                    help="Clusters smaller than this are discarded (clustering.yaml: min_cluster_size)",
+                )
+
+                # Min identity similarity
+                min_id_sim_key = _get_pipeline_settings_key(ep_id, "cluster", "min_identity_sim")
+                if min_id_sim_key not in st.session_state:
+                    st.session_state[min_id_sim_key] = CLUSTER_MIN_IDENTITY_SIM_DEFAULT
+                st.slider(
+                    "Min identity similarity",
+                    min_value=0.3,
+                    max_value=0.8,
+                    step=0.01,
+                    key=min_id_sim_key,
+                    help="Tracks below this similarity to centroid are outliers (clustering.yaml: min_identity_sim)",
+                )
+
+        st.divider()
+        if st.button("Close", use_container_width=True, type="primary"):
+            st.rerun()
+
+    # Button to open dialog (gear icon)
+    if st.button("⚙️", key=dialog_key, help="Open pipeline settings"):
+        settings_dialog()
+
+
+def _get_detect_settings(ep_id: str) -> Dict[str, Any]:
+    """Get current detect/track settings from session state with defaults."""
+    def _get(field: str, default: Any) -> Any:
+        key = _get_pipeline_settings_key(ep_id, "detect", field)
+        return st.session_state.get(key, default)
+
+    device_label = _get("device", helpers.DEFAULT_DEVICE_LABEL)
+    detector_label = _get("detector", "RetinaFace (recommended)")
+    tracker_label = _get("tracker", "ByteTrack (default)")
+
+    # Scene detector: convert label to value
+    scene_detector_label = _get("scene_detector", "PySceneDetect (recommended)")
+    scene_detector_value = helpers.SCENE_DETECTOR_VALUE_MAP.get(
+        scene_detector_label, helpers.SCENE_DETECTOR_DEFAULT
+    )
+
+    return {
+        "device": helpers.DEVICE_VALUE_MAP.get(device_label, "auto"),
+        "device_label": device_label,
+        "detector": helpers.DETECTOR_VALUE_MAP.get(detector_label, "retinaface"),
+        "detector_label": detector_label,
+        "tracker": helpers.TRACKER_VALUE_MAP.get(tracker_label, "bytetrack"),
+        "tracker_label": tracker_label,
+        "stride": int(_get("stride", helpers.DEFAULT_STRIDE)),
+        "fps": float(_get("fps", 0.0)),
+        "det_thresh": float(_get("det_thresh", helpers.DEFAULT_DET_THRESH)),
+        "save_frames": bool(_get("save_frames", True)),
+        "save_crops": bool(_get("save_crops", True)),
+        "cpu_threads": int(_get("cpu_threads", 2)),
+        "max_gap": int(_get("max_gap", helpers.DEFAULT_MAX_GAP)),
+        "track_high_thresh": float(_get("track_high_thresh", TRACK_THRESH_DEFAULT)),
+        "new_track_thresh": float(_get("new_track_thresh", TRACK_NEW_THRESH_DEFAULT)),
+        "match_thresh": float(_get("match_thresh", TRACK_MATCH_THRESH_DEFAULT)),
+        "jpeg_quality": int(_get("jpeg_quality", JPEG_DEFAULT)),
+        # Scene detection settings
+        "scene_detector": scene_detector_value,
+        "scene_detector_label": scene_detector_label,
+        "scene_threshold": float(_get("scene_threshold", helpers.SCENE_THRESHOLD_DEFAULT)),
+        "scene_min_len": int(_get("scene_min_len", helpers.SCENE_MIN_LEN_DEFAULT)),
+        "scene_warmup_dets": int(_get("scene_warmup_dets", helpers.SCENE_WARMUP_DETS_DEFAULT)),
+    }
+
+
+def _get_harvest_settings(ep_id: str) -> Dict[str, Any]:
+    """Get current faces harvest settings from session state with defaults."""
+    def _get(field: str, default: Any) -> Any:
+        key = _get_pipeline_settings_key(ep_id, "harvest", field)
+        return st.session_state.get(key, default)
+
+    device_label = _get("device", helpers.DEFAULT_DEVICE_LABEL)
+
+    return {
+        "device": helpers.DEVICE_VALUE_MAP.get(device_label, "auto"),
+        "device_label": device_label,
+        "save_frames": bool(_get("save_frames", False)),
+        "save_crops": bool(_get("save_crops", True)),
+        "min_frames_between_crops": int(_get("min_frames_between_crops", FACES_MIN_FRAMES_BETWEEN_CROPS_DEFAULT)),
+        "thumb_size": int(_get("thumb_size", FACES_THUMB_SIZE_DEFAULT)),
+        "jpeg_quality": int(_get("jpeg_quality", JPEG_DEFAULT)),
+    }
+
+
+def _get_cluster_settings(ep_id: str) -> Dict[str, Any]:
+    """Get current cluster settings from session state with defaults."""
+    def _get(field: str, default: Any) -> Any:
+        key = _get_pipeline_settings_key(ep_id, "cluster", field)
+        return st.session_state.get(key, default)
+
+    device_label = _get("device", helpers.DEFAULT_DEVICE_LABEL)
+
+    return {
+        "device": helpers.DEVICE_VALUE_MAP.get(device_label, "auto"),
+        "device_label": device_label,
+        "cluster_thresh": float(_get("cluster_thresh", CLUSTER_THRESH_DEFAULT)),
+        "min_cluster_size": int(_get("min_cluster_size", CLUSTER_MIN_SIZE_DEFAULT)),
+        "min_identity_sim": float(_get("min_identity_sim", CLUSTER_MIN_IDENTITY_SIM_DEFAULT)),
+    }
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -315,6 +882,54 @@ def _get_most_recent_run_marker_age(ep_id: str) -> float | None:
     return None
 
 
+# Suggestion 8: Mtime-based retry backoff constants
+_MAX_RETRY_ATTEMPTS = 30  # Max 30 attempts (~30 seconds)
+_ARTIFACT_FRESHNESS_WINDOW = 60  # Consider artifacts "fresh" if modified within 60s
+
+
+def _get_manifest_mtime(ep_id: str, phase: str) -> float | None:
+    """Get the mtime of a manifest file for a specific phase."""
+    manifest_map = {
+        "faces": "faces.jsonl",
+        "detect": "tracks.jsonl",
+        "cluster": "identities.json",
+    }
+    filename = manifest_map.get(phase)
+    if not filename:
+        return None
+    manifest_path = helpers.DATA_ROOT / "manifests" / ep_id / filename
+    try:
+        if manifest_path.exists():
+            return manifest_path.stat().st_mtime
+    except OSError:
+        pass
+    return None
+
+
+def _should_retry_phase_trigger(ep_id: str, phase: str, retry_count: int) -> tuple[bool, str]:
+    """Suggestion 8: Mtime-based retry backoff instead of fixed 10 attempts.
+
+    Check if we should retry waiting for a phase to be ready based on:
+    1. Artifact freshness (if manifest was recently modified, keep waiting)
+    2. Retry count with increased limit (30 attempts vs 10)
+
+    Returns: (should_retry, status_message)
+    """
+    # Check if artifacts are freshly written (within 60s)
+    manifest_mtime = _get_manifest_mtime(ep_id, phase)
+    if manifest_mtime is not None:
+        age_seconds = time.time() - manifest_mtime
+        if age_seconds < _ARTIFACT_FRESHNESS_WINDOW:
+            # Artifacts are fresh, definitely keep retrying
+            return True, f"Artifacts fresh ({int(age_seconds)}s old), retrying..."
+
+    # Check retry count with longer cap
+    if retry_count < _MAX_RETRY_ATTEMPTS:
+        return True, f"Waiting for {phase} phase... ({retry_count}/{_MAX_RETRY_ATTEMPTS})"
+
+    return False, f"Timeout waiting for {phase} prerequisites after {_MAX_RETRY_ATTEMPTS} attempts"
+
+
 def _sync_job_state_with_api(
     ep_id: str,
     running_job_key: str,
@@ -518,20 +1133,53 @@ def _cached_storage_status() -> Dict[str, Any] | None:
         return None
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+# Suggestion 2: Adaptive cache TTL based on job state
+# During active jobs: 10s TTL (human can't perceive <10s delay in progress updates)
+# When idle: 3s TTL for responsive manual refresh
+_CACHE_TTL_ACTIVE = 10  # Longer TTL during job execution
+_CACHE_TTL_IDLE = 3  # Shorter TTL when idle
+
+
+def _any_job_active(ep_id: str) -> bool:
+    """Check if any job is active for this episode (from session state)."""
+    _autorun_key = f"{ep_id}::autorun_active"
+    if st.session_state.get(_autorun_key):
+        return True
+    running_key = f"episode_detail_running_job:{ep_id}"
+    if st.session_state.get(running_key):
+        return True
+    return False
+
+
+def _get_adaptive_ttl(ep_id: str) -> int:
+    """Get cache TTL based on job activity - longer during jobs, shorter when idle."""
+    return _CACHE_TTL_ACTIVE if _any_job_active(ep_id) else _CACHE_TTL_IDLE
+
+
+@st.cache_data(ttl=_CACHE_TTL_ACTIVE, show_spinner=False)
 def _cached_celery_jobs() -> Dict[str, Any] | None:
-    """Cache celery jobs API response with 5s TTL (changes frequently during jobs)."""
+    """Cache celery jobs API response (adaptive TTL handled at call site)."""
     try:
         return helpers.api_get("/celery_jobs")
     except requests.RequestException:
         return None
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=_CACHE_TTL_ACTIVE, show_spinner=False)
 def _cached_episode_jobs(ep_id: str) -> Dict[str, Any] | None:
-    """Cache episode jobs list API response with 5s TTL."""
+    """Cache episode jobs list API response."""
     try:
         return helpers.api_get(f"/jobs?ep_id={ep_id}&limit=20")
+    except requests.RequestException:
+        return None
+
+
+@st.cache_data(ttl=_CACHE_TTL_ACTIVE, show_spinner=False)
+def _cached_local_jobs(ep_id: str | None = None) -> Dict[str, Any] | None:
+    """Cache local jobs list API response."""
+    try:
+        params = f"?ep_id={ep_id}" if ep_id else ""
+        return helpers.api_get(f"/celery_jobs/local{params}")
     except requests.RequestException:
         return None
 
@@ -911,16 +1559,25 @@ status_payload = st.session_state.get(status_cache_key)
 _manifests_dir = get_path(ep_id, "detections").parent
 _runs_dir = _manifests_dir / "runs"
 _track_metrics_path = _manifests_dir / "track_metrics.json"
+
+
+# Batch file stat operations for efficiency - use try/except to avoid separate exists() calls
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        return 0
+
+
 current_mtimes = (
-    (_runs_dir / "detect_track.json").stat().st_mtime if (_runs_dir / "detect_track.json").exists() else 0,
-    (_runs_dir / "faces_embed.json").stat().st_mtime if (_runs_dir / "faces_embed.json").exists() else 0,
-    (_runs_dir / "cluster.json").stat().st_mtime if (_runs_dir / "cluster.json").exists() else 0,
-    (_manifests_dir / "detections.jsonl").stat().st_mtime if (_manifests_dir / "detections.jsonl").exists() else 0,
-    (_manifests_dir / "tracks.jsonl").stat().st_mtime if (_manifests_dir / "tracks.jsonl").exists() else 0,
-    (_manifests_dir / "faces.jsonl").stat().st_mtime if (_manifests_dir / "faces.jsonl").exists() else 0,
-    # Track cluster metrics so status cache updates when clustering writes only metrics.
-    _track_metrics_path.stat().st_mtime if _track_metrics_path.exists() else 0,
-    (_manifests_dir / "identities.json").stat().st_mtime if (_manifests_dir / "identities.json").exists() else 0,
+    _safe_mtime(_runs_dir / "detect_track.json"),
+    _safe_mtime(_runs_dir / "faces_embed.json"),
+    _safe_mtime(_runs_dir / "cluster.json"),
+    _safe_mtime(_manifests_dir / "detections.jsonl"),
+    _safe_mtime(_manifests_dir / "tracks.jsonl"),
+    _safe_mtime(_manifests_dir / "faces.jsonl"),
+    _safe_mtime(_track_metrics_path),
+    _safe_mtime(_manifests_dir / "identities.json"),
 )
 cached_mtimes = st.session_state.get(mtimes_key)
 should_refresh_status = force_refresh or _job_active(ep_id) or status_payload is None or cached_mtimes != current_mtimes
@@ -1015,18 +1672,49 @@ with st.expander("🔧 Execution Settings", expanded=False):
 
 
 # =============================================================================
-# Current Jobs Panel (Celery + subprocess background jobs)
+# Current Jobs Panel (Celery + subprocess + local background jobs)
 # =============================================================================
 with st.expander("⚙️ Current Jobs", expanded=False):
     try:
         all_jobs: list[dict] = []
+        seen_job_ids: set[str] = set()  # Avoid duplicates across sources
+
+        # Fetch LOCAL jobs FIRST (most common for local mode, highest priority)
+        local_response = _cached_local_jobs(ep_id)
+        local_jobs = local_response.get("jobs", []) if local_response else []
+        for job in local_jobs:
+            job_id = job.get("job_id", "unknown")
+            if job_id in seen_job_ids:
+                continue
+            seen_job_ids.add(job_id)
+            state = job.get("state", "unknown")
+            # Local jobs in registry are always running/in_progress
+            op = job.get("operation", "Pipeline Job")
+            op_label = op.replace("_", " ").title() if op else "Pipeline Job"
+            pid = job.get("pid")
+            all_jobs.append({
+                "job_id": job_id,
+                "name": f"{op_label} (PID {pid})" if pid else op_label,
+                "state": state,
+                "worker": f"PID {pid}" if pid else "",
+                "ep_id": job.get("ep_id"),
+                "source": "local",
+                "pid": pid,
+            })
 
         # Fetch Celery jobs (cached for 5s)
         celery_response = _cached_celery_jobs()
         celery_jobs = celery_response.get("jobs", []) if celery_response else []
         for job in celery_jobs:
+            job_id = job.get("job_id", "unknown")
+            if job_id in seen_job_ids:
+                continue
+            # Only show jobs for current episode
+            if job.get("ep_id") != ep_id:
+                continue
+            seen_job_ids.add(job_id)
             all_jobs.append({
-                "job_id": job.get("job_id", "unknown"),
+                "job_id": job_id,
                 "name": job.get("name", "Celery Task"),
                 "state": job.get("state", "unknown"),
                 "worker": job.get("worker", ""),
@@ -1034,15 +1722,19 @@ with st.expander("⚙️ Current Jobs", expanded=False):
                 "source": "celery",
             })
 
-        # Fetch subprocess-based jobs (cached for 5s, filtered to current episode)
+        # Fetch subprocess-based jobs (legacy, cached for 5s, filtered to current episode)
         jobs_response = _cached_episode_jobs(ep_id)
         subprocess_jobs = jobs_response.get("jobs", []) if jobs_response else []
         for job in subprocess_jobs:
+            job_id = job.get("job_id", "unknown")
+            if job_id in seen_job_ids:
+                continue
             # Only show running/queued jobs, not completed ones
             state = job.get("state", "unknown")
             if state in ("running", "queued", "in_progress"):
+                seen_job_ids.add(job_id)
                 all_jobs.append({
-                    "job_id": job.get("job_id", "unknown"),
+                    "job_id": job_id,
                     "name": job.get("job_type", "Pipeline Job"),
                     "state": state,
                     "worker": "",
@@ -1086,12 +1778,17 @@ with st.expander("⚙️ Current Jobs", expanded=False):
                     cancel_key = f"cancel_{job_id}"
                     if st.button("❌", key=cancel_key, help="Cancel this job"):
                         try:
-                            if source == "celery":
+                            if source == "local":
+                                # Local jobs use the celery_jobs cancel endpoint
+                                cancel_resp = helpers.api_post(f"/celery_jobs/{job_id}/cancel")
+                            elif source == "celery":
                                 cancel_resp = helpers.api_post(f"/celery_jobs/{job_id}/cancel")
                             else:
                                 cancel_resp = helpers.api_post(f"/jobs/{job_id}/cancel")
                             if cancel_resp:
                                 st.success(f"Cancelled job {job_id[:8]}...")
+                                # Clear caches to reflect cancellation
+                                _cached_local_jobs.clear()
                                 st.rerun()
                             else:
                                 st.error("Failed to cancel job")
@@ -1722,9 +2419,15 @@ combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_dete
 combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
 
 # =============================================================================
-# Performance Profile selector (applies to all three jobs)
+# Pipeline Settings Header with Settings Dialog Button
 # =============================================================================
-st.markdown("### Pipeline Settings")
+settings_col1, settings_col2 = st.columns([10, 1])
+with settings_col1:
+    st.markdown("### Pipeline Settings")
+with settings_col2:
+    # Render the settings dialog and its trigger button
+    _render_pipeline_settings_dialog(ep_id, video_meta)
+
 _profile_session_prefix = f"episode_detail::{ep_id}"
 _profile_widget_key = f"{_profile_session_prefix}::global_profile"
 
@@ -1765,7 +2468,513 @@ profile_value = helpers.PROFILE_VALUE_MAP.get(profile_label, _profile_seed_value
 profile_changed = profile_value != _profile_seed_value
 profile_defaults = helpers.profile_defaults(profile_value)
 
+# ── Auto-Run Pipeline ────────────────────────────────────────────────────────
+# Session state keys for auto-run pipeline
+_autorun_key = f"{ep_id}::autorun_pipeline"
+_autorun_phase_key = f"{ep_id}::autorun_phase"  # "detect", "faces", "cluster", or None
+
+# Check if auto-run is active and a phase just completed
+autorun_active = st.session_state.get(_autorun_key, False)
+autorun_phase = st.session_state.get(_autorun_phase_key)
+
+# Auto-run container for the button
+with st.container():
+    auto_col1, auto_col2 = st.columns([3, 1])
+    with auto_col1:
+        if autorun_active:
+            phase_labels = {"detect": "Detect/Track", "faces": "Faces Harvest", "cluster": "Clustering"}
+            current_phase_label = phase_labels.get(autorun_phase, "Unknown")
+            # Get completed stages log
+            completed_stages = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+            # Build status display
+            status_lines = []
+            for stage_info in completed_stages:
+                status_lines.append(f"✅ {stage_info}")
+            status_lines.append(f"🔄 Currently running: {current_phase_label}")
+            st.info("**Auto-Run Pipeline Active**\n\n" + "\n\n".join(status_lines))
+
+            # Suggestion 4: Pipeline Progress Bar with ETA
+            # Weight phases by typical duration: detect=50%, faces=30%, cluster=20%
+            phase_weights = {"detect": 0.50, "faces": 0.30, "cluster": 0.20}
+            phase_order = ["detect", "faces", "cluster"]
+
+            # Calculate completed phase weight
+            completed_weight = 0.0
+            for phase in phase_order:
+                if phase in [s.split(" ")[0].lower() for s in completed_stages]:
+                    completed_weight += phase_weights.get(phase, 0)
+                elif phase == "detect" and any("Detect" in s for s in completed_stages):
+                    completed_weight += phase_weights["detect"]
+                elif phase == "faces" and any("Faces" in s for s in completed_stages):
+                    completed_weight += phase_weights["faces"]
+
+            # Get current phase progress (from running jobs or 0)
+            current_phase_weight = phase_weights.get(autorun_phase, 0)
+            current_phase_pct = 0.0
+            # Fetch running jobs for progress (uses cached batch API)
+            _running_jobs = helpers.get_all_running_jobs_for_episode(ep_id)
+            if autorun_phase == "detect" and _running_jobs.get("detect_track"):
+                current_phase_pct = _running_jobs["detect_track"].get("progress_pct", 0) / 100
+            elif autorun_phase == "faces" and _running_jobs.get("faces_embed"):
+                current_phase_pct = _running_jobs["faces_embed"].get("progress_pct", 0) / 100
+            elif autorun_phase == "cluster" and _running_jobs.get("cluster"):
+                current_phase_pct = _running_jobs["cluster"].get("progress_pct", 0) / 100
+
+            total_progress = completed_weight + (current_phase_pct * current_phase_weight)
+            st.progress(min(total_progress, 1.0))
+            st.caption(f"Pipeline: {int(total_progress * 100)}% complete")
+        else:
+            st.caption("Run all pipeline stages in sequence: Detect/Track → Faces Harvest → Cluster")
+    with auto_col2:
+        if autorun_active:
+            if st.button("⏹️ Stop Auto-Run", key="stop_autorun", use_container_width=True, type="secondary"):
+                st.session_state[_autorun_key] = False
+                st.session_state[_autorun_phase_key] = None
+                st.toast("Auto-run stopped")
+                st.rerun()
+        else:
+            # Disable if no video or job already running
+            autorun_disabled = not local_video_exists or st.session_state.get(running_job_key, False)
+            if st.button(
+                "🚀 Auto-Run Pipeline",
+                key="start_autorun",
+                use_container_width=True,
+                type="primary",
+                disabled=autorun_disabled,
+                help="Run Detect/Track → Faces Harvest → Cluster automatically with current settings",
+            ):
+                # Clear old manifest data to prevent stale data confusion
+                # Archive old run markers and clear status cache
+                _manifests_dir = helpers.DATA_ROOT / "manifests" / ep_id
+                _runs_dir = _manifests_dir / "runs"
+                archived_count = 0
+                manifest_archived = 0
+                if _runs_dir.exists():
+                    archive_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    for marker_file in ["detect_track.json", "faces_embed.json", "cluster.json"]:
+                        marker_path = _runs_dir / marker_file
+                        if marker_path.exists():
+                            try:
+                                archive_path = _runs_dir / f"{marker_file}.{archive_time}.bak"
+                                marker_path.rename(archive_path)
+                                archived_count += 1
+                                LOGGER.info("[AUTORUN] Archived old marker: %s -> %s", marker_file, archive_path.name)
+                            except OSError as e:
+                                LOGGER.warning("[AUTORUN] Failed to archive %s: %s", marker_file, e)
+                    # Archive manifest files as well to force a clean pipeline run
+                    manifest_files = [
+                        "detections.jsonl",
+                        "tracks.jsonl",
+                        "faces.jsonl",
+                        "identities.json",
+                        "track_metrics.json",
+                    ]
+                    for manifest_file in manifest_files:
+                        manifest_path = _manifests_dir / manifest_file
+                        if manifest_path.exists():
+                            try:
+                                archive_path = _manifests_dir / f"{manifest_file}.{archive_time}.bak"
+                                manifest_path.rename(archive_path)
+                                manifest_archived += 1
+                                LOGGER.info("[AUTORUN] Archived old manifest: %s -> %s", manifest_file, archive_path.name)
+                            except OSError as e:
+                                LOGGER.warning("[AUTORUN] Failed to archive manifest %s: %s", manifest_file, e)
+                if archived_count > 0:
+                    LOGGER.info("[AUTORUN] Archived %d old run markers", archived_count)
+                if manifest_archived > 0:
+                    LOGGER.info("[AUTORUN] Archived %d manifest files for clean auto-run start", manifest_archived)
+
+                # Record baseline mtimes to avoid promoting stale artifacts from prior runs
+                def _safe_mtime(path: Path) -> float:
+                    try:
+                        return path.stat().st_mtime
+                    except (FileNotFoundError, OSError):
+                        return 0.0
+
+                st.session_state[f"{ep_id}::autorun_detect_baseline_mtime"] = max(
+                    _safe_mtime(_manifests_dir / "tracks.jsonl"),
+                    _safe_mtime(_runs_dir / "detect_track.json"),
+                )
+                st.session_state[f"{ep_id}::autorun_faces_baseline_mtime"] = max(
+                    _safe_mtime(_manifests_dir / "faces.jsonl"),
+                    _safe_mtime(_runs_dir / "faces_embed.json"),
+                )
+                st.session_state[f"{ep_id}::autorun_cluster_baseline_mtime"] = max(
+                    _safe_mtime(_manifests_dir / "identities.json"),
+                    _safe_mtime(_runs_dir / "cluster.json"),
+                )
+
+                # Clear all status caches to force fresh fetch
+                st.session_state.pop(_status_mtimes_key(ep_id), None)
+                st.session_state.pop(_status_cache_key(ep_id), None)
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                helpers.invalidate_running_jobs_cache(ep_id)
+                _cached_local_jobs.clear()
+
+                # Clear any stale promotion keys from previous runs
+                st.session_state.pop(f"{ep_id}::autorun_detect_promoted_mtime", None)
+                st.session_state.pop(f"{ep_id}::autorun_faces_promoted_mtime", None)
+
+                st.session_state[_autorun_key] = True
+                st.session_state[_autorun_phase_key] = "detect"
+                st.session_state[f"{ep_id}::autorun_completed_stages"] = []  # Clear completed stages log
+                st.session_state[f"{ep_id}::autorun_started_at"] = time.time()  # Track when auto-run started
+                st.session_state["episode_detail_detect_autorun_flag"] = True  # Trigger detect job
+                st.toast("Starting auto-run pipeline...")
+                st.rerun()
+
+# Debug: Show auto-run state (collapsible)
+if autorun_active:
+    with st.expander("🔍 Auto-Run Debug Info", expanded=False):
+        # Get current settings for display
+        _debug_detect_settings = _get_detect_settings(ep_id)
+        debug_cols = st.columns(2)
+        with debug_cols[0]:
+            st.markdown("**Session State (Auto-Run)**")
+            st.code(f"""
+autorun_key: {st.session_state.get(_autorun_key)}
+autorun_phase: {st.session_state.get(_autorun_phase_key)}
+completed_stages: {st.session_state.get(f"{ep_id}::autorun_completed_stages", [])}
+detect_autorun_flag: {st.session_state.get("episode_detail_detect_autorun_flag", False)}
+faces_trigger: {st.session_state.get(f"{ep_id}::autorun_faces_trigger", False)}
+cluster_trigger: {st.session_state.get(f"{ep_id}::autorun_cluster_trigger", False)}
+            """, language="yaml")
+        with debug_cols[1]:
+            st.markdown("**Job State**")
+            st.code(f"""
+running_job_key: {st.session_state.get(running_job_key, False)}
+detect_running: {st.session_state.get(_detect_job_state_key(ep_id), False)}
+job_activity: {st.session_state.get(_job_activity_key(ep_id), False)}
+tracks_just_completed: {st.session_state.get(f"{ep_id}::tracks_just_completed", False)}
+faces_just_completed: {st.session_state.get(f"{ep_id}::faces_just_completed", False)}
+            """, language="yaml")
+            st.markdown("**Completion Flags (from ui_helpers)**")
+            st.code(f"""
+detect_track_just_completed: {st.session_state.get(f"{ep_id}::detect_track_just_completed", False)}
+faces_embed_just_completed: {st.session_state.get(f"{ep_id}::faces_embed_just_completed", False)}
+cluster_just_completed: {st.session_state.get(f"{ep_id}::cluster_just_completed", False)}
+            """, language="yaml")
+        st.markdown("**Phase Status (from API)**")
+        st.code(f"""
+detect_status: {detect_phase_status.get("status", "?")}
+faces_status: {faces_phase_status.get("status", "?")}
+cluster_status: {cluster_phase_status.get("status", "?")}
+        """, language="yaml")
+        st.markdown("**Timing (for fallback checks)**")
+        _autorun_started = st.session_state.get(f"{ep_id}::autorun_started_at", 0)
+        _autorun_started_str = datetime.fromtimestamp(_autorun_started).isoformat() if _autorun_started else "N/A"
+        st.code(f"""
+autorun_started_at: {_autorun_started_str}
+faces_completed_at: {st.session_state.get(f"{ep_id}::faces_completed_at", "N/A")}
+tracks_completed_at: {st.session_state.get(f"{ep_id}::tracks_completed_at", "N/A")}
+        """, language="yaml")
+        st.markdown("**Pipeline Settings (Current)**")
+        st.code(f"""
+scene_detector: {_debug_detect_settings.get("scene_detector", "?")}
+scene_threshold: {_debug_detect_settings.get("scene_threshold", "?")}
+scene_min_len: {_debug_detect_settings.get("scene_min_len", "?")}
+scene_warmup_dets: {_debug_detect_settings.get("scene_warmup_dets", "?")}
+stride: {_debug_detect_settings.get("stride", "?")}
+device: {_debug_detect_settings.get("device", "?")}
+detector: {_debug_detect_settings.get("detector", "?")}
+tracker: {_debug_detect_settings.get("tracker", "?")}
+        """, language="yaml")
+
 st.divider()
+
+# =============================================================================
+# AUTO-RUN FALLBACK PROMOTION
+# When auto-run is active but session flags were lost (e.g., page refresh during
+# local mode job), check API status and manifest mtimes to recover state.
+# =============================================================================
+if autorun_active:
+    autorun_phase = st.session_state.get(_autorun_phase_key)
+    _fallback_triggered = False
+
+    # Helper: Get run marker mtime for a phase
+    def _get_run_marker_mtime(phase: str) -> float | None:
+        marker_path = helpers.DATA_ROOT / "manifests" / ep_id / "runs" / f"{phase}.json"
+        try:
+            if marker_path.exists():
+                return marker_path.stat().st_mtime
+        except OSError:
+            pass
+        return None
+
+    # Helper: Get manifest file mtime (returns 0 if doesn't exist)
+    def _get_manifest_mtime(filename: str) -> float:
+        manifest_path = helpers.DATA_ROOT / "manifests" / ep_id / filename
+        try:
+            if manifest_path.exists():
+                return manifest_path.stat().st_mtime
+        except OSError:
+            pass
+        return 0.0
+
+    # Helper: Check if manifest was updated recently (within N seconds)
+    def _is_manifest_fresh(filename: str, max_age_sec: float = 120.0) -> bool:
+        mtime = _get_manifest_mtime(filename)
+        return mtime > 0 and (time.time() - mtime) < max_age_sec
+
+    def _get_progress_mtime() -> float:
+        progress_path = helpers.DATA_ROOT / "manifests" / ep_id / "progress.json"
+        try:
+            if progress_path.exists():
+                return progress_path.stat().st_mtime
+        except OSError:
+            pass
+        return 0.0
+
+    # Fallback 1: detect → faces
+    # If auto-run is stuck on "detect" but API says detect is success and no job running
+    if autorun_phase == "detect":
+        detect_api_status = detect_phase_status.get("status")
+        detect_job_running = helpers.get_running_job_for_episode(ep_id, "detect_track") is not None
+
+        # Get when auto-run started - manifest must be newer than this
+        autorun_started_at = st.session_state.get(f"{ep_id}::autorun_started_at", 0.0)
+        detect_baseline = st.session_state.get(f"{ep_id}::autorun_detect_baseline_mtime", autorun_started_at)
+
+        # FIX: Clamp future/stale autorun_started_at to prevent blocking
+        # This handles cases where session state has a stale timestamp from a prior session
+        # or clock skew causes the timestamp to be ahead of artifact mtimes
+        current_time = time.time()
+        if autorun_started_at > current_time + 60:
+            LOGGER.warning(
+                "[AUTORUN FALLBACK] autorun_started_at (%.1f) is in the future (current=%.1f), clamping",
+                autorun_started_at, current_time
+            )
+            autorun_started_at = current_time
+            st.session_state[f"{ep_id}::autorun_started_at"] = autorun_started_at
+
+        # Check if tracks manifest is from current auto-run session
+        tracks_manifest_mtime = _get_manifest_mtime("tracks.jsonl")
+        tracks_manifest_from_current_run = tracks_manifest_mtime > detect_baseline
+
+        # Also check run marker mtime as additional signal
+        detect_marker_mtime = _get_run_marker_mtime("detect_track") or 0.0
+        detect_marker_from_current_run = detect_marker_mtime > detect_baseline
+        # Also allow a fresh progress.json “done” as a completion signal
+        progress_mtime = _get_progress_mtime()
+        progress_from_current_run = progress_mtime > detect_baseline
+        progress_payload = helpers.get_episode_progress(ep_id) or {}
+        progress_done = str(progress_payload.get("step") or "").lower() == "done" or str(progress_payload.get("phase") or "").lower() == "done"
+        if progress_done:
+            progress_from_current_run = True
+
+        # Debug logging for fallback conditions
+        LOGGER.info(
+            "[AUTORUN FALLBACK] detect check: api_status=%s, job_running=%s, "
+            "tracks_mtime=%.1f, marker_mtime=%.1f, autorun_started=%.1f, "
+            "manifest_current=%s, marker_current=%s",
+            detect_api_status, detect_job_running,
+            tracks_manifest_mtime, detect_marker_mtime, autorun_started_at,
+            tracks_manifest_from_current_run, detect_marker_from_current_run
+        )
+
+        # Accept either manifest or marker being current (marker is more reliable for local mode)
+        detect_from_current_run = (
+            tracks_manifest_from_current_run
+            or detect_marker_from_current_run
+            or progress_from_current_run
+        )
+
+        # FIX: Safety fallback - if API=success and manifests exist AND are fresh, promote
+        # This handles cases where autorun_started_at is stale/future compared to artifact mtimes
+        # But we require manifests to be reasonably fresh (within 10 min) to avoid using stale data
+        if detect_api_status == "success" and not detect_job_running and not detect_from_current_run:
+            det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
+            trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+            if det_path.exists() and trk_path.exists():
+                # Check freshness - manifests must be modified within last 10 minutes
+                manifest_freshness_window = 600  # 10 minutes in seconds
+                manifest_age = current_time - tracks_manifest_mtime
+                if manifest_age < manifest_freshness_window:
+                    LOGGER.warning(
+                        "[AUTORUN FALLBACK] mtime check failed (tracks=%.1f, marker=%.1f, started=%.1f) "
+                        "but API=success and manifests are fresh (age=%.1fs) - promoting",
+                        tracks_manifest_mtime, detect_marker_mtime, autorun_started_at, manifest_age
+                    )
+                    detect_from_current_run = True  # Allow the existing block to handle promotion
+                else:
+                    LOGGER.warning(
+                        "[AUTORUN FALLBACK] mtime check failed and manifests are stale (age=%.1fs > %ds) - NOT promoting",
+                        manifest_age, manifest_freshness_window
+                    )
+
+        if detect_api_status == "success" and not detect_job_running and detect_from_current_run:
+            # Check if we already processed this (use run marker OR manifest mtime to avoid double-firing)
+            _detect_promoted_key = f"{ep_id}::autorun_detect_promoted_mtime"
+            marker_mtime = _get_run_marker_mtime("detect_track")
+            # FALLBACK: If marker doesn't exist (e.g., subprocess interrupted), use manifest mtime
+            effective_mtime = marker_mtime if marker_mtime else tracks_manifest_mtime
+            last_promoted_mtime = st.session_state.get(_detect_promoted_key)
+
+            LOGGER.info(
+                "[AUTORUN FALLBACK] detect promotion check: marker_mtime=%s, manifest_mtime=%.1f, "
+                "effective_mtime=%.1f, last_promoted=%.1f",
+                marker_mtime, tracks_manifest_mtime, effective_mtime,
+                last_promoted_mtime or 0.0
+            )
+
+            if effective_mtime > 0 and (last_promoted_mtime is None or effective_mtime > last_promoted_mtime):
+                # Read counts from manifest for the completed stage log
+                det_count = 0
+                trk_count = 0
+                det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
+                trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+                try:
+                    if det_path.exists():
+                        with det_path.open("r", encoding="utf-8") as fh:
+                            det_count = sum(1 for line in fh if line.strip())
+                    if trk_path.exists():
+                        with trk_path.open("r", encoding="utf-8") as fh:
+                            trk_count = sum(1 for line in fh if line.strip())
+                except OSError:
+                    pass
+
+                # Best-effort: write a run marker if missing
+                marker_path = helpers.DATA_ROOT / "manifests" / ep_id / "runs" / "detect_track.json"
+                if not marker_path.exists():
+                    try:
+                        marker_path.parent.mkdir(parents=True, exist_ok=True)
+                        marker_payload = {
+                            "phase": "detect_track",
+                            "status": "success",
+                            "ep_id": ep_id,
+                            "detections": det_count,
+                            "tracks": trk_count,
+                            "finished_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                        }
+                        marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
+
+                # Guard: If zero detections/tracks, stop auto-run (scene-only or failed run)
+                if det_count == 0 or trk_count == 0:
+                    LOGGER.warning("[AUTORUN FALLBACK] Stopping: zero detections/tracks (det=%s, trk=%s)", det_count, trk_count)
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    st.session_state[f"{ep_id}::autorun_error"] = f"Zero detections ({det_count}) or tracks ({trk_count})"
+                    st.error(f"❌ Auto-run stopped: No faces detected (detections={det_count}, tracks={trk_count}).")
+                else:
+                    LOGGER.info("[AUTORUN FALLBACK] Detect complete (API status=success), promoting to faces phase")
+                    # Mark as promoted to avoid double-firing (use effective_mtime which falls back to manifest)
+                    st.session_state[_detect_promoted_key] = effective_mtime
+                    # Set completion flags
+                    st.session_state[f"{ep_id}::tracks_just_completed"] = True
+                    st.session_state[f"{ep_id}::detect_track_just_completed"] = True
+                    st.session_state[f"{ep_id}::tracks_completed_at"] = time.time()
+                    # Log completed stage
+                    completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                    if not any("Detect" in s for s in completed):
+                        completed.append(f"Detect/Track ({det_count:,} detections, {trk_count:,} tracks)")
+                        st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                    # Advance to faces phase
+                    st.session_state[_autorun_phase_key] = "faces"
+                    st.session_state[f"{ep_id}::autorun_faces_trigger"] = True
+                    st.toast("✅ Detect/Track complete - advancing to Faces Harvest...")
+                    _fallback_triggered = True
+
+    # Fallback 2: faces → cluster
+    # If auto-run is stuck on "faces" but faces job is done and no job running
+    # Accept "success" or "stale" status (stale happens when detect is newer than faces)
+    # Also check manifest/marker freshness as additional signal
+    elif autorun_phase == "faces":
+        faces_api_status = faces_phase_status.get("status")
+        faces_job_running = helpers.get_running_job_for_episode(ep_id, "faces_embed") is not None
+
+        # Accept "success" or "stale" - both mean faces harvest has run at some point
+        # "stale" occurs when detect_track marker is newer than faces marker (timestamp comparison)
+        faces_status_ok = faces_api_status in ("success", "stale")
+
+        # Get when auto-run started - manifest/marker must be newer than this
+        autorun_started_at = st.session_state.get(f"{ep_id}::autorun_started_at", 0.0)
+        faces_baseline = st.session_state.get(f"{ep_id}::autorun_faces_baseline_mtime", autorun_started_at)
+
+        # Check manifest mtime - must be newer than when auto-run started
+        faces_manifest_mtime = _get_manifest_mtime("faces.jsonl")
+        faces_manifest_from_current_run = faces_manifest_mtime > faces_baseline
+
+        # Also check run marker mtime - this is written when faces_embed completes
+        faces_marker_mtime = _get_run_marker_mtime("faces_embed") or 0.0
+        faces_marker_from_current_run = faces_marker_mtime > faces_baseline
+        # Also allow a fresh progress.json “done” as a completion signal
+        progress_mtime = _get_progress_mtime()
+        progress_from_current_run = progress_mtime > faces_baseline
+
+        # Check if faces marker is newer than detect marker (proves faces ran after detect)
+        detect_marker_mtime = _get_run_marker_mtime("detect_track") or 0.0
+        faces_ran_after_detect = faces_marker_mtime > detect_marker_mtime
+
+        LOGGER.info(
+            "[AUTORUN FALLBACK] faces check: status=%s, job_running=%s, status_ok=%s, "
+            "manifest_mtime=%.1f, marker_mtime=%.1f, detect_marker=%.1f, autorun_started=%.1f, "
+            "manifest_current=%s, marker_current=%s, faces_after_detect=%s",
+            faces_api_status, faces_job_running, faces_status_ok,
+            faces_manifest_mtime, faces_marker_mtime, detect_marker_mtime, autorun_started_at,
+            faces_manifest_from_current_run, faces_marker_from_current_run, faces_ran_after_detect
+        )
+
+        # Proceed if:
+        # 1. No job currently running
+        # 2. Either manifest or marker is from current auto-run session
+        # 3. Either API status is OK, or faces ran after detect (marker comparison)
+        faces_from_current_run = (
+            faces_manifest_from_current_run
+            or faces_marker_from_current_run
+            or progress_from_current_run
+        )
+        faces_valid = faces_status_ok or faces_ran_after_detect
+
+        if not faces_job_running and faces_from_current_run and faces_valid:
+            # Check if we already processed this
+            _faces_promoted_key = f"{ep_id}::autorun_faces_promoted_mtime"
+            # Use manifest mtime as source of truth (more reliable than run marker in edge cases)
+            manifest_mtime = faces_manifest_mtime
+            marker_mtime = _get_run_marker_mtime("faces_embed")
+            # Use the most recent of manifest or marker mtime
+            effective_mtime = max(manifest_mtime, marker_mtime or 0.0)
+            last_promoted_mtime = st.session_state.get(_faces_promoted_key)
+
+            if effective_mtime > 0 and (last_promoted_mtime is None or effective_mtime > last_promoted_mtime):
+                # Read faces count from manifest
+                faces_count = 0
+                faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
+                try:
+                    if faces_path.exists():
+                        with faces_path.open("r", encoding="utf-8") as fh:
+                            faces_count = sum(1 for line in fh if line.strip())
+                except OSError:
+                    pass
+
+                # Guard: If zero faces, stop auto-run
+                if faces_count == 0:
+                    LOGGER.warning("[AUTORUN FALLBACK] Stopping: zero faces harvested")
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    st.session_state[f"{ep_id}::autorun_error"] = "Zero faces harvested - cannot cluster"
+                    st.error(f"❌ Auto-run stopped: No faces harvested (faces={faces_count}).")
+                else:
+                    LOGGER.info("[AUTORUN FALLBACK] Faces complete (status=%s, from_current_run=%s), promoting to cluster", faces_api_status, faces_from_current_run)
+                    # Mark as promoted using effective_mtime
+                    st.session_state[_faces_promoted_key] = effective_mtime
+                    # Set completion flags
+                    st.session_state[f"{ep_id}::faces_just_completed"] = True
+                    st.session_state[f"{ep_id}::faces_completed_at"] = time.time()
+                    # Log completed stage
+                    completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                    if not any("Faces" in s for s in completed):
+                        completed.append(f"Faces Harvest ({faces_count:,} faces)")
+                        st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                    # Advance to cluster phase
+                    st.session_state[_autorun_phase_key] = "cluster"
+                    st.session_state[f"{ep_id}::autorun_cluster_trigger"] = True
+                    st.toast("✅ Faces Harvest complete - advancing to Cluster...")
+                    _fallback_triggered = True
+
+    if _fallback_triggered:
+        st.rerun()
 
 col_detect, col_faces, col_cluster = st.columns(3)
 
@@ -1811,13 +3020,25 @@ with col_detect:
         job_complete = progress_pct >= 99.5 or state in ("done", "success", "completed")
         if job_complete:
             st.success(f"✅ **Detect/Track complete!** ({frames_done:,} / {frames_total:,} frames)")
-            st.caption("Refreshing to show results...")
             # Mark job as complete to prevent infinite refresh loop
             st.session_state[detect_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            time.sleep(1.5)
-            st.rerun()
+            # Mark tracks as fresh to bypass stale status check (Celery jobs may have status update delays)
+            st.session_state[f"{ep_id}::tracks_completed_at"] = time.time()  # Bug 4 fix: Use timestamp
+
+            # Check if auto-run is active - trigger next phase
+            if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "detect":
+                st.caption("Auto-run: Starting Faces Harvest...")
+                st.session_state[_autorun_phase_key] = "faces"
+                st.session_state[f"{ep_id}::autorun_faces_trigger"] = True
+                # Suggestion 3: No delay for auto-run transitions
+                st.rerun()
+            else:
+                st.caption("Refreshing to show results...")
+                # Brief delay for manual runs to show success message
+                time.sleep(0.5)
+                st.rerun()
 
         st.info(f"🔄 **Detect/Track job running** ({state})")
         if frames_total > 0:
@@ -1836,328 +3057,37 @@ with col_detect:
                 success, msg = helpers.cancel_running_job(job_id)
                 if success:
                     st.success(msg)
-                    time.sleep(1)
+                    time.sleep(0.3)  # Suggestion 3: Reduced delay
                     st.rerun()
                 else:
                     st.error(msg)
 
         st.divider()
 
-    # Profile settings come from the global profile selector above the columns
-    # profile_value, profile_changed, and profile_defaults are defined at the page level
+    # ─── GET SETTINGS FROM PIPELINE SETTINGS DIALOG ──────────────────────────
+    # All settings are now managed in the unified Pipeline Settings dialog (gear icon)
+    # We just read the values here to build the job payload
+    detect_settings = _get_detect_settings(ep_id)
 
-    stride_default = helpers.coerce_int(detect_job_defaults.get("stride"))
-    if stride_default is None:
-        stride_default = helpers.coerce_int(profile_defaults.get("stride")) or helpers.DEFAULT_STRIDE
-    # Prefill FPS from video metadata if available
-    fps_default = helpers.coerce_float(detect_job_defaults.get("fps")) or 0.0
-    if fps_default == 0.0 and video_meta and video_meta.get("fps_detected"):
-        fps_default = float(video_meta["fps_detected"])
-    if fps_default == 0.0 and profile_defaults.get("fps") is not None:
-        try:
-            fps_default = float(profile_defaults["fps"])
-        except (TypeError, ValueError):
-            fps_default = 0.0
-    det_thresh_default = float(detect_job_defaults.get("det_thresh") or helpers.DEFAULT_DET_THRESH)
-    save_frames_default = detect_job_defaults.get("save_frames")
-    if save_frames_default is None:
-        save_frames_default = profile_defaults.get("save_frames")
-    if save_frames_default is None:
-        save_frames_default = True
-    save_crops_default = detect_job_defaults.get("save_crops")
-    if save_crops_default is None:
-        save_crops_default = profile_defaults.get("save_crops")
-    if save_crops_default is None:
-        save_crops_default = True
-    cpu_threads_default = helpers.coerce_int(detect_job_defaults.get("cpu_threads"))
-    if cpu_threads_default is None:
-        cpu_threads_default = helpers.coerce_int(profile_defaults.get("cpu_threads"))
-    if cpu_threads_default is None and profile_value == "low_power":
-        cpu_threads_default = 2
-    jpeg_quality_default = int(detect_job_defaults.get("jpeg_quality") or JPEG_DEFAULT)
-    max_gap_default = int(detect_job_defaults.get("max_gap") or helpers.DEFAULT_MAX_GAP)
-    scene_threshold_default = float(detect_job_defaults.get("scene_threshold") or helpers.SCENE_THRESHOLD_DEFAULT)
-    scene_min_len_default = int(detect_job_defaults.get("scene_min_len") or helpers.SCENE_MIN_LEN_DEFAULT)
-    scene_warmup_default = int(detect_job_defaults.get("scene_warmup_dets") or helpers.SCENE_WARMUP_DETS_DEFAULT)
+    # Extract values from settings
+    stride_value = detect_settings["stride"]
+    fps_value = detect_settings["fps"]
+    det_thresh_value = detect_settings["det_thresh"]
+    save_frames = detect_settings["save_frames"]
+    save_crops = detect_settings["save_crops"]
+    cpu_threads_value = detect_settings["cpu_threads"]
+    max_gap_value = detect_settings["max_gap"]
+    jpeg_quality = detect_settings["jpeg_quality"]
+    track_high_value = detect_settings["track_high_thresh"]
+    track_new_value = detect_settings["new_track_thresh"]
+    scene_detector_value = detect_settings["scene_detector"]
+    scene_threshold_value = detect_settings["scene_threshold"]
+    scene_min_len_value = detect_settings["scene_min_len"]
+    scene_warmup_value = detect_settings["scene_warmup_dets"]
+    detect_device_value = detect_settings["device"]
+    detect_device_label = detect_settings["device_label"]
 
-    stride_field = _detect_setting_key(ep_id, "stride")
-    fps_field = _detect_setting_key(ep_id, "fps")
-    save_frames_key = _detect_setting_key(ep_id, "save_frames")
-    save_crops_key = _detect_setting_key(ep_id, "save_crops")
-    cpu_threads_key = _detect_setting_key(ep_id, "cpu_threads")
-
-    if profile_changed:
-        if profile_defaults.get("stride") is not None:
-            st.session_state[stride_field] = int(profile_defaults["stride"])
-        if profile_defaults.get("fps") is not None:
-            try:
-                st.session_state[fps_field] = float(profile_defaults["fps"])
-            except (TypeError, ValueError):
-                pass
-        if profile_defaults.get("save_frames") is not None:
-            st.session_state[save_frames_key] = bool(profile_defaults["save_frames"])
-        if profile_defaults.get("save_crops") is not None:
-            st.session_state[save_crops_key] = bool(profile_defaults["save_crops"])
-        if profile_defaults.get("cpu_threads") is not None:
-            try:
-                st.session_state[cpu_threads_key] = int(profile_defaults["cpu_threads"])
-            except (TypeError, ValueError):
-                pass
-
-    if stride_field not in st.session_state:
-        st.session_state[stride_field] = int(stride_default)
-    stride_value = st.number_input(
-        "Stride",
-        min_value=1,
-        max_value=50,
-        step=1,
-        key=stride_field,
-    )
-    st.caption(
-        "Stride 4 (sampling every fourth frame) is the standard baseline for 42-minute episodes; "
-        "lower values tighten QA, higher values accelerate longer cuts."
-    )
-    if fps_field not in st.session_state:
-        st.session_state[fps_field] = float(fps_default)
-    fps_value = st.number_input(
-        "FPS",
-        min_value=0.0,
-        max_value=120.0,
-        step=1.0,
-        key=fps_field,
-    )
-    st.caption("Frames per second extracted from source video. Lower FPS reduces processing time and storage.")
-    # Automatically save to S3
-    if save_frames_key not in st.session_state:
-        st.session_state[save_frames_key] = bool(save_frames_default)
-    save_frames = st.checkbox(
-        "Save sampled frames",
-        value=bool(st.session_state[save_frames_key]),
-        help="Stores sampled RGB frames alongside detections for QA and future crops.",
-        key=save_frames_key,
-    )
-    if save_crops_key not in st.session_state:
-        st.session_state[save_crops_key] = bool(save_crops_default)
-    save_crops = st.checkbox(
-        "Save crops",
-        value=bool(st.session_state[save_crops_key]),
-        help="Exports aligned face crops during detect/track. Disable when reusing previous crops.",
-        key=save_crops_key,
-    )
-
-    # Show storage impact estimate
-    video_duration_sec = None
-    video_fps = None
-    if video_meta and isinstance(video_meta, dict):
-        video_duration_sec = video_meta.get("duration_sec")
-        video_fps = video_meta.get("fps")
-    _render_storage_estimate(video_duration_sec, fps_value, save_frames, save_crops)
-
-    # Validate stride/FPS combination (A19)
-    effective_video_fps = fps_value if fps_value > 0 else (video_fps or 24.0)
-    if stride_value > 0 and effective_video_fps > 0:
-        effective_fps = effective_video_fps / stride_value
-        if effective_fps < 0.1:
-            st.error(
-                f"⚠️ **Sampling too sparse**: stride={int(stride_value)} @ {effective_video_fps:.0f}fps = "
-                f"{effective_fps:.2f} effective fps. This may miss most faces. Lower stride or increase FPS."
-            )
-        elif effective_fps < 0.5:
-            st.warning(
-                f"⚠️ **Low sampling rate**: stride={int(stride_value)} @ {effective_video_fps:.0f}fps = "
-                f"{effective_fps:.2f} effective fps. Consider lowering stride for better coverage."
-            )
-        elif effective_fps > 30:
-            st.warning(
-                f"⚠️ **High sampling rate**: stride={int(stride_value)} @ {effective_video_fps:.0f}fps = "
-                f"{effective_fps:.1f} effective fps. This will significantly increase processing time and storage."
-            )
-
-    cpu_options = [1, 2, 4]
-    cpu_seed = int(st.session_state.get(cpu_threads_key, cpu_threads_default or 2))
-    if cpu_seed not in cpu_options:
-        cpu_seed = 2
-    if cpu_threads_key not in st.session_state:
-        st.session_state[cpu_threads_key] = cpu_seed
-    cpu_default_index = cpu_options.index(cpu_seed) if cpu_seed in cpu_options else 1
-    cpu_threads_value = st.selectbox(
-        "CPU threads (cap)",
-        options=cpu_options,
-        index=cpu_default_index,
-        key=cpu_threads_key,
-        help="Caps BLAS/ONNX threads. Use 2 for laptop-friendly Low Power runs; increase if you need throughput.",
-    )
-    jpeg_key = _detect_setting_key(ep_id, "jpeg_quality")
-    if jpeg_key not in st.session_state:
-        st.session_state[jpeg_key] = int(jpeg_quality_default)
-    jpeg_quality = st.number_input(
-        "JPEG quality",
-        min_value=50,
-        max_value=100,
-        value=int(st.session_state[jpeg_key]),
-        step=5,
-        key=jpeg_key,
-    )
-    st.caption("Compression quality for saved face thumbnails and frame images. Higher = better quality, larger files.")
-
-    max_gap_key = f"{session_prefix}::max_gap"
-    max_gap_seed = int(st.session_state.get(max_gap_key, max_gap_default))
-    max_gap_value = st.number_input("Max gap (frames)", min_value=1, max_value=240, value=max_gap_seed, step=1)
-    st.caption("Maximum frames a face can be missing before track terminates. Higher values connect tracks across longer occlusions.")
-    st.session_state[max_gap_key] = int(max_gap_value)
-
-    det_thresh_key = f"{session_prefix}::det_thresh"
-    det_thresh_seed = float(st.session_state.get(det_thresh_key, det_thresh_default))
-    det_thresh_value = st.slider(
-        "Detection threshold",
-        min_value=0.1,
-        max_value=0.9,
-        value=float(det_thresh_seed),
-        step=0.01,
-    )
-    st.caption("Confidence range for valid face detections. Lower values increase recall but may add false positives.")
-    st.session_state[det_thresh_key] = float(det_thresh_value)
-
-    track_high_default = helpers.coerce_float(detect_job_defaults.get("track_high_thresh"))
-    if track_high_default is None:
-        track_high_default = helpers.coerce_float(detect_phase_status.get("track_high_thresh"))
-    if track_high_default is None:
-        track_high_default = helpers.TRACK_HIGH_THRESH_DEFAULT
-    track_new_default = helpers.coerce_float(detect_job_defaults.get("new_track_thresh"))
-    if track_new_default is None:
-        track_new_default = helpers.coerce_float(detect_phase_status.get("new_track_thresh"))
-    if track_new_default is None:
-        track_new_default = helpers.TRACK_NEW_THRESH_DEFAULT
-    track_high_value: float | None = track_high_default
-    track_new_value: float | None = track_new_default
-
-    with st.expander("Advanced detect/track", expanded=False):
-        scene_detector_session_key = f"{session_prefix}::scene_detector"
-        scene_detector_seed = st.session_state.get(
-            scene_detector_session_key, detect_job_defaults.get("scene_detector")
-        )
-        scene_detector_label = st.selectbox(
-            "Scene detector",
-            helpers.SCENE_DETECTOR_LABELS,
-            index=helpers.scene_detector_label_index(scene_detector_seed),
-            key=f"{scene_detector_session_key}::select",
-        )
-        st.caption("Automatically detects scene changes/cuts. PySceneDetect uses content detection; HSV is a fallback.")
-        scene_detector_value = helpers.scene_detector_value_from_label(scene_detector_label)
-        st.session_state[scene_detector_session_key] = scene_detector_value
-
-        scene_thresh_key = f"{session_prefix}::scene_threshold"
-        scene_thresh_seed = float(st.session_state.get(scene_thresh_key, scene_threshold_default))
-        scene_threshold_value = st.number_input(
-            "Scene cut threshold",
-            min_value=0.0,
-            value=scene_thresh_seed,
-            step=0.05,
-        )
-        st.caption("Sensitivity for detecting scene changes. Lower = more sensitive (detects subtle changes), higher = only hard cuts.")
-        st.session_state[scene_thresh_key] = float(scene_threshold_value)
-
-        scene_min_key = f"{session_prefix}::scene_min_len"
-        scene_min_seed = int(st.session_state.get(scene_min_key, scene_min_len_default))
-        scene_min_len_value = st.number_input(
-            "Minimum frames between cuts",
-            min_value=1,
-            max_value=600,
-            value=scene_min_seed,
-            step=1,
-        )
-        st.caption("Prevents rapid consecutive scene cut detections. Enforces minimum gap between detected cuts.")
-        st.session_state[scene_min_key] = int(scene_min_len_value)
-
-        scene_warmup_key = f"{session_prefix}::scene_warmup"
-        scene_warmup_seed = int(st.session_state.get(scene_warmup_key, scene_warmup_default))
-        scene_warmup_value = st.number_input(
-            "Warmup detections after cut",
-            min_value=0,
-            max_value=25,
-            value=scene_warmup_seed,
-            step=1,
-        )
-        st.caption("Number of 'fresh' detection passes after scene cut. Helps re-establish tracking after scene changes.")
-        st.session_state[scene_warmup_key] = int(scene_warmup_value)
-
-        if detect_tracker_value == "bytetrack":
-            st.markdown("#### Advanced tracking")
-            track_high_session_key = f"{session_prefix}::track_high_thresh"
-            track_high_seed = float(st.session_state.get(track_high_session_key, track_high_default))
-            track_high_value = st.slider(
-                "track_high_thresh",
-                min_value=0.30,
-                max_value=0.95,
-                value=float(track_high_seed),
-                step=0.01,
-            )
-            st.caption("Confidence threshold for continuing existing tracks. Match must score within this range to extend a track.")
-            st.session_state[track_high_session_key] = float(track_high_value)
-            track_new_session_key = f"{session_prefix}::new_track_thresh"
-            track_new_seed = float(st.session_state.get(track_new_session_key, track_new_default))
-            track_new_value = st.slider(
-                "new_track_thresh",
-                min_value=0.30,
-                max_value=0.95,
-                value=float(track_new_seed),
-                step=0.01,
-            )
-            st.caption("Confidence threshold for creating new tracks. Detection must score within this range to start a new track.")
-            st.session_state[track_new_session_key] = float(track_new_value)
-            st.caption(
-                "Lower thresholds increase recall but may introduce more false tracks; higher thresholds are stricter."
-            )
-
-    # Only show devices that are actually supported on this host
-    supported_detect_devices = helpers.list_supported_devices()
-    detect_device_default_idx = (
-        supported_detect_devices.index(detect_device_label_default)
-        if detect_device_label_default in supported_detect_devices
-        else 0
-    )
-    detect_device_choice = st.selectbox(
-        "Device (for face detection/tracking)",
-        supported_detect_devices,
-        index=detect_device_default_idx,
-        key=f"{ep_id}::detect_device_choice",
-    )
-    st.caption("CPU recommended for detection; GPU/CoreML may bottleneck on M-series chips for YOLOv8.")
-    detect_device_value = helpers.DEVICE_VALUE_MAP.get(detect_device_choice, "auto")
-    detect_device_label = helpers.device_label_from_value(detect_device_value)
-
-    if detect_tracker_value != "bytetrack":
-        track_high_value = None
-        track_new_value = None
-
-    sampled_frames_est = _estimated_sampled_frames(video_meta, int(stride_value))
-    if sampled_frames_est:
-        est_seconds = _estimate_runtime_seconds(sampled_frames_est, detect_device_value)
-        if est_seconds > 0:
-            runtime_minutes = est_seconds / 60.0
-            st.caption(
-                f"≈{sampled_frames_est:,} frames scheduled; rough runtime ~{runtime_minutes:.1f} min on {detect_device_label}."
-            )
-            if sampled_frames_est > 200_000 and detect_device_value == "cpu":
-                st.warning(
-                    "High load: consider increasing stride or lowering FPS when running on CPU to avoid stalls."
-                )
-    if save_frames and sampled_frames_est:
-        quality_factor = max(min(jpeg_quality / 85.0, 2.0), 0.5)
-        est_frame_bytes = int(sampled_frames_est * FRAME_JPEG_SIZE_EST_BYTES * quality_factor)
-        st.caption(
-            f"Frames: ≈{helpers.human_size(est_frame_bytes)} for {sampled_frames_est:,} sampled frames (estimate)."
-        )
-    if save_crops:
-        # Derive face count from detections manifest for real-time feedback
-        estimated_faces = _count_manifest_rows(detections_path)
-        if estimated_faces is None:
-            estimated_faces = helpers.coerce_int(detect_phase_status.get("detections"))
-        if estimated_faces is None and sampled_frames_est:
-            estimated_faces = int(sampled_frames_est * AVG_FACES_PER_FRAME)
-        if estimated_faces:
-            est_crop_bytes = int(estimated_faces * CROP_JPEG_SIZE_EST_BYTES)
-            st.caption(f"Crops: ≈{helpers.human_size(est_crop_bytes)} for approximately {estimated_faces:,} faces.")
+    # Build summary for display
     stride_hint = "every frame" if stride_value == 1 else f"every {stride_value}th frame"
     export_bits: list[str] = []
     if save_frames:
@@ -2165,9 +3095,13 @@ with col_detect:
     if save_crops:
         export_bits.append("crops")
     export_text = "saving " + " & ".join(export_bits) if export_bits else "no frame/crop exports"
+
+    # Show compact settings summary
+    scene_label = helpers.scene_detector_label(scene_detector_value)
     st.info(
-        f"**Detect/Track plan** → {detect_detector_label} + {detect_tracker_label} on {detect_device_choice} "
-        f"· stride {int(stride_value)} ({stride_hint}), {export_text}, profile {helpers.profile_label_from_value(profile_value)}."
+        f"**Detect/Track** → {detect_detector_label} + {detect_tracker_label} on {detect_device_label} "
+        f"· stride {stride_value} ({stride_hint}), {export_text}\n\n"
+        f"Scene detection: **{scene_label}** (threshold {scene_threshold_value:.1f})"
     )
     if job_running:
         st.caption("Another job is running; Detect/Track controls will re-enable once it completes.")
@@ -2202,7 +3136,121 @@ with col_detect:
     mode_label = f"{detect_detector_label} + {detect_tracker_label}"
 
     def _process_detect_result(summary: Dict[str, Any] | None, error_message: str | None) -> None:
+        # DEBUG: Log entry to help diagnose auto-run issues
+        autorun_val = st.session_state.get(_autorun_key)
+        phase_val = st.session_state.get(_autorun_phase_key)
+        # FIX 5: Enhanced diagnostic logging
+        LOGGER.info(
+            "[AUTORUN] _process_detect_result: summary_truthy=%s, summary_status=%s, error=%s, autorun=%s, phase=%s",
+            bool(summary),
+            summary.get("status") if isinstance(summary, dict) else None,
+            error_message,
+            autorun_val,
+            phase_val
+        )
+        # Extra debug: show what summary contains
+        if summary:
+            LOGGER.info("[AUTORUN] Summary type=%s, keys=%s", type(summary).__name__, list(summary.keys())[:10])
+
+        # FIX 3: Synthesize summary if empty but no error
+        # This handles cases where streaming succeeded but didn't return a proper summary
+        if not summary and not error_message:
+            LOGGER.warning("[AUTORUN] No summary received, attempting to synthesize from manifests")
+            det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
+            trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+            if det_path.exists() and trk_path.exists():
+                LOGGER.info("[AUTORUN] Manifests exist, synthesizing summary")
+                summary = {"status": "completed", "fallback": True}
+
+        # IMPORTANT: Set auto-run progression FIRST, before any early returns
+        # This ensures the next phase is triggered even if we can't display counts
+        if summary and not error_message:
+            # Mark job complete flags for single runs and refresh helpers
+            detect_job_complete_key = f"{ep_id}::detect_job_complete"
+            st.session_state[detect_job_complete_key] = True
+            st.session_state[f"{ep_id}::detect_track_just_completed"] = True
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            st.session_state[f"{ep_id}::tracks_completed_at"] = time.time()  # Bug 4 fix: Use timestamp
+            # Invalidate ALL caches to force fresh status on next page load
+            helpers.invalidate_running_jobs_cache(ep_id)
+            _cached_local_jobs.clear()
+            # Clear status cache to force refetch
+            st.session_state.pop(_status_mtimes_key(ep_id), None)
+            st.session_state.pop(_status_cache_key(ep_id), None)
+            if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "detect":
+                # Log completed stage with counts from summary
+                LOGGER.info("[AUTORUN] Detect complete, checking if we can advance to faces phase")
+                LOGGER.info("[AUTORUN] Raw summary keys: %s", list(summary.keys()) if summary else "None")
+                normalized = helpers.normalize_summary(ep_id, summary)
+                LOGGER.info("[AUTORUN] Normalized summary: detections=%s, tracks=%s",
+                           normalized.get("detections"), normalized.get("tracks"))
+                det_count = helpers.coerce_int(normalized.get("detections"))
+                trk_count = helpers.coerce_int(normalized.get("tracks"))
+                LOGGER.info("[AUTORUN] Coerced counts: det_count=%s, trk_count=%s", det_count, trk_count)
+
+                # FALLBACK: If normalize_summary didn't get counts, read directly from manifest
+                # This is critical for local mode where streaming response may not include counts
+                if det_count is None or det_count == 0:
+                    det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
+                    if det_path.exists():
+                        try:
+                            with det_path.open("r", encoding="utf-8") as fh:
+                                det_count = sum(1 for line in fh if line.strip())
+                            LOGGER.info("[AUTORUN] Fallback det_count from manifest: %s", det_count)
+                        except OSError:
+                            pass
+                if trk_count is None or trk_count == 0:
+                    trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+                    if trk_path.exists():
+                        try:
+                            with trk_path.open("r", encoding="utf-8") as fh:
+                                trk_count = sum(1 for line in fh if line.strip())
+                            LOGGER.info("[AUTORUN] Fallback trk_count from manifest: %s", trk_count)
+                        except OSError:
+                            pass
+
+                # Bug D fix: Validate detection/track counts before advancing
+                if det_count is None or det_count == 0 or trk_count is None or trk_count == 0:
+                    LOGGER.warning("[AUTORUN] Stopping: zero detections/tracks (det=%s, trk=%s)", det_count, trk_count)
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    st.session_state[f"{ep_id}::autorun_error"] = f"Zero detections ({det_count or 0}) or tracks ({trk_count or 0}) - cannot continue"
+                    st.error(f"❌ Auto-run stopped: No faces detected (detections={det_count or 0}, tracks={trk_count or 0}).")
+                    st.rerun()
+                    return  # Unreachable but explicit - st.rerun() raises exception
+
+                completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                completed.append(f"Detect/Track ({det_count:,} detections, {trk_count:,} tracks)")
+                st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                st.session_state[_autorun_phase_key] = "faces"
+                st.session_state[f"{ep_id}::autorun_faces_trigger"] = True
+                # Verify state was set before rerun
+                verify_phase = st.session_state.get(_autorun_phase_key)
+                verify_trigger = st.session_state.get(f"{ep_id}::autorun_faces_trigger")
+                LOGGER.info("[AUTORUN] Set phase=faces, trigger=True. Verify: phase=%s, trigger=%s", verify_phase, verify_trigger)
+
+                # CRITICAL: Verify state was actually set correctly before rerun
+                if verify_phase != "faces" or not verify_trigger:
+                    LOGGER.error("[AUTORUN] FAILED to set faces trigger state! phase=%s, trigger=%s", verify_phase, verify_trigger)
+                    st.error("⚠️ Auto-run state error: Could not set faces trigger - please try again")
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    return
+
+                st.toast("✅ Detect/Track complete - advancing to Faces Harvest...")
+                LOGGER.info("[AUTORUN] About to st.rerun() to trigger faces phase")
+                # CRITICAL: Rerun immediately to trigger faces phase
+                # Don't wait for end of function which may have early returns
+                st.rerun()
+
         if error_message:
+            # Bug 2 fix: Stop auto-run on error to prevent getting stuck
+            if st.session_state.get(_autorun_key):
+                st.session_state[_autorun_key] = False
+                st.session_state[_autorun_phase_key] = None
+                st.session_state[f"{ep_id}::autorun_error"] = error_message
+                st.error(f"❌ Auto-run stopped due to error in Detect/Track phase.")
+
             if error_message == "mirror_failed":
                 st.error("Failed to mirror video from S3. Check that the video exists in S3 and you have network connectivity.")
                 return
@@ -2257,8 +3305,8 @@ with col_detect:
         if tracker_summary:
             details_line.append(f"tracker: {helpers.tracker_label_from_value(tracker_summary)}")
         st.session_state["episode_detail_flash"] = "Detect/track complete · " + " · ".join(details_line)
-        # Force status refresh after job completion to pick up new detect/track status
-        st.session_state[_status_force_refresh_key(ep_id)] = True
+        # Note: status refresh and auto-run progression are now set at the TOP of this function
+        # before any early returns, to ensure they always happen on success
         st.rerun()
 
     if autorun_detect:
@@ -2276,7 +3324,19 @@ with col_detect:
             active_job_key=_job_activity_key(ep_id),
             detect_flag_key=detect_running_key,
         )
-        _process_detect_result(summary, error_message)
+        try:
+            _process_detect_result(summary, error_message)
+        except (RerunException, StopException):
+            # st.rerun() and st.stop() work by raising exceptions - let them propagate
+            raise
+        except Exception as e:
+            LOGGER.exception("[AUTORUN] Exception in _process_detect_result (auto-run trigger): %s", e)
+            st.error(f"⚠️ Auto-run error: {e}")
+            # Clear auto-run to prevent stuck state
+            st.session_state[_autorun_key] = False
+            st.session_state[_autorun_phase_key] = None
+        # Note: _process_detect_result() handles auto-run progression and calls st.rerun()
+        # Code after this point is unreachable when job completes successfully
 
     if not local_video_exists:
         s3_meta = details.get("s3") or {}
@@ -2329,7 +3389,17 @@ with col_detect:
                 active_job_key=_job_activity_key(ep_id),
                 detect_flag_key=detect_running_key,
             )
-            _process_detect_result(summary, error_message)
+            try:
+                _process_detect_result(summary, error_message)
+            except (RerunException, StopException):
+                # st.rerun() and st.stop() work by raising exceptions - let them propagate
+                raise
+            except Exception as e:
+                LOGGER.exception("[AUTORUN] Exception in _process_detect_result (button click): %s", e)
+                st.error(f"⚠️ Auto-run error: {e}")
+                # Clear auto-run to prevent stuck state
+                st.session_state[_autorun_key] = False
+                st.session_state[_autorun_phase_key] = None
     st.caption("Mirrors required video artifacts automatically before detect/track starts.")
 
     # Show previous run logs (only in local mode, collapsed by default)
@@ -2337,6 +3407,57 @@ with col_detect:
         helpers.render_previous_logs(ep_id, "detect_track", expanded=False)
 
 with col_faces:
+    # CRITICAL: Check for detect_track completion flag set by ui_helpers
+    # This catches cases where the return value didn't reach the caller
+    # (Streamlit may restart script on widget updates during streaming)
+    _detect_just_completed_key = f"{ep_id}::detect_track_just_completed"
+    if st.session_state.get(_detect_just_completed_key):
+        LOGGER.info("[AUTORUN] Detected detect_track_just_completed flag, advancing to faces phase")
+        # Clear the flag to prevent re-processing
+        st.session_state.pop(_detect_just_completed_key, None)
+        # Get the summary that was stored
+        stored_summary = st.session_state.pop(f"{ep_id}::detect_track_summary", None)
+        completed_at = st.session_state.get(f"{ep_id}::detect_track_completed_at")
+
+        # Set tracks_completed_at if not already set
+        if not st.session_state.get(f"{ep_id}::tracks_completed_at"):
+            st.session_state[f"{ep_id}::tracks_completed_at"] = completed_at or time.time()
+            LOGGER.info("[AUTORUN] Set tracks_completed_at from detect_track completion flag")
+
+        # Check if auto-run is active and waiting on detect phase
+        if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "detect":
+            # Build completed stage entry
+            if stored_summary:
+                normalized = helpers.normalize_summary(ep_id, stored_summary)
+                det_count = helpers.coerce_int(normalized.get("detections"))
+                track_count = helpers.coerce_int(normalized.get("tracks"))
+            else:
+                det_count, track_count = None, None
+            # Fallback to manifest counts
+            if det_count is None or track_count is None:
+                det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
+                trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+                try:
+                    if det_path.exists():
+                        det_count = sum(1 for line in det_path.open("r", encoding="utf-8") if line.strip())
+                    if trk_path.exists():
+                        track_count = sum(1 for line in trk_path.open("r", encoding="utf-8") if line.strip())
+                except OSError:
+                    pass
+            # Log completed stage
+            completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+            stage_label = f"Detect/Track ({det_count or '?':,} detections, {track_count or '?':,} tracks)"
+            if stage_label not in completed:
+                completed.append(stage_label)
+                st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+            # Advance to faces phase
+            st.session_state[_autorun_phase_key] = "faces"
+            st.session_state[f"{ep_id}::autorun_faces_trigger"] = True
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            LOGGER.info("[AUTORUN] Advanced from detect to faces via completion flag")
+            st.toast("✅ Detect/Track complete - starting Faces Harvest...")
+            st.rerun()
+
     st.markdown("### Faces Harvest")
     st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
 
@@ -2352,13 +3473,25 @@ with col_faces:
         job_complete = progress_pct >= 99.5 or state in ("done", "success", "completed")
         if job_complete:
             st.success("✅ **Faces Harvest complete!**")
-            st.caption("Refreshing to show results...")
             # Mark job as complete to prevent infinite refresh loop
             st.session_state[faces_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            time.sleep(1.5)
-            st.rerun()
+            # Mark faces as fresh to bypass stale status check (Celery jobs may have status update delays)
+            st.session_state[f"{ep_id}::faces_completed_at"] = time.time()  # Bug 4 fix: Use timestamp
+
+            # Check if auto-run is active - trigger next phase
+            if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "faces":
+                st.caption("Auto-run: Starting Clustering...")
+                st.session_state[_autorun_phase_key] = "cluster"
+                st.session_state[f"{ep_id}::autorun_cluster_trigger"] = True
+                # Suggestion 3: No delay for auto-run transitions
+                st.rerun()
+            else:
+                st.caption("Refreshing to show results...")
+                # Brief delay for manual runs to show success message
+                time.sleep(0.5)
+                st.rerun()
 
         st.info(f"🔄 **Faces Harvest job running** ({state})")
         st.progress(min(progress_pct / 100, 1.0))
@@ -2374,98 +3507,42 @@ with col_faces:
                 success, msg = helpers.cancel_running_job(job_id)
                 if success:
                     st.success(msg)
-                    time.sleep(1)
+                    time.sleep(0.3)  # Suggestion 3: Reduced delay
                     st.rerun()
                 else:
                     st.error(msg)
 
         st.divider()
 
-    # Add pipeline state indicator
-    detect_track_info = detect_phase_status
-    if detect_track_info:
-        detector_name = detect_track_info.get("detector")
-        tracker_name = detect_track_info.get("tracker")
-        if detector_name and tracker_name:
-            st.caption(
-                f"📊 Current pipeline: {helpers.detector_label_from_value(detector_name)} + "
-                f"{helpers.tracker_label_from_value(tracker_name)}"
-            )
+    # ─── GET SETTINGS FROM PIPELINE SETTINGS DIALOG ──────────────────────────
+    # All settings are now managed in the unified Pipeline Settings dialog (gear icon)
+    harvest_settings = _get_harvest_settings(ep_id)
 
-    # Only show devices that are actually supported on this host
-    supported_faces_devices = helpers.list_supported_devices()
-    faces_device_default_idx = (
-        supported_faces_devices.index(faces_device_label_default)
-        if faces_device_label_default in supported_faces_devices
-        else 0
-    )
-    faces_device_choice = st.selectbox(
-        "Device (for face embeddings)",
-        supported_faces_devices,
-        index=faces_device_default_idx,
-        key=f"{ep_id}::faces_device_choice",
-    )
-    st.caption("CoreML/GPU strongly recommended for ArcFace embeddings; significantly faster than CPU.")
-    faces_device_value = helpers.DEVICE_VALUE_MAP.get(faces_device_choice, "auto")
-    faces_save_frames = st.toggle(
-        "Save full frames",
-        value=bool(faces_save_frames_default),
-        help="When off, only face crops are stored; reduces storage and CPU during harvest.",
-        key=f"{ep_id}::faces_save_frames_toggle",
-    )
-    faces_save_crops = st.toggle(
-        "Save face crops",
-        value=bool(faces_save_crops_default),
-        help="Exports aligned face crops for review and embeddings.",
-        key=f"{ep_id}::faces_save_crops_toggle",
-    )
-    faces_min_frames_between_crops = st.number_input(
-        "Minimum frames between crops",
-        min_value=1,
-        max_value=600,
-        value=int(faces_min_frames_between_crops_default),
-        step=1,
-        help="Number of frames between successive crops on the same track; higher values reduce near-duplicate faces.",
-        key=f"{ep_id}::faces_min_frames_between_crops",
-    )
-    st.caption("Default spacing ~1–2s keeps crops lean for laptop runs.")
+    faces_device_value = harvest_settings["device"]
+    faces_device_label = harvest_settings["device_label"]
+    faces_save_frames = harvest_settings["save_frames"]
+    faces_save_crops = harvest_settings["save_crops"]
+    faces_min_frames_between_crops = harvest_settings["min_frames_between_crops"]
+    faces_thumb_size = harvest_settings["thumb_size"]
+    faces_jpeg_quality = harvest_settings["jpeg_quality"]
 
-    faces_thumb_size_default = int(faces_job_defaults.get("thumb_size") or 256)
-    quality_options = sorted({60, 70, 80, int(faces_jpeg_quality_default)})
-    with st.expander("Advanced face exports", expanded=False):
-        faces_jpeg_quality = st.select_slider(
-            "Image quality (frames/crops)",
-            options=quality_options,
-            value=int(faces_jpeg_quality_default),
-            help="Lower JPEG quality reduces S3 size; 60–80 is usually sufficient for UI flows.",
-            key=f"{ep_id}::faces_jpeg_quality_detail",
-        )
-        faces_thumb_size = st.number_input(
-            "Thumbnail size",
-            min_value=64,
-            max_value=512,
-            value=faces_thumb_size_default,
-            step=32,
-            key=f"{ep_id}::faces_thumb_size_detail",
-        )
-    if faces_device_value in {"mps", "coreml"}:
-        st.caption(
-            "ArcFace embeddings use Apple's CoreML backend on supported hardware and only fall back to CPU "
-            "if the CoreML provider is unavailable."
-        )
-    resolved_embed_device = faces_phase_status.get("resolved_device")
-    if isinstance(resolved_embed_device, str) and resolved_embed_device.strip():
-        resolved_embed_device = resolved_embed_device.strip().lower()
-        resolved_label = helpers.device_label_from_value(resolved_embed_device)
-        if resolved_label == helpers.device_default_label() and resolved_embed_device:
-            resolved_label = resolved_embed_device.upper()
-        st.caption(f"Last harvest resolved to **{resolved_label}**.")
+    # Show compact settings summary
+    export_bits: list[str] = []
+    if faces_save_frames:
+        export_bits.append("frames")
+    if faces_save_crops:
+        export_bits.append("crops")
+    export_text = "saving " + " & ".join(export_bits) if export_bits else "crops only"
+    st.info(
+        f"**Faces Harvest** → {faces_device_label} · {export_text}, "
+        f"crop interval {faces_min_frames_between_crops} frames"
+    )
+
+    # Estimate counts
     harvest_frame_est = (
         helpers.coerce_int(detect_phase_status.get("frames_exported"))
         or helpers.coerce_int(detect_phase_status.get("sampled_frames"))
-        or sampled_frames_est
     )
-    # Derive face count from detections manifest for real-time feedback
     harvest_faces_est = _count_manifest_rows(detections_path)
     if harvest_faces_est is None:
         harvest_faces_est = helpers.coerce_int(detect_phase_status.get("detections"))
@@ -2531,8 +3608,15 @@ with col_faces:
             "Select a supported combo (e.g., RetinaFace + ByteTrack/StrongSORT) and rerun detect/track."
         )
 
+    # Check if tracks just completed (bypasses stale status check for auto-run progression)
+    # Bug 4 fix: Use timestamp instead of boolean to survive multiple reruns
+    tracks_completed_at = st.session_state.get(f"{ep_id}::tracks_completed_at")
+    tracks_just_completed = tracks_completed_at is not None and (time.time() - tracks_completed_at < 30)
+    # If tracks just completed, treat as ready even if API hasn't updated
+    effective_tracks_ready = tracks_ready or tracks_just_completed
+
     faces_disabled = (
-        (not tracks_ready)
+        (not effective_tracks_ready)
         or (not detector_face_only)
         or job_running
         or faces_status_value == "running"
@@ -2544,7 +3628,63 @@ with col_faces:
     if running_faces_job:
         st.warning(f"⚠️ A faces harvest job is already running ({running_faces_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
 
-    if st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled):
+    # Check for auto-run trigger from pipeline automation
+    # Bug 1 fix: Use .get() instead of .pop() - only clear after job successfully starts
+    autorun_faces_trigger = st.session_state.get(f"{ep_id}::autorun_faces_trigger", False)
+
+    # Debug: Show why faces might be disabled (only when auto-run is active)
+    if autorun_active and autorun_faces_trigger:
+        with st.expander("🔍 Faces Phase Debug", expanded=True):
+            st.markdown(f"**Trigger received**: `autorun_faces_trigger={autorun_faces_trigger}`")
+            st.markdown(f"**faces_disabled**: `{faces_disabled}`")
+            if faces_disabled:
+                st.markdown("**Disabled because:**")
+                reasons = []
+                if not effective_tracks_ready:
+                    reasons.append(f"- tracks not ready (tracks_ready={tracks_ready}, tracks_just_completed={tracks_just_completed})")
+                if not detector_face_only:
+                    reasons.append(f"- detector not face-only ({detector_face_only=})")
+                if job_running:
+                    reasons.append(f"- job already running ({job_running=})")
+                if faces_status_value == "running":
+                    reasons.append(f"- faces status is 'running' ({faces_status_value=})")
+                if not combo_supported_harvest:
+                    reasons.append(f"- combo not supported ({combo_supported_harvest=})")
+                if tracks_only_fallback:
+                    reasons.append(f"- tracks only fallback ({tracks_only_fallback=})")
+                if running_faces_job is not None:
+                    reasons.append(f"- faces job already running ({running_faces_job=})")
+                st.code("\n".join(reasons) if reasons else "No specific reason found", language="text")
+
+    should_run_faces = st.button("Run Faces Harvest", use_container_width=True, disabled=faces_disabled)
+
+    # Auto-run trigger: simulate button click if auto-run is active and not disabled
+    if autorun_faces_trigger:
+        if not faces_disabled:
+            should_run_faces = True
+            # Bug 1 fix: Clear trigger AFTER we confirm job will start
+            st.session_state.pop(f"{ep_id}::autorun_faces_trigger", None)
+            # Bug 3 fix: Reset retry counter on success
+            st.session_state.pop(f"{ep_id}::autorun_faces_retry", None)
+            st.info("🤖 Auto-Run: Starting Faces Harvest...")
+        else:
+            # Suggestion 8: Mtime-based retry with longer limit
+            retry_count = st.session_state.get(f"{ep_id}::autorun_faces_retry", 0) + 1
+            should_retry, status_msg = _should_retry_phase_trigger(ep_id, "faces", retry_count)
+            if should_retry:
+                st.session_state[f"{ep_id}::autorun_faces_retry"] = retry_count
+                st.caption(f"⏳ {status_msg}")
+                time.sleep(1)
+                st.rerun()
+            else:
+                # Give up after max retries
+                st.session_state.pop(f"{ep_id}::autorun_faces_trigger", None)
+                st.session_state.pop(f"{ep_id}::autorun_faces_retry", None)
+                st.session_state[_autorun_key] = False
+                st.session_state[_autorun_phase_key] = None
+                st.error(f"❌ Auto-run stopped: {status_msg}")
+
+    if should_run_faces:
         can_run_faces = True
         if not local_video_exists:
             can_run_faces = _ensure_local_artifacts(ep_id, details)
@@ -2592,7 +3732,86 @@ with col_faces:
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
+
+            # IMPORTANT: Set auto-run progression FIRST, before any UI display
+            # This ensures the next phase is triggered even if UI display has issues
+            LOGGER.info("[AUTORUN] Faces job returned: summary=%s, error=%s", bool(summary), error_message)
+            # Synthesize summary if empty but no error (parity with detect path)
+            if not summary and not error_message:
+                LOGGER.warning("[AUTORUN] Faces summary missing, synthesizing from manifests")
+                summary = {"status": "completed", "fallback": True}
+            # If summary exists but status missing, set completed to allow progression
+            if summary and not summary.get("status"):
+                summary["status"] = "completed"
+            if summary and not error_message:
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.session_state[f"{ep_id}::faces_completed_at"] = time.time()  # Bug 4 fix: Use timestamp
+                # Invalidate ALL caches to force fresh status on next page load
+                helpers.invalidate_running_jobs_cache(ep_id)
+                _cached_local_jobs.clear()
+                # Clear status cache mtimes to force refetch (these are recalculated on page load)
+                st.session_state.pop(_status_mtimes_key(ep_id), None)
+                st.session_state.pop(_status_cache_key(ep_id), None)
+                autorun_val = st.session_state.get(_autorun_key)
+                phase_val = st.session_state.get(_autorun_phase_key)
+                LOGGER.info("[AUTORUN] After faces: autorun=%s, phase=%s", autorun_val, phase_val)
+                if autorun_val and phase_val == "faces":
+                    # Log completed stage with counts from summary
+                    normalized = helpers.normalize_summary(ep_id, summary)
+                    faces_count = helpers.coerce_int(normalized.get("faces"))
+
+                    # FALLBACK: If normalize_summary didn't get faces count, read directly from manifest
+                    if faces_count is None or faces_count == 0:
+                        faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
+                        if faces_path.exists():
+                            try:
+                                with faces_path.open("r", encoding="utf-8") as fh:
+                                    faces_count = sum(1 for line in fh if line.strip())
+                                LOGGER.info("[AUTORUN] Fallback faces_count from manifest: %s", faces_count)
+                            except OSError:
+                                pass
+
+                    # Bug E fix: Validate faces count before advancing to cluster
+                    if faces_count is None or faces_count == 0:
+                        LOGGER.warning("[AUTORUN] Stopping: zero faces harvested (faces=%s)", faces_count)
+                        st.session_state[_autorun_key] = False
+                        st.session_state[_autorun_phase_key] = None
+                        st.session_state[f"{ep_id}::autorun_error"] = f"Zero faces harvested - cannot cluster"
+                        st.error(f"❌ Auto-run stopped: No faces harvested (faces={faces_count or 0}). Nothing to cluster.")
+                        st.rerun()
+
+                    completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                    completed.append(f"Faces Harvest ({faces_count:,} faces)")
+                    st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                    st.session_state[_autorun_phase_key] = "cluster"
+                    st.session_state[f"{ep_id}::autorun_cluster_trigger"] = True
+
+                    # Verify state was set before rerun
+                    verify_phase = st.session_state.get(_autorun_phase_key)
+                    verify_trigger = st.session_state.get(f"{ep_id}::autorun_cluster_trigger")
+                    LOGGER.info("[AUTORUN] Set phase=cluster, trigger=True. Verify: phase=%s, trigger=%s", verify_phase, verify_trigger)
+
+                    if verify_phase != "cluster" or not verify_trigger:
+                        LOGGER.error("[AUTORUN] FAILED to set cluster trigger state!")
+                        st.error("⚠️ Auto-run state error: Could not set cluster trigger")
+                        st.session_state[_autorun_key] = False
+                        st.session_state[_autorun_phase_key] = None
+                        # Don't call rerun - let the page render normally
+                    else:
+                        st.toast("✅ Faces Harvest complete - advancing to Cluster...")
+                        LOGGER.info("[AUTORUN] About to st.rerun() to trigger cluster phase")
+                        # CRITICAL: Rerun immediately to trigger cluster phase
+                        # Don't wait for end of function which may have early returns
+                        st.rerun()
+
             if error_message:
+                # Bug 2 fix: Stop auto-run on error to prevent getting stuck
+                if st.session_state.get(_autorun_key):
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    st.session_state[f"{ep_id}::autorun_error"] = error_message
+                    st.error(f"❌ Auto-run stopped due to error in Faces Harvest phase.")
+
                 if "tracks.jsonl" in error_message.lower():
                     st.error("Run detect/track first.")
                 else:
@@ -2609,8 +3828,7 @@ with col_faces:
                 flash_parts.append(f"thumb size: {int(faces_thumb_size)}px")
                 flash_msg = "Faces harvest complete" + (" · " + ", ".join(flash_parts) if flash_parts else "")
                 st.session_state["episode_detail_flash"] = flash_msg
-                # Force status refresh after job completion to pick up new faces status
-                st.session_state[_status_force_refresh_key(ep_id)] = True
+                # Note: status refresh and auto-run progression are now set BEFORE this block
                 st.rerun()
 
     # Show previous run logs (only in local mode, collapsed by default)
@@ -2618,6 +3836,96 @@ with col_faces:
         helpers.render_previous_logs(ep_id, "faces_embed", expanded=False)
 
 with col_cluster:
+    # CRITICAL: Check for faces_embed completion flag set by ui_helpers
+    # This catches cases where the return value didn't reach the caller
+    # (Streamlit may restart script on widget updates during streaming)
+    _faces_just_completed_key = f"{ep_id}::faces_embed_just_completed"
+    if st.session_state.get(_faces_just_completed_key):
+        LOGGER.info("[AUTORUN] Detected faces_embed_just_completed flag, advancing to cluster phase")
+        # Clear the flag to prevent re-processing
+        st.session_state.pop(_faces_just_completed_key, None)
+        # Get the summary that was stored
+        stored_summary = st.session_state.pop(f"{ep_id}::faces_embed_summary", None)
+        completed_at = st.session_state.get(f"{ep_id}::faces_embed_completed_at")
+
+        # Set faces_completed_at if not already set
+        if not st.session_state.get(f"{ep_id}::faces_completed_at"):
+            st.session_state[f"{ep_id}::faces_completed_at"] = completed_at or time.time()
+            LOGGER.info("[AUTORUN] Set faces_completed_at from faces_embed completion flag")
+
+        # Check if auto-run is active and waiting on faces phase
+        if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "faces":
+            # Build completed stage entry
+            if stored_summary:
+                normalized = helpers.normalize_summary(ep_id, stored_summary)
+                faces_count = helpers.coerce_int(normalized.get("faces"))
+            else:
+                faces_count = None
+            # Fallback to manifest count
+            if faces_count is None:
+                faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
+                try:
+                    if faces_path.exists():
+                        faces_count = sum(1 for line in faces_path.open("r", encoding="utf-8") if line.strip())
+                except OSError:
+                    pass
+            # Log completed stage
+            completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+            stage_label = f"Faces Harvest ({faces_count or '?':,} faces)"
+            if stage_label not in completed:
+                completed.append(stage_label)
+                st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+            # Advance to cluster phase
+            st.session_state[_autorun_phase_key] = "cluster"
+            st.session_state[f"{ep_id}::autorun_cluster_trigger"] = True
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            LOGGER.info("[AUTORUN] Advanced from faces to cluster via completion flag")
+            st.toast("✅ Faces Harvest complete - starting Clustering...")
+            st.rerun()
+
+    # CRITICAL: Check for cluster completion flag set by ui_helpers
+    # This handles the final phase where cluster completes and marks auto-run done
+    _cluster_just_completed_key = f"{ep_id}::cluster_just_completed"
+    if st.session_state.get(_cluster_just_completed_key):
+        LOGGER.info("[AUTORUN] Detected cluster_just_completed flag, finalizing auto-run")
+        # Clear the flag to prevent re-processing
+        st.session_state.pop(_cluster_just_completed_key, None)
+        # Get the summary that was stored
+        stored_summary = st.session_state.pop(f"{ep_id}::cluster_summary", None)
+
+        # Check if auto-run is active and waiting on cluster phase
+        if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
+            # Build completed stage entry
+            if stored_summary:
+                normalized = helpers.normalize_summary(ep_id, stored_summary)
+                identities_count = helpers.coerce_int(normalized.get("identities"))
+            else:
+                identities_count = None
+            # Fallback to manifest count
+            if identities_count is None:
+                identities_path = helpers.DATA_ROOT / "manifests" / ep_id / "identities.json"
+                try:
+                    if identities_path.exists():
+                        import json
+                        data = json.loads(identities_path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict) and isinstance(data.get("identities"), list):
+                            identities_count = len(data["identities"])
+                except (OSError, json.JSONDecodeError):
+                    pass
+            # Log completed stage
+            completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+            stage_label = f"Cluster ({identities_count or '?':,} identities)"
+            if stage_label not in completed:
+                completed.append(stage_label)
+                st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+            # Mark auto-run complete
+            st.session_state[_autorun_key] = False
+            st.session_state[_autorun_phase_key] = None
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            LOGGER.info("[AUTORUN] Auto-run pipeline complete via completion flag")
+            st.success("🎉 **Auto-Run Pipeline Complete!** All phases finished successfully.")
+            st.rerun()
+
     st.markdown("### Cluster Identities")
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
 
@@ -2633,13 +3941,23 @@ with col_cluster:
         job_complete = progress_pct >= 99.5 or state in ("done", "success", "completed")
         if job_complete:
             st.success("✅ **Cluster complete!**")
-            st.caption("Refreshing to show results...")
             # Mark job as complete to prevent infinite refresh loop
             st.session_state[cluster_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            time.sleep(1.5)
-            st.rerun()
+
+            # Check if auto-run is active - this is the final phase, mark complete
+            if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
+                st.success("🎉 **Auto-Run Pipeline Complete!** All phases finished successfully.")
+                st.session_state[_autorun_key] = False
+                st.session_state[_autorun_phase_key] = None
+                # Suggestion 3: No delay for auto-run completion
+                st.rerun()
+            else:
+                st.caption("Refreshing to show results...")
+                # Brief delay for manual runs to show success message
+                time.sleep(0.5)
+                st.rerun()
 
         st.info(f"🔄 **Cluster job running** ({state})")
         st.progress(min(progress_pct / 100, 1.0))
@@ -2655,58 +3973,38 @@ with col_cluster:
                 success, msg = helpers.cancel_running_job(job_id)
                 if success:
                     st.success(msg)
-                    time.sleep(1)
+                    time.sleep(0.3)  # Suggestion 3: Reduced delay
                     st.rerun()
                 else:
                     st.error(msg)
 
         st.divider()
 
-    # Only show devices that are actually supported on this host
-    supported_cluster_devices = helpers.list_supported_devices()
-    cluster_device_default_idx = (
-        supported_cluster_devices.index(cluster_device_label_default)
-        if cluster_device_label_default in supported_cluster_devices
-        else 0
-    )
-    cluster_device_choice = st.selectbox(
-        "Device (for clustering)",
-        supported_cluster_devices,
-        index=cluster_device_default_idx,
-        key=f"{ep_id}::cluster_device_choice",
-    )
-    st.caption("Device for similarity comparisons during clustering; GPU/CoreML provides faster batch processing.")
-    cluster_device_value = helpers.DEVICE_VALUE_MAP.get(cluster_device_choice, "auto")
-    cluster_thresh_value = st.slider(
-        "Cluster similarity threshold",
-        min_value=0.4,
-        max_value=0.9,
-        value=float(cluster_thresh_default),
-        step=0.01,
-        help="Higher thresholds require tighter ArcFace similarity between faces to form a cluster.",
-        key=f"{ep_id}::cluster_similarity_threshold",
-    )
-    # Provide threshold guidance based on selected value
-    if cluster_thresh_value >= 0.80:
-        st.caption("🔴 **Very strict**: May over-split same person into multiple clusters.")
-    elif cluster_thresh_value >= 0.70:
-        st.caption("🟡 **Strict**: Good for distinguishing similar-looking people.")
-    elif cluster_thresh_value >= 0.55:
-        st.caption("🟢 **Balanced**: Recommended for most content.")
-    else:
-        st.caption("🟠 **Lenient**: May merge different people into same cluster.")
+    # ─── GET SETTINGS FROM PIPELINE SETTINGS DIALOG ──────────────────────────
+    # All settings are now managed in the unified Pipeline Settings dialog (gear icon)
+    cluster_settings = _get_cluster_settings(ep_id)
 
-    min_cluster_size_value = st.number_input(
-        "Minimum tracks per identity",
-        min_value=1,
-        max_value=50,
-        value=int(min_cluster_size_default),
-        step=1,
-        help="Clusters smaller than this are discarded as noise. Recommended: 2+ for cleaner results.",
-        key=f"{ep_id}::cluster_min_tracks_per_identity",
+    cluster_device_value = cluster_settings["device"]
+    cluster_device_label = cluster_settings["device_label"]
+    cluster_thresh_value = cluster_settings["cluster_thresh"]
+    min_cluster_size_value = cluster_settings["min_cluster_size"]
+
+    # Threshold guidance
+    if cluster_thresh_value >= 0.80:
+        thresh_hint = "🔴 Very strict"
+    elif cluster_thresh_value >= 0.70:
+        thresh_hint = "🟡 Strict"
+    elif cluster_thresh_value >= 0.55:
+        thresh_hint = "🟢 Balanced"
+    else:
+        thresh_hint = "🟠 Lenient"
+
+    # Show compact settings summary
+    st.info(
+        f"**Clustering** → {cluster_device_label} · threshold {cluster_thresh_value:.2f} ({thresh_hint}), "
+        f"min tracks {min_cluster_size_value}"
     )
-    if min_cluster_size_value == 1:
-        st.caption("⚠️ Single-track clusters may contain noise/false detections.")
+
     if not local_video_exists:
         s3_meta = details.get("s3") or {}
         s3_exists = s3_meta.get("v2_exists") or s3_meta.get("v1_exists")
@@ -2755,17 +4053,53 @@ with col_cluster:
     elif cluster_status_value == "running":
         st.info("Clustering is currently running. Wait for it to complete before starting another run.")
 
+    # Check if faces just completed (bypasses stale status check for auto-run progression)
+    # Bug 4 fix: Use timestamp instead of boolean to survive multiple reruns
+    # Extended timeout from 30s to 120s to survive double-rerun and slow status refresh
+    faces_completed_at = st.session_state.get(f"{ep_id}::faces_completed_at")
+    faces_just_completed = faces_completed_at is not None and (time.time() - faces_completed_at < 120)
+    # If faces just completed, treat the status as fresh even if API says stale
+    effective_faces_stale = faces_status_value == "stale" and not faces_just_completed
+    # Similarly, if faces just completed, assume faces are ready
+    effective_faces_ready = faces_ready or faces_just_completed
+
+    # CRITICAL FIX: If cluster trigger is active from auto-run, faces JUST completed
+    # The trigger was set immediately after faces completed successfully, so trust it
+    # This bypasses status caching issues that can cause cluster to never start
+    cluster_trigger_active = st.session_state.get(f"{ep_id}::autorun_cluster_trigger", False)
+    if cluster_trigger_active:
+        LOGGER.info(
+            "[AUTORUN CLUSTER] Trigger active - bypassing status checks. "
+            "Original: faces_ready=%s, faces_just_completed=%s, effective_faces_ready=%s, effective_faces_stale=%s",
+            faces_ready, faces_just_completed, effective_faces_ready, effective_faces_stale
+        )
+        # Force these values since we KNOW faces just completed (trigger was set right after)
+        faces_just_completed = True
+        effective_faces_ready = True
+        effective_faces_stale = False
+
     cluster_disabled = (
-        (not faces_ready)
+        (not effective_faces_ready)
         or (not detector_face_only)
         or (not tracks_ready)
         or job_running
         or zero_faces_success
         or (not combo_supported_cluster)
-        or faces_status_value == "stale"
+        or effective_faces_stale
         or cluster_status_value == "running"
         or running_cluster_job is not None
     )
+
+    # Debug logging for cluster_disabled calculation
+    if autorun_active:
+        LOGGER.info(
+            "[AUTORUN CLUSTER] cluster_disabled=%s: effective_faces_ready=%s, detector_face_only=%s, "
+            "tracks_ready=%s, job_running=%s, zero_faces_success=%s, combo_supported=%s, "
+            "effective_faces_stale=%s, cluster_status=%s, running_cluster_job=%s, trigger_active=%s",
+            cluster_disabled, effective_faces_ready, detector_face_only, tracks_ready, job_running,
+            zero_faces_success, combo_supported_cluster, effective_faces_stale, cluster_status_value,
+            running_cluster_job is not None, cluster_trigger_active
+        )
 
     if running_cluster_job:
         st.warning(f"⚠️ A cluster job is already running ({running_cluster_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
@@ -2819,7 +4153,67 @@ with col_cluster:
             return "Auto-group complete (draft people stay in Needs Cast Assignment)"
         return "Auto-grouped " + ", ".join(parts) + " (draft people stay in Needs Cast Assignment)"
 
-    if st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled):
+    # Check for auto-run trigger from pipeline automation
+    # Bug 1 fix: Use .get() instead of .pop() - only clear after job successfully starts
+    autorun_cluster_trigger = st.session_state.get(f"{ep_id}::autorun_cluster_trigger", False)
+
+    # Debug: Show why cluster might be disabled (only when auto-run is active)
+    if autorun_active and autorun_cluster_trigger:
+        with st.expander("🔍 Cluster Phase Debug", expanded=True):
+            st.markdown(f"**Trigger received**: `autorun_cluster_trigger={autorun_cluster_trigger}`")
+            st.markdown(f"**cluster_disabled**: `{cluster_disabled}`")
+            if cluster_disabled:
+                st.markdown("**Disabled because:**")
+                reasons = []
+                if not effective_faces_ready:
+                    reasons.append(f"- faces not ready (faces_ready={faces_ready}, faces_just_completed={faces_just_completed})")
+                if not detector_face_only:
+                    reasons.append(f"- detector not face-only ({detector_face_only=})")
+                if not tracks_ready:
+                    reasons.append(f"- tracks not ready ({tracks_ready=})")
+                if job_running:
+                    reasons.append(f"- job already running ({job_running=})")
+                if zero_faces_success:
+                    reasons.append(f"- zero faces success ({zero_faces_success=})")
+                if not combo_supported_cluster:
+                    reasons.append(f"- combo not supported ({combo_supported_cluster=})")
+                if effective_faces_stale:
+                    reasons.append(f"- faces stale (faces_status_value={faces_status_value}, faces_just_completed={faces_just_completed})")
+                if cluster_status_value == "running":
+                    reasons.append(f"- cluster status is 'running' ({cluster_status_value=})")
+                if running_cluster_job is not None:
+                    reasons.append(f"- cluster job already running ({running_cluster_job=})")
+                st.code("\n".join(reasons) if reasons else "No specific reason found", language="text")
+
+    should_run_cluster = st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled)
+
+    # Auto-run trigger: simulate button click if auto-run is active and not disabled
+    if autorun_cluster_trigger:
+        if not cluster_disabled:
+            should_run_cluster = True
+            # Bug 1 fix: Clear trigger AFTER we confirm job will start
+            st.session_state.pop(f"{ep_id}::autorun_cluster_trigger", None)
+            # Bug 3 fix: Reset retry counter on success
+            st.session_state.pop(f"{ep_id}::autorun_cluster_retry", None)
+            st.info("🤖 Auto-Run: Starting Cluster...")
+        else:
+            # Suggestion 8: Mtime-based retry with longer limit
+            retry_count = st.session_state.get(f"{ep_id}::autorun_cluster_retry", 0) + 1
+            should_retry, status_msg = _should_retry_phase_trigger(ep_id, "cluster", retry_count)
+            if should_retry:
+                st.session_state[f"{ep_id}::autorun_cluster_retry"] = retry_count
+                st.caption(f"⏳ {status_msg}")
+                time.sleep(1)
+                st.rerun()
+            else:
+                # Give up after max retries
+                st.session_state.pop(f"{ep_id}::autorun_cluster_trigger", None)
+                st.session_state.pop(f"{ep_id}::autorun_cluster_retry", None)
+                st.session_state[_autorun_key] = False
+                st.session_state[_autorun_phase_key] = None
+                st.error(f"❌ Auto-run stopped: {status_msg}")
+
+    if should_run_cluster:
         can_run_cluster = True
         if not local_video_exists:
             can_run_cluster = _ensure_local_artifacts(ep_id, details)
@@ -2883,7 +4277,36 @@ with col_cluster:
             finally:
                 st.session_state[running_job_key] = False
                 _set_job_active(ep_id, False)
+
+            # IMPORTANT: Set auto-run completion FIRST, before any UI display
+            # This ensures the pipeline is marked complete even if UI display has issues
+            if summary and not error_message:
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                # Invalidate running jobs cache to ensure fresh state
+                helpers.invalidate_running_jobs_cache(ep_id)
+                _cached_local_jobs.clear()
+                if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
+                    # Log completed stage with counts from summary
+                    normalized = helpers.normalize_summary(ep_id, summary)
+                    identities_count = normalized.get("identities")
+                    faces_count = normalized.get("faces")
+                    completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                    id_count = identities_count if isinstance(identities_count, int) else "?"
+                    fc_count = faces_count if isinstance(faces_count, int) else "?"
+                    completed.append(f"Clustering ({id_count} identities, {fc_count} faces)")
+                    st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    st.toast("🎉 Auto-Run Pipeline Complete!")
+
             if error_message:
+                # Bug 2 fix: Stop auto-run on error to prevent getting stuck
+                if st.session_state.get(_autorun_key):
+                    st.session_state[_autorun_key] = False
+                    st.session_state[_autorun_phase_key] = None
+                    st.session_state[f"{ep_id}::autorun_error"] = error_message
+                    st.error(f"❌ Auto-run stopped due to error in Cluster phase.")
+
                 if "faces.jsonl" in error_message.lower():
                     st.error("Run faces harvest first.")
                 else:
@@ -2910,229 +4333,19 @@ with col_cluster:
                     st.session_state["episode_detail_flash_error"] = f"Auto-group failed: {group_error}"
                 if group_flash:
                     flash_msg = flash_msg + " · " + group_flash
+
+                # Build completion flash message
+                completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                if completed:
+                    completion_summary = " → ".join([s.split(" (")[0] for s in completed])
+                    flash_msg = f"Auto-Run Pipeline Complete! ({completion_summary}) " + flash_msg
+
                 st.session_state["episode_detail_flash"] = flash_msg
-                # Force status refresh after job completion to pick up new cluster status
-                st.session_state[_status_force_refresh_key(ep_id)] = True
+                # Note: status refresh and auto-run completion are now set BEFORE this block
                 st.rerun()
 
     # Keep latest cluster log handy for copy/paste
     helpers.render_previous_logs(ep_id, "cluster", expanded=False)
-
-st.divider()
-
-# ── Timestamp Preview ──────────────────────────────────────────────────────────
-st.subheader("Timestamp Preview")
-st.caption("Enter a timestamp to see the frame with detected faces and their track/cluster assignments.")
-
-_ts_preview_key = f"{ep_id}::timestamp_preview_input"
-_ts_preview_result_key = f"{ep_id}::timestamp_preview_result"
-
-
-def _auto_format_timestamp(raw: str) -> str:
-    """Auto-format raw digits into MM:SS.ms format.
-
-    Examples:
-        "012771" -> "01:27.71"
-        "0127" -> "01:27"
-        "130" -> "01:30"
-        "01:27.71" -> "01:27.71" (already formatted)
-    """
-    # If already has colon, return as-is (already formatted)
-    if ":" in raw:
-        return raw
-
-    # Strip non-digits
-    digits = "".join(c for c in raw if c.isdigit())
-    if not digits:
-        return "00:00"
-
-    # Pad to at least 4 digits for MM:SS
-    # Format: MMSS or MMSSFF (where FF is fractional/ms)
-    if len(digits) <= 4:
-        # MMSS format
-        digits = digits.zfill(4)
-        mm = digits[:2]
-        ss = digits[2:4]
-        return f"{mm}:{ss}"
-    else:
-        # MMSSFF format (6+ digits -> MM:SS.FF)
-        digits = digits.zfill(6)
-        mm = digits[:2]
-        ss = digits[2:4]
-        ms = digits[4:]
-        return f"{mm}:{ss}.{ms}"
-
-
-# Input row: timestamp input + button
-ts_col1, ts_col2 = st.columns([3, 1])
-with ts_col1:
-    raw_ts_input = st.text_input(
-        "Timestamp (MM:SS or MM:SS.ms)",
-        value="00:00",
-        key=_ts_preview_key,
-        placeholder="e.g., 0130 or 013050 → auto-formats",
-        help="Type digits like 0130 for 01:30, or 013050 for 01:30.50. Colons added automatically.",
-    )
-    # Auto-format the input
-    ts_input = _auto_format_timestamp(raw_ts_input)
-    # Show formatted version if different from raw input
-    if ts_input != raw_ts_input and raw_ts_input.strip():
-        st.caption(f"→ {ts_input}")
-
-with ts_col2:
-    st.write("")  # Spacing
-    preview_clicked = st.button("🔍 Preview", key=f"{ep_id}::ts_preview_btn", use_container_width=True)
-
-
-def _parse_timestamp_input(ts_str: str) -> float | None:
-    """Parse MM:SS or MM:SS.ms format to seconds."""
-    import re
-    ts_str = ts_str.strip()
-    if not ts_str:
-        return None
-
-    # Try MM:SS.ms format
-    match = re.match(r"^(\d+):(\d{1,2})(?:\.(\d+))?$", ts_str)
-    if match:
-        minutes = int(match.group(1))
-        seconds = int(match.group(2))
-        ms_str = match.group(3)
-        ms = float(f"0.{ms_str}") if ms_str else 0.0
-        return minutes * 60 + seconds + ms
-
-    # Try just seconds
-    try:
-        return float(ts_str)
-    except ValueError:
-        return None
-
-
-if preview_clicked:
-    timestamp_s = _parse_timestamp_input(ts_input)
-    if timestamp_s is None:
-        st.error("Invalid timestamp format. Use MM:SS or MM:SS.ms (e.g., 01:30 or 01:30.50)")
-    else:
-        with st.spinner(f"Loading frame at {ts_input}..."):
-            try:
-                preview_resp = helpers.api_get(
-                    f"/episodes/{ep_id}/timestamp/{timestamp_s}/preview",
-                    timeout=30,
-                )
-                st.session_state[_ts_preview_result_key] = preview_resp
-            except requests.RequestException as exc:
-                st.error(helpers.describe_error(f"timestamp preview", exc))
-                st.session_state[_ts_preview_result_key] = None
-
-# Display result if available
-preview_result = st.session_state.get(_ts_preview_result_key)
-if preview_result:
-    # Show gap warning if we had to find a nearby frame
-    gap_seconds = preview_result.get("gap_seconds", 0)
-    actual_ts = preview_result.get("timestamp_s", 0)
-    frame_idx = preview_result.get("frame_idx", 0)
-    fps = preview_result.get("fps", 24)
-
-    if gap_seconds > 0.5:
-        st.warning(
-            f"No faces detected at exact timestamp. Showing nearest frame with faces "
-            f"(gap: {gap_seconds:.2f}s)"
-        )
-
-    # Frame info
-    actual_mm = int(actual_ts // 60)
-    actual_ss = actual_ts % 60
-    st.caption(f"Frame {frame_idx} @ {actual_mm}:{actual_ss:05.2f} ({fps:.2f} fps)")
-
-    # Display the preview image
-    preview_url = preview_result.get("url")
-    if preview_url:
-        # Handle local paths vs URLs
-        if preview_url.startswith("/") or preview_url.startswith("data/"):
-            # Local path - read and display
-            from pathlib import Path
-            local_path = Path(preview_url)
-            if local_path.exists():
-                st.image(str(local_path), use_column_width=True)
-            else:
-                st.error(f"Preview image not found: {preview_url}")
-        else:
-            # S3 presigned URL
-            st.image(preview_url, use_column_width=True)
-
-    # Display pipeline summary first
-    pipeline_summary = preview_result.get("pipeline_summary", {})
-    if pipeline_summary:
-        sum_detected = pipeline_summary.get("detected", 0)
-        sum_tracked = pipeline_summary.get("tracked", 0)
-        sum_harvested = pipeline_summary.get("harvested", 0)
-        sum_clustered = pipeline_summary.get("clustered", 0)
-
-        # Show pipeline funnel as metrics
-        pipe_cols = st.columns(4)
-        pipe_cols[0].metric("Detected", sum_detected, help="Faces found by RetinaFace detector")
-        pipe_cols[1].metric("Tracked", sum_tracked, help="Faces linked to ByteTrack tracks")
-        pipe_cols[2].metric("Harvested", sum_harvested, help="Faces that passed quality gate and were embedded")
-        pipe_cols[3].metric("Clustered", sum_clustered, help="Faces assigned to identity clusters")
-
-        # Show drop-off warnings
-        if sum_detected > 0:
-            if sum_tracked < sum_detected:
-                st.warning(f"⚠️ {sum_detected - sum_tracked} face(s) detected but NOT tracked (below track confidence threshold)")
-            if sum_harvested < sum_tracked:
-                st.info(f"ℹ️ {sum_tracked - sum_harvested} tracked face(s) NOT harvested (didn't pass quality gate or not sampled)")
-            if sum_clustered < sum_harvested:
-                st.info(f"ℹ️ {sum_harvested - sum_clustered} harvested face(s) NOT clustered yet")
-
-    # Display face info table
-    faces = preview_result.get("faces", [])
-    if faces:
-        st.markdown(f"**{len(faces)} face(s) in frame:**")
-
-        face_rows = []
-        for face in faces:
-            track_id = face.get("track_id")
-            identity_id = face.get("identity_id", "—")
-            name = face.get("name")
-            cast_id = face.get("cast_id")
-            bbox = face.get("bbox", [])
-            conf = face.get("conf")
-
-            # Pipeline status flags
-            is_detected = face.get("detected", False)
-            is_tracked = face.get("tracked", False)
-            is_harvested = face.get("harvested", False)
-            is_clustered = face.get("clustered", False)
-
-            # Format bbox as readable string
-            bbox_str = f"[{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]" if bbox else "—"
-
-            # Format confidence as percentage
-            conf_str = f"{conf * 100:.0f}%" if conf is not None else "—"
-
-            # Pipeline status indicators (checkmarks/x)
-            def _status_icon(val: bool) -> str:
-                return "✓" if val else "✗"
-
-            face_rows.append({
-                "Track": f"T{track_id}" if track_id else "—",
-                "Conf": conf_str,
-                "Det": _status_icon(is_detected),
-                "Trk": _status_icon(is_tracked),
-                "Harv": _status_icon(is_harvested),
-                "Clust": _status_icon(is_clustered),
-                "Identity": identity_id[:16] + "…" if identity_id and len(str(identity_id)) > 16 else (identity_id or "—"),
-                "Name": name or "—",
-                "BBox": bbox_str,
-            })
-
-        import pandas as pd
-        df = pd.DataFrame(face_rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        # Legend for status columns
-        st.caption("Pipeline status: Conf=Detection confidence, Det=Detected, Trk=Tracked, Harv=Harvested (quality gated + embedded), Clust=Clustered")
-    else:
-        st.info("No faces detected in this frame.")
 
 st.divider()
 

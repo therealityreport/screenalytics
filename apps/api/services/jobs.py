@@ -14,7 +14,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import IO, Any, Callable, Dict, List, Literal, Optional
 
 try:
     import psutil  # type: ignore
@@ -373,17 +373,22 @@ class JobService:
         stderr_log_path = stderr_log_dir / f"job-{job_id}.stderr.log"
 
         env = os.environ.copy()
-        # Open stderr log for subprocess (will be closed automatically when process exits)
+        # Bug 8 fix: Open stderr log for subprocess, will be closed by monitor thread
         stderr_file = open(stderr_log_path, "w", encoding="utf-8")  # noqa: SIM115
         effective_command = _maybe_wrap_with_cpulimit(command)
-        proc = subprocess.Popen(
-            effective_command,
-            cwd=str(PROJECT_ROOT),
-            env=env,
-            stderr=stderr_file,
-            stdout=subprocess.DEVNULL,  # Stdout goes to progress.json via ProgressEmitter
-        )  # noqa: S603
-        
+        try:
+            proc = subprocess.Popen(
+                effective_command,
+                cwd=str(PROJECT_ROOT),
+                env=env,
+                stderr=stderr_file,
+                stdout=subprocess.DEVNULL,  # Stdout goes to progress.json via ProgressEmitter
+            )  # noqa: S603
+        except Exception:
+            # Bug 8 fix: Close file handle if subprocess fails to start
+            stderr_file.close()
+            raise
+
         # Apply CPU affinity fallback if cpulimit wrapper wasn't applied
         if _CPULIMIT_PERCENT > 0 and effective_command == command:
             # cpulimit wasn't available, try psutil affinity fallback
@@ -409,9 +414,10 @@ class JobService:
         with self._lock:
             self._write_job(record)
 
+        # Bug 8 fix: Pass stderr_file to monitor thread for proper cleanup
         monitor = threading.Thread(
             target=self._monitor_process,
-            args=(job_id, proc),
+            args=(job_id, proc, stderr_file),
             name=f"job-monitor-{job_id}",
             daemon=True,
         )
@@ -992,13 +998,22 @@ class JobService:
 
         return record
 
-    def _monitor_process(self, job_id: str, proc: subprocess.Popen) -> None:
+    def _monitor_process(
+        self, job_id: str, proc: subprocess.Popen, stderr_file: IO[str] | None = None
+    ) -> None:
         error_msg: str | None = None
         try:
             return_code = proc.wait()
         except Exception as exc:  # pragma: no cover - rare failure
             return_code = -1
             error_msg = str(exc)
+        finally:
+            # Bug 8 fix: Always close stderr file handle when process exits
+            if stderr_file is not None:
+                try:
+                    stderr_file.close()
+                except Exception:
+                    pass  # Ignore errors closing file
         state = "succeeded" if return_code == 0 and error_msg is None else "failed"
         self._finalize_job(job_id, state, return_code, error_msg)
 

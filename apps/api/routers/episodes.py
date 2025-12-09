@@ -2916,8 +2916,15 @@ def list_cluster_tracks(
 
 
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
-def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
-    """Get representative frames with similarity scores for all tracks in a cluster."""
+def get_cluster_track_reps(
+    ep_id: str,
+    cluster_id: str,
+    frames_per_track: int = Query(0, ge=0, le=20, description="Number of sample frames to include per track (0=none)"),
+) -> dict:
+    """Get representative frames with similarity scores for all tracks in a cluster.
+
+    If frames_per_track > 0, includes sample frames for each track for inline display.
+    """
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
@@ -2930,13 +2937,61 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
 
         result = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
 
-        # Resolve crop URLs
+        # Load faces for sample frames if requested
+        all_faces = None
+        if frames_per_track > 0:
+            all_faces = _load_faces(ep_id, include_skipped=False)
+
+        # Resolve crop URLs and add sample frames
         for track in result.get("tracks", []):
             crop_key = track.get("crop_key")
             if crop_key:
                 # Use existing _resolve_crop_url helper
                 url = _resolve_crop_url(ep_id, crop_key, None)
                 track["crop_url"] = url
+
+            # Add sample frames if requested
+            if frames_per_track > 0 and all_faces:
+                track_id_str = track.get("track_id", "")
+                # Parse track_id to int
+                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                    try:
+                        track_id_int = int(track_id_str.replace("track_", ""))
+                    except ValueError:
+                        track_id_int = None
+                else:
+                    try:
+                        track_id_int = int(track_id_str)
+                    except (ValueError, TypeError):
+                        track_id_int = None
+
+                if track_id_int is not None:
+                    # Get all faces for this track, sorted by frame_idx
+                    track_faces = sorted(
+                        [f for f in all_faces if f.get("track_id") == track_id_int],
+                        key=lambda f: f.get("frame_idx", 0)
+                    )
+                    total_frames = len(track_faces)
+                    track["frame_count"] = total_frames
+
+                    # Sample evenly across the track
+                    if total_frames <= frames_per_track:
+                        sampled = track_faces
+                    else:
+                        step = total_frames / frames_per_track
+                        indices = [int(i * step) for i in range(frames_per_track)]
+                        sampled = [track_faces[i] for i in indices if i < total_frames]
+
+                    # Build frame entries with URLs
+                    sample_frames = []
+                    for face in sampled:
+                        frame_url = _resolve_face_media_url(ep_id, face)
+                        sample_frames.append({
+                            "frame_idx": face.get("frame_idx"),
+                            "crop_url": frame_url,
+                            "quality": face.get("quality"),
+                        })
+                    track["sample_frames"] = sample_frames
 
         return result
     except Exception as exc:
@@ -4512,6 +4567,48 @@ def generate_timestamp_preview(
         }
     finally:
         cap.release()
+
+
+@router.get("/episodes/{ep_id}/frame/{frame_idx}/preview")
+def generate_frame_preview(
+    ep_id: str,
+    frame_idx: int,
+    include_unidentified: bool = Query(True, description="Include faces without cast assignment"),
+) -> dict:
+    """Generate a frame preview at a specific frame index with named bounding boxes.
+
+    This is a convenience wrapper around the timestamp preview that takes a frame index
+    directly instead of a timestamp.
+
+    Args:
+        ep_id: Episode identifier
+        frame_idx: Frame index (0-based)
+        include_unidentified: If True, show boxes for faces without cast assignment
+
+    Returns:
+        Same format as /timestamp/{timestamp_s}/preview endpoint
+    """
+    # Get video FPS to convert frame index to timestamp
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30.0
+    finally:
+        cap.release()
+
+    # Convert frame index to timestamp
+    timestamp_s = frame_idx / fps
+
+    # Reuse the timestamp preview endpoint
+    return generate_timestamp_preview(ep_id, timestamp_s, include_unidentified)
 
 
 class VideoClipRequest(BaseModel):
