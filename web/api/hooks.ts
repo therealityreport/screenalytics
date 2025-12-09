@@ -10,6 +10,7 @@ import {
   eventsUrl,
   fetchAllRunningJobs,
   fetchEpisodeDetail,
+  fetchEpisodes,
   fetchEpisodeStatus,
   fetchJobs,
   fetchS3Videos,
@@ -30,6 +31,7 @@ import type {
   EpisodeEvent,
   EpisodePhase,
   EpisodeStatus,
+  EpisodeSummary,
   Job,
   S3VideoItem,
   Show,
@@ -238,5 +240,15 @@ export function useUpsertEpisode() {
       client.invalidateQueries({ queryKey: ["s3-videos"] });
       client.invalidateQueries({ queryKey: ["episodes"] });
     },
+  });
+}
+
+// Episodes List
+export function useEpisodes(options?: { enabled?: boolean }) {
+  return useQuery<EpisodeSummary[], ApiError>({
+    queryKey: ["episodes"],
+    queryFn: fetchEpisodes,
+    enabled: options?.enabled ?? true,
+    staleTime: 30 * 1000, // 30 seconds
   });
 }

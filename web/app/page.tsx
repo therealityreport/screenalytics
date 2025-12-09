@@ -1,48 +1,20 @@
 import Link from "next/link";
-import { prisma } from "@/src/lib/prisma";
 
-async function getEvents() {
-  return prisma.event.findMany({
-    orderBy: { createdAt: "desc" },
-  });
-}
-
-async function createSampleEvent() {
-  "use server";
-  const now = new Date();
-  const name = `Sample Event ${now.toISOString().slice(0, 10)}`;
-  await prisma.event.create({
-    data: {
-      name,
-      startDate: now,
-    },
-  });
-}
-
-export default async function HomePage() {
-  const events = await getEvents();
+export default function HomePage() {
   return (
     <div className="card">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Events</h1>
-        <form action={createSampleEvent}>
-          <button type="submit">Create sample event</button>
-        </form>
-      </div>
-      {events.length === 0 ? (
-        <p style={{ marginTop: 16 }}>No events yet. Create one to get started.</p>
-      ) : (
-        <ul style={{ marginTop: 16, paddingLeft: 18 }}>
-          {events.map((event) => (
-            <li key={event.id} style={{ marginBottom: 8 }}>
-              <Link href={`/events/${event.id}`}>{event.name}</Link>
-            </li>
-          ))}
-        </ul>
-      )}
+      <h1 style={{ margin: 0 }}>Screenalytics</h1>
       <p style={{ marginTop: 16 }}>
-        Need request analysis? Visit <Link href="/request-analysis">Request Analysis</Link>.
+        Reality TV face tracking and screen time analytics platform.
       </p>
+      <div style={{ marginTop: 24, display: "flex", gap: 12 }}>
+        <Link href="/screenalytics/upload" style={{ padding: "12px 20px", background: "#0f172a", color: "#fff", borderRadius: 8, textDecoration: "none", fontWeight: 600 }}>
+          Upload Episode
+        </Link>
+        <Link href="/screenalytics/episodes" style={{ padding: "12px 20px", border: "1px solid #cbd5e1", borderRadius: 8, textDecoration: "none", fontWeight: 600 }}>
+          Browse Episodes
+        </Link>
+      </div>
     </div>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { use, useMemo, useState } from "react";
+import Link from "next/link";
 import { useEpisodeEvents, useEpisodeStatus, useTriggerPhase } from "@/api/hooks";
 import type { EpisodePhase } from "@/api/types";
 import styles from "../episode.module.css";
@@ -11,8 +12,8 @@ function StatusBadge({ state }: { state?: string }) {
   return <span className={cls}>{text}</span>;
 }
 
-export default function EpisodeDetail({ params }: { params: { id: string } }) {
-  const episodeId = params.id;
+export default function EpisodeDetail({ params }: { params: Promise<{ id: string }> }) {
+  const { id: episodeId } = use(params);
   const [events, setEvents] = useState<string[]>([]);
 
   const statusQuery = useEpisodeStatus(episodeId, { enabled: true, refetchInterval: 1800 });
@@ -44,8 +45,10 @@ export default function EpisodeDetail({ params }: { params: { id: string } }) {
     <div className="card">
       <div className={styles.headerRow}>
         <div>
-          <div style={{ color: "#475569", fontSize: 13 }}>Episode Detail</div>
-          <h2 style={{ margin: 0 }}>{episodeId}</h2>
+          <Link href="/screenalytics/episodes" style={{ color: "#64748b", fontSize: 13, textDecoration: "none" }}>
+            ← Episodes
+          </Link>
+          <h2 style={{ margin: "4px 0 0" }}>{episodeId}</h2>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button

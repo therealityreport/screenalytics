@@ -2239,8 +2239,23 @@ def encode_jpeg_bytes(image, *, quality: int = 85, color: str = "bgr") -> bytes:
     return encoded.tobytes()
 
 
-def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr") -> None:
-    """Normalize + persist an image to JPEG, ensuring non-blank uint8 BGR data."""
+def save_image(
+    path: str | Path,
+    image,
+    *,
+    quality: int = 95,
+    color: str = "bgr",
+    image_format: str = "png",
+) -> None:
+    """Normalize + persist an image to PNG (lossless) or JPEG, ensuring non-blank uint8 BGR data.
+
+    Args:
+        path: Output file path (extension will be adjusted based on format)
+        image: Image array (numpy array or similar)
+        quality: JPEG quality 1-100 (only used for jpg format)
+        color: Input color mode ('bgr' or 'rgb')
+        image_format: 'png' for lossless, 'jpg' for compressed
+    """
     import cv2  # type: ignore
 
     arr = np.asarray(image)
@@ -2256,14 +2271,29 @@ def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr")
         elif mode not in {"bgr", "rgb"}:
             raise ValueError(f"Unsupported color mode '{color}'")
     else:
-        raise ValueError(f"Unsupported image shape for JPEG write: {arr.shape}")
+        raise ValueError(f"Unsupported image shape for image write: {arr.shape}")
     arr = np.ascontiguousarray(arr)
-    jpeg_quality = max(1, min(int(quality or 85), 100))
+
     out_path = Path(path)
+    fmt = image_format.lower().strip(".")
+    # Adjust extension based on format
+    if fmt == "png":
+        out_path = out_path.with_suffix(".png")
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 3]  # 0-9, 3 is good balance
+    else:
+        out_path = out_path.with_suffix(".jpg")
+        jpeg_quality = max(1, min(int(quality or 95), 100))
+        params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(str(out_path), arr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    ok = cv2.imwrite(str(out_path), arr, params)
     if not ok:
         raise RuntimeError(f"cv2.imwrite failed for {out_path}")
+
+
+def save_jpeg(path: str | Path, image, *, quality: int = 95, color: str = "bgr") -> None:
+    """Legacy wrapper - use save_image() with image_format='jpg' instead."""
+    save_image(path, image, quality=quality, color=color, image_format="jpg")
 
 
 class ThumbWriter:
@@ -2278,11 +2308,13 @@ class ThumbWriter:
     """
 
     def __init__(
-        self, ep_id: str, size: int = 256, jpeg_quality: int = 85, storage_backend=None
+        self, ep_id: str, size: int = 256, jpeg_quality: int = 95, storage_backend=None,
+        image_format: str = "png"
     ) -> None:
         self.ep_id = ep_id
         self.size = size
-        self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
+        self.jpeg_quality = max(1, min(int(jpeg_quality or 95), 100))
+        self.image_format = image_format.lower().strip(".")  # "png" or "jpg"
         self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
         self._storage_backend = storage_backend
         # Determine if we should use backend for writes (only for pure S3 mode)
@@ -2365,22 +2397,31 @@ class ThumbWriter:
             if mx - mn < 1e-6:
                 LOGGER.warning("Nearly constant thumb track=%s frame=%s", track_id, frame_idx)
             self._stat_samples += 1
-        rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
+
+        ext = "png" if self.image_format == "png" else "jpg"
+        rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.{ext}")
         abs_path = self.root_dir / rel_path
 
         # Write thumbnail using storage backend (S3) or direct filesystem
         if self._use_backend_writes and self._storage_backend is not None:
             # Direct-to-S3 mode: encode to bytes and upload
             try:
-                jpeg_data = encode_jpeg_bytes(thumb, quality=self.jpeg_quality, color="bgr")
+                if self.image_format == "png":
+                    # Encode as PNG (lossless)
+                    success, encoded = self._cv2.imencode(".png", thumb, [self._cv2.IMWRITE_PNG_COMPRESSION, 3])
+                    if not success:
+                        raise RuntimeError("cv2.imencode PNG failed")
+                    image_data = encoded.tobytes()
+                else:
+                    image_data = encode_jpeg_bytes(thumb, quality=self.jpeg_quality, color="bgr")
                 # entity_id includes track and frame info
                 entity_id = f"track_{track_id:04d}/thumb_{frame_idx:06d}"
                 result = self._storage_backend.write_thumbnail(
-                    self.ep_id, "track", entity_id, jpeg_data
+                    self.ep_id, "track", entity_id, image_data
                 )
                 if result.success:
                     self.thumbs_written += 1
-                    self.bytes_written += len(jpeg_data)
+                    self.bytes_written += len(image_data)
                     self._last_thumb_meta = {
                         "source_shape": tuple(int(x) for x in source.shape[:2]),
                         "source_kind": source_kind,
@@ -2393,19 +2434,22 @@ class ThumbWriter:
                 LOGGER.warning("Failed to encode/upload thumb %s: %s", rel_path, exc)
                 return None, None
         else:
-            # Local/hybrid mode: write directly to disk
-            ok, reason = safe_imwrite(abs_path, thumb, self.jpeg_quality)
-            if not ok:
-                LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
+            # Local/hybrid mode: write directly to disk using save_image
+            try:
+                save_image(abs_path, thumb, quality=self.jpeg_quality, color="bgr", image_format=self.image_format)
+                self.thumbs_written += 1
+                # Re-get path with correct extension (save_image adjusts it)
+                actual_path = abs_path.with_suffix(f".{ext}")
+                if actual_path.exists():
+                    self.bytes_written += actual_path.stat().st_size
+                self._last_thumb_meta = {
+                    "source_shape": tuple(int(x) for x in source.shape[:2]),
+                    "source_kind": source_kind,
+                }
+                return rel_path.as_posix(), actual_path
+            except Exception as exc:
+                LOGGER.warning("Failed to write thumb %s: %s", abs_path, exc)
                 return None, None
-            self.thumbs_written += 1
-            if abs_path.exists():
-                self.bytes_written += abs_path.stat().st_size
-            self._last_thumb_meta = {
-                "source_shape": tuple(int(x) for x in source.shape[:2]),
-                "source_kind": source_kind,
-            }
-            return rel_path.as_posix(), abs_path
 
     def _letterbox(self, crop):
         if self._cv2 is None:

@@ -74,17 +74,34 @@ def safe_crop(
     return to_u8_bgr(crop), clipped, None
 
 
-def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | None]:
-    """Write JPEGs with variance + size guards."""
+def safe_imwrite(path: str | Path, image, jpg_q: int = 95, image_format: str = "png") -> tuple[bool, str | None]:
+    """Write images (PNG lossless or JPEG) with variance + size guards.
+
+    Args:
+        path: Output file path
+        image: Image array
+        jpg_q: JPEG quality 1-100 (only used for jpg format)
+        image_format: 'png' for lossless, 'jpg' for compressed
+    """
     if image is None:
         return False, "image_missing"
     img = to_u8_bgr(np.asarray(image))
     out_path = Path(path)
+
+    # Adjust extension based on format
+    fmt = image_format.lower().strip(".")
+    if fmt == "png":
+        out_path = out_path.with_suffix(".png")
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 3]  # 0-9, 3 is good balance
+    else:
+        out_path = out_path.with_suffix(".jpg")
+        jpeg_q = max(1, min(int(jpg_q or 95), 100))
+        params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_q]
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    jpeg_q = max(1, min(int(jpg_q or 85), 100))
     variance = float(np.std(img)) if img.size else 0.0
     range_val = float(np.nanmax(img)) - float(np.nanmin(img)) if img.size else 0.0
-    ok = cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+    ok = cv2.imwrite(str(out_path), img, params)
     if not ok:
         return False, "imwrite_failed"
     try:

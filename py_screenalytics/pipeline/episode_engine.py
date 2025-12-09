@@ -42,6 +42,7 @@ from py_screenalytics.pipeline.constants import (
     DEFAULT_MIN_IDENTITY_SIM,
     DEFAULT_THUMB_SIZE,
     DEFAULT_JPEG_QUALITY,
+    DEFAULT_IMAGE_FORMAT,
     DEFAULT_MAX_SAMPLES_PER_TRACK,
     DEFAULT_MIN_SAMPLES_PER_TRACK,
     DEFAULT_SAMPLE_EVERY_N_FRAMES,
@@ -169,7 +170,7 @@ class EpisodeRunConfig:
     # Export settings
     # =========================================================================
     save_frames: bool = False
-    """Save full frame JPGs"""
+    """Save full frame images"""
 
     save_crops: bool = False
     """Save per-track face crops"""
@@ -178,7 +179,10 @@ class EpisodeRunConfig:
     """Square thumbnail size for face crops"""
 
     jpeg_quality: int = DEFAULT_JPEG_QUALITY
-    """JPEG quality for exports (1-100)"""
+    """JPEG quality for exports (1-100), only used when image_format='jpg'"""
+
+    image_format: str = DEFAULT_IMAGE_FORMAT
+    """Image format for frame/crop exports: 'png' (lossless) or 'jpg' (smaller)"""
 
     # =========================================================================
     # Output settings

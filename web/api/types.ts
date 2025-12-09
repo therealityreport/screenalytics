@@ -125,3 +125,17 @@ export type EpisodeDetail = {
   faces_count?: number;
   processed_at?: string;
 };
+
+// Episode list types
+export type EpisodeSummary = {
+  ep_id: string;
+  show_slug: string;
+  season_number: number;
+  episode_number: number;
+  title?: string | null;
+  air_date?: string | null;
+};
+
+export type EpisodeListResponse = {
+  episodes: EpisodeSummary[];
+};

@@ -290,26 +290,26 @@ def get_ffmpeg_encode_args(
     output_path: str | Path,
     *,
     codec: str = "h264_videotoolbox",
-    bitrate: str = "4M",
-    maxrate: str = "6M",
-    bufsize: str = "8M",
+    bitrate: str = "8M",
+    maxrate: str = "12M",
+    bufsize: str = "16M",
     audio_codec: str = "aac",
-    audio_bitrate: str = "160k",
+    audio_bitrate: str = "192k",
     use_software_fallback: bool = True,
 ) -> List[str]:
     """Get FFmpeg encode arguments with VideoToolbox acceleration.
 
     If VideoToolbox encoder is not available and use_software_fallback=True,
-    falls back to libx264 with thermal-safe settings.
+    falls back to libx264 with high-quality CRF settings.
 
     Args:
         output_path: Output file path
         codec: Video codec (h264_videotoolbox or libx264)
-        bitrate: Target video bitrate
-        maxrate: Maximum video bitrate
-        bufsize: Rate control buffer size
+        bitrate: Target video bitrate (8M default for high quality)
+        maxrate: Maximum video bitrate (12M default)
+        bufsize: Rate control buffer size (16M default)
         audio_codec: Audio codec
-        audio_bitrate: Audio bitrate
+        audio_bitrate: Audio bitrate (192k default for high quality)
         use_software_fallback: Use libx264 if VideoToolbox unavailable
 
     Returns:
@@ -319,7 +319,7 @@ def get_ffmpeg_encode_args(
 
     # Check if VideoToolbox encoder is available
     if _IS_MACOS and "videotoolbox" in codec.lower():
-        # VideoToolbox hardware encoding
+        # VideoToolbox hardware encoding with high quality bitrate
         args.extend([
             "-c:v", codec,
             "-b:v", bitrate,
@@ -327,14 +327,13 @@ def get_ffmpeg_encode_args(
             "-bufsize", bufsize,
         ])
     elif use_software_fallback or not _IS_MACOS:
-        # Software fallback with thermal-safe settings
+        # Software fallback with CRF for quality (CRF 18 = near-lossless)
         args.extend([
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
+            "-preset", "fast",
+            "-crf", "18",
             "-pix_fmt", "yuv420p",
-            "-threads", "2",
-            "-b:v", bitrate,
+            "-threads", "4",
         ])
 
     # Audio encoding

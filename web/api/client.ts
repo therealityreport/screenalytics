@@ -6,8 +6,10 @@ import type {
   EpisodeCreateResponse,
   EpisodeDetail,
   EpisodeEvent,
+  EpisodeListResponse,
   EpisodeStatus,
   EpisodePhase,
+  EpisodeSummary,
   Job,
   JobsResponse,
   S3VideosResponse,
@@ -194,6 +196,12 @@ export async function upsertEpisodeById(payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+// Episodes List
+export async function fetchEpisodes(): Promise<EpisodeSummary[]> {
+  const response = await apiFetch<EpisodeListResponse>("/episodes");
+  return response.episodes || [];
 }
 
 export { normalizeError };

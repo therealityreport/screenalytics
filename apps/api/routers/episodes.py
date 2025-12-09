@@ -4867,12 +4867,13 @@ def generate_video_clip(ep_id: str, body: VideoClipRequest) -> dict:
 
         try:
             # Use ffmpeg to convert to H.264 with AAC audio (browser compatible)
+            # CRF 18 = near-lossless quality (0-51 scale, lower is better)
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(tmp_path),
                 "-c:v", "libx264",
                 "-preset", "fast",
-                "-crf", "23",
+                "-crf", "18",
                 "-pix_fmt", "yuv420p",  # Required for browser compatibility
                 "-movflags", "+faststart",  # Enable streaming
                 "-an",  # No audio (source has no audio)
