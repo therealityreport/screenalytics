@@ -2916,8 +2916,15 @@ def list_cluster_tracks(
 
 
 @router.get("/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
-def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
-    """Get representative frames with similarity scores for all tracks in a cluster."""
+def get_cluster_track_reps(
+    ep_id: str,
+    cluster_id: str,
+    frames_per_track: int = Query(0, ge=0, le=20, description="Number of sample frames to include per track (0=none)"),
+) -> dict:
+    """Get representative frames with similarity scores for all tracks in a cluster.
+
+    If frames_per_track > 0, includes sample frames for each track for inline display.
+    """
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
@@ -2930,13 +2937,61 @@ def get_cluster_track_reps(ep_id: str, cluster_id: str) -> dict:
 
         result = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
 
-        # Resolve crop URLs
+        # Load faces for sample frames if requested
+        all_faces = None
+        if frames_per_track > 0:
+            all_faces = _load_faces(ep_id, include_skipped=False)
+
+        # Resolve crop URLs and add sample frames
         for track in result.get("tracks", []):
             crop_key = track.get("crop_key")
             if crop_key:
                 # Use existing _resolve_crop_url helper
                 url = _resolve_crop_url(ep_id, crop_key, None)
                 track["crop_url"] = url
+
+            # Add sample frames if requested
+            if frames_per_track > 0 and all_faces:
+                track_id_str = track.get("track_id", "")
+                # Parse track_id to int
+                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+                    try:
+                        track_id_int = int(track_id_str.replace("track_", ""))
+                    except ValueError:
+                        track_id_int = None
+                else:
+                    try:
+                        track_id_int = int(track_id_str)
+                    except (ValueError, TypeError):
+                        track_id_int = None
+
+                if track_id_int is not None:
+                    # Get all faces for this track, sorted by frame_idx
+                    track_faces = sorted(
+                        [f for f in all_faces if f.get("track_id") == track_id_int],
+                        key=lambda f: f.get("frame_idx", 0)
+                    )
+                    total_frames = len(track_faces)
+                    track["frame_count"] = total_frames
+
+                    # Sample evenly across the track
+                    if total_frames <= frames_per_track:
+                        sampled = track_faces
+                    else:
+                        step = total_frames / frames_per_track
+                        indices = [int(i * step) for i in range(frames_per_track)]
+                        sampled = [track_faces[i] for i in indices if i < total_frames]
+
+                    # Build frame entries with URLs
+                    sample_frames = []
+                    for face in sampled:
+                        frame_url = _resolve_face_media_url(ep_id, face)
+                        sample_frames.append({
+                            "frame_idx": face.get("frame_idx"),
+                            "crop_url": frame_url,
+                            "quality": face.get("quality"),
+                        })
+                    track["sample_frames"] = sample_frames
 
         return result
     except Exception as exc:
@@ -4220,8 +4275,9 @@ def generate_timestamp_preview(
                     except json.JSONDecodeError:
                         continue
 
-        # Load tracks - build mapping of track_id -> track info
-        track_info_map = {}  # track_id -> {frame_indices, ...}
+        # Load tracks - build mapping of track_id -> frame_span
+        # tracks.jsonl uses frame_span: [start_frame, end_frame] format
+        track_frame_spans = {}  # track_id -> (start_frame, end_frame)
         if tracks_path.exists():
             import json
             with open(tracks_path, "r") as f:
@@ -4230,18 +4286,17 @@ def generate_timestamp_preview(
                         track = json.loads(line)
                         tid = track.get("track_id")
                         if tid is not None:
-                            if tid not in track_info_map:
-                                track_info_map[tid] = {"frame_indices": set()}
-                            fidx = track.get("frame_idx")
-                            if fidx is not None:
-                                track_info_map[tid]["frame_indices"].add(fidx)
+                            frame_span = track.get("frame_span")
+                            if frame_span and len(frame_span) >= 2:
+                                track_frame_spans[tid] = (frame_span[0], frame_span[1])
                     except json.JSONDecodeError:
                         continue
 
-        # Build set of (track_id, frame_idx) that are tracked at our frame
+        # Build set of track_ids that are tracked at our frame
+        # A track is "tracked" if frame_idx falls within its frame_span
         tracked_at_frame = set()
-        for tid, info in track_info_map.items():
-            if frame_idx in info["frame_indices"]:
+        for tid, (start_f, end_f) in track_frame_spans.items():
+            if start_f <= frame_idx <= end_f:
                 tracked_at_frame.add(tid)
 
         # Load faces for this episode (harvested faces)
@@ -4258,41 +4313,47 @@ def generate_timestamp_preview(
         if not faces and not frame_detections:
             raise HTTPException(status_code=404, detail="No faces or detections found for episode")
 
-        # Filter to faces in or near the requested frame
-        # Since faces are detected at stride intervals (default stride=8), we need to find
-        # the nearest sampled frame. A face at frame N could be at any frame N±stride.
-        frame_faces = [f for f in faces if f.get("frame_idx") == frame_idx]
+        # Build harvested faces lookup by (track_id, frame_idx) for quick access
+        harvested_faces_lookup = {}
+        for f in faces:
+            key = (f.get("track_id"), f.get("frame_idx"))
+            if key[0] is not None:
+                harvested_faces_lookup[key] = f
 
-        # If no exact match, find the closest frame that has detected faces
-        # First try a reasonable window (stride + buffer), then expand if needed
+        # Use detections as primary source - this shows ALL detected faces
+        # Detections have: track_id, frame_idx, bbox, conf, etc.
         original_frame_idx = frame_idx
-        if not frame_faces:
-            # Get all unique frame indices with faces, sorted
-            all_face_frames = sorted(set(f.get("frame_idx") for f in faces if f.get("frame_idx") is not None))
+        gap_seconds = 0.0
 
-            if not all_face_frames:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No faces detected in this episode"
-                )
+        # If no detections at exact frame, find closest frame with detections
+        if not frame_detections:
+            # Load all detections to find closest frame
+            all_detections = []
+            if detections_path.exists():
+                with open(detections_path, "r") as f:
+                    for line in f:
+                        try:
+                            det = json.loads(line)
+                            all_detections.append(det)
+                        except json.JSONDecodeError:
+                            continue
 
-            # Find the closest frame with faces
-            closest_frame = min(all_face_frames, key=lambda f: abs(f - frame_idx))
-            gap = abs(closest_frame - frame_idx)
+            if all_detections:
+                all_det_frames = sorted(set(d.get("frame_idx") for d in all_detections if d.get("frame_idx") is not None))
+                if all_det_frames:
+                    closest_frame = min(all_det_frames, key=lambda f: abs(f - frame_idx))
+                    gap = abs(closest_frame - frame_idx)
+                    gap_seconds = gap / fps if fps > 0 else 0
 
-            # If gap is very large (> 2 seconds at ~24fps), warn user but still show result
-            max_acceptable_gap = int(fps * 2)  # 2 seconds worth of frames
+                    frame_detections = [d for d in all_detections if d.get("frame_idx") == closest_frame]
+                    frame_idx = closest_frame
 
-            frame_faces = [f for f in faces if f.get("frame_idx") == closest_frame]
-            frame_idx = closest_frame
+                    LOGGER.info(
+                        f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
+                        f"closest detected frame is {closest_frame} (gap={gap} frames, {gap_seconds:.2f}s)"
+                    )
 
-            # Log the gap for debugging
-            LOGGER.info(
-                f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
-                f"closest detected frame is {closest_frame} (gap={gap} frames, {gap/fps:.2f}s)"
-            )
-
-        if not frame_faces:
+        if not frame_detections:
             raise HTTPException(
                 status_code=404,
                 detail=f"No faces found near timestamp {timestamp_s:.2f}s (frame {original_frame_idx})"
@@ -4354,9 +4415,13 @@ def generate_timestamp_preview(
         face_info = []
         track_ids_seen = set()
 
-        for face in frame_faces:
-            track_id = face.get("track_id")
-            bbox = face.get("bbox_xyxy")
+        # Iterate over ALL detections (not just harvested faces)
+        for detection in frame_detections:
+            track_id = detection.get("track_id")
+            # Detections use "bbox" as [x1, y1, x2, y2] format
+            bbox = detection.get("bbox") or detection.get("bbox_xyxy")
+            conf = detection.get("conf", 0.0)
+
             if track_id is None or not bbox:
                 continue
 
@@ -4377,6 +4442,11 @@ def generate_timestamp_preview(
             # Skip unidentified if not requested
             if not include_unidentified and not name:
                 continue
+
+            # Determine pipeline status for this face
+            is_tracked = track_id in tracked_at_frame
+            is_harvested = track_id in harvested_track_ids
+            is_clustered = identity_id is not None
 
             # Choose color: named cast get colors, unidentified get gray
             if name:
@@ -4413,20 +4483,16 @@ def generate_timestamp_preview(
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
                 )
 
-                # Determine pipeline status for this face
-                is_tracked = track_id in tracked_at_frame
-                is_harvested = track_id in harvested_track_ids
-                is_clustered = identity_id is not None
-
                 face_info.append({
                     "track_id": track_id,
                     "bbox": bbox,
+                    "conf": round(conf, 3),
                     "name": name,
                     "cast_id": cast_id,
                     "identity_id": identity_id,
                     "person_id": person_id,
                     # Pipeline status
-                    "detected": True,  # If it's in faces.jsonl, it was detected
+                    "detected": True,  # If it's in detections.jsonl, it was detected
                     "tracked": is_tracked,
                     "harvested": is_harvested,
                     "clustered": is_clustered,
@@ -4501,6 +4567,48 @@ def generate_timestamp_preview(
         }
     finally:
         cap.release()
+
+
+@router.get("/episodes/{ep_id}/frame/{frame_idx}/preview")
+def generate_frame_preview(
+    ep_id: str,
+    frame_idx: int,
+    include_unidentified: bool = Query(True, description="Include faces without cast assignment"),
+) -> dict:
+    """Generate a frame preview at a specific frame index with named bounding boxes.
+
+    This is a convenience wrapper around the timestamp preview that takes a frame index
+    directly instead of a timestamp.
+
+    Args:
+        ep_id: Episode identifier
+        frame_idx: Frame index (0-based)
+        include_unidentified: If True, show boxes for faces without cast assignment
+
+    Returns:
+        Same format as /timestamp/{timestamp_s}/preview endpoint
+    """
+    # Get video FPS to convert frame index to timestamp
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30.0
+    finally:
+        cap.release()
+
+    # Convert frame index to timestamp
+    timestamp_s = frame_idx / fps
+
+    # Reuse the timestamp preview endpoint
+    return generate_timestamp_preview(ep_id, timestamp_s, include_unidentified)
 
 
 class VideoClipRequest(BaseModel):

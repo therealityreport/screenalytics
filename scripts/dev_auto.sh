@@ -122,8 +122,17 @@ echo "[dev_auto] Killing existing processes..."
 pkill -f "uvicorn apps.api.main:app" 2>/dev/null || true
 pkill -f "streamlit run" 2>/dev/null || true
 pkill -f "celery.*apps.api.celery_app" 2>/dev/null || true
-pkill -f "redis-server" 2>/dev/null || true
+# Don't kill redis-server - we need it for queue purging
 sleep 1
+
+# ============================================================================
+# Purge Celery queues (kill all pending/running Celery jobs)
+# ============================================================================
+if command -v redis-cli >/dev/null 2>&1 && redis-cli ping >/dev/null 2>&1; then
+    echo "[dev_auto] Purging Celery job queues..."
+    "$PYTHON" -m celery -A apps.api.celery_app:celery_app purge -f 2>/dev/null || true
+    echo "[dev_auto] Celery queues purged"
+fi
 
 # ============================================================================
 # Helper: Open command in new Terminal window (macOS)
@@ -245,6 +254,28 @@ echo "[dev_auto] Starting API (auto-reload, storage: $STORAGE_BACKEND)..."
     --log-level info >> "$API_LOG" 2>&1 &
 API_PID=$!
 echo "[dev_auto] API started (PID: $API_PID, log: $API_LOG)"
+
+# ============================================================================
+# Wait for API and kill any stale jobs
+# ============================================================================
+echo "[dev_auto] Waiting for API to be ready..."
+API_READY=false
+for i in {1..30}; do
+    if curl -s http://127.0.0.1:8000/health >/dev/null 2>&1; then
+        API_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if $API_READY; then
+    echo "[dev_auto] API is ready, killing any stale jobs..."
+    # Kill all local/orphan jobs via API
+    curl -s -X POST http://127.0.0.1:8000/celery_jobs/kill_all_local >/dev/null 2>&1 || true
+    echo "[dev_auto] Stale jobs cleanup complete"
+else
+    echo "[dev_auto] WARNING: API not ready after 30s, skipping job cleanup"
+fi
 
 # ============================================================================
 # Open Browser

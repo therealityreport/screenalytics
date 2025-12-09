@@ -623,9 +623,19 @@ def _fetch_track_detail_cached(ep_id: str, track_id: int) -> Dict[str, Any] | No
 
 
 @st.cache_data(ttl=60)
-def _fetch_cluster_track_reps_cached(ep_id: str, cluster_id: str) -> Dict[str, Any] | None:
-    """Cached fetch of cluster track representatives for faster navigation."""
-    return _safe_api_get(f"/episodes/{ep_id}/clusters/{cluster_id}/track_reps")
+def _fetch_cluster_track_reps_cached(
+    ep_id: str, cluster_id: str, frames_per_track: int = 0
+) -> Dict[str, Any] | None:
+    """Cached fetch of cluster track representatives for faster navigation.
+
+    Args:
+        frames_per_track: Number of sample frames to include per track (0=none, default).
+                          Set to 10 for row-based display with frame scrolling.
+    """
+    params = {}
+    if frames_per_track > 0:
+        params["frames_per_track"] = frames_per_track
+    return _safe_api_get(f"/episodes/{ep_id}/clusters/{cluster_id}/track_reps", params=params)
 
 
 @st.cache_data(ttl=60)
@@ -2955,42 +2965,95 @@ def _render_unassigned_cluster_card(
                 st.text_area("Debug Info", debug_info, height=300, key=f"debug_{cluster_id}")
                 st.caption("Select all (Cmd+A) and copy (Cmd+C)")
 
-        # Display each track as its own row with carousel of frames
+        # Display one representative frame from each track in the cluster with scrollable carousel
         if track_list:
-            import streamlit.components.v1 as components
+            num_tracks = len(track_list)
+            max_visible = 12  # Show up to 12 tracks at a time
 
-            # Inject CSS/JS once for all track carousels
-            st.markdown(helpers.cluster_track_rows_css(), unsafe_allow_html=True)
+            # Track pagination state for this cluster (include ep_id to avoid collisions)
+            page_key = f"track_page_{ep_id}_{cluster_id}"
+            if page_key not in st.session_state:
+                st.session_state[page_key] = 0
 
-            for track in track_list:
-                track_id_val = track.get("track_id")
-                track_faces = track.get("faces", 0)
-                track_sim = track.get("similarity")
-                track_internal_sim = track.get("internal_similarity")
-                track_sim_value = track_sim if track_sim is not None else track_internal_sim
+            current_page = st.session_state[page_key]
+            total_pages = (num_tracks + max_visible - 1) // max_visible
 
-                # Fetch frames for this track (sample every 1, up to 20 frames)
-                frames_data = _fetch_track_frames(
-                    ep_id,
-                    track_id_val,
-                    sample=1,
-                    page=1,
-                    page_size=20,
-                    include_skipped=False,
-                )
-                frames = frames_data.get("items", [])
+            # Navigation controls if more than max_visible tracks
+            if total_pages > 1:
+                col_left, col_center, col_right = st.columns([1, 6, 1])
+                with col_left:
+                    if st.button("◀", key=f"prev_{ep_id}_{cluster_id}", disabled=current_page == 0):
+                        st.session_state[page_key] = max(0, current_page - 1)
+                        st.rerun()
+                with col_center:
+                    st.caption(
+                        f"Showing tracks {current_page * max_visible + 1}-{min((current_page + 1) * max_visible, num_tracks)} of {num_tracks}"
+                    )
+                with col_right:
+                    if st.button(
+                        "▶",
+                        key=f"next_{ep_id}_{cluster_id}",
+                        disabled=current_page >= total_pages - 1,
+                    ):
+                        st.session_state[page_key] = min(total_pages - 1, current_page + 1)
+                        st.rerun()
 
-                # Build the carousel HTML for this track row
-                carousel_html = helpers.cluster_track_row_carousel_html(
-                    cluster_id=cluster_id,
-                    track_id=track_id_val,
-                    frames=frames,
-                    track_similarity=track_sim_value,
-                    track_faces=track_faces,
-                    thumb_width=100,
-                    max_visible=6,
-                )
-                st.markdown(carousel_html, unsafe_allow_html=True)
+            # Display current page of tracks in a single row
+            start_idx = current_page * max_visible
+            end_idx = min(start_idx + max_visible, num_tracks)
+            visible_tracks = track_list[start_idx:end_idx]
+
+            # Create rows of 6 tracks each (prevents overlap with assignment controls)
+            TRACKS_PER_ROW = 6
+            if visible_tracks:
+                for row_start in range(0, len(visible_tracks), TRACKS_PER_ROW):
+                    row_tracks = visible_tracks[row_start:row_start + TRACKS_PER_ROW]
+                    # Create exactly 6 columns per row for consistent layout
+                    cols = st.columns(TRACKS_PER_ROW)
+                    for idx, track in enumerate(row_tracks):
+                        with cols[idx]:
+                            thumb_url = track.get("rep_thumb_url")
+                            track_id = track.get("track_id")
+                            track_faces = track.get("faces", 0)
+                            track_sim = track.get("similarity")
+                            track_internal_sim = track.get("internal_similarity")
+                            # Prefer explicit track similarity, else internal similarity as fallback
+                            track_sim_value = track_sim if track_sim is not None else track_internal_sim
+                            # Nov 2024: Enhanced with dropout indicator
+                            track_badge = None
+                            if track_sim_value is not None:
+                                excluded_frames = track.get("excluded_frames", 0)
+                                track_badge = render_track_with_dropout(track_sim_value, excluded_frames, track_faces)
+
+                            # Show track info with similarity score if available
+                            caption = f"Track {track_id} · {track_faces} faces"
+                            if track_sim_value is not None:
+                                sim_pct = int(track_sim_value * 100)
+                                caption = f"Track {track_id} · {track_faces} faces · {sim_pct}% sim"
+
+                            if thumb_url:
+                                # Use presigned URL directly if already HTTPS, otherwise extract key
+                                if thumb_url.startswith("https://"):
+                                    thumb_src = thumb_url
+                                else:
+                                    thumb_src = _extract_s3_key_from_url(thumb_url)
+                                thumb_markup = helpers.thumb_html(
+                                    thumb_src,
+                                    alt=f"Track {track_id}",
+                                    hide_if_missing=False,
+                                )
+                                st.markdown(thumb_markup, unsafe_allow_html=True)
+                                if track_badge:
+                                    st.markdown(track_badge, unsafe_allow_html=True)
+                            else:
+                                # Show placeholder when no thumbnail
+                                st.markdown(
+                                    '<div style="width:147px;height:184px;background:#333;border-radius:6px;'
+                                    'display:flex;align-items:center;justify-content:center;color:#666;">'
+                                    '📷</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            st.caption(caption)
 
         # Show cast suggestions (Enhancement #1) if available
         if cast_suggestions:
@@ -4937,8 +5000,8 @@ def _render_cluster_tracks(
         on_click=lambda: _set_view("person_clusters", person_id=person_id),
     )
 
-    # Fetch track representatives (cached for 60s for faster navigation)
-    track_reps_data = _fetch_cluster_track_reps_cached(ep_id, identity_id)
+    # Fetch track representatives with sample frames (cached for 60s)
+    track_reps_data = _fetch_cluster_track_reps_cached(ep_id, identity_id, frames_per_track=10)
     if not track_reps_data:
         st.error("Failed to load track representatives.")
         return
@@ -5058,18 +5121,6 @@ def _render_cluster_tracks(
             ))
         if metrics:
             render_metrics_strip(metrics, compact=False, strip_id=f"cluster_detail_{identity_id}")
-
-    _identity_name_controls(
-        ep_id=ep_id,
-        identity={
-            "identity_id": identity_id,
-            "name": display_name,
-            "label": label,
-        },
-        show_slug=show_slug,
-        roster_names=roster_names,
-        prefix=f"cluster_tracks_{identity_id}",
-    )
 
     # Display all track representatives with similarity scores
     if not track_reps:
@@ -5235,44 +5286,44 @@ def _render_cluster_tracks(
     st.markdown("---")
 
     # track_reps is already sorted by user's selection via sort_tracks() above
-    # Render tracks in grid
-    for row_start in range(0, len(track_reps), MAX_TRACKS_PER_ROW):
-        row_tracks = track_reps[row_start : row_start + MAX_TRACKS_PER_ROW]
-        cols = st.columns(len(row_tracks))
+    # Render each track as its own row with sample frames
+    FRAMES_TO_SHOW = 12  # Number of frames visible at once
 
-        for idx, track_rep in enumerate(row_tracks):
-            with cols[idx]:
-                track_id_str = track_rep.get("track_id", "")
-                similarity = track_rep.get("similarity")
-                crop_url = track_rep.get("crop_url")
-                checkbox_key = f"track_bulk::{identity_id}::{track_id_str}"
+    for track_rep in track_reps:
+        track_id_str = track_rep.get("track_id", "")
+        similarity = track_rep.get("similarity")
+        sample_frames = track_rep.get("sample_frames", [])
+        frame_count = track_rep.get("frame_count", len(sample_frames))
+        checkbox_key = f"track_bulk::{identity_id}::{track_id_str}"
 
-                # Parse track ID for display and operations
-                if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
-                    track_num = track_id_str.replace("track_", "")
-                    try:
-                        track_id_int = int(track_num)
-                    except (TypeError, ValueError):
-                        track_id_int = None
-                else:
-                    track_num = track_id_str
-                    try:
-                        track_id_int = int(track_id_str)
-                    except (TypeError, ValueError):
-                        track_id_int = None
+        # Parse track ID for display and operations
+        if isinstance(track_id_str, str) and track_id_str.startswith("track_"):
+            track_num = track_id_str.replace("track_", "")
+            try:
+                track_id_int = int(track_num)
+            except (TypeError, ValueError):
+                track_id_int = None
+        else:
+            track_num = track_id_str
+            try:
+                track_id_int = int(track_id_str)
+            except (TypeError, ValueError):
+                track_id_int = None
 
-                # Display thumbnail
-                resolved = helpers.resolve_thumb(crop_url)
-                thumb_markup = helpers.thumb_html(resolved, alt=f"Track {track_num}", hide_if_missing=False)
-                st.markdown(thumb_markup, unsafe_allow_html=True)
+        # Each track in its own bordered container
+        with st.container(border=True):
+            # Header row: checkbox, track info, actions
+            header_cols = st.columns([0.5, 3, 2])
 
+            with header_cols[0]:
                 # Checkbox for bulk selection
                 if track_id_int is not None:
                     is_selected = track_id_int in selected_tracks
                     if st.checkbox(
-                        f"Select",
+                        "Sel",
                         value=is_selected,
                         key=checkbox_key,
+                        label_visibility="collapsed",
                         help="Select for bulk assignment",
                     ):
                         if track_id_int not in selected_tracks:
@@ -5280,17 +5331,23 @@ def _render_cluster_tracks(
                     else:
                         selected_tracks.discard(track_id_int)
 
-                # Display track ID and similarity badge (Nov 2024: enhanced with dropout)
+            with header_cols[1]:
+                # Track ID and similarity badge
                 excluded_frames = track_rep.get("excluded_frames", 0)
-                total_frames = track_rep.get("frame_count") or track_rep.get("faces", 0)
-                badge_html = render_track_with_dropout(similarity, excluded_frames, total_frames)
-                st.markdown(f"Track {track_num} {badge_html}", unsafe_allow_html=True)
+                badge_html = render_track_with_dropout(similarity, excluded_frames, frame_count)
+                st.markdown(
+                    f"**Track {track_num}** {badge_html} · {frame_count} frames",
+                    unsafe_allow_html=True
+                )
 
-                # Actions
-                if track_id_int is not None:
-                    if st.button(
-                        "View frames",
+            with header_cols[2]:
+                # Action buttons in a row
+                btn_cols = st.columns(3)
+                with btn_cols[0]:
+                    if track_id_int is not None and st.button(
+                        "👁️ View",
                         key=f"view_track_{identity_id}_{track_id_int}",
+                        use_container_width=True,
                     ):
                         _set_view(
                             "track",
@@ -5298,8 +5355,8 @@ def _render_cluster_tracks(
                             identity_id=identity_id,
                             track_id=track_id_int,
                         )
-
-                    if move_options:
+                with btn_cols[1]:
+                    if track_id_int is not None and move_options:
                         cast_select_key = f"cluster_move_select_{identity_id}_{track_id_int}"
                         prev_value = st.session_state.get(cast_select_key)
                         default_index = 0
@@ -5310,44 +5367,110 @@ def _render_cluster_tracks(
                                     default_index = idx_opt
                                     break
                         choice = st.selectbox(
-                            "Move to",
+                            "Move",
                             move_options,
                             format_func=lambda opt: opt[0],
                             index=default_index,
                             key=cast_select_key,
+                            label_visibility="collapsed",
                         )
                         cast_choice = choice[1] if choice else None
                         cast_name = choice[0] if choice else None
-                        if cast_choice == "__new_cast__":
-                            new_cast_key = f"new_cast_name_{identity_id}_{track_id_int}"
+                with btn_cols[2]:
+                    if track_id_int is not None and st.button(
+                        "🗃️",
+                        key=f"cluster_delete_btn_{identity_id}_{track_id_int}",
+                        help="Archive track",
+                        use_container_width=True,
+                    ):
+                        _archive_track(ep_id, track_id_int)
+
+            # Handle cast assignment (if selected from dropdown above)
+            if track_id_int is not None and move_options:
+                cast_select_key = f"cluster_move_select_{identity_id}_{track_id_int}"
+                choice = st.session_state.get(cast_select_key)
+                if choice and isinstance(choice, (list, tuple)) and len(choice) >= 2:
+                    cast_choice = choice[1]
+                    cast_name = choice[0]
+                    if cast_choice == "__new_cast__":
+                        new_cast_key = f"new_cast_name_{identity_id}_{track_id_int}"
+                        ncol1, ncol2 = st.columns([2, 1])
+                        with ncol1:
                             new_name = st.text_input(
-                                "New cast member name",
+                                "New name",
                                 key=new_cast_key,
                                 placeholder="Enter cast member name",
+                                label_visibility="collapsed",
                             )
+                        with ncol2:
                             if new_name and new_name.strip():
                                 if st.button(
                                     "Create & Assign",
                                     key=f"create_assign_cast_{identity_id}_{track_id_int}",
+                                    use_container_width=True,
                                 ):
                                     _create_and_assign_to_new_cast(
                                         ep_id, track_id_int, new_name.strip(), show_slug
                                     )
-                        elif cast_choice and cast_name:
-                            # Create a NEW cluster for this track under the cast member
-                            # (using assign_track_name splits track into new cluster with cast association)
-                            if st.button(
-                                "Assign",
-                                key=f"cluster_move_btn_{identity_id}_{track_id_int}",
-                            ):
-                                _assign_track_name(ep_id, track_id_int, cast_name, show_slug, cast_choice)
+                    elif cast_choice and cast_name and cast_name != "Select Cast Member":
+                        if st.button(
+                            f"Assign to {cast_name}",
+                            key=f"cluster_move_btn_{identity_id}_{track_id_int}",
+                        ):
+                            _assign_track_name(ep_id, track_id_int, cast_name, show_slug, cast_choice)
 
-                    if st.button(
-                        "🗃️ Archive",
-                        key=f"cluster_delete_btn_{identity_id}_{track_id_int}",
-                        type="secondary",
-                    ):
-                        _archive_track(ep_id, track_id_int)
+            # Frame gallery with scrolling
+            if sample_frames:
+                # Session state for frame offset (for scrolling)
+                offset_key = f"frame_offset::{identity_id}::{track_id_str}"
+                if offset_key not in st.session_state:
+                    st.session_state[offset_key] = 0
+                offset = st.session_state[offset_key]
+
+                total_sample = len(sample_frames)
+                max_offset = max(0, total_sample - FRAMES_TO_SHOW)
+
+                # Navigation row (only show if more frames than FRAMES_TO_SHOW)
+                if total_sample > FRAMES_TO_SHOW:
+                    nav_cols = st.columns([1, 6, 1])
+                    with nav_cols[0]:
+                        if st.button("◀", key=f"prev_{identity_id}_{track_id_str}", disabled=offset <= 0):
+                            st.session_state[offset_key] = max(0, offset - FRAMES_TO_SHOW)
+                            st.rerun()
+                    with nav_cols[1]:
+                        # Show position indicator
+                        end_idx = min(offset + FRAMES_TO_SHOW, total_sample)
+                        st.caption(f"Showing {offset + 1}-{end_idx} of {total_sample} sample frames")
+                    with nav_cols[2]:
+                        if st.button("▶", key=f"next_{identity_id}_{track_id_str}", disabled=offset >= max_offset):
+                            st.session_state[offset_key] = min(max_offset, offset + FRAMES_TO_SHOW)
+                            st.rerun()
+
+                # Display frames
+                visible_frames = sample_frames[offset : offset + FRAMES_TO_SHOW]
+                frame_cols = st.columns(len(visible_frames)) if visible_frames else []
+
+                for idx, frame_data in enumerate(visible_frames):
+                    with frame_cols[idx]:
+                        crop_url = frame_data.get("crop_url")
+                        frame_idx = frame_data.get("frame_idx", "?")
+                        resolved = helpers.resolve_thumb(crop_url)
+                        thumb_markup = helpers.thumb_html(
+                            resolved,
+                            alt=f"Frame {frame_idx}",
+                            hide_if_missing=False,
+                        )
+                        st.markdown(thumb_markup, unsafe_allow_html=True)
+                        st.caption(f"F{frame_idx}")
+            else:
+                # Fallback: show single representative thumbnail
+                crop_url = track_rep.get("crop_url")
+                if crop_url:
+                    resolved = helpers.resolve_thumb(crop_url)
+                    thumb_markup = helpers.thumb_html(resolved, alt=f"Track {track_num}", hide_if_missing=False)
+                    st.markdown(thumb_markup, unsafe_allow_html=True)
+                else:
+                    st.caption("No frames available")
 
     # --- Export to Facebank (at the bottom) ---
     person_id_for_export = identity_meta.get("person_id")

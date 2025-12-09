@@ -705,23 +705,28 @@ PROFILE_DEFAULTS = {
     },
 }
 
-# Device-to-profile mapping: laptop-friendly devices get low_power by default
+# Device-to-profile mapping: balanced by default for all devices
 DEVICE_DEFAULT_PROFILE = {
-    "coreml": "low_power",
-    "mps": "low_power",
-    "cpu": "low_power",
-    "metal": "low_power",
-    "apple": "low_power",
-    "cuda": "balanced",    # CUDA GPUs can handle more
-    "auto": "low_power",   # Be conservative by default
+    "coreml": "balanced",
+    "mps": "balanced",
+    "cpu": "balanced",
+    "metal": "balanced",
+    "apple": "balanced",
+    "cuda": "balanced",
+    "auto": "balanced",
 }
 
 # CPU-only devices where "performance" profile should be rejected/downgraded
 CPU_BOUND_DEVICES = {"cpu", "coreml", "mps", "metal", "apple", "auto"}
 
-# Maximum safe CPU threads for laptops (can be overridden via env var)
-# Default raised from 2→3 for better local mode performance while remaining thermal-safe
-DEFAULT_LAPTOP_CPU_THREADS = int(os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "3"))
+# Profile-specific CPU thread caps: low_power=2, balanced=4, performance=8
+PROFILE_THREAD_CAPS = {
+    "low_power": 2,
+    "balanced": 4,
+    "performance": 8,
+}
+# Fallback max if profile unknown (can be overridden via env var)
+DEFAULT_LAPTOP_CPU_THREADS = int(os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "4"))
 
 
 def _resolve_profile(device: str, profile: str | None) -> tuple[str, str | None]:
@@ -732,8 +737,8 @@ def _resolve_profile(device: str, profile: str | None) -> tuple[str, str | None]
     """
     device_lower = (device or "auto").strip().lower()
 
-    # Determine default profile based on device
-    default_profile = DEVICE_DEFAULT_PROFILE.get(device_lower, "low_power")
+    # Determine default profile based on device (balanced is the default)
+    default_profile = DEVICE_DEFAULT_PROFILE.get(device_lower, "balanced")
 
     if profile is None:
         return default_profile, None
@@ -744,14 +749,16 @@ def _resolve_profile(device: str, profile: str | None) -> tuple[str, str | None]
     if profile_lower not in PROFILE_DEFAULTS:
         return default_profile, f"Unknown profile '{profile}', using {default_profile}"
 
-    # Guardrail: performance profile on CPU-bound devices is dangerous
+    # Note: Previously had a guardrail that downgraded "performance" to "balanced" for
+    # CPU-bound devices (coreml, mps, etc.) to prevent overheating. Removed to allow
+    # user control. Monitor thermals when using performance profile on Apple Silicon.
     if profile_lower == "performance" and device_lower in CPU_BOUND_DEVICES:
         warning = (
-            f"Profile 'performance' is not recommended for {device} devices (causes overheating). "
-            f"Auto-downgrading to 'balanced'. Use CUDA for performance profile."
+            f"⚡ Performance profile on {device} - monitor thermals. "
+            f"Lower stride values or save_frames+save_crops may cause high CPU load."
         )
-        LOGGER.warning(warning)
-        return "balanced", warning
+        LOGGER.info(warning)
+        return profile_lower, warning  # Return requested profile with advisory warning
 
     return profile_lower, None
 
@@ -772,19 +779,24 @@ def _apply_profile_defaults(
         (modified_options, list of warnings)
     """
     warnings: list[str] = []
-    profile_settings = PROFILE_DEFAULTS.get(profile, PROFILE_DEFAULTS["low_power"])
+    profile_settings = PROFILE_DEFAULTS.get(profile, PROFILE_DEFAULTS["balanced"])
     device_lower = (device or "auto").strip().lower()
 
     # Apply profile defaults only where options are None or not explicitly set
     # Note: stride has a default in Pydantic, so we check if it matches the schema default
 
-    # CPU threads: ALWAYS apply a limit for thermal safety
+    # CPU threads: Use profile-specific cap (low_power=2, balanced=4, performance=8)
+    profile_thread_cap = PROFILE_THREAD_CAPS.get(profile, DEFAULT_LAPTOP_CPU_THREADS)
     if options.get("cpu_threads") is None:
-        # Use profile default, but cap at laptop-safe maximum
-        profile_threads = profile_settings.get("cpu_threads", 2)
-        safe_threads = min(profile_threads, DEFAULT_LAPTOP_CPU_THREADS)
-        options["cpu_threads"] = safe_threads
-        LOGGER.info(f"Applying CPU thread limit: {safe_threads} (profile={profile})")
+        # Use profile's thread setting
+        options["cpu_threads"] = profile_thread_cap
+        LOGGER.info(f"Applying CPU threads from profile: {profile_thread_cap} (profile={profile})")
+    else:
+        # User specified threads - cap at profile maximum
+        requested = options["cpu_threads"]
+        options["cpu_threads"] = min(requested, profile_thread_cap)
+        if requested > profile_thread_cap:
+            LOGGER.info(f"Capping CPU threads: {requested} -> {profile_thread_cap} (profile={profile})")
 
     # FPS: apply profile default if not set
     if options.get("fps") is None:
@@ -1591,12 +1603,11 @@ def _run_local_subprocess_blocking(
     LOGGER.info(f"[{episode_id}] Starting local {operation} (device={device}, stride={stride}, threads={cpu_threads})")
     LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
 
-    # Set up environment with CPU thread limits
-    # For local mode, we enforce a hard cap of 2 threads for thermal safety on laptops
+    # Set up environment with CPU thread limits based on profile
+    # Profile caps: low_power=2, balanced=4, performance=8
     env = os.environ.copy()
-    LOCAL_THREADS_CAP = int(os.environ.get("SCREENALYTICS_LOCAL_MAX_THREADS", "4"))
-    default_local_threads = int(os.environ.get("SCREENALYTICS_LOCAL_DEFAULT_THREADS", "2"))
-    local_max_threads = min(int(cpu_threads or default_local_threads), LOCAL_THREADS_CAP)
+    profile_thread_cap = PROFILE_THREAD_CAPS.get(profile, 4)
+    local_max_threads = min(int(cpu_threads or profile_thread_cap), profile_thread_cap)
     env.update({
         "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
         "OMP_NUM_THREADS": str(local_max_threads),
@@ -1609,7 +1620,7 @@ def _run_local_subprocess_blocking(
         # Enable local mode instrumentation for verbose phase-level logging
         "LOCAL_MODE_INSTRUMENTATION": "1",
     })
-    logs.append(f"Local mode: CPU threads capped at {local_max_threads} for thermal safety")
+    logs.append(f"Local mode: CPU threads = {local_max_threads} (profile={profile})")
     LOGGER.info(f"[{episode_id}] Local mode CPU threads capped at {local_max_threads}")
 
     # Apply thermal limiting wrapper for thermal safety
@@ -2180,8 +2191,8 @@ def _stream_local_subprocess(
     # Extract config values
     device = options.get("device", "auto")
     stride = options.get("stride", 6)
-    profile = options.get("profile", "low_power")
-    cpu_threads = options.get("cpu_threads", 2)
+    profile = options.get("profile", "balanced")
+    cpu_threads = options.get("cpu_threads", 4)
 
     # Initialize the log formatter
     formatter = LogFormatter(episode_id, operation)
@@ -2201,11 +2212,11 @@ def _stream_local_subprocess(
         """Track a raw line that was suppressed from formatted output."""
         raw_logs.append(raw_line)
 
-    # Set up environment with CPU thread limits
+    # Set up environment with CPU thread limits based on profile
+    # Profile caps: low_power=2, balanced=4, performance=8
     env = os.environ.copy()
-    LOCAL_THREADS_CAP = int(os.environ.get("SCREENALYTICS_LOCAL_MAX_THREADS", "4"))
-    default_local_threads = int(os.environ.get("SCREENALYTICS_LOCAL_DEFAULT_THREADS", "2"))
-    local_max_threads = min(int(cpu_threads or default_local_threads), LOCAL_THREADS_CAP)
+    profile_thread_cap = PROFILE_THREAD_CAPS.get(profile, 4)
+    local_max_threads = min(int(cpu_threads or profile_thread_cap), profile_thread_cap)
     env.update({
         "SCREENALYTICS_MAX_CPU_THREADS": str(local_max_threads),
         "OMP_NUM_THREADS": str(local_max_threads),
@@ -2262,6 +2273,13 @@ def _stream_local_subprocess(
     )
     for line in config_block.split("\n"):
         yield _emit_formatted(line, line)
+
+    # Emit warnings (e.g., profile downgrade for thermal safety)
+    warnings = options.get("_warnings", [])
+    if warnings:
+        for warning in warnings:
+            warning_line = f"⚠️ {warning}"
+            yield _emit_formatted(warning_line, warning_line)
 
     LOGGER.info(f"[{episode_id}] Starting streaming local {operation}")
     LOGGER.info(f"[{episode_id}] Command: {' '.join(command)}")
@@ -2453,11 +2471,46 @@ def _stream_local_subprocess(
         # Save logs
         _save_logs_always("completed", elapsed)
 
+        # Read counts from manifest files for auto-run progression
+        # These counts are CRITICAL for the UI to detect job completion and trigger next phase
+        summary_counts: Dict[str, Any] = {}
+        try:
+            from py_screenalytics.artifacts import get_path
+            manifests_dir = get_path(episode_id, "detections").parent
+
+            if operation == "detect_track":
+                det_path = manifests_dir / "detections.jsonl"
+                trk_path = manifests_dir / "tracks.jsonl"
+                if det_path.exists():
+                    with det_path.open("r", encoding="utf-8") as f:
+                        summary_counts["detections"] = sum(1 for line in f if line.strip())
+                if trk_path.exists():
+                    with trk_path.open("r", encoding="utf-8") as f:
+                        summary_counts["tracks"] = sum(1 for line in f if line.strip())
+            elif operation == "faces_embed":
+                faces_path = manifests_dir / "faces.jsonl"
+                if faces_path.exists():
+                    with faces_path.open("r", encoding="utf-8") as f:
+                        summary_counts["faces"] = sum(1 for line in f if line.strip())
+            elif operation == "cluster":
+                identities_path = manifests_dir / "identities.json"
+                if identities_path.exists():
+                    try:
+                        payload = json.loads(identities_path.read_text(encoding="utf-8"))
+                        identities_list = payload.get("identities") if isinstance(payload, dict) else None
+                        if isinstance(identities_list, list):
+                            summary_counts["identities"] = len(identities_list)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except Exception as count_err:
+            LOGGER.warning(f"[{episode_id}] Failed to read counts for summary: {count_err}")
+
         yield json.dumps({
             "type": "summary",
             "status": "completed",
             "elapsed_seconds": elapsed,
             "return_code": 0,
+            **summary_counts,
         }) + "\n"
 
     except GeneratorExit:
@@ -2512,10 +2565,9 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         - execution_mode="redis" (default): Enqueues job via Celery, returns 202 with job_id
         - execution_mode="local": Runs job synchronously in-process, returns result when done
 
-    Thermal Safety:
-        - Resolves profile based on device (low_power for CPU/CoreML/MPS)
-        - Auto-downgrades "performance" profile on non-CUDA devices
-        - Always applies CPU thread limits (default: 2 for laptops)
+    Profiles:
+        - Uses selected profile from Pipeline Settings (default: balanced)
+        - Thread caps: low_power=2, balanced=4, performance=8
 
     Check for active jobs before starting to prevent duplicate runs.
     """
@@ -2582,6 +2634,8 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
     if execution_mode == "local":
         # Add profile to options for logging
         options["profile"] = resolved_profile
+        # Include warnings so they're visible in the stream
+        options["_warnings"] = all_warnings
 
         project_root = _find_project_root()
         command = _build_detect_track_command(req.ep_id, options, project_root)
@@ -2677,6 +2731,8 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
     if execution_mode == "local":
         # Add profile to options for logging
         options["profile"] = resolved_profile
+        # Include warnings so they're visible in the stream
+        options["_warnings"] = all_warnings
 
         project_root = _find_project_root()
         command = _build_faces_embed_command(req.ep_id, options, project_root)
@@ -2792,6 +2848,8 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
     if execution_mode == "local":
         # Add profile to options for logging
         options["profile"] = resolved_profile
+        # Include warnings so they're visible in the stream
+        options["_warnings"] = all_warnings
 
         project_root = _find_project_root()
         command = _build_cluster_command(req.ep_id, options, project_root)
