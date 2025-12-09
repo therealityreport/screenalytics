@@ -130,7 +130,7 @@ def validate_storage_backend_config(force_refresh: bool = False) -> StorageConfi
             or os.environ.get("AWS_ENDPOINT_URL")
         )
 
-        # Check credentials
+        # Check credentials from multiple sources
         has_access_key = bool(
             os.environ.get("AWS_ACCESS_KEY_ID")
             or os.environ.get("SCREENALYTICS_OBJECT_STORE_ACCESS_KEY")
@@ -141,13 +141,18 @@ def validate_storage_backend_config(force_refresh: bool = False) -> StorageConfi
         )
         # Also check for AWS profile or instance credentials
         has_profile = bool(os.environ.get("AWS_PROFILE"))
-        has_credentials = (has_access_key and has_secret_key) or has_profile
+        # Check for ~/.aws/credentials file (default AWS credential chain)
+        aws_creds_file = Path.home() / ".aws" / "credentials"
+        has_aws_creds_file = aws_creds_file.exists()
+        has_credentials = (has_access_key and has_secret_key) or has_profile or has_aws_creds_file
 
         if raw_backend == "s3" and not has_credentials:
             # For S3, missing credentials might use instance profile, so just warn
             warnings.append(
-                "No AWS credentials found (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or AWS_PROFILE). "
-                "If running on AWS with instance profiles, this may be fine."
+                "S3 storage backend configured but AWS credentials not detected. "
+                "Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in .env, use AWS_PROFILE, "
+                "or configure ~/.aws/credentials. "
+                "If running on EC2/ECS with IAM instance profiles, this warning can be ignored."
             )
 
         if raw_backend == "minio":

@@ -239,6 +239,7 @@ def run_auto_group_task(
         options: Optional dict with:
             - protect_manual: bool (default True) - Don't merge manually assigned clusters
             - facebank_first: bool (default True) - Try facebank matching before prototypes
+            - skip_cast_assignment: bool (default True) - Only group clusters, don't assign to cast
 
     Returns:
         Result dict with grouping statistics
@@ -273,6 +274,7 @@ def run_auto_group_task(
             progress_callback=progress_callback,
             protect_manual=options.get("protect_manual", True),
             facebank_first=options.get("facebank_first", True),
+            skip_cast_assignment=options.get("skip_cast_assignment", True),
         )
 
         # Extract key stats from result

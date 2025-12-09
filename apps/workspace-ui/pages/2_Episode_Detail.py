@@ -32,7 +32,9 @@ MIN_FRAMES_BETWEEN_CROPS_DEFAULT = int(os.environ.get("SCREENALYTICS_MIN_FRAMES_
 EST_TZ = ZoneInfo("America/New_York")
 
 
-def _load_job_defaults(ep_id: str, job_type: str) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_job_defaults(ep_id: str, job_type: str) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
+    """Cached fetch of job defaults to reduce repeated API calls on page load."""
     try:
         resp = helpers.api_get(f"/jobs?ep_id={ep_id}&job_type={job_type}&limit=1")
     except requests.RequestException:
@@ -45,6 +47,11 @@ def _load_job_defaults(ep_id: str, job_type: str) -> Tuple[Dict[str, Any], Dict[
     if isinstance(requested, dict):
         return dict(requested), job
     return {}, job
+
+
+def _load_job_defaults(ep_id: str, job_type: str) -> Tuple[Dict[str, Any], Dict[str, Any] | None]:
+    """Load job defaults with caching."""
+    return _cached_job_defaults(ep_id, job_type)
 
 
 def _format_timestamp(value: str | None) -> str | None:
@@ -280,6 +287,34 @@ def _get_progress_file_age(ep_id: str) -> float | None:
     return None
 
 
+def _get_most_recent_run_marker_age(ep_id: str) -> float | None:
+    """Get the age of the most recently updated run marker in seconds.
+
+    Checks all phase markers (detect_track, faces_embed, cluster) and returns
+    the age of whichever was most recently modified. Returns None if no markers found.
+    """
+    runs_dir = helpers.DATA_ROOT / "manifests" / ep_id / "runs"
+    if not runs_dir.exists():
+        return None
+
+    phases = ["detect_track.json", "faces_embed.json", "cluster.json"]
+    most_recent_mtime = None
+
+    for phase_file in phases:
+        marker_path = runs_dir / phase_file
+        try:
+            if marker_path.exists():
+                mtime = marker_path.stat().st_mtime
+                if most_recent_mtime is None or mtime > most_recent_mtime:
+                    most_recent_mtime = mtime
+        except OSError:
+            continue
+
+    if most_recent_mtime is not None:
+        return time.time() - most_recent_mtime
+    return None
+
+
 def _sync_job_state_with_api(
     ep_id: str,
     running_job_key: str,
@@ -456,49 +491,6 @@ def _manifest_has_rows(path: Path) -> bool:
         return False
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def _load_speaker_groups_manifest(path_str: str, mtime: float) -> Dict[str, Any] | None:
-    """Load speaker groups manifest with caching."""
-    path = Path(path_str)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        LOGGER.debug("Failed to load speaker groups manifest %s: %s", path, exc)
-        return None
-
-
-@st.cache_data(ttl=15, show_spinner=False)
-def _load_transcript_rows(path_str: str, mtime: float) -> list[dict]:
-    """Load transcript rows for overlap lookup."""
-    path = Path(path_str)
-    if not path.exists():
-        return []
-    rows: list[dict] = []
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-    except Exception as exc:
-        LOGGER.debug("Failed to load transcript rows from %s: %s", path, exc)
-        return []
-    return rows
-
-
-def _transcript_overlap(rows: list[dict], start: float, end: float, tolerance: float = 0.25) -> list[dict]:
-    """Return transcript segments overlapping a time range."""
-    matches = []
-    for row in rows:
-        row_start = float(row.get("start", 0))
-        row_end = float(row.get("end", 0))
-        if row_start < (end + tolerance) and row_end > (start - tolerance):
-            matches.append(row)
-    return sorted(matches, key=lambda r: r.get("start", 0))
-
-
 @st.cache_data(ttl=10, show_spinner=False)
 def _cached_episode_details(ep_id: str, cache_key: float) -> Dict[str, Any]:
     """Cache episode details API response with 10s TTL."""
@@ -515,6 +507,42 @@ def _cached_episode_status(ep_id: str, cache_key: float, marker_mtimes: tuple) -
         marker_mtimes: Tuple of artifact mtimes to auto-invalidate cache (runs + manifests)
     """
     return helpers.get_episode_status(ep_id)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_storage_status() -> Dict[str, Any] | None:
+    """Cache storage status API response with 60s TTL (rarely changes)."""
+    try:
+        return helpers.api_get("/config/storage")
+    except requests.RequestException:
+        return None
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _cached_celery_jobs() -> Dict[str, Any] | None:
+    """Cache celery jobs API response with 5s TTL (changes frequently during jobs)."""
+    try:
+        return helpers.api_get("/celery_jobs")
+    except requests.RequestException:
+        return None
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _cached_episode_jobs(ep_id: str) -> Dict[str, Any] | None:
+    """Cache episode jobs list API response with 5s TTL."""
+    try:
+        return helpers.api_get(f"/jobs?ep_id={ep_id}&limit=20")
+    except requests.RequestException:
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_video_meta(ep_id: str) -> Dict[str, Any] | None:
+    """Cache video metadata API response with 60s TTL (static for an episode)."""
+    try:
+        return helpers.api_get(f"/episodes/{ep_id}/video_meta")
+    except requests.RequestException:
+        return None
 
 
 def _detect_track_manifests_ready(detections_path: Path, tracks_path: Path) -> dict:
@@ -793,6 +821,8 @@ def _launch_detect_job(
         if not _ensure_local_artifacts(ep_id, details):
             return current_local, None, "mirror_failed"
         current_local = True
+    # Clear completion marker when starting new job
+    st.session_state.pop(f"{ep_id}::detect_job_complete", None)
     if running_state_key:
         st.session_state[running_state_key] = True
     if active_job_key:
@@ -926,18 +956,8 @@ faces_job_defaults, faces_job_record = _load_job_defaults(ep_id, "faces_embed")
 cluster_job_defaults, cluster_job_record = _load_job_defaults(ep_id, "cluster")
 _, screentime_job_record = _load_job_defaults(ep_id, "screen_time_analyze")
 local_video_exists = bool(details["local"].get("exists"))
-video_meta_key = f"episode_detail_video_meta::{ep_id}"
-video_meta = st.session_state.get(video_meta_key)
-if local_video_exists:
-    if video_meta is None:
-        try:
-            video_meta = helpers.api_get(f"/episodes/{ep_id}/video_meta")
-        except requests.RequestException:
-            video_meta = None
-        else:
-            st.session_state[video_meta_key] = video_meta
-else:
-    st.session_state.pop(video_meta_key, None)
+# Use cached video_meta (60s TTL) - no need for session state caching
+video_meta = _cached_video_meta(ep_id) if local_video_exists else None
 
 
 # =============================================================================
@@ -946,8 +966,8 @@ else:
 def _render_system_status():
     """Show system configuration warnings at page load."""
     try:
-        # Check storage backend status
-        storage_status = helpers.api_get("/config/storage")
+        # Check storage backend status (cached for 60s)
+        storage_status = _cached_storage_status()
         if storage_status and storage_status.get("status") == "success":
             validation = storage_status.get("validation")
             if validation:
@@ -1001,8 +1021,8 @@ with st.expander("⚙️ Current Jobs", expanded=False):
     try:
         all_jobs: list[dict] = []
 
-        # Fetch Celery jobs
-        celery_response = helpers.api_get("/celery_jobs")
+        # Fetch Celery jobs (cached for 5s)
+        celery_response = _cached_celery_jobs()
         celery_jobs = celery_response.get("jobs", []) if celery_response else []
         for job in celery_jobs:
             all_jobs.append({
@@ -1014,8 +1034,8 @@ with st.expander("⚙️ Current Jobs", expanded=False):
                 "source": "celery",
             })
 
-        # Fetch subprocess-based jobs (filtered to current episode if set)
-        jobs_response = helpers.api_get(f"/jobs?ep_id={ep_id}&limit=20")
+        # Fetch subprocess-based jobs (cached for 5s, filtered to current episode)
+        jobs_response = _cached_episode_jobs(ep_id)
         subprocess_jobs = jobs_response.get("jobs", []) if jobs_response else []
         for job in subprocess_jobs:
             # Only show running/queued jobs, not completed ones
@@ -1262,9 +1282,11 @@ if faces_manifest_exists:
     faces_manifest_count = _count_manifest_rows(faces_path) or 0
 if faces_status_value == "success":
     faces_ready_state = True
-elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_exists:
+elif faces_status_value in {"missing", "unknown"} and faces_manifest_exists:
+    # Manifest exists but API reports missing/unknown - use manifest fallback
     faces_ready_state = True
     faces_manifest_fallback = True
+# Note: "stale" status is NOT treated as ready - it needs to be re-run
 if faces_count_value is None and faces_manifest_count is not None:
     faces_count_value = faces_manifest_count
 
@@ -1432,7 +1454,12 @@ with st.expander("Pipeline Status", expanded=False):
         faces_jpeg_state = helpers.coerce_int(faces_phase_status.get("jpeg_quality"))
         if faces_jpeg_state:
             faces_params.append(f"jpeg={faces_jpeg_state}")
-        if faces_ready_state:
+        if faces_status_value == "stale":
+            # Stale: detect/track was rerun after this faces harvest
+            face_count_label = helpers.format_count(faces_count_value) or "0"
+            st.warning(f"⚠️ **Faces Harvest**: Outdated ({face_count_label} faces)")
+            st.caption("Detect/Track was rerun. Rerun **Faces Harvest** to rebuild embeddings for the new tracks.")
+        elif faces_ready_state:
             runtime_label = faces_runtime or "n/a"
             st.success(f"✅ **Faces Harvest**: Complete (Runtime: {runtime_label})")
             face_count_label = helpers.format_count(faces_count_value) or "0"
@@ -1486,7 +1513,11 @@ with st.expander("Pipeline Status", expanded=False):
         if min_cluster_state is not None:
             cluster_params.append(f"min_cluster={min_cluster_state}")
         identities_label = helpers.format_count(identities_count_value) or "0"
-        if cluster_status_value == "success":
+        if cluster_status_value == "stale":
+            # Stale: detect/track or faces was rerun after this clustering
+            st.warning(f"⚠️ **Cluster**: Outdated ({identities_label} identities)")
+            st.caption("Detect/Track was rerun. Rerun **Faces Harvest** first, then **Cluster** to rebuild identities.")
+        elif cluster_status_value == "success":
             runtime_label = cluster_runtime or "n/a"
             st.success(f"✅ **Cluster**: Complete (Runtime: {runtime_label})")
             st.caption(f"Identities: {identities_label}")
@@ -1673,16 +1704,8 @@ cluster_device_default_value = _choose_value(
 )
 cluster_device_label_default = helpers.device_label_from_value(cluster_device_default_value)
 cluster_device_label_default = _resolved_device_label(cluster_device_label_default)
-cluster_thresh_default_raw = (
-    cluster_job_defaults.get("cluster_thresh")
-    or cluster_phase_status.get("cluster_thresh")
-    or helpers.DEFAULT_CLUSTER_SIMILARITY
-)
-try:
-    cluster_thresh_default = float(cluster_thresh_default_raw)
-except (TypeError, ValueError):
-    cluster_thresh_default = helpers.DEFAULT_CLUSTER_SIMILARITY
-cluster_thresh_default = min(max(cluster_thresh_default, 0.4), 0.9)
+# Always use the configured default (0.58) - ignore cached values from previous runs
+cluster_thresh_default = helpers.DEFAULT_CLUSTER_SIMILARITY
 min_cluster_size_default = helpers.coerce_int(cluster_job_defaults.get("min_cluster_size"))
 if min_cluster_size_default is None:
     min_cluster_size_default = helpers.coerce_int(cluster_phase_status.get("min_cluster_size"))
@@ -1697,6 +1720,53 @@ detector_face_only = helpers.detector_is_face_only(ep_id, detect_phase_status)
 combo_detector, combo_tracker = helpers.detect_tracker_combo(ep_id, detect_phase_status)
 combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_detector, combo_tracker)
 combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
+
+# =============================================================================
+# Performance Profile selector (applies to all three jobs)
+# =============================================================================
+st.markdown("### Pipeline Settings")
+_profile_session_prefix = f"episode_detail::{ep_id}"
+_profile_widget_key = f"{_profile_session_prefix}::global_profile"
+
+# Determine default profile: from previous job, phase status, or device-based default
+_profile_default_value = (
+    detect_job_defaults.get("profile")
+    or faces_job_defaults.get("profile")
+    or cluster_job_defaults.get("profile")
+    or detect_phase_status.get("profile")
+    or faces_phase_status.get("profile")
+)
+if not _profile_default_value:
+    _profile_default_value = "balanced"  # Default to Balanced
+
+_profile_seed_value = helpers.profile_value_from_state(
+    st.session_state.get(_profile_widget_key, _profile_default_value)
+)
+
+# Sanitize the selectbox session state to use label format
+if _profile_widget_key in st.session_state:
+    _stored_value = st.session_state[_profile_widget_key]
+    if _stored_value not in helpers.PROFILE_LABELS:
+        _sanitized = helpers.PROFILE_LABEL_MAP.get(str(_stored_value).lower())
+        if _sanitized:
+            st.session_state[_profile_widget_key] = _sanitized
+        else:
+            del st.session_state[_profile_widget_key]
+
+profile_label = st.selectbox(
+    "Performance Profile",
+    helpers.PROFILE_LABELS,
+    index=helpers.profile_label_index(_profile_seed_value),
+    key=_profile_widget_key,
+    help="Controls stride, export settings, and resource usage for all pipeline jobs. "
+         "**Balanced** (default) is recommended for most use cases.",
+)
+profile_value = helpers.PROFILE_VALUE_MAP.get(profile_label, _profile_seed_value)
+profile_changed = profile_value != _profile_seed_value
+profile_defaults = helpers.profile_defaults(profile_value)
+
+st.divider()
+
 col_detect, col_faces, col_cluster = st.columns(3)
 
 # Check for running jobs for each phase
@@ -1728,12 +1798,26 @@ with col_detect:
     session_prefix = f"episode_detail_detect::{ep_id}"
 
     # Show running job progress if a job is active
-    if running_detect_job:
+    # Skip if we already marked this job as complete (prevents infinite refresh loop)
+    detect_job_complete_key = f"{ep_id}::detect_job_complete"
+    if running_detect_job and not st.session_state.get(detect_job_complete_key):
         job_id = running_detect_job.get("job_id", "unknown")
         progress_pct = running_detect_job.get("progress_pct", 0)
         frames_done = running_detect_job.get("frames_done", 0)
         frames_total = running_detect_job.get("frames_total", 0)
         state = running_detect_job.get("state", "running")
+
+        # Auto-refresh when job hits 100% or state indicates completion
+        job_complete = progress_pct >= 99.5 or state in ("done", "success", "completed")
+        if job_complete:
+            st.success(f"✅ **Detect/Track complete!** ({frames_done:,} / {frames_total:,} frames)")
+            st.caption("Refreshing to show results...")
+            # Mark job as complete to prevent infinite refresh loop
+            st.session_state[detect_job_complete_key] = True
+            # Force status refresh to pick up new data
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            time.sleep(1.5)
+            st.rerun()
 
         st.info(f"🔄 **Detect/Track job running** ({state})")
         if frames_total > 0:
@@ -1759,32 +1843,8 @@ with col_detect:
 
         st.divider()
 
-    profile_default_value = detect_job_defaults.get("profile") or detect_phase_status.get("profile")
-    if not profile_default_value:
-        profile_default_value = helpers.default_profile_for_device(detect_device_default_value)
-    profile_key = _detect_setting_key(ep_id, "profile")
-    profile_seed_value = helpers.profile_value_from_state(st.session_state.get(profile_key, profile_default_value))
-    # Sanitize the selectbox session state to use label format (Streamlit stores widget value directly)
-    profile_widget_key = f"{session_prefix}::profile"
-    if profile_widget_key in st.session_state:
-        stored_value = st.session_state[profile_widget_key]
-        if stored_value not in helpers.PROFILE_LABELS:
-            # Convert internal value to label format
-            sanitized = helpers.PROFILE_LABEL_MAP.get(str(stored_value).lower())
-            if sanitized:
-                st.session_state[profile_widget_key] = sanitized
-            else:
-                del st.session_state[profile_widget_key]  # Remove invalid value
-    profile_label = st.selectbox(
-        "Performance profile",
-        helpers.PROFILE_LABELS,
-        index=helpers.profile_label_index(profile_seed_value),
-        key=profile_widget_key,
-        help="Low Power is recommended on Apple laptops (higher stride, capped FPS, fewer exports).",
-    )
-    profile_value = helpers.PROFILE_VALUE_MAP.get(profile_label, profile_seed_value)
-    profile_changed = profile_value != profile_seed_value
-    profile_defaults = helpers.profile_defaults(profile_value)
+    # Profile settings come from the global profile selector above the columns
+    # profile_value, profile_changed, and profile_defaults are defined at the page level
 
     stride_default = helpers.coerce_int(detect_job_defaults.get("stride"))
     if stride_default is None:
@@ -2281,10 +2341,24 @@ with col_faces:
     st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
 
     # Show running job progress if a job is active
-    if running_faces_job:
+    # Skip if we already marked this job as complete (prevents infinite refresh loop)
+    faces_job_complete_key = f"{ep_id}::faces_job_complete"
+    if running_faces_job and not st.session_state.get(faces_job_complete_key):
         job_id = running_faces_job.get("job_id", "unknown")
         progress_pct = running_faces_job.get("progress_pct", 0)
         state = running_faces_job.get("state", "running")
+
+        # Auto-refresh when job hits 100% or state indicates completion
+        job_complete = progress_pct >= 99.5 or state in ("done", "success", "completed")
+        if job_complete:
+            st.success("✅ **Faces Harvest complete!**")
+            st.caption("Refreshing to show results...")
+            # Mark job as complete to prevent infinite refresh loop
+            st.session_state[faces_job_complete_key] = True
+            # Force status refresh to pick up new data
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            time.sleep(1.5)
+            st.rerun()
 
         st.info(f"🔄 **Faces Harvest job running** ({state})")
         st.progress(min(progress_pct / 100, 1.0))
@@ -2480,6 +2554,7 @@ with col_faces:
             payload = {
                 "ep_id": ep_id,
                 "device": faces_device_value,
+                "profile": profile_value,
                 "save_frames": bool(faces_save_frames),
                 "save_crops": bool(faces_save_crops),
                 "min_frames_between_crops": int(faces_min_frames_between_crops),
@@ -2487,6 +2562,8 @@ with col_faces:
                 "thumb_size": int(faces_thumb_size),
             }
             st.session_state[running_job_key] = True
+            # Clear completion marker when starting new job
+            st.session_state.pop(f"{ep_id}::faces_job_complete", None)
             _set_job_active(ep_id, True)
             try:
                 # Use execution mode from UI settings (respects local/redis toggle)
@@ -2545,10 +2622,24 @@ with col_cluster:
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
 
     # Show running job progress if a job is active
-    if running_cluster_job:
+    # Skip if we already marked this job as complete (prevents infinite refresh loop)
+    cluster_job_complete_key = f"{ep_id}::cluster_job_complete"
+    if running_cluster_job and not st.session_state.get(cluster_job_complete_key):
         job_id = running_cluster_job.get("job_id", "unknown")
         progress_pct = running_cluster_job.get("progress_pct", 0)
         state = running_cluster_job.get("state", "running")
+
+        # Auto-refresh when job hits 100% or state indicates completion
+        job_complete = progress_pct >= 99.5 or state in ("done", "success", "completed")
+        if job_complete:
+            st.success("✅ **Cluster complete!**")
+            st.caption("Refreshing to show results...")
+            # Mark job as complete to prevent infinite refresh loop
+            st.session_state[cluster_job_complete_key] = True
+            # Force status refresh to pick up new data
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            time.sleep(1.5)
+            st.rerun()
 
         st.info(f"🔄 **Cluster job running** ({state})")
         st.progress(min(progress_pct / 100, 1.0))
@@ -2759,8 +2850,11 @@ with col_cluster:
                 "device": cluster_device_value,
                 "cluster_thresh": float(cluster_thresh_value),
                 "min_cluster_size": int(min_cluster_size_value),
+                "profile": profile_value,
             }
             st.session_state[running_job_key] = True
+            # Clear completion marker when starting new job
+            st.session_state.pop(f"{ep_id}::cluster_job_complete", None)
             _set_job_active(ep_id, True)
             try:
                 # Use execution mode from UI settings (respects local/redis toggle)
@@ -2824,416 +2918,175 @@ with col_cluster:
     # Keep latest cluster log handy for copy/paste
     helpers.render_previous_logs(ep_id, "cluster", expanded=False)
 
-# =============================================================================
-# Audio & Transcript Section
-# =============================================================================
-st.subheader("Audio & Transcript")
+st.divider()
 
-# Define audio/transcript paths
-audio_dir = helpers.DATA_ROOT / "audio" / ep_id
-transcript_jsonl_path = manifests_dir / "episode_transcript.jsonl"
-transcript_vtt_path = manifests_dir / "episode_transcript.vtt"
-audio_qc_path = manifests_dir / "audio_qc.json"
-voice_clusters_path = manifests_dir / "audio_voice_clusters.json"
-voice_mapping_path = manifests_dir / "audio_voice_mapping.json"
-diarization_path = manifests_dir / "audio_diarization.jsonl"
-asr_raw_path = manifests_dir / "audio_asr_raw.jsonl"
-speaker_groups_path = manifests_dir / "audio_speaker_groups.json"
-vocals_path = audio_dir / "episode_vocals.wav"
-vocals_enhanced_path = audio_dir / "episode_vocals_enhanced.wav"
-final_voice_path = audio_dir / "episode_final_voice_only.wav"
+# ── Timestamp Preview ──────────────────────────────────────────────────────────
+st.subheader("Timestamp Preview")
+st.caption("Enter a timestamp to see the frame with detected faces and their track/cluster assignments.")
 
-# Check what exists
-has_transcript_jsonl = transcript_jsonl_path.exists()
-has_transcript_vtt = transcript_vtt_path.exists()
-has_audio_qc = audio_qc_path.exists()
-has_voice_clusters = voice_clusters_path.exists()
-has_voice_mapping = voice_mapping_path.exists()
-has_audio_files = vocals_path.exists()
-has_diarization = diarization_path.exists()
-has_asr = asr_raw_path.exists()
-has_speaker_groups = speaker_groups_path.exists()
+_ts_preview_key = f"{ep_id}::timestamp_preview_input"
+_ts_preview_result_key = f"{ep_id}::timestamp_preview_result"
 
-# Determine audio pipeline status
-audio_status = "not_started"
-audio_qc_status = None
-voice_cluster_count = 0
-labeled_voices = 0
-unlabeled_voices = 0
-
-if has_audio_qc:
-    try:
-        audio_qc_data = json.loads(audio_qc_path.read_text(encoding="utf-8"))
-        audio_qc_status = audio_qc_data.get("status", "unknown")
-        voice_cluster_count = audio_qc_data.get("voice_cluster_count", 0)
-        labeled_voices = audio_qc_data.get("labeled_voices", 0)
-        unlabeled_voices = audio_qc_data.get("unlabeled_voices", 0)
-        audio_status = "complete"
-    except Exception as exc:
-        LOGGER.warning("Failed to parse audio QC file %s: %s", audio_qc_path, exc)
-        audio_status = "error"
-elif has_voice_mapping:
-    # Fallback: read voice stats from voice_mapping.json if QC not available
-    try:
-        voice_mapping_data = json.loads(voice_mapping_path.read_text(encoding="utf-8"))
-        voice_cluster_count = len(voice_mapping_data)
-        labeled_voices = sum(1 for m in voice_mapping_data if m.get("similarity") is not None)
-        unlabeled_voices = voice_cluster_count - labeled_voices
-        audio_status = "in_progress"  # QC not complete yet
-    except Exception as exc:
-        LOGGER.warning("Failed to parse voice mapping file %s: %s", voice_mapping_path, exc)
-        audio_status = "error"
-elif has_transcript_jsonl:
-    audio_status = "complete"  # Transcript exists but no QC
-elif running_audio_job:
-    audio_status = "running"
-
-# Status display
-audio_col1, audio_col2 = st.columns([3, 1])
-with audio_col1:
-    if audio_status == "complete":
-        qc_badge = "✅" if audio_qc_status == "ok" else ("⚠️" if audio_qc_status == "warn" else "🔴")
-        st.success(f"Audio pipeline complete {qc_badge} QC: {audio_qc_status or 'unknown'}")
-        if voice_cluster_count > 0:
-            st.caption(f"Voices: {voice_cluster_count} clusters ({labeled_voices} labeled, {unlabeled_voices} unlabeled)")
-        elif not has_voice_mapping:
-            st.caption("Voice mapping: Not generated yet")
-    elif audio_status == "in_progress":
-        st.warning("Audio pipeline in progress (QC not complete)")
-        if voice_cluster_count > 0:
-            st.caption(f"Voices: {voice_cluster_count} clusters ({labeled_voices} labeled, {unlabeled_voices} unlabeled)")
-    elif audio_status == "running":
-        job_id = running_audio_job.get("job_id", "unknown")
-        progress_pct = running_audio_job.get("progress_pct", 0)
-        state = running_audio_job.get("state", "running")
-        message = running_audio_job.get("message", "")
-        st.info(f"🔄 **Audio pipeline running** ({state})")
-        st.progress(min(progress_pct / 100, 1.0))
-        if message:
-            st.caption(f"Step: {message} ({progress_pct:.1f}%)")
-        else:
-            st.caption(f"Progress: {progress_pct:.1f}%")
-    elif audio_status == "error":
-        st.error("Audio pipeline encountered an error")
-    else:
-        st.info("Audio pipeline not yet run")
-
-with audio_col2:
-    if has_transcript_vtt:
-        try:
-            vtt_content = transcript_vtt_path.read_text(encoding="utf-8")
-            st.download_button(
-                "📥 VTT",
-                data=vtt_content,
-                file_name=f"{ep_id}_transcript.vtt",
-                mime="text/vtt",
-                key=f"download_vtt_{ep_id}",
-            )
-        except Exception as exc:
-            LOGGER.warning("Failed to read VTT file %s: %s", transcript_vtt_path, exc)
-            st.caption("⚠️ VTT unavailable")
-    if has_transcript_jsonl:
-        try:
-            jsonl_content = transcript_jsonl_path.read_text(encoding="utf-8")
-            st.download_button(
-                "📥 JSONL",
-                data=jsonl_content,
-                file_name=f"{ep_id}_transcript.jsonl",
-                mime="application/jsonl",
-                key=f"download_jsonl_{ep_id}",
-            )
-        except Exception as exc:
-            LOGGER.warning("Failed to read JSONL file %s: %s", transcript_jsonl_path, exc)
-            st.caption("⚠️ JSONL unavailable")
-
-# Running job controls
-if running_audio_job:
-    job_id = running_audio_job.get("job_id", "unknown")
-    btn_col1, btn_col2 = st.columns(2)
-    with btn_col1:
-        if st.button("🔄 Refresh", key=f"refresh_audio_{job_id}", use_container_width=True):
-            st.rerun()
-    with btn_col2:
-        if st.button("❌ Cancel", key=f"cancel_audio_{job_id}", use_container_width=True):
-            success, msg = helpers.cancel_running_job(job_id)
-            if success:
-                st.success(msg)
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.error(msg)
-
-# Audio pipeline controls (when not running)
-audio_job_running = running_audio_job is not None
-with st.expander("Audio Pipeline (Phased)", expanded=not audio_status == "complete"):
-    # Controls row: overwrite checkbox and clear cache button
-    ctrl_col1, ctrl_col2 = st.columns([3, 1])
-    with ctrl_col1:
-        audio_overwrite = st.checkbox(
-            "Overwrite existing artifacts",
-            value=False,
-            key=f"audio_overwrite_{ep_id}",
-            disabled=audio_job_running,
-        )
-    with ctrl_col2:
-        clear_cache_clicked = st.button(
-            "🗑️ Clear Cache",
-            key=f"clear_audio_cache_detail_{ep_id}",
-            disabled=audio_job_running,
-            use_container_width=True,
-            help="Delete diarization, clustering, and transcript files (keeps audio files)",
-        )
-
-    # Handle Clear Cache button
-    if clear_cache_clicked:
-        manifest_dir = helpers.DATA_ROOT / "manifests" / ep_id
-        files_to_clear = [
-            "audio_diarization_pyannote.jsonl",
-            "audio_diarization_gpt4o.jsonl",
-            "audio_diarization.jsonl",
-            "audio_diarization_comparison.json",
-            "audio_speaker_groups.json",
-            "audio_voice_clusters.json",
-            "audio_voice_clusters_gpt4o_only.json",
-            "audio_voice_mapping.json",
-            "audio_asr_raw.jsonl",
-            "episode_transcript.jsonl",
-            "episode_transcript.vtt",
-            "audio_qc.json",
-        ]
-        deleted = []
-        for fname in files_to_clear:
-            fpath = manifest_dir / fname
-            if fpath.exists():
-                fpath.unlink()
-                deleted.append(fname)
-        if deleted:
-            st.success(f"Cleared {len(deleted)} cache files: {', '.join(deleted)}")
-            time.sleep(1)
-            st.rerun()
-        else:
-            st.info("No cache files to clear")
-
-    # Phase 1: Create Audio Files
-    st.markdown("---")
-    st.markdown("**Phase 1: Create Audio Files**")
-    phase1_status = "✅" if has_audio_files else "⏳"
-    st.caption(f"{phase1_status} Extract audio, separate vocals, enhance")
-
-    if st.button(
-        "🎵 Create Audio Files",
-        key=f"create_audio_files_{ep_id}",
-        disabled=audio_job_running or (has_audio_files and not audio_overwrite),
-        use_container_width=True,
-    ):
-        try:
-            payload = {"ep_id": ep_id, "overwrite": audio_overwrite}
-            resp = helpers.api_post("/jobs/episode_audio_files", json=payload)
-            job_id = resp.get("job_id")
-            if job_id:
-                helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
-                st.success(f"Audio files job started: {job_id}")
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.error(f"Failed to start job: {resp}")
-        except requests.RequestException as exc:
-            st.error(helpers.describe_error("Create Audio Files", exc))
-
-    # Phase 2: Diarization + Transcription
-    st.markdown("---")
-    st.markdown("**Phase 2: Diarization + Transcription**")
-    phase2_status = "✅" if (has_diarization and has_asr and has_voice_clusters) else "⏳"
-    st.caption(f"{phase2_status} Run diarization, transcription, initial clustering")
-
-    asr_provider = st.selectbox(
-        "ASR Provider",
-        options=["openai_whisper", "gemini"],
-        index=0,
-        key=f"audio_asr_provider_{ep_id}",
-        disabled=audio_job_running,
+# Input row: timestamp input + button
+ts_col1, ts_col2 = st.columns([3, 1])
+with ts_col1:
+    ts_input = st.text_input(
+        "Timestamp (MM:SS or MM:SS.ms)",
+        value="00:00",
+        key=_ts_preview_key,
+        placeholder="e.g., 01:30 or 01:30.50",
+        help="Format: MM:SS or MM:SS.ms (milliseconds optional)",
     )
 
-    if st.button(
-        "🎙️ Run Diarization + Transcription",
-        key=f"run_diarize_transcribe_{ep_id}",
-        disabled=audio_job_running or not has_audio_files,
-        use_container_width=True,
-    ):
-        if not has_audio_files:
-            st.error("Audio files not found. Run 'Create Audio Files' first.")
-        else:
-            try:
-                payload = {"ep_id": ep_id, "asr_provider": asr_provider, "overwrite": audio_overwrite}
-                resp = helpers.api_post("/jobs/episode_audio_diarize_transcribe", json=payload)
-                job_id = resp.get("job_id")
-                if job_id:
-                    helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
-                    st.success(f"Diarization job started: {job_id}")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error(f"Failed to start job: {resp}")
-            except requests.RequestException as exc:
-                st.error(helpers.describe_error("Run Diarization", exc))
+with ts_col2:
+    st.write("")  # Spacing
+    preview_clicked = st.button("🔍 Preview", key=f"{ep_id}::ts_preview_btn", use_container_width=True)
 
-    # Phase 3: Manual Review (link to Voices Review page)
-    st.markdown("---")
-    st.markdown("**Phase 3: Review Voices**")
-    if has_voice_clusters:
-        cluster_count = 0
-        cluster_load_error = False
-        try:
-            cluster_data = json.loads(voice_clusters_path.read_text(encoding="utf-8"))
-            cluster_count = len(cluster_data)
-        except Exception as exc:
-            LOGGER.warning("Failed to parse voice clusters file %s: %s", voice_clusters_path, exc)
-            cluster_load_error = True
-        if cluster_load_error:
-            st.caption("⚠️ Voice clusters file exists but could not be read")
-        else:
-            st.caption(f"✅ {cluster_count} voice clusters ready for review")
-        st.page_link("pages/3_Voices_Review.py", label="🔊 Go to Voices Review", icon="🔊")
+
+def _parse_timestamp_input(ts_str: str) -> float | None:
+    """Parse MM:SS or MM:SS.ms format to seconds."""
+    import re
+    ts_str = ts_str.strip()
+    if not ts_str:
+        return None
+
+    # Try MM:SS.ms format
+    match = re.match(r"^(\d+):(\d{1,2})(?:\.(\d+))?$", ts_str)
+    if match:
+        minutes = int(match.group(1))
+        seconds = int(match.group(2))
+        ms_str = match.group(3)
+        ms = float(f"0.{ms_str}") if ms_str else 0.0
+        return minutes * 60 + seconds + ms
+
+    # Try just seconds
+    try:
+        return float(ts_str)
+    except ValueError:
+        return None
+
+
+if preview_clicked:
+    timestamp_s = _parse_timestamp_input(ts_input)
+    if timestamp_s is None:
+        st.error("Invalid timestamp format. Use MM:SS or MM:SS.ms (e.g., 01:30 or 01:30.50)")
     else:
-        st.caption("⏳ Run diarization first to create voice clusters")
-
-    # Phase 4: Finalize Transcript
-    st.markdown("---")
-    st.markdown("**Phase 4: Finalize Transcript**")
-    phase4_status = "✅" if has_transcript_jsonl else "⏳"
-    st.caption(f"{phase4_status} Generate final transcript with voice assignments, run QC")
-
-    if st.button(
-        "📝 Finalize Transcript",
-        key=f"finalize_transcript_{ep_id}",
-        disabled=audio_job_running or not (has_diarization and has_asr),
-        use_container_width=True,
-    ):
-        if not (has_diarization and has_asr):
-            st.error("Diarization or ASR not found. Run 'Diarization + Transcription' first.")
-        else:
+        with st.spinner(f"Loading frame at {ts_input}..."):
             try:
-                payload = {"ep_id": ep_id, "overwrite": audio_overwrite}
-                resp = helpers.api_post("/jobs/episode_audio_finalize", json=payload)
-                job_id = resp.get("job_id")
-                if job_id:
-                    helpers.store_celery_job_id(ep_id, "audio_pipeline", job_id)
-                    st.success(f"Finalize job started: {job_id}")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error(f"Failed to start job: {resp}")
-            except requests.RequestException as exc:
-                st.error(helpers.describe_error("Finalize Transcript", exc))
-
-# Speaker group exploration + Smart Split
-st.markdown("### Speaker Groups (Pyannote vs GPT-4o)")
-if not has_speaker_groups:
-    st.caption("Run diarization to generate speaker groups for audio review.")
-else:
-    sg_mtime = speaker_groups_path.stat().st_mtime if speaker_groups_path.exists() else 0
-    speaker_groups_data = _load_speaker_groups_manifest(str(speaker_groups_path), sg_mtime) or {}
-    transcript_rows = _load_transcript_rows(
-        str(transcript_jsonl_path),
-        transcript_jsonl_path.stat().st_mtime if transcript_jsonl_path.exists() else 0,
-    ) if transcript_jsonl_path.exists() else []
-
-    sources_payload = speaker_groups_data.get("sources") or []
-    if not sources_payload:
-        st.caption("Speaker groups manifest is empty.")
-    else:
-        # Summaries
-        summary_cols = st.columns(max(1, min(3, len(sources_payload))))
-        for idx, src in enumerate(sources_payload):
-            summary = src.get("summary") or {}
-            summary_cols[idx % len(summary_cols)].metric(
-                label=src.get("source", "unknown").title(),
-                value=f"{summary.get('speakers', 0)} speakers",
-                delta=f"{summary.get('segments', 0)} segments • {summary.get('speech_seconds', 0)}s",
-            )
-
-        source_options = [src.get("source", "unknown") for src in sources_payload]
-        selected_source = st.selectbox(
-            "Diarization source",
-            options=source_options,
-            key=f"speaker_source_{ep_id}",
-        )
-        source_data = next((s for s in sources_payload if s.get("source") == selected_source), sources_payload[0])
-        groups = source_data.get("speakers") or []
-
-        if not groups:
-            st.caption("No speaker groups found for this source.")
-        else:
-            group_table = [
-                {
-                    "speaker_group_id": g.get("speaker_group_id"),
-                    "label": g.get("speaker_label"),
-                    "segments": g.get("segment_count", len(g.get("segments", []))),
-                    "duration_s": round(g.get("total_duration", 0.0), 2),
-                }
-                for g in groups
-            ]
-            st.dataframe(group_table, use_container_width=True, hide_index=True)
-
-            group_ids = [g.get("speaker_group_id") for g in groups]
-            selected_group_id = st.selectbox(
-                "Select speaker group",
-                options=group_ids,
-                index=0,
-                key=f"speaker_group_select_{ep_id}",
-            )
-            selected_group = next((g for g in groups if g.get("speaker_group_id") == selected_group_id), None)
-            if selected_group:
-                st.markdown(f"**Segments for {selected_group_id} ({selected_group.get('speaker_label')})**")
-                expected_voices = st.slider(
-                    "Expected voices if split",
-                    min_value=2,
-                    max_value=4,
-                    value=2,
-                    key=f"split_expected_{selected_group_id}",
+                preview_resp = helpers.api_get(
+                    f"/episodes/{ep_id}/timestamp/{timestamp_s}/preview",
+                    timeout=30,
                 )
-                final_audio_bytes = None
-                if final_voice_path.exists():
-                    try:
-                        final_audio_bytes = final_voice_path.read_bytes()
-                    except OSError:
-                        final_audio_bytes = None
+                st.session_state[_ts_preview_result_key] = preview_resp
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error(f"timestamp preview", exc))
+                st.session_state[_ts_preview_result_key] = None
 
-                for seg in selected_group.get("segments", []):
-                    seg_id = seg.get("segment_id")
-                    seg_start = seg.get("start", 0.0)
-                    seg_end = seg.get("end", 0.0)
-                    with st.expander(f"{seg_id or 'segment'}: {seg_start:.2f}s → {seg_end:.2f}s", expanded=False):
-                        if final_audio_bytes:
-                            st.audio(final_audio_bytes, format="audio/wav")
-                            st.caption(f"Focus on {seg_start:.2f}s → {seg_end:.2f}s")
-                        overlap_rows = _transcript_overlap(transcript_rows, seg_start, seg_end)
-                        if overlap_rows:
-                            st.caption("Transcript overlap:")
-                            for row in overlap_rows[:3]:
-                                st.write(f"{row.get('speaker_display_name', '')}: {row.get('text', '')}")
-                        if st.button(
-                            "Smart Split",
-                            key=f"smart_split_btn_{selected_group_id}_{seg_id}",
-                            use_container_width=True,
-                        ):
-                            payload = {
-                                "source": selected_source,
-                                "speaker_group_id": selected_group_id,
-                                "segment_id": seg_id,
-                                "expected_voices": expected_voices,
-                            }
-                            try:
-                                with st.spinner("Splitting segment..."):
-                                    resp = helpers.api_post(f"/episodes/{ep_id}/audio/smart_split", json=payload)
-                                if resp.get("error"):
-                                    st.error(resp.get("error"))
-                                else:
-                                    st.success("Segment split complete")
-                                    time.sleep(0.8)
-                                    st.rerun()
-                            except requests.RequestException as exc:
-                                st.error(helpers.describe_error("Smart Split", exc))
+# Display result if available
+preview_result = st.session_state.get(_ts_preview_result_key)
+if preview_result:
+    # Show gap warning if we had to find a nearby frame
+    gap_seconds = preview_result.get("gap_seconds", 0)
+    actual_ts = preview_result.get("timestamp_s", 0)
+    frame_idx = preview_result.get("frame_idx", 0)
+    fps = preview_result.get("fps", 24)
+
+    if gap_seconds > 0.5:
+        st.warning(
+            f"No faces detected at exact timestamp. Showing nearest frame with faces "
+            f"(gap: {gap_seconds:.2f}s)"
+        )
+
+    # Frame info
+    actual_mm = int(actual_ts // 60)
+    actual_ss = actual_ts % 60
+    st.caption(f"Frame {frame_idx} @ {actual_mm}:{actual_ss:05.2f} ({fps:.2f} fps)")
+
+    # Display the preview image
+    preview_url = preview_result.get("url")
+    if preview_url:
+        # Handle local paths vs URLs
+        if preview_url.startswith("/") or preview_url.startswith("data/"):
+            # Local path - read and display
+            from pathlib import Path
+            local_path = Path(preview_url)
+            if local_path.exists():
+                st.image(str(local_path), use_column_width=True)
+            else:
+                st.error(f"Preview image not found: {preview_url}")
+        else:
+            # S3 presigned URL
+            st.image(preview_url, use_column_width=True)
+
+    # Display pipeline summary first
+    pipeline_summary = preview_result.get("pipeline_summary", {})
+    if pipeline_summary:
+        sum_detected = pipeline_summary.get("detected", 0)
+        sum_tracked = pipeline_summary.get("tracked", 0)
+        sum_harvested = pipeline_summary.get("harvested", 0)
+        sum_clustered = pipeline_summary.get("clustered", 0)
+
+        # Show pipeline funnel as metrics
+        pipe_cols = st.columns(4)
+        pipe_cols[0].metric("Detected", sum_detected, help="Faces found by RetinaFace detector")
+        pipe_cols[1].metric("Tracked", sum_tracked, help="Faces linked to ByteTrack tracks")
+        pipe_cols[2].metric("Harvested", sum_harvested, help="Faces that passed quality gate and were embedded")
+        pipe_cols[3].metric("Clustered", sum_clustered, help="Faces assigned to identity clusters")
+
+        # Show drop-off warnings
+        if sum_detected > 0:
+            if sum_tracked < sum_detected:
+                st.warning(f"⚠️ {sum_detected - sum_tracked} face(s) detected but NOT tracked (below track confidence threshold)")
+            if sum_harvested < sum_tracked:
+                st.info(f"ℹ️ {sum_tracked - sum_harvested} tracked face(s) NOT harvested (didn't pass quality gate or not sampled)")
+            if sum_clustered < sum_harvested:
+                st.info(f"ℹ️ {sum_harvested - sum_clustered} harvested face(s) NOT clustered yet")
+
+    # Display face info table
+    faces = preview_result.get("faces", [])
+    if faces:
+        st.markdown(f"**{len(faces)} face(s) in frame:**")
+
+        face_rows = []
+        for face in faces:
+            track_id = face.get("track_id")
+            identity_id = face.get("identity_id", "—")
+            name = face.get("name")
+            cast_id = face.get("cast_id")
+            bbox = face.get("bbox", [])
+
+            # Pipeline status flags
+            is_detected = face.get("detected", False)
+            is_tracked = face.get("tracked", False)
+            is_harvested = face.get("harvested", False)
+            is_clustered = face.get("clustered", False)
+
+            # Format bbox as readable string
+            bbox_str = f"[{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]" if bbox else "—"
+
+            # Pipeline status indicators (checkmarks/x)
+            def _status_icon(val: bool) -> str:
+                return "✓" if val else "✗"
+
+            face_rows.append({
+                "Track": f"T{track_id}" if track_id else "—",
+                "Det": _status_icon(is_detected),
+                "Trk": _status_icon(is_tracked),
+                "Harv": _status_icon(is_harvested),
+                "Clust": _status_icon(is_clustered),
+                "Identity": identity_id[:16] + "…" if identity_id and len(str(identity_id)) > 16 else (identity_id or "—"),
+                "Name": name or "—",
+                "BBox": bbox_str,
+            })
+
+        import pandas as pd
+        df = pd.DataFrame(face_rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Legend for status columns
+        st.caption("Pipeline status: Det=Detected, Trk=Tracked, Harv=Harvested (quality gated + embedded), Clust=Clustered")
+    else:
+        st.info("No faces detected in this frame.")
 
 st.divider()
 
@@ -3346,14 +3199,45 @@ for group, paths in artifact_groups.items():
 
 
 # =============================================================================
-# Auto-refresh when jobs are running
+# Auto-refresh when jobs are running (CELERY MODE ONLY)
 # =============================================================================
-# If ANY job is running for this episode, auto-refresh every 3 seconds
-# to poll for updates. This MUST be at the end of the page so content
-# fully renders before the refresh.
+# In Celery mode: auto-refresh every 3 seconds to poll for updates.
+# In Local mode: DO NOT auto-refresh while job is running - logs stream via SSE
+# and auto-refresh would disconnect the stream, killing the subprocess.
+# BUT: refresh once when job completes to update the UI status.
 
 _any_job_running = running_detect_job or running_faces_job or running_cluster_job or running_audio_job
-if _any_job_running:
+_execution_mode = helpers.get_execution_mode(ep_id)
+
+# Check if a local mode job JUST completed
+# Two detection methods:
+# 1. progress.json shows "done" and was recently updated (for Detect/Track, Faces Harvest)
+# 2. A run marker was recently updated (for Cluster, which cleans up its progress file)
+_local_job_just_completed = False
+if _execution_mode == "local" and not _any_job_running:
+    # Method 1: Check progress.json for "done" status
+    _progress_data = helpers.get_episode_progress(ep_id)
+    if _progress_data and _progress_data.get("step") == "done":
+        _progress_age = _get_progress_file_age(ep_id)
+        # If progress file was updated in last 10 seconds and shows "done", job just finished
+        if _progress_age is not None and _progress_age < 10:
+            _local_job_just_completed = True
+
+    # Method 2: Check if any run marker was recently updated (catches Cluster completion)
+    if not _local_job_just_completed:
+        _run_marker_age = _get_most_recent_run_marker_age(ep_id)
+        # If a run marker was updated in last 10 seconds, a job just finished
+        if _run_marker_age is not None and _run_marker_age < 10:
+            _local_job_just_completed = True
+
+if _local_job_just_completed:
+    # Local mode job just completed - refresh once to show updated status
+    st.caption("✅ Job completed! Refreshing to show results...")
+    import time as _time
+    _time.sleep(1.5)
+    st.rerun()
+elif _any_job_running and _execution_mode != "local":
+    # Celery mode: poll for updates since jobs run in background
     import time as _time
     _running_ops = []
     if running_detect_job:
@@ -3367,3 +3251,6 @@ if _any_job_running:
     st.caption(f"⏳ Auto-refreshing for running job(s): {', '.join(_running_ops)}...")
     _time.sleep(3)
     st.rerun()
+elif _any_job_running and _execution_mode == "local":
+    # Local mode: logs stream via SSE, no auto-refresh needed
+    st.caption("📡 Streaming logs from local subprocess... (do not refresh page)")

@@ -3566,6 +3566,167 @@ def force_embed_track(ep_id: str, track_id: int, body: ForceEmbedRequest = None)
     }
 
 
+class BatchRescueRequest(BaseModel):
+    """Request body for batch rescue of quality-only clusters."""
+    cluster_ids: List[str] = []  # If empty, rescue ALL quality-only clusters
+    quality_profile: str = "inclusive"  # inclusive, bypass, balanced, strict
+    recompute_centroids: bool = True
+
+
+@router.post("/episodes/{ep_id}/rescue_quality_clusters")
+def rescue_quality_clusters(ep_id: str, body: BatchRescueRequest = None) -> Dict[str, Any]:
+    """Batch rescue all quality-only clusters (no embeddings due to quality gate).
+
+    This endpoint finds all clusters where ALL faces were skipped due to quality
+    (blur, contrast, confidence) and rescues them by removing skip flags.
+
+    Args:
+        ep_id: Episode identifier
+        body: Optional request body with cluster_ids filter and quality_profile
+
+    Returns:
+        Summary of rescued clusters and next steps
+    """
+    from apps.api.config import get_quality_profile, QUALITY_PROFILES
+    from apps.api.services.grouping import GroupingService
+
+    body = body or BatchRescueRequest()
+
+    # Validate quality profile
+    if body.quality_profile not in QUALITY_PROFILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid quality_profile. Must be one of: {list(QUALITY_PROFILES.keys())}",
+        )
+
+    profile = get_quality_profile(body.quality_profile)
+
+    # Load all faces and identities
+    faces = _load_faces(ep_id, include_skipped=True)
+    identities_data = _load_identities(ep_id)
+    identities = identities_data.get("identities", [])
+
+    # Build cluster -> track_ids map
+    cluster_to_tracks: Dict[str, List[int]] = {}
+    for identity in identities:
+        cluster_id = identity.get("identity_id")
+        track_ids = identity.get("track_ids", [])
+        if cluster_id:
+            cluster_to_tracks[cluster_id] = [int(t) for t in track_ids]
+
+    # Build track -> faces map and identify quality-only clusters
+    track_faces: Dict[int, List[Dict]] = {}
+    for face in faces:
+        tid = face.get("track_id")
+        if tid is not None:
+            track_faces.setdefault(int(tid), []).append(face)
+
+    # Find clusters where ALL faces are skipped (quality-only)
+    quality_only_clusters: List[str] = []
+    for cluster_id, track_ids in cluster_to_tracks.items():
+        # If specific cluster_ids provided, filter
+        if body.cluster_ids and cluster_id not in body.cluster_ids:
+            continue
+
+        all_faces_for_cluster = []
+        for tid in track_ids:
+            all_faces_for_cluster.extend(track_faces.get(tid, []))
+
+        if not all_faces_for_cluster:
+            continue
+
+        # Check if ALL faces are skipped
+        skipped_count = sum(1 for f in all_faces_for_cluster if f.get("skip"))
+        embedded_count = sum(1 for f in all_faces_for_cluster if f.get("embedding"))
+
+        if skipped_count == len(all_faces_for_cluster) and embedded_count == 0:
+            quality_only_clusters.append(cluster_id)
+
+    if not quality_only_clusters:
+        return {
+            "status": "no_clusters_to_rescue",
+            "message": "No quality-only clusters found (all clusters have at least one embedded face)",
+            "clusters_checked": len(cluster_to_tracks),
+        }
+
+    # Rescue all faces in quality-only clusters
+    rescued_clusters: List[Dict[str, Any]] = []
+    total_rescued_faces = 0
+
+    for cluster_id in quality_only_clusters:
+        track_ids = cluster_to_tracks.get(cluster_id, [])
+        cluster_rescued = 0
+        skip_reasons: List[str] = []
+        best_face_score = 0.0
+
+        for face in faces:
+            tid = face.get("track_id")
+            if tid is None or int(tid) not in track_ids:
+                continue
+            if "skip" not in face:
+                continue
+
+            # Track skip reasons and quality scores for reporting
+            skip_reason = face.get("skip", "")
+            skip_reasons.append(skip_reason)
+
+            # Get quality score from skip_data if available
+            skip_data = face.get("skip_data", {})
+            blur = skip_data.get("blur_score", 0)
+            conf = skip_data.get("confidence", 0)
+            contrast = skip_data.get("contrast", 0)
+            # Composite score: higher is better
+            face_score = blur * 0.5 + conf * 30 + contrast * 0.5
+            best_face_score = max(best_face_score, face_score)
+
+            # Remove skip flag and mark as rescued
+            original_skip = face.pop("skip")
+            face["rescued"] = {
+                "original_skip_reason": original_skip,
+                "quality_profile": body.quality_profile,
+                "rescued_at": datetime.utcnow().isoformat() + "Z",
+                "batch_rescue": True,
+            }
+            cluster_rescued += 1
+
+        if cluster_rescued > 0:
+            rescued_clusters.append({
+                "cluster_id": cluster_id,
+                "track_ids": track_ids,
+                "rescued_faces": cluster_rescued,
+                "skip_reasons": list(set(skip_reasons))[:3],
+                "best_quality_score": round(best_face_score, 2),
+            })
+            total_rescued_faces += cluster_rescued
+
+    # Write updated faces back
+    _write_faces(ep_id, faces)
+
+    # Recompute centroids if requested
+    centroid_status = None
+    if body.recompute_centroids and rescued_clusters:
+        try:
+            grouping = GroupingService()
+            centroid_result = grouping.compute_cluster_centroids(ep_id)
+            centroid_status = f"Recomputed {len(centroid_result.get('centroids', {}))} centroids"
+        except Exception as e:
+            centroid_status = f"Centroid recomputation failed: {str(e)}"
+
+    return {
+        "status": "rescued",
+        "rescued_clusters": len(rescued_clusters),
+        "total_rescued_faces": total_rescued_faces,
+        "quality_profile": body.quality_profile,
+        "quality_warning": profile.get("warning"),
+        "clusters": rescued_clusters,
+        "centroid_status": centroid_status,
+        "next_steps": (
+            "Faces have been unskipped. Run 'faces_embed' job to generate embeddings, "
+            "then 'Refresh Suggestions' to get cast matches."
+        ),
+    }
+
+
 @router.post("/episodes/{ep_id}/tracks/{track_id}/frames/move")
 def move_track_frames(ep_id: str, track_id: int, body: TrackFrameMoveRequest) -> dict:
     frame_ids = sorted({int(idx) for idx in body.frame_ids or []})
@@ -3971,6 +4132,700 @@ def generate_frame_overlay(ep_id: str, frame_idx: int) -> dict:
             "frame_idx": frame_idx,
             "tracks": track_info,
         }
+    finally:
+        cap.release()
+
+
+@router.get("/episodes/{ep_id}/timestamp/{timestamp_s}/preview")
+def generate_timestamp_preview(
+    ep_id: str,
+    timestamp_s: float,
+    include_unidentified: bool = Query(True, description="Include faces without cast assignment"),
+) -> dict:
+    """Generate a frame preview at a specific timestamp with named bounding boxes.
+
+    This extracts the video frame at the given timestamp, draws bounding boxes for
+    all detected faces, and labels them with cast member names (if assigned).
+
+    Args:
+        ep_id: Episode identifier
+        timestamp_s: Timestamp in seconds (e.g., 125.5 for 2:05.5)
+        include_unidentified: If True, show boxes for faces without cast assignment
+
+    Returns:
+        {
+            "url": "path/to/overlay.jpg",
+            "frame_idx": 3765,
+            "timestamp_s": 125.5,
+            "fps": 30.0,
+            "faces": [
+                {"track_id": 1, "bbox": [x1,y1,x2,y2], "name": "Lisa Barlow", "cast_id": "..."},
+                {"track_id": 5, "bbox": [...], "name": null, "identity_id": "cluster_42"},
+                ...
+            ]
+        }
+    """
+    import hashlib
+    import numpy as np
+    import tempfile
+    import shutil
+    from apps.api.services.people import PeopleService
+
+    # Get video path and metadata
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        # Get FPS to convert timestamp to frame index
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30.0  # Fallback to 30fps
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_s = total_frames / fps if fps > 0 else 0
+
+        # Calculate frame index from timestamp
+        frame_idx = int(timestamp_s * fps)
+
+        # Clamp to valid range
+        if frame_idx < 0:
+            frame_idx = 0
+        if frame_idx >= total_frames:
+            frame_idx = total_frames - 1
+
+        # Load all pipeline artifacts to determine status of each face
+        # 1. Detections - raw face detections from RetinaFace
+        # 2. Tracks - faces grouped into tracks by ByteTrack
+        # 3. Faces (harvested) - faces that passed quality gating and were embedded
+
+        detections_path = get_path(ep_id, "detections")
+        tracks_path = get_path(ep_id, "tracks")
+        faces_path = detections_path.parent / "faces.jsonl"  # faces.jsonl is in manifests dir
+
+        # Load detections for this frame
+        frame_detections = []
+        if detections_path.exists():
+            import json
+            with open(detections_path, "r") as f:
+                for line in f:
+                    try:
+                        det = json.loads(line)
+                        if det.get("frame_idx") == frame_idx:
+                            frame_detections.append(det)
+                    except json.JSONDecodeError:
+                        continue
+
+        # Load tracks - build mapping of track_id -> track info
+        track_info_map = {}  # track_id -> {frame_indices, ...}
+        if tracks_path.exists():
+            import json
+            with open(tracks_path, "r") as f:
+                for line in f:
+                    try:
+                        track = json.loads(line)
+                        tid = track.get("track_id")
+                        if tid is not None:
+                            if tid not in track_info_map:
+                                track_info_map[tid] = {"frame_indices": set()}
+                            fidx = track.get("frame_idx")
+                            if fidx is not None:
+                                track_info_map[tid]["frame_indices"].add(fidx)
+                    except json.JSONDecodeError:
+                        continue
+
+        # Build set of (track_id, frame_idx) that are tracked at our frame
+        tracked_at_frame = set()
+        for tid, info in track_info_map.items():
+            if frame_idx in info["frame_indices"]:
+                tracked_at_frame.add(tid)
+
+        # Load faces for this episode (harvested faces)
+        faces = identity_service.load_faces(ep_id)
+
+        # Build set of track_ids that were harvested
+        harvested_track_ids = set()
+        if faces:
+            for face in faces:
+                tid = face.get("track_id")
+                if tid is not None:
+                    harvested_track_ids.add(tid)
+
+        if not faces and not frame_detections:
+            raise HTTPException(status_code=404, detail="No faces or detections found for episode")
+
+        # Filter to faces in or near the requested frame
+        # Since faces are detected at stride intervals (default stride=8), we need to find
+        # the nearest sampled frame. A face at frame N could be at any frame N±stride.
+        frame_faces = [f for f in faces if f.get("frame_idx") == frame_idx]
+
+        # If no exact match, find the closest frame that has detected faces
+        # First try a reasonable window (stride + buffer), then expand if needed
+        original_frame_idx = frame_idx
+        if not frame_faces:
+            # Get all unique frame indices with faces, sorted
+            all_face_frames = sorted(set(f.get("frame_idx") for f in faces if f.get("frame_idx") is not None))
+
+            if not all_face_frames:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No faces detected in this episode"
+                )
+
+            # Find the closest frame with faces
+            closest_frame = min(all_face_frames, key=lambda f: abs(f - frame_idx))
+            gap = abs(closest_frame - frame_idx)
+
+            # If gap is very large (> 2 seconds at ~24fps), warn user but still show result
+            max_acceptable_gap = int(fps * 2)  # 2 seconds worth of frames
+
+            frame_faces = [f for f in faces if f.get("frame_idx") == closest_frame]
+            frame_idx = closest_frame
+
+            # Log the gap for debugging
+            LOGGER.info(
+                f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
+                f"closest detected frame is {closest_frame} (gap={gap} frames, {gap/fps:.2f}s)"
+            )
+
+        if not frame_faces:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No faces found near timestamp {timestamp_s:.2f}s (frame {original_frame_idx})"
+            )
+
+        # Build mapping chain: track_id -> identity_id -> person_id -> cast (name, cast_id)
+        identities_payload = _load_identities(ep_id)
+        identities_list = identities_payload.get("identities", [])
+
+        # track_id -> identity
+        track_to_identity = {}
+        identity_to_person = {}
+        for identity in identities_list:
+            identity_id = identity.get("identity_id")
+            person_id = identity.get("person_id")
+            if identity_id and person_id:
+                identity_to_person[identity_id] = person_id
+            for track_id in identity.get("track_ids", []) or []:
+                try:
+                    track_to_identity[int(track_id)] = identity
+                except (TypeError, ValueError):
+                    continue
+
+        # Load people for cast name mapping
+        ep_ctx = episode_context_from_id(ep_id)
+        show_id = ep_ctx.show_slug.upper()
+        people_service = PeopleService()
+        people = people_service.list_people(show_id)
+
+        # person_id -> cast info (name, cast_id)
+        person_to_cast = {}
+        for person in people:
+            person_id = person.get("person_id")
+            if person_id:
+                person_to_cast[person_id] = {
+                    "name": person.get("name") or person.get("display_name"),
+                    "cast_id": person.get("cast_id"),
+                }
+
+        # Extract the video frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise HTTPException(status_code=404, detail=f"Could not read frame {frame_idx}")
+
+        # Draw bounding boxes for each face/track
+        colors = [
+            (66, 133, 244),   # Blue
+            (52, 168, 83),    # Green
+            (251, 188, 4),    # Yellow
+            (234, 67, 53),    # Red
+            (154, 0, 255),    # Purple
+            (0, 188, 212),    # Cyan
+            (255, 152, 0),    # Orange
+            (156, 39, 176),   # Deep Purple
+        ]
+        gray_color = (128, 128, 128)  # Gray for unidentified faces
+
+        face_info = []
+        track_ids_seen = set()
+
+        for face in frame_faces:
+            track_id = face.get("track_id")
+            bbox = face.get("bbox_xyxy")
+            if track_id is None or not bbox:
+                continue
+
+            # Skip duplicates
+            if track_id in track_ids_seen:
+                continue
+            track_ids_seen.add(track_id)
+
+            # Resolve track -> identity -> person -> cast
+            identity = track_to_identity.get(track_id)
+            identity_id = identity.get("identity_id") if identity else None
+            person_id = identity.get("person_id") if identity else None
+            cast_info = person_to_cast.get(person_id) if person_id else None
+
+            name = cast_info.get("name") if cast_info else None
+            cast_id = cast_info.get("cast_id") if cast_info else None
+
+            # Skip unidentified if not requested
+            if not include_unidentified and not name:
+                continue
+
+            # Choose color: named cast get colors, unidentified get gray
+            if name:
+                color_idx = track_id % len(colors)
+                color = colors[color_idx]
+            else:
+                color = gray_color
+
+            # Draw bbox
+            try:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                # Create label: name if available, otherwise identity_id or track_id
+                if name:
+                    label = name
+                elif identity_id:
+                    label = f"[{identity_id[:12]}]"
+                else:
+                    label = f"T{track_id}"
+
+                font_scale = 0.6
+                thickness = 2
+                (label_w, label_h), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+                )
+
+                # Draw label background
+                cv2.rectangle(
+                    frame, (x1, y1 - label_h - 6), (x1 + label_w + 6, y1), color, -1
+                )
+                cv2.putText(
+                    frame, label, (x1 + 3, y1 - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
+                )
+
+                # Determine pipeline status for this face
+                is_tracked = track_id in tracked_at_frame
+                is_harvested = track_id in harvested_track_ids
+                is_clustered = identity_id is not None
+
+                face_info.append({
+                    "track_id": track_id,
+                    "bbox": bbox,
+                    "name": name,
+                    "cast_id": cast_id,
+                    "identity_id": identity_id,
+                    "person_id": person_id,
+                    # Pipeline status
+                    "detected": True,  # If it's in faces.jsonl, it was detected
+                    "tracked": is_tracked,
+                    "harvested": is_harvested,
+                    "clustered": is_clustered,
+                })
+            except (TypeError, ValueError):
+                continue
+
+        # Save overlay image
+        overlay_filename = f"frame_{frame_idx:06d}_preview.jpg"
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        success = cv2.imwrite(str(tmp_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not success:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="Failed to save preview image")
+
+        # Upload to S3 or save locally
+        try:
+            s3_key = f"artifacts/{ep_id}/previews/{overlay_filename}"
+
+            if STORAGE.backend in {"s3", "minio"} and STORAGE._client is not None:
+                extra_args = {"ContentType": "image/jpeg"}
+                STORAGE._client.upload_file(
+                    str(tmp_path),
+                    STORAGE.bucket,
+                    s3_key,
+                    ExtraArgs=extra_args,
+                )
+                url = STORAGE.presign_get(s3_key, expires_in=3600)
+                if not url:
+                    raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+            else:
+                # Local mode - save to artifacts directory
+                artifacts_dir = get_path(ep_id, "frames_root").parent / "previews"
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                local_path = artifacts_dir / overlay_filename
+                shutil.copy(tmp_path, local_path)
+                url = str(local_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        # Calculate gap info if we had to find a nearby frame
+        actual_timestamp_s = round(frame_idx / fps, 3)
+        gap_frames = abs(frame_idx - original_frame_idx)
+        gap_seconds = round(gap_frames / fps, 2) if gap_frames > 0 else 0
+
+        # Calculate pipeline summary stats
+        num_detected = len(frame_detections)
+        num_tracked = len(tracked_at_frame)
+        num_harvested = sum(1 for f in face_info if f.get("harvested"))
+        num_clustered = sum(1 for f in face_info if f.get("clustered"))
+
+        return {
+            "url": url,
+            "frame_idx": frame_idx,
+            "timestamp_s": actual_timestamp_s,
+            "requested_timestamp_s": timestamp_s,
+            "gap_frames": gap_frames,
+            "gap_seconds": gap_seconds,
+            "fps": fps,
+            "duration_s": round(duration_s, 2),
+            "faces": face_info,
+            # Pipeline summary for this frame
+            "pipeline_summary": {
+                "detected": num_detected,
+                "tracked": num_tracked,
+                "harvested": num_harvested,
+                "clustered": num_clustered,
+            },
+        }
+    finally:
+        cap.release()
+
+
+class VideoClipRequest(BaseModel):
+    """Request model for video clip generation."""
+
+    start_s: float = Field(..., ge=0, description="Start timestamp in seconds")
+    end_s: float = Field(..., gt=0, description="End timestamp in seconds")
+    include_unidentified: bool = Field(True, description="Include faces without cast assignment")
+    output_fps: Optional[float] = Field(None, ge=1, le=60, description="Output FPS (default: source FPS)")
+
+
+@router.post("/episodes/{ep_id}/video_clip")
+def generate_video_clip(ep_id: str, body: VideoClipRequest) -> dict:
+    """Generate a video clip with named face overlays.
+
+    Creates a short video clip from the source video with bounding boxes and
+    cast member names drawn on each frame.
+
+    Args:
+        ep_id: Episode identifier
+        body: VideoClipRequest with start_s, end_s, include_unidentified, output_fps
+
+    Returns:
+        {
+            "url": "path/to/clip.mp4",
+            "start_s": 30.0,
+            "end_s": 35.0,
+            "duration_s": 5.0,
+            "fps": 30.0,
+            "frame_count": 150,
+            "faces_detected": 42
+        }
+    """
+    import tempfile
+    import shutil
+    from apps.api.services.people import PeopleService
+
+    if body.end_s <= body.start_s:
+        raise HTTPException(status_code=400, detail="end_s must be greater than start_s")
+
+    max_duration = 30.0  # Max 30 second clips
+    if body.end_s - body.start_s > max_duration:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Clip duration exceeds maximum of {max_duration} seconds"
+        )
+
+    # Get video path
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        # Get video metadata
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not source_fps or source_fps <= 0:
+            source_fps = 30.0
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_frames / source_fps
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Clamp timestamps to video duration
+        start_s = max(0, min(body.start_s, video_duration))
+        end_s = max(start_s + 0.1, min(body.end_s, video_duration))
+
+        # Calculate frame range
+        start_frame = int(start_s * source_fps)
+        end_frame = int(end_s * source_fps)
+
+        # Use output FPS or source FPS
+        output_fps = body.output_fps or source_fps
+
+        # Load faces for this episode
+        faces = identity_service.load_faces(ep_id)
+        if not faces:
+            raise HTTPException(status_code=404, detail="No faces found for episode")
+
+        # Index faces by frame for fast lookup
+        faces_by_frame: Dict[int, List[Dict[str, Any]]] = {}
+        for face in faces:
+            frame_idx = face.get("frame_idx")
+            if frame_idx is not None:
+                faces_by_frame.setdefault(frame_idx, []).append(face)
+
+        # Build mapping chain: track_id -> identity -> person -> cast
+        identities_payload = _load_identities(ep_id)
+        identities_list = identities_payload.get("identities", [])
+
+        track_to_identity = {}
+        for identity in identities_list:
+            identity_id = identity.get("identity_id")
+            for track_id in identity.get("track_ids", []) or []:
+                try:
+                    track_to_identity[int(track_id)] = identity
+                except (TypeError, ValueError):
+                    continue
+
+        # Load people for cast name mapping
+        ep_ctx = episode_context_from_id(ep_id)
+        show_id = ep_ctx.show_slug.upper()
+        people_service = PeopleService()
+        people = people_service.list_people(show_id)
+
+        person_to_cast = {}
+        for person in people:
+            person_id = person.get("person_id")
+            if person_id:
+                person_to_cast[person_id] = {
+                    "name": person.get("name") or person.get("display_name"),
+                    "cast_id": person.get("cast_id"),
+                }
+
+        # Colors for different tracks
+        colors = [
+            (66, 133, 244),   # Blue
+            (52, 168, 83),    # Green
+            (251, 188, 4),    # Yellow
+            (234, 67, 53),    # Red
+            (154, 0, 255),    # Purple
+            (0, 188, 212),    # Cyan
+            (255, 152, 0),    # Orange
+            (156, 39, 176),   # Deep Purple
+        ]
+        gray_color = (128, 128, 128)
+
+        # Create temp file for output
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        # Initialize video writer
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(tmp_path), fourcc, output_fps, (width, height))
+
+        if not writer.isOpened():
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="Could not create video writer")
+
+        try:
+            # Seek to start frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            frames_written = 0
+            total_faces_detected = 0
+
+            # Calculate frame step for output FPS (if downsampling)
+            frame_step = max(1, int(source_fps / output_fps)) if output_fps < source_fps else 1
+
+            for frame_idx in range(start_frame, end_frame):
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+
+                # Skip frames if downsampling
+                if (frame_idx - start_frame) % frame_step != 0:
+                    continue
+
+                # Find faces near this frame (accounting for stride)
+                # Check current frame and nearby frames within stride window
+                frame_faces = []
+                stride = 8  # Default stride from tracker config
+                for check_frame in range(frame_idx - stride, frame_idx + stride + 1):
+                    if check_frame in faces_by_frame:
+                        frame_faces.extend(faces_by_frame[check_frame])
+                        break  # Use first match
+
+                track_ids_seen = set()
+                for face in frame_faces:
+                    track_id = face.get("track_id")
+                    bbox = face.get("bbox_xyxy")
+                    if track_id is None or not bbox:
+                        continue
+                    if track_id in track_ids_seen:
+                        continue
+                    track_ids_seen.add(track_id)
+
+                    # Resolve identity chain
+                    identity = track_to_identity.get(track_id)
+                    identity_id = identity.get("identity_id") if identity else None
+                    person_id = identity.get("person_id") if identity else None
+                    cast_info = person_to_cast.get(person_id) if person_id else None
+                    name = cast_info.get("name") if cast_info else None
+
+                    # Skip unidentified if not requested
+                    if not body.include_unidentified and not name:
+                        continue
+
+                    total_faces_detected += 1
+
+                    # Choose color
+                    if name:
+                        color = colors[track_id % len(colors)]
+                    else:
+                        color = gray_color
+
+                    # Draw bbox
+                    try:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                        # Create label
+                        if name:
+                            label = name
+                        elif identity_id:
+                            label = f"[{identity_id[:8]}]"
+                        else:
+                            label = f"T{track_id}"
+
+                        font_scale = 0.6
+                        thickness = 2
+                        (label_w, label_h), _ = cv2.getTextSize(
+                            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+                        )
+
+                        # Draw label background
+                        cv2.rectangle(
+                            frame, (x1, y1 - label_h - 6), (x1 + label_w + 6, y1), color, -1
+                        )
+                        cv2.putText(
+                            frame, label, (x1 + 3, y1 - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
+                        )
+                    except (TypeError, ValueError):
+                        continue
+
+                # Add timestamp overlay
+                current_time = frame_idx / source_fps
+                mins = int(current_time // 60)
+                secs = current_time % 60
+                timestamp_text = f"{mins}:{secs:05.2f}"
+                cv2.putText(
+                    frame, timestamp_text, (10, height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+                )
+
+                writer.write(frame)
+                frames_written += 1
+
+        finally:
+            writer.release()
+
+        if frames_written == 0:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="No frames written to clip")
+
+        # Re-encode to H.264 for browser compatibility using ffmpeg
+        import subprocess
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as h264_tmp:
+            h264_path = Path(h264_tmp.name)
+
+        try:
+            # Use ffmpeg to convert to H.264 with AAC audio (browser compatible)
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-i", str(tmp_path),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",  # Required for browser compatibility
+                "-movflags", "+faststart",  # Enable streaming
+                "-an",  # No audio (source has no audio)
+                str(h264_path)
+            ]
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                LOGGER.warning(f"ffmpeg conversion failed: {result.stderr.decode()}")
+                # Fall back to original file if ffmpeg fails
+                h264_path = tmp_path
+            else:
+                # Remove original temp file, use h264 version
+                tmp_path.unlink(missing_ok=True)
+                tmp_path = h264_path
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            LOGGER.warning(f"ffmpeg not available or timed out: {e}, using mp4v codec")
+            h264_path.unlink(missing_ok=True)
+            # Continue with original tmp_path
+
+        # Generate output filename
+        clip_filename = f"clip_{int(start_s)}s_{int(end_s)}s.mp4"
+
+        # Upload to S3 or save locally
+        try:
+            s3_key = f"artifacts/{ep_id}/clips/{clip_filename}"
+
+            if STORAGE.backend in {"s3", "minio"} and STORAGE._client is not None:
+                extra_args = {"ContentType": "video/mp4"}
+                STORAGE._client.upload_file(
+                    str(tmp_path),
+                    STORAGE.bucket,
+                    s3_key,
+                    ExtraArgs=extra_args,
+                )
+                url = STORAGE.presign_get(s3_key, expires_in=3600)
+                if not url:
+                    raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+            else:
+                # Local mode - save to artifacts directory
+                artifacts_dir = get_path(ep_id, "frames_root").parent / "clips"
+                artifacts_dir.mkdir(parents=True, exist_ok=True)
+                local_path = artifacts_dir / clip_filename
+                shutil.copy(tmp_path, local_path)
+                url = str(local_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        return {
+            "url": url,
+            "start_s": round(start_s, 2),
+            "end_s": round(end_s, 2),
+            "duration_s": round(end_s - start_s, 2),
+            "fps": output_fps,
+            "frame_count": frames_written,
+            "faces_detected": total_faces_detected,
+        }
+
     finally:
         cap.release()
 

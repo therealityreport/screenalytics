@@ -27,6 +27,9 @@ class ScreenTimeConfig:
     screen_time_mode: Literal["faces", "tracks"] = "faces"
     edge_padding_s: float = 0.0
     track_coverage_min: float = 0.0
+    # Minimum duration for a single-face interval to avoid zero-duration entries
+    # Default: 1/30s (~33ms) which is approximately one frame at 30fps
+    min_interval_duration_s: float = 0.033
 
 
 @dataclass
@@ -239,11 +242,22 @@ class ScreenTimeAnalyzer:
                     self.config.screen_time_mode,
                 )
 
-        # Compute confidence scores
+        # Compute confidence scores based on data quality indicators
+        # Confidence is derived from:
+        #   - Number of tracks (more tracks = higher confidence, up to ~20 tracks for max)
+        #   - Faces per track ratio (more faces per track = better tracking quality)
+        # Formula: base_confidence + track_bonus + density_bonus, capped at 1.0
         for cast_id, metrics in cast_metrics_map.items():
-            if metrics.faces_count > 0:
-                # Simple confidence: could be enhanced with quality distribution analysis
-                metrics.confidence = min(1.0, 0.5 + (metrics.tracks_count * 0.05))
+            if metrics.faces_count > 0 and metrics.tracks_count > 0:
+                # Base: 0.5 for having any data
+                base = 0.5
+                # Track bonus: +0.025 per track, max +0.3 (at ~12 tracks)
+                track_bonus = min(0.3, metrics.tracks_count * 0.025)
+                # Density bonus: faces/tracks ratio indicates tracking quality
+                # Average ~3 faces/track is good; reward up to +0.2 for high density
+                avg_faces_per_track = metrics.faces_count / metrics.tracks_count
+                density_bonus = min(0.2, avg_faces_per_track * 0.04)
+                metrics.confidence = min(1.0, base + track_bonus + density_bonus)
             else:
                 metrics.confidence = 0.0
 
@@ -639,9 +653,17 @@ class ScreenTimeAnalyzer:
         return [(start, end) for start, end in merged]
 
     def _interval_duration(self, interval: Tuple[float, float]) -> float:
-        """Return the non-negative duration of an interval."""
+        """Return the duration of an interval, with a minimum to avoid zero-duration entries.
+
+        Single-face intervals (where start == end) are given a minimum duration
+        based on config.min_interval_duration_s to ensure they contribute to screen time.
+        """
         start, end = interval
-        return max(0.0, end - start)
+        raw_duration = max(0.0, end - start)
+        # Apply minimum duration for zero-length intervals (e.g., single-face detections)
+        if raw_duration < self.config.min_interval_duration_s:
+            return self.config.min_interval_duration_s
+        return raw_duration
 
     def write_outputs(self, ep_id: str, metrics_data: Dict[str, Any]) -> Tuple[Path, Path]:
         """Write screen time outputs to JSON and CSV.

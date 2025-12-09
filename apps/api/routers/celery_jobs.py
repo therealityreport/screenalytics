@@ -890,6 +890,11 @@ class ClusterCeleryRequest(BaseModel):
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
     )
+    clear_assignments: bool = Field(
+        True,
+        description="Clear all existing cluster-to-person assignments before clustering. "
+        "When True (default), all old assignments are removed and clusters start fresh."
+    )
 
 
 def _map_celery_state(state: str) -> str:
@@ -2731,6 +2736,28 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
                     "state": "already_running",
                     "message": f"Cluster job {active_job} is already running for this episode",
                 },
+            )
+
+    # Clear all existing cluster-to-person assignments before clustering
+    # This ensures old cluster IDs and person links are removed so Faces Review starts fresh
+    cleared_count = 0
+    if req.clear_assignments:
+        try:
+            from apps.api.services.grouping import GroupingService
+
+            grouping_service = GroupingService()
+            cleared_count = grouping_service._clear_person_assignments(req.ep_id)
+            if cleared_count > 0:
+                LOGGER.info(
+                    "[%s] Cleared %d existing assignment(s) before clustering",
+                    req.ep_id,
+                    cleared_count,
+                )
+        except Exception as exc:
+            LOGGER.warning(
+                "[%s] Failed to clear assignments before clustering: %s",
+                req.ep_id,
+                exc,
             )
 
     # Resolve profile based on device

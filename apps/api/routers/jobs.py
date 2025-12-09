@@ -251,6 +251,11 @@ class ClusterRequest(BaseModel):
         le=0.99,
         description="Minimum cosine similarity for a track to remain in an identity cluster",
     )
+    clear_assignments: bool = Field(
+        True,
+        description="Clear all existing cluster-to-person assignments before clustering. "
+        "When True (default), all old assignments are removed and clusters start fresh.",
+    )
 
 
 class CleanupJobRequest(BaseModel):
@@ -1106,6 +1111,29 @@ async def run_cluster(req: ClusterRequest, request: Request):
     faces_path = manifests_dir / "faces.jsonl"
     if not faces_path.exists():
         raise HTTPException(status_code=400, detail="faces.jsonl not found; run faces_embed first")
+
+    # Clear all existing cluster-to-person assignments before clustering
+    # This ensures old cluster IDs and person links are removed so Faces Review starts fresh
+    cleared_count = 0
+    if req.clear_assignments:
+        try:
+            from apps.api.services.grouping import GroupingService
+
+            grouping_service = GroupingService()
+            cleared_count = grouping_service._clear_person_assignments(req.ep_id)
+            if cleared_count > 0:
+                LOGGER.info(
+                    "[%s] Cleared %d existing assignment(s) before clustering",
+                    req.ep_id,
+                    cleared_count,
+                )
+        except Exception as exc:
+            LOGGER.warning(
+                "[%s] Failed to clear assignments before clustering: %s",
+                req.ep_id,
+                exc,
+            )
+
     progress_path = _progress_file_path(req.ep_id)
     command = _build_cluster_command(req, progress_path)
     result = _run_job_with_optional_sse(command, request, progress_file=progress_path)

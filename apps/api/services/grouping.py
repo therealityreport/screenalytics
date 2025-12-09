@@ -22,6 +22,7 @@ from py_screenalytics.artifacts import get_path
 
 from apps.api.services.facebank import FacebankService, SEED_ATTACH_SIM
 from apps.api.services.cast import CastService
+from apps.api.services.archive import ArchiveService
 from apps.api.config.suggestions import (
     SUGGESTION_THRESHOLDS,
     GROUPING_THRESHOLDS,
@@ -51,10 +52,69 @@ FACEBANK_MATCH_SIMILARITY = SUGGESTION_THRESHOLDS["cast_high"]
 # Feature flags (still from environment for flexibility)
 USE_SEED_IN_ACROSS_EPISODE = os.getenv("USE_SEED_IN_ACROSS_EPISODE", "1").lower() in ("1", "true", "yes")
 COHESION_WEIGHT_ENABLED = os.getenv("COHESION_WEIGHT_ENABLED", "1").lower() in ("1", "true", "yes")
-FACEBANK_FIRST_MATCHING = os.getenv("FACEBANK_FIRST_MATCHING", "1").lower() in ("1", "true", "yes")
+# Facebank-first matching disabled by default - causes false positives when seeds don't match well
+FACEBANK_FIRST_MATCHING = os.getenv("FACEBANK_FIRST_MATCHING", "0").lower() in ("1", "true", "yes")
 PROTECT_MANUAL_DEFAULT = os.getenv("PROTECT_MANUAL_DEFAULT", "1").lower() in ("1", "true", "yes")
 
 DEFAULT_DATA_ROOT = Path("data").expanduser()
+
+
+def _validate_embedding_dimensions(embeddings: List[np.ndarray], context: str = "") -> List[np.ndarray]:
+    """Validate that all embeddings have the same dimension.
+
+    Args:
+        embeddings: List of embedding arrays
+        context: Context string for error messages
+
+    Returns:
+        Filtered list with only embeddings matching the most common dimension
+
+    Raises:
+        ValueError: If embeddings list is empty
+    """
+    if not embeddings:
+        return []
+
+    # Get dimensions
+    dims = [len(emb) for emb in embeddings]
+    unique_dims = set(dims)
+
+    if len(unique_dims) == 1:
+        return embeddings  # All same dimension
+
+    # Find most common dimension
+    from collections import Counter
+    dim_counts = Counter(dims)
+    most_common_dim = dim_counts.most_common(1)[0][0]
+
+    # Filter to only embeddings with most common dimension
+    filtered = [emb for emb in embeddings if len(emb) == most_common_dim]
+    dropped = len(embeddings) - len(filtered)
+
+    if dropped > 0:
+        LOGGER.warning(
+            f"[{context}] Filtered {dropped} embeddings with mismatched dimensions. "
+            f"Expected {most_common_dim}, found dimensions: {sorted(unique_dims)}"
+        )
+
+    return filtered
+
+
+def _safe_get_tracks(cluster_data: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    """Safely get tracks from cluster data with null check.
+
+    Args:
+        cluster_data: Cluster data dict (may be None)
+
+    Returns:
+        List of tracks, empty if data is None or tracks is None
+    """
+    if cluster_data is None:
+        return []
+    tracks = cluster_data.get("tracks")
+    if tracks is None:
+        return []
+    return tracks
 
 
 def _now_iso() -> str:
@@ -223,8 +283,17 @@ def _compute_group_centroid(
     for cid in cluster_ids:
         data = centroids_map.get(cid)
         if data is not None and data.get("centroid") is not None:
-            vectors.append(data["centroid"])
+            centroid = data["centroid"]
+            # Convert to numpy array if needed
+            if isinstance(centroid, list):
+                centroid = np.array(centroid)
+            vectors.append(centroid)
 
+    if not vectors:
+        return None
+
+    # Validate embedding dimensions before stacking
+    vectors = _validate_embedding_dimensions(vectors, context="combined_centroid")
     if not vectors:
         return None
 
@@ -240,6 +309,173 @@ class GroupingService:
         self.people_service = PeopleService(data_root)
         self.facebank_service = FacebankService(data_root)
         self.cast_service = CastService(data_root)
+
+    def _get_best_skipped_face(
+        self,
+        ep_id: str,
+        track_ids: List[int],
+    ) -> Optional[Dict[str, Any]]:
+        """Find the best quality skipped face from a list of tracks.
+
+        Uses skip_data quality metrics to pick the face most likely to produce
+        a usable embedding when force-embedded.
+
+        Args:
+            ep_id: Episode identifier
+            track_ids: List of track IDs to search
+
+        Returns:
+            Best face dict or None if no skipped faces found
+        """
+        faces_path = self._faces_path(ep_id)
+        if not faces_path.exists():
+            return None
+
+        best_face = None
+        best_score = -1.0
+
+        track_ids_set = set(int(t) for t in track_ids)
+
+        with faces_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    face = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                tid = face.get("track_id")
+                if tid is None or int(tid) not in track_ids_set:
+                    continue
+
+                if not face.get("skip"):
+                    continue  # Not a skipped face
+
+                # Calculate quality score from skip_data
+                skip_data = face.get("skip_data", {})
+                blur = skip_data.get("blur_score", 0)
+                conf = skip_data.get("confidence", 0)
+                contrast = skip_data.get("contrast", 0)
+
+                # Composite score: higher is better
+                # Weight confidence heavily since it's the detection quality
+                score = blur * 0.3 + conf * 50 + contrast * 0.2
+
+                if score > best_score:
+                    best_score = score
+                    best_face = face
+
+        return best_face
+
+    def _force_embed_best_face(
+        self,
+        ep_id: str,
+        cluster_id: str,
+        track_ids: List[int],
+    ) -> Optional[np.ndarray]:
+        """Force-embed the best available skipped face for a cluster.
+
+        This is used for quality-only clusters to generate at least one embedding
+        for centroid computation.
+
+        Args:
+            ep_id: Episode identifier
+            cluster_id: Cluster ID for logging
+            track_ids: Track IDs in this cluster
+
+        Returns:
+            Embedding vector or None if force-embedding failed
+        """
+        # Find best skipped face
+        best_face = self._get_best_skipped_face(ep_id, track_ids)
+        if not best_face:
+            LOGGER.debug(f"[{ep_id}] Cluster {cluster_id}: no skipped faces to rescue")
+            return None
+
+        # Check if face has a crop we can re-embed
+        crop_rel_path = best_face.get("crop_rel_path")
+        if not crop_rel_path:
+            LOGGER.debug(f"[{ep_id}] Cluster {cluster_id}: best face has no crop_rel_path")
+            return None
+
+        # Try to load crop and generate embedding
+        try:
+            from py_screenalytics.artifacts import get_path
+
+            crops_root = get_path(ep_id, "crops")
+            crop_path = crops_root.parent / crop_rel_path if crops_root else None
+
+            if crop_path and crop_path.exists():
+                import cv2
+
+                img = cv2.imread(str(crop_path))
+                if img is not None:
+                    # Use the face encoder
+                    from py_screenalytics.facematch import FaceEncoder
+
+                    encoder = FaceEncoder()
+                    embeddings = encoder.encode([img])
+                    if embeddings is not None and len(embeddings) > 0:
+                        embedding = embeddings[0]
+                        norm = np.linalg.norm(embedding)
+                        if norm > 1e-6:
+                            # Mark face as rescued in faces.jsonl
+                            self._mark_face_as_rescued(ep_id, best_face, embedding)
+                            LOGGER.info(
+                                f"[{ep_id}] Cluster {cluster_id}: force-embedded face "
+                                f"{best_face.get('face_id')} (score={best_face.get('skip_data', {}).get('blur_score', 0):.1f})"
+                            )
+                            return embedding / norm
+        except Exception as e:
+            LOGGER.warning(f"[{ep_id}] Force-embed failed for cluster {cluster_id}: {e}")
+
+        return None
+
+    def _mark_face_as_rescued(
+        self,
+        ep_id: str,
+        face: Dict[str, Any],
+        embedding: np.ndarray,
+    ) -> None:
+        """Mark a face as rescued and add its embedding to faces.jsonl."""
+        from datetime import datetime
+
+        faces_path = self._faces_path(ep_id)
+        if not faces_path.exists():
+            return
+
+        face_id = face.get("face_id")
+        if not face_id:
+            return
+
+        # Read all faces, update the rescued one, write back
+        faces = []
+        with faces_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("face_id") == face_id:
+                    # Update this face
+                    original_skip = row.pop("skip", None)
+                    row["embedding"] = embedding.tolist()
+                    row["rescued"] = {
+                        "original_skip_reason": original_skip,
+                        "quality_profile": "auto_rescue",
+                        "rescued_at": datetime.utcnow().isoformat() + "Z",
+                    }
+                faces.append(row)
+
+        # Write back
+        with faces_path.open("w", encoding="utf-8") as f:
+            for row in faces:
+                f.write(json.dumps(row) + "\n")
 
     def backup_before_cleanup(self, ep_id: str) -> Dict[str, Any]:
         """Create backup of identities.json, people.json, cluster_centroids.json (Enhancement #7).
@@ -567,9 +803,28 @@ class GroupingService:
 
         # Use dict format (cluster_id -> centroid data) instead of list
         centroids = {}
+        auto_rescued_count = 0
         for cluster_id in sorted(cluster_to_tracks.keys()):
             embs = cluster_embeddings.get(cluster_id, [])
+            track_ids = cluster_to_tracks.get(cluster_id, [])
+
+            # Auto-rescue: For single-track clusters with no embeddings,
+            # try to force-embed the best available skipped face
+            if not embs and len(track_ids) == 1:
+                rescued_embedding = self._force_embed_best_face(ep_id, cluster_id, track_ids)
+                if rescued_embedding is not None:
+                    embs = [rescued_embedding]
+                    cluster_embeddings[cluster_id] = embs
+                    cluster_counts[cluster_id] = 1
+                    auto_rescued_count += 1
+
             if not embs:
+                continue
+
+            # Validate embedding dimensions before computing mean
+            embs = _validate_embedding_dimensions(embs, context=f"cluster_cleanup:{cluster_id}")
+            if not embs:
+                LOGGER.warning(f"[cluster_cleanup] Skipping cluster {cluster_id} - no valid embeddings after dimension filter")
                 continue
 
             # Mean and L2-normalize
@@ -610,8 +865,17 @@ class GroupingService:
 
             centroids[cluster_id] = centroid_entry
 
+        # Log auto-rescue stats
+        if auto_rescued_count > 0:
+            LOGGER.info(
+                f"[cluster_cleanup] Auto-rescued {auto_rescued_count} single-face clusters "
+                f"by force-embedding best available skipped faces"
+            )
+
         # Save to file in new dict format
         output = {"ep_id": ep_id, "centroids": centroids, "computed_at": _now_iso()}
+        if auto_rescued_count > 0:
+            output["auto_rescued"] = auto_rescued_count
         centroids_path = self._cluster_centroids_path(ep_id)
         centroids_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
@@ -627,6 +891,272 @@ class GroupingService:
         if not path.exists():
             raise FileNotFoundError(f"cluster_centroids.json not found for {ep_id}")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def get_cluster_detail(self, ep_id: str, cluster_id: str) -> Dict[str, Any] | None:
+        """Get detailed cluster info including tracks and embeddings.
+
+        Used by outlier_audit to compute cohesion metrics.
+
+        Returns:
+            Dict with "tracks" list, each containing track_id, embedding, faces, thumb_url, track_similarity
+            Returns None if cluster not found
+        """
+        identities_path = self._identities_path(ep_id)
+        if not identities_path.exists():
+            return None
+
+        identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+
+        # Find the cluster
+        target_identity = None
+        for identity in identities_data.get("identities", []):
+            if identity.get("identity_id") == cluster_id:
+                target_identity = identity
+                break
+
+        if not target_identity:
+            return None
+
+        track_ids = target_identity.get("track_ids", [])
+        if not track_ids:
+            return {"tracks": []}
+
+        # Load track reps for embeddings
+        try:
+            from apps.api.services.track_reps import load_track_reps
+            track_reps = load_track_reps(ep_id)
+        except Exception:
+            track_reps = {}
+
+        # Load faces for face counts
+        faces_path = self._faces_path(ep_id)
+        face_counts: Dict[int, int] = {}
+        if faces_path.exists():
+            faces = json.loads(faces_path.read_text(encoding="utf-8"))
+            for row in faces:
+                try:
+                    tid = int(row.get("track_id", -1))
+                except (TypeError, ValueError):
+                    continue
+                face_counts[tid] = face_counts.get(tid, 0) + 1
+
+        # Load tracks for thumbnail URLs
+        tracks_path = self._tracks_path(ep_id)
+        track_lookup: Dict[int, Dict[str, Any]] = {}
+        if tracks_path.exists():
+            tracks_data = json.loads(tracks_path.read_text(encoding="utf-8"))
+            for track in tracks_data:
+                try:
+                    tid = int(track.get("track_id", -1))
+                except (TypeError, ValueError):
+                    continue
+                track_lookup[tid] = track
+
+        # Build tracks list with embeddings
+        result_tracks = []
+        for raw_tid in track_ids:
+            try:
+                tid = int(raw_tid)
+            except (TypeError, ValueError):
+                continue
+
+            track_key = f"track_{tid:04d}"
+            track_rep = track_reps.get(track_key, {})
+            track_row = track_lookup.get(tid, {})
+
+            embedding = track_rep.get("embed")
+            if not embedding:
+                continue  # Skip tracks without embeddings
+
+            result_tracks.append({
+                "track_id": tid,
+                "embedding": embedding,
+                "faces": track_row.get("faces_count") or face_counts.get(tid, 0),
+                "thumb_url": track_row.get("crop_key") or track_row.get("rep_media_url"),
+                "track_similarity": track_rep.get("sim_to_centroid"),
+            })
+
+        return {"tracks": result_tracks}
+
+    def merge_adjacent_quality_only_clusters(
+        self,
+        ep_id: str,
+        max_frame_gap: int = 60,
+    ) -> Dict[str, Any]:
+        """Merge quality-only clusters that are temporally adjacent.
+
+        Clusters like id_0102, id_0103, id_0104 might be the same person
+        captured in different short segments. This method merges them if:
+        1. Both clusters have no embeddings (quality-only)
+        2. Their frame ranges are within max_frame_gap frames of each other
+
+        Args:
+            ep_id: Episode identifier
+            max_frame_gap: Maximum frame gap between clusters to consider merging (default: 60 = ~2 seconds at 30fps)
+
+        Returns:
+            {"merged_groups": int, "clusters_merged": int, "merges": [...]}
+        """
+        faces_path = self._faces_path(ep_id)
+        identities_path = self._identities_path(ep_id)
+
+        if not faces_path.exists() or not identities_path.exists():
+            return {"merged_groups": 0, "clusters_merged": 0, "merges": []}
+
+        # Load identities
+        identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+        identities = identities_data.get("identities", [])
+
+        # Build cluster -> track_ids map
+        cluster_to_tracks: Dict[str, List[int]] = {}
+        for identity in identities:
+            cluster_id = identity.get("identity_id")
+            track_ids = identity.get("track_ids", [])
+            if cluster_id:
+                cluster_to_tracks[cluster_id] = [int(t) for t in track_ids]
+
+        # Load faces and compute frame ranges per track
+        track_frame_ranges: Dict[int, tuple[int, int]] = {}
+        track_has_embeddings: Dict[int, bool] = {}
+
+        with faces_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    face = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                tid = face.get("track_id")
+                frame_idx = face.get("frame_idx")
+                if tid is None or frame_idx is None:
+                    continue
+
+                tid = int(tid)
+                frame_idx = int(frame_idx)
+
+                # Track frame range
+                if tid not in track_frame_ranges:
+                    track_frame_ranges[tid] = (frame_idx, frame_idx)
+                else:
+                    min_f, max_f = track_frame_ranges[tid]
+                    track_frame_ranges[tid] = (min(min_f, frame_idx), max(max_f, frame_idx))
+
+                # Track if has embeddings
+                if face.get("embedding") and not face.get("skip"):
+                    track_has_embeddings[tid] = True
+
+        # Identify quality-only clusters (no embeddings in any track)
+        cluster_frame_ranges: Dict[str, tuple[int, int]] = {}
+        quality_only_clusters: List[str] = []
+
+        for cluster_id, track_ids in cluster_to_tracks.items():
+            # Check if any track has embeddings
+            has_embeddings = any(track_has_embeddings.get(tid, False) for tid in track_ids)
+            if has_embeddings:
+                continue
+
+            # Compute cluster frame range
+            min_frame = float('inf')
+            max_frame = 0
+            for tid in track_ids:
+                if tid in track_frame_ranges:
+                    min_f, max_f = track_frame_ranges[tid]
+                    min_frame = min(min_frame, min_f)
+                    max_frame = max(max_frame, max_f)
+
+            if min_frame != float('inf'):
+                cluster_frame_ranges[cluster_id] = (int(min_frame), int(max_frame))
+                quality_only_clusters.append(cluster_id)
+
+        if len(quality_only_clusters) < 2:
+            return {"merged_groups": 0, "clusters_merged": 0, "merges": []}
+
+        # Sort by frame range for efficient grouping
+        quality_only_clusters.sort(key=lambda c: cluster_frame_ranges.get(c, (0, 0))[0])
+
+        # Find merge groups (clusters that can be merged together)
+        merge_groups: List[List[str]] = []
+        used: set[str] = set()
+
+        for i, cluster_a in enumerate(quality_only_clusters):
+            if cluster_a in used:
+                continue
+
+            group = [cluster_a]
+            used.add(cluster_a)
+            min_a, max_a = cluster_frame_ranges[cluster_a]
+
+            # Find adjacent clusters
+            for cluster_b in quality_only_clusters[i + 1:]:
+                if cluster_b in used:
+                    continue
+
+                min_b, max_b = cluster_frame_ranges[cluster_b]
+
+                # Check if temporally adjacent
+                # Adjacent if: max_a + gap >= min_b OR max_b + gap >= min_a
+                if max_a + max_frame_gap >= min_b and min_a - max_frame_gap <= max_b:
+                    group.append(cluster_b)
+                    used.add(cluster_b)
+                    # Extend the group's frame range
+                    max_a = max(max_a, max_b)
+
+            if len(group) > 1:
+                merge_groups.append(group)
+
+        if not merge_groups:
+            return {"merged_groups": 0, "clusters_merged": 0, "merges": []}
+
+        # Perform merges
+        merges_performed = []
+        for group in merge_groups:
+            # Keep the first cluster, merge others into it
+            target_cluster = group[0]
+            source_clusters = group[1:]
+
+            # Collect all track IDs
+            all_track_ids = list(cluster_to_tracks.get(target_cluster, []))
+            for source_cluster in source_clusters:
+                all_track_ids.extend(cluster_to_tracks.get(source_cluster, []))
+
+            # Update identities
+            for identity in identities:
+                if identity.get("identity_id") == target_cluster:
+                    identity["track_ids"] = list(set(all_track_ids))
+                    identity["merged_from"] = source_clusters
+                elif identity.get("identity_id") in source_clusters:
+                    # Mark as merged (will be filtered out)
+                    identity["merged_into"] = target_cluster
+
+            merges_performed.append({
+                "target": target_cluster,
+                "sources": source_clusters,
+                "track_count": len(all_track_ids),
+            })
+
+        # Filter out merged identities
+        identities = [
+            identity for identity in identities
+            if not identity.get("merged_into")
+        ]
+        identities_data["identities"] = identities
+
+        # Write back
+        identities_path.write_text(json.dumps(identities_data, indent=2), encoding="utf-8")
+
+        total_merged = sum(len(m["sources"]) for m in merges_performed)
+        LOGGER.info(
+            f"[{ep_id}] Merged {total_merged} quality-only clusters into {len(merge_groups)} groups"
+        )
+
+        return {
+            "merged_groups": len(merge_groups),
+            "clusters_merged": total_merged,
+            "merges": merges_performed,
+        }
 
     def group_within_episode(
         self,
@@ -1058,6 +1588,124 @@ class GroupingService:
         data["identities"] = identities
         identities_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    def _update_identities_with_groups(
+        self,
+        ep_id: str,
+        groups: List[List[str]],
+    ) -> None:
+        """Merge similar clusters into single identities in identities.json.
+
+        For each multi-cluster group, combine all track_ids into the first cluster
+        and remove the other clusters. This reduces the number of separate identities
+        that need to be assigned to cast members.
+
+        Also clears any existing assignments from people.json to ensure Faces Review
+        doesn't show stale cast member associations.
+
+        Args:
+            ep_id: Episode ID
+            groups: List of cluster_id groups (each group is a list of cluster_ids that belong together)
+        """
+        # Step 1: Remove episode clusters from people.json FIRST
+        # This prevents Faces Review from showing cast members with stale clusters
+        parsed = _parse_ep_id(ep_id)
+        if parsed:
+            show_id = parsed["show"]
+            try:
+                result = self.people_service.remove_episode_clusters(show_id, ep_id)
+                removed_clusters = result.get("clusters_removed", 0)
+                removed_people = result.get("empty_people_removed", 0)
+                if removed_clusters > 0 or removed_people > 0:
+                    LOGGER.info(
+                        f"[{ep_id}] Cleared {removed_clusters} cluster(s) from people.json ({removed_people} empty people deleted)"
+                    )
+            except Exception as e:
+                LOGGER.warning(f"[{ep_id}] Failed to remove clusters from people.json: {e}")
+
+        # Step 2: Merge clusters in identities.json
+        identities_path = self._identities_path(ep_id)
+        if not identities_path.exists():
+            return
+
+        data = json.loads(identities_path.read_text(encoding="utf-8"))
+        identities = data.get("identities", [])
+
+        # Build identity lookup by cluster_id
+        identity_map: Dict[str, Dict[str, Any]] = {}
+        for identity in identities:
+            cid = identity.get("identity_id")
+            if cid:
+                identity_map[cid] = identity
+
+        # Track which clusters to keep vs remove after merging
+        clusters_to_remove: set = set()
+        merged_count = 0
+
+        # Process each multi-cluster group
+        for group in groups:
+            if not group or len(group) < 2:
+                continue  # Skip singletons
+
+            # First cluster in group becomes the primary (absorbs the others)
+            primary_id = group[0]
+            primary = identity_map.get(primary_id)
+            if not primary:
+                continue
+
+            # Merge all other clusters into the primary
+            primary_tracks = set(primary.get("track_ids", []))
+            primary_size = primary.get("size", 0) or 0
+            merged_from = []
+
+            for cluster_id in group[1:]:
+                secondary = identity_map.get(cluster_id)
+                if not secondary:
+                    continue
+
+                # Absorb track_ids from secondary
+                secondary_tracks = secondary.get("track_ids", [])
+                primary_tracks.update(secondary_tracks)
+
+                # Add size from secondary
+                secondary_size = secondary.get("size", 0) or 0
+                primary_size += secondary_size
+
+                # Mark secondary for removal
+                clusters_to_remove.add(cluster_id)
+                merged_from.append(cluster_id)
+
+            if merged_from:
+                # Update primary with merged data
+                primary["track_ids"] = sorted(primary_tracks)
+                primary["size"] = primary_size
+                primary["merged_from"] = merged_from
+                merged_count += 1
+                LOGGER.info(
+                    f"[{ep_id}] Merged clusters {merged_from} into {primary_id} "
+                    f"({len(merged_from) + 1} clusters -> 1, {len(primary_tracks)} tracks)"
+                )
+
+        # Remove absorbed clusters from identity list
+        if clusters_to_remove:
+            identities = [i for i in identities if i.get("identity_id") not in clusters_to_remove]
+            LOGGER.info(f"[{ep_id}] Removed {len(clusters_to_remove)} absorbed cluster(s) after merging")
+
+        # Clear any stale person_id/cast_id from remaining identities
+        for identity in identities:
+            identity.pop("person_id", None)
+            identity.pop("cast_id", None)
+            identity.pop("group_id", None)  # No longer needed - clusters are actually merged
+
+        data["identities"] = identities
+        data["grouped_at"] = _now_iso()
+        data["group_mode"] = "merged"  # Indicates clusters were actually merged
+        data["merge_stats"] = {
+            "groups_merged": merged_count,
+            "clusters_absorbed": len(clusters_to_remove),
+            "identities_after": len(identities),
+        }
+        identities_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
     def _prune_empty_people(self, show_id: str) -> int:
         """Delete auto-created people that no longer own any clusters."""
         removed = 0
@@ -1076,14 +1724,15 @@ class GroupingService:
         progress_callback=None,
         protect_manual: bool | None = None,
         facebank_first: bool | None = None,
+        skip_cast_assignment: bool = True,
     ) -> Dict[str, Any]:
         """Run full auto grouping: compute centroids, within-episode, across-episode.
 
         Enhanced algorithm:
         1. Compute cluster centroids with cohesion metrics
-        2. Try facebank matching first (if enabled) - matches clusters to known cast members
+        2. Try facebank matching first (if enabled AND skip_cast_assignment=False)
         3. Within-episode grouping with cohesion-weighted distances
-        4. Across-episode matching to show-level people
+        4. Across-episode matching to show-level people (if skip_cast_assignment=False)
 
         Args:
             ep_id: Episode ID
@@ -1092,6 +1741,9 @@ class GroupingService:
                            to different cast members. Defaults to PROTECT_MANUAL_DEFAULT.
             facebank_first: If True, try matching clusters to facebank seeds before
                            using people prototypes. Defaults to FACEBANK_FIRST_MATCHING.
+            skip_cast_assignment: If True (default), only group similar clusters without
+                           assigning to cast members or creating people records. User must
+                           manually assign grouped clusters to cast members afterward.
 
         Returns combined result with audit log.
         """
@@ -1100,6 +1752,9 @@ class GroupingService:
             protect_manual = PROTECT_MANUAL_DEFAULT
         if facebank_first is None:
             facebank_first = FACEBANK_FIRST_MATCHING
+        # When skipping cast assignment, disable facebank matching
+        if skip_cast_assignment:
+            facebank_first = False
         parsed = _parse_ep_id(ep_id)
         if not parsed:
             raise ValueError(f"Invalid episode ID: {ep_id}")
@@ -1183,6 +1838,58 @@ class GroupingService:
         centroids_map: Dict[str, np.ndarray] = {
             cid: data["centroid"] for cid, data in centroids_map_full.items()
         }
+
+        # Step 1.1: Filter out clusters that match archived items for THIS episode only
+        # This prevents deleted/archived clusters from reappearing after reclustering
+        # Only checks archived items from the same episode, not other episodes in the show
+        _progress("filter_archived", 0.15, "Filtering archived clusters...")
+        archived_cluster_ids: set[str] = set()
+        try:
+            archive_service = ArchiveService()
+            # Only get archived clusters from THIS episode (not other episodes in the show)
+            archived_centroids = archive_service.get_archived_centroids(
+                show_id, item_type="cluster", episode_id=ep_id
+            )
+            if archived_centroids:
+                # Check each cluster against archived centroids from this episode
+                for cluster_id, centroid_data in list(centroids_map_full.items()):
+                    centroid_vec = centroid_data["centroid"]
+                    matches = archive_service.find_matching_archived(
+                        show_id,
+                        centroid_vec.tolist() if hasattr(centroid_vec, 'tolist') else list(centroid_vec),
+                        threshold=0.85,  # High threshold - must be very similar to archived
+                        item_type="cluster",
+                        episode_id=ep_id,  # Only match archived items from this episode
+                    )
+                    if matches:
+                        # This cluster matches an archived item - remove it
+                        archived_cluster_ids.add(cluster_id)
+                        LOGGER.info(
+                            f"[{ep_id}] Filtering archived cluster {cluster_id} "
+                            f"(matches archive_id={matches[0].get('archive_id')}, "
+                            f"similarity={matches[0].get('similarity', 0):.3f})"
+                        )
+
+                # Remove archived clusters from maps
+                for cid in archived_cluster_ids:
+                    centroids_map_full.pop(cid, None)
+                    centroids_map.pop(cid, None)
+
+            log["steps"].append({
+                "step": "filter_archived",
+                "status": "success",
+                "archived_checked": len(archived_centroids) if archived_centroids else 0,
+                "filtered_count": len(archived_cluster_ids),
+            })
+            _progress(
+                "filter_archived",
+                0.2,
+                f"Filtered {len(archived_cluster_ids)} archived cluster(s)",
+            )
+        except Exception as e:
+            # Don't fail the whole operation if archive check fails
+            LOGGER.warning(f"[{ep_id}] Failed to filter archived clusters: {e}")
+            log["steps"].append({"step": "filter_archived", "status": "error", "error": str(e)})
 
         # Step 1.5: Facebank-first matching (if enabled)
         # Try to match clusters to known cast members via their facebank seeds
@@ -1289,6 +1996,78 @@ class GroupingService:
             self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=False)
             # Continue even if within-episode grouping fails - clusters can still be matched across episodes
 
+        # Build groupings from within_result (if any)
+        groups: List[List[str]] = []
+        if isinstance(within_result, dict):
+            for group_entry in within_result.get("groups", []) or []:
+                if not isinstance(group_entry, dict):
+                    continue
+                cluster_ids = [str(cid) for cid in group_entry.get("cluster_ids", []) if cid]
+                if len(cluster_ids) > 1:
+                    groups.append(cluster_ids)
+
+        # Ensure singletons are tracked
+        all_clusters = set(centroids_map.keys())
+        grouped_clusters = set()
+        for group in groups:
+            grouped_clusters.update(group)
+        for cid in sorted(all_clusters - grouped_clusters):
+            groups.append([cid])
+
+        # =========================================================================
+        # SKIP CAST ASSIGNMENT MODE: Only group similar clusters, no people/cast
+        # =========================================================================
+        if skip_cast_assignment:
+            _progress(
+                "finalize_grouping",
+                0.9,
+                f"Finalizing {len(groups)} cluster group(s) (no cast assignment)...",
+                {"total_clusters": len(centroids_map), "groups": len(groups)},
+            )
+
+            # Update identities.json to record which clusters are grouped together
+            # Use a group_id to link clusters without creating people records
+            self._update_identities_with_groups(ep_id, groups)
+
+            log["steps"].append({
+                "step": "finalize_grouping",
+                "status": "success",
+                "groups": len(groups),
+                "total_clusters": len(centroids_map),
+                "mode": "skip_cast_assignment",
+            })
+            _progress(
+                "finalize_grouping",
+                1.0,
+                f"Grouped {len(centroids_map)} clusters into {len(groups)} group(s). Ready for manual cast assignment.",
+                {
+                    "total_clusters": len(centroids_map),
+                    "groups": len(groups),
+                    "multi_cluster_groups": sum(1 for g in groups if len(g) > 1),
+                },
+            )
+
+            log["finished_at"] = _now_iso()
+            self._save_group_log(ep_id, log)
+            self._write_progress(ep_id, progress_entries, started_at=log["started_at"], finished=True)
+            self._cleanup_progress_file(ep_id)
+
+            return {
+                "ep_id": ep_id,
+                "centroids": centroids_result,
+                "facebank_matching": {},
+                "facebank_assigned": 0,
+                "within_episode": within_result,
+                "across_episodes": {},
+                "assignments": [],
+                "groups": [{"cluster_ids": g} for g in groups],
+                "skip_cast_assignment": True,
+                "log": log,
+            }
+
+        # =========================================================================
+        # FULL AUTO-ASSIGN MODE: Create people records and assign to cast
+        # =========================================================================
         # Step 3: Across-episode matching to people (auto-assign + create)
         _progress(
             "group_across_episodes",
@@ -1321,28 +2100,11 @@ class GroupingService:
             raise
 
         # Step 4: Apply within-episode merges to the assigned people
-        # Build groupings from within_result (if any)
-        groups: List[List[str]] = []
-        if isinstance(within_result, dict):
-            for group_entry in within_result.get("groups", []) or []:
-                if not isinstance(group_entry, dict):
-                    continue
-                cluster_ids = [str(cid) for cid in group_entry.get("cluster_ids", []) if cid]
-                if len(cluster_ids) > 1:
-                    groups.append(cluster_ids)
-
-        # Ensure singletons are tracked so all clusters get assignments
         assigned_map: Dict[str, str] = {
             str(entry.get("cluster_id")): str(entry.get("person_id"))
             for entry in assignments
             if entry.get("cluster_id") and entry.get("person_id")
         }
-        all_clusters = set(centroids_map.keys())
-        grouped_clusters = set()
-        for group in groups:
-            grouped_clusters.update(group)
-        for cid in sorted(all_clusters - grouped_clusters):
-            groups.append([cid])
 
         merged_clusters = 0
         facebank_assigned = 0
@@ -2346,37 +3108,91 @@ class GroupingService:
                                     break
                         temporal_suggestions = unique_suggestions
 
-                quality_only_clusters.append({
-                    "cluster_id": cluster_id,
-                    "track_ids": track_ids,
-                    "person_id": person_id,
-                    "has_embeddings": False,
-                    "quality_only": is_quality_only,
-                    "total_faces": total_faces,
-                    "skipped_faces": skipped_faces,
-                    "skip_reasons": list(set(all_skip_reasons))[:10],  # Unique reasons, max 10
-                    "blurry_count": len(blurry_reasons),
-                    "other_skip_count": len(other_reasons),
-                    "reason_summary": (
-                        f"blurry ({len(blurry_reasons)} faces)"
-                        if len(blurry_reasons) > len(other_reasons)
-                        else f"quality gate ({len(all_skip_reasons)} faces)"
-                    ) if all_skip_reasons else "unknown (no skip reasons)",
-                    "frame_range": [min(cluster_frames), max(cluster_frames)] if cluster_frames else None,
-                    "temporal_suggestions": temporal_suggestions,  # Cast members appearing in nearby frames
-                })
+                # If we have temporal suggestions, convert them to actual cast suggestions
+                # This provides fallback suggestions for quality-only clusters based on nearby assigned tracks
+                if temporal_suggestions:
+                    # Convert temporal suggestions to cast_suggestions format
+                    # Use a base similarity that scales with frame proximity (closer = higher confidence)
+                    temporal_cast_suggestions = []
+                    for ts in temporal_suggestions[:top_k]:
+                        # Calculate proximity-based similarity (max 0.50 for very close, min 0.30)
+                        # overlap_frames is how many frames overlap with the temporal window
+                        overlap = ts.get("overlap_frames", 0)
+                        # More overlap = higher confidence (0.30 base + up to 0.20 bonus)
+                        proximity_similarity = min(0.50, 0.30 + (overlap / 300.0))
+                        temporal_cast_suggestions.append({
+                            "cast_id": ts["cast_id"],
+                            "name": ts["cast_name"],
+                            "similarity": round(proximity_similarity, 3),
+                            "source": "temporal",  # Mark as temporal-based suggestion
+                            "faces_used": 0,  # No face embeddings used
+                            "frame_proximity": overlap,
+                            "nearby_track_id": ts.get("track_id"),
+                        })
 
+                    # Add to main suggestions list (these will appear in Smart Suggestions)
+                    suggestions.append({
+                        "cluster_id": cluster_id,
+                        "cast_suggestions": temporal_cast_suggestions,
+                        "rescued": False,
+                        "temporal_only": True,  # Flag for UI to show warning badge
+                        "quality_only_metadata": {
+                            "total_faces": total_faces,
+                            "skipped_faces": skipped_faces,
+                            "reason_summary": (
+                                f"blurry ({len(blurry_reasons)} faces)"
+                                if len(blurry_reasons) > len(other_reasons)
+                                else f"quality gate ({len(all_skip_reasons)} faces)"
+                            ) if all_skip_reasons else "unknown",
+                        },
+                    })
+                    LOGGER.debug(
+                        f"[{ep_id}] Cluster {cluster_id}: converted {len(temporal_cast_suggestions)} "
+                        f"temporal suggestions to cast suggestions"
+                    )
+                else:
+                    # No temporal suggestions available - add to quality_only_clusters
+                    quality_only_clusters.append({
+                        "cluster_id": cluster_id,
+                        "track_ids": track_ids,
+                        "person_id": person_id,
+                        "has_embeddings": False,
+                        "quality_only": is_quality_only,
+                        "total_faces": total_faces,
+                        "skipped_faces": skipped_faces,
+                        "skip_reasons": list(set(all_skip_reasons))[:10],  # Unique reasons, max 10
+                        "blurry_count": len(blurry_reasons),
+                        "other_skip_count": len(other_reasons),
+                        "reason_summary": (
+                            f"blurry ({len(blurry_reasons)} faces)"
+                            if len(blurry_reasons) > len(other_reasons)
+                            else f"quality gate ({len(all_skip_reasons)} faces)"
+                        ) if all_skip_reasons else "unknown (no skip reasons)",
+                        "frame_range": [min(cluster_frames), max(cluster_frames)] if cluster_frames else None,
+                        "temporal_suggestions": [],  # No temporal suggestions available
+                    })
+
+            # Count how many clusters got temporal suggestions vs truly no suggestions
+            temporal_suggestion_count = len(clusters_missing_centroids) - len(quality_only_clusters)
+            if temporal_suggestion_count > 0:
+                LOGGER.info(
+                    f"[{ep_id}] Converted {temporal_suggestion_count} quality-only clusters "
+                    f"to temporal-based suggestions"
+                )
             if quality_only_clusters:
                 LOGGER.info(
-                    f"[{ep_id}] Identified {len(quality_only_clusters)} quality-only clusters "
-                    f"(no embeddings, all faces skipped)"
+                    f"[{ep_id}] {len(quality_only_clusters)} quality-only clusters have no suggestions "
+                    f"(no embeddings and no nearby assigned tracks)"
                 )
 
         # Log summary
+        temporal_only_count = sum(1 for s in suggestions if s.get("temporal_only"))
+        embedding_based_count = len(suggestions) - temporal_only_count
         LOGGER.info(
-            f"[{ep_id}] Generated cast suggestions for {len(suggestions)} clusters; "
+            f"[{ep_id}] Generated cast suggestions for {len(suggestions)} clusters "
+            f"({embedding_based_count} embedding-based, {temporal_only_count} temporal-based); "
             f"{len(mismatched_embeddings)} skipped due to dimension mismatch; "
-            f"{len(quality_only_clusters)} quality-only (no embeddings)"
+            f"{len(quality_only_clusters)} with no suggestions"
         )
         return {
             "suggestions": suggestions,
@@ -3424,6 +4240,79 @@ class GroupingService:
             "results": merge_results,
             "threshold": similarity_threshold,
         }
+
+    def get_cast_suggestions_for_embedding(
+        self,
+        ep_id: str,
+        embedding: List[float],
+        top_k: int = 3,
+        exclude_cast_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get cast suggestions for a single embedding by comparing to all people's prototypes.
+
+        This is used by the outlier audit to suggest reassignments for tracks that
+        have low cohesion with their current assignment.
+
+        Args:
+            ep_id: Episode ID (to extract show_id)
+            embedding: 512-d face embedding vector
+            top_k: Number of top matches to return
+            exclude_cast_id: Optional cast_id to exclude from results (e.g., current assignment)
+
+        Returns:
+            List of suggestions: [{"cast_id": str, "name": str, "similarity": float}, ...]
+        """
+        from apps.api.services.facebank import cosine_similarity
+
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            return []
+        show_id = parsed["show"]
+
+        # Get all people for this show
+        people = self.people_service.list_people(show_id)
+        if not people:
+            return []
+
+        # Get cast info for names
+        cast_members = self.cast_service.list_cast(show_id)
+        cast_lookup = {m["cast_id"]: m.get("name", m["cast_id"]) for m in cast_members if m.get("cast_id")}
+
+        # Convert embedding to numpy array
+        embedding_vec = np.array(embedding, dtype=np.float32)
+        norm = np.linalg.norm(embedding_vec)
+        if norm > 1e-6:
+            embedding_vec = embedding_vec / norm
+
+        # Compare against all people's prototypes
+        suggestions = []
+        for person in people:
+            cast_id = person.get("cast_id")
+            if not cast_id:
+                continue  # Skip people not linked to cast
+
+            if exclude_cast_id and cast_id == exclude_cast_id:
+                continue  # Skip excluded cast member
+
+            prototype = person.get("prototype", [])
+            if not prototype:
+                continue
+
+            proto_vec = np.array(prototype, dtype=np.float32)
+            if proto_vec.shape != embedding_vec.shape:
+                continue
+
+            similarity = cosine_similarity(embedding_vec, proto_vec)
+            suggestions.append({
+                "cast_id": cast_id,
+                "name": cast_lookup.get(cast_id, person.get("name", cast_id)),
+                "person_id": person.get("person_id"),
+                "similarity": round(float(similarity), 3),
+            })
+
+        # Sort by similarity (highest first) and return top_k
+        suggestions.sort(key=lambda x: x["similarity"], reverse=True)
+        return suggestions[:top_k]
 
 
 __all__ = ["GroupingService", "GROUP_WITHIN_EP_DISTANCE", "PEOPLE_MATCH_DISTANCE"]

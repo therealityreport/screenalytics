@@ -4,26 +4,25 @@
 
 # Quality gating thresholds
 # These control which faces are accepted for embedding based on quality metrics
+# NOTE: Relaxed settings to include smaller/lower-quality faces that may be cast members
 quality_gating:
   # Combined quality score threshold (0.0-10.0, higher = stricter)
   # Quality score combines: blur + contrast + face size
-  min_quality_score: 3.0
+  # Lowered from 3.0 to 1.5 to include more faces
+  min_quality_score: 1.5
 
   # Individual component thresholds
-  min_confidence: 0.60      # Detection confidence (0.0-1.0)
-  min_blur_score: 35.0      # Laplacian variance (higher = sharper)
-  min_std: 1.0              # Image standard deviation (contrast)
+  min_confidence: 0.45      # Detection confidence (0.0-1.0) - lowered from 0.60
+  min_blur_score: 15.0      # Laplacian variance (higher = sharper) - lowered from 35.0
+  min_std: 0.5              # Image standard deviation (contrast) - lowered from 1.0
 
-  # Pose filtering (degrees)
-  max_yaw_angle: 45.0       # Maximum head rotation (left/right)
-  max_pitch_angle: 30.0     # Maximum head tilt (up/down)
+  # Pose filtering (degrees) - relaxed to include more profile shots
+  max_yaw_angle: 60.0       # Maximum head rotation (left/right) - was 45.0
+  max_pitch_angle: 45.0     # Maximum head tilt (up/down) - was 30.0
 
   # Expression filtering (list of allowed expressions, or empty for all)
-  allowed_expressions:
-    - neutral
-    - smile
-    - happy
-    - unknown
+  # Empty list = allow all expressions
+  allowed_expressions: []
 
   # Sampling strategy: "uniform", "quality_weighted", "stratified"
   sampling_mode: "quality_weighted"

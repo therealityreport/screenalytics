@@ -443,21 +443,24 @@ def _upload_presigned(
     file_obj,
     headers: dict,
     content_type: str = "video/mp4",
-    chunk_size: int = 8 * 1024 * 1024,  # 8 MB default chunk size
+    max_retries: int = 3,
 ) -> None:
-    """Upload file using presigned URL with streaming (no boto3 required).
+    """Upload file using presigned URL (no boto3 required).
 
-    Streams the upload in chunks to avoid loading the entire file into memory.
-    This is critical for multi-GB video uploads that would otherwise OOM.
+    Reads the entire file into memory before uploading to avoid SSL streaming
+    issues with OpenSSL 3.x. For very large files (>2GB), consider using
+    boto3 multipart upload instead.
+
+    Includes retry logic for transient SSL/network errors.
 
     Args:
         upload_url: Presigned S3 PUT URL
         file_obj: File-like object supporting read() and seek()
         headers: Headers to include in the PUT request
         content_type: MIME type for the uploaded file (default: video/mp4)
-        chunk_size: Size of chunks to stream (default: 8 MB)
+        max_retries: Maximum number of retry attempts for transient errors (default: 3)
     """
-    from urllib.parse import urlparse
+    from requests.exceptions import SSLError, ConnectionError, Timeout, ChunkedEncodingError
 
     # Get file size for progress tracking
     file_obj.seek(0, 2)  # Seek to end
@@ -467,34 +470,60 @@ def _upload_presigned(
     # Create progress bar and status
     progress_bar = st.progress(0)
     status_text = st.empty()
-    status_text.text(f"Uploading: 0 MB / {file_size / (1024**2):.1f} MB (0%)")
 
     # Merge content-type and content-length into headers
     request_headers = dict(headers)
     request_headers["Content-Type"] = content_type
     request_headers["Content-Length"] = str(file_size)
 
-    # Create a streaming generator that yields chunks and updates progress
-    def _streaming_generator():
-        bytes_sent = 0
-        while True:
-            chunk = file_obj.read(chunk_size)
-            if not chunk:
-                break
-            bytes_sent += len(chunk)
-            # Update progress (will be displayed after each chunk is sent)
-            progress = bytes_sent / file_size if file_size > 0 else 0
-            progress_bar.progress(min(progress, 1.0))
-            mb_sent = bytes_sent / (1024**2)
-            mb_total = file_size / (1024**2)
-            status_text.text(
-                f"Uploading: {mb_sent:.1f} MB / {mb_total:.1f} MB ({progress * 100:.1f}%)"
-            )
-            yield chunk
+    # Read entire file into memory (avoids SSL streaming issues with OpenSSL 3.x)
+    status_text.text(f"Reading file into memory: {file_size / (1024**2):.1f} MB...")
+    progress_bar.progress(0.1)
+    file_data = file_obj.read()
+    progress_bar.progress(0.2)
+    status_text.text(f"Uploading: 0 MB / {file_size / (1024**2):.1f} MB (0%)")
 
-    # Upload using requests.put with streaming data
-    response = requests.put(upload_url, data=_streaming_generator(), headers=request_headers)
-    response.raise_for_status()
+    # Retry loop for transient network errors
+    last_error = None
+    for attempt in range(max_retries + 1):
+        retry_info = f" (attempt {attempt + 1}/{max_retries + 1})" if attempt > 0 else ""
+        status_text.text(
+            f"Uploading: {file_size / (1024**2):.1f} MB...{retry_info}"
+        )
+        progress_bar.progress(0.3)
+
+        try:
+            # Upload using requests.put with pre-read data (not streaming)
+            # This avoids SSL buffer issues with OpenSSL 3.x streaming uploads
+            response = requests.put(
+                upload_url,
+                data=file_data,
+                headers=request_headers,
+                timeout=(30, 600),  # 30s connect, 600s read timeout for large files
+            )
+            response.raise_for_status()
+            # Success - break out of retry loop
+            break
+
+        except (SSLError, ConnectionError, Timeout, ChunkedEncodingError) as exc:
+            last_error = exc
+            if attempt < max_retries:
+                # Exponential backoff: 2s, 4s, 8s
+                wait_time = 2 ** (attempt + 1)
+                status_text.text(
+                    f"Upload interrupted ({type(exc).__name__}). Retrying in {wait_time}s... "
+                    f"(attempt {attempt + 1}/{max_retries + 1})"
+                )
+                progress_bar.progress(0)
+                time.sleep(wait_time)
+            else:
+                # All retries exhausted
+                progress_bar.empty()
+                status_text.empty()
+                raise Exception(
+                    f"Upload failed after {max_retries + 1} attempts. "
+                    f"Last error: {type(exc).__name__}: {exc}"
+                ) from exc
 
     # Complete the progress bar
     progress_bar.progress(1.0)
@@ -712,15 +741,33 @@ if submit:
     bucket = presign_resp.get("bucket")
     key = presign_resp.get("key") or presign_resp.get("object_key")
 
-    if upload_method == "PUT" and upload_url:
-        # S3 presigned URL upload - use requests.put (no boto3 credentials needed)
-        st.info(f"Uploading to s3://{bucket}/{key} via presigned URL...")
+    if upload_method == "PUT" and bucket and key:
+        # Try boto3 multipart upload first (more reliable on macOS with OpenSSL 3.x)
+        # Fall back to presigned URL if boto3 credentials are unavailable
+        st.info(f"Uploading to s3://{bucket}/{key}...")
+        s3_upload_success = False
+
         try:
-            _upload_presigned(upload_url, uploaded_file, upload_headers)
-        except Exception as exc:
-            st.error(f"Upload failed: {type(exc).__name__}: {exc}")
-            _rollback_episode_creation(ep_id)
-            st.stop()
+            _upload_file(bucket, key, uploaded_file)
+            s3_upload_success = True
+        except Exception as boto_exc:
+            # boto3 failed (likely no credentials), try presigned URL
+            st.warning(f"Direct S3 upload failed ({type(boto_exc).__name__}), trying presigned URL...")
+            uploaded_file.seek(0)
+
+            if upload_url:
+                try:
+                    _upload_presigned(upload_url, uploaded_file, upload_headers)
+                    s3_upload_success = True
+                except Exception as presign_exc:
+                    st.error(f"Upload failed: {type(presign_exc).__name__}: {presign_exc}")
+                    _rollback_episode_creation(ep_id)
+                    st.stop()
+            else:
+                st.error(f"Upload failed: {type(boto_exc).__name__}: {boto_exc}")
+                _rollback_episode_creation(ep_id)
+                st.stop()
+
         # Seek back to beginning for local mirror after S3 upload
         uploaded_file.seek(0)
     elif upload_method == "FILE":

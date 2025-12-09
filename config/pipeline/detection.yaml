@@ -1,17 +1,19 @@
 model_id: retinaface_r50
-min_size: 90
-confidence_th: 0.8
+# Minimum face size in pixels - lowered to 24x24 to detect smaller/distant faces
+min_size: 24
+# Detection confidence threshold - lowered from 0.8 to catch more faces
+confidence_th: 0.50
 iou_th: 0.5  # D5: Increased from 0.4 for better NMS consistency
 
 # D1: Adaptive confidence threshold (fixes low-light/high-contrast detection)
 adaptive_confidence: false  # Set to true to enable adaptive thresholding
-min_confidence: 0.6  # Minimum threshold for very dark scenes
+min_confidence: 0.45  # Minimum threshold for very dark scenes (was 0.6)
 max_confidence: 0.9  # Maximum threshold for well-lit scenes
 
 # D2: Configurable minimum face size (fixes small background faces)
 # Lower this value to detect smaller/background faces (e.g., 32 or 24)
 # Note: Lower values increase false positives and processing time
-min_size_small_faces: 32  # Alternative min_size for background face detection
+min_size_small_faces: 24  # Alternative min_size for background face detection (was 32)
 
 # D7: NMS mode selection (fixes overlapping faces in crowds/hugs)
 nms_mode: hard  # Options: "hard" or "soft"

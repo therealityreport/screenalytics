@@ -119,6 +119,18 @@ def get_archived_centroids(
     }
 
 
+class ArchiveClusterRequest(BaseModel):
+    """Request to archive a cluster."""
+
+    episode_id: str = Field(..., description="Episode ID")
+    cluster_id: str = Field(..., description="Cluster ID")
+    reason: str = Field("user_skipped", description="Reason for archiving")
+    centroid: Optional[list[float]] = Field(None, description="Cluster centroid embedding")
+    rep_crop_url: Optional[str] = Field(None, description="Representative crop URL")
+    track_ids: Optional[list[int]] = Field(None, description="Track IDs in this cluster")
+    face_count: int = Field(0, description="Number of faces in this cluster")
+
+
 class ArchiveTrackRequest(BaseModel):
     """Request to archive a track."""
 
@@ -129,6 +141,30 @@ class ArchiveTrackRequest(BaseModel):
     centroid: Optional[list[float]] = Field(None, description="Track centroid embedding")
     rep_crop_url: Optional[str] = Field(None, description="Representative crop URL")
     frame_count: int = Field(0, description="Number of frames in this track")
+
+
+@router.post("/shows/{show_id}/clusters")
+def archive_cluster(show_id: str, request: ArchiveClusterRequest) -> dict:
+    """Archive a cluster when user skips/dismisses it.
+
+    Stores the cluster metadata for potential future matching or restoration.
+    This allows auto-archiving similar faces in future episodes.
+    """
+    archived = archive_service.archive_cluster(
+        show_id,
+        request.episode_id,
+        request.cluster_id,
+        reason=request.reason,
+        centroid=request.centroid,
+        rep_crop_url=request.rep_crop_url,
+        track_ids=request.track_ids,
+        face_count=request.face_count,
+    )
+    return {
+        "status": "archived",
+        "archive_id": archived.get("archive_id"),
+        "cluster_id": request.cluster_id,
+    }
 
 
 @router.post("/shows/{show_id}/tracks")
@@ -151,4 +187,25 @@ def archive_track(show_id: str, request: ArchiveTrackRequest) -> dict:
         "status": "archived",
         "archive_id": archived.get("archive_id"),
         "track_id": request.track_id,
+    }
+
+
+@router.delete("/shows/{show_id}/clear")
+def clear_all_archived(
+    show_id: str,
+    episode_id: Optional[str] = Query(None, description="Filter by episode (only clear items from this episode)"),
+) -> dict:
+    """Clear archived items for a show (or specific episode).
+
+    This permanently deletes archived people, clusters, and tracks.
+    Use with caution - this cannot be undone.
+
+    If episode_id is provided, only items from that episode are cleared.
+    """
+    result = archive_service.clear_all(show_id, episode_id=episode_id)
+    return {
+        "status": "cleared",
+        "show_id": show_id,
+        "episode_id": episode_id,
+        "deleted_count": result.get("deleted_count", 0),
     }

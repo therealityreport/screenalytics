@@ -698,6 +698,7 @@ def _invalidate_assignment_caches() -> None:
     _fetch_people_cached.clear()
     _fetch_cast_cached.clear()
     _fetch_cluster_track_reps_cached.clear()
+    _fetch_unlinked_entities.clear()  # Critical: clears "Needs Assignment" cache
     # Clear session state caches if they exist
     for key in list(st.session_state.keys()):
         if key.startswith("cast_carousel_cache") or key.startswith("_thumb_result_cache"):
@@ -2452,7 +2453,8 @@ def _render_cast_carousel(
 
     cast_api_resp = cache.get(show_key)
     if cast_api_resp is None:
-        cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast")
+        # Include featured seed thumbnails for cast gallery display
+        cast_api_resp = _safe_api_get(f"/shows/{show_id}/cast", params={"include_featured": "1"})
         if cast_api_resp:
             cache[show_key] = cast_api_resp
     if not cast_api_resp:
@@ -2643,7 +2645,7 @@ def _render_unassigned_cluster_card(
     track_list = cluster_meta.get("tracks", [])
 
     # For single-track clusters, show even single-frame tracks (with low-confidence badge)
-    # For multi-track clusters, filter out single-frame tracks as noise
+    # For multi-track clusters, filter out single-frame tracks as noise UNLESS that would leave 0 tracks
     original_track_list = track_list
     is_single_track_cluster = len(track_list) == 1
     has_single_frame_track = any(t.get("faces", 0) <= 1 for t in track_list)
@@ -2653,8 +2655,14 @@ def _render_unassigned_cluster_card(
         filtered_tracks_count = 0
     else:
         # Filter out single-frame tracks for multi-track clusters
-        track_list = [t for t in track_list if t.get("faces", 0) > 1]
-        filtered_tracks_count = len(original_track_list) - len(track_list)
+        multi_frame_tracks = [t for t in track_list if t.get("faces", 0) > 1]
+        if multi_frame_tracks:
+            # We have some multi-frame tracks, filter out single-frame ones
+            track_list = multi_frame_tracks
+            filtered_tracks_count = len(original_track_list) - len(track_list)
+        else:
+            # ALL tracks are single-frame — show them with a warning rather than hiding everything
+            filtered_tracks_count = 0  # Don't filter, show all with warning
 
     # Recalculate counts after filtering
     tracks_count = len(track_list)
@@ -2947,101 +2955,66 @@ def _render_unassigned_cluster_card(
                 st.text_area("Debug Info", debug_info, height=300, key=f"debug_{cluster_id}")
                 st.caption("Select all (Cmd+A) and copy (Cmd+C)")
 
-        # Display one representative frame from each track in the cluster with scrollable carousel
+        # Display each track as its own row with carousel of frames
         if track_list:
-            num_tracks = len(track_list)
-            max_visible = 6  # Show up to 6 tracks at a time
+            import streamlit.components.v1 as components
 
-            # Track pagination state for this cluster (include ep_id to avoid collisions)
-            page_key = f"track_page_{ep_id}_{cluster_id}"
-            if page_key not in st.session_state:
-                st.session_state[page_key] = 0
+            # Inject CSS/JS once for all track carousels
+            st.markdown(helpers.cluster_track_rows_css(), unsafe_allow_html=True)
 
-            current_page = st.session_state[page_key]
-            total_pages = (num_tracks + max_visible - 1) // max_visible
+            for track in track_list:
+                track_id_val = track.get("track_id")
+                track_faces = track.get("faces", 0)
+                track_sim = track.get("similarity")
+                track_internal_sim = track.get("internal_similarity")
+                track_sim_value = track_sim if track_sim is not None else track_internal_sim
 
-            # Navigation controls if more than max_visible tracks
-            if total_pages > 1:
-                col_left, col_center, col_right = st.columns([1, 6, 1])
-                with col_left:
-                    if st.button("◀", key=f"prev_{ep_id}_{cluster_id}", disabled=current_page == 0):
-                        st.session_state[page_key] = max(0, current_page - 1)
-                        st.rerun()
-                with col_center:
-                    st.caption(
-                        f"Showing tracks {current_page * max_visible + 1}-{min((current_page + 1) * max_visible, num_tracks)} of {num_tracks}"
-                    )
-                with col_right:
-                    if st.button(
-                        "▶",
-                        key=f"next_{ep_id}_{cluster_id}",
-                        disabled=current_page >= total_pages - 1,
-                    ):
-                        st.session_state[page_key] = min(total_pages - 1, current_page + 1)
-                        st.rerun()
+                # Fetch frames for this track (sample every 1, up to 20 frames)
+                frames_data = _fetch_track_frames(
+                    ep_id,
+                    track_id_val,
+                    sample=1,
+                    page=1,
+                    page_size=20,
+                    include_skipped=False,
+                )
+                frames = frames_data.get("items", [])
 
-            # Display current page of tracks in a single row
-            start_idx = current_page * max_visible
-            end_idx = min(start_idx + max_visible, num_tracks)
-            visible_tracks = track_list[start_idx:end_idx]
-
-            # Create single-row columns for the visible tracks
-            if visible_tracks:
-                cols = st.columns(len(visible_tracks))
-                for idx, track in enumerate(visible_tracks):
-                    with cols[idx]:
-                        thumb_url = track.get("rep_thumb_url")
-                        track_id = track.get("track_id")
-                        track_faces = track.get("faces", 0)
-                        track_sim = track.get("similarity")
-                        track_internal_sim = track.get("internal_similarity")
-                        # Prefer explicit track similarity, else internal similarity as fallback
-                        track_sim_value = track_sim if track_sim is not None else track_internal_sim
-                        # Nov 2024: Enhanced with dropout indicator
-                        track_badge = None
-                        if track_sim_value is not None:
-                            excluded_frames = track.get("excluded_frames", 0)
-                            track_badge = render_track_with_dropout(track_sim_value, excluded_frames, track_faces)
-
-                        # Show track info with similarity score if available
-                        caption = f"Track {track_id} · {track_faces} faces"
-                        if track_sim_value is not None:
-                            sim_pct = int(track_sim_value * 100)
-                            caption = f"Track {track_id} · {track_faces} faces · {sim_pct}% sim"
-
-                        if thumb_url:
-                            # Use presigned URL directly if already HTTPS, otherwise extract key
-                            if thumb_url.startswith("https://"):
-                                thumb_src = thumb_url
-                            else:
-                                thumb_src = _extract_s3_key_from_url(thumb_url)
-                            thumb_markup = helpers.thumb_html(
-                                thumb_src,
-                                alt=f"Track {track_id}",
-                                hide_if_missing=False,
-                            )
-                            st.markdown(thumb_markup, unsafe_allow_html=True)
-                            if track_badge:
-                                st.markdown(track_badge, unsafe_allow_html=True)
-                        else:
-                            # Show placeholder when no thumbnail
-                            st.markdown(
-                                '<div style="width:147px;height:184px;background:#333;border-radius:6px;'
-                                'display:flex;align-items:center;justify-content:center;color:#666;">'
-                                '📷</div>',
-                                unsafe_allow_html=True,
-                            )
-                        st.caption(caption)
+                # Build the carousel HTML for this track row
+                carousel_html = helpers.cluster_track_row_carousel_html(
+                    cluster_id=cluster_id,
+                    track_id=track_id_val,
+                    frames=frames,
+                    track_similarity=track_sim_value,
+                    track_faces=track_faces,
+                    thumb_width=100,
+                    max_visible=6,
+                )
+                st.markdown(carousel_html, unsafe_allow_html=True)
 
         # Show cast suggestions (Enhancement #1) if available
         if cast_suggestions:
             st.markdown("**🎯 Cast Suggestions:**")
             margin_pct = None
+            top_sim = cast_suggestions[0].get("similarity") or 0
+
+            # Filter suggestions: only show runners-up if they're close to top match
+            # - If delta >= 10%, only show the top suggestion (confident match)
+            # - If delta < 10%, show close runners-up (ambiguous, needs review)
+            filtered_suggestions = [cast_suggestions[0]]
             if len(cast_suggestions) > 1:
-                top = cast_suggestions[0].get("similarity") or 0
                 runner_up = cast_suggestions[1].get("similarity") or 0
-                margin_pct = int((max(top - runner_up, 0)) * 100)
-            for idx, cast_sugg in enumerate(cast_suggestions[:3]):
+                margin_pct = int((max(top_sim - runner_up, 0)) * 100)
+
+                # Only show runners-up if margin is small (< 10%) AND runner is decent (>= 40%)
+                if margin_pct < 10:
+                    for sugg in cast_suggestions[1:3]:
+                        sugg_sim = sugg.get("similarity") or 0
+                        # Include if within 10% of top AND at least 40% similarity
+                        if (top_sim - sugg_sim) < 0.10 and sugg_sim >= 0.40:
+                            filtered_suggestions.append(sugg)
+
+            for idx, cast_sugg in enumerate(filtered_suggestions):
                 sugg_cast_id = cast_sugg.get("cast_id")
                 sugg_name = cast_sugg.get("name", sugg_cast_id)
                 sugg_sim = cast_sugg.get("similarity", 0)
@@ -3049,8 +3022,8 @@ def _render_unassigned_cluster_card(
                 sugg_source = cast_sugg.get("source", "facebank")
                 faces_used = cast_sugg.get("faces_used")
 
-                # Nov 2024: Enhanced with rank context
-                total_suggs = min(len(cast_suggestions), 3)
+                # Nov 2024: Enhanced with rank context (use filtered list count)
+                total_suggs = len(filtered_suggestions)
                 sim_badge = render_cast_rank_badge(sugg_sim, rank=idx + 1, total_suggestions=total_suggs, cast_name=sugg_name)
                 # Confidence buckets aligned to cast thresholds (68/50)
                 conf_level = "high" if sugg_sim >= 0.68 else "medium" if sugg_sim >= 0.50 else "low"
@@ -3095,6 +3068,7 @@ def _render_unassigned_cluster_card(
                         }
                         resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                         if resp and resp.get("status") == "success":
+                            _invalidate_assignment_caches()
                             st.success(f"Assigned cluster to {sugg_name}!")
                             st.rerun()
                         else:
@@ -3159,6 +3133,7 @@ def _render_unassigned_cluster_card(
                     }
                     resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                     if resp and resp.get("status") == "success":
+                        _invalidate_assignment_caches()
                         st.success(f"Assigned cluster to {suggested_cast_name}!")
                         st.rerun()
                     else:
@@ -3217,6 +3192,7 @@ def _render_unassigned_cluster_card(
                                 }
                                 resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
                                 if resp and resp.get("status") == "success":
+                                    _invalidate_assignment_caches()
                                     st.success(f"Assigned cluster to {cast_options.get(selected_cast_id, 'cast member')}!")
                                     st.rerun()
                                 else:
@@ -3225,28 +3201,31 @@ def _render_unassigned_cluster_card(
                 st.warning("No cast members available. Import cast first.")
 
         else:  # New person
-            new_name = st.text_input(
-                "Person name",
-                key=f"new_name_unassigned_{cluster_id}",
-                placeholder="Enter name...",
-            )
-            if st.button(
-                "Create person",
-                key=f"create_person_btn_{cluster_id}",
-                disabled=not new_name,
-            ):
-                with st.spinner("Creating person..."):
-                    payload = {
-                        "strategy": "manual",
-                        "cluster_ids": [cluster_id],
-                        "name": new_name,
-                    }
-                    resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                    if resp and resp.get("status") == "success":
-                        st.success(f"Created person '{new_name}' with this cluster!")
-                        st.rerun()
+            with st.form(key=f"create_person_form_{cluster_id}"):
+                new_name = st.text_input(
+                    "Person name",
+                    key=f"new_name_unassigned_{cluster_id}",
+                    placeholder="Enter name...",
+                )
+                submit_create = st.form_submit_button("Create person")
+
+                if submit_create:
+                    if not new_name:
+                        st.warning("Enter a name before creating.")
                     else:
-                        st.error("Failed to create person. Check logs.")
+                        with st.spinner("Creating person..."):
+                            payload = {
+                                "strategy": "manual",
+                                "cluster_ids": [cluster_id],
+                                "name": new_name,
+                            }
+                            resp = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
+                            if resp and resp.get("status") == "success":
+                                _invalidate_assignment_caches()
+                                st.success(f"Created person '{new_name}' with this cluster!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to create person. Check logs.")
 
 
 def _render_auto_person_card(
@@ -4010,27 +3989,43 @@ def _render_people_view(
             _render_cast_gallery(ep_id, cast_gallery_cards, cluster_lookup, cast_cluster_centroids)
 
     # --- ARCHIVED ITEMS VIEWER ---
-    # Show archived items for this show (deleted people, clusters, tracks)
+    # Show archived items for THIS EPISODE only (not entire show)
     show_id_for_archive = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
-    archive_stats = _safe_api_get(f"/archive/shows/{show_id_for_archive}/stats")
-    total_archived = archive_stats.get("total_archived", 0) if archive_stats else 0
+
+    # Fetch archived items filtered by episode_id
+    archived_resp = _safe_api_get(
+        f"/archive/shows/{show_id_for_archive}",
+        params={"limit": 50, "episode_id": ep_id},
+    )
+    archived_items = archived_resp.get("items", []) if archived_resp else []
+    counts = archived_resp.get("counts", {}) if archived_resp else {}
+
+    # Use counts from filtered response (not show-wide stats)
+    total_archived = counts.get("total", 0) or len(archived_items)
 
     if total_archived > 0:
         with st.expander(f"🗃️ View Archived Items ({total_archived})", expanded=False):
             st.caption(
-                "Archived items are deleted faces that will be auto-matched in future episodes. "
+                "Archived items are deleted faces from this episode. "
                 "If the same face appears again, it can be automatically archived."
             )
 
-            # Fetch archived items
-            archived_resp = _safe_api_get(
-                f"/archive/shows/{show_id_for_archive}",
-                params={"limit": 50, "episode_id": ep_id},
-            )
-            archived_items = archived_resp.get("items", []) if archived_resp else []
-            counts = archived_resp.get("counts", {}) if archived_resp else {}
+            # Clear All button (clears only this episode's items)
+            clear_col1, clear_col2 = st.columns([3, 1])
+            with clear_col2:
+                if st.button("🗑️ Clear All", key="clear_all_archived", type="secondary"):
+                    # Clear only items from this episode
+                    clear_resp = helpers.api_delete(
+                        f"/archive/shows/{show_id_for_archive}/clear",
+                        params={"episode_id": ep_id}
+                    )
+                    if clear_resp:
+                        st.success(f"Cleared {clear_resp.get('deleted_count', 0)} archived items")
+                        st.rerun()
+                    else:
+                        st.error("Failed to clear archive")
 
-            # Show counts
+            # Show counts (already filtered by episode)
             stat_cols = st.columns(4)
             stat_cols[0].metric("People", counts.get("people", 0))
             stat_cols[1].metric("Clusters", counts.get("clusters", 0))
@@ -4137,11 +4132,24 @@ def _render_people_view(
             cluster_id = cluster_ids[0]
             cluster_info = cluster_lookup.get(cluster_id, {})
             counts = cluster_info.get("counts", {})
+            track_list = cluster_info.get("tracks", [])
+
+            # Calculate filtered track count (excluding single-frame tracks for multi-track clusters)
+            original_tracks = counts.get("tracks", 0)
+            if len(track_list) > 1:
+                # Multi-track cluster: count only multi-frame tracks
+                multi_frame_tracks = [t for t in track_list if t.get("faces", 0) > 1]
+                filtered_tracks = len(multi_frame_tracks) if multi_frame_tracks else len(track_list)
+            else:
+                # Single-track cluster: keep as-is
+                filtered_tracks = len(track_list) if track_list else original_tracks
+
             single_cluster_queue.append(
                 {
                     "kind": "cluster",
                     "cluster_id": cluster_id,
-                    "tracks": counts.get("tracks", 0),
+                    "tracks": filtered_tracks,  # Use filtered count for sorting
+                    "original_tracks": original_tracks,
                     "faces": counts.get("faces", 0),
                     "cohesion": cluster_info.get("cohesion"),
                 }
@@ -4163,8 +4171,71 @@ def _render_people_view(
         st.markdown("---")
         st.markdown(f"### 🔍 Needs Cast Assignment ({total_items})")
 
+        # Sort options for unassigned clusters
+        sort_col, analyze_col, spacer_col = st.columns([1.5, 1, 2])
+        with sort_col:
+            unassigned_sort_key = f"unassigned_sort:{ep_id}"
+            unassigned_sort_option = st.selectbox(
+                "Sort by",
+                UNASSIGNED_CLUSTER_SORT_OPTIONS,
+                index=0,  # Default: Face Count (High to Low)
+                key=unassigned_sort_key,
+                label_visibility="collapsed",
+            )
+
+            # Apply sorting based on selected option
+            def unassigned_sort_key_fn(item):
+                # Get faces - check direct key first, then counts dict
+                faces = item.get("faces")
+                if faces is None:
+                    faces = item.get("counts", {}).get("faces", 0)
+                # Get tracks - check direct key first, then counts dict
+                tracks = item.get("tracks")
+                if tracks is None:
+                    tracks = item.get("counts", {}).get("tracks", 0)
+                cohesion = item.get("cohesion") or item.get("avg_cohesion") or 0.0
+                cluster_id = item.get("cluster_id") or ""
+                # Get cast match score from suggestions if available
+                cid = item.get("cluster_id") or (item.get("episode_clusters", [None])[0])
+                cast_score = 0.0
+                if cid and cid in cast_suggestions_by_cluster:
+                    suggestions = cast_suggestions_by_cluster[cid]
+                    # Handle both list and dict formats
+                    if isinstance(suggestions, list) and suggestions:
+                        cast_score = suggestions[0].get("similarity", 0.0)
+                    elif isinstance(suggestions, dict):
+                        cast_score = suggestions.get("similarity", 0.0)
+
+                # Use negative values for descending, positive for ascending
+                # No reverse flag needed - just return appropriate tuple
+                if unassigned_sort_option == "Face Count (High to Low)":
+                    return (-faces, -tracks)
+                elif unassigned_sort_option == "Face Count (Low to High)":
+                    return (faces, tracks)
+                elif unassigned_sort_option == "Track Count (High to Low)":
+                    return (-tracks, -faces)
+                elif unassigned_sort_option == "Track Count (Low to High)":
+                    return (tracks, faces)
+                elif unassigned_sort_option == "Cast Match Score (High to Low)":
+                    return (-cast_score, -faces)
+                elif unassigned_sort_option == "Cast Match Score (Low to High)":
+                    return (cast_score, faces)
+                elif unassigned_sort_option == "Cluster Similarity (High to Low)":
+                    return (-cohesion if cohesion else 0, -faces)
+                elif unassigned_sort_option == "Cluster Similarity (Low to High)":
+                    return (cohesion if cohesion else 999, faces)
+                elif unassigned_sort_option == "Cluster ID (A-Z)":
+                    return (cluster_id, 0)
+                elif unassigned_sort_option == "Cluster ID (Z-A)":
+                    # Reverse by using negative ord values
+                    return tuple(-ord(c) for c in cluster_id) if cluster_id else (0,)
+                return (-faces, -tracks)
+
+            # Re-sort with user's chosen option (no reverse needed, handled in key)
+            multi_cluster_queue.sort(key=unassigned_sort_key_fn)
+            single_cluster_queue.sort(key=unassigned_sort_key_fn)
+
         # Analyze & Group Similar button
-        analyze_col, spacer_col = st.columns([1, 3])
         with analyze_col:
             if st.button("🔬 Analyze & Group Similar", key=f"analyze_unassigned_{ep_id}", help="Group similar unassigned clusters and suggest cast members"):
                 with st.spinner("Analyzing clusters..."):

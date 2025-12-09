@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -55,6 +55,7 @@ class GroupClustersRequest(BaseModel):
     name: Optional[str] = Field(None, description="Name for new person (when target_person_id is None)")
     protect_manual: bool = Field(True, description="If True, don't merge manually assigned clusters to different people")
     facebank_first: bool = Field(True, description="If True, try facebank matching before people prototypes (more accurate)")
+    skip_cast_assignment: bool = Field(True, description="If True, only group similar clusters without assigning to cast members. Set to False to enable auto-assignment to cast.")
     execution_mode: Optional[Literal["redis", "local"]] = Field(
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
@@ -130,6 +131,7 @@ def group_clusters(ep_id: str, body: GroupClustersRequest) -> dict:
                     progress_callback=progress_callback,
                     protect_manual=body.protect_manual,
                     facebank_first=body.facebank_first,
+                    skip_cast_assignment=body.skip_cast_assignment,
                 )
             except Exception as inner_exc:
                 import traceback
@@ -377,6 +379,7 @@ def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
                 progress_callback=progress_callback,
                 protect_manual=body.protect_manual,
                 facebank_first=body.facebank_first,
+                skip_cast_assignment=body.skip_cast_assignment,
             )
             return {
                 "status": "success",
@@ -408,6 +411,7 @@ def group_clusters_async(ep_id: str, body: GroupClustersRequest) -> dict:
             options={
                 "protect_manual": body.protect_manual,
                 "facebank_first": body.facebank_first,
+                "skip_cast_assignment": body.skip_cast_assignment,
             },
         )
 
@@ -687,6 +691,10 @@ def get_cast_suggestions(ep_id: str, min_similarity: float = 0.50, top_k: int = 
         mismatched = result.get("mismatched_embeddings", [])
         if mismatched:
             response["mismatched_embeddings"] = mismatched
+        # Include quality-only clusters (no embeddings, all faces skipped by quality gate)
+        quality_only = result.get("quality_only_clusters", [])
+        if quality_only:
+            response["quality_only_clusters"] = quality_only
         # Include any message (e.g., "No assigned clusters available")
         if result.get("message"):
             response["message"] = result["message"]
@@ -1338,6 +1346,209 @@ def clear_dismissed_suggestions(ep_id: str) -> dict:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear dismissed suggestions: {str(e)}")
+
+
+@router.get("/episodes/{ep_id}/outlier_audit")
+def get_outlier_audit(
+    ep_id: str,
+    cohesion_threshold: float = Query(0.70, description="Tracks below this cohesion are flagged as outliers"),
+    min_tracks_for_comparison: int = Query(2, description="Minimum tracks needed to compute cohesion"),
+) -> dict:
+    """Audit all assigned tracks for potential outliers.
+
+    Scans all cast members with assigned clusters/tracks and identifies tracks
+    that have low cohesion with other tracks assigned to the same person.
+
+    Returns:
+        {
+            "ep_id": str,
+            "total_cast_members": int,
+            "total_tracks_audited": int,
+            "outliers": [
+                {
+                    "track_id": int,
+                    "cluster_id": str,
+                    "person_id": str,
+                    "cast_id": str,
+                    "cast_name": str,
+                    "cohesion_score": float,
+                    "track_similarity": float,
+                    "thumb_url": str,
+                    "faces": int,
+                    "suggested_reassignment": {
+                        "cast_id": str,
+                        "cast_name": str,
+                        "similarity": float
+                    } | None
+                }
+            ],
+            "summary": {
+                "high_risk": int,  # cohesion < 0.50
+                "medium_risk": int,  # cohesion 0.50-0.65
+                "low_risk": int  # cohesion 0.65-threshold
+            }
+        }
+    """
+    import numpy as np
+    from apps.api.services.people import PeopleService
+
+    try:
+        # Get show slug from episode using same pattern as other endpoints
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise HTTPException(status_code=400, detail="Invalid episode ID format")
+        show_slug = parsed["show"]
+
+        # Get all people for this show
+        people_service_instance = PeopleService()
+        people = people_service_instance.list_people(show_slug)
+        if not people:
+            return {
+                "ep_id": ep_id,
+                "total_cast_members": 0,
+                "total_tracks_audited": 0,
+                "outliers": [],
+                "summary": {"high_risk": 0, "medium_risk": 0, "low_risk": 0},
+            }
+
+        outliers = []
+        total_tracks_audited = 0
+        cast_members_with_tracks = 0
+
+        # Process each person who has a cast_id (assigned to cast member)
+        for person in people:
+            person_id = person.get("person_id")
+            cast_id = person.get("cast_id")
+            if not cast_id:
+                continue  # Skip people not linked to cast
+
+            cast_name = person.get("name") or "(unnamed)"
+
+            # Get this episode's clusters from person's cluster_ids
+            # cluster_ids are in format "ep_id:cluster_id"
+            all_cluster_ids = person.get("cluster_ids", [])
+            episode_clusters = [
+                cid.split(":", 1)[1] if ":" in cid else cid
+                for cid in all_cluster_ids
+                if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
+            ]
+            if not episode_clusters:
+                continue
+
+            cast_members_with_tracks += 1
+
+            # Fetch cluster details to get tracks and embeddings
+            all_tracks = []
+            all_embeddings = []
+            track_to_cluster = {}
+
+            for cluster_id in episode_clusters:
+                try:
+                    cluster_detail = grouping_service.get_cluster_detail(ep_id, cluster_id)
+                    if not cluster_detail:
+                        continue
+
+                    tracks = cluster_detail.get("tracks", [])
+                    for track in tracks:
+                        track_id = track.get("track_id")
+                        embedding = track.get("embedding")
+                        if track_id is not None and embedding:
+                            track_idx = len(all_tracks)
+                            all_tracks.append({
+                                "track_id": track_id,
+                                "cluster_id": cluster_id,
+                                "faces": track.get("faces", 0),
+                                "thumb_url": track.get("thumb_url") or track.get("thumbnail_url"),
+                                "track_similarity": track.get("track_similarity"),
+                            })
+                            all_embeddings.append(embedding)
+                            track_to_cluster[track_idx] = cluster_id
+                except Exception as e:
+                    LOGGER.warning(f"[outlier_audit] Failed to get cluster {cluster_id}: {e}")
+                    continue
+
+            total_tracks_audited += len(all_tracks)
+
+            # Need at least min_tracks_for_comparison to compute cohesion
+            if len(all_embeddings) < min_tracks_for_comparison:
+                continue
+
+            # Compute pairwise similarities and per-track cohesion
+            try:
+                embeddings_array = np.array(all_embeddings)
+                norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
+                normalized = embeddings_array / (norms + 1e-10)
+                similarity_matrix = normalized @ normalized.T
+
+                # Compute cohesion for each track (mean similarity to others)
+                for idx, track_data in enumerate(all_tracks):
+                    # Exclude self-similarity
+                    other_sims = [similarity_matrix[idx, j] for j in range(len(all_tracks)) if j != idx]
+                    cohesion = float(np.mean(other_sims)) if other_sims else 1.0
+
+                    if cohesion < cohesion_threshold:
+                        # This track is an outlier - find suggested reassignment
+                        suggested = None
+                        try:
+                            # Get cast suggestions for this track's embedding
+                            track_embedding = all_embeddings[idx]
+                            suggestions = grouping_service.get_cast_suggestions_for_embedding(
+                                ep_id, track_embedding, top_k=3, exclude_cast_id=cast_id
+                            )
+                            if suggestions:
+                                top_suggestion = suggestions[0]
+                                suggested = {
+                                    "cast_id": top_suggestion.get("cast_id"),
+                                    "cast_name": top_suggestion.get("name"),
+                                    "similarity": top_suggestion.get("similarity"),
+                                }
+                        except Exception:
+                            pass
+
+                        outliers.append({
+                            "track_id": track_data["track_id"],
+                            "cluster_id": track_data["cluster_id"],
+                            "person_id": person_id,
+                            "cast_id": cast_id,
+                            "cast_name": cast_name,
+                            "cohesion_score": round(cohesion, 3),
+                            "track_similarity": track_data.get("track_similarity"),
+                            "thumb_url": track_data.get("thumb_url"),
+                            "faces": track_data.get("faces", 0),
+                            "suggested_reassignment": suggested,
+                        })
+            except Exception as e:
+                LOGGER.warning(f"[outlier_audit] Failed to compute cohesion for {person_id}: {e}")
+                continue
+
+        # Sort outliers by cohesion (lowest first = worst outliers)
+        outliers.sort(key=lambda x: x["cohesion_score"])
+
+        # Compute summary
+        high_risk = len([o for o in outliers if o["cohesion_score"] < 0.50])
+        medium_risk = len([o for o in outliers if 0.50 <= o["cohesion_score"] < 0.65])
+        low_risk = len([o for o in outliers if o["cohesion_score"] >= 0.65])
+
+        return {
+            "ep_id": ep_id,
+            "cohesion_threshold": cohesion_threshold,
+            "total_cast_members": cast_members_with_tracks,
+            "total_tracks_audited": total_tracks_audited,
+            "outliers": outliers,
+            "summary": {
+                "high_risk": high_risk,
+                "medium_risk": medium_risk,
+                "low_risk": low_risk,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        LOGGER.error(f"[outlier_audit] Failed for {ep_id}: {e}\n{tb}")
+        raise HTTPException(status_code=500, detail=f"Failed to audit outliers: {str(e)}")
 
 
 __all__ = ["router"]

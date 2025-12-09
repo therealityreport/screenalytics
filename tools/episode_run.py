@@ -34,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 from apps.common.cpu_limits import apply_global_cpu_limits
 apply_global_cpu_limits()
 
+import cv2
 import numpy as np
 
 from apps.api.services.storage import (
@@ -89,9 +90,14 @@ DEFAULT_TRACKER = TRACKER_CHOICES[0]
 ARC_FACE_MODEL_NAME = os.environ.get("ARCFACE_MODEL", "arcface_r100_v1")
 RETINAFACE_MODEL_NAME = os.environ.get("RETINAFACE_MODEL", "retinaface_r50_v1")
 FACE_CLASS_LABEL = "face"
-MIN_FACE_AREA = 20.0
+# Minimum face bounding box area in pixels
+# Lower values detect smaller faces but may increase false positives
+# Original: 20.0, Now: 10.0 to capture smaller background faces
+MIN_FACE_AREA = 10.0
 FACE_RATIO_BOUNDS = (0.5, 2.0)
-RETINAFACE_SCORE_THRESHOLD = 0.65
+# Detection confidence threshold - lower values catch more faces but may increase false positives
+# Original: 0.65, Now: 0.50 to capture smaller/distant faces
+RETINAFACE_SCORE_THRESHOLD = 0.50
 RETINAFACE_NMS = 0.45
 
 RUN_MARKERS_SUBDIR = "runs"
@@ -331,8 +337,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Minimum bounding box area for ByteTrack to consider a detection
+# Lower values allow tracking smaller faces. Original: 20.0, Now: 10.0
 BYTE_TRACK_MIN_BOX_AREA_DEFAULT = max(
-    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 20.0)),
+    _env_float("SCREENALYTICS_MIN_BOX_AREA", _env_float("BYTE_TRACK_MIN_BOX_AREA", 10.0)),
     0.0,
 )
 DEFAULT_GMC_METHOD = os.environ.get("SCREENALYTICS_GMC_METHOD", "sparseOptFlow")
@@ -347,14 +355,15 @@ RETINAFACE_HELP = (
 )
 ARC_FACE_HELP = "ArcFace weights missing or could not initialize. See README 'Models' or run scripts/fetch_models.py."
 # Strict tracking defaults (matching config/pipeline/tracking.yaml)
-GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.75"))
-GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.82"))
+# Tightened after multi-person track bug analysis (track 57 in rhoslc-s06e88)
+GATE_APPEAR_T_HARD_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_HARD", "0.70"))  # Was 0.75, lowered to catch more switches
+GATE_APPEAR_T_SOFT_DEFAULT = float(os.environ.get("TRACK_GATE_APPEAR_SOFT", "0.78"))  # Was 0.82, lowered for faster streak detection
 GATE_APPEAR_STREAK_DEFAULT = max(int(os.environ.get("TRACK_GATE_APPEAR_STREAK", "2")), 1)
-GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.50"))  # Increased to prevent spatial jumps
-GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.90")), 0.0), 1.0)
+GATE_IOU_THRESHOLD_DEFAULT = float(os.environ.get("TRACK_GATE_IOU", "0.55"))  # Was 0.50, raised to catch near-misses like 0.5013
+GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM", "0.85")), 0.0), 1.0)  # Was 0.90, reduced for faster adaptation
 GATE_EMB_EVERY_DEFAULT = max(
-    int(os.environ.get("TRACK_GATE_EMB_EVERY", "10")), 0
-)  # Reduced from 5 to 10 for better thermal performance
+    int(os.environ.get("TRACK_GATE_EMB_EVERY", "3")), 0
+)  # Was 10, reduced to catch more person switches (critical fix)
 # ByteTrack spatial matching - strict defaults
 TRACK_BUFFER_BASE_DEFAULT = max(
     _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
@@ -370,12 +379,12 @@ TRACK_NEW_THRESH_DEFAULT = _env_float(
     _env_float("BYTE_TRACK_NEW_TRACK_THRESH", 0.70),
 )
 TRACK_MAX_GAP_SEC = float(os.environ.get("TRACK_MAX_GAP_SEC", "0.5"))
-TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "6")), 2)
+TRACK_PROTO_MAX_SAMPLES = max(int(os.environ.get("TRACK_PROTO_MAX_SAMPLES", "12")), 2)
 TRACK_PROTO_SIM_DELTA = float(os.environ.get("TRACK_PROTO_SIM_DELTA", "0.08"))
 TRACK_PROTO_SIM_MIN = float(os.environ.get("TRACK_PROTO_SIM_MIN", "0.6"))
 DEFAULT_CLUSTER_SIMILARITY = float(
-    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.75")
-)  # Increased to prevent multiple people in same cluster
+    os.environ.get("SCREANALYTICS_CLUSTER_SIM", "0.68")
+)  # Stricter threshold (was 0.58) to prevent grouping different people
 
 # Load and apply YAML config overrides if available (only if env vars not set)
 _YAML_CONFIG = _load_tracking_config_yaml()
@@ -395,10 +404,18 @@ if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTIC
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
         LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
-MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.50"))
+MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREANALYTICS_MIN_IDENTITY_SIM", "0.55"))  # Stricter (was 0.50)
+# Minimum cohesion for a cluster to be kept together; below this, split into singletons
+MIN_CLUSTER_COHESION = float(os.environ.get("SCREENALYTICS_MIN_CLUSTER_COHESION", "0.55"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
 FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
+
+# Lower thresholds for single-face tracks (more permissive to avoid orphaned clusters)
+# Single-face tracks have no redundancy, so we accept lower quality to get at least one embedding
+FACE_MIN_CONFIDENCE_SINGLE = float(os.environ.get("FACES_MIN_CONF_SINGLE", "0.45"))
+FACE_MIN_BLUR_SINGLE = float(os.environ.get("FACES_MIN_BLUR_SINGLE", "15.0"))
+FACE_MIN_STD_SINGLE = float(os.environ.get("FACES_MIN_STD_SINGLE", "0.5"))
 BYTE_TRACK_BUFFER_DEFAULT = TRACK_BUFFER_BASE_DEFAULT
 BYTE_TRACK_HIGH_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
 BYTE_TRACK_NEW_TRACK_THRESH_DEFAULT = TRACK_NEW_THRESH_DEFAULT
@@ -994,6 +1011,29 @@ class AppearanceGate:
             if tracker_id not in active_ids:
                 self._states.pop(tracker_id, None)
 
+    def needs_embedding(self, tracker_id: int) -> bool:
+        """Check if a track needs an embedding computed.
+
+        Returns True if:
+        - Track is new (not in _states)
+        - Track exists but has no prototype yet (proto is None)
+
+        This ensures we always get an embedding for the first detection of a track,
+        regardless of the embedding stride. Critical fix for multi-person track bug.
+        """
+        if tracker_id not in self._states:
+            return True
+        state = self._states[tracker_id]
+        return state.proto is None
+
+    def tracks_needing_embedding(self, tracker_ids: list[int]) -> set[int]:
+        """Return set of track IDs that need embeddings computed.
+
+        Used to force embedding computation for new tracks even when
+        frame_idx % stride != 0.
+        """
+        return {tid for tid in tracker_ids if self.needs_embedding(tid)}
+
     def process(
         self,
         tracker_id: int,
@@ -1510,27 +1550,100 @@ class ArcFaceEmbedder:
         if not crops:
             return np.zeros((0, 512), dtype=np.float32)
         model = self._lazy_model()
-        embeddings: list[np.ndarray] = []
-        for crop in crops:
+
+        # Prepare batch: resize all crops and track valid indices
+        resized_batch: list[np.ndarray] = []
+        valid_indices: list[int] = []
+        embeddings: list[np.ndarray] = [np.zeros(512, dtype=np.float32)] * len(crops)
+
+        for i, crop in enumerate(crops):
             if crop is None or crop.size == 0:
-                embeddings.append(np.zeros(512, dtype=np.float32))
                 continue
             resized = _resize_for_arcface(crop)
-            feat = model.get_feat(resized)
-            vec = np.asarray(feat, dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            embeddings.append(vec)
+            if resized is None:
+                continue  # Skip faces too small to resize
+            resized_batch.append(resized)
+            valid_indices.append(i)
+
+        if not resized_batch:
+            return np.vstack(embeddings)
+
+        # Batch inference: stack images into (N, H, W, C) array
+        # InsightFace's get_feat supports batch processing via stacked arrays
+        try:
+            batch_array = np.stack(resized_batch, axis=0)
+            # Try batch inference first (much faster)
+            feats = model.get_feat(batch_array)
+            feats = np.asarray(feats, dtype=np.float32)
+            if feats.ndim == 1:
+                # Single image case
+                feats = feats.reshape(1, -1)
+
+            # L2 normalize each embedding
+            norms = np.linalg.norm(feats, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)  # Avoid division by zero
+            feats = feats / norms
+
+            # Place normalized embeddings back into result array
+            for idx, valid_idx in enumerate(valid_indices):
+                embeddings[valid_idx] = feats[idx]
+
+        except Exception as batch_err:
+            # Fallback to per-image inference if batch fails (common with mixed-size batches)
+            LOGGER.debug("Batch embedding using per-image mode: %s", batch_err)
+            for i, resized in zip(valid_indices, resized_batch):
+                try:
+                    feat = model.get_feat(resized)
+                    vec = np.asarray(feat, dtype=np.float32)
+                    norm = np.linalg.norm(vec)
+                    if norm > 0:
+                        vec = vec / norm
+                    embeddings[i] = vec
+                except Exception:
+                    # Skip faces that fail embedding (zero vector already in place)
+                    pass
+
         return np.vstack(embeddings)
 
 
 def _resize_for_arcface(image):
+    """Resize image to ArcFace input size (112x112).
+
+    Returns None if image has invalid dimensions (too small to resize).
+    """
     import cv2  # type: ignore
 
+    # Check for valid dimensions before resize
+    if image is None:
+        return None
+    if not hasattr(image, 'shape') or len(image.shape) < 2:
+        return None
+    if image.size == 0:
+        return None
+    h, w = image.shape[:2]
+    # Require minimum 10x10 pixels - tiny crops cause OpenCV resize errors
+    MIN_CROP_DIM = 10
+    if h < MIN_CROP_DIM or w < MIN_CROP_DIM:
+        return None
+
+    # Ensure image is contiguous and has correct dtype
+    if not image.flags['C_CONTIGUOUS']:
+        image = np.ascontiguousarray(image)
+
+    # Ensure 3-channel uint8 for proper resize
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8)
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
     target = (112, 112)
-    resized = cv2.resize(image, target)
-    return resized
+    try:
+        resized = cv2.resize(image, target)
+        return resized
+    except cv2.error:
+        return None
 
 
 def _letterbox_square(image, size: int = 112, pad_value: int = 127):
@@ -1854,6 +1967,10 @@ def _make_skip_face_row(
     crop_s3_key: str | None = None,
     thumb_rel_path: str | None = None,
     thumb_s3_key: str | None = None,
+    # Structured skip data for smarter rescue decisions
+    blur_score: float | None = None,
+    confidence: float | None = None,
+    contrast: float | None = None,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "ep_id": ep_id,
@@ -1866,6 +1983,17 @@ def _make_skip_face_row(
         "pipeline_ver": PIPELINE_VERSION,
         "skip": reason,
     }
+    # Store structured quality metrics for smarter rescue decisions
+    # This allows rescue logic to pick the "best" skipped face
+    skip_data: Dict[str, Any] = {"reason": reason.split(":")[0] if ":" in reason else reason}
+    if blur_score is not None:
+        skip_data["blur_score"] = round(blur_score, 2)
+    if confidence is not None:
+        skip_data["confidence"] = round(confidence, 3)
+    if contrast is not None:
+        skip_data["contrast"] = round(contrast, 2)
+    row["skip_data"] = skip_data
+
     if crop_rel_path:
         row["crop_rel_path"] = crop_rel_path
     if crop_s3_key:
@@ -2282,9 +2410,11 @@ class ThumbWriter:
     def _letterbox(self, crop):
         if self._cv2 is None:
             return np.zeros((self.size, self.size, 3), dtype=np.uint8)
-        if crop.size == 0:
-            crop = np.zeros((self.size, self.size, 3), dtype=np.uint8)
+        if crop is None or crop.size == 0:
+            return np.zeros((self.size, self.size, 3), dtype=np.uint8)
         h, w = crop.shape[:2]
+        if h <= 0 or w <= 0:
+            return np.zeros((self.size, self.size, 3), dtype=np.uint8)
         scale = min(self.size / max(w, 1), self.size / max(h, 1))
         new_w = max(int(w * scale), 1)
         new_h = max(int(h * scale), 1)
@@ -5028,6 +5158,9 @@ def _run_full_pipeline(
                     crop_records: list[tuple[int, list[float]]] = []
                     gate_embeddings: dict[int, np.ndarray | None] = {}
                     should_embed_gate = False
+                    # Tracks that MUST have embeddings computed (new tracks without prototypes)
+                    # This is critical to prevent multi-person track contamination
+                    tracks_needing_embed: set[int] = set()
                     if appearance_gate:
                         should_embed_gate = True if frames_since_cut < scene_warmup else False
                         stride_for_gate = gate_embed_stride or frame_stride
@@ -5035,7 +5168,22 @@ def _run_full_pipeline(
                             should_embed_gate = frame_idx % stride_for_gate == 0
                         else:
                             should_embed_gate = True
-                        if should_embed_gate and gate_embedder and tracked_objects:
+
+                        # CRITICAL FIX: Always compute embeddings for new tracks without prototypes
+                        # This prevents the bug where a track starts on a non-embedding frame,
+                        # then a different person enters on an embedding frame and becomes the prototype
+                        tracks_needing_embed = appearance_gate.tracks_needing_embedding(
+                            [obj.track_id for obj in tracked_objects]
+                        )
+                        if tracks_needing_embed and not should_embed_gate:
+                            LOGGER.debug(
+                                "[gate] Force embedding for %d new track(s) at frame %d: %s",
+                                len(tracks_needing_embed),
+                                frame_idx,
+                                list(tracks_needing_embed)[:5],  # Log first 5 to avoid spam
+                            )
+
+                        if (should_embed_gate or tracks_needing_embed) and gate_embedder and tracked_objects:
                             # DEBUG: Show gate embedding processing
                             if frames_sampled < 5:
                                 LOGGER.error(
@@ -5047,6 +5195,9 @@ def _run_full_pipeline(
                             embed_inputs: list[np.ndarray] = []
                             embed_track_ids: list[int] = []
                             for obj in tracked_objects:
+                                # Skip tracks that don't need embedding on non-embedding frames
+                                if not should_embed_gate and obj.track_id not in tracks_needing_embed:
+                                    continue
                                 # Validate bbox before cropping to prevent NoneType multiply errors
                                 validated_bbox, bbox_err = _safe_bbox_or_none(obj.bbox)
                                 if validated_bbox is None:
@@ -5642,7 +5793,6 @@ def _run_detect_track_stage(
                     ),
                 },
                 "s3_prefixes": s3_prefixes,
-                "s3_uploads": s3_stats,
             },
         }
         if detect_track_stats:
@@ -6005,13 +6155,23 @@ def _run_faces_embed_stage(
                 blur_score = _estimate_blur_score(crop)
                 skip_reason: str | None = None
                 skip_meta: str | None = None
-                if conf < FACE_MIN_CONFIDENCE:
+
+                # Use lower thresholds for single-face tracks to avoid orphaned clusters
+                # Single-face tracks have no redundancy, so we're more permissive
+                track_sample_count = sample.get("track_sample_count", 999)
+                is_single_face_track = track_sample_count == 1
+
+                min_conf = FACE_MIN_CONFIDENCE_SINGLE if is_single_face_track else FACE_MIN_CONFIDENCE
+                min_std = FACE_MIN_STD_SINGLE if is_single_face_track else FACE_MIN_STD
+                min_blur = FACE_MIN_BLUR_SINGLE if is_single_face_track else FACE_MIN_BLUR
+
+                if conf < min_conf:
                     skip_reason = "low_confidence"
                     skip_meta = f"{conf:.2f}"
-                elif crop_std < FACE_MIN_STD:
+                elif crop_std < min_std:
                     skip_reason = "low_contrast"
                     skip_meta = f"{crop_std:.2f}"
-                elif blur_score < FACE_MIN_BLUR:
+                elif blur_score < min_blur:
                     skip_reason = "blurry"
                     skip_meta = f"{blur_score:.1f}"
                 if skip_reason:
@@ -6029,6 +6189,10 @@ def _run_faces_embed_stage(
                             crop_s3_key=crop_s3_key,
                             thumb_rel_path=None,
                             thumb_s3_key=None,
+                            # Pass quality metrics for smarter rescue decisions
+                            blur_score=blur_score,
+                            confidence=conf,
+                            contrast=crop_std,
                         )
                     )
                     faces_done = min(faces_total, faces_done + 1)
@@ -6209,7 +6373,7 @@ def _run_faces_embed_stage(
         else:
             np.save(embed_path, np.zeros((0, 512), dtype=np.float32))
 
-        _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
+        coherence_result = _update_track_embeddings(track_path, track_embeddings, track_best_thumb, embedding_model_name)
         if exporter:
             exporter.write_indexes()
 
@@ -6240,7 +6404,11 @@ def _run_faces_embed_stage(
                 "s3_prefixes": s3_prefixes,
             },
             "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
+            "coherence": coherence_result.get("coherence_stats", {}),
         }
+        # Add mixed tracks if any were found
+        if coherence_result.get("mixed_tracks"):
+            summary["mixed_tracks"] = coherence_result["mixed_tracks"]
 
         # Emit completion BEFORE S3 sync (which might hang or take long)
         progress.emit(
@@ -6374,16 +6542,43 @@ def _select_track_prototype(
     return proto, stack.shape[0], spread
 
 
+# Threshold for flagging a track as potentially containing multiple people
+# A spread ≥0.30 indicates the max pairwise cosine distance between embeddings
+# is quite high, suggesting the track may have different faces
+TRACK_COHERENCE_WARN_THRESHOLD = float(os.environ.get("TRACK_COHERENCE_WARN", "0.30"))
+
+
 def _update_track_embeddings(
     track_path: Path,
     track_embeddings: Dict[int, List[TrackEmbeddingSample]],
     track_best_thumb: Dict[int, tuple[float, str, str | None]],
     embedding_model: str,
-) -> None:
+) -> Dict[str, Any]:
+    """Update tracks with embedding info and return coherence validation stats.
+
+    Returns:
+        Dict with:
+        - mixed_tracks: list of track_ids with spread >= threshold
+        - coherence_stats: summary statistics
+    """
+    coherence_result: Dict[str, Any] = {
+        "mixed_tracks": [],
+        "coherence_stats": {
+            "total_tracks": 0,
+            "tracks_with_embeddings": 0,
+            "tracks_flagged_mixed": 0,
+            "max_spread": 0.0,
+            "avg_spread": 0.0,
+        },
+    }
     if not track_path.exists():
-        return
+        return coherence_result
+
     rows = list(_iter_jsonl(track_path))
     updated: List[dict] = []
+    spreads: List[float] = []
+    mixed_tracks: List[int] = []
+
     for row in rows:
         track_id = int(row.get("track_id", -1))
         samples = track_embeddings.get(track_id) or []
@@ -6395,7 +6590,21 @@ def _update_track_embeddings(
                 row["face_embedding_model"] = embedding_model
                 row["face_embedding_samples"] = sample_count
                 if spread is not None:
-                    row["face_embedding_spread"] = round(float(spread), 4)
+                    spread_rounded = round(float(spread), 4)
+                    row["face_embedding_spread"] = spread_rounded
+                    spreads.append(spread_rounded)
+
+                    # Flag tracks with high spread as potentially mixed
+                    if spread_rounded >= TRACK_COHERENCE_WARN_THRESHOLD:
+                        mixed_tracks.append(track_id)
+                        row["coherence_warning"] = "high_spread"
+                        LOGGER.warning(
+                            "[COHERENCE] Track %d has high embedding spread %.3f (threshold %.2f) - "
+                            "may contain multiple people",
+                            track_id,
+                            spread_rounded,
+                            TRACK_COHERENCE_WARN_THRESHOLD,
+                        )
         thumb_info = track_best_thumb.get(track_id)
         if thumb_info:
             _, rel_path, s3_key = thumb_info
@@ -6403,8 +6612,30 @@ def _update_track_embeddings(
             if s3_key:
                 row["thumb_s3_key"] = s3_key
         updated.append(row)
+
     if updated:
         _write_jsonl(track_path, updated)
+
+    # Compute coherence stats
+    coherence_result["mixed_tracks"] = mixed_tracks
+    coherence_result["coherence_stats"]["total_tracks"] = len(rows)
+    coherence_result["coherence_stats"]["tracks_with_embeddings"] = len(spreads)
+    coherence_result["coherence_stats"]["tracks_flagged_mixed"] = len(mixed_tracks)
+    if spreads:
+        coherence_result["coherence_stats"]["max_spread"] = round(max(spreads), 4)
+        coherence_result["coherence_stats"]["avg_spread"] = round(
+            sum(spreads) / len(spreads), 4
+        )
+
+    if mixed_tracks:
+        LOGGER.info(
+            "[COHERENCE] Embed stage flagged %d tracks as potentially mixed (spread >= %.2f): %s",
+            len(mixed_tracks),
+            TRACK_COHERENCE_WARN_THRESHOLD,
+            mixed_tracks[:10] if len(mixed_tracks) > 10 else mixed_tracks,
+        )
+
+    return coherence_result
 
 
 def _run_cluster_stage(
@@ -6666,13 +6897,29 @@ def _run_cluster_stage(
         if not embedding_rows and not forced_singletons and not preserved_identities:
             raise RuntimeError("No track embeddings available; rerun faces_embed with detector enabled")
 
+        # === FIX 2: Pre-clustering validation ===
+        # Reject tracks with low internal similarity before they can pollute clusters
+        pre_cluster_rejected: List[Tuple[int, str]] = []
+        if embedding_rows and track_index:
+            track_ids, embedding_rows, pre_cluster_rejected = _validate_track_embeddings_for_clustering(
+                track_ids,
+                embedding_rows,
+                track_index,
+                min_internal_sim=0.70,  # Reject tracks with <70% internal consistency
+            )
+            if pre_cluster_rejected:
+                LOGGER.info(
+                    "Pre-clustering: rejected %d tracks with low internal similarity",
+                    len(pre_cluster_rejected),
+                )
+
         track_groups: Dict[int, List[int]] = defaultdict(list)
         if embedding_rows:
             labels = _cluster_embeddings(np.vstack(embedding_rows), args.cluster_thresh)
             for tid, label in zip(track_ids, labels):
                 track_groups[label].append(tid)
 
-        # Build track embeddings index for outlier removal
+        # Build track embeddings index for outlier removal and cohesion check
         track_embeddings: Dict[int, np.ndarray] = {}
         for tid, embed in zip(track_ids, embedding_rows):
             track_embeddings[tid] = embed
@@ -6692,6 +6939,26 @@ def _run_cluster_stage(
                     len(outlier_tracks),
                     min_identity_sim,
                 )
+
+        # === FIX 3: Cohesion quality gate ===
+        # Split clusters with low cohesion into singletons (likely different people)
+        split_clusters: List[Tuple[List[int], float, str]] = []
+        if track_groups:
+            track_groups, split_clusters = _split_low_cohesion_clusters(
+                track_groups,
+                track_embeddings,
+                min_cohesion=MIN_CLUSTER_COHESION,
+            )
+            if split_clusters:
+                total_tracks_split = sum(len(tracks) for tracks, _, _ in split_clusters)
+                LOGGER.info(
+                    "Cohesion quality gate: split %d low-cohesion clusters (%d tracks) into singletons",
+                    len(split_clusters),
+                    total_tracks_split,
+                )
+
+        # Add pre-cluster rejected tracks to outliers (they become singletons)
+        outlier_tracks.extend(pre_cluster_rejected)
 
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
@@ -7226,6 +7493,11 @@ def _load_track_samples(
             min_samples_per_track,
             sample_every_n_frames,
         )
+        # Add track_sample_count to each sample for adaptive quality thresholds
+        # Single-face tracks get more permissive quality gates to avoid orphaned clusters
+        track_sample_count = len(sampled)
+        for s in sampled:
+            s["track_sample_count"] = track_sample_count
         samples.extend(sampled)
 
     if sort_by_frame:
@@ -7289,18 +7561,48 @@ def _cluster_distance_threshold(similarity: float) -> float:
 
 
 def _cluster_embeddings(matrix: np.ndarray, threshold: float) -> np.ndarray:
+    """Cluster embeddings using centroid-based hierarchical clustering.
+
+    Uses scipy's linkage with 'centroid' method, which compares cluster centroids
+    rather than averaging all pairwise distances. This is more robust when clusters
+    contain noisy embeddings (e.g., from single-frame tracks or extreme poses).
+
+    Args:
+        matrix: N x D embedding matrix (each row is a track's prototype embedding)
+        threshold: Similarity threshold (0-1). Clusters with centroid similarity
+                   above this threshold will be merged.
+
+    Returns:
+        Array of cluster labels for each input embedding.
+    """
     if matrix.shape[0] == 1:
         return np.array([0], dtype=int)
-    from sklearn.cluster import AgglomerativeClustering
 
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import pdist
+
+    # Normalize embeddings for cosine similarity
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms > 0, norms, 1.0)  # Avoid division by zero
+    normalized = matrix / norms
+
+    # Compute pairwise cosine distances (1 - similarity)
+    # For normalized vectors, cosine distance = 1 - dot product
+    distances = pdist(normalized, metric='cosine')
+
+    # Hierarchical clustering with centroid linkage
+    # 'centroid' method: distance between clusters is the distance between their centroids
+    # This is more robust than 'average' when clusters have noisy outliers
+    Z = linkage(distances, method='centroid')
+
+    # Convert similarity threshold to distance threshold
     distance_threshold = _cluster_distance_threshold(threshold)
-    model = AgglomerativeClustering(
-        n_clusters=None,
-        metric="cosine",
-        linkage="average",
-        distance_threshold=distance_threshold,
-    )
-    return model.fit_predict(matrix)
+
+    # Cut the dendrogram at the threshold
+    # fcluster returns labels starting from 1, convert to 0-indexed
+    labels = fcluster(Z, t=distance_threshold, criterion='distance')
+
+    return labels - 1  # Convert to 0-indexed labels
 
 
 # NOTE: Duplicate _cosine_similarity removed - using single definition at line ~590
@@ -7362,6 +7664,118 @@ def _remove_low_similarity_outliers(
             updated_groups[label] = kept_tracks
 
     return updated_groups, outliers
+
+
+def _validate_track_embeddings_for_clustering(
+    track_ids: List[int],
+    embedding_rows: List[np.ndarray],
+    track_index: Dict[int, Dict[str, Any]],
+    min_internal_sim: float = 0.70,
+) -> Tuple[List[int], List[np.ndarray], List[Tuple[int, str]]]:
+    """Pre-clustering validation: reject tracks with poor internal consistency.
+
+    Tracks with low internal similarity (intra-track sim) are unreliable and
+    can pollute clusters when grouped with others.
+
+    Args:
+        track_ids: List of track IDs to validate
+        embedding_rows: Corresponding embeddings for each track
+        track_index: Track metadata containing internal_sim scores
+        min_internal_sim: Minimum required internal similarity (default 0.70)
+
+    Returns:
+        - Filtered track_ids (those that passed)
+        - Filtered embedding_rows (corresponding embeddings)
+        - List of (track_id, reason) for rejected tracks
+    """
+    valid_track_ids = []
+    valid_embeddings = []
+    rejected: List[Tuple[int, str]] = []
+
+    for tid, embed in zip(track_ids, embedding_rows):
+        track_info = track_index.get(tid, {})
+        internal_sim = track_info.get("internal_sim")
+
+        # If no internal_sim available (single face track), allow through
+        if internal_sim is None:
+            valid_track_ids.append(tid)
+            valid_embeddings.append(embed)
+            continue
+
+        if internal_sim >= min_internal_sim:
+            valid_track_ids.append(tid)
+            valid_embeddings.append(embed)
+        else:
+            rejected.append((tid, f"low_internal_sim_{internal_sim:.3f}"))
+            LOGGER.info(
+                "Track %d rejected from clustering: internal_sim=%.3f < %.3f",
+                tid, internal_sim, min_internal_sim,
+            )
+
+    return valid_track_ids, valid_embeddings, rejected
+
+
+def _split_low_cohesion_clusters(
+    track_groups: Dict[int, List[int]],
+    track_embeddings: Dict[int, np.ndarray],
+    min_cohesion: float = MIN_CLUSTER_COHESION,
+) -> Tuple[Dict[int, List[int]], List[Tuple[List[int], float, str]]]:
+    """Quality gate: split clusters with cohesion below threshold into singletons.
+
+    Low cohesion indicates the tracks in a cluster are not similar enough
+    to each other - they are likely different people incorrectly grouped.
+
+    Args:
+        track_groups: Cluster label -> list of track IDs
+        track_embeddings: Track ID -> embedding vector
+        min_cohesion: Minimum cohesion threshold (default from MIN_CLUSTER_COHESION)
+
+    Returns:
+        - Updated track_groups with low-cohesion clusters split
+        - List of (original_track_ids, cohesion, reason) for split clusters
+    """
+    updated_groups: Dict[int, List[int]] = {}
+    split_clusters: List[Tuple[List[int], float, str]] = []
+    next_label = max(track_groups.keys()) + 1 if track_groups else 0
+
+    for label, track_ids in track_groups.items():
+        if len(track_ids) < 2:
+            # Single-track clusters always pass
+            updated_groups[label] = track_ids
+            continue
+
+        # Compute cluster cohesion (mean pairwise similarity)
+        cluster_embeds = [track_embeddings[tid] for tid in track_ids if tid in track_embeddings]
+        if len(cluster_embeds) < 2:
+            updated_groups[label] = track_ids
+            continue
+
+        # Compute centroid
+        centroid = np.mean(cluster_embeds, axis=0)
+        centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-12)
+
+        # Compute cohesion as mean similarity to centroid
+        similarities = []
+        for embed in cluster_embeds:
+            sim = _cosine_similarity(embed, centroid_norm)
+            similarities.append(sim)
+        cohesion = float(np.mean(similarities)) if similarities else 0.0
+
+        if cohesion >= min_cohesion:
+            # Cluster passes quality gate
+            updated_groups[label] = track_ids
+        else:
+            # Split into singleton clusters
+            split_clusters.append((track_ids.copy(), cohesion, f"cohesion_{cohesion:.3f}_below_{min_cohesion:.2f}"))
+            LOGGER.warning(
+                "Splitting cluster %d into %d singletons: cohesion=%.3f < %.3f (tracks: %s)",
+                label, len(track_ids), cohesion, min_cohesion, track_ids,
+            )
+            for tid in track_ids:
+                updated_groups[next_label] = [tid]
+                next_label += 1
+
+    return updated_groups, split_clusters
 
 
 def _materialize_identity_thumb(

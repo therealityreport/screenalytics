@@ -10,6 +10,8 @@ import numbers
 import os
 import platform
 import re
+import signal
+import subprocess
 import threading
 import time
 from functools import lru_cache
@@ -49,7 +51,7 @@ DEFAULT_DEVICE_LABEL = "CoreML (Apple Silicon)" if _IS_MACOS_APPLE_SILICON else 
 
 DEFAULT_DET_THRESH = 0.65  # Raised from 0.5 to reduce false positive face detections
 DEFAULT_MAX_GAP = 60
-DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.7"))
+DEFAULT_CLUSTER_SIMILARITY = float(os.environ.get("SCREENALYTICS_CLUSTER_SIM", "0.58"))
 _LOCAL_MEDIA_CACHE_SIZE = 256
 
 LOGGER = logging.getLogger(__name__)
@@ -678,6 +680,67 @@ def render_cached_logs(ep_id: str, operation: str) -> bool:
     return True
 
 
+def _restart_api_server() -> bool:
+    """Kill any existing API server on port 8000 and start a new one.
+
+    Returns True if restart was initiated successfully.
+    """
+    project_root = Path(__file__).parent.parent.parent  # workspace-ui -> apps -> project root
+
+    # Kill any existing process on port 8000
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", ":8000"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    LOGGER.info(f"Killed process {pid} on port 8000")
+                except (ProcessLookupError, ValueError):
+                    pass
+            time.sleep(0.5)  # Give OS time to release the port
+    except subprocess.TimeoutExpired:
+        LOGGER.warning("Timeout checking for processes on port 8000")
+    except Exception as e:
+        LOGGER.warning(f"Error checking port 8000: {e}")
+
+    # Start the API server in background
+    api_script = project_root / "apps" / "api" / "main.py"
+    if not api_script.exists():
+        LOGGER.error(f"API script not found: {api_script}")
+        return False
+
+    try:
+        # Start uvicorn in background
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        subprocess.Popen(
+            [
+                str(project_root / ".venv" / "bin" / "python"),
+                "-m", "uvicorn",
+                "apps.api.main:app",
+                "--host", "0.0.0.0",
+                "--port", "8000",
+                "--reload"
+            ],
+            cwd=str(project_root),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        LOGGER.info("API server restart initiated")
+        return True
+    except Exception as e:
+        LOGGER.error(f"Failed to start API server: {e}")
+        return False
+
+
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
@@ -848,13 +911,13 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     inject_custom_fonts()
 
     api_base = st.session_state.get("api_base") or _env("SCREENALYTICS_API_URL", "http://localhost:8000")
-    st.session_state.setdefault("api_base", api_base)
+    st.session_state["api_base"] = api_base  # Always set (setdefault doesn't overwrite "")
     backend = st.session_state.get("backend") or _env("STORAGE_BACKEND", "s3").lower()
-    st.session_state.setdefault("backend", backend)
+    st.session_state["backend"] = backend
     bucket = st.session_state.get("bucket") or (
         _env("AWS_S3_BUCKET") or _env("SCREENALYTICS_OBJECT_STORE_BUCKET") or ("local" if backend == "local" else "screenalytics")
     )
-    st.session_state.setdefault("bucket", bucket)
+    st.session_state["bucket"] = bucket
 
     query_ep_id = st.query_params.get("ep_id", "")
     stored_ep_id = st.session_state.get("ep_id")
@@ -879,13 +942,26 @@ def init_page(title: str = DEFAULT_TITLE) -> Dict[str, str]:
     sidebar.header("API")
     sidebar.code(api_base)
     health_url = f"{api_base}/healthz"
+    api_healthy = False
     try:
         resp = requests.get(health_url, timeout=5)
         resp.raise_for_status()
         sidebar.success("/healthz OK")
+        api_healthy = True
     except requests.RequestException as exc:
         sidebar.error(describe_error(health_url, exc))
     sidebar.caption(f"Backend: {backend} | Bucket: {bucket}")
+    # Buttons: refresh status or restart API
+    btn_col1, btn_col2 = sidebar.columns(2)
+    with btn_col1:
+        if st.button("🔄 Refresh", key="sidebar_refresh_api", use_container_width=True):
+            st.rerun()
+    with btn_col2:
+        if st.button("⚡ Restart API", key="sidebar_restart_api", use_container_width=True):
+            _restart_api_server()
+            import time
+            time.sleep(2)  # Give API time to start
+            st.rerun()
     sidebar.divider()
 
     # Episode selector
@@ -5484,6 +5560,215 @@ def track_carousel_html(
             const scrollAmount = frameWidth * 4; // scroll 4 frames at a time
             track.scrollBy({{ left: direction * scrollAmount, behavior: 'smooth' }});
         }}
+    </script>
+    '''
+
+
+def cluster_track_row_carousel_html(
+    cluster_id: str,
+    track_id: int,
+    frames: List[Dict[str, Any]],
+    track_similarity: float | None = None,
+    track_faces: int = 0,
+    *,
+    thumb_width: int = 100,
+    max_visible: int = 6,
+) -> str:
+    """Generate a compact carousel row for a single track within a cluster view.
+
+    Shows up to max_visible frames with arrows to scroll if more frames exist.
+    Uses 4:5 aspect ratio thumbnails.
+
+    Args:
+        cluster_id: Cluster ID for unique element IDs
+        track_id: Track ID for display and unique keys
+        frames: List of frame dicts with 'crop_url' or 'url' and 'frame_idx'
+        track_similarity: Track similarity score (0-1) for badge display
+        track_faces: Total number of faces in track
+        thumb_width: Width of each thumbnail in pixels
+        max_visible: Maximum number of frames visible at once
+
+    Returns:
+        HTML string for the track row with carousel navigation
+    """
+    carousel_id = f"cluster_{cluster_id}_track_{track_id}"
+    thumb_height = int(thumb_width * 5 / 4)  # 4:5 aspect ratio
+
+    # Build similarity badge
+    sim_badge = ""
+    if track_similarity is not None:
+        pct = int(track_similarity * 100)
+        color = "#4CAF50" if pct >= 75 else "#FF9800" if pct >= 60 else "#F44336"
+        sim_badge = f'<span style="background:{color};color:white;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:bold;">{pct}%</span>'
+
+    # Build frame thumbnails
+    frame_items = []
+    for i, frame in enumerate(frames):
+        url = frame.get("crop_url") or frame.get("url") or frame.get("thumbnail_url") or frame.get("rep_thumb_url")
+        frame_idx = frame.get("frame_idx", i)
+        similarity = frame.get("similarity")
+
+        if url:
+            src = html.escape(str(url))
+            alt_text = html.escape(f"Track {track_id} frame {frame_idx}")
+
+            # Similarity badge for individual frame
+            badge = ""
+            if similarity is not None:
+                fpct = int(similarity * 100)
+                badge = f'<span class="ctr-frame-badge">{fpct}%</span>'
+
+            frame_items.append(f'''
+                <div class="ctr-frame">
+                    <img src="{src}" alt="{alt_text}" loading="lazy" />
+                    {badge}
+                </div>
+            ''')
+
+    if not frame_items:
+        # No frames - show placeholder
+        return f'''
+        <div class="ctr-row" id="{carousel_id}">
+            <div class="ctr-header">
+                <span class="ctr-track-label">Track {track_id}</span>
+                {sim_badge}
+                <span class="ctr-face-count">{track_faces} faces</span>
+            </div>
+            <div class="ctr-empty">No frames available</div>
+        </div>
+        '''
+
+    frames_html = "".join(frame_items)
+    total_frames = len(frame_items)
+    show_arrows = total_frames > max_visible
+
+    # Arrow buttons (only if needed)
+    prev_btn = f'<button class="ctr-arrow ctr-prev" onclick="scrollClusterTrack(\'{carousel_id}\', -1)">◀</button>' if show_arrows else ''
+    next_btn = f'<button class="ctr-arrow ctr-next" onclick="scrollClusterTrack(\'{carousel_id}\', 1)">▶</button>' if show_arrows else ''
+
+    return f'''
+    <div class="ctr-row" id="{carousel_id}">
+        <div class="ctr-header">
+            <span class="ctr-track-label">Track {track_id}</span>
+            {sim_badge}
+            <span class="ctr-face-count">{track_faces} faces</span>
+        </div>
+        <div class="ctr-carousel">
+            {prev_btn}
+            <div class="ctr-track">
+                {frames_html}
+            </div>
+            {next_btn}
+        </div>
+    </div>
+    '''
+
+
+def cluster_track_rows_css() -> str:
+    """Return CSS for cluster track row carousels. Include once per page."""
+    return '''
+    <style>
+        .ctr-row {
+            margin-bottom: 16px;
+            padding: 12px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+        }
+        .ctr-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .ctr-track-label {
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .ctr-face-count {
+            color: #888;
+            font-size: 12px;
+            margin-left: auto;
+        }
+        .ctr-carousel {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .ctr-arrow {
+            width: 32px;
+            height: 32px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(100,100,100,0.6);
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: background 0.2s;
+        }
+        .ctr-arrow:hover {
+            background: rgba(100,100,100,0.9);
+        }
+        .ctr-track {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            scroll-behavior: smooth;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+            padding: 4px 0;
+            flex: 1;
+        }
+        .ctr-track::-webkit-scrollbar {
+            display: none;
+        }
+        .ctr-frame {
+            position: relative;
+            flex-shrink: 0;
+            width: 100px;
+            height: 125px;
+            border-radius: 6px;
+            overflow: hidden;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            background: #333;
+        }
+        .ctr-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .ctr-frame-badge {
+            position: absolute;
+            top: 3px;
+            right: 3px;
+            background: rgba(33, 150, 243, 0.85);
+            color: white;
+            font-size: 9px;
+            font-weight: bold;
+            padding: 1px 4px;
+            border-radius: 3px;
+        }
+        .ctr-empty {
+            color: #666;
+            font-style: italic;
+            padding: 20px;
+            text-align: center;
+        }
+    </style>
+    <script>
+        function scrollClusterTrack(rowId, direction) {
+            const row = document.getElementById(rowId);
+            if (!row) return;
+            const track = row.querySelector('.ctr-track');
+            if (!track) return;
+            const frameWidth = 100 + 8; // width + gap
+            const scrollAmount = frameWidth * 4; // scroll 4 frames at a time
+            track.scrollBy({ left: direction * scrollAmount, behavior: 'smooth' });
+        }
     </script>
     '''
 
