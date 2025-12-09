@@ -321,7 +321,7 @@ def _hydrate_seed_urls(facebank_payload: dict) -> dict:
 
 
 @router.get("/cast/{cast_id}/facebank")
-def get_facebank(cast_id: str, show_id: str) -> FacebankResponse:
+def get_facebank(cast_id: str, show_id: str) -> dict:
     """Get facebank data for a cast member."""
     member = cast_service.get_cast_member(show_id, cast_id)
     if not member:
@@ -329,7 +329,18 @@ def get_facebank(cast_id: str, show_id: str) -> FacebankResponse:
 
     facebank = facebank_service.get_facebank(show_id, cast_id)
     facebank = _hydrate_seed_urls(facebank)
-    return FacebankResponse(**facebank)
+
+    # Add featured_seed convenience field (full seed object with display URL)
+    featured_seed = None
+    featured_id = facebank.get("featured_seed_id")
+    if featured_id:
+        for seed in facebank.get("seeds", []):
+            if seed.get("fb_id") == featured_id:
+                featured_seed = seed
+                break
+    facebank["featured_seed"] = featured_seed
+
+    return facebank
 
 
 @router.post("/cast/{cast_id}/seeds/upload")
