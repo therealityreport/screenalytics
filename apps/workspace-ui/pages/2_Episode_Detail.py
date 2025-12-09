@@ -2927,16 +2927,57 @@ st.caption("Enter a timestamp to see the frame with detected faces and their tra
 _ts_preview_key = f"{ep_id}::timestamp_preview_input"
 _ts_preview_result_key = f"{ep_id}::timestamp_preview_result"
 
+
+def _auto_format_timestamp(raw: str) -> str:
+    """Auto-format raw digits into MM:SS.ms format.
+
+    Examples:
+        "012771" -> "01:27.71"
+        "0127" -> "01:27"
+        "130" -> "01:30"
+        "01:27.71" -> "01:27.71" (already formatted)
+    """
+    # If already has colon, return as-is (already formatted)
+    if ":" in raw:
+        return raw
+
+    # Strip non-digits
+    digits = "".join(c for c in raw if c.isdigit())
+    if not digits:
+        return "00:00"
+
+    # Pad to at least 4 digits for MM:SS
+    # Format: MMSS or MMSSFF (where FF is fractional/ms)
+    if len(digits) <= 4:
+        # MMSS format
+        digits = digits.zfill(4)
+        mm = digits[:2]
+        ss = digits[2:4]
+        return f"{mm}:{ss}"
+    else:
+        # MMSSFF format (6+ digits -> MM:SS.FF)
+        digits = digits.zfill(6)
+        mm = digits[:2]
+        ss = digits[2:4]
+        ms = digits[4:]
+        return f"{mm}:{ss}.{ms}"
+
+
 # Input row: timestamp input + button
 ts_col1, ts_col2 = st.columns([3, 1])
 with ts_col1:
-    ts_input = st.text_input(
+    raw_ts_input = st.text_input(
         "Timestamp (MM:SS or MM:SS.ms)",
         value="00:00",
         key=_ts_preview_key,
-        placeholder="e.g., 01:30 or 01:30.50",
-        help="Format: MM:SS or MM:SS.ms (milliseconds optional)",
+        placeholder="e.g., 0130 or 013050 → auto-formats",
+        help="Type digits like 0130 for 01:30, or 013050 for 01:30.50. Colons added automatically.",
     )
+    # Auto-format the input
+    ts_input = _auto_format_timestamp(raw_ts_input)
+    # Show formatted version if different from raw input
+    if ts_input != raw_ts_input and raw_ts_input.strip():
+        st.caption(f"→ {ts_input}")
 
 with ts_col2:
     st.write("")  # Spacing
@@ -3054,6 +3095,7 @@ if preview_result:
             name = face.get("name")
             cast_id = face.get("cast_id")
             bbox = face.get("bbox", [])
+            conf = face.get("conf")
 
             # Pipeline status flags
             is_detected = face.get("detected", False)
@@ -3064,12 +3106,16 @@ if preview_result:
             # Format bbox as readable string
             bbox_str = f"[{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]" if bbox else "—"
 
+            # Format confidence as percentage
+            conf_str = f"{conf * 100:.0f}%" if conf is not None else "—"
+
             # Pipeline status indicators (checkmarks/x)
             def _status_icon(val: bool) -> str:
                 return "✓" if val else "✗"
 
             face_rows.append({
                 "Track": f"T{track_id}" if track_id else "—",
+                "Conf": conf_str,
                 "Det": _status_icon(is_detected),
                 "Trk": _status_icon(is_tracked),
                 "Harv": _status_icon(is_harvested),
@@ -3084,7 +3130,7 @@ if preview_result:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
         # Legend for status columns
-        st.caption("Pipeline status: Det=Detected, Trk=Tracked, Harv=Harvested (quality gated + embedded), Clust=Clustered")
+        st.caption("Pipeline status: Conf=Detection confidence, Det=Detected, Trk=Tracked, Harv=Harvested (quality gated + embedded), Clust=Clustered")
     else:
         st.info("No faces detected in this frame.")
 

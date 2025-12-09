@@ -4220,8 +4220,9 @@ def generate_timestamp_preview(
                     except json.JSONDecodeError:
                         continue
 
-        # Load tracks - build mapping of track_id -> track info
-        track_info_map = {}  # track_id -> {frame_indices, ...}
+        # Load tracks - build mapping of track_id -> frame_span
+        # tracks.jsonl uses frame_span: [start_frame, end_frame] format
+        track_frame_spans = {}  # track_id -> (start_frame, end_frame)
         if tracks_path.exists():
             import json
             with open(tracks_path, "r") as f:
@@ -4230,18 +4231,17 @@ def generate_timestamp_preview(
                         track = json.loads(line)
                         tid = track.get("track_id")
                         if tid is not None:
-                            if tid not in track_info_map:
-                                track_info_map[tid] = {"frame_indices": set()}
-                            fidx = track.get("frame_idx")
-                            if fidx is not None:
-                                track_info_map[tid]["frame_indices"].add(fidx)
+                            frame_span = track.get("frame_span")
+                            if frame_span and len(frame_span) >= 2:
+                                track_frame_spans[tid] = (frame_span[0], frame_span[1])
                     except json.JSONDecodeError:
                         continue
 
-        # Build set of (track_id, frame_idx) that are tracked at our frame
+        # Build set of track_ids that are tracked at our frame
+        # A track is "tracked" if frame_idx falls within its frame_span
         tracked_at_frame = set()
-        for tid, info in track_info_map.items():
-            if frame_idx in info["frame_indices"]:
+        for tid, (start_f, end_f) in track_frame_spans.items():
+            if start_f <= frame_idx <= end_f:
                 tracked_at_frame.add(tid)
 
         # Load faces for this episode (harvested faces)
@@ -4258,41 +4258,47 @@ def generate_timestamp_preview(
         if not faces and not frame_detections:
             raise HTTPException(status_code=404, detail="No faces or detections found for episode")
 
-        # Filter to faces in or near the requested frame
-        # Since faces are detected at stride intervals (default stride=8), we need to find
-        # the nearest sampled frame. A face at frame N could be at any frame N±stride.
-        frame_faces = [f for f in faces if f.get("frame_idx") == frame_idx]
+        # Build harvested faces lookup by (track_id, frame_idx) for quick access
+        harvested_faces_lookup = {}
+        for f in faces:
+            key = (f.get("track_id"), f.get("frame_idx"))
+            if key[0] is not None:
+                harvested_faces_lookup[key] = f
 
-        # If no exact match, find the closest frame that has detected faces
-        # First try a reasonable window (stride + buffer), then expand if needed
+        # Use detections as primary source - this shows ALL detected faces
+        # Detections have: track_id, frame_idx, bbox, conf, etc.
         original_frame_idx = frame_idx
-        if not frame_faces:
-            # Get all unique frame indices with faces, sorted
-            all_face_frames = sorted(set(f.get("frame_idx") for f in faces if f.get("frame_idx") is not None))
+        gap_seconds = 0.0
 
-            if not all_face_frames:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No faces detected in this episode"
-                )
+        # If no detections at exact frame, find closest frame with detections
+        if not frame_detections:
+            # Load all detections to find closest frame
+            all_detections = []
+            if detections_path.exists():
+                with open(detections_path, "r") as f:
+                    for line in f:
+                        try:
+                            det = json.loads(line)
+                            all_detections.append(det)
+                        except json.JSONDecodeError:
+                            continue
 
-            # Find the closest frame with faces
-            closest_frame = min(all_face_frames, key=lambda f: abs(f - frame_idx))
-            gap = abs(closest_frame - frame_idx)
+            if all_detections:
+                all_det_frames = sorted(set(d.get("frame_idx") for d in all_detections if d.get("frame_idx") is not None))
+                if all_det_frames:
+                    closest_frame = min(all_det_frames, key=lambda f: abs(f - frame_idx))
+                    gap = abs(closest_frame - frame_idx)
+                    gap_seconds = gap / fps if fps > 0 else 0
 
-            # If gap is very large (> 2 seconds at ~24fps), warn user but still show result
-            max_acceptable_gap = int(fps * 2)  # 2 seconds worth of frames
+                    frame_detections = [d for d in all_detections if d.get("frame_idx") == closest_frame]
+                    frame_idx = closest_frame
 
-            frame_faces = [f for f in faces if f.get("frame_idx") == closest_frame]
-            frame_idx = closest_frame
+                    LOGGER.info(
+                        f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
+                        f"closest detected frame is {closest_frame} (gap={gap} frames, {gap_seconds:.2f}s)"
+                    )
 
-            # Log the gap for debugging
-            LOGGER.info(
-                f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
-                f"closest detected frame is {closest_frame} (gap={gap} frames, {gap/fps:.2f}s)"
-            )
-
-        if not frame_faces:
+        if not frame_detections:
             raise HTTPException(
                 status_code=404,
                 detail=f"No faces found near timestamp {timestamp_s:.2f}s (frame {original_frame_idx})"
@@ -4354,9 +4360,13 @@ def generate_timestamp_preview(
         face_info = []
         track_ids_seen = set()
 
-        for face in frame_faces:
-            track_id = face.get("track_id")
-            bbox = face.get("bbox_xyxy")
+        # Iterate over ALL detections (not just harvested faces)
+        for detection in frame_detections:
+            track_id = detection.get("track_id")
+            # Detections use "bbox" as [x1, y1, x2, y2] format
+            bbox = detection.get("bbox") or detection.get("bbox_xyxy")
+            conf = detection.get("conf", 0.0)
+
             if track_id is None or not bbox:
                 continue
 
@@ -4377,6 +4387,11 @@ def generate_timestamp_preview(
             # Skip unidentified if not requested
             if not include_unidentified and not name:
                 continue
+
+            # Determine pipeline status for this face
+            is_tracked = track_id in tracked_at_frame
+            is_harvested = track_id in harvested_track_ids
+            is_clustered = identity_id is not None
 
             # Choose color: named cast get colors, unidentified get gray
             if name:
@@ -4413,20 +4428,16 @@ def generate_timestamp_preview(
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
                 )
 
-                # Determine pipeline status for this face
-                is_tracked = track_id in tracked_at_frame
-                is_harvested = track_id in harvested_track_ids
-                is_clustered = identity_id is not None
-
                 face_info.append({
                     "track_id": track_id,
                     "bbox": bbox,
+                    "conf": round(conf, 3),
                     "name": name,
                     "cast_id": cast_id,
                     "identity_id": identity_id,
                     "person_id": person_id,
                     # Pipeline status
-                    "detected": True,  # If it's in faces.jsonl, it was detected
+                    "detected": True,  # If it's in detections.jsonl, it was detected
                     "tracked": is_tracked,
                     "harvested": is_harvested,
                     "clustered": is_clustered,
