@@ -10,18 +10,26 @@ import {
   deleteEpisode,
   eventsUrl,
   fetchAllRunningJobs,
+  fetchArtifactStatus,
   fetchEpisodeDetail,
+  fetchEpisodeDetails,
+  fetchEpisodeJobHistory,
   fetchEpisodes,
   fetchEpisodeStatus,
   fetchJobs,
   fetchS3Videos,
   fetchShows,
+  fetchStorageConfig,
   fetchTimestampPreview,
+  fetchVideoMeta,
   mapEventStream,
   mirrorEpisodeFromS3,
   presignEpisodeAssets,
   setFeaturedThumbnail,
   triggerAudioPipeline,
+  triggerCluster,
+  triggerDetectTrack,
+  triggerFacesEmbed,
   triggerJob,
   upsertEpisodeById,
 } from "./client";
@@ -29,18 +37,27 @@ import type {
   ApiError,
   AssetUploadResponse,
   AudioPipelineRequest,
+  ClusterJobRequest,
+  DetectTrackJobRequest,
+  EpisodeArtifactStatus,
   EpisodeCreateRequest,
   EpisodeDetail,
+  EpisodeDetailResponse,
   EpisodeEvent,
   EpisodePhase,
   EpisodeStatus,
   EpisodeSummary,
+  FacesJobRequest,
   Job,
+  PipelineSettings,
   S3VideoItem,
   Show,
   ShowCreateRequest,
+  StorageStatus,
   TimestampPreviewResponse,
+  VideoMeta,
 } from "./types";
+import { DEFAULT_PIPELINE_SETTINGS } from "./types";
 
 export function useEpisodeStatus(
   episodeId?: string,
@@ -386,4 +403,151 @@ export function useRecentEpisodes() {
   }, []);
 
   return { getRecent, addRecent, clearRecent };
+}
+
+// ============================================================================
+// Episode Detail Hooks
+// ============================================================================
+
+// Extended episode details
+export function useEpisodeDetails(
+  episodeId: string,
+  options?: { enabled?: boolean }
+) {
+  return useQuery<EpisodeDetailResponse, ApiError>({
+    queryKey: ["episode-details", episodeId],
+    queryFn: () => fetchEpisodeDetails(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 30 * 1000,
+  });
+}
+
+// Video metadata
+export function useVideoMeta(
+  episodeId: string,
+  options?: { enabled?: boolean }
+) {
+  return useQuery<VideoMeta | null, ApiError>({
+    queryKey: ["video-meta", episodeId],
+    queryFn: () => fetchVideoMeta(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Job history for episode
+export function useEpisodeJobHistory(
+  episodeId: string,
+  options?: { enabled?: boolean; limit?: number }
+) {
+  return useQuery<Job[], ApiError>({
+    queryKey: ["episode-job-history", episodeId, options?.limit ?? 5],
+    queryFn: () => fetchEpisodeJobHistory(episodeId, options?.limit ?? 5),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 10 * 1000,
+  });
+}
+
+// Artifact status
+export function useArtifactStatus(
+  episodeId: string,
+  options?: { enabled?: boolean }
+) {
+  return useQuery<EpisodeArtifactStatus | null, ApiError>({
+    queryKey: ["artifact-status", episodeId],
+    queryFn: () => fetchArtifactStatus(episodeId),
+    enabled: (options?.enabled ?? true) && !!episodeId,
+    staleTime: 30 * 1000,
+  });
+}
+
+// Storage configuration
+export function useStorageConfig(options?: { enabled?: boolean }) {
+  return useQuery<StorageStatus | null, ApiError>({
+    queryKey: ["storage-config"],
+    queryFn: fetchStorageConfig,
+    enabled: options?.enabled ?? true,
+    staleTime: 60 * 1000,
+  });
+}
+
+// Trigger detect/track with settings
+export function useTriggerDetectTrack() {
+  const client = useQueryClient();
+  return useMutation<
+    { job_id?: string; status?: string },
+    ApiError,
+    DetectTrackJobRequest
+  >({
+    mutationFn: triggerDetectTrack,
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-status", variables.ep_id] });
+      client.invalidateQueries({ queryKey: ["episode-job-history", variables.ep_id] });
+    },
+  });
+}
+
+// Trigger faces harvest with settings
+export function useTriggerFacesEmbed() {
+  const client = useQueryClient();
+  return useMutation<
+    { job_id?: string; status?: string },
+    ApiError,
+    FacesJobRequest
+  >({
+    mutationFn: triggerFacesEmbed,
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-status", variables.ep_id] });
+      client.invalidateQueries({ queryKey: ["episode-job-history", variables.ep_id] });
+    },
+  });
+}
+
+// Trigger clustering with settings
+export function useTriggerCluster() {
+  const client = useQueryClient();
+  return useMutation<
+    { job_id?: string; status?: string },
+    ApiError,
+    ClusterJobRequest
+  >({
+    mutationFn: triggerCluster,
+    onSuccess: (_data, variables) => {
+      client.invalidateQueries({ queryKey: ["episode-status", variables.ep_id] });
+      client.invalidateQueries({ queryKey: ["episode-job-history", variables.ep_id] });
+    },
+  });
+}
+
+// Pipeline settings (localStorage)
+const PIPELINE_SETTINGS_KEY = "screenalytics_pipeline_settings";
+
+export function usePipelineSettings() {
+  const getSettings = useCallback((): PipelineSettings => {
+    if (typeof window === "undefined") return DEFAULT_PIPELINE_SETTINGS;
+    try {
+      const stored = localStorage.getItem(PIPELINE_SETTINGS_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return { ...DEFAULT_PIPELINE_SETTINGS, ...parsed };
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    return DEFAULT_PIPELINE_SETTINGS;
+  }, []);
+
+  const saveSettings = useCallback((settings: Partial<PipelineSettings>) => {
+    if (typeof window === "undefined") return;
+    const current = getSettings();
+    const updated = { ...current, ...settings };
+    localStorage.setItem(PIPELINE_SETTINGS_KEY, JSON.stringify(updated));
+  }, [getSettings]);
+
+  const resetSettings = useCallback(() => {
+    if (typeof window === "undefined") return;
+    localStorage.removeItem(PIPELINE_SETTINGS_KEY);
+  }, []);
+
+  return { getSettings, saveSettings, resetSettings };
 }

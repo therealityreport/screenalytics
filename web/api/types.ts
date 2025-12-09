@@ -194,3 +194,163 @@ export type FavoriteEpisode = {
   ep_id: string;
   added_at: string;
 };
+
+// ============================================================================
+// Episode Detail Page Types
+// ============================================================================
+
+// Extended video metadata
+export type VideoMeta = {
+  fps_detected?: number;
+  duration_sec?: number;
+  resolution?: string;
+  width?: number;
+  height?: number;
+  codec?: string;
+  container?: string;
+  file_size?: number;
+  frames?: number;
+};
+
+// Extended episode detail response
+export type EpisodeDetailResponse = {
+  ep_id: string;
+  show_slug: string;
+  season_number: number;
+  episode_number: number;
+  title?: string | null;
+  air_date?: string | null;
+  created_at?: string;
+  video_meta?: VideoMeta;
+  s3?: {
+    v1_exists?: boolean;
+    v2_exists?: boolean;
+    key?: string;
+    size?: number;
+  };
+  local?: {
+    exists?: boolean;
+    path?: string;
+  };
+};
+
+// Pipeline settings (persisted to localStorage)
+export type PipelineSettings = {
+  // Detect/Track settings
+  device: string;
+  detector: string;
+  tracker: string;
+  stride: number;
+  det_thresh: number;
+  save_frames: boolean;
+  save_crops: boolean;
+  max_gap: number;
+  // Scene detection
+  scene_detector: string;
+  scene_threshold: number;
+  scene_min_len: number;
+  // Faces harvest
+  faces_device: string;
+  min_frames_between_crops: number;
+  thumb_size: number;
+  faces_jpeg_quality: number;
+  // Cluster settings
+  cluster_device: string;
+  cluster_thresh: number;
+  min_cluster_size: number;
+  min_identity_sim: number;
+};
+
+// Default pipeline settings
+export const DEFAULT_PIPELINE_SETTINGS: PipelineSettings = {
+  device: "auto",
+  detector: "retinaface",
+  tracker: "bytetrack",
+  stride: 3,
+  det_thresh: 0.5,
+  save_frames: true,
+  save_crops: true,
+  max_gap: 90,
+  scene_detector: "pyscenedetect",
+  scene_threshold: 27.0,
+  scene_min_len: 12,
+  faces_device: "auto",
+  min_frames_between_crops: 32,
+  thumb_size: 256,
+  faces_jpeg_quality: 72,
+  cluster_device: "auto",
+  cluster_thresh: 0.58,
+  min_cluster_size: 1,
+  min_identity_sim: 0.5,
+};
+
+// Phase-specific job trigger request
+export type DetectTrackJobRequest = {
+  ep_id: string;
+  device?: string;
+  detector?: string;
+  tracker?: string;
+  stride?: number;
+  det_thresh?: number;
+  save_frames?: boolean;
+  save_crops?: boolean;
+  max_gap?: number;
+  scene_detector?: string;
+  scene_threshold?: number;
+  scene_min_len?: number;
+};
+
+export type FacesJobRequest = {
+  ep_id: string;
+  device?: string;
+  min_frames_between_crops?: number;
+  thumb_size?: number;
+  jpeg_quality?: number;
+};
+
+export type ClusterJobRequest = {
+  ep_id: string;
+  device?: string;
+  cluster_thresh?: number;
+  min_cluster_size?: number;
+  min_identity_sim?: number;
+};
+
+// Job history entry with more details
+export type JobHistoryEntry = Job & {
+  requested?: Record<string, unknown>;
+  runtime_sec?: number;
+};
+
+// Storage status
+export type StorageStatus = {
+  s3_enabled: boolean;
+  local_path?: string;
+  bucket?: string;
+};
+
+// Artifact counts
+export type ArtifactCounts = {
+  frames: number;
+  crops: number;
+  thumbs_tracks: number;
+  manifests: number;
+};
+
+// Episode artifact status
+export type EpisodeArtifactStatus = {
+  sync_status: "synced" | "partial" | "pending" | "empty" | "s3_disabled";
+  local: ArtifactCounts;
+  s3: ArtifactCounts;
+};
+
+// Quick stats for episode
+export type EpisodeQuickStats = {
+  tracks_count: number;
+  identities_count: number;
+  assigned_count: number;
+  unassigned_count: number;
+  singleton_before: number;
+  singleton_after: number;
+  screen_time_calculated: boolean;
+};

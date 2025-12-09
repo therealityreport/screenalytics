@@ -2,20 +2,28 @@ import type {
   ApiError,
   AssetUploadResponse,
   AudioPipelineRequest,
+  ClusterJobRequest,
+  DetectTrackJobRequest,
+  EpisodeArtifactStatus,
   EpisodeCreateRequest,
   EpisodeCreateResponse,
   EpisodeDetail,
+  EpisodeDetailResponse,
   EpisodeEvent,
   EpisodeListResponse,
+  EpisodeQuickStats,
   EpisodeStatus,
   EpisodePhase,
   EpisodeSummary,
+  FacesJobRequest,
   Job,
   JobsResponse,
   S3VideosResponse,
   Show,
   ShowCreateRequest,
+  StorageStatus,
   TimestampPreviewResponse,
+  VideoMeta,
 } from "./types";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/$/, "");
@@ -252,6 +260,108 @@ export async function setFeaturedThumbnail(
     method: "POST",
     body: JSON.stringify({ timestamp_s: timestampS }),
   });
+}
+
+// ============================================================================
+// Episode Detail API Functions
+// ============================================================================
+
+// Fetch extended episode details
+export async function fetchEpisodeDetails(
+  episodeId: string
+): Promise<EpisodeDetailResponse> {
+  return apiFetch<EpisodeDetailResponse>(`/episodes/${episodeId}`);
+}
+
+// Fetch video metadata
+export async function fetchVideoMeta(
+  episodeId: string
+): Promise<VideoMeta | null> {
+  try {
+    return await apiFetch<VideoMeta>(`/episodes/${episodeId}/video_meta`);
+  } catch {
+    return null;
+  }
+}
+
+// Fetch job history for episode
+export async function fetchEpisodeJobHistory(
+  episodeId: string,
+  limit: number = 5
+): Promise<Job[]> {
+  const response = await apiFetch<JobsResponse>(`/jobs?ep_id=${episodeId}&limit=${limit}`);
+  return response.jobs || [];
+}
+
+// Trigger detect/track with custom settings
+export async function triggerDetectTrack(
+  payload: DetectTrackJobRequest
+): Promise<JobTriggerResponse> {
+  return apiFetch<JobTriggerResponse>("/jobs/detect_track", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// Trigger faces harvest with custom settings
+export async function triggerFacesEmbed(
+  payload: FacesJobRequest
+): Promise<JobTriggerResponse> {
+  return apiFetch<JobTriggerResponse>("/jobs/faces_embed", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// Trigger clustering with custom settings
+export async function triggerCluster(
+  payload: ClusterJobRequest
+): Promise<JobTriggerResponse> {
+  return apiFetch<JobTriggerResponse>("/jobs/cluster", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// Fetch artifact status
+export async function fetchArtifactStatus(
+  episodeId: string
+): Promise<EpisodeArtifactStatus | null> {
+  try {
+    return await apiFetch<EpisodeArtifactStatus>(`/episodes/${episodeId}/artifact_status`);
+  } catch {
+    return null;
+  }
+}
+
+// Fetch storage configuration
+export async function fetchStorageConfig(): Promise<StorageStatus | null> {
+  try {
+    return await apiFetch<StorageStatus>("/config/storage");
+  } catch {
+    return null;
+  }
+}
+
+// Fetch quick stats for episode
+export async function fetchEpisodeQuickStats(
+  episodeId: string
+): Promise<EpisodeQuickStats | null> {
+  try {
+    // This would need a dedicated endpoint, for now derive from status
+    const status = await fetchEpisodeStatus(episodeId);
+    return {
+      tracks_count: status.detect_track?.tracks ?? 0,
+      identities_count: status.cluster?.identities ?? 0,
+      assigned_count: 0, // Would need additional endpoint
+      unassigned_count: 0,
+      singleton_before: 0,
+      singleton_after: 0,
+      screen_time_calculated: false,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export { normalizeError };
