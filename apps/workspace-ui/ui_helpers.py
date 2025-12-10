@@ -25,11 +25,21 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit.runtime.scriptrunner.script_run_context import (
-    add_script_run_ctx,
-    get_script_run_ctx,
-)
-from streamlit.runtime.scriptrunner.script_requests import RerunData
+# Streamlit 1.44+ reorganized internal modules - use try/except for compatibility
+try:
+    # Streamlit 1.44+
+    from streamlit.runtime.scriptrunner import (
+        add_script_run_ctx,
+        get_script_run_ctx,
+        RerunData,
+    )
+except ImportError:
+    # Streamlit < 1.44
+    from streamlit.runtime.scriptrunner.script_run_context import (
+        add_script_run_ctx,
+        get_script_run_ctx,
+    )
+    from streamlit.runtime.scriptrunner.script_requests import RerunData
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -2899,7 +2909,7 @@ def identity_card(title: str, subtitle: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.markdown(f"**{title}**")
         if subtitle:
             st.caption(subtitle)
@@ -2912,7 +2922,7 @@ def track_card(title: str, caption: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.markdown(f"**{title}**")
         st.caption(caption)
         if extra:
@@ -2924,7 +2934,7 @@ def frame_card(title: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.caption(title)
         if extra:
             extra()

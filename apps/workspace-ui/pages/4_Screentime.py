@@ -558,14 +558,14 @@ if preview_result:
     if preview_url:
         # Handle both local paths and URLs
         if preview_url.startswith("http"):
-            st.image(preview_url, use_column_width=True)
+            st.image(preview_url, use_container_width=True)
         else:
             # Local file path
             from pathlib import Path as StPath
 
             local_preview = StPath(preview_url)
             if local_preview.exists():
-                st.image(str(local_preview), use_column_width=True)
+                st.image(str(local_preview), use_container_width=True)
             else:
                 st.warning(f"Preview file not found: {preview_url}")
 

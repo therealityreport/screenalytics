@@ -201,24 +201,56 @@ def write_identities(ep_id: str, payload: Dict[str, Any]) -> Path:
     return path
 
 
+def _fast_line_count(path: Path) -> int:
+    """Count non-empty lines without parsing JSON (much faster for large files)."""
+    if not path.exists():
+        return 0
+    count = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
 def update_identity_stats(ep_id: str, payload: Dict[str, Any]) -> None:
-    faces_count = len(load_faces(ep_id))
+    # Fast line count instead of loading entire faces.jsonl
+    faces_count = _fast_line_count(_faces_path(ep_id))
     payload.setdefault("stats", {})
     payload["stats"]["faces"] = faces_count
     payload["stats"]["clusters"] = len(payload.get("identities", []))
 
 
-def sync_manifests(ep_id: str, *paths: Path) -> None:
+def sync_manifests(ep_id: str, *paths: Path, async_upload: bool = False) -> None:
+    """Sync manifest files to S3.
+
+    Args:
+        ep_id: Episode ID
+        *paths: File paths to sync
+        async_upload: If True, upload in background thread (fire-and-forget)
+    """
     try:
         ctx = episode_context_from_id(ep_id)
     except ValueError:
         return
-    for path in paths:
-        if path and path.exists():
-            try:
-                STORAGE.put_artifact(ctx, "manifests", path, path.name)
-            except Exception:
-                continue
+
+    def _do_sync():
+        for path in paths:
+            if path and path.exists():
+                try:
+                    STORAGE.put_artifact(ctx, "manifests", path, path.name)
+                except Exception:
+                    continue
+
+    if async_upload:
+        import threading
+        thread = threading.Thread(target=_do_sync, daemon=True)
+        thread.start()
+    else:
+        _do_sync()
 
 
 def _identity_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -614,7 +646,8 @@ def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, An
     payload["identities"] = [item for item in identities if item.get("identity_id") != source_id]
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
-    sync_manifests(ep_id, identities_path)
+    # Async S3 upload for snappy UI response
+    sync_manifests(ep_id, identities_path, async_upload=True)
     return target
 
 

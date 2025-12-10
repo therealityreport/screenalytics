@@ -74,6 +74,27 @@ def _load_tracking_config_yaml() -> dict[str, Any]:
     return {}
 
 
+def _load_detection_config_yaml() -> dict[str, Any]:
+    """Load detection configuration from YAML file if available."""
+    config_path = REPO_ROOT / "config" / "pipeline" / "detection.yaml"
+    if not config_path.exists():
+        LOGGER.debug("Detection config YAML not found at %s, using defaults", config_path)
+        return {}
+
+    try:
+        import yaml
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        if config:
+            LOGGER.info("Loaded detection config from %s", config_path)
+            return config
+    except Exception as exc:
+        LOGGER.warning("Failed to load detection config YAML: %s", exc)
+
+    return {}
+
+
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
@@ -404,7 +425,37 @@ if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTIC
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
         LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
-MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREANALYTICS_MIN_IDENTITY_SIM", "0.55"))  # Stricter (was 0.50)
+
+# Load detection config for wide shot mode and small face settings
+_DETECTION_CONFIG = _load_detection_config_yaml()
+WIDE_SHOT_MODE_ENABLED = _DETECTION_CONFIG.get("wide_shot_mode", False)
+WIDE_SHOT_INPUT_SIZE = int(_DETECTION_CONFIG.get("wide_shot_input_size", 960))
+WIDE_SHOT_MIN_FACE_SIZE = int(_DETECTION_CONFIG.get("wide_shot_min_face_size", 12))
+WIDE_SHOT_CONFIDENCE_TH = float(_DETECTION_CONFIG.get("wide_shot_confidence_th", 0.40))
+DETECTION_MIN_SIZE = int(_DETECTION_CONFIG.get("min_size", 16))
+DETECTION_CONFIDENCE_TH = float(_DETECTION_CONFIG.get("confidence_th", 0.50))
+# Person fallback settings
+PERSON_FALLBACK_ENABLED = _DETECTION_CONFIG.get("enable_person_fallback", False)
+PERSON_FALLBACK_MIN_BODY_HEIGHT = int(_DETECTION_CONFIG.get("person_fallback_min_body_height", 100))
+PERSON_FALLBACK_FACE_REGION_RATIO = float(_DETECTION_CONFIG.get("person_fallback_face_region_ratio", 0.25))
+PERSON_FALLBACK_CONFIDENCE_TH = float(_DETECTION_CONFIG.get("person_fallback_confidence_th", 0.50))
+PERSON_FALLBACK_MAX_PER_FRAME = int(_DETECTION_CONFIG.get("person_fallback_max_per_frame", 10))
+
+if WIDE_SHOT_MODE_ENABLED:
+    LOGGER.info(
+        "Wide shot mode ENABLED: input_size=%d, min_face=%d, conf=%.2f",
+        WIDE_SHOT_INPUT_SIZE,
+        WIDE_SHOT_MIN_FACE_SIZE,
+        WIDE_SHOT_CONFIDENCE_TH,
+    )
+if PERSON_FALLBACK_ENABLED:
+    LOGGER.info(
+        "Person fallback ENABLED: min_body_height=%d, face_ratio=%.2f",
+        PERSON_FALLBACK_MIN_BODY_HEIGHT,
+        PERSON_FALLBACK_FACE_REGION_RATIO,
+    )
+
+MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM", "0.55"))  # Stricter (was 0.50)
 # Minimum cohesion for a cluster to be kept together; below this, split into singletons
 MIN_CLUSTER_COHESION = float(os.environ.get("SCREENALYTICS_MIN_CLUSTER_COHESION", "0.55"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
@@ -1406,7 +1457,15 @@ class RetinaFaceDetectorBackend:
     ) -> None:
         self.device = device
         self.score_thresh = max(min(float(score_thresh or RETINAFACE_SCORE_THRESHOLD), 1.0), 0.0)
-        self.min_area = MIN_FACE_AREA
+        # Use config-based min_size (convert dimension to area)
+        # In wide shot mode, use smaller min face size for better small face detection
+        if WIDE_SHOT_MODE_ENABLED:
+            min_size_dim = WIDE_SHOT_MIN_FACE_SIZE
+            # Use wide shot confidence threshold
+            self.score_thresh = max(min(float(WIDE_SHOT_CONFIDENCE_TH), 1.0), 0.0)
+        else:
+            min_size_dim = DETECTION_MIN_SIZE
+        self.min_area = float(min_size_dim * min_size_dim)  # Convert pixel dimension to area
         self._model = None
         self._resolved_device: Optional[str] = None
         self._coreml_input_size = coreml_input_size
@@ -1492,6 +1551,137 @@ def _build_face_detector(
         score_thresh=score_thresh,
         coreml_input_size=coreml_input_size,
         allow_cpu_fallback=allow_cpu_fallback,
+    )
+
+
+class PersonFallbackDetector:
+    """YOLO-based person detector for fallback when faces are too small to detect.
+
+    When face detection fails (e.g., in wide shots), this detector finds people
+    and estimates face regions from the upper portion of their body bounding boxes.
+    """
+
+    PERSON_CLASS_ID = 0  # COCO person class
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        confidence_thresh: float = 0.50,
+        min_body_height: int = 100,
+        face_region_ratio: float = 0.25,
+        max_detections: int = 10,
+    ) -> None:
+        self.device = device
+        self.confidence_thresh = confidence_thresh
+        self.min_body_height = min_body_height
+        self.face_region_ratio = face_region_ratio
+        self.max_detections = max_detections
+        self._model = None
+
+    def _lazy_model(self):
+        """Lazily load YOLO model on first use."""
+        if self._model is not None:
+            return self._model
+        try:
+            from ultralytics import YOLO
+
+            # Use YOLOv8n (nano) for speed - only need person detection
+            self._model = YOLO("yolov8n.pt")
+            # Force model to specified device
+            if self.device and self.device != "cpu":
+                self._model.to(self.device)
+            LOGGER.info("Loaded YOLOv8n for person fallback detection on device=%s", self.device)
+        except Exception as exc:
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", exc)
+            self._model = None
+        return self._model
+
+    def detect_persons(self, image: np.ndarray) -> list[DetectionSample]:
+        """Detect persons and return estimated face regions.
+
+        Args:
+            image: BGR image array
+
+        Returns:
+            List of DetectionSample with estimated face bounding boxes
+        """
+        if not PERSON_FALLBACK_ENABLED:
+            return []
+
+        model = self._lazy_model()
+        if model is None:
+            return []
+
+        try:
+            # Run YOLO inference
+            results = model(image, verbose=False, conf=self.confidence_thresh, classes=[self.PERSON_CLASS_ID])
+            if not results or len(results) == 0:
+                return []
+
+            detections = []
+            boxes = results[0].boxes
+            if boxes is None or len(boxes) == 0:
+                return []
+
+            # Process person detections
+            for i, box in enumerate(boxes):
+                if i >= self.max_detections:
+                    break
+
+                # Get body bounding box (xyxy format)
+                xyxy = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+                body_height = y2 - y1
+                body_width = x2 - x1
+
+                # Skip if body is too small
+                if body_height < self.min_body_height:
+                    continue
+
+                conf = float(box.conf[0].cpu().numpy())
+
+                # Estimate face region from top portion of body
+                # Face is typically in upper 20-25% of body, centered horizontally
+                face_height = body_height * self.face_region_ratio
+                face_width = min(face_height * 0.8, body_width * 0.6)  # Face is roughly square
+
+                # Center the face region horizontally
+                body_center_x = (x1 + x2) / 2
+                face_x1 = body_center_x - face_width / 2
+                face_x2 = body_center_x + face_width / 2
+                face_y1 = y1  # Top of body
+                face_y2 = y1 + face_height
+
+                # Create detection sample
+                face_bbox = np.array([face_x1, face_y1, face_x2, face_y2], dtype=np.float32)
+                detections.append(
+                    DetectionSample(
+                        bbox=face_bbox,
+                        conf=conf * 0.8,  # Discount confidence since this is estimated
+                        class_idx=0,
+                        class_label="face_estimated",  # Mark as estimated face
+                        landmarks=None,  # No landmarks from body detection
+                    )
+                )
+
+            LOGGER.debug("Person fallback: found %d estimated faces from %d persons", len(detections), len(boxes))
+            return detections
+
+        except Exception as exc:
+            LOGGER.warning("Person fallback detection failed: %s", exc)
+            return []
+
+
+def _build_person_fallback_detector(device: str) -> PersonFallbackDetector | None:
+    """Build person fallback detector if enabled in config."""
+    if not PERSON_FALLBACK_ENABLED:
+        return None
+    return PersonFallbackDetector(
+        device=device,
+        confidence_thresh=PERSON_FALLBACK_CONFIDENCE_TH,
+        min_body_height=PERSON_FALLBACK_MIN_BODY_HEIGHT,
+        face_region_ratio=PERSON_FALLBACK_FACE_REGION_RATIO,
+        max_detections=PERSON_FALLBACK_MAX_PER_FRAME,
     )
 
 
@@ -2239,6 +2429,68 @@ def encode_jpeg_bytes(image, *, quality: int = 85, color: str = "bgr") -> bytes:
     return encoded.tobytes()
 
 
+def encode_png_bytes(image, *, compression: int = 3, color: str = "bgr") -> bytes:
+    """Encode an image to PNG bytes without writing to disk (lossless).
+
+    Args:
+        image: Input image (numpy array or array-like)
+        compression: PNG compression level (0-9, default 3)
+        color: Input color space ("bgr" or "rgb")
+
+    Returns:
+        PNG-encoded bytes
+    """
+    import cv2  # type: ignore
+
+    arr = np.asarray(image)
+    if arr.size == 0:
+        raise ValueError("Cannot encode empty image")
+    arr = np.ascontiguousarray(_normalize_to_uint8(arr))
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        mode = color.lower()
+        if mode == "rgb":
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        elif mode not in {"bgr", "rgb"}:
+            raise ValueError(f"Unsupported color mode '{color}'")
+    else:
+        raise ValueError(f"Unsupported image shape for PNG encode: {arr.shape}")
+    arr = np.ascontiguousarray(arr)
+    compression = max(0, min(int(compression), 9))
+    success, encoded = cv2.imencode(".png", arr, [cv2.IMWRITE_PNG_COMPRESSION, compression])
+    if not success:
+        raise RuntimeError("cv2.imencode failed")
+    return encoded.tobytes()
+
+
+def save_png(path: str | Path, image, *, compression: int = 3, color: str = "bgr") -> None:
+    """Normalize + persist an image to PNG (lossless), ensuring non-blank uint8 BGR data."""
+    import cv2  # type: ignore
+
+    arr = np.asarray(image)
+    if arr.size == 0:
+        raise ValueError(f"Cannot save empty image to {path}")
+    arr = np.ascontiguousarray(_normalize_to_uint8(arr))
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        mode = color.lower()
+        if mode == "rgb":
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        elif mode not in {"bgr", "rgb"}:
+            raise ValueError(f"Unsupported color mode '{color}'")
+    else:
+        raise ValueError(f"Unsupported image shape for PNG write: {arr.shape}")
+    arr = np.ascontiguousarray(arr)
+    compression = max(0, min(int(compression), 9))
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(out_path), arr, [cv2.IMWRITE_PNG_COMPRESSION, compression])
+    if not ok:
+        raise RuntimeError(f"cv2.imwrite failed for {out_path}")
+
+
 def save_jpeg(path: str | Path, image, *, quality: int = 85, color: str = "bgr") -> None:
     """Normalize + persist an image to JPEG, ensuring non-blank uint8 BGR data."""
     import cv2  # type: ignore
@@ -2278,11 +2530,19 @@ class ThumbWriter:
     """
 
     def __init__(
-        self, ep_id: str, size: int = 256, jpeg_quality: int = 85, storage_backend=None
+        self,
+        ep_id: str,
+        size: int = 256,
+        jpeg_quality: int = 85,
+        storage_backend=None,
+        use_png: bool = True,  # Default to PNG for maximum quality
+        png_compression: int = 3,
     ) -> None:
         self.ep_id = ep_id
         self.size = size
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
+        self.use_png = use_png
+        self.png_compression = max(0, min(int(png_compression), 9))
         self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
         self._storage_backend = storage_backend
         # Determine if we should use backend for writes (only for pure S3 mode)
@@ -2365,22 +2625,26 @@ class ThumbWriter:
             if mx - mn < 1e-6:
                 LOGGER.warning("Nearly constant thumb track=%s frame=%s", track_id, frame_idx)
             self._stat_samples += 1
-        rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}.jpg")
+        ext = ".png" if self.use_png else ".jpg"
+        rel_path = Path(f"track_{track_id:04d}/thumb_{frame_idx:06d}{ext}")
         abs_path = self.root_dir / rel_path
 
         # Write thumbnail using storage backend (S3) or direct filesystem
         if self._use_backend_writes and self._storage_backend is not None:
             # Direct-to-S3 mode: encode to bytes and upload
             try:
-                jpeg_data = encode_jpeg_bytes(thumb, quality=self.jpeg_quality, color="bgr")
+                if self.use_png:
+                    img_data = encode_png_bytes(thumb, compression=self.png_compression, color="bgr")
+                else:
+                    img_data = encode_jpeg_bytes(thumb, quality=self.jpeg_quality, color="bgr")
                 # entity_id includes track and frame info
                 entity_id = f"track_{track_id:04d}/thumb_{frame_idx:06d}"
                 result = self._storage_backend.write_thumbnail(
-                    self.ep_id, "track", entity_id, jpeg_data
+                    self.ep_id, "track", entity_id, img_data, use_png=self.use_png
                 )
                 if result.success:
                     self.thumbs_written += 1
-                    self.bytes_written += len(jpeg_data)
+                    self.bytes_written += len(img_data)
                     self._last_thumb_meta = {
                         "source_shape": tuple(int(x) for x in source.shape[:2]),
                         "source_kind": source_kind,
@@ -2394,7 +2658,10 @@ class ThumbWriter:
                 return None, None
         else:
             # Local/hybrid mode: write directly to disk
-            ok, reason = safe_imwrite(abs_path, thumb, self.jpeg_quality)
+            ok, reason = safe_imwrite(
+                abs_path, thumb, self.jpeg_quality,
+                use_png=self.use_png, png_compression=self.png_compression
+            )
             if not ok:
                 LOGGER.warning("Failed to write thumb %s: %s", abs_path, reason)
                 return None, None
@@ -2798,11 +3065,15 @@ class FrameExporter:
         jpeg_quality: int,
         debug_logger: JsonlLogger | NullLogger | None = None,
         storage_backend=None,
+        use_png: bool = True,  # Default to PNG for maximum quality
+        png_compression: int = 3,  # PNG compression (0-9)
     ) -> None:
         self.ep_id = ep_id
         self.save_frames = save_frames
         self.save_crops = save_crops
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
+        self.use_png = use_png
+        self.png_compression = max(0, min(int(png_compression), 9))
         self.root_dir = get_path(ep_id, "frames_root")
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
@@ -2859,23 +3130,30 @@ class FrameExporter:
         if not (self.save_frames or self.save_crops):
             return
         if self.save_frames:
-            frame_path = self.frames_dir / f"frame_{frame_idx:06d}.jpg"
+            ext = ".png" if self.use_png else ".jpg"
+            frame_path = self.frames_dir / f"frame_{frame_idx:06d}{ext}"
             try:
                 self._log_image_stats("frame", frame_path, image)
                 if self._use_backend_writes and self._storage_backend is not None:
                     # Direct-to-S3 mode: encode to bytes and upload
-                    jpeg_data = encode_jpeg_bytes(image, quality=self.jpeg_quality, color="bgr")
+                    if self.use_png:
+                        img_data = encode_png_bytes(image, compression=self.png_compression, color="bgr")
+                    else:
+                        img_data = encode_jpeg_bytes(image, quality=self.jpeg_quality, color="bgr")
                     result = self._storage_backend.write_frame(
-                        self.ep_id, frame_idx, jpeg_data
+                        self.ep_id, frame_idx, img_data, use_png=self.use_png
                     )
                     if result.success:
                         self.frames_written += 1
-                        self.bytes_written += len(jpeg_data)
+                        self.bytes_written += len(img_data)
                     else:
                         LOGGER.warning("Failed to upload frame %d: %s", frame_idx, result.error)
                 else:
                     # Local/hybrid mode: write directly to disk
-                    save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
+                    if self.use_png:
+                        save_png(frame_path, image, compression=self.png_compression, color="bgr")
+                    else:
+                        save_jpeg(frame_path, image, quality=self.jpeg_quality, color="bgr")
                     self.frames_written += 1
                     if frame_path.exists():
                         self.bytes_written += frame_path.stat().st_size
@@ -2905,7 +3183,8 @@ class FrameExporter:
                     self._record_crop_index(track_id, frame_idx, ts)
 
     def crop_component(self, track_id: int, frame_idx: int) -> str:
-        return f"track_{track_id:04d}/frame_{frame_idx:06d}.jpg"
+        ext = ".png" if self.use_png else ".jpg"
+        return f"track_{track_id:04d}/frame_{frame_idx:06d}{ext}"
 
     def crop_rel_path(self, track_id: int, frame_idx: int) -> str:
         return f"crops/{self.crop_component(track_id, frame_idx)}"
@@ -3011,22 +3290,28 @@ class FrameExporter:
         if self._use_backend_writes and self._storage_backend is not None:
             # Direct-to-S3 mode: encode to bytes and upload
             try:
-                jpeg_data = encode_jpeg_bytes(crop, quality=self.jpeg_quality, color="bgr")
+                if self.use_png:
+                    img_data = encode_png_bytes(crop, compression=self.png_compression, color="bgr")
+                else:
+                    img_data = encode_jpeg_bytes(crop, quality=self.jpeg_quality, color="bgr")
                 result = self._storage_backend.write_crop(
-                    self.ep_id, track_id, frame_idx, jpeg_data
+                    self.ep_id, track_id, frame_idx, img_data, use_png=self.use_png
                 )
                 ok = result.success
                 save_err = result.error if not ok else None
-                file_size = len(jpeg_data) if ok else None
+                file_size = len(img_data) if ok else None
                 if ok:
-                    self.bytes_written += len(jpeg_data)
+                    self.bytes_written += len(img_data)
             except Exception as exc:
                 ok = False
                 save_err = str(exc)
                 file_size = None
         else:
             # Local/hybrid mode: write directly to disk
-            ok, save_err = safe_imwrite(crop_path, crop, self.jpeg_quality)
+            ok, save_err = safe_imwrite(
+                crop_path, crop, self.jpeg_quality,
+                use_png=self.use_png, png_compression=self.png_compression
+            )
             file_size = crop_path.stat().st_size if ok and crop_path.exists() else None
             if ok and file_size:
                 self.bytes_written += file_size
@@ -4342,6 +4627,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                 coreml_size = f"{int(coreml_size)}x{int(coreml_size)}"
             args.coreml_det_size = str(coreml_size)
 
+    # Apply wide shot mode override if enabled (increases input size for small face detection)
+    # This overrides profile settings unless explicit CLI flag was provided
+    if WIDE_SHOT_MODE_ENABLED and not _flag_present(raw_argv, "--coreml-det-size"):
+        wide_size = WIDE_SHOT_INPUT_SIZE
+        args.coreml_det_size = f"{wide_size}x{wide_size}"
+        LOGGER.info("Wide shot mode: overriding coreml_det_size to %dx%d", wide_size, wide_size)
+        # Also apply lower detection threshold for small faces
+        if not _flag_present(raw_argv, "--det-thresh") and hasattr(args, "det_thresh"):
+            args.det_thresh = WIDE_SHOT_CONFIDENCE_TH
+            LOGGER.info("Wide shot mode: using lower detection threshold %.2f", WIDE_SHOT_CONFIDENCE_TH)
+
     # Configure logging based on --quiet/--verbose flags
     _configure_logging(getattr(args, "quiet", False), getattr(args, "verbose", False))
 
@@ -4732,6 +5028,12 @@ def _run_full_pipeline(
     )
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
+
+    # Initialize person fallback detector if enabled
+    person_fallback_detector = _build_person_fallback_detector(detector_device)
+    if person_fallback_detector:
+        LOGGER.info("Person fallback detector initialized for wide shot detection")
+
     tracker_label = tracker_choice
     if progress:
         start_frames, video_meta = _progress_value(-1, include_current=True)
@@ -4966,6 +5268,18 @@ def _run_full_pipeline(
                         )
                         raise RuntimeError(f"Face detection failed at frame {frame_idx}") from exc
                     face_detections = [sample for sample in detections if sample.class_label == FACE_CLASS_LABEL]
+
+                    # Person fallback: if face detection found few/no faces, try body detection
+                    if PERSON_FALLBACK_ENABLED and person_fallback_detector is not None and len(face_detections) == 0:
+                        person_fallback_detections = person_fallback_detector.detect_persons(frame)
+                        if person_fallback_detections:
+                            LOGGER.debug(
+                                "Frame %d: face detection found 0 faces, person fallback found %d estimated faces",
+                                frame_idx,
+                                len(person_fallback_detections),
+                            )
+                            # Add estimated face detections from person detection
+                            face_detections.extend(person_fallback_detections)
 
                     # DEBUG: Show face detection count
                     if frames_sampled < 5:
@@ -7860,7 +8174,8 @@ def _rep_payload(face: Dict[str, Any] | None, s3_prefixes: Dict[str, str] | None
         track_id = face.get("track_id")
         frame_idx = face.get("frame_idx")
         if track_id is not None and frame_idx is not None:
-            s3_key = f"{s3_prefixes['crops']}track_{int(track_id):04d}/frame_{int(frame_idx):06d}.jpg"
+            # Default to PNG (matches FrameExporter default use_png=True)
+            s3_key = f"{s3_prefixes['crops']}track_{int(track_id):04d}/frame_{int(frame_idx):06d}.png"
     if s3_key:
         rep["s3_key"] = s3_key
     return rep

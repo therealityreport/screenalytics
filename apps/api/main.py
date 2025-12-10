@@ -24,6 +24,7 @@ from apps.api.routers import (
     config,
     episodes,
     facebank,
+    face_review,
     files,
     grouping,
     identities,
@@ -57,6 +58,7 @@ app.include_router(files.router, tags=["files"])
 app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
+app.include_router(face_review.router, tags=["face_review"])
 app.include_router(metadata.router)
 app.include_router(archive.router, tags=["archive"])
 app.include_router(audio.router, tags=["audio"])

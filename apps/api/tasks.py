@@ -89,18 +89,35 @@ def check_active_job(episode_id: str, operation: str) -> Optional[str]:
         return None
 
 
-def _acquire_lock(episode_id: str, operation: str, job_id: str, ttl: int = 3600) -> bool:
+# Operation-specific TTLs (Bug 7 fix)
+OPERATION_TTLS = {
+    "detect_track": 1800,       # 30 minutes
+    "faces_embed": 900,         # 15 minutes
+    "cluster": 600,             # 10 minutes
+    "auto_group": 600,          # 10 minutes
+    "manual_assign": 300,       # 5 minutes
+    "refresh_similarity": 600,  # 10 minutes
+    "improve_faces_queue": 300, # 5 minutes
+}
+DEFAULT_LOCK_TTL = 600  # 10 minutes default
+
+
+def _acquire_lock(episode_id: str, operation: str, job_id: str, ttl: int = None) -> bool:
     """Try to acquire lock for an episode+operation.
 
     Args:
         episode_id: Episode ID
         operation: Operation type (manual_assign, auto_group, etc.)
         job_id: Celery task ID
-        ttl: Lock TTL in seconds (default 1 hour)
+        ttl: Lock TTL in seconds (defaults to operation-specific TTL)
 
     Returns:
-        True if lock acquired, False if another job is running
+        True if lock acquired, False if another job is running or Redis unavailable
     """
+    # Use operation-specific TTL if not explicitly provided (Bug 7 fix)
+    if ttl is None:
+        ttl = OPERATION_TTLS.get(operation, DEFAULT_LOCK_TTL)
+
     try:
         r = _get_redis()
         lock_key = _lock_key(episode_id, operation)
@@ -112,14 +129,18 @@ def _acquire_lock(episode_id: str, operation: str, job_id: str, ttl: int = 3600)
             result = AsyncResult(existing, app=celery_app)
             if result.state in (states.PENDING, states.RECEIVED, states.STARTED):
                 return False  # Another job is running
-            # Old job finished, we can take over
+            # Old job finished - explicitly delete stale lock before acquiring (Bug 8 fix)
+            r.delete(lock_key)
+            LOGGER.info(f"Cleaned up stale lock for {episode_id}:{operation} (job {existing} state={result.state})")
 
         # Set lock with TTL
         r.setex(lock_key, ttl, job_id)
         return True
     except Exception as e:
-        LOGGER.warning(f"Failed to acquire lock: {e}")
-        return True  # Proceed anyway if Redis fails
+        LOGGER.error(f"Failed to acquire lock for {episode_id}:{operation}: {e}")
+        # Bug 2 fix: Return False on Redis failure to prevent concurrent execution
+        # without proper locking. Better to fail-safe than allow data corruption.
+        return False
 
 
 def _release_lock(episode_id: str, operation: str, job_id: str) -> None:
@@ -817,6 +838,14 @@ class PipelineTask(Task):
 
     abstract = True
 
+    # Operation-specific max durations in seconds (Bug 4 fix)
+    OPERATION_MAX_DURATIONS = {
+        "detect_track": 7200,    # 2 hours
+        "faces_embed": 3600,    # 1 hour
+        "cluster": 1800,        # 30 minutes
+    }
+    MAX_PROGRESS_FILE_SIZE = 10_000_000  # 10MB (Bug 15 fix)
+
     def _run_subprocess(
         self,
         command: list[str],
@@ -844,6 +873,7 @@ class PipelineTask(Task):
         import json
 
         job_id = self.request.id
+        proc = None  # Track subprocess for cleanup (Bug 9 fix)
 
         LOGGER.info(f"[{job_id}] Starting {operation} for {episode_id}")
         LOGGER.info(f"[{job_id}] Command: {' '.join(command)}")
@@ -863,24 +893,54 @@ class PipelineTask(Task):
             poll_interval = 2.0  # seconds
             last_progress = 0.0
             last_phase = ""
-            stderr_lines = []
+            start_time = time.time()  # Bug 4 fix: track start time
+            max_duration = self.OPERATION_MAX_DURATIONS.get(operation, 7200)
 
             # Poll until process completes
             while proc.poll() is None:
                 time.sleep(poll_interval)
 
+                # Bug 4 fix: Check for timeout
+                elapsed = time.time() - start_time
+                if elapsed > max_duration:
+                    LOGGER.error(f"[{job_id}] {operation} exceeded max duration ({max_duration}s)")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    return {
+                        "status": "error",
+                        "episode_id": episode_id,
+                        "operation": operation,
+                        "error": f"Task timeout exceeded ({max_duration}s)",
+                    }
+
                 # Read progress file if available and update Celery state
                 if progress_path and progress_path.exists():
                     try:
+                        # Bug 15 fix: Validate file size before reading
+                        file_size = progress_path.stat().st_size
+                        if file_size > self.MAX_PROGRESS_FILE_SIZE:
+                            LOGGER.warning(f"[{job_id}] Progress file too large ({file_size} bytes), skipping")
+                            continue
+
                         progress_text = progress_path.read_text(encoding="utf-8")
                         progress_data = json.loads(progress_text)
-                        frames_done = progress_data.get("frames_done", 0)
-                        frames_total = progress_data.get("frames_total", 1)
-                        phase = progress_data.get("phase", "running")
-                        secs_done = progress_data.get("secs_done", 0)
+
+                        # Bug 12 fix: Validate progress data structure
+                        if not isinstance(progress_data, dict):
+                            LOGGER.warning(f"[{job_id}] Progress data not a dict, skipping")
+                            continue
+
+                        frames_done = int(progress_data.get("frames_done", 0))
+                        frames_total = max(1, int(progress_data.get("frames_total", 1)))
+                        phase = str(progress_data.get("phase", "running"))[:50]
+                        secs_done = int(progress_data.get("secs_done", 0))
 
                         # Calculate progress percentage (cap at 99% until complete)
-                        progress_pct = min(frames_done / max(frames_total, 1), 0.99)
+                        progress_pct = min(frames_done / frames_total, 0.99)
 
                         # Update Celery state if progress changed
                         if progress_pct > last_progress or phase != last_phase:
@@ -903,13 +963,11 @@ class PipelineTask(Task):
                                 f"[{job_id}] Progress update: {phase} {frames_done}/{frames_total} "
                                 f"({progress_pct*100:.1f}%)"
                             )
-                    except (json.JSONDecodeError, OSError) as e:
+                    except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
                         LOGGER.debug(f"[{job_id}] Could not read progress file: {e}")
 
             # Process complete - get final output
             stdout, stderr = proc.communicate()
-            if stderr:
-                stderr_lines.append(stderr)
 
             # Read final progress
             progress_data = None
@@ -942,6 +1000,18 @@ class PipelineTask(Task):
             }
 
         except Exception as e:
+            # Bug 9 fix: Clean up subprocess on exception
+            if proc is not None and proc.poll() is None:
+                LOGGER.warning(f"[{job_id}] Terminating subprocess due to exception")
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass  # Best effort cleanup
+
             LOGGER.exception(f"[{job_id}] {operation} raised exception: {e}")
             return {
                 "status": "error",

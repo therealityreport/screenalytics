@@ -607,6 +607,34 @@ def _fetch_unlinked_entities(ep_id: str) -> Dict[str, Any] | None:
     return _safe_api_get(f"/episodes/{ep_id}/unlinked_entities")
 
 
+@st.cache_data(ttl=15)
+def _fetch_archived_ids(ep_id: str) -> Dict[str, set]:
+    """Fetch archived cluster/track ids for an episode so UI can hide them."""
+    show_id = ep_id.split("-")[0].upper() if "-" in ep_id else ep_id.upper()
+    resp = _safe_api_get(
+        f"/archive/shows/{show_id}",
+        params={"episode_id": ep_id, "limit": 500},
+    )
+    clusters: set[str] = set()
+    tracks: set[int] = set()
+    if resp:
+        items = resp.get("items", []) or []
+        for item in items:
+            item_type = item.get("type")
+            if item_type == "cluster":
+                cid = item.get("cluster_id") or item.get("identity_id") or item.get("original_id")
+                if cid:
+                    clusters.add(str(cid))
+            elif item_type == "track":
+                tid = item.get("track_id") or item.get("original_id")
+                try:
+                    if tid is not None:
+                        tracks.add(int(tid))
+                except (TypeError, ValueError):
+                    continue
+    return {"clusters": clusters, "tracks": tracks}
+
+
 @st.cache_data(ttl=15)  # Reduced from 60s - frequently mutated by assignments
 def _fetch_cast_cached(show_slug: str | None, season_label: str | None = None) -> Dict[str, Any] | None:
     if not show_slug:
@@ -648,6 +676,153 @@ def _fetch_cluster_metrics_cached(ep_id: str, cluster_id: str) -> Dict[str, Any]
 def _fetch_track_metrics_cached(ep_id: str, track_id: int) -> Dict[str, Any] | None:
     """Cached fetch of track metrics (similarity, quality, person cohesion)."""
     return _safe_api_get(f"/episodes/{ep_id}/tracks/{track_id}/metrics")
+
+
+def _coerce_track_int(val: Any) -> int | None:
+    """Parse track ids in either int or track_123 string form."""
+    if isinstance(val, str) and val.startswith("track_"):
+        val = val.replace("track_", "")
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _start_improve_faces(ep_id: str, *, force: bool = False) -> bool:
+    """Fetch initial suggestions and activate the Improve Faces modal."""
+    try:
+        resp = helpers.api_get(f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions")
+    except Exception as exc:
+        st.error(f"Failed to load Improve Faces suggestions: {exc}")
+        return False
+
+    suggestions = resp.get("suggestions", []) if isinstance(resp, dict) else []
+    initial_done = bool(resp.get("initial_pass_done")) if isinstance(resp, dict) else False
+
+    if not suggestions or initial_done:
+        if force:
+            st.info("No Improve Faces suggestions right now.")
+        st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+        st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+        st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+        return False
+
+    st.session_state[f"{ep_id}::improve_faces_active"] = True
+    st.session_state[f"{ep_id}::improve_faces_suggestions"] = suggestions
+    st.session_state[f"{ep_id}::improve_faces_index"] = 0
+    st.session_state.pop(f"{ep_id}::trigger_improve_faces", None)
+    st.rerun()
+    return True
+
+
+def _render_improve_faces_modal(ep_id: str) -> None:
+    """Render Improve Faces dialog if active."""
+    if not st.session_state.get(f"{ep_id}::improve_faces_active"):
+        return
+
+    suggestions = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
+    idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+
+    @st.dialog("Improve Face Clustering", width="large")
+    def _dialog():
+        suggestions_local = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
+        current_idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+
+        def _render_thumb(url: str | None) -> None:
+            """Render face crop filling the column width."""
+            if not url:
+                st.markdown("*No image available*")
+                return
+            st.image(url, use_container_width=True)
+
+        if not suggestions_local or current_idx >= len(suggestions_local):
+            st.success("All suggestions reviewed!")
+            st.markdown("Click **Go to Faces Review** to continue assigning faces to cast members.")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Go to Faces Review", type="primary", use_container_width=True):
+                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.rerun()
+            with col2:
+                if st.button("Close", use_container_width=True):
+                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.rerun()
+            return
+
+        suggestion = suggestions_local[current_idx]
+        cluster_a = suggestion.get("cluster_a", {}) if isinstance(suggestion, dict) else {}
+        cluster_b = suggestion.get("cluster_b", {}) if isinstance(suggestion, dict) else {}
+        similarity = suggestion.get("similarity", 0)
+
+        st.markdown(f"**Are they the same person?** — {current_idx + 1} of {len(suggestions_local)}")
+        st.progress((current_idx + 1) / len(suggestions_local))
+
+        img_col1, img_col2 = st.columns(2)
+        with img_col1:
+            crop_url_a = cluster_a.get("crop_url")
+            resolved_a = helpers.resolve_thumb(crop_url_a) if crop_url_a else None
+            _render_thumb(resolved_a)
+            st.caption(f"Cluster: {cluster_a.get('id', '?')}")
+            st.caption(f"Tracks: {cluster_a.get('tracks', 0)} · Faces: {cluster_a.get('faces', 0)}")
+
+        with img_col2:
+            crop_url_b = cluster_b.get("crop_url")
+            resolved_b = helpers.resolve_thumb(crop_url_b) if crop_url_b else None
+            _render_thumb(resolved_b)
+            st.caption(f"Cluster: {cluster_b.get('id', '?')}")
+            st.caption(f"Tracks: {cluster_b.get('tracks', 0)} · Faces: {cluster_b.get('faces', 0)}")
+
+        st.caption(f"Similarity: {similarity:.1%}")
+
+        btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 1])
+
+        def _advance():
+            st.session_state[f"{ep_id}::improve_faces_index"] = current_idx + 1
+
+        with btn_col1:
+            if st.button("Yes", type="primary", use_container_width=True, key=f"improve_yes_{current_idx}"):
+                exec_mode = helpers.get_execution_mode(ep_id)
+                payload = {
+                    "pair_type": "unassigned_unassigned",
+                    "cluster_a_id": cluster_a.get("id"),
+                    "cluster_b_id": cluster_b.get("id"),
+                    "decision": "merge",
+                    "execution_mode": "redis" if exec_mode != "local" else "local",
+                }
+                try:
+                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
+                except Exception:
+                    pass
+                _advance()
+
+        with btn_col2:
+            if st.button("No", use_container_width=True, key=f"improve_no_{current_idx}"):
+                exec_mode = helpers.get_execution_mode(ep_id)
+                payload = {
+                    "pair_type": "unassigned_unassigned",
+                    "cluster_a_id": cluster_a.get("id"),
+                    "cluster_b_id": cluster_b.get("id"),
+                    "decision": "reject",
+                    "execution_mode": "redis" if exec_mode != "local" else "local",
+                }
+                try:
+                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
+                except Exception:
+                    pass
+                _advance()
+
+        with btn_col3:
+            if st.button("Skip All", use_container_width=True, key=f"improve_skip_{current_idx}"):
+                st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+                st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+                st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                st.rerun()
+
+    _dialog()
 
 
 def _get_best_crop_from_clusters(
@@ -4540,6 +4715,12 @@ def _render_person_clusters(
         track["track_int"] = track_int
         if track_int is not None:
             track_ids.append(track_int)
+
+    archived_tracks = st.session_state.get(f"{ep_id}::archived_tracks", set())
+    if not isinstance(archived_tracks, set):
+        archived_tracks = set(archived_tracks)
+    if archived_tracks:
+        all_tracks = [t for t in all_tracks if _coerce_track_int(t.get("track_int") or t.get("track_id")) not in archived_tracks]
     track_meta_map = _fetch_tracks_meta(ep_id, track_ids)
 
     def _track_meta(track_int: int | None) -> Dict[str, Any]:
@@ -4839,6 +5020,11 @@ def _render_cast_all_tracks(
     total_faces = 0
 
     clusters_list = clusters_summary.get("clusters", [])
+    archived_clusters = st.session_state.get(f"{ep_id}::archived_clusters", set())
+    if not isinstance(archived_clusters, set):
+        archived_clusters = set(archived_clusters)
+    if archived_clusters:
+        clusters_list = [c for c in clusters_list if c.get("cluster_id") not in archived_clusters]
     for cluster_data in clusters_list:
         total_faces += cluster_data.get("faces", 0)
         cluster_id = cluster_data.get("cluster_id")
@@ -6283,6 +6469,7 @@ if not ep_id:
 if not ep_id:
     st.warning("Select an episode from the sidebar to continue.")
     st.stop()
+
 _initialize_state(ep_id)
 
 # Check for active Celery jobs and render status (Phase 2 - non-blocking jobs)
@@ -6346,11 +6533,13 @@ with ThreadPoolExecutor(max_workers=4) as executor:
         "people": _submit_with_ctx(executor, _fetch_people_cached, show_slug),
         "cast": _submit_with_ctx(executor, _fetch_cast_cached, show_slug, season_label),
         "cluster_tracks": _submit_with_ctx(executor, _safe_api_get, f"/episodes/{ep_id}/cluster_tracks"),
+        "archived": _submit_with_ctx(executor, _fetch_archived_ids, ep_id),
     }
     identities_payload = futures["identities"].result()
     people_resp = futures["people"].result()
     cast_api_resp = futures["cast"].result()
     cluster_payload = futures["cluster_tracks"].result() or {"clusters": []}
+    archived_sets = futures["archived"].result() or {}
 
 if not identities_payload:
     st.error("Failed to load identities data. Please check that the API is running and the episode has been processed.")
@@ -6361,6 +6550,72 @@ _show_local_fallback_banner(cluster_payload)
 
 # Show sync-to-S3 option for missing thumbnails
 _render_sync_to_s3_button(ep_id)
+
+# Remove archived clusters/tracks from cluster payload before building lookup
+archived_clusters: set = archived_sets.get("clusters", set()) if isinstance(archived_sets, dict) else set()
+archived_tracks: set = archived_sets.get("tracks", set()) if isinstance(archived_sets, dict) else set()
+if not isinstance(archived_clusters, set):
+    archived_clusters = set(archived_clusters)
+if not isinstance(archived_tracks, set):
+    archived_tracks = set(archived_tracks)
+
+
+def _filter_cluster_payload(payload: Dict[str, Any], archived_clusters: set, archived_tracks: set) -> Dict[str, Any]:
+    filtered = dict(payload)
+    clusters = []
+    for entry in payload.get("clusters", []):
+        cid = entry.get("cluster_id") or entry.get("identity_id")
+        if cid and str(cid) in archived_clusters:
+            continue
+        entry_copy = dict(entry)
+        tracks_field = entry_copy.get("tracks")
+        if isinstance(tracks_field, list):
+            filtered_tracks = []
+            for t in tracks_field:
+                tid_val = t.get("track_id") or t.get("track_int") or t.get("track")
+                tid_int = _coerce_track_int(tid_val)
+                if tid_int is not None and tid_int in archived_tracks:
+                    continue
+                filtered_tracks.append(t)
+            entry_copy["tracks"] = filtered_tracks
+        reps = entry_copy.get("track_reps") or []
+        cleaned_reps = []
+        for tr in reps:
+            tid_val = tr.get("track_id") or tr.get("track") or tr.get("track_int")
+            tid_int = _coerce_track_int(tid_val)
+            if tid_int is not None and tid_int in archived_tracks:
+                continue
+            cleaned_reps.append(tr)
+        if cleaned_reps is not reps:
+            entry_copy["track_reps"] = cleaned_reps
+            counts = entry_copy.get("counts")
+            if isinstance(counts, dict):
+                counts = dict(counts)
+                counts["tracks"] = len(cleaned_reps)
+                entry_copy["counts"] = counts
+        clusters.append(entry_copy)
+    filtered["clusters"] = clusters
+    return filtered
+
+
+cluster_payload = _filter_cluster_payload(cluster_payload, archived_clusters, archived_tracks)
+
+# Keep archived sets handy for other views
+st.session_state[f"{ep_id}::archived_clusters"] = archived_clusters
+st.session_state[f"{ep_id}::archived_tracks"] = archived_tracks
+
+# Consume Improve Faces trigger set by Episode Detail
+if st.session_state.pop(f"{ep_id}::trigger_improve_faces", False):
+    _start_improve_faces(ep_id)
+
+# Manual Improve Faces launcher (always available)
+if st.button("🎯 Improve Faces", key=f"improve_faces_btn_{ep_id}", type="primary"):
+    _start_improve_faces(ep_id, force=True)
+
+# If Improve Faces modal is open, render it and skip the heavy page to keep YES/NO snappy
+_render_improve_faces_modal(ep_id)
+if st.session_state.get(f"{ep_id}::improve_faces_active"):
+    st.stop()
 
 cluster_lookup = _clusters_by_identity(cluster_payload)
 identities = identities_payload.get("identities", [])

@@ -1,6 +1,7 @@
 model_id: retinaface_r50
-# Minimum face size in pixels - lowered to 24x24 to detect smaller/distant faces
-min_size: 24
+# Minimum face size in pixels - lowered to 16x16 to detect smaller/distant faces in wide shots
+# Note: This is the size AFTER scaling to detector input resolution
+min_size: 16
 # Detection confidence threshold - lowered from 0.8 to catch more faces
 confidence_th: 0.50
 iou_th: 0.5  # D5: Increased from 0.4 for better NMS consistency
@@ -13,7 +14,7 @@ max_confidence: 0.9  # Maximum threshold for well-lit scenes
 # D2: Configurable minimum face size (fixes small background faces)
 # Lower this value to detect smaller/background faces (e.g., 32 or 24)
 # Note: Lower values increase false positives and processing time
-min_size_small_faces: 24  # Alternative min_size for background face detection (was 32)
+min_size_small_faces: 16  # Alternative min_size for background face detection
 
 # D7: NMS mode selection (fixes overlapping faces in crowds/hugs)
 nms_mode: hard  # Options: "hard" or "soft"
@@ -26,3 +27,19 @@ max_yaw_angle: 45.0  # Maximum head rotation angle (degrees) before discarding l
 # D9: Letterbox/pillarbox detection and removal (fixes detection on letterboxed video)
 auto_crop_letterbox: false  # Set to true to automatically detect and crop black bars
 letterbox_threshold: 20  # Pixel intensity threshold for detecting black bars (0-255)
+
+# D11: Wide shot / small face detection mode
+# Increases detector input resolution for better small face detection in wide shots
+# Trade-off: Higher compute cost but better detection of distant faces
+wide_shot_mode: true  # Enable enhanced small face detection
+wide_shot_input_size: 960  # Input size for wide shot mode (960x960 recommended)
+wide_shot_min_face_size: 12  # Minimum face size in wide shot mode (12-16px)
+wide_shot_confidence_th: 0.40  # Lower confidence threshold for small faces
+
+# D12: Person/body fallback detection
+# When face detection fails, use body detection to ensure screen time tracking
+enable_person_fallback: true  # Enable person detection fallback
+person_fallback_min_body_height: 100  # Minimum body height in pixels
+person_fallback_face_region_ratio: 0.25  # Top portion of body box to estimate face region
+person_fallback_confidence_th: 0.50  # Confidence threshold for person detection
+person_fallback_max_per_frame: 10  # Maximum person detections per frame to avoid explosion

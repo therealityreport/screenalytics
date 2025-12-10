@@ -193,12 +193,12 @@ if preview_result:
             # Local path - read and display
             local_path = Path(preview_url)
             if local_path.exists():
-                st.image(str(local_path), use_column_width=True)
+                st.image(str(local_path), use_container_width=True)
             else:
                 st.error(f"Preview image not found: {preview_url}")
         else:
             # S3 presigned URL
-            st.image(preview_url, use_column_width=True)
+            st.image(preview_url, use_container_width=True)
 
     # Display pipeline summary first
     pipeline_summary = preview_result.get("pipeline_summary", {})
