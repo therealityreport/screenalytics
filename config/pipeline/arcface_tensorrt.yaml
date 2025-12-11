@@ -1,0 +1,40 @@
+# ArcFace TensorRT Configuration
+# Documentation: FEATURES/arcface-tensorrt/docs/README.md
+
+# Master switch
+arcface_tensorrt:
+  enabled: false  # Disabled until TensorRT engine is built
+
+tensorrt:
+  # Model configuration
+  model_name: arcface_r100       # Base model: arcface_r100, arcface_r50
+  onnx_path: null                # Path to ONNX model (auto-detect if null)
+
+  # Engine storage
+  engine_local_dir: data/engines # Local cache directory
+  engine_s3_bucket: null         # S3/MinIO bucket for engine storage
+  engine_s3_key_prefix: engines/arcface  # S3 key prefix
+
+  # Build settings
+  precision: fp16                # fp32, fp16, int8
+  max_batch_size: 32             # Maximum batch size for dynamic shapes
+  min_batch_size: 1              # Minimum batch size
+  opt_batch_size: 16             # Optimal batch size for optimization
+  workspace_size_mb: 1024        # TensorRT workspace memory (MB)
+
+  # Input shape (ArcFace standard - do not change)
+  input_height: 112
+  input_width: 112
+  input_channels: 3
+
+# Comparison settings
+comparison:
+  min_cosine_similarity: 0.995   # Minimum acceptable similarity vs PyTorch
+  max_l2_distance: 0.1           # Maximum acceptable L2 distance
+  n_validation_samples: 100      # Samples for validation comparison
+
+# Performance targets
+performance:
+  target_speedup: 5.0            # Minimum speedup vs PyTorch
+  target_throughput_batch32: 1000  # Images/second at batch=32
+  max_latency_batch1_ms: 10      # Max latency for single image
