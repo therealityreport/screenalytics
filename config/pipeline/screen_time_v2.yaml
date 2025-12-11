@@ -35,3 +35,13 @@ screen_time_presets:
     screen_time_mode: faces
     edge_padding_s: 0.05
     track_coverage_min: 0.5
+
+  # Strict benchmark preset - minimal gap tolerance for accuracy validation.
+  # Use this when comparing against manual DaVinci timings.
+  strict:
+    quality_min: 0.48
+    gap_tolerance_s: 0.1
+    use_video_decode: true
+    screen_time_mode: tracks
+    edge_padding_s: 0.0
+    track_coverage_min: 0.6

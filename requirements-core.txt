@@ -13,6 +13,7 @@ numpy==1.26.4
 Pillow==10.4.0
 pandas==2.2.3
 plotly==5.24.1
+kaleido==0.2.1  # For Plotly static image export (PDF reports)
 psycopg2-binary~=2.9
 # Background job queue (Phase 2)
 celery[redis]==5.3.6

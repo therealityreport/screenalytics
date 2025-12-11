@@ -13,7 +13,7 @@ quality_gating:
 
   # Individual component thresholds
   min_confidence: 0.45      # Detection confidence (0.0-1.0) - lowered from 0.60
-  min_blur_score: 15.0      # Laplacian variance (higher = sharper) - lowered from 35.0
+  min_blur_score: 18.0      # Laplacian variance (higher = sharper) - TUNED: 35.0 -> 18.0
   min_std: 0.5              # Image standard deviation (contrast) - lowered from 1.0
 
   # Pose filtering (degrees) - relaxed to include more profile shots

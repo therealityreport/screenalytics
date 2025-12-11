@@ -1,0 +1,87 @@
+# NeMo MSDD Speaker Diarization Configuration
+# For overlap-aware diarization with speaker probabilities
+#
+# Reference:
+# - https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/models.html
+# - https://docs.nvidia.com/nemo-framework/user-guide/24.09/nemotoolkit/asr/speaker_diarization/configs.html
+
+nemo_diarization:
+  # Backend identifier
+  backend: "nemo-msdd"
+
+  # Voice Activity Detection (VAD) settings
+  vad:
+    model: "vad_multilingual_marblenet"
+    threshold: 0.5
+    min_speech_duration: 0.25  # seconds - minimum speech segment duration
+    min_silence_duration: 0.1  # seconds - minimum silence between segments
+    pad_onset: 0.1
+    pad_offset: 0.1
+
+  # Speaker embedding model
+  # Options: titanet_large (recommended), ecapa_tdnn
+  speaker_embeddings:
+    model: "titanet_large"
+    embedding_dim: 192
+    # Multi-scale window settings for robust embeddings
+    window_lengths: [1.5, 1.25, 1.0, 0.75, 0.5]
+    shift_lengths: [0.75, 0.625, 0.5, 0.375, 0.25]
+    scale_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
+
+  # Multi-Scale Diarization Decoder (MSDD) settings
+  msdd:
+    model: "diar_msdd_telephonic"  # NGC pretrained model
+    model_path: null  # Override with local path if needed
+    # Sigmoid threshold for speaker activity detection
+    overlap_threshold: 0.5
+    # MSDD inference parameters
+    seq_eval_mode: true
+    split_infer: true
+    diar_window_length: 50
+    overlap_infer_spk_limit: 5
+
+  # Clustering initialization settings
+  # Used for initial speaker count estimation before MSDD refinement
+  clustering:
+    max_num_speakers: 8  # Upper bound for reality TV episodes
+    min_num_speakers: 1
+    oracle_num_speakers: null  # Set if exact count known ahead of time
+    # Spectral clustering parameters
+    enhanced_count_thres: 80
+    max_rp_threshold: 0.25
+    sparse_search_volume: 30
+
+  # Post-processing
+  postprocessing:
+    merge_gap_ms: 300  # Merge same-speaker segments within this gap (ms)
+    min_speech_duration: 0.2  # Filter out very short segments (seconds)
+    collar: 0.25  # Tolerance for evaluation metrics (seconds)
+
+  # Device settings
+  device: "auto"  # Options: auto, cuda, cpu
+  batch_size: 32
+
+  # Output settings
+  output:
+    include_speaker_probabilities: true
+    include_overlap_flags: true
+    save_raw_rttm: true
+    save_embeddings: true
+
+# Audio preprocessing requirements
+audio:
+  sample_rate: 16000  # NeMo requires 16kHz
+  channels: 1  # Mono
+  format: "wav"
+  # Audio longer than this will be processed in chunks
+  max_duration_seconds: 7200  # 2 hours
+
+# Model paths (optional overrides)
+# Uncomment and set paths to use local models instead of NGC downloads
+# model_paths:
+#   vad: "/path/to/local/vad_model.nemo"
+#   speaker_embeddings: "/path/to/local/titanet_large.nemo"
+#   msdd: "/path/to/local/msdd_model.nemo"
+
+# Description
+description: "NeMo MSDD overlap-aware speaker diarization for reality TV analytics"

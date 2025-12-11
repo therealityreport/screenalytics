@@ -3907,6 +3907,7 @@ def _get_audio_paths(ep_id: str) -> Dict[str, Path]:
         "vocals": manifests_dir / "episode_vocals.wav",
         "vocals_enhanced": manifests_dir / "episode_vocals_enhanced.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
+        # Legacy paths for backward compatibility
         "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
         "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
         "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
@@ -3954,9 +3955,9 @@ def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
 
     Returns dict with:
         - complete: bool - True if diarization and ASR exist
-        - diarization: bool - True if diarization exists
-        - diarization_pyannote: bool - True if pyannote diarization exists
-        - diarization_gpt4o: bool - True if GPT-4o diarization exists
+        - diarization: bool - True if diarization exists (NeMo MSDD)
+        - diarization_pyannote: bool - (Legacy) True if old pyannote diarization exists
+        - diarization_gpt4o: bool - (Legacy) True if old GPT-4o diarization exists
         - asr: bool - True if ASR raw transcript exists
         - voice_clusters: bool - True if initial voice clusters exist
         - segment_count: int - Number of diarization segments
@@ -3966,6 +3967,7 @@ def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
     paths = _get_audio_paths(ep_id)
 
     diarization = paths["diarization"].exists()
+    # Legacy paths for backward compatibility
     diarization_pyannote = paths["diarization_pyannote"].exists()
     diarization_gpt4o = paths["diarization_gpt4o"].exists()
     asr = paths["asr_raw"].exists()
@@ -4001,8 +4003,8 @@ def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
     return {
         "complete": diarization and asr,
         "diarization": diarization,
-        "diarization_pyannote": diarization_pyannote,
-        "diarization_gpt4o": diarization_gpt4o,
+        "diarization_pyannote": diarization_pyannote,  # Legacy
+        "diarization_gpt4o": diarization_gpt4o,  # Legacy
         "asr": asr,
         "voice_clusters": voice_clusters,
         "segment_count": segment_count,

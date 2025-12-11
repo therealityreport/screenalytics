@@ -118,7 +118,7 @@ class VoiceAssignResponse(BaseModel):
 
 class SmartSplitRequest(BaseModel):
     """Request payload for smart split."""
-    source: Literal["pyannote", "gpt4o"]
+    source: str = Field("nemo", description="Diarization source (nemo, pyannote, gpt4o)")
     speaker_group_id: str
     segment_id: Optional[str] = Field(None, description="Segment identifier to split")
     start: Optional[float] = Field(None, description="Start time (seconds) if segment_id not provided")
@@ -133,8 +133,8 @@ class SpeakerAssignmentItem(BaseModel):
     - Group-level: start and end are omitted → applies to entire speaker group
     - Time-range: start and end are provided → applies only to that time window
     """
-    source: str = Field(..., description="Diarization source (pyannote, gpt4o)")
-    speaker_group_id: str = Field(..., description="Speaker group ID (e.g., pyannote:SPEAKER_00)")
+    source: str = Field("nemo", description="Diarization source (nemo, pyannote, gpt4o)")
+    speaker_group_id: str = Field(..., description="Speaker group ID (e.g., nemo:speaker_0)")
     cast_id: str = Field(..., description="Cast member ID to assign to")
     cast_display_name: Optional[str] = Field(None, description="Cast member display name")
     # Time-range fields for segment-level assignments
@@ -623,7 +623,7 @@ async def check_audio_prerequisites() -> dict:
             "ffmpeg": False,
             "soundfile": False,
             "demucs": False,
-            "pyannote": False,
+            "nemo": False,  # NeMo MSDD diarization
             "openai": bool(os.environ.get("OPENAI_API_KEY")),
             "gemini": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")),
             "resemble": bool(os.environ.get("RESEMBLE_API_KEY")),
@@ -1406,7 +1406,7 @@ async def split_segment_at_utterance(ep_id: str, req: SplitAtUtteranceRequest) -
 async def get_segment_words(
     ep_id: str,
     segment_id: str,
-    source: str = "pyannote",
+    source: str = "nemo",
     speaker_group_id: Optional[str] = None,
 ) -> SegmentWordsResponse:
     """Get word-level timing information for a segment.
@@ -1417,7 +1417,7 @@ async def get_segment_words(
     Args:
         ep_id: Episode identifier
         segment_id: Segment ID to get words for
-        source: Diarization source (pyannote, gpt4o)
+        source: Diarization source (nemo, pyannote, gpt4o - legacy)
         speaker_group_id: Optional speaker group ID (inferred if not provided)
 
     Returns:
@@ -2027,27 +2027,22 @@ async def smart_split_segment(ep_id: str, req: SmartSplitRequest) -> dict:
         segments_by_cluster = {}  # cluster_id -> list of new segments
 
         if req.auto_assign and cluster_centroids:
-            # Try to import pyannote for embedding extraction
+            # NOTE: Auto-assign with embedding extraction is temporarily disabled
+            # after migration from pyannote to NeMo MSDD.
+            # TODO: Implement NeMo TitaNet-based embedding extraction for Smart Split
             try:
                 import numpy as np
                 import soundfile as sf
-                from py_screenalytics.audio.diarization_pyannote import _get_embedding_model
 
                 # Load audio
                 audio_data, sample_rate = sf.read(audio_path)
                 if len(audio_data.shape) > 1:
                     audio_data = np.mean(audio_data, axis=1)
 
-                # Get embedding model
-                embedding_model = _get_embedding_model()
-
-                # Try to get Inference class
-                try:
-                    from pyannote.audio import Inference
-                    inference = Inference(embedding_model, window="whole")
-                except ImportError:
-                    inference = None
-                    LOGGER.warning("pyannote.audio not available - falling back to basic split")
+                # NeMo embedding extraction for Smart Split - not yet implemented
+                # For now, fall back to basic split (no auto-assignment)
+                inference = None
+                LOGGER.warning("Smart Split auto-assign is temporarily unavailable (NeMo migration pending)")
 
                 if inference:
                     import torch
@@ -2587,28 +2582,35 @@ async def diarize_only(ep_id: str, req: Optional[DiarizeOnlyRequest] = None):
     try:
         _write_progress(ep_id, "diarize", "Starting re-diarization...", 0.0)
 
-        from py_screenalytics.audio.diarization_pyannote import run_diarization
+        from py_screenalytics.audio.diarization_nemo import run_diarization_nemo, NeMoDiarizationConfig
         from py_screenalytics.audio.episode_audio_pipeline import _load_config
 
         # Load config from yaml for proper defaults
         pipeline_config = _load_config()
         config = pipeline_config.diarization
 
-        # Apply num_speakers override if provided
+        # Build NeMo config from pipeline config
+        nemo_config = NeMoDiarizationConfig(
+            max_num_speakers=config.max_speakers,
+            min_num_speakers=config.min_speakers,
+            num_speakers=num_speakers if num_speakers is not None else config.num_speakers,
+            overlap_threshold=getattr(config, 'overlap_threshold', 0.5),
+        )
+
         if num_speakers is not None:
-            config = config.model_copy(update={"num_speakers": num_speakers})
             LOGGER.info(f"Re-running diarization for {ep_id} with forced num_speakers={num_speakers}")
             _write_progress(ep_id, "diarize", f"Running diarization (forcing {num_speakers} speakers)...", 0.2)
         else:
             LOGGER.info(f"Re-running diarization for {ep_id} with auto speaker detection")
             _write_progress(ep_id, "diarize", "Running diarization (auto speaker detection)...", 0.2)
 
-        segments = run_diarization(
+        result = run_diarization_nemo(
             audio_path,
             paths["diarization"],
-            config,
+            nemo_config,
             overwrite=True,
         )
+        segments = result.segments
 
         speakers = set(s.speaker for s in segments)
 
@@ -2672,7 +2674,7 @@ async def preview_clustering(ep_id: str, req: ClusterReclusterRequest) -> dict:
 
     try:
         from py_screenalytics.audio.models import DiarizationSegment, VoiceClusteringConfig
-        from py_screenalytics.audio.diarization_pyannote import extract_speaker_embeddings
+        from py_screenalytics.audio.diarization_nemo import extract_speaker_embeddings
 
         import numpy as np
         from scipy.cluster.hierarchy import linkage, fcluster
@@ -2842,15 +2844,14 @@ async def recluster_voices(ep_id: str, req: ClusterReclusterRequest):
         sys.path.insert(0, str(PROJECT_ROOT))
         from py_screenalytics.audio.voice_clusters import cluster_episode_voices
         from py_screenalytics.audio.voice_bank import match_voice_clusters_to_bank
-        from py_screenalytics.audio.diarization_pyannote import _load_diarization_manifest
+        from py_screenalytics.audio.diarization_nemo import load_diarization_manifest
         from py_screenalytics.audio.models import VoiceClusteringConfig, VoiceBankConfig
 
         # Get show_id
         show_id = ep_id.rsplit("-", 1)[0] if "-" in ep_id else ep_id
 
         # Load diarization
-        diar_path = paths.get("diarization_combined", paths["diarization"])
-        diarization_segments = _load_diarization_manifest(diar_path if diar_path.exists() else paths["diarization"])
+        diarization_segments = load_diarization_manifest(paths["diarization"])
 
         # Get audio path
         audio_path = paths["audio_vocals_enhanced"]
@@ -3520,16 +3521,19 @@ async def get_audio_waveform(
 
 @router.get("/episodes/{ep_id}/audio/diarization/comparison")
 async def get_diarization_comparison(ep_id: str) -> dict:
-    """Get A/B comparison of pyannote vs GPT-4o diarization.
+    """DEPRECATED: Get A/B comparison of pyannote vs GPT-4o diarization.
 
-    Returns the pre-generated comparison report and segment details
-    for side-by-side comparison.
+    This endpoint is deprecated as the system now uses NeMo MSDD exclusively
+    for diarization. The endpoint remains for backward compatibility with
+    episodes processed before the migration.
+
+    For new episodes, use the main diarization endpoint instead.
 
     Args:
         ep_id: Episode identifier
 
     Returns:
-        Comparison data for UI visualization
+        Comparison data for UI visualization (legacy episodes only)
     """
     data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
     manifests_dir = data_root / "manifests" / ep_id

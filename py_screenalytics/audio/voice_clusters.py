@@ -243,10 +243,10 @@ def _cluster_from_segments_legacy(
 
     # If use_diarization_labels is set, skip embedding clustering entirely
     if config.use_diarization_labels:
-        LOGGER.info("Using pyannote speaker labels directly (use_diarization_labels=True)")
+        LOGGER.info("Using diarization speaker labels directly (use_diarization_labels=True)")
         return _clusters_from_diarization_labels(diarization_segments)
 
-    from .diarization_pyannote import extract_speaker_embeddings
+    from .diarization_nemo import extract_speaker_embeddings
 
     segment_embeddings = extract_speaker_embeddings(
         audio_path,

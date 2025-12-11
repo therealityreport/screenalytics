@@ -1025,12 +1025,58 @@ class BufferedManifestWriter:
 # =============================================================================
 
 
+def rotate_backups(path: Path, max_backups: int = 3) -> int:
+    """Rotate backup files, keeping only the most recent ones.
+
+    Args:
+        path: Path to the manifest file (backups are in same directory)
+        max_backups: Maximum number of backup files to keep
+
+    Returns:
+        Number of backup files deleted
+    """
+    if not path.parent.exists():
+        return 0
+
+    # Find all backup files for this manifest
+    base_name = path.name
+    backup_pattern = f"{base_name}.*"
+    backups = []
+
+    for f in path.parent.glob(backup_pattern):
+        # Match .bak or timestamped .YYYYMMDD_HHMMSS.bak files
+        if f.suffix == ".bak" or ".bak" in f.name:
+            try:
+                mtime = f.stat().st_mtime
+                backups.append((mtime, f))
+            except Exception:
+                pass
+
+    if len(backups) <= max_backups:
+        return 0
+
+    # Sort by modification time (newest first) and delete oldest
+    backups.sort(reverse=True)
+    deleted = 0
+    for _, backup_path in backups[max_backups:]:
+        try:
+            backup_path.unlink()
+            deleted += 1
+            LOGGER.debug("[manifest] Deleted old backup: %s", backup_path)
+        except Exception as exc:
+            LOGGER.warning("[manifest] Failed to delete backup %s: %s", backup_path, exc)
+
+    return deleted
+
+
 def atomic_write_manifest(
     path: Path,
     content: Union[str, bytes],
     backup: bool = True,
+    max_backups: int = 3,
+    timestamped_backup: bool = True,
 ) -> bool:
-    """Write a manifest file atomically.
+    """Write a manifest file atomically with backup rotation.
 
     This implements requirement D33: Partial writes can corrupt manifests.
 
@@ -1038,6 +1084,8 @@ def atomic_write_manifest(
         path: Target path
         content: Content to write
         backup: If True, keep backup of previous version
+        max_backups: Maximum number of backup files to keep (0 = unlimited)
+        timestamped_backup: If True, create timestamped backups instead of overwriting
 
     Returns:
         True on success
@@ -1047,8 +1095,16 @@ def atomic_write_manifest(
     try:
         # Backup existing
         if backup and path.exists():
-            backup_path = path.with_suffix(path.suffix + ".bak")
+            if timestamped_backup:
+                timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                backup_path = path.with_suffix(f".{timestamp}.bak")
+            else:
+                backup_path = path.with_suffix(path.suffix + ".bak")
             shutil.copy2(path, backup_path)
+
+            # Rotate old backups if limit set
+            if max_backups > 0:
+                rotate_backups(path, max_backups)
 
         # Write to temp and rename
         tmp_path = path.with_suffix(".tmp")
@@ -1168,4 +1224,5 @@ __all__ = [
     # Convenience
     "atomic_write_manifest",
     "read_manifest_safe",
+    "rotate_backups",
 ]

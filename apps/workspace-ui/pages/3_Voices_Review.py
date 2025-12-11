@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import html
 import json
-import os
+import logging
+import subprocess
 import sys
 import time
 from functools import lru_cache
@@ -101,8 +102,6 @@ def _extract_segment_audio(ep_id: str, cluster_id: str, segment_idx: int, start:
         return None
 
     try:
-        import subprocess
-
         # Create output directory
         segment_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -199,7 +198,8 @@ def _load_transcript(ep_id: str) -> List[Dict]:
                 if line:
                     rows.append(json.loads(line))
         return rows
-    except Exception:
+    except (json.JSONDecodeError, OSError) as e:
+        logging.warning(f"Failed to load transcript for {ep_id}: {e}")
         return []
 
 
@@ -606,8 +606,9 @@ with st.expander("🎙️ Audio Pipeline", expanded=not has_voice_clusters):
     # Handle Clear Cache button
     if clear_cache_clicked:
         manifest_dir = DATA_ROOT / "manifests" / ep_id
+        # Clear current and legacy diarization files
         files_to_clear = [
-            "audio_diarization_pyannote.jsonl",
+            "audio_diarization_pyannote.jsonl",  # Legacy
             "audio_diarization.jsonl",
             "audio_speaker_groups.json",
             "audio_voice_clusters.json",
@@ -621,8 +622,11 @@ with st.expander("🎙️ Audio Pipeline", expanded=not has_voice_clusters):
         for fname in files_to_clear:
             fpath = manifest_dir / fname
             if fpath.exists():
-                fpath.unlink()
-                deleted.append(fname)
+                try:
+                    fpath.unlink()
+                    deleted.append(fname)
+                except (OSError, PermissionError) as e:
+                    st.warning(f"Could not delete {fname}: {e}")
         if deleted:
             st.success(f"Cleared {len(deleted)} cache files: {', '.join(deleted)}")
             time.sleep(1)
@@ -731,7 +735,7 @@ with st.expander("⚡ Incremental Reruns", expanded=False):
     run_mode = "local" if _exec_mode == "local" else "queue"
 
     st.write("**Re-run Diarization Only**")
-    st.caption("Keep audio files, re-do speaker segmentation")
+    st.caption("Keep audio files, re-do speaker segmentation using NeMo MSDD")
 
     # Calculate speaker range from cast count (-2/+5)
     _rerun_show_id = _get_show_id(ep_id)
@@ -1067,7 +1071,7 @@ with col3:
 
 st.markdown(
     "> **Voice segments** generated via MDX-Extra stem separation, "
-    "Resemble-enhanced vocals, and pyannote.audio diarization + speaker embeddings."
+    "Resemble-enhanced vocals, and NeMo MSDD diarization + TitaNet speaker embeddings."
 )
 
 st.markdown("---")
@@ -1085,7 +1089,7 @@ with st.expander("🎤 Voice References", expanded=False):
     # List existing voice references
     try:
         refs_resp = helpers.api_get(f"/jobs/shows/{show_id}/voice_references")
-        existing_refs = refs_resp.get("references", [])
+        existing_refs = refs_resp.get("references", []) if refs_resp else []
 
         if existing_refs:
             st.info(f"**{len(existing_refs)}** cast member(s) have voice references")
@@ -1144,7 +1148,7 @@ with st.expander("🎤 Voice References", expanded=False):
             )
 
         if selected_upload_cast and uploaded_file:
-            if st.button("📤 Upload Voice Reference", key="upload_ref_btn", use_container_width=True):
+            if st.button("📤 Upload Voice Reference", key=f"upload_ref_btn_{ep_id}", use_container_width=True):
                 with st.spinner("Uploading and processing..."):
                     try:
                         files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "audio/wav")}
@@ -1191,13 +1195,13 @@ with st.expander("🔗 Suggested Merges", expanded=False):
             f"/jobs/episodes/{ep_id}/audio/clusters/suggest_merges",
             params={"min_similarity": merge_threshold},
         )
-        suggestions = suggestions_resp.get("suggestions", [])
+        suggestions = suggestions_resp.get("suggestions", []) if suggestions_resp else []
 
         if suggestions:
             st.info(f"Found **{len(suggestions)}** potential merge(s) above {merge_threshold:.0%} similarity")
 
             # Accept All button
-            if st.button("✅ Accept All Suggested Merges", key="accept_all_merges", use_container_width=True):
+            if st.button("✅ Accept All Suggested Merges", key=f"accept_all_merges_{ep_id}", use_container_width=True):
                 # Build merge list - merge smaller into larger (by duration)
                 merges = []
                 for s in suggestions:
@@ -1220,20 +1224,21 @@ with st.expander("🔗 Suggested Merges", expanded=False):
                         f"/jobs/episodes/{ep_id}/audio/clusters/bulk_merge",
                         json=merges,
                     )
-                if merge_resp.get("success"):
+                if merge_resp and merge_resp.get("success"):
                     st.success(f"Merged {merge_resp.get('merged_count', 0)} cluster pairs!")
                     time.sleep(0.5)
                     st.rerun()
                 else:
-                    st.error(f"Merge failed: {merge_resp}")
+                    error_msg = merge_resp.get("error", "Unknown error") if merge_resp else "No response from server"
+                    st.error(f"Merge failed: {error_msg}")
 
             st.markdown("---")
 
             # Individual suggestions
             for idx, s in enumerate(suggestions):
-                ca = s["cluster_a"]
-                cb = s["cluster_b"]
-                sim = s["similarity"]
+                ca = s.get("cluster_a", {})
+                cb = s.get("cluster_b", {})
+                sim = s.get("similarity", 0)
 
                 col_a, col_sim, col_b, col_action = st.columns([3, 1, 3, 2])
 
@@ -1613,28 +1618,37 @@ else:
                                             key=f"confirm_split_{ep_id}_{grp_id}_{seg_id}",
                                             type="primary"
                                         ):
-                                            try:
-                                                resp = helpers.api_post(
-                                                    f"/jobs/episodes/{ep_id}/audio/segments/word-split",
-                                                    json={
-                                                        "source": source_name,
-                                                        "speaker_group_id": grp_id,
-                                                        "segment_id": seg_id,
-                                                        "split_word_indices": sorted_splits,
-                                                        "rebuild_downstream": False,  # Don't rebuild for UI responsiveness
-                                                    },
-                                                )
-                                                if resp.get("status") == "ok":
-                                                    new_segs = resp.get("new_segments", [])
-                                                    st.success(f"✅ Split into {len(new_segs)} segments!")
-                                                    # Clear split state
-                                                    st.session_state[split_state_key] = []
-                                                    time.sleep(0.5)
-                                                    st.rerun()
-                                                else:
-                                                    st.error(f"Split failed: {resp.get('message', 'Unknown error')}")
-                                            except Exception as e:
-                                                st.error(f"API error: {e}")
+                                            # Validate split indices are within bounds
+                                            valid_indices = [i for i in sorted_splits if 0 <= i < len(words) - 1]
+                                            if len(valid_indices) != len(sorted_splits):
+                                                st.warning("Some split indices were invalid and have been removed.")
+                                                sorted_splits = valid_indices
+                                            if not sorted_splits:
+                                                st.error("No valid split points selected.")
+                                            else:
+                                                try:
+                                                    resp = helpers.api_post(
+                                                        f"/jobs/episodes/{ep_id}/audio/segments/word-split",
+                                                        json={
+                                                            "source": source_name,
+                                                            "speaker_group_id": grp_id,
+                                                            "segment_id": seg_id,
+                                                            "split_word_indices": sorted_splits,
+                                                            "rebuild_downstream": False,  # Don't rebuild for UI responsiveness
+                                                        },
+                                                    )
+                                                    if resp and resp.get("status") == "ok":
+                                                        new_segs = resp.get("new_segments", [])
+                                                        st.success(f"✅ Split into {len(new_segs)} segments!")
+                                                        # Clear split state
+                                                        st.session_state[split_state_key] = []
+                                                        time.sleep(0.5)
+                                                        st.rerun()
+                                                    else:
+                                                        error_msg = resp.get('message', 'Unknown error') if resp else 'No response from server'
+                                                        st.error(f"Split failed: {error_msg}")
+                                                except Exception as e:
+                                                    st.error(f"API error: {e}")
                                     with confirm_cols[1]:
                                         if st.button("❌ Clear", key=f"clear_split_{ep_id}_{grp_id}_{seg_id}"):
                                             st.session_state[split_state_key] = []
@@ -1647,8 +1661,8 @@ else:
                     # Per-segment cast assignment (for mixed speaker groups)
                     # Check if there's a time-range assignment for this specific segment
                     seg_assignment = seg.get("segment_assignment")  # From API if enriched
-                    seg_cast_id = seg_assignment.get("cast_id") if seg_assignment else None
-                    has_segment_level_assignment = seg_assignment is not None and seg_assignment.get("start") is not None
+                    seg_cast_id = seg_assignment.get("cast_id") if seg_assignment and isinstance(seg_assignment, dict) else None
+                    has_segment_level_assignment = seg_assignment is not None and isinstance(seg_assignment, dict) and seg_assignment.get("start") is not None
 
                     # Show segment-level cast dropdown for mixed/low purity groups
                     if group_purity in ("low", "medium") or has_segment_level_assignment:
@@ -1695,13 +1709,14 @@ else:
                                             "end": seg_end,
                                         },
                                     )
-                                    if resp.get("status") in ("ok", "removed"):
+                                    if resp and resp.get("status") in ("ok", "removed"):
                                         action = "removed" if not new_seg_cast_id else "set"
                                         st.toast(f"✅ Segment cast {action}")
                                         time.sleep(0.3)
                                         st.rerun()
                                     else:
-                                        st.error(f"Failed: {resp.get('message', 'Unknown error')}")
+                                        error_msg = resp.get('message', 'Unknown error') if resp else 'No response from server'
+                                        st.error(f"Failed to update segment cast: {error_msg}")
                                 except Exception as e:
                                     st.error(f"API error: {e}")
                         with seg_assign_cols[2]:
@@ -1763,7 +1778,12 @@ else:
                         except Exception:
                             st.caption("🔇 Audio unavailable")
                     else:
-                        st.caption("🔇 Audio not extracted")
+                        # Show specific error if available
+                        extract_error = _get_audio_extract_error(ep_id, grp_id.replace(":", "_"), seg_idx)
+                        if extract_error:
+                            st.caption(f"🔇 {extract_error}")
+                        else:
+                            st.caption("🔇 Audio not extracted")
 
                     # Show transcripts with split buttons
                     if seg_transcripts:
@@ -1957,7 +1977,7 @@ with st.expander("🎵 Audio Waveform", expanded=False):
                     match_text = match["text"][:40] + "..." if len(match["text"]) > 40 else match["text"]
                     if st.button(
                         f"⏱️ {_format_duration(match_start)}: \"{match_text}\"",
-                        key=f"jump_{ep_id}_{int(match_start*1000)}",
+                        key=f"jump_{ep_id}_{int(match_start*100000)}",
                         use_container_width=True,
                     ):
                         # Set the waveform start time to this position
@@ -2571,7 +2591,15 @@ for cluster in sorted_clusters:
                 start = row.get("start", 0)
                 text = row.get("text", "")
                 truncated = text[:200] + "..." if len(text) > 200 else text
-                st.write(f"[{_format_duration(start)}] {truncated}")
+                # Show overlap badge if segment has overlapping speakers
+                overlap_badge = ""
+                if row.get("overlap", False):
+                    secondary = row.get("secondary_speakers", [])
+                    if secondary:
+                        overlap_badge = f" 🔀 *+{len(secondary)} speaker{'s' if len(secondary) > 1 else ''}*"
+                    else:
+                        overlap_badge = " 🔀 *overlap*"
+                st.write(f"[{_format_duration(start)}] {truncated}{overlap_badge}")
         else:
             st.info("No transcript excerpts for this cluster.")
 

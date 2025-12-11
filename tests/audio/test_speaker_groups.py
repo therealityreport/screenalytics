@@ -41,7 +41,7 @@ def test_build_speaker_groups_manifest(tmp_path):
 
 def test_smart_split_segment_reassigns_voice(tmp_path, monkeypatch):
     """Smart split reassigns subsegments to a better-matching speaker group."""
-    from py_screenalytics.audio.diarization_pyannote import _save_diarization_manifest
+    from py_screenalytics.audio.diarization_nemo import save_diarization_manifest
     from py_screenalytics.audio.models import DiarizationSegment, VoiceBankMatchResult, VoiceCluster, VoiceClusterSegment
     from py_screenalytics.audio.speaker_edit import smart_split_segment
     from py_screenalytics.audio.speaker_groups import build_speaker_groups_manifest
@@ -69,7 +69,7 @@ def test_smart_split_segment_reassigns_voice(tmp_path, monkeypatch):
         manifest_path,
         overwrite=True,
     )
-    _save_diarization_manifest(diar_segments, manifests_dir / "audio_diarization_pyannote.jsonl")
+    save_diarization_manifest(diar_segments, manifests_dir / "audio_diarization_pyannote.jsonl")
     shutil.copy(manifests_dir / "audio_diarization_pyannote.jsonl", manifests_dir / "audio_diarization.jsonl")
     (manifests_dir / "audio_asr_raw.jsonl").write_text("", encoding="utf-8")
 

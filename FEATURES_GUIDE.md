@@ -288,4 +288,95 @@ If `tools/promote-feature.py` fails:
 
 ---
 
+## Active Feature Sandboxes
+
+### Body Tracking (`FEATURES/body-tracking/`)
+
+**Status:** Implemented
+**TTL:** 2026-01-10
+**Owner:** Engineering
+
+Adds person body tracking to maintain identity when faces aren't visible.
+
+**Components:**
+- YOLO person detection
+- ByteTrack temporal tracking
+- OSNet Re-ID embeddings (256-d)
+- Face↔body track fusion
+- Screen-time comparison (face-only vs face+body)
+
+**Usage:**
+```bash
+# Run full pipeline
+python -m FEATURES.body_tracking --episode-id rhoslc-s06e01
+
+# Run specific stage
+python -m FEATURES.body_tracking --episode-id rhoslc-s06e01 --stage detect
+python -m FEATURES.body_tracking --episode-id rhoslc-s06e01 --stage track
+python -m FEATURES.body_tracking --episode-id rhoslc-s06e01 --stage fuse
+python -m FEATURES.body_tracking --episode-id rhoslc-s06e01 --stage compare
+```
+
+**Artifacts** (in `data/manifests/{ep_id}/body_tracking/`):
+| File | Description |
+|------|-------------|
+| `body_detections.jsonl` | Frame-by-frame person detections |
+| `body_tracks.jsonl` | Tracked persons over time |
+| `body_embeddings.npy` | Re-ID embedding vectors |
+| `body_embeddings_meta.json` | Metadata for embeddings |
+| `track_fusion.json` | Face↔body associations |
+| `screentime_comparison.json` | Face-only vs combined metrics |
+| `body_metrics.json` | Pipeline summary |
+
+**Config:**
+- `config/pipeline/body_detection.yaml` - Detection, tracking, Re-ID settings
+- `config/pipeline/track_fusion.yaml` - Fusion rules and thresholds
+
+**Tests:**
+```bash
+pytest FEATURES/body-tracking/tests/ -v
+```
+
+**Docs:**
+- [FEATURES/body-tracking/docs/README.md](FEATURES/body-tracking/docs/README.md)
+- [FEATURES/body-tracking/TODO.md](FEATURES/body-tracking/TODO.md)
+- [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
+
+**Acceptance Matrix:** Sections 3.10-3.12
+
+---
+
+### Face Alignment (`FEATURES/face-alignment/`)
+
+**Status:** In Progress
+**TTL:** 2026-01-10
+**Owner:** Engineering
+
+FAN-based face alignment with 68-point landmarks for improved embedding quality.
+
+**Components:**
+- FAN 2D/3D landmark extraction
+- Aligned face crop generation
+- Quality scoring (future: LUVLi)
+- 3D head pose (future: 3DDFA_V2)
+
+**Usage:**
+```bash
+# Run alignment on episode
+python -m FEATURES.face_alignment --episode-id rhoslc-s06e01
+```
+
+**Artifacts** (in `data/manifests/{ep_id}/face_alignment/`):
+| File | Description |
+|------|-------------|
+| `aligned_faces.jsonl` | Landmarks and quality scores |
+| `aligned_crops/` | Aligned face images (optional) |
+
+**Config:**
+- `config/pipeline/face_alignment.yaml`
+
+**Acceptance Matrix:** Sections 3.7-3.9
+
+---
+
 **Maintained by:** Screenalytics Engineering

@@ -23,6 +23,22 @@ if str(PROJECT_ROOT) not in sys.path:
 from apps.api.services.face_review import face_review_service
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _extract_show_id(ep_id: str) -> str | None:
+    """Extract show_id from ep_id (e.g., 'rhobh-s05e02' -> 'rhobh')."""
+    if not ep_id or "-" not in ep_id:
+        return None
+    # Pattern: show-sXXeYY or show-sXXeYY-extra
+    parts = ep_id.lower().split("-")
+    # Find the season marker (sXX) and take everything before it
+    for i, part in enumerate(parts):
+        if part.startswith("s") and len(part) >= 3 and part[1:3].isdigit():
+            return "-".join(parts[:i]) if i > 0 else None
+    # Fallback: take first part
+    return parts[0] if parts else None
+
+
 router = APIRouter(prefix="/episodes")
 
 
@@ -39,6 +55,7 @@ class DecisionRequest(BaseModel):
     decision: Literal["merge", "reject", "yes", "no"] = Field(
         ..., description="User decision"
     )
+    show_id: Optional[str] = Field(None, description="Show ID (auto-detected from ep_id if not provided)")
     execution_mode: Optional[Literal["redis", "local"]] = Field(
         "local", description="Execution mode (currently only local supported)"
     )
@@ -85,6 +102,9 @@ def process_decision(ep_id: str, request: DecisionRequest):
     elif decision == "reject":
         decision = "no"
 
+    # Get show_id from request or auto-detect from ep_id
+    show_id = request.show_id or _extract_show_id(ep_id)
+
     try:
         result = face_review_service.process_decision(
             ep_id=ep_id,
@@ -94,7 +114,7 @@ def process_decision(ep_id: str, request: DecisionRequest):
             cluster_b_id=request.cluster_b_id,
             person_id=request.person_id,
             cast_id=request.cast_id,
-            show_id=None,  # TODO: extract show_id from ep_id if needed
+            show_id=show_id,
         )
         return result
     except Exception as e:

@@ -403,5 +403,224 @@ class TestIntegration:
                 assert 100001 in identity.body_track_ids
 
 
+class TestWithFixtures:
+    """Tests using synthetic fixtures for comprehensive coverage."""
+
+    def test_tracking_with_synthetic_data(self, temp_detections_jsonl):
+        """Test tracking pipeline with synthetic detections."""
+        import tempfile
+
+        tracker = BodyTracker(
+            tracker_type="bytetrack",
+            track_buffer=30,
+            id_offset=100000,
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            tracks_path = Path(f.name)
+
+        try:
+            track_bodies(tracker, temp_detections_jsonl, tracks_path)
+
+            # Verify tracks
+            tracks = []
+            with open(tracks_path) as f:
+                for line in f:
+                    tracks.append(json.loads(line))
+
+            # Should have multiple tracks (3 persons in fixture)
+            assert len(tracks) >= 2
+
+            # Verify track structure
+            for track in tracks:
+                assert track["track_id"] >= 100000  # ID offset applied
+                assert track["frame_count"] > 0
+                assert track["duration"] >= 0
+                assert len(track["detections"]) == track["frame_count"]
+
+        finally:
+            tracks_path.unlink(missing_ok=True)
+
+    def test_fusion_with_synthetic_data(
+        self,
+        synthetic_face_tracks,
+        synthetic_body_tracks,
+    ):
+        """Test fusion pipeline with synthetic face and body tracks."""
+        fusion = TrackFusion(
+            iou_threshold=0.5,
+            min_overlap_ratio=0.5,  # Lower for synthetic data
+        )
+
+        # Convert to dict format
+        face_tracks = {t["track_id"]: t for t in synthetic_face_tracks}
+        body_tracks = {t["track_id"]: t for t in synthetic_body_tracks}
+
+        identities = fusion.fuse_tracks(face_tracks, body_tracks)
+
+        # Should create identities
+        assert len(identities) > 0
+
+        # Check metrics
+        total_face_frames = sum(
+            identity.face_visible_frames
+            for identity in identities.values()
+        )
+        total_body_frames = sum(
+            identity.body_only_frames
+            for identity in identities.values()
+        )
+
+        # Synthetic data should have some face visibility
+        assert total_face_frames > 0 or total_body_frames > 0
+
+    def test_screentime_comparison_with_synthetic_data(
+        self,
+        synthetic_face_tracks,
+        synthetic_body_tracks,
+    ):
+        """Test screentime comparison with synthetic data."""
+        comparator = ScreenTimeComparator(fps=24.0, merge_short_gaps=True)
+
+        # Extract frames from tracks
+        for face_track in synthetic_face_tracks[:1]:
+            face_frames = [d["frame_idx"] for d in face_track["detections"]]
+
+            # Find corresponding body track
+            if synthetic_body_tracks:
+                body_track = synthetic_body_tracks[0]
+                body_frames = [d["frame_idx"] for d in body_track["detections"]]
+
+                breakdown = comparator.compute_breakdown(
+                    f"test_{face_track['track_id']}",
+                    face_frames,
+                    body_frames,
+                )
+
+                # Verify breakdown
+                assert breakdown.combined_frames >= breakdown.face_only_frames
+                assert breakdown.combined_duration >= breakdown.face_only_duration
+
+    def test_full_pipeline_with_manifest(self, temp_manifest_dir):
+        """Test full pipeline flow using temp manifest directory."""
+        # Verify artifacts exist
+        body_det_path = temp_manifest_dir / "body_tracking" / "body_detections.jsonl"
+        body_tracks_path = temp_manifest_dir / "body_tracking" / "body_tracks.jsonl"
+        faces_path = temp_manifest_dir / "faces.jsonl"
+
+        assert body_det_path.exists()
+        assert body_tracks_path.exists()
+        assert faces_path.exists()
+
+        # Load and verify body detections
+        with open(body_det_path) as f:
+            body_dets = [json.loads(line) for line in f]
+        assert len(body_dets) > 0
+        assert all("frame_idx" in d for d in body_dets)
+        assert all("bbox" in d for d in body_dets)
+
+        # Load and verify body tracks
+        with open(body_tracks_path) as f:
+            body_tracks = [json.loads(line) for line in f]
+        assert len(body_tracks) > 0
+
+        # Load and verify face tracks
+        with open(faces_path) as f:
+            face_tracks = [json.loads(line) for line in f]
+        # May have face tracks
+
+
+class TestConfigLoading:
+    """Tests for configuration loading."""
+
+    def test_body_tracking_config_defaults(self):
+        """Test BodyTrackingConfig defaults."""
+        from FEATURES.body_tracking.src.body_tracking_runner import BodyTrackingConfig
+
+        config = BodyTrackingConfig()
+
+        assert config.detector_model == "yolov8n"
+        assert config.confidence_threshold == 0.50
+        assert config.tracker == "bytetrack"
+        assert config.reid_enabled == True
+        assert config.reid_model == "osnet_x1_0"
+        assert config.id_offset == 100000
+
+    def test_fusion_config_defaults(self):
+        """Test FusionConfig defaults."""
+        from FEATURES.body_tracking.src.body_tracking_runner import FusionConfig
+
+        config = FusionConfig()
+
+        assert config.iou_threshold == 0.50
+        assert config.reid_similarity_threshold == 0.70
+        assert config.max_gap_seconds == 30.0
+        assert config.merge_short_gaps == True
+
+
+class TestEdgeCases:
+    """Tests for edge cases and error handling."""
+
+    def test_empty_detections(self):
+        """Test handling of empty detections."""
+        tracker = SimpleIoUTracker()
+        ids = tracker.update(0, np.array([]).reshape(0, 4), np.array([]))
+        assert len(ids) == 0
+
+    def test_single_frame_track(self):
+        """Test tracks with single frame."""
+        dets = [
+            BodyDetection(frame_idx=0, timestamp=0.0, bbox=[0, 0, 100, 200], score=0.9),
+        ]
+        track = BodyTrack(track_id=1, detections=dets)
+
+        assert track.start_frame == 0
+        assert track.end_frame == 0
+        assert track.duration == 0.0
+        assert track.frame_count == 1
+
+    def test_fusion_no_overlap(self):
+        """Test fusion when face and body tracks don't overlap."""
+        fusion = TrackFusion()
+
+        face_tracks = {
+            1: {
+                "track_id": 1,
+                "detections": [
+                    {"frame_idx": 0, "bbox": [0, 0, 50, 50]},
+                ],
+            }
+        }
+
+        body_tracks = {
+            100001: {
+                "track_id": 100001,
+                "detections": [
+                    {"frame_idx": 0, "bbox": [500, 500, 600, 700]},  # Far away
+                ],
+            }
+        }
+
+        identities = fusion.fuse_tracks(face_tracks, body_tracks)
+
+        # Should create separate identities (no association)
+        assert len(identities) == 2
+
+    def test_screentime_zero_duration(self):
+        """Test screentime with zero-length segments."""
+        comparator = ScreenTimeComparator(fps=24.0)
+
+        breakdown = comparator.compute_breakdown("empty", [], [])
+
+        assert breakdown.face_only_duration == 0.0
+        assert breakdown.combined_duration == 0.0
+        assert breakdown.duration_gain == 0.0
+        assert breakdown.duration_gain_pct == 0.0
+
+
+# Import fixtures
+pytest_plugins = ["FEATURES.body_tracking.tests.fixtures"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

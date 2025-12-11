@@ -280,7 +280,8 @@ def _invalidate_suggestions_cache(ep_id: str) -> None:
         f"embedding_mismatches:{ep_id}",
         f"quality_only_clusters:{ep_id}",
         f"people_cache:{ep_id}",
-        "config_thresholds",  # In case thresholds changed
+        f"config_thresholds:{ep_id}",  # Episode-namespaced thresholds
+        f"dismissed_loaded:{ep_id}",  # Force re-fetch of dismissed suggestions
     ]
     for key in keys_to_clear:
         st.session_state.pop(key, None)
@@ -1839,10 +1840,16 @@ with bulk_col:
         ]
         high_count = len(high_conf_entries)
 
-        # Check for pending confirmation
-        if _confirm_action("bulk_accept_high", "Accept All High", high_count):
+        # Check for pending confirmation (episode-namespaced to avoid cross-tab leakage)
+        if _confirm_action(f"{ep_id}::bulk_accept_high", "Accept All High", high_count):
             with st.spinner(f"Accepting {high_count} high-confidence clusters..."):
                 accepted = 0
+                failed = 0
+                # Collect cluster IDs to delete after loop (avoid modifying dict during iteration)
+                clusters_to_remove = []
+                # Fetch people cache once before loop (optimization)
+                people_resp = _fetch_people_cached(show_slug)
+                people = people_resp.get("people", []) if people_resp else []
                 progress_bar = st.progress(0, text="Accepting clusters...")
                 for i, entry in enumerate(high_conf_entries):
                     cluster_id = _normalize_cluster_id(entry["cluster_id"])
@@ -1850,9 +1857,7 @@ with bulk_col:
                     cast_id = suggestion.get("cast_id")
                     if not cast_id:
                         continue
-                    # Find or create person
-                    people_resp = _fetch_people_cached(show_slug)
-                    people = people_resp.get("people", []) if people_resp else []
+                    # Find person from cached list
                     target_person = next((p for p in people if p.get("cast_id") == cast_id), None)
                     target_person_id = target_person.get("person_id") if target_person else None
                     payload = {
@@ -1864,22 +1869,26 @@ with bulk_col:
                     result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=10)
                     if result.ok:
                         accepted += 1
-                        if cluster_id in cast_suggestions:
-                            del cast_suggestions[cluster_id]
+                        clusters_to_remove.append(cluster_id)
+                    else:
+                        failed += 1
                     progress_bar.progress((i + 1) / high_count, text=f"Accepted {accepted}/{i + 1}...")
                 progress_bar.empty()
+                # Remove accepted clusters from suggestions after loop
+                for cluster_id in clusters_to_remove:
+                    cast_suggestions.pop(cluster_id, None)
             if accepted > 0:
                 _invalidate_suggestions_cache(ep_id)
-                st.toast(f"Assigned {accepted} high-confidence clusters")
+                st.toast(f"Assigned {accepted} high-confidence clusters" + (f" ({failed} failed)" if failed else ""))
                 st.rerun()
 
-        if st.button(f"✓ Accept All High ({high_count})", key="bulk_accept_high", disabled=high_count == 0, use_container_width=True):
+        if st.button(f"✓ Accept All High ({high_count})", key=f"{ep_id}::bulk_accept_high", disabled=high_count == 0, use_container_width=True):
             if high_count > 3:  # Only confirm for more than 3 items
-                _request_confirmation("bulk_accept_high")
+                _request_confirmation(f"{ep_id}::bulk_accept_high")
                 st.rerun()
             else:
                 # Direct execution for small batches
-                st.session_state["confirmed:bulk_accept_high"] = True
+                st.session_state[f"confirmed:{ep_id}::bulk_accept_high"] = True
                 st.rerun()
 
     with bulk_c2:
@@ -1894,8 +1903,8 @@ with bulk_col:
         ]
         low_count = len(low_conf_entries)
 
-        # Check for pending confirmation
-        if _confirm_action("bulk_dismiss_low", "Dismiss Low Confidence", low_count,
+        # Check for pending confirmation (episode-namespaced to avoid cross-tab leakage)
+        if _confirm_action(f"{ep_id}::bulk_dismiss_low", "Dismiss Low Confidence", low_count,
                           warning_message="These clusters will be archived and hidden from suggestions."):
             with st.spinner(f"Dismissing {low_count} low-confidence clusters..."):
                 progress_bar = st.progress(0, text="Archiving clusters...")
@@ -1911,12 +1920,12 @@ with bulk_col:
             st.toast(f"Dismissed and archived {low_count} low-confidence suggestions")
             st.rerun()
 
-        if st.button(f"✗ Dismiss Low ({low_count})", key="bulk_dismiss_low", disabled=low_count == 0, use_container_width=True):
+        if st.button(f"✗ Dismiss Low ({low_count})", key=f"{ep_id}::bulk_dismiss_low", disabled=low_count == 0, use_container_width=True):
             if low_count > 3:
-                _request_confirmation("bulk_dismiss_low")
+                _request_confirmation(f"{ep_id}::bulk_dismiss_low")
                 st.rerun()
             else:
-                st.session_state["confirmed:bulk_dismiss_low"] = True
+                st.session_state[f"confirmed:{ep_id}::bulk_dismiss_low"] = True
                 st.rerun()
 
     with bulk_c3:
@@ -1927,8 +1936,8 @@ with bulk_col:
         ]
         temporal_count = len(temporal_only_entries)
 
-        # Check for pending confirmation
-        if _confirm_action("bulk_skip_temporal", "Skip Temporal-Only", temporal_count,
+        # Check for pending confirmation (episode-namespaced to avoid cross-tab leakage)
+        if _confirm_action(f"{ep_id}::bulk_skip_temporal", "Skip Temporal-Only", temporal_count,
                           warning_message="Temporal suggestions are based on frame proximity, not face similarity."):
             with st.spinner(f"Skipping {temporal_count} temporal-only clusters..."):
                 progress_bar = st.progress(0, text="Archiving temporal clusters...")
@@ -1946,16 +1955,16 @@ with bulk_col:
 
         if st.button(
             f"✗ Skip Temporal ({temporal_count})",
-            key="bulk_skip_temporal",
+            key=f"{ep_id}::bulk_skip_temporal",
             disabled=temporal_count == 0,
             use_container_width=True,
             help="Skip all temporal-only suggestions (weak frame-proximity matches)"
         ):
             if temporal_count > 3:
-                _request_confirmation("bulk_skip_temporal")
+                _request_confirmation(f"{ep_id}::bulk_skip_temporal")
                 st.rerun()
             else:
-                st.session_state["confirmed:bulk_skip_temporal"] = True
+                st.session_state[f"confirmed:{ep_id}::bulk_skip_temporal"] = True
                 st.rerun()
 
     # Add a 4th column for triage
@@ -1977,16 +1986,16 @@ with bulk_col:
                 use_container_width=True,
                 help="Review HIGH-risk singletons with decent matches"
             ):
-                # Set filter to show only these
-                st.session_state["singleton_triage_mode"] = True
+                # Set filter to show only these (episode-namespaced to avoid cross-tab leakage)
+                st.session_state[f"singleton_triage_mode:{ep_id}"] = True
                 st.rerun()
 
 # Apply sort
 sort_key, sort_reverse = SORT_OPTIONS[selected_sort]
 suggestion_entries = _sort_entries(suggestion_entries, sort_key, sort_reverse)
 
-# Singleton triage mode - filter to only show high-risk singletons
-singleton_triage_mode = st.session_state.get("singleton_triage_mode", False)
+# Singleton triage mode - filter to only show high-risk singletons (episode-namespaced)
+singleton_triage_mode = st.session_state.get(f"singleton_triage_mode:{ep_id}", False)
 if singleton_triage_mode:
     original_count = len(suggestion_entries)
     suggestion_entries = [
@@ -2002,8 +2011,8 @@ if singleton_triage_mode:
 
     col1, col2 = st.columns([1, 4])
     with col1:
-        if st.button("Exit Triage", key="exit_singleton_triage"):
-            st.session_state["singleton_triage_mode"] = False
+        if st.button("Exit Triage", key=f"exit_singleton_triage:{ep_id}"):
+            st.session_state[f"singleton_triage_mode:{ep_id}"] = False
             st.rerun()
 
     st.markdown("---")
@@ -2619,8 +2628,14 @@ def render_grouped_cast_row(
     # Generate unique key for this group
     group_key = f"cast_{cast_id}_{confidence_level}"
 
+    # Build cast dropdown options for container: suggested cast first, then others alphabetically
+    container_cast_options = [(cast_id, cast_name)]  # Suggested cast is default
+    for cid_opt, name_opt in sorted(cast_options.items(), key=lambda x: x[1].lower()):
+        if cid_opt != cast_id:  # Don't duplicate the suggested cast
+            container_cast_options.append((cid_opt, name_opt))
+
     with st.container(border=True):
-        thumb_col, info_col, action_col = st.columns([3, 3, 1])
+        thumb_col, info_col, dropdown_col, action_col = st.columns([2.5, 2.5, 2, 1])
 
         with thumb_col:
             # Use carousel for all thumbnails from all clusters
@@ -2651,22 +2666,36 @@ def render_grouped_cast_row(
                 unsafe_allow_html=True,
             )
 
+        with dropdown_col:
+            # Cast member dropdown for reassigning all clusters
+            st.caption("Assign to:")
+            container_cast_idx = st.selectbox(
+                "Assign to cast",
+                options=range(len(container_cast_options)),
+                format_func=lambda i: container_cast_options[i][1],
+                key=f"grp_cast_select_{group_key}",
+                label_visibility="collapsed",
+            )
+            selected_container_cast_id, selected_container_cast_name = container_cast_options[container_cast_idx]
+
         with action_col:
-            # Accept All button - assigns all clusters to this cast member
+            # Accept All button - assigns all clusters to selected cast member
             if st.button(f"✓ Accept All ({cluster_count})", key=f"grp_accept_{group_key}", use_container_width=True):
                 accepted = 0
                 people_resp = _fetch_people_cached(show_slug)
                 people = people_resp.get("people", []) if people_resp else []
-                target_person = next((p for p in people if p.get("cast_id") == cast_id), None)
+                target_person = next((p for p in people if p.get("cast_id") == selected_container_cast_id), None)
                 target_person_id = target_person.get("person_id") if target_person else None
 
+                primary_cluster_ids = set()
                 for entry in entries:
                     cluster_id = entry["cluster_id"]
+                    primary_cluster_ids.add(cluster_id)
                     payload = {
                         "strategy": "manual",
                         "cluster_ids": [cluster_id],
                         "target_person_id": target_person_id,
-                        "cast_id": cast_id,
+                        "cast_id": selected_container_cast_id,
                     }
                     result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=10)
                     if result.ok:
@@ -2674,8 +2703,45 @@ def render_grouped_cast_row(
                         if cluster_id in cast_suggestions:
                             del cast_suggestions[cluster_id]
 
+                # After assigning primary clusters, find and assign similar unassigned singletons
+                extra_assigned = 0
+                if accepted > 0 and (target_person_id or selected_container_cast_id):
+                    similar_resp = _safe_api_get(
+                        f"/episodes/{ep_id}/find_similar_unassigned",
+                        params={
+                            "person_id": target_person_id or "",
+                            "cast_id": selected_container_cast_id or "",
+                            "min_similarity": 0.55,  # Slightly looser threshold for singletons
+                        },
+                    )
+                    if similar_resp and similar_resp.get("similar_clusters"):
+                        for sim_cluster in similar_resp["similar_clusters"]:
+                            sim_cid = sim_cluster["cluster_id"]
+                            # Skip if already in primary set or dismissed
+                            if sim_cid in primary_cluster_ids or sim_cid in dismissed:
+                                continue
+                            # Assign to same cast member
+                            assign_result = _api_post(
+                                f"/episodes/{ep_id}/clusters/group",
+                                {
+                                    "strategy": "manual",
+                                    "cluster_ids": [sim_cid],
+                                    "target_person_id": target_person_id,
+                                    "cast_id": selected_container_cast_id,
+                                },
+                                timeout=10,
+                            )
+                            if assign_result.ok:
+                                extra_assigned += 1
+                                if sim_cid in cast_suggestions:
+                                    del cast_suggestions[sim_cid]
+
                 if accepted > 0:
-                    st.toast(f"Assigned {accepted} cluster(s) to {cast_name}")
+                    msg = f"Assigned {accepted} cluster(s) to {selected_container_cast_name}"
+                    if extra_assigned > 0:
+                        msg += f" + {extra_assigned} similar singleton(s)"
+                    st.toast(msg)
+                    _invalidate_suggestions_cache(ep_id)  # Clear all caches including Singletons Review
                     st.rerun()
 
             # View button behavior depends on cluster count
@@ -2756,6 +2822,12 @@ def render_grouped_cast_row(
         # Show cluster list expander OUTSIDE columns to prevent overlap
         if cluster_count > 1:
             with st.expander(f"📋 View All Clusters ({cluster_count})", expanded=False):
+                # Build cast dropdown options: suggested cast first, then others
+                cast_dropdown_options = [(cast_id, cast_name)]  # Suggested cast is default
+                for cid_opt, name_opt in sorted(cast_options.items(), key=lambda x: x[1].lower()):
+                    if cid_opt != cast_id:  # Don't duplicate the suggested cast
+                        cast_dropdown_options.append((cid_opt, name_opt))
+
                 for entry in entries:
                     cid = entry["cluster_id"]
                     thumb_urls = entry.get("thumb_urls", [])
@@ -2764,8 +2836,8 @@ def render_grouped_cast_row(
                     sugg = entry.get("suggestion", {})
                     sugg_sim = sugg.get("similarity", 0)
 
-                    # Compact inline layout: thumbnails + info + button
-                    exp_col1, exp_col2 = st.columns([5, 1])
+                    # Compact inline layout: thumbnails + info + cast dropdown + action buttons
+                    exp_col1, exp_col2, exp_col3, exp_col4, exp_col5 = st.columns([3, 2.5, 0.5, 0.5, 0.5])
                     with exp_col1:
                         thumb_html = ""
                         if thumb_urls:
@@ -2784,6 +2856,47 @@ def render_grouped_cast_row(
                             unsafe_allow_html=True,
                         )
                     with exp_col2:
+                        # Cast member dropdown - default to suggested cast
+                        selected_cast_idx = st.selectbox(
+                            "Cast",
+                            options=range(len(cast_dropdown_options)),
+                            format_func=lambda i: cast_dropdown_options[i][1],
+                            key=f"exp_cast_select_{group_key}_{cid}",
+                            label_visibility="collapsed",
+                        )
+                        selected_cast_id, selected_cast_name = cast_dropdown_options[selected_cast_idx]
+                    with exp_col3:
+                        # Accept/approve this specific cluster to selected cast
+                        if st.button("✓", key=f"exp_accept_{group_key}_{cid}", help=f"Assign {cid} to {selected_cast_name}"):
+                            people_resp = _fetch_people_cached(show_slug)
+                            people_list = people_resp.get("people", []) if people_resp else []
+                            target_person = next((p for p in people_list if p.get("cast_id") == selected_cast_id), None)
+                            target_person_id = target_person.get("person_id") if target_person else None
+                            payload = {
+                                "strategy": "manual",
+                                "cluster_ids": [cid],
+                                "target_person_id": target_person_id,
+                                "cast_id": selected_cast_id,
+                            }
+                            result = _api_post(f"/episodes/{ep_id}/clusters/group", payload, timeout=10)
+                            if result.ok:
+                                if cid in cast_suggestions:
+                                    del cast_suggestions[cid]
+                                st.toast(f"Assigned {cid} to {selected_cast_name}")
+                                _invalidate_suggestions_cache(ep_id)  # Clear all caches
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to assign: {result.error}")
+                    with exp_col4:
+                        # Dismiss/archive this specific cluster
+                        if st.button("🗑️", key=f"exp_dismiss_{group_key}_{cid}", help=f"Dismiss {cid}"):
+                            cdata = entry.get("cluster_data", {})
+                            _archive_cluster(cid, cdata, reason="user_skipped_individual")
+                            dismissed.add(cid)
+                            _save_dismissed_to_api([cid])
+                            st.toast(f"Dismissed {cid}")
+                            st.rerun()
+                    with exp_col5:
                         if st.button("→", key=f"exp_view_{group_key}_{cid}", help=f"View {cid}"):
                             st.session_state["facebank_ep"] = ep_id
                             st.session_state["facebank_view"] = "cluster_tracks"
@@ -3146,68 +3259,96 @@ if dismissed:
         st.session_state[dismissed_key] = set()
         st.rerun()
 
-# --- ARCHIVE SECTION ---
+# --- ARCHIVE SECTION (Shared with Faces Review and Singletons Review) ---
 st.markdown("---")
-with st.expander("🗄️ Archived Items (Skipped/Deleted)", expanded=False):
-    st.caption("View and restore clusters that were skipped or deleted.")
 
-    # Fetch archived items for this show
-    archive_data = None
-    if show_slug:
-        try:
-            archive_result = _safe_api_get(f"/archive/shows/{show_slug}", timeout=5)
-            if archive_result.ok:
-                archive_data = archive_result.data
-        except Exception as e:
-            st.warning(f"Could not load archive: {e}")
+# Fetch archived items for this show/episode
+archived_items = []
+archive_counts = {}
+total_archived = 0
 
-    if archive_data:
-        archived_clusters = archive_data.get("archived_clusters", [])
-        archived_people = archive_data.get("archived_people", [])
-        archived_tracks = archive_data.get("archived_tracks", [])
+if show_slug:
+    try:
+        archive_result = _safe_api_get(
+            f"/archive/shows/{show_slug}",
+            params={"limit": 50, "episode_id": ep_id},
+            timeout=5
+        )
+        if archive_result.ok and archive_result.data:
+            archived_items = archive_result.data.get("items", [])
+            archive_counts = archive_result.data.get("counts", {})
+            total_archived = archive_counts.get("total", 0) or len(archived_items)
+    except Exception as e:
+        LOGGER.warning(f"Could not load archive: {e}")
 
-        total_archived = len(archived_clusters) + len(archived_people) + len(archived_tracks)
+if total_archived > 0:
+    with st.expander(f"🗃️ View Archived Items ({total_archived})", expanded=False):
+        st.caption(
+            "Archived items are excluded from screen time calculations. "
+            "If the same face appears again, it can be automatically archived."
+        )
 
-        if total_archived == 0:
-            st.info("No archived items. Items will appear here when you skip/delete clusters.")
-        else:
-            st.write(f"**{len(archived_clusters)}** clusters · **{len(archived_people)}** people · **{len(archived_tracks)}** tracks")
+        # Clear All button
+        clear_col1, clear_col2 = st.columns([3, 1])
+        with clear_col2:
+            if st.button("🗑️ Clear All", key="clear_all_archived_smart", type="secondary"):
+                try:
+                    clear_url = f"{_api_base}/archive/shows/{show_slug}/clear"
+                    resp = requests.delete(clear_url, params={"episode_id": ep_id}, timeout=10)
+                    if resp.status_code == 200:
+                        # Also clear dismissed suggestions
+                        _clear_dismissed_via_api()
+                        st.success(f"Cleared archived items")
+                        st.rerun()
+                    else:
+                        st.error("Failed to clear archive")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-            # Filter to this episode
-            ep_clusters = [c for c in archived_clusters if c.get("episode_id") == ep_id]
-            if ep_clusters:
-                st.markdown(f"##### This Episode ({len(ep_clusters)} clusters)")
-                for ac in ep_clusters[-10:]:  # Show last 10
-                    col1, col2, col3 = st.columns([3, 2, 1])
-                    with col1:
-                        st.text(f"{ac.get('original_id', '?')}")
-                    with col2:
-                        reason = ac.get("reason", "unknown")
-                        archived_at = ac.get("archived_at", "")[:10]  # Just date
-                        st.caption(f"{reason} · {archived_at}")
-                    with col3:
-                        archive_id = ac.get("archive_id")
-                        if archive_id:
-                            if st.button("↩️", key=f"restore_{archive_id}", help="Restore this cluster"):
-                                try:
-                                    restore_result = _api_post(f"/archive/shows/{show_slug}/restore/{archive_id}", timeout=5)
-                                    if restore_result.ok:
-                                        st.success(f"Restored {ac.get('original_id')}")
-                                        # Also remove from dismissed if present
-                                        dismissed.discard(ac.get("original_id"))
-                                        st.rerun()
-                                    else:
-                                        st.error(f"Restore failed: {restore_result.error}")
-                                except Exception as e:
-                                    st.error(f"Restore error: {e}")
+        # Show counts
+        stat_cols = st.columns(4)
+        stat_cols[0].metric("People", archive_counts.get("people", 0))
+        stat_cols[1].metric("Clusters", archive_counts.get("clusters", 0))
+        stat_cols[2].metric("Tracks", archive_counts.get("tracks", 0))
+        stat_cols[3].metric("Total", total_archived)
 
-                if len(ep_clusters) > 10:
-                    st.caption(f"... and {len(ep_clusters) - 10} more")
+        if archived_items:
+            st.markdown("##### Archived Items")
+            for idx, item in enumerate(archived_items[:20]):  # Show first 20
+                item_type = item.get("type", "unknown")
+                archive_id = item.get("archive_id", "")
+                name = item.get("name") or item.get("original_id") or archive_id[:12]
+                archived_at = item.get("archived_at", "")[:10]  # Date only
+                reason = item.get("reason", "deleted")
+                rep_crop_url = item.get("rep_crop_url")
 
-            # Show other episodes summary
-            other_clusters = [c for c in archived_clusters if c.get("episode_id") != ep_id]
-            if other_clusters:
-                st.markdown(f"##### Other Episodes ({len(other_clusters)} clusters)")
-                st.caption("Switch to that episode to restore them.")
-    else:
-        st.info("No archive data available." if show_slug else "Select an episode to view archive.")
+                item_cols = st.columns([1, 3, 2, 1])
+                with item_cols[0]:
+                    if rep_crop_url:
+                        st.image(rep_crop_url, width=50)
+                    else:
+                        st.markdown("👤")
+                with item_cols[1]:
+                    type_icon = {"person": "👤", "cluster": "🎯", "track": "🔗"}.get(item_type, "📦")
+                    st.markdown(f"**{type_icon} {name}**")
+                    st.caption(f"{item_type} · {reason} · {archived_at}")
+                with item_cols[2]:
+                    if item.get("episode_id"):
+                        st.caption(f"From: {item['episode_id']}")
+                with item_cols[3]:
+                    if st.button("↩️", key=f"restore_archive_smart_{archive_id}_{idx}", help="Restore item"):
+                        try:
+                            restore_result = _api_post(f"/archive/shows/{show_slug}/restore/{archive_id}", timeout=5)
+                            if restore_result.ok:
+                                # Also remove from dismissed if present
+                                original_id = item.get("original_id")
+                                if original_id:
+                                    dismissed.discard(original_id)
+                                st.success(f"Restored {name}")
+                                st.rerun()
+                            else:
+                                st.error(f"Restore failed: {restore_result.error}")
+                        except Exception as e:
+                            st.error(f"Restore error: {e}")
+
+                st.markdown("---")

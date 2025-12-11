@@ -795,8 +795,8 @@ def _render_improve_faces_modal(ep_id: str) -> None:
                 }
                 try:
                     helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    st.error(f"Failed to save merge decision: {exc}")
                 _advance()
 
         with btn_col2:
@@ -811,8 +811,8 @@ def _render_improve_faces_modal(ep_id: str) -> None:
                 }
                 try:
                     helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    st.error(f"Failed to save reject decision: {exc}")
                 _advance()
 
         with btn_col3:
@@ -877,17 +877,37 @@ def _invalidate_assignment_caches() -> None:
     """Clear all caches affected by assignment operations.
 
     Call this immediately after any assignment/merge/create person operation
-    to ensure the UI shows fresh data.
+    to ensure the UI shows fresh data. Also clears cross-page caches used by
+    Smart Suggestions and Singletons Review pages.
     """
     _fetch_identities_cached.clear()
     _fetch_people_cached.clear()
     _fetch_cast_cached.clear()
     _fetch_cluster_track_reps_cached.clear()
     _fetch_unlinked_entities.clear()  # Critical: clears "Needs Assignment" cache
-    # Clear session state caches if they exist
-    for key in list(st.session_state.keys()):
-        if key.startswith("cast_carousel_cache") or key.startswith("_thumb_result_cache"):
-            del st.session_state[key]
+
+    # Clear session state caches if they exist (safe copy to avoid mutation during iteration)
+    # Include cross-page cache keys for Smart Suggestions and Singletons Review
+    cache_prefixes = (
+        "cast_carousel_cache",
+        "_thumb_result_cache",
+        "cast_suggestions:",  # Smart Suggestions page
+        "dismissed_suggestions:",  # Smart Suggestions page
+        "dismissed_loaded:",  # Smart Suggestions page
+        "people_cache:",  # Smart Suggestions page
+    )
+    keys_to_clear = [
+        key for key in list(st.session_state.keys())
+        if any(key.startswith(prefix) for prefix in cache_prefixes)
+    ]
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)  # Use pop with default to avoid KeyError
+
+    # Also clear Streamlit's built-in cache to ensure fresh data
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass  # Ignore if cache clearing fails
 
 
 def _persist_and_refresh_cast_suggestions(
@@ -941,8 +961,13 @@ def _fetch_tracks_meta(ep_id: str, track_ids: List[int]) -> Dict[int, Dict[str, 
             batch_resp = resp.json()
             if batch_resp and isinstance(batch_resp, dict):
                 items = batch_resp.get("tracks") or batch_resp.get("items") or []
+                # Validate items is actually a list to avoid iteration errors
+                if not isinstance(items, list):
+                    items = []
                 meta: Dict[int, Dict[str, Any]] = {}
                 for item in items:
+                    if not isinstance(item, dict):
+                        continue
                     tid = coerce_int(item.get("track_id") or item.get("id"))
                     if tid is not None:
                         meta[int(tid)] = item
@@ -2857,14 +2882,24 @@ def _render_unassigned_cluster_card(
     if not track_list or tracks_count == 0:
         with st.container(border=True):
             st.markdown(f"### 🔍 Cluster `{cluster_id}`")
-            st.warning(
-                f"⚠️ This cluster has no reviewable tracks. "
-                f"({filtered_tracks_count} single-frame track(s) were filtered as noise.)"
-            )
-            st.caption(
-                "Smart Suggestions skip this cluster. Delete it to clear the noise or rerun detection "
-                "if you believe frames are missing."
-            )
+            # Distinguish between empty clusters (no tracks) vs filtered clusters (all single-frame)
+            if not original_track_list:
+                # Truly empty cluster - no tracks at all
+                st.warning("⚠️ This cluster is empty (no tracks).")
+                st.caption(
+                    "Empty clusters occur when all tracks are moved/merged elsewhere. "
+                    "Delete to clean up, or use 'Cleanup Empty Clusters' in the sidebar."
+                )
+            else:
+                # Had tracks but all were filtered as single-frame noise
+                st.warning(
+                    f"⚠️ This cluster has no reviewable tracks. "
+                    f"({filtered_tracks_count} single-frame track(s) were filtered as noise.)"
+                )
+                st.caption(
+                    "Smart Suggestions skip this cluster. Delete it to clear the noise or rerun detection "
+                    "if you believe frames are missing."
+                )
             col1, col2 = st.columns([2, 1])
             with col2:
                 if st.button("Delete", key=f"delete_empty_{cluster_id}", type="secondary"):
@@ -3504,17 +3539,42 @@ def _render_auto_person_card(
             best_cast_suggestion = cast_suggestions[0]  # Already sorted by similarity
 
     with st.container(border=True):
-        # Name
-        st.markdown(f"### 👤 {name}")
+        # Get representative crop from person's clusters
+        featured_crop = None
+        if episode_clusters:
+            # Extract cluster IDs without episode prefix
+            cluster_ids_plain = [c.split(":")[-1] for c in episode_clusters]
+            featured_crop = _get_best_crop_from_clusters(ep_id, cluster_ids_plain)
 
-        # Show aliases if present
-        if aliases:
-            alias_text = ", ".join(f"`{a}`" for a in aliases)
-            st.caption(f"Aliases: {alias_text}")
+        # Two-column layout: image on left, details on right
+        img_col, details_col = st.columns([1, 3])
 
-        # Metrics line
-        metrics_text = f"ID: {person_id} · {total_clusters} cluster(s) overall · {len(episode_clusters)} in this episode"
-        st.caption(metrics_text)
+        with img_col:
+            if featured_crop:
+                resolved = helpers.resolve_thumb(featured_crop)
+                if resolved:
+                    thumb_markup = helpers.thumb_html(resolved, alt=name, hide_if_missing=True)
+                    if thumb_markup:
+                        st.markdown(thumb_markup, unsafe_allow_html=True)
+                    else:
+                        st.markdown("👤", help="No image available")
+                else:
+                    st.markdown("👤", help="No image available")
+            else:
+                st.markdown("👤", help="No image available")
+
+        with details_col:
+            # Name
+            st.markdown(f"### 👤 {name}")
+
+            # Show aliases if present
+            if aliases:
+                alias_text = ", ".join(f"`{a}`" for a in aliases)
+                st.caption(f"Aliases: {alias_text}")
+
+            # Metrics line
+            metrics_text = f"ID: {person_id} · {total_clusters} cluster(s) overall · {len(episode_clusters)} in this episode"
+            st.caption(metrics_text)
 
         # Identity Similarity row + View button
         sim_cols = st.columns([3, 1])
@@ -4101,6 +4161,9 @@ def _render_people_view(
         st.error("Unable to determine show for this episode.")
         return
 
+    # Build people lookup for quick access by person_id
+    people_lookup = {str(person.get("person_id") or ""): person for person in people}
+
     # Check for cast filter
     filter_cast_id = st.session_state.get("filter_cast_id")
     filter_cast_name = st.session_state.get("filter_cast_name")
@@ -4285,7 +4348,7 @@ def _render_people_view(
                 for item in archived_items[:20]:  # Show first 20
                     item_type = item.get("type", "unknown")
                     archive_id = item.get("archive_id", "")
-                    name = item.get("name") or item.get("original_id") or archive_id[:12]
+                    name = str(item.get("name") or item.get("original_id") or archive_id[:12])
                     archived_at = item.get("archived_at", "")[:10]  # Date only
                     reason = item.get("reason", "deleted")
                     rep_crop_url = item.get("rep_crop_url")
@@ -4293,7 +4356,16 @@ def _render_people_view(
                     item_cols = st.columns([1, 3, 2, 1])
                     with item_cols[0]:
                         if rep_crop_url:
-                            st.image(rep_crop_url, width=50)
+                            # Use resolve_thumb + thumb_html for safe image loading
+                            resolved = helpers.resolve_thumb(rep_crop_url)
+                            if resolved:
+                                thumb_markup = helpers.thumb_html(resolved, alt=name, hide_if_missing=True)
+                                if thumb_markup:
+                                    st.markdown(thumb_markup, unsafe_allow_html=True)
+                                else:
+                                    st.markdown("👤")
+                            else:
+                                st.markdown("👤")
                         else:
                             st.markdown("👤")
                     with item_cols[1]:
@@ -4315,6 +4387,31 @@ def _render_people_view(
     # --- NEEDS CAST ASSIGNMENT (UNIFIED) ---
     unlinked_resp = _fetch_unlinked_entities(ep_id)
     unlinked_entities = unlinked_resp.get("entities", []) if unlinked_resp else []
+
+    # Load dismissed suggestions to filter out skipped items (shared with Smart Suggestions)
+    dismissed_resp = _safe_api_get(f"/episodes/{ep_id}/dismissed_suggestions")
+    dismissed_ids: set = set()
+    if dismissed_resp and dismissed_resp.get("dismissed"):
+        dismissed_ids = set(dismissed_resp.get("dismissed", []))
+
+    # Filter out dismissed entities
+    if dismissed_ids:
+        filtered_entities = []
+        for entity in unlinked_entities:
+            cluster_ids = entity.get("cluster_ids", [])
+            # Check if any cluster in this entity is dismissed
+            if entity.get("entity_type") == "person":
+                person_id = entity.get("entity_id")
+                if f"person:{person_id}" in dismissed_ids:
+                    continue
+            # Filter out dismissed cluster_ids from the entity
+            remaining_clusters = [cid for cid in cluster_ids if cid not in dismissed_ids]
+            if not remaining_clusters:
+                continue
+            entity_copy = dict(entity)
+            entity_copy["cluster_ids"] = remaining_clusters
+            filtered_entities.append(entity_copy)
+        unlinked_entities = filtered_entities
 
     # Build options: map cast_id to name for assignment controls
     cast_options = {
@@ -4420,7 +4517,7 @@ def _render_people_view(
         st.markdown(f"### 🔍 Needs Cast Assignment ({total_items})")
 
         # Sort options for unassigned clusters
-        sort_col, analyze_col, spacer_col = st.columns([1.5, 1, 2])
+        sort_col, analyze_col, autoassign_col, spacer_col = st.columns([1.5, 1, 1, 1.5])
         with sort_col:
             unassigned_sort_key = f"unassigned_sort:{ep_id}"
             unassigned_sort_option = st.selectbox(
@@ -4494,6 +4591,35 @@ def _render_people_view(
                     else:
                         msg = analysis_resp.get("message") if analysis_resp else "API error"
                         st.error(f"Analysis failed: {msg}")
+
+        # Auto-assign all clusters to cast based on facebank
+        with autoassign_col:
+            if st.button(
+                "⚡ Auto-Assign All",
+                key=f"autoassign_all_{ep_id}",
+                help="Automatically assign all unassigned clusters to cast members based on facebank matches",
+                type="primary",
+            ):
+                with st.spinner("Auto-assigning clusters to cast..."):
+                    autoassign_resp = _api_post(
+                        f"/episodes/{ep_id}/clusters/group",
+                        {
+                            "strategy": "auto",
+                            "protect_manual": True,
+                            "facebank_first": True,
+                            "skip_cast_assignment": False,
+                        },
+                    )
+                    if autoassign_resp and autoassign_resp.get("status") == "success":
+                        result = autoassign_resp.get("result", {})
+                        assigned = len(result.get("assignments", {}).get("assigned", []))
+                        st.success(f"Auto-assigned {assigned} cluster(s) to cast members!")
+                        _invalidate_assignment_caches()
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        msg = autoassign_resp.get("error") if autoassign_resp else "API error"
+                        st.error(f"Auto-assign failed: {msg}")
 
         # Show analysis results if available
         analysis_key = f"unassigned_analysis:{ep_id}"
@@ -6586,7 +6712,8 @@ def _filter_cluster_payload(payload: Dict[str, Any], archived_clusters: set, arc
             if tid_int is not None and tid_int in archived_tracks:
                 continue
             cleaned_reps.append(tr)
-        if cleaned_reps is not reps:
+        # Only update track_reps and counts if we actually filtered something
+        if len(cleaned_reps) != len(reps):
             entry_copy["track_reps"] = cleaned_reps
             counts = entry_copy.get("counts")
             if isinstance(counts, dict):
@@ -6609,8 +6736,25 @@ if st.session_state.pop(f"{ep_id}::trigger_improve_faces", False):
     _start_improve_faces(ep_id)
 
 # Manual Improve Faces launcher (always available)
-if st.button("🎯 Improve Faces", key=f"improve_faces_btn_{ep_id}", type="primary"):
-    _start_improve_faces(ep_id, force=True)
+action_btn_col1, action_btn_col2, action_btn_col3 = st.columns([1, 1, 2])
+with action_btn_col1:
+    if st.button("🎯 Improve Faces", key=f"improve_faces_btn_{ep_id}", type="primary"):
+        _start_improve_faces(ep_id, force=True)
+
+with action_btn_col2:
+    if st.button("🧹 Cleanup Empty Clusters", key=f"cleanup_empty_{ep_id}", help="Remove clusters with no tracks"):
+        with st.spinner("Cleaning up empty clusters..."):
+            cleanup_resp = _api_post(f"/episodes/{ep_id}/cleanup_empty_clusters")
+            if cleanup_resp and cleanup_resp.get("status") == "success":
+                removed = cleanup_resp.get("removed_clusters", [])
+                if removed:
+                    st.success(f"Removed {len(removed)} empty cluster(s): {', '.join(removed[:5])}{'...' if len(removed) > 5 else ''}")
+                    _invalidate_assignment_caches()
+                    st.rerun()
+                else:
+                    st.info("No empty clusters found")
+            else:
+                st.error(f"Cleanup failed: {cleanup_resp.get('error', 'Unknown error') if cleanup_resp else 'API error'}")
 
 # If Improve Faces modal is open, render it and skip the heavy page to keep YES/NO snappy
 _render_improve_faces_modal(ep_id)

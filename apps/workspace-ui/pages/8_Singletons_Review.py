@@ -1,25 +1,25 @@
-"""Singletons Review Page - Review and assign singleton clusters.
+"""Singletons Review Page - Batch review and assign singleton clusters.
 
-This page shows all singleton clusters (clusters with only 1 track) for review
-AFTER the main Faces Review workflow is complete. Singletons often include:
-- Brief appearances of cast members
-- Background extras
-- Low-quality/skipped faces that couldn't be clustered
-- Noise detections
+This page performs batch analysis of ALL singleton clusters (clusters with 1 track)
+against ALL assigned track embeddings from the episode. Results are grouped by
+suggested cast member for efficient review.
 
-Use this page to:
-1. Assign singletons to known cast members
-2. Mark singletons as "noise" to exclude from screentime
-3. Review and clean up after main cast assignment
+Features:
+- Batch comparison (single API call instead of N+1)
+- Person-grouped display (all Lisa suggestions together, etc.)
+- Bulk accept/reject per person group
+- Archive similarity matching
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 import streamlit as st
@@ -30,8 +30,6 @@ PAGE_PATH = Path(__file__).resolve()
 WORKSPACE_DIR = PAGE_PATH.parents[1]
 if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
-
-import os
 
 import ui_helpers as helpers  # noqa: E402
 from similarity_badges import (  # noqa: E402
@@ -46,51 +44,115 @@ cfg = helpers.init_page("Singletons Review")
 
 st.title("Singletons Review")
 
+
 # ============================================================================
 # API Client Setup
 # ============================================================================
 
 API_BASE = st.session_state.get("api_base") or os.environ.get("API_BASE", "http://127.0.0.1:8000")
 
-
-def _api_session() -> requests.Session:
-    """Create a requests session with retry logic."""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+_retry_session: Optional[requests.Session] = None
 
 
-def _api_get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Make a GET request to the API."""
+def _get_session() -> requests.Session:
+    """Get or create retry session."""
+    global _retry_session
+    if _retry_session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _retry_session = session
+    return _retry_session
+
+
+@dataclass
+class ApiResult:
+    """Structured API result with explicit error handling."""
+
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    status_code: Optional[int] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.data is not None
+
+    @property
+    def error_message(self) -> str:
+        if not self.error:
+            return ""
+        if self.status_code:
+            return f"API error {self.status_code}: {self.error}"
+        return f"API error: {self.error}"
+
+
+def _api_get(path: str, params: Optional[Dict] = None, timeout: int = 30) -> ApiResult:
+    """GET request with structured error handling."""
+    url = f"{API_BASE}{path}"
+    session = _get_session()
     try:
-        session = _api_session()
-        url = f"{API_BASE}{endpoint}"
-        resp = session.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        LOGGER.error("API GET %s failed: %s", endpoint, e)
-        return {"error": str(e)}
+        resp = session.get(url, params=params or {}, timeout=timeout)
+        if resp.status_code == 200:
+            return ApiResult(data=resp.json())
+        try:
+            error_detail = resp.json().get("detail", resp.text or resp.reason)
+        except Exception:
+            error_detail = resp.text or resp.reason or "Unknown error"
+        return ApiResult(error=error_detail, status_code=resp.status_code)
+    except requests.Timeout:
+        return ApiResult(error=f"Request timed out ({timeout}s)")
+    except requests.ConnectionError:
+        return ApiResult(error="Connection failed - API may be unavailable")
+    except Exception as e:
+        return ApiResult(error=f"Unexpected error: {e}")
 
 
-def _api_post(endpoint: str, json_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Make a POST request to the API."""
+def _api_post(path: str, payload: Optional[Dict] = None, timeout: int = 60) -> ApiResult:
+    """POST request with structured error handling."""
+    url = f"{API_BASE}{path}"
+    session = _get_session()
     try:
-        session = _api_session()
-        url = f"{API_BASE}{endpoint}"
-        resp = session.post(url, json=json_data or {}, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        LOGGER.error("API POST %s failed: %s", endpoint, e)
-        return {"error": str(e)}
+        resp = session.post(url, json=payload or {}, timeout=timeout)
+        if resp.status_code in (200, 201):
+            return ApiResult(data=resp.json())
+        try:
+            error_detail = resp.json().get("detail", resp.text or resp.reason)
+        except Exception:
+            error_detail = resp.text or resp.reason or "Unknown error"
+        return ApiResult(error=error_detail, status_code=resp.status_code)
+    except requests.Timeout:
+        return ApiResult(error=f"Request timed out ({timeout}s)")
+    except requests.ConnectionError:
+        return ApiResult(error="Connection failed - API may be unavailable")
+    except Exception as e:
+        return ApiResult(error=f"Unexpected error: {e}")
+
+
+# ============================================================================
+# Session State Keys
+# ============================================================================
+
+
+def _analysis_key(ep_id: str) -> str:
+    return f"{ep_id}::singleton_analysis"
+
+
+def _analysis_timestamp_key(ep_id: str) -> str:
+    return f"{ep_id}::singleton_analysis_ts"
+
+
+def _selections_key(ep_id: str) -> str:
+    return f"{ep_id}::singleton_selections"
+
+
+def _expanded_key(ep_id: str) -> str:
+    return f"{ep_id}::expanded_person_groups"
 
 
 # ============================================================================
@@ -98,161 +160,58 @@ def _api_post(endpoint: str, json_data: Optional[Dict[str, Any]] = None) -> Dict
 # ============================================================================
 
 
-@st.cache_data(ttl=30)
-def load_singletons(ep_id: str) -> Dict[str, Any]:
-    """Load singleton clusters AND unclustered tracks for an episode.
+def load_singleton_analysis(
+    ep_id: str,
+    include_archive: bool = False,
+    min_similarity: float = 0.30,
+    force_refresh: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Load singleton analysis from API (cached in session state)."""
+    cache_key = _analysis_key(ep_id)
+    ts_key = _analysis_timestamp_key(ep_id)
 
-    Returns both:
-    1. Existing singleton clusters from identities.json (identity_id set)
-    2. Unclustered tracks from faces.jsonl (identity_id=None, has track_id)
-    """
-    # Load existing identities
-    result = _api_get(f"/episodes/{ep_id}/identities_with_metrics")
-    if "error" in result:
-        return {"clusters": [], "singleton_health": {}, "error": result["error"]}
+    if not force_refresh and cache_key in st.session_state:
+        return st.session_state[cache_key]
 
-    # API returns "identities" array with track_ids list
-    identities = result.get("identities", [])
+    with st.spinner("Analyzing singletons... (batch comparison)"):
+        result = _api_post(
+            f"/episodes/{ep_id}/singleton_analysis",
+            {
+                "include_archive": include_archive,
+                "min_similarity": min_similarity,
+                "top_k": 3,
+            },
+            timeout=120,  # May take longer for large episodes
+        )
 
-    # Enrich with counts structure for compatibility
-    for identity in identities:
-        track_ids = identity.get("track_ids", [])
-        faces = identity.get("faces", 0)
-        identity["counts"] = {
-            "tracks": len(track_ids),
-            "faces": faces,
-        }
-        # Map metrics fields to expected names
-        metrics = identity.get("metrics", {})
-        identity["identity_similarity"] = metrics.get("cohesion")
-        identity["cohesion"] = metrics.get("cohesion")
-        # Determine singleton risk based on track and face counts
-        if len(track_ids) == 1 and faces == 1:
-            identity["singleton_risk"] = "HIGH"
-        elif len(track_ids) == 1 and faces <= 3:
-            identity["singleton_risk"] = "MEDIUM"
-        elif len(track_ids) == 1:
-            identity["singleton_risk"] = "LOW"
+    if result.ok:
+        st.session_state[cache_key] = result.data
+        st.session_state[ts_key] = time.strftime("%H:%M:%S")
+        st.toast("Analysis generated successfully!", icon="✅")
+        return result.data
+    else:
+        st.error(f"Failed to analyze singletons: {result.error_message}")
+        return None
+
+
+def load_cast_members(show_id: str) -> List[Dict[str, Any]]:
+    """Load cast members for dropdown selection."""
+    cache_key = f"cast_members:{show_id}"
+    if cache_key not in st.session_state:
+        result = _api_get(f"/shows/{show_id}/cast")
+        if result.ok and result.data:
+            # API returns {"cast": [...]} format
+            cast_list = result.data.get("cast", []) if isinstance(result.data, dict) else result.data
+            st.session_state[cache_key] = cast_list
         else:
-            identity["singleton_risk"] = None
-
-    # Filter to only singleton clusters (1 track)
-    singletons = [c for c in identities if c.get("counts", {}).get("tracks", 0) == 1]
-
-    # ALSO load unclustered tracks (tracks in faces.jsonl but not in any identity)
-    unclustered_result = _api_get(f"/episodes/{ep_id}/unclustered_tracks")
-    unclustered_tracks = []
-    if "error" not in unclustered_result:
-        raw_unclustered = unclustered_result.get("unclustered_tracks", [])
-        for track in raw_unclustered:
-            # Convert to same format as singletons for unified display
-            unclustered_tracks.append({
-                "identity_id": None,  # Not yet clustered
-                "track_id": track.get("track_id"),  # Store track_id for assignment
-                "track_ids": [track.get("track_id")],
-                "faces": track.get("faces", 0),
-                "counts": {
-                    "tracks": 1,
-                    "faces": track.get("faces", 0),
-                },
-                "rep_thumbnail_url": track.get("rep_thumbnail_url"),
-                "singleton_risk": track.get("singleton_risk", "HIGH"),
-                "person_id": None,
-                "name": None,
-                "is_unclustered": True,  # Flag to identify unclustered tracks
-                "faces_skipped": track.get("faces_skipped", 0),
-                "faces_with_embeddings": track.get("faces_with_embeddings", 0),
-            })
-
-    # Combine existing singletons and unclustered tracks
-    all_items = singletons + unclustered_tracks
-
-    # Calculate singleton health metrics (including unclustered)
-    total_identities = len(identities)
-    total_items = len(all_items)
-    singleton_count = len(singletons)
-    unclustered_count = len(unclustered_tracks)
-    high_risk_count = sum(1 for s in all_items if s.get("singleton_risk") == "HIGH")
-    single_frame_count = sum(1 for s in all_items if s.get("counts", {}).get("faces", 0) == 1)
-
-    singleton_health = {
-        "singleton_fraction": singleton_count / total_identities if total_identities > 0 else 0,
-        "high_risk_count": high_risk_count,
-        "single_frame_tracks": single_frame_count,
-        "unclustered_count": unclustered_count,
-        "health_status": "critical" if unclustered_count > 50 else (
-            "warning" if unclustered_count > 20 else "healthy"
-        ),
-    }
-
-    return {
-        "clusters": all_items,
-        "singleton_health": singleton_health,
-        "total_clusters": total_identities,
-        "unclustered_count": unclustered_count,
-    }
+            st.session_state[cache_key] = []
+    return st.session_state.get(cache_key, [])
 
 
-@st.cache_data(ttl=60)
-def load_cast_members(ep_id: str) -> List[Dict[str, Any]]:
-    """Load cast members for assignment dropdown."""
-    # Extract show from ep_id (e.g., rhoslc-s06e99 -> RHOSLC)
-    import re
-    match = re.match(r"^(?P<show>.+)-s\d{2}e\d{2}$", ep_id, re.IGNORECASE)
-    if not match:
-        return []
-
-    show_id = match.group("show").upper()
-    result = _api_get(f"/shows/{show_id}/cast")
-    if "error" in result:
-        return []
-
-    return result.get("cast", [])
-
-
-@st.cache_data(ttl=30)
-def load_cast_suggestions(ep_id: str) -> Dict[str, List[Dict[str, Any]]]:
-    """Load cast suggestions for all clusters, keyed by cluster_id."""
-    result = _api_get(f"/episodes/{ep_id}/cast_suggestions")
-    if "error" in result:
-        return {}
-
-    suggestions = result.get("suggestions", [])
-    # Build map: cluster_id -> list of cast suggestions
-    suggestions_map = {}
-    for s in suggestions:
-        cluster_id = s.get("cluster_id")
-        cast_suggestions = s.get("cast_suggestions", [])
-        if cluster_id and cast_suggestions:
-            suggestions_map[cluster_id] = cast_suggestions
-
-    return suggestions_map
-
-
-def get_thumbnail_url(ep_id: str, cluster: Dict[str, Any]) -> Optional[str]:
-    """Get the best thumbnail URL for a cluster."""
-    # Try rep_thumbnail_url first (API provides signed S3 URL)
-    rep_url = cluster.get("rep_thumbnail_url")
-    if rep_url:
-        return rep_url
-
-    # Try rep_media_url as fallback
-    rep_media = cluster.get("rep_media_url")
-    if rep_media:
-        return rep_media
-
-    # Try rep_crop for local path resolution
-    rep_crop = cluster.get("rep_crop")
-    if rep_crop:
-        return helpers.resolve_image_url(ep_id, rep_crop)
-
-    # Try tracks[0].thumb_rel_path
-    tracks = cluster.get("tracks", [])
-    if tracks:
-        thumb_path = tracks[0].get("thumb_rel_path")
-        if thumb_path:
-            return helpers.resolve_image_url(ep_id, thumb_path)
-
+def get_show_id_from_ep(ep_id: str) -> Optional[str]:
+    """Extract show ID from episode ID (e.g., 'rhobh-s05e02' -> 'rhobh')."""
+    if "-" in ep_id:
+        return ep_id.split("-")[0].lower()
     return None
 
 
@@ -261,64 +220,160 @@ def get_thumbnail_url(ep_id: str, cluster: Dict[str, Any]) -> Optional[str]:
 # ============================================================================
 
 
-def assign_to_cast(ep_id: str, cluster_id: str, cast_id: str) -> Dict[str, Any]:
+def assign_singleton_to_cast(
+    ep_id: str,
+    identity_id: str,
+    track_id: int,
+    cast_id: str,
+    cast_name: str,
+) -> bool:
     """Assign a singleton cluster to a cast member."""
-    # Use the manual assign endpoint with cluster_ids list
-    return _api_post(
-        f"/episodes/{ep_id}/clusters/manual",
-        {"cluster_ids": [cluster_id], "cast_id": cast_id},
+    show_id = get_show_id_from_ep(ep_id)
+    if not show_id:
+        st.error("Could not determine show ID")
+        return False
+
+    # Use the cluster group endpoint for assignment
+    result = _api_post(
+        f"/episodes/{ep_id}/clusters/group",
+        {
+            "cluster_ids": [identity_id],
+            "cast_id": cast_id,
+            "name": cast_name,
+            "strategy": "manual",
+        },
     )
 
+    if result.ok:
+        return True
+    else:
+        st.error(f"Failed to assign: {result.error_message}")
+        return False
 
-def assign_track_to_cast(ep_id: str, track_id: int, cast_name: str, show: str) -> Dict[str, Any]:
-    """Assign an unclustered track to a cast member by name.
 
-    This creates a singleton identity for the track and assigns it in one step.
-    """
-    return _api_post(
-        f"/episodes/{ep_id}/tracks/{track_id}/name",
-        {"name": cast_name, "show": show},
+def mark_singleton_as_noise(
+    ep_id: str,
+    identity_id: str,
+    track_id: int,
+    thumbnail_url: Optional[str] = None,
+) -> bool:
+    """Mark a singleton as noise (archive it)."""
+    show_id = get_show_id_from_ep(ep_id)
+    if not show_id:
+        st.error("Could not determine show ID")
+        return False
+
+    result = _api_post(
+        f"/archive/shows/{show_id}/clusters",
+        {
+            "episode_id": ep_id,
+            "cluster_id": identity_id,
+            "reason": "noise",
+            "rep_crop_url": thumbnail_url,
+        },
     )
 
-
-def mark_as_noise(ep_id: str, cluster_id: str) -> Dict[str, Any]:
-    """Mark a singleton as noise WITHOUT deleting it from identities.json.
-
-    IMPORTANT: This function does NOT delete the cluster. It only marks it as
-    noise/dismissed in the tracking system. The cluster remains in identities.json
-    so it can be restored later if needed.
-
-    Previously this was calling DELETE which caused data loss by permanently
-    removing clusters from identities.json.
-    """
-    try:
-        session = _api_session()
-        # Use the dismissed_suggestions endpoint to mark as skipped/noise
-        # This preserves the cluster in identities.json
-        url = f"{API_BASE}/episodes/{ep_id}/dismissed_suggestions"
-        resp = session.post(url, json={"suggestion_ids": [cluster_id]}, timeout=30)
-        resp.raise_for_status()
-        LOGGER.info("Marked cluster %s as noise (dismissed) in %s", cluster_id, ep_id)
-        return {"status": "dismissed", "cluster_id": cluster_id}
-    except requests.RequestException as e:
-        LOGGER.error("API POST dismissed_suggestions %s failed: %s", cluster_id, e)
-        return {"error": str(e)}
+    if result.ok:
+        return True
+    else:
+        st.error(f"Failed to archive: {result.error_message}")
+        return False
 
 
-def mark_track_as_noise(ep_id: str, track_id: int) -> Dict[str, Any]:
-    """Mark an unclustered track as noise by creating and archiving a singleton."""
-    # First, we need to create a singleton for this track, then archive it
-    # For now, we'll just skip it - unclustered tracks don't have identities to delete
-    # TODO: Implement proper noise marking for unclustered tracks
-    return {"status": "skipped", "message": "Track not yet clustered - no identity to archive"}
+# ============================================================================
+# Batch Operations
+# ============================================================================
 
 
-def merge_with_cluster(ep_id: str, source_id: str, target_id: str) -> Dict[str, Any]:
-    """Merge a singleton into another cluster."""
-    return _api_post(
-        f"/episodes/{ep_id}/identities/merge",
-        {"source_id": source_id, "target_id": target_id},
-    )
+@dataclass
+class BatchProgress:
+    """Track batch operation progress."""
+
+    total: int
+    completed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    errors: List[str] = field(default_factory=list)
+
+    def increment(self, success: bool = True, error: str = "") -> None:
+        self.completed += 1
+        if success:
+            self.succeeded += 1
+        else:
+            self.failed += 1
+            if error:
+                self.errors.append(error)
+
+
+def batch_assign_person_group(
+    ep_id: str,
+    person_id: str,
+    cast_id: str,
+    cast_name: str,
+    matches: List[Dict[str, Any]],
+) -> BatchProgress:
+    """Assign all matches in a person group to that cast member."""
+    progress = BatchProgress(total=len(matches))
+    progress_bar = st.progress(0, text=f"Assigning to {cast_name}: 0/{len(matches)}")
+
+    for i, match in enumerate(matches):
+        identity_id = match.get("identity_id")
+        track_id = match.get("track_id")
+
+        if not identity_id:
+            progress.increment(success=False, error=f"Track {track_id}: missing identity_id")
+            continue
+
+        success = assign_singleton_to_cast(
+            ep_id=ep_id,
+            identity_id=identity_id,
+            track_id=track_id,
+            cast_id=cast_id,
+            cast_name=cast_name,
+        )
+        progress.increment(success=success, error="" if success else f"Track {track_id} failed")
+
+        progress_bar.progress(
+            (i + 1) / len(matches),
+            text=f"Assigning to {cast_name}: {i + 1}/{len(matches)}",
+        )
+
+    progress_bar.empty()
+    return progress
+
+
+def batch_archive_matches(
+    ep_id: str,
+    matches: List[Dict[str, Any]],
+) -> BatchProgress:
+    """Archive all matches as noise."""
+    progress = BatchProgress(total=len(matches))
+    progress_bar = st.progress(0, text=f"Archiving: 0/{len(matches)}")
+
+    for i, match in enumerate(matches):
+        identity_id = match.get("identity_id")
+        track_id = match.get("track_id")
+        thumbnail_url = match.get("thumbnail_url")
+
+        if not identity_id:
+            progress.increment(success=False, error=f"Track {track_id}: missing identity_id")
+            continue
+
+        success = mark_singleton_as_noise(
+            ep_id=ep_id,
+            identity_id=identity_id,
+            track_id=track_id,
+            thumbnail_url=thumbnail_url,
+        )
+        progress.increment(success=success, error="" if success else f"Track {track_id} failed")
+
+        progress_bar.progress(
+            (i + 1) / len(matches),
+            text=f"Archiving: {i + 1}/{len(matches)}",
+        )
+
+    progress_bar.empty()
+    return progress
 
 
 # ============================================================================
@@ -326,189 +381,325 @@ def merge_with_cluster(ep_id: str, source_id: str, target_id: str) -> Dict[str, 
 # ============================================================================
 
 
+def render_confidence_badge(confidence: str, similarity: float) -> str:
+    """Render confidence badge with color."""
+    if confidence == "high":
+        color = "#28a745"  # Green
+        icon = "H"
+    elif confidence == "medium":
+        color = "#ffc107"  # Yellow
+        icon = "M"
+    else:
+        color = "#dc3545"  # Red
+        icon = "L"
+
+    return f'<span style="background-color:{color};color:white;padding:2px 6px;border-radius:4px;font-size:12px;font-weight:bold;">{icon} {similarity:.0%}</span>'
+
+
 def render_singleton_card(
     ep_id: str,
-    cluster: Dict[str, Any],
-    cast_members: List[Dict[str, Any]],
-    suggestions: List[Dict[str, Any]],
-    idx: int,
+    match: Dict[str, Any],
+    cast_id: str,
+    cast_name: str,
+    card_key: str,
 ) -> Optional[str]:
-    """Render a singleton cluster card. Returns action taken if any."""
-    import re
+    """Render a single singleton match card. Returns action taken or None."""
+    track_id = match.get("track_id")
+    identity_id = match.get("identity_id")
+    similarity = match.get("similarity", 0)
+    confidence = match.get("confidence", "low")
+    face_count = match.get("face_count", 0)
+    singleton_risk = match.get("singleton_risk", "MEDIUM")
+    thumbnail_url = match.get("thumbnail_url")
 
-    cluster_id = cluster.get("identity_id", "")
-    track_id = cluster.get("track_id")  # For unclustered tracks
-    is_unclustered = cluster.get("is_unclustered", False)
-    person_id = cluster.get("person_id")
-    # API uses "name" field (can be None)
-    person_name = cluster.get("name") or cluster.get("person_name")
-    counts = cluster.get("counts", {})
-    track_count = counts.get("tracks", 0)
-    face_count = counts.get("faces", 0)
-    risk_level = cluster.get("singleton_risk", "LOW")
+    # Resolve S3 key to presigned URL
+    resolved_thumb = helpers.resolve_thumb(thumbnail_url) if thumbnail_url else None
 
-    # Get metrics
-    identity_sim = cluster.get("identity_similarity")
+    cols = st.columns([0.5, 2, 1, 1, 1])
 
-    # Get top suggestion if available
-    top_suggestion = suggestions[0] if suggestions else None
+    with cols[0]:
+        # Thumbnail
+        if resolved_thumb:
+            try:
+                st.image(resolved_thumb, width=60)
+            except Exception:
+                st.text("No img")
+        else:
+            st.text("No img")
 
-    # Check if already assigned
-    is_assigned = bool(person_id)
+    with cols[1]:
+        # Info
+        st.markdown(
+            f"**T{track_id}** ({face_count} faces) "
+            f"{render_confidence_badge(confidence, similarity)}",
+            unsafe_allow_html=True,
+        )
+        risk_badge = render_singleton_risk_badge(1, face_count)
+        st.markdown(f"Risk: {risk_badge}", unsafe_allow_html=True)
 
-    # Display name: for unclustered tracks, show track_id
-    if is_unclustered:
-        display_name = f"T{track_id}"
-        unique_key = f"track_{track_id}"
-    else:
-        display_name = person_name if person_name else cluster_id
-        unique_key = cluster_id or f"unknown_{idx}"
+    with cols[2]:
+        # Accept button
+        if st.button(f"Accept", key=f"accept_{card_key}", type="primary"):
+            success = assign_singleton_to_cast(
+                ep_id=ep_id,
+                identity_id=identity_id,
+                track_id=track_id,
+                cast_id=cast_id,
+                cast_name=cast_name,
+            )
+            if success:
+                return "accepted"
 
-    # Extract show from ep_id for assignment
-    match = re.match(r"^(?P<show>.+)-s\d{2}e\d{2}$", ep_id, re.IGNORECASE)
-    show_slug = match.group("show").upper() if match else None
+    with cols[3]:
+        # Skip/Noise button
+        if st.button(f"Noise", key=f"noise_{card_key}"):
+            success = mark_singleton_as_noise(
+                ep_id=ep_id,
+                identity_id=identity_id,
+                track_id=track_id,
+                thumbnail_url=thumbnail_url,
+            )
+            if success:
+                return "archived"
 
-    # Card container
-    with st.container():
-        cols = st.columns([1, 3, 2])
+    with cols[4]:
+        # Alternative suggestions
+        alternatives = match.get("alternative_suggestions", [])
+        if alternatives:
+            alt_text = ", ".join([f"{a.get('person_id', '?')[:8]}:{a.get('similarity', 0):.0%}" for a in alternatives[:2]])
+            st.caption(f"Alt: {alt_text}")
 
-        # Column 1: Thumbnail
-        with cols[0]:
-            thumb_url = get_thumbnail_url(ep_id, cluster)
-            if thumb_url:
-                st.image(thumb_url, width=100)
-            else:
-                st.markdown("🖼️ *No image*")
+    return None
 
-        # Column 2: Info
-        with cols[1]:
-            # Title with status badges
-            title_html = f"**{display_name}**"
-            if is_assigned:
-                title_html += " ✅"
-            if is_unclustered:
-                title_html += " 🆕"  # New/unclustered indicator
-            st.markdown(title_html)
 
-            # Risk badge
-            risk_badge = render_singleton_risk_badge(track_count, face_count)
-            st.markdown(risk_badge, unsafe_allow_html=True)
+def render_person_group(
+    ep_id: str,
+    group: Dict[str, Any],
+    group_index: int,
+    show_id: str,
+) -> int:
+    """Render a person group accordion. Returns count of actions taken."""
+    person_name = group.get("person_name", "Unknown")
+    person_id = group.get("person_id", "")
+    cast_id = group.get("cast_id")
+    matches = group.get("matches", [])
+    avg_similarity = group.get("avg_similarity", 0)
+    confidence_breakdown = group.get("confidence_breakdown", {})
 
-            # Stats - show extra info for unclustered tracks
-            if is_unclustered:
-                faces_skipped = cluster.get("faces_skipped", 0)
-                faces_with_emb = cluster.get("faces_with_embeddings", 0)
-                st.caption(f"Faces: {face_count} (skipped: {faces_skipped}, emb: {faces_with_emb})")
-            else:
-                st.caption(f"Faces: {face_count} | Tracks: {track_count}")
+    high_count = confidence_breakdown.get("high", 0)
+    medium_count = confidence_breakdown.get("medium", 0)
+    low_count = confidence_breakdown.get("low", 0)
 
-            # Show top cast suggestion if available and not assigned
-            if top_suggestion and not is_assigned:
-                sug_name = top_suggestion.get("name", "Unknown")
-                sug_sim = top_suggestion.get("similarity", 0)
-                sug_conf = top_suggestion.get("confidence", "low")
-                # Color code by confidence
-                conf_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(sug_conf, "⚪")
-                st.markdown(
-                    f"**Suggested:** {sug_name} ({sug_sim:.0%}) {conf_color}",
-                    help=f"Confidence: {sug_conf}, Similarity: {sug_sim:.2f}",
-                )
+    # Header with stats
+    header = f"{person_name} ({len(matches)} singletons | {avg_similarity:.0%} avg"
+    if high_count:
+        header += f" | {high_count}H"
+    if medium_count:
+        header += f" | {medium_count}M"
+    if low_count:
+        header += f" | {low_count}L"
+    header += ")"
 
-            # Metrics
-            if identity_sim is not None:
-                sim_badge = render_similarity_badge(
-                    identity_sim,
-                    SimilarityType.IDENTITY,
-                    show_label=True,
-                )
-                st.markdown(sim_badge, unsafe_allow_html=True)
+    actions_taken = 0
 
-        # Column 3: Actions
-        with cols[2]:
-            action_taken = None
+    with st.expander(header, expanded=(group_index == 0)):
+        # Bulk action buttons
+        col1, col2, col3 = st.columns([1, 1, 2])
 
-            if not is_assigned:
-                # Quick assign button if suggestion available (only for clustered items)
-                if top_suggestion and not is_unclustered:
-                    sug_cast_id = top_suggestion.get("cast_id", "")
-                    sug_name = top_suggestion.get("name", "Unknown")
-                    sug_conf = top_suggestion.get("confidence", "low")
-                    btn_label = f"⚡ {sug_name[:12]}"
-                    btn_disabled = sug_conf == "low"  # Disable for low confidence
-                    if st.button(
-                        btn_label,
-                        key=f"btn_quick_{unique_key}_{idx}",
-                        use_container_width=True,
-                        disabled=btn_disabled,
-                        help=f"Quick assign to {sug_name}" if not btn_disabled else "Low confidence - use manual assign",
-                    ):
-                        result = assign_to_cast(ep_id, cluster_id, sug_cast_id)
-                        if "error" not in result:
-                            st.success(f"Assigned to {sug_name}")
-                            action_taken = "assigned"
-                        else:
-                            st.error(f"Failed: {result.get('error')}")
+        with col1:
+            if st.button(f"Accept All ({len(matches)})", key=f"accept_all_{person_id}", type="primary"):
+                if cast_id:
+                    progress = batch_assign_person_group(
+                        ep_id=ep_id,
+                        person_id=person_id,
+                        cast_id=cast_id,
+                        cast_name=person_name,
+                        matches=matches,
+                    )
+                    st.success(f"Assigned {progress.succeeded}/{progress.total} to {person_name}")
+                    if progress.failed:
+                        st.warning(f"{progress.failed} failed: {', '.join(progress.errors[:3])}")
+                    actions_taken = progress.succeeded
+                else:
+                    st.error("No cast_id for this person")
 
-                # Manual assignment dropdown
-                cast_options = ["-- Select Cast --"] + [
-                    f"{c.get('name', 'Unknown')} ({c.get('cast_id', '')})"
-                    for c in cast_members
-                ]
-                selected = st.selectbox(
-                    "Assign to:",
-                    cast_options,
-                    key=f"assign_{unique_key}_{idx}",
-                    label_visibility="collapsed",
-                )
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("✅ Assign", key=f"btn_assign_{unique_key}_{idx}", use_container_width=True):
-                        if selected != "-- Select Cast --":
-                            # Extract cast name from selection for track-based assignment
-                            cast_name = selected.split(" (")[0]
-                            cast_id = selected.split("(")[-1].rstrip(")")
-                            if is_unclustered and show_slug:
-                                # For unclustered tracks, use track-based assignment
-                                result = assign_track_to_cast(ep_id, track_id, cast_name, show_slug)
-                            else:
-                                # For clustered singletons, use identity-based assignment
-                                result = assign_to_cast(ep_id, cluster_id, cast_id)
-                            if "error" not in result:
-                                st.success(f"Assigned to {cast_name}")
-                                action_taken = "assigned"
-                            else:
-                                st.error(f"Failed: {result.get('error')}")
-
-                with col_b:
-                    if st.button("🗑️ Noise", key=f"btn_noise_{unique_key}_{idx}", use_container_width=True):
-                        if is_unclustered:
-                            # For unclustered tracks, use track-based noise marking
-                            result = mark_track_as_noise(ep_id, track_id)
-                        else:
-                            result = mark_as_noise(ep_id, cluster_id)
-                        if "error" not in result:
-                            st.success("Marked as noise")
-                            action_taken = "deleted"
-                        else:
-                            st.error(f"Failed: {result.get('error')}")
-            else:
-                st.success(f"Assigned: {person_name}")
-
-                # View in Faces Review button (only for clustered items)
-                if not is_unclustered:
-                    if st.button(
-                        "👁️ View",
-                        key=f"btn_view_{unique_key}_{idx}",
-                        use_container_width=True,
-                    ):
-                        st.query_params["ep_id"] = ep_id
-                        st.query_params["view"] = "cluster"
-                        st.query_params["cluster"] = cluster_id
-                        st.switch_page("pages/3_Faces_Review.py")
+        with col2:
+            if st.button(f"Archive All", key=f"archive_all_{person_id}"):
+                progress = batch_archive_matches(ep_id=ep_id, matches=matches)
+                st.info(f"Archived {progress.succeeded}/{progress.total}")
+                actions_taken = progress.succeeded
 
         st.divider()
-        return action_taken
+
+        # Individual cards
+        for i, match in enumerate(matches):
+            card_key = f"{person_id}_{match.get('track_id', i)}_{group_index}"
+            action = render_singleton_card(
+                ep_id=ep_id,
+                match=match,
+                cast_id=cast_id or "",
+                cast_name=person_name,
+                card_key=card_key,
+            )
+            if action:
+                actions_taken += 1
+            if i < len(matches) - 1:
+                st.divider()
+
+    return actions_taken
+
+
+def render_unmatched_section(
+    ep_id: str,
+    unmatched: List[Dict[str, Any]],
+    cast_members: List[Dict[str, Any]],
+) -> int:
+    """Render the unmatched singletons section."""
+    if not unmatched:
+        return 0
+
+    actions_taken = 0
+
+    with st.expander(f"No Suggestions ({len(unmatched)} singletons)", expanded=False):
+        st.warning("These singletons had no good matches. You can manually assign or archive them.")
+
+        # Cast member dropdown for manual assignment
+        # Handle both dict format {"name": ..., "cast_id": ...} and string format (just cast_id)
+        cast_options = {}
+        for m in cast_members:
+            if isinstance(m, dict):
+                name = m.get("name", m.get("cast_id", "?"))
+                cast_id = m.get("cast_id")
+            else:
+                # m is a string (cast_id)
+                name = str(m)
+                cast_id = str(m)
+            cast_options[name] = cast_id
+
+        for i, item in enumerate(unmatched):
+            track_id = item.get("track_id")
+            identity_id = item.get("identity_id")
+            face_count = item.get("face_count", 0)
+            singleton_risk = item.get("singleton_risk", "MEDIUM")
+            thumbnail_url = item.get("thumbnail_url")
+            # Resolve S3 key to presigned URL
+            resolved_thumb = helpers.resolve_thumb(thumbnail_url) if thumbnail_url else None
+
+            cols = st.columns([0.5, 2, 2, 1])
+
+            with cols[0]:
+                if resolved_thumb:
+                    try:
+                        st.image(resolved_thumb, width=60)
+                    except Exception:
+                        st.text("No img")
+                else:
+                    st.text("No img")
+
+            with cols[1]:
+                st.markdown(f"**T{track_id}** ({face_count} faces)")
+                risk_badge = render_singleton_risk_badge(1, face_count)
+                st.markdown(f"Risk: {risk_badge}", unsafe_allow_html=True)
+
+            with cols[2]:
+                selected_name = st.selectbox(
+                    "Assign to:",
+                    options=["-- Select --"] + list(cast_options.keys()),
+                    key=f"manual_assign_{track_id}_{i}",
+                    label_visibility="collapsed",
+                )
+                if selected_name and selected_name != "-- Select --":
+                    if st.button("Assign", key=f"do_assign_{track_id}_{i}"):
+                        cast_id = cast_options[selected_name]
+                        success = assign_singleton_to_cast(
+                            ep_id=ep_id,
+                            identity_id=identity_id,
+                            track_id=track_id,
+                            cast_id=cast_id,
+                            cast_name=selected_name,
+                        )
+                        if success:
+                            st.success(f"Assigned T{track_id} to {selected_name}")
+                            actions_taken += 1
+
+            with cols[3]:
+                if st.button("Noise", key=f"noise_unmatched_{track_id}_{i}"):
+                    success = mark_singleton_as_noise(
+                        ep_id=ep_id,
+                        identity_id=identity_id,
+                        track_id=track_id,
+                        thumbnail_url=thumbnail_url,
+                    )
+                    if success:
+                        st.info(f"Archived T{track_id}")
+                        actions_taken += 1
+
+            if i < len(unmatched) - 1:
+                st.divider()
+
+    return actions_taken
+
+
+def render_archive_matches_section(
+    ep_id: str,
+    archive_matches: List[Dict[str, Any]],
+) -> int:
+    """Render singletons that match archived items."""
+    if not archive_matches:
+        return 0
+
+    actions_taken = 0
+
+    with st.expander(f"Similar to Archived ({len(archive_matches)} matches)", expanded=False):
+        st.info("These singletons are similar to previously archived items. Consider archiving them too.")
+
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("Archive All Similar", key="archive_all_similar"):
+                progress = batch_archive_matches(ep_id=ep_id, matches=archive_matches)
+                st.success(f"Archived {progress.succeeded}/{progress.total}")
+                actions_taken = progress.succeeded
+
+        for i, item in enumerate(archive_matches):
+            track_id = item.get("track_id")
+            identity_id = item.get("identity_id")
+            similarity = item.get("similarity", 0)
+            archived_name = item.get("archived_name", "noise")
+            thumbnail_url = item.get("thumbnail_url")
+            # Resolve S3 key to presigned URL
+            resolved_thumb = helpers.resolve_thumb(thumbnail_url) if thumbnail_url else None
+
+            cols = st.columns([0.5, 2, 1, 1])
+
+            with cols[0]:
+                if resolved_thumb:
+                    try:
+                        st.image(resolved_thumb, width=60)
+                    except Exception:
+                        st.text("No img")
+                else:
+                    st.text("No img")
+
+            with cols[1]:
+                st.markdown(f"**T{track_id}** - {similarity:.0%} similar to '{archived_name}'")
+
+            with cols[2]:
+                if st.button("Archive", key=f"archive_similar_{track_id}_{i}"):
+                    success = mark_singleton_as_noise(
+                        ep_id=ep_id,
+                        identity_id=identity_id,
+                        track_id=track_id,
+                        thumbnail_url=thumbnail_url,
+                    )
+                    if success:
+                        st.info(f"Archived T{track_id}")
+                        actions_taken += 1
+
+            with cols[3]:
+                if st.button("Keep", key=f"keep_similar_{track_id}_{i}"):
+                    st.info(f"Keeping T{track_id}")
+
+    return actions_taken
 
 
 # ============================================================================
@@ -516,361 +707,124 @@ def render_singleton_card(
 # ============================================================================
 
 # Episode selector
-ep_id = st.query_params.get("ep_id", "")
+sidebar_ep_id = None
+try:
+    sidebar_ep_id = helpers.render_sidebar_episode_selector()
+except Exception:
+    sidebar_ep_id = None
+
+ep_id = helpers.get_ep_id()
+if not ep_id and sidebar_ep_id:
+    helpers.set_ep_id(sidebar_ep_id, rerun=False)
+    ep_id = sidebar_ep_id
 if not ep_id:
-    # Show episode picker
-    episodes_resp = _api_get("/episodes")
-    episodes = episodes_resp.get("episodes", []) if "error" not in episodes_resp else []
-
-    if not episodes:
-        st.warning("No episodes found. Process an episode first.")
-        st.stop()
-
-    ep_options = [e.get("ep_id", "") for e in episodes if e.get("ep_id")]
-    ep_id = st.selectbox("Select Episode:", ep_options)
-    if ep_id:
-        st.query_params["ep_id"] = ep_id
-        st.rerun()
+    ep_id_from_query = helpers.get_ep_id_from_query_params()
+    if ep_id_from_query:
+        helpers.set_ep_id(ep_id_from_query, rerun=False)
+        ep_id = ep_id_from_query
+if not ep_id:
+    st.warning("Select an episode from the sidebar to continue.")
     st.stop()
 
-st.markdown(f"**Episode:** `{ep_id}`")
+show_id = get_show_id_from_ep(ep_id)
 
-# Load data
-with st.spinner("Loading singletons and suggestions..."):
-    data = load_singletons(ep_id)
-    cast_members = load_cast_members(ep_id)
-    suggestions_map = load_cast_suggestions(ep_id)
-
-if "error" in data:
-    st.error(f"Failed to load data: {data['error']}")
-    st.stop()
-
-singletons = data["clusters"]
-singleton_health = data["singleton_health"]
-total_clusters = data.get("total_clusters", 0)
-
-# Count how many singletons have suggestions
-singletons_with_suggestions = sum(
-    1 for s in singletons
-    if s.get("identity_id") in suggestions_map and not s.get("person_id")
-)
-
-# ============================================================================
-# Summary Header
-# ============================================================================
-
+# Controls
 st.markdown("---")
+col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
-# Count unclustered tracks
-unclustered_count = sum(1 for s in singletons if s.get("is_unclustered", False))
-clustered_count = len(singletons) - unclustered_count
-
-# Health metrics
-col1, col2, col3, col4, col5, col6 = st.columns(6)
 with col1:
-    st.metric(
-        "Total Items",
-        len(singletons),
-        help="Singleton clusters + unclustered tracks",
-    )
+    include_archive = st.checkbox("Include archive comparison", value=False, key="include_archive")
+
 with col2:
-    st.metric(
-        "Unclustered",
-        unclustered_count,
-        help="Tracks not yet assigned to any identity cluster",
-    )
+    min_sim = st.slider("Min similarity", 0.0, 1.0, 0.30, 0.05, key="min_sim")
+
 with col3:
-    singleton_frac = singleton_health.get("singleton_fraction", 0)
-    st.metric(
-        "Singleton %",
-        f"{singleton_frac * 100:.1f}%",
-        help="Percentage of all clusters that are singletons",
-    )
-with col4:
-    high_risk = singleton_health.get("high_risk_count", 0)
-    st.metric(
-        "High Risk",
-        high_risk,
-        help="Single-track, single-frame clusters (unreliable)",
-    )
-with col5:
-    single_frame = singleton_health.get("single_frame_tracks", 0)
-    st.metric(
-        "Single-Frame",
-        single_frame,
-        help="Tracks with only 1 frame",
-    )
-with col6:
-    st.metric(
-        "With Suggestions",
-        singletons_with_suggestions,
-        help="Unassigned singletons with cast suggestions",
-    )
-
-# Health status
-health_status = singleton_health.get("health_status", "unknown")
-if health_status == "critical":
-    st.error(
-        f"⚠️ High singleton fraction ({singleton_frac * 100:.0f}%) - "
-        "Consider re-running clustering with looser thresholds or reviewing detections."
-    )
-elif health_status == "warning":
-    st.warning(
-        f"⚠️ Moderate singleton fraction ({singleton_frac * 100:.0f}%) - "
-        "Some singletons may be valid brief appearances."
-    )
-
-st.markdown("---")
-
-# ============================================================================
-# Filters
-# ============================================================================
-
-st.subheader("Filters")
-
-filter_cols = st.columns([1, 1, 1, 1, 1, 1])
-
-with filter_cols[0]:
-    filter_type = st.selectbox(
-        "Type:",
-        ["All", "Clustered Only", "Unclustered Only"],
-        key="filter_type",
-        help="Clustered = existing singleton identities, Unclustered = tracks with no identity",
-    )
-
-with filter_cols[1]:
-    filter_assigned = st.selectbox(
-        "Assignment Status:",
-        ["All", "Unassigned Only", "Assigned Only"],
-        key="filter_assigned",
-    )
-
-with filter_cols[2]:
-    filter_risk = st.selectbox(
-        "Risk Level:",
-        ["All", "HIGH", "MEDIUM", "LOW"],
-        key="filter_risk",
-    )
-
-with filter_cols[3]:
-    filter_suggestions = st.selectbox(
-        "Suggestions:",
-        ["All", "Has Suggestion", "No Suggestion"],
-        key="filter_suggestions",
-    )
-
-with filter_cols[4]:
-    sort_by = st.selectbox(
-        "Sort By:",
-        ["Suggestion Confidence", "Risk (High First)", "Faces (Most First)", "Track ID"],
-        key="sort_by",
-    )
-
-with filter_cols[5]:
-    page_size = st.selectbox(
-        "Per Page:",
-        [10, 25, 50, 100],
-        index=1,
-        key="page_size",
-    )
-
-# Apply filters
-filtered = singletons
-
-# Type filter (clustered vs unclustered)
-if filter_type == "Clustered Only":
-    filtered = [s for s in filtered if not s.get("is_unclustered", False)]
-elif filter_type == "Unclustered Only":
-    filtered = [s for s in filtered if s.get("is_unclustered", False)]
-
-if filter_assigned == "Unassigned Only":
-    filtered = [s for s in filtered if not s.get("person_id")]
-elif filter_assigned == "Assigned Only":
-    filtered = [s for s in filtered if s.get("person_id")]
-
-if filter_risk != "All":
-    filtered = [s for s in filtered if s.get("singleton_risk") == filter_risk]
-
-if filter_suggestions == "Has Suggestion":
-    filtered = [s for s in filtered if s.get("identity_id") in suggestions_map]
-elif filter_suggestions == "No Suggestion":
-    filtered = [s for s in filtered if s.get("identity_id") not in suggestions_map]
-
-# Helper to get suggestion confidence for sorting
-def get_suggestion_confidence(s):
-    cluster_id = s.get("identity_id", "")
-    suggestions = suggestions_map.get(cluster_id, [])
-    if not suggestions:
-        return (3, 0)  # No suggestion = lowest priority
-    top = suggestions[0]
-    conf = top.get("confidence", "low")
-    sim = top.get("similarity", 0)
-    conf_order = {"high": 0, "medium": 1, "low": 2}
-    return (conf_order.get(conf, 3), -sim)  # Sort by confidence, then by similarity descending
-
-# Helper to get sort key by track ID
-def get_track_id_key(s):
-    # For unclustered tracks, use track_id; for clustered, get first track from track_ids
-    if s.get("is_unclustered"):
-        return s.get("track_id", 0)
-    track_ids = s.get("track_ids", [])
-    return track_ids[0] if track_ids else 0
-
-# Apply sorting
-if sort_by == "Suggestion Confidence":
-    filtered = sorted(filtered, key=get_suggestion_confidence)
-elif sort_by == "Risk (High First)":
-    risk_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    filtered = sorted(filtered, key=lambda s: risk_order.get(s.get("singleton_risk", "LOW"), 3))
-elif sort_by == "Faces (Most First)":
-    filtered = sorted(filtered, key=lambda s: s.get("counts", {}).get("faces", 0), reverse=True)
-else:
-    filtered = sorted(filtered, key=get_track_id_key)
-
-st.markdown(f"**Showing {len(filtered)} of {len(singletons)} items**")
-
-# ============================================================================
-# Pagination
-# ============================================================================
-
-total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
-current_page = st.session_state.get("singletons_page", 1)
-current_page = min(current_page, total_pages)
-
-if total_pages > 1:
-    page_cols = st.columns([1, 3, 1])
-    with page_cols[0]:
-        if st.button("⬅️ Prev", disabled=current_page <= 1):
-            st.session_state["singletons_page"] = current_page - 1
-            st.rerun()
-    with page_cols[1]:
-        st.markdown(f"<center>Page {current_page} of {total_pages}</center>", unsafe_allow_html=True)
-    with page_cols[2]:
-        if st.button("Next ➡️", disabled=current_page >= total_pages):
-            st.session_state["singletons_page"] = current_page + 1
-            st.rerun()
-
-# ============================================================================
-# Singleton Cards
-# ============================================================================
-
-start_idx = (current_page - 1) * page_size
-end_idx = min(start_idx + page_size, len(filtered))
-page_singletons = filtered[start_idx:end_idx]
-
-if not page_singletons:
-    if filtered:
-        st.info("No singletons on this page.")
-    else:
-        st.success("🎉 No singletons matching the filters! All clusters have been processed.")
-else:
-    actions_taken = []
-    for idx, singleton in enumerate(page_singletons):
-        cluster_id = singleton.get("identity_id", "")
-        # Get suggestions for this singleton
-        cluster_suggestions = suggestions_map.get(cluster_id, [])
-        action = render_singleton_card(ep_id, singleton, cast_members, cluster_suggestions, idx)
-        if action:
-            actions_taken.append(action)
-
-    # If actions were taken, clear cache and rerun
-    if actions_taken:
-        load_singletons.clear()
-        load_cast_suggestions.clear()
-        time.sleep(0.5)  # Brief delay for API to process
+    if st.button("Generate Analysis", type="primary"):
+        # Force refresh - clear cache and rerun
+        st.session_state.pop(_analysis_key(ep_id), None)
+        st.session_state.pop(_analysis_timestamp_key(ep_id), None)
+        st.toast("Regenerating analysis...", icon="🔄")
         st.rerun()
 
-# ============================================================================
-# Bulk Actions
-# ============================================================================
+with col4:
+    if st.button("Refresh"):
+        # Force refresh - clear cache and rerun
+        st.session_state.pop(_analysis_key(ep_id), None)
+        st.session_state.pop(_analysis_timestamp_key(ep_id), None)
+        st.toast("Refreshing...", icon="🔄")
+        st.rerun()
 
-st.markdown("---")
-st.subheader("Bulk Actions")
-
-bulk_cols = st.columns([2, 2, 2])
-
-with bulk_cols[0]:
-    high_risk_unassigned = [
-        s for s in singletons
-        if not s.get("person_id") and s.get("singleton_risk") == "HIGH" and not s.get("is_unclustered")
-    ]
-    high_risk_count = len(high_risk_unassigned)
-
-    # Two-step confirmation for bulk dismissal
-    confirm_key = f"{ep_id}::bulk_dismiss_confirm"
-    if st.session_state.get(confirm_key, False):
-        st.warning(
-            f"⚠️ **Confirm:** This will mark {high_risk_count} HIGH-risk singletons as noise. "
-            "They will be hidden from suggestions but NOT deleted from identities.json."
-        )
-        col_yes, col_no = st.columns(2)
-        with col_yes:
-            if st.button("✓ Yes, Mark as Noise", key="confirm_bulk_yes", type="primary"):
-                dismissed = 0
-                for s in high_risk_unassigned:
-                    identity_id = s.get("identity_id", "")
-                    if identity_id:
-                        result = mark_as_noise(ep_id, identity_id)
-                        if "error" not in result:
-                            dismissed += 1
-                st.success(f"Marked {dismissed} singletons as noise (hidden from view)")
-                st.session_state[confirm_key] = False
-                load_singletons.clear()
-                st.rerun()
-        with col_no:
-            if st.button("✗ Cancel", key="confirm_bulk_no"):
-                st.session_state[confirm_key] = False
-                st.rerun()
-    else:
-        if st.button(
-            f"🚫 Mark HIGH Risk as Noise ({high_risk_count})",
-            disabled=high_risk_count == 0,
-            use_container_width=True,
-            help="Mark unassigned HIGH-risk singletons as noise (hidden but not deleted)"
-        ):
-            st.session_state[confirm_key] = True
-            st.rerun()
-
-with bulk_cols[1]:
-    # Restore hidden singletons
-    try:
-        dismissed_resp = api_get(f"/episodes/{ep_id}/dismissed_suggestions")
-        dismissed_ids = set(dismissed_resp.get("dismissed_ids", [])) if dismissed_resp else set()
-    except Exception:
-        dismissed_ids = set()
-
-    hidden_count = len(dismissed_ids)
-    if hidden_count > 0:
-        if st.button(f"👁️ Restore Hidden ({hidden_count})", use_container_width=True, help="Restore hidden clusters"):
-            try:
-                session = _api_session()
-                resp = session.delete(f"{API_BASE}/episodes/{ep_id}/dismissed_suggestions", timeout=30)
-                if resp.status_code == 200:
-                    st.success(f"Restored {hidden_count} hidden cluster(s)")
-                    load_singletons.clear()
-                    st.rerun()
-                else:
-                    st.error("Failed to restore hidden clusters")
-            except Exception as e:
-                st.error(f"Error: {e}")
-    else:
-        if st.button("🔄 Refresh Data", use_container_width=True):
-            load_singletons.clear()
-            load_cast_members.clear()
-            st.rerun()
-
-with bulk_cols[2]:
-    if st.button("👈 Back to Faces Review", use_container_width=True):
-        st.query_params["ep_id"] = ep_id
-        st.switch_page("pages/3_Faces_Review.py")
-
-# ============================================================================
-# Footer
-# ============================================================================
-
-st.markdown("---")
-st.caption(
-    "**Tip:** Review singletons AFTER completing the main Faces Review workflow. "
-    "HIGH-risk singletons (single-frame, single-track) are often noise, while "
-    "MEDIUM/LOW-risk singletons may be valid brief appearances of cast members."
+# Load analysis
+analysis = load_singleton_analysis(
+    ep_id=ep_id,
+    include_archive=include_archive,
+    min_similarity=min_sim,
 )
+
+if not analysis:
+    st.info("Click 'Generate Analysis' to analyze singletons.")
+    st.stop()
+
+# Stats summary
+stats = analysis.get("stats", {})
+person_groups = analysis.get("person_groups", [])
+archive_matches = analysis.get("archive_matches", [])
+unmatched = analysis.get("unmatched", [])
+
+total_singletons = stats.get("total_singletons", 0)
+with_suggestions = stats.get("with_suggestions", 0)
+unmatched_count = stats.get("unmatched_count", 0)
+persons_with_matches = stats.get("persons_with_matches", 0)
+
+# Show last generated timestamp
+ts_key = _analysis_timestamp_key(ep_id)
+last_generated = st.session_state.get(ts_key, "")
+
+st.markdown("---")
+summary_text = f"**Summary**: {total_singletons} singletons | {with_suggestions} with suggestions | {unmatched_count} unmatched | {persons_with_matches} person groups"
+if last_generated:
+    summary_text += f" | *Generated at {last_generated}*"
+st.markdown(summary_text)
+
+if total_singletons == 0:
+    st.success("No unassigned singletons found. Great job!")
+    st.stop()
+
+# Load cast members for manual assignment
+cast_members = load_cast_members(show_id) if show_id else []
+
+# Track total actions for refresh
+total_actions = 0
+
+# Render person groups
+st.markdown("### Suggested Assignments")
+if person_groups:
+    for i, group in enumerate(person_groups):
+        actions = render_person_group(
+            ep_id=ep_id,
+            group=group,
+            group_index=i,
+            show_id=show_id or "",
+        )
+        total_actions += actions
+else:
+    st.info("No person groups with suggestions.")
+
+# Render archive matches
+if archive_matches:
+    st.markdown("### Archive Matches")
+    actions = render_archive_matches_section(ep_id=ep_id, archive_matches=archive_matches)
+    total_actions += actions
+
+# Render unmatched
+st.markdown("### Unmatched Singletons")
+actions = render_unmatched_section(
+    ep_id=ep_id,
+    unmatched=unmatched,
+    cast_members=cast_members,
+)
+total_actions += actions
+
+# Auto-refresh if actions were taken
+if total_actions > 0:
+    st.info(f"Completed {total_actions} action(s). Click 'Refresh' to update the list.")

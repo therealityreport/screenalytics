@@ -4275,6 +4275,7 @@ with col_cluster:
             "strategy": "auto",
             "protect_manual": True,
             "facebank_first": True,
+            "skip_cast_assignment": False,  # Auto-assign clusters to cast members
         }
         try:
             resp = helpers.api_post(f"/episodes/{ep_id}/clusters/group", json=payload, timeout=300)

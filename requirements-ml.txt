@@ -5,7 +5,10 @@ torch==2.3.1
 torchvision==0.18.1
 ultralytics>=8.2.70
 scikit-learn==1.5.1
-pyannote.audio==3.1.1
+# DEPRECATED: pyannote.audio - being replaced by NeMo MSDD
+# pyannote.audio==3.1.1  # Remove after NeMo migration complete
+# NeMo MSDD speaker diarization (requires CUDA for optimal performance)
+nemo_toolkit[asr]>=2.0.0
 faster-whisper==1.0.1
 ffmpeg-python==0.2.0
 opencv-python-headless==4.10.0.84
@@ -16,6 +19,7 @@ pgvector==0.2.5
 pyyaml==6.0.1
 tomlkit==0.13.2
 insightface>=0.7.3  # run python scripts/fetch_models.py after installing
+face-alignment>=1.4.0  # FAN 68-point landmark detection for FEATURES/face-alignment
 onnxruntime>=1.17.0
 # Optional CUDA acceleration for ONNX Runtime:
 # onnxruntime-gpu==1.17.*

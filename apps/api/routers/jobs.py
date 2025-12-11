@@ -1374,6 +1374,51 @@ async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -
     }
 
 
+class VideoExportRequest(BaseModel):
+    """Request model for video export job."""
+
+    ep_id: str = Field(..., description="Episode identifier")
+    include_unidentified: bool = Field(
+        True,
+        description="Include faces without cast assignment (shown in gray)",
+    )
+    output_fps: float | None = Field(
+        None,
+        ge=1,
+        le=30,
+        description="Output FPS (default: 15fps for smaller file)",
+    )
+
+
+@router.post("/video_export")
+async def export_video_with_overlays(req: VideoExportRequest, request: Request) -> dict:
+    """Export full episode video with face overlay annotations.
+
+    Creates a video with bounding boxes and name labels for all detected
+    and identified faces. The video is uploaded to S3 when complete.
+
+    This is a long-running job - poll the job progress endpoint to track status.
+    """
+    await _reject_legacy_payload(request)
+    try:
+        job = JOB_SERVICE.start_video_export_job(
+            ep_id=req.ep_id,
+            include_unidentified=req.include_unidentified,
+            output_fps=req.output_fps,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "job_id": job["job_id"],
+        "ep_id": req.ep_id,
+        "state": job["state"],
+        "started_at": job["started_at"],
+        "progress_file": job.get("progress_file"),
+        "requested": job.get("requested"),
+    }
+
+
 @router.get("")
 def list_jobs(ep_id: str | None = None, job_type: str | None = None, limit: int = 50) -> dict:
     """List all jobs, optionally filtered by episode and/or job type."""

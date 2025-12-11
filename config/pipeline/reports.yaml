@@ -1,0 +1,49 @@
+# Episode Report Configuration (v3)
+# These settings control the behavior of episode report generation and snapshot management.
+
+# -------------------------------------------------------------------
+# Snapshot Retention
+# -------------------------------------------------------------------
+# Maximum number of snapshots to keep per episode (excluding pinned)
+snapshot_retention_count: 10
+
+# -------------------------------------------------------------------
+# Singleton Analysis
+# -------------------------------------------------------------------
+# Duration threshold (seconds) below which a singleton is considered "short"
+# Short singletons are labeled as "short track" rather than "possible miss"
+singleton_short_duration_sec: 2.0
+
+# -------------------------------------------------------------------
+# Run Comparison
+# -------------------------------------------------------------------
+# Percentage threshold for highlighting significant metric changes
+# Metrics with |delta| > this threshold will be highlighted in reports
+delta_highlight_threshold_pct: 10.0
+
+# -------------------------------------------------------------------
+# Per-Cast Health
+# -------------------------------------------------------------------
+# Visual time threshold (seconds) below which a cast member is labeled "LOW"
+# This indicates insufficient screen time data for reliable metrics
+cast_low_visual_threshold_sec: 10.0
+
+# -------------------------------------------------------------------
+# Track Sampling
+# -------------------------------------------------------------------
+# Number of sample tracks to select (one from each time segment)
+# The episode is divided into this many equal time windows
+track_sample_count: 3
+
+# -------------------------------------------------------------------
+# Experiment Tag
+# -------------------------------------------------------------------
+# Default experiment tag if none is provided via API or environment
+# Leave empty string "" for no default tag
+default_experiment_tag: ""
+
+# -------------------------------------------------------------------
+# Co-Presence Analysis (v3.1)
+# -------------------------------------------------------------------
+# Number of top cast pairs to include in co-presence summary
+co_presence_top_pairs: 10

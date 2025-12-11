@@ -83,10 +83,25 @@ def _get_video_meta(ep_id: str) -> Dict[str, Any] | None:
 
 ASYNC_JOBS_KEY = "async_jobs"
 ADD_SHOW_OPTION = "+ Add new show..."
+# U11 fix: Auto-cleanup completed jobs after this many seconds
+COMPLETED_JOB_TTL_SECONDS = 300  # 5 minutes
 
 
 def _job_state() -> Dict[str, Dict[str, Any]]:
     return st.session_state.setdefault(ASYNC_JOBS_KEY, {})
+
+
+def _cleanup_stale_jobs() -> None:
+    """U11 fix: Remove completed jobs older than TTL to prevent unbounded state growth."""
+    jobs = _job_state()
+    current_time = time.time()
+    stale_job_ids = []
+    for job_id, meta in jobs.items():
+        completed_at = meta.get("_completed_at")
+        if completed_at and (current_time - completed_at) > COMPLETED_JOB_TTL_SECONDS:
+            stale_job_ids.append(job_id)
+    for job_id in stale_job_ids:
+        jobs.pop(job_id, None)
 
 
 def _register_async_job(
@@ -117,6 +132,8 @@ def _register_async_job(
 
 
 def _render_job_sections() -> bool:
+    # U11 fix: Clean up stale completed jobs before rendering
+    _cleanup_stale_jobs()
     jobs = _job_state()
     if not jobs:
         return False
@@ -182,6 +199,11 @@ def _render_single_job(job_id: str, meta: Dict[str, Any], jobs: Dict[str, Dict[s
 
     summary = detail.get("summary") if detail else None
     error_msg = detail.get("error") if detail else None
+
+    # U11 fix: Mark job completion time for auto-cleanup (only set once)
+    if "_completed_at" not in meta:
+        meta["_completed_at"] = time.time()
+
     if state == "succeeded":
         counts = []
         if summary:
@@ -329,6 +351,10 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
     file_size = file_obj.tell()
     file_obj.seek(0)  # Reset to beginning
 
+    # U12 fix: Guard against division by zero if file is empty
+    if file_size == 0:
+        raise ValueError("Cannot upload empty file (0 bytes)")
+
     # Create progress bar and status
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -366,7 +392,10 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
             Key=key,
             ContentType=content_type,
         )
-        upload_id = multipart["UploadId"]
+        # U5 fix: Validate multipart response contains UploadId
+        upload_id = multipart.get("UploadId")
+        if not upload_id:
+            raise Exception("S3 multipart upload failed: Server response missing 'UploadId'")
 
         parts = []
         part_number = 1
@@ -386,9 +415,13 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
                     Body=chunk,
                 )
 
+                # U5 fix: Validate part response contains ETag
+                etag = part.get("ETag")
+                if not etag:
+                    raise Exception(f"S3 part upload failed: Server response missing 'ETag' for part {part_number}")
                 parts.append({
                     "PartNumber": part_number,
-                    "ETag": part["ETag"],
+                    "ETag": etag,
                 })
 
                 # Update progress in main thread (where Streamlit context is available)
@@ -409,12 +442,20 @@ def _upload_file(bucket: str, key: str, file_obj, content_type: str = "video/mp4
                 MultipartUpload={"Parts": parts},
             )
         except Exception as e:
-            # Abort the multipart upload on error
-            s3_client.abort_multipart_upload(
-                Bucket=bucket,
-                Key=key,
-                UploadId=upload_id,
-            )
+            # U2 fix: Wrap abort in try/except to prevent orphaned uploads and log failures
+            try:
+                s3_client.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                )
+            except Exception as abort_exc:
+                # Log abort failure but don't mask the original error
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to abort multipart upload %s: %s. Upload may be orphaned in S3.",
+                    upload_id, abort_exc
+                )
             raise
     else:
         # For small files, use simple put_object
@@ -466,6 +507,10 @@ def _upload_presigned(
     file_obj.seek(0, 2)  # Seek to end
     file_size = file_obj.tell()
     file_obj.seek(0)  # Reset to beginning
+
+    # U12 fix: Guard against division by zero if file is empty
+    if file_size == 0:
+        raise ValueError("Cannot upload empty file (0 bytes)")
 
     # Create progress bar and status
     progress_bar = st.progress(0)
@@ -723,7 +768,11 @@ if submit:
         st.error(f"Episode create failed: {helpers.describe_error(endpoint, exc)}")
         st.stop()
 
-    ep_id = create_resp["ep_id"]
+    # U6 fix: Validate response contains ep_id before using
+    ep_id = create_resp.get("ep_id")
+    if not ep_id:
+        st.error("Episode creation failed: Server response missing 'ep_id' field.")
+        st.stop()
     st.info(f"Episode `{ep_id}` created. Requesting upload target...")
 
     presign_path = f"/episodes/{ep_id}/assets"
@@ -740,6 +789,11 @@ if submit:
     upload_headers = presign_resp.get("headers", {})
     bucket = presign_resp.get("bucket")
     key = presign_resp.get("key") or presign_resp.get("object_key")
+
+    # U7 fix: Warn if PUT method requested but bucket/key missing
+    if upload_method == "PUT" and (not bucket or not key):
+        st.warning("S3 upload requested but bucket/key missing in response. Falling back to local-only.")
+        upload_method = "FILE"  # Force local fallback
 
     if upload_method == "PUT" and bucket and key:
         # Try boto3 multipart upload first (more reliable on macOS with OpenSSL 3.x)
@@ -772,13 +826,17 @@ if submit:
         uploaded_file.seek(0)
     elif upload_method == "FILE":
         # Local-only mode - skip remote upload entirely
-        st.info(f"Writing to local storage: {presign_resp['local_video_path']}")
+        # U4 fix: Use .get() with fallback to prevent KeyError
+        local_video_path = presign_resp.get("local_video_path") or str(get_path(ep_id, "video"))
+        st.info(f"Writing to local storage: {local_video_path}")
     else:
         # Unexpected method - warn but continue with local mirror
         st.warning(f"Unknown upload method '{upload_method}', falling back to local-only")
 
+    # U4 fix: Use .get() with fallback to default video path
+    local_video_path = presign_resp.get("local_video_path") or str(get_path(ep_id, "video"))
     try:
-        _mirror_local(ep_id, uploaded_file, presign_resp["local_video_path"])
+        _mirror_local(ep_id, uploaded_file, local_video_path)
     except OSError as exc:
         st.error(f"Failed to write local copy: {exc}")
         if upload_method == "PUT":

@@ -38,10 +38,12 @@ from apps.api.services.storage import (
     artifact_prefixes,
     episode_context_from_id,
 )
+from apps.api.services.facebank import FacebankService
 
 LOGGER = logging.getLogger(__name__)
 STORAGE = StorageService()
 PEOPLE_SERVICE = PeopleService()
+FACEBANK_SERVICE = FacebankService()
 
 # Thresholds for suggestion generation
 # Note: cluster_thresh in config/pipeline/clustering.yaml is 0.58
@@ -1032,10 +1034,9 @@ class FaceReviewService:
 
             # Skip heavy stats update for quick operations - cluster count unchanged
             identities_path = write_identities(ep_id, identities_data)
-            # Use async S3 upload for faster response
-            sync_manifests(ep_id, identities_path, async_upload=True)
 
-            # Update the person's cluster_ids list
+            # Update the person's cluster_ids list BEFORE syncing to S3
+            # This avoids a race condition where async upload could overwrite rollback data
             if show_id and person_id:
                 try:
                     qualified_cluster_id = f"{ep_id}:{cluster_id}"
@@ -1054,7 +1055,18 @@ class FaceReviewService:
                         "details": {"error": f"Failed to update person record: {e}"},
                     }
 
+            # Now sync to S3 - safe to use async since person update succeeded (or wasn't needed)
+            sync_manifests(ep_id, identities_path, async_upload=True)
+
             LOGGER.info(f"[{ep_id}] Assigned cluster {cluster_id} to person {person_id}")
+
+            # Auto-seed facebank with cluster centroid for future matching
+            if cast_id and show_id:
+                try:
+                    self._auto_seed_facebank(ep_id, cluster_id, cast_id, show_id, cluster)
+                except Exception as seed_err:
+                    # Don't fail the assignment if seeding fails - just log
+                    LOGGER.warning(f"[{ep_id}] Auto-seed facebank failed for cluster {cluster_id}: {seed_err}")
 
             return {
                 "status": "success",
@@ -1072,6 +1084,81 @@ class FaceReviewService:
                 "action": "assign_failed",
                 "details": {"error": str(e)},
             }
+
+    def _auto_seed_facebank(
+        self,
+        ep_id: str,
+        cluster_id: str,
+        cast_id: str,
+        show_id: str,
+        cluster: Dict[str, Any],
+    ) -> None:
+        """Auto-seed facebank with cluster centroid when assigned to cast.
+
+        This enables future clustering/matching to recognize this cast member
+        based on the assigned cluster's representative face.
+
+        Args:
+            ep_id: Episode ID
+            cluster_id: Cluster being assigned
+            cast_id: Cast member ID receiving the assignment
+            show_id: Show ID
+            cluster: Cluster identity data dict
+        """
+        # Load centroid embedding for this cluster
+        try:
+            centroids = load_cluster_centroids(ep_id)
+        except FileNotFoundError:
+            LOGGER.warning(f"[{ep_id}] No centroids file, skipping auto-seed for {cluster_id}")
+            return
+
+        centroid_data = centroids.get(cluster_id)
+        if not centroid_data:
+            LOGGER.warning(f"[{ep_id}] No centroid for cluster {cluster_id}, skipping auto-seed")
+            return
+
+        centroid_embedding = centroid_data.get("centroid")
+        if not centroid_embedding:
+            LOGGER.warning(f"[{ep_id}] Empty centroid for cluster {cluster_id}, skipping auto-seed")
+            return
+
+        embedding = np.array(centroid_embedding, dtype=np.float32)
+
+        # Get representative crop URL for this cluster
+        try:
+            track_reps = load_track_reps(ep_id)
+        except FileNotFoundError:
+            track_reps = {}
+
+        crop_url = self._get_representative_crop_url(ep_id, cluster_id, track_reps, centroids)
+
+        # Build quality info from cluster data
+        quality = {
+            "source": "cluster_centroid",
+            "episode_id": ep_id,
+            "cluster_id": cluster_id,
+            "track_count": len(cluster.get("track_ids", [])),
+            "cluster_size": cluster.get("size", 0),
+        }
+
+        # Generate seed ID that encodes the source
+        seed_id = f"auto_{ep_id}_{cluster_id}"
+
+        # Add the seed to facebank
+        FACEBANK_SERVICE.add_seed(
+            show_id=show_id,
+            cast_id=cast_id,
+            image_path=crop_url or "",  # display URI
+            embedding=embedding,
+            quality=quality,
+            seed_id=seed_id,
+            display_uri=crop_url,
+        )
+
+        LOGGER.info(
+            f"[{ep_id}] Auto-seeded facebank for cast {cast_id} from cluster {cluster_id} "
+            f"({len(cluster.get('track_ids', []))} tracks)"
+        )
 
 
 # Singleton instance

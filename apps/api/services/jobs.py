@@ -848,6 +848,77 @@ class JobService:
             requested=requested,
         )
 
+    def start_video_export_job(
+        self,
+        *,
+        ep_id: str,
+        include_unidentified: bool = True,
+        output_fps: float | None = None,
+    ) -> JobRecord:
+        """Start a video export job with face overlays.
+
+        Creates a full video of the episode with bounding boxes and name labels
+        drawn on each frame. The video is uploaded to S3 when complete.
+
+        Args:
+            ep_id: Episode identifier
+            include_unidentified: Include faces without cast assignment (gray boxes)
+            output_fps: Output FPS (default: 15fps for smaller file)
+
+        Returns:
+            JobRecord with job metadata
+
+        Raises:
+            FileNotFoundError: If required artifacts are missing
+        """
+        # Validate that required artifacts exist
+        video_path = get_path(ep_id, "video")
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found for {ep_id}")
+
+        faces_path = get_path(ep_id, "detections").parent / "faces.jsonl"
+        if not faces_path.exists():
+            raise FileNotFoundError(f"faces.jsonl not found for {ep_id}")
+
+        # Build output path and S3 key
+        output_filename = f"{ep_id}_overlay.mp4"
+        temp_output = self.data_root / "analytics" / ep_id / output_filename
+        temp_output.parent.mkdir(parents=True, exist_ok=True)
+        s3_key = f"artifacts/{ep_id}/exports/{output_filename}"
+
+        # Build command
+        progress_path = self._progress_path(ep_id)
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "export_overlay_video.py"),
+            "--ep-id", ep_id,
+            "--output", str(temp_output),
+            "--progress-file", str(progress_path),
+            "--upload-s3",
+            "--s3-key", s3_key,
+        ]
+
+        requested: Dict[str, Any] = {
+            "include_unidentified": include_unidentified,
+            "s3_key": s3_key,
+        }
+
+        if not include_unidentified:
+            command += ["--include-unidentified", "false"]
+            requested["include_unidentified"] = False
+
+        if output_fps is not None:
+            command += ["--output-fps", str(output_fps)]
+            requested["output_fps"] = output_fps
+
+        return self._launch_job(
+            job_type="video_export",
+            ep_id=ep_id,
+            command=command,
+            progress_path=progress_path,
+            requested=requested,
+        )
+
     def start_episode_run_job(
         self,
         *,
@@ -1048,7 +1119,11 @@ class JobService:
 
     def get_progress(self, job_id: str) -> Optional[Dict[str, Any]]:
         record = self._read_job(job_id)
-        return self._read_progress(Path(record["progress_file"]))
+        # J7 fix: Check progress_file exists before creating Path
+        progress_file = record.get("progress_file")
+        if not progress_file:
+            return None
+        return self._read_progress(Path(progress_file))
 
     def cancel(self, job_id: str) -> JobRecord:
         def _apply(record: JobRecord) -> None:

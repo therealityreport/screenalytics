@@ -1,9 +1,11 @@
 """Utilities for constructing and maintaining speaker group manifests.
 
 Speaker groups are the primary abstraction for diarization results. They
-aggregate diarization segments by source (pyannote, gpt4o, etc.) and provide
-stable identifiers that downstream clustering, UI, and editing features can
-reference.
+aggregate diarization segments by source (nemo, etc.) and provide stable
+identifiers that downstream clustering, UI, and editing features can reference.
+
+Migration note: As of NeMo MSDD migration, the primary source is "nemo".
+Legacy sources (pyannote, gpt4o) are still supported for backward compatibility.
 """
 
 from __future__ import annotations
@@ -16,7 +18,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from .diarization_pyannote import extract_speaker_embeddings
+# Use NeMo for speaker embeddings
+from .diarization_nemo import extract_speaker_embeddings
 from .models import (
     AudioSpeakerGroupsManifest,
     DiarizationSegment,
@@ -31,6 +34,9 @@ LOGGER = logging.getLogger(__name__)
 
 def _source_prefix(source: str) -> str:
     """Return a deterministic prefix for segment IDs for a diarization source."""
+    if source.lower().startswith("nemo"):
+        return "nemo"
+    # Legacy source prefixes for backward compatibility
     if source.lower().startswith("py"):
         return "py"
     if source.lower().startswith("gpt4"):

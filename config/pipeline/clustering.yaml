@@ -2,16 +2,18 @@
 # Controls how face tracks are grouped into identities
 
 # Agglomerative clustering settings
-cluster_thresh: 0.58  # Cosine similarity threshold (0.0-1.0, higher = stricter)
+cluster_thresh: 0.52  # Cosine similarity threshold (0.0-1.0, higher = stricter)
                       # Balanced: 0.58, Loose: 0.50, Strict: 0.70
                       # Converted to distance: dist = 1 - similarity
+                      # TUNED: 0.58 -> 0.52 to reduce singleton fraction
 
 min_cluster_size: 1   # Minimum tracks per cluster (1 = allow singletons)
                       # Set higher to filter out brief appearances
 
 # Outlier filtering
-min_identity_sim: 0.50  # Minimum similarity to cluster centroid
+min_identity_sim: 0.45  # Minimum similarity to cluster centroid
                         # Tracks below this are ejected as outliers
+                        # TUNED: 0.50 -> 0.45 to be less aggressive
 
 # Track prototype selection
 # (How to aggregate multiple face embeddings per track)
@@ -30,12 +32,17 @@ metrics_thresholds:
 # Second-stage singleton merge (optional) for high-singleton runs
 singleton_merge:
   enabled: true
-  trigger_singleton_frac: 0.60       # Only run merge if >= this singleton fraction
-  similarity_thresh: 0.62            # Looser cosine similarity threshold for merging singletons
-  fallback_delta: 0.05               # If similarity_thresh missing, use primary - delta
-  neighbor_top_k: 20                 # Candidate neighbors per singleton (top-K by similarity)
+  trigger_singleton_frac: 0.40       # Only run merge if >= this singleton fraction
+                                     # TUNED: 0.60 -> 0.40 to trigger merge more often
+  similarity_thresh: 0.55            # Looser cosine similarity threshold for merging singletons
+                                     # TUNED: 0.62 -> 0.55 to merge more aggressively
+  fallback_delta: 0.08               # If similarity_thresh missing, use primary - delta
+                                     # TUNED: 0.05 -> 0.08 for bigger fallback gap
+  neighbor_top_k: 30                 # Candidate neighbors per singleton (top-K by similarity)
+                                     # TUNED: 20 -> 30 to consider more candidates
   min_tracks_per_merged_cluster: 2   # Require at least this many tracks in a merged cluster
-  max_singleton_merge_iters: 1       # Avoid unbounded reclustering loops
+  max_singleton_merge_iters: 2       # Avoid unbounded reclustering loops
+                                     # TUNED: 1 -> 2 to allow second merge pass
 
 # Description
 description: "Balanced clustering settings for TV show episodes"
