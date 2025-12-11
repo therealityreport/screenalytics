@@ -89,6 +89,13 @@ class EpisodeMetrics:
     alignment_quality_p05: Optional[float] = None
     alignment_quality_p95: Optional[float] = None
 
+    # Gating metrics (populated when gating is evaluated)
+    gating_enabled: bool = False
+    gating_threshold: float = 0.0
+    num_embeddings_generated: int = 0
+    gated_face_count: int = 0
+    gating_rate: float = 0.0  # Percentage of faces gated (0.0-1.0)
+
     def to_dict(self) -> dict:
         return {
             "episode_id": self.episode_id,
@@ -119,6 +126,19 @@ class EpisodeMetrics:
             },
             "runtime_seconds": round(self.pipeline_runtime_seconds, 2),
             "alignment_quality_stats": self._get_alignment_quality_stats(),
+            "gating_metrics": self._get_gating_metrics(),
+        }
+
+    def _get_gating_metrics(self) -> Optional[dict]:
+        """Return gating metrics if available."""
+        if not self.gating_enabled:
+            return None
+        return {
+            "enabled": self.gating_enabled,
+            "threshold": self.gating_threshold,
+            "num_embeddings_generated": self.num_embeddings_generated,
+            "gated_face_count": self.gated_face_count,
+            "gating_rate": round(self.gating_rate, 4),
         }
 
     def _get_alignment_quality_stats(self) -> Optional[dict]:
@@ -278,6 +298,47 @@ def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, float
     }
 
 
+def load_gating_stats(manifest_dir: Path) -> Optional[Dict[str, any]]:
+    """
+    Load gating statistics from faces.jsonl.
+
+    Returns dict with 'num_embeddings', 'gated_count', 'gating_rate' or None if file doesn't exist.
+    """
+    faces_path = manifest_dir / "faces.jsonl"
+
+    if not faces_path.exists():
+        logger.debug(f"No faces.jsonl found at {faces_path}")
+        return None
+
+    total_faces = 0
+    embeddings_generated = 0
+    gated_count = 0
+
+    with open(faces_path) as f:
+        for line in f:
+            data = json.loads(line)
+            total_faces += 1
+
+            # Check if this face has an embedding
+            embedding = data.get("embedding")
+            skip_reason = data.get("skip_reason", "")
+
+            if embedding is not None and len(embedding) > 0:
+                embeddings_generated += 1
+            elif "low_alignment_quality" in skip_reason:
+                gated_count += 1
+
+    if total_faces == 0:
+        return None
+
+    return {
+        "total_faces": total_faces,
+        "num_embeddings": embeddings_generated,
+        "gated_count": gated_count,
+        "gating_rate": gated_count / total_faces if total_faces > 0 else 0.0,
+    }
+
+
 def compute_embedding_jitter(
     embeddings: np.ndarray,
     meta: List[Dict],
@@ -393,6 +454,8 @@ def run_evaluation(
     manifest_dir: Path,
     alignment_enabled: bool,
     fps: float = 24.0,
+    gating_enabled: Optional[bool] = None,
+    gating_threshold: float = 0.3,
 ) -> EpisodeMetrics:
     """
     Run evaluation on existing pipeline output.
@@ -400,6 +463,14 @@ def run_evaluation(
     Note: This reads existing artifacts rather than re-running the pipeline.
     For a full end-to-end comparison, you would need to run the pipeline twice
     with different alignment settings.
+
+    Args:
+        episode_id: Episode identifier
+        manifest_dir: Path to manifest directory
+        alignment_enabled: Whether alignment was enabled for this run
+        fps: Frames per second
+        gating_enabled: Whether to evaluate gating metrics (None = auto-detect)
+        gating_threshold: Alignment quality gating threshold
     """
     logger.info(f"Evaluating {episode_id} (alignment_enabled={alignment_enabled})")
 
@@ -457,6 +528,24 @@ def run_evaluation(
             metrics.alignment_quality_p95 = quality_stats["p95"]
             logger.info(f"  Alignment quality: mean={quality_stats['mean']:.4f}, "
                        f"p05={quality_stats['p05']:.4f}, p95={quality_stats['p95']:.4f}")
+
+    # Gating metrics
+    # Auto-detect gating if not specified
+    if gating_enabled is None:
+        # Check if gating stats are available in the manifest
+        gating_stats = load_gating_stats(manifest_dir)
+        gating_enabled = gating_stats is not None and gating_stats.get("gated_count", 0) > 0
+
+    if gating_enabled:
+        gating_stats = load_gating_stats(manifest_dir)
+        if gating_stats:
+            metrics.gating_enabled = True
+            metrics.gating_threshold = gating_threshold
+            metrics.num_embeddings_generated = gating_stats.get("num_embeddings", 0)
+            metrics.gated_face_count = gating_stats.get("gated_count", 0)
+            metrics.gating_rate = gating_stats.get("gating_rate", 0.0)
+            logger.info(f"  Gating: {metrics.gated_face_count} faces gated "
+                       f"({metrics.gating_rate:.2%}), threshold={gating_threshold}")
 
     logger.info(f"  Tracks: {metrics.num_tracks}, Avg length: {metrics.avg_track_length:.1f}")
     logger.info(f"  Clusters: {metrics.cluster_count}, Singletons: {metrics.singleton_count}")
@@ -579,6 +668,20 @@ Examples:
     )
 
     parser.add_argument(
+        "--gating",
+        choices=["off", "on"],
+        default=None,
+        help="Evaluate alignment_quality gating impact: off (disabled) or on (enabled)",
+    )
+
+    parser.add_argument(
+        "--gating-threshold",
+        type=float,
+        default=0.3,
+        help="Alignment quality gating threshold (default: 0.3)",
+    )
+
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose logging",
@@ -622,7 +725,15 @@ Examples:
         else:
             # Single mode
             alignment_enabled = args.alignment_enabled == "true"
-            metrics = run_evaluation(episode_id, manifest_dir, alignment_enabled, args.fps)
+            gating_enabled = None if args.gating is None else (args.gating == "on")
+            metrics = run_evaluation(
+                episode_id,
+                manifest_dir,
+                alignment_enabled,
+                fps=args.fps,
+                gating_enabled=gating_enabled,
+                gating_threshold=args.gating_threshold,
+            )
             all_results.append(metrics.to_dict())
 
     # Save results
@@ -668,9 +779,13 @@ Examples:
             emb = result.get("embedding_quality", {})
             ids = result.get("id_switch_metrics", {})
             tracks = result.get("track_metrics", {})
+            gating = result.get("gating_metrics")
             print(f"  Embedding jitter: {emb.get('mean_embedding_jitter', 0):.6f}")
             print(f"  ID switch rate: {ids.get('id_switch_rate_per_minute', 0):.4f}/min")
             print(f"  Avg track length: {tracks.get('avg_track_length', 0):.2f}")
+            if gating and gating.get("enabled"):
+                print(f"  Gating: {gating.get('gated_face_count', 0)} faces gated "
+                      f"({gating.get('gating_rate', 0):.2%}), threshold={gating.get('threshold', 0)}")
 
     print(f"\nResults saved to: {output_path}")
 

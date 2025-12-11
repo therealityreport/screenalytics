@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import groupby
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Set, Tuple
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import queue
 import threading
@@ -91,6 +91,44 @@ def _load_detection_config_yaml() -> dict[str, Any]:
             return config
     except Exception as exc:
         LOGGER.warning("Failed to load detection config YAML: %s", exc)
+
+    return {}
+
+
+def _load_embedding_config() -> dict[str, Any]:
+    """Load embedding configuration from YAML file if available."""
+    config_path = REPO_ROOT / "config" / "pipeline" / "embedding.yaml"
+    if not config_path.exists():
+        return {"embedding": {"backend": "pytorch"}}
+
+    try:
+        import yaml
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        if config:
+            return config
+    except Exception as exc:
+        LOGGER.warning("Failed to load embedding config YAML: %s", exc)
+
+    return {"embedding": {"backend": "pytorch"}}
+
+
+def _load_alignment_config() -> dict[str, Any]:
+    """Load face alignment configuration from YAML file if available."""
+    config_path = REPO_ROOT / "config" / "pipeline" / "face_alignment.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        if config:
+            return config
+    except Exception as exc:
+        LOGGER.warning("Failed to load alignment config YAML: %s", exc)
 
     return {}
 
@@ -459,7 +497,7 @@ MIN_IDENTITY_SIMILARITY = float(os.environ.get("SCREENALYTICS_MIN_IDENTITY_SIM",
 # Minimum cohesion for a cluster to be kept together; below this, split into singletons
 MIN_CLUSTER_COHESION = float(os.environ.get("SCREENALYTICS_MIN_CLUSTER_COHESION", "0.55"))
 FACE_MIN_CONFIDENCE = float(os.environ.get("FACES_MIN_CONF", "0.60"))
-FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "35.0"))
+FACE_MIN_BLUR = float(os.environ.get("FACES_MIN_BLUR", "18.0"))  # TUNED: 35.0 -> 18.0 to allow more blurry faces
 FACE_MIN_STD = float(os.environ.get("FACES_MIN_STD", "1.0"))
 
 # Lower thresholds for single-face tracks (more permissive to avoid orphaned clusters)
@@ -1707,6 +1745,182 @@ def _bytetrack_config_from_args(args: argparse.Namespace) -> ByteTrackRuntimeCon
     )
 
 
+# =============================================================================
+# Embedding Backend Abstraction
+# =============================================================================
+
+class EmbeddingBackend(Protocol):
+    """Protocol for face embedding backends.
+
+    Supports multiple embedding implementations:
+    - pytorch: PyTorch/ONNX Runtime via InsightFace (default)
+    - tensorrt: TensorRT-accelerated ArcFace (GPU-optimized)
+    """
+
+    def encode(self, crops: list[np.ndarray]) -> np.ndarray:
+        """Encode face crops to embeddings.
+
+        Args:
+            crops: List of BGR face crops (any size, will be resized to 112x112)
+
+        Returns:
+            L2-normalized embeddings array of shape (N, 512)
+        """
+        ...
+
+    def ensure_ready(self) -> None:
+        """Ensure model is loaded and ready for inference."""
+        ...
+
+
+class TensorRTEmbeddingBackend:
+    """TensorRT-accelerated ArcFace embedding backend.
+
+    Uses TensorRT for GPU-accelerated face embedding inference.
+    Provides ~5x speedup over PyTorch/ONNX Runtime on compatible GPUs.
+    """
+
+    def __init__(
+        self,
+        config_path: str = "config/pipeline/arcface_tensorrt.yaml",
+        engine_path: Optional[str] = None,
+    ):
+        """
+        Initialize TensorRT embedding backend.
+
+        Args:
+            config_path: Path to TensorRT configuration YAML
+            engine_path: Explicit path to TensorRT engine (overrides config)
+        """
+        self.config_path = config_path
+        self.engine_path = engine_path
+        self._engine = None
+        self._resolved_device = "tensorrt"
+
+    def ensure_ready(self) -> None:
+        """Load TensorRT engine and prepare for inference."""
+        if self._engine is not None:
+            return
+
+        try:
+            # Import from FEATURES directory (use underscore for Python import)
+            import sys
+            features_path = str(REPO_ROOT / "FEATURES" / "arcface-tensorrt")
+            if features_path not in sys.path:
+                sys.path.insert(0, features_path)
+
+            from src.tensorrt_inference import TensorRTArcFace
+            from src.tensorrt_builder import TensorRTConfig, build_or_load_engine
+
+            # Load config and build/load engine
+            if self.engine_path:
+                engine_path = Path(self.engine_path)
+            else:
+                import yaml
+                with open(self.config_path) as f:
+                    config_dict = yaml.safe_load(f)
+
+                config = TensorRTConfig(
+                    model_name=config_dict.get("tensorrt", {}).get("model_name", "arcface_r100"),
+                    precision=config_dict.get("tensorrt", {}).get("precision", "fp16"),
+                    max_batch_size=config_dict.get("tensorrt", {}).get("max_batch_size", 32),
+                    engine_local_dir=config_dict.get("tensorrt", {}).get("engine_local_dir", "data/engines"),
+                    onnx_path=config_dict.get("tensorrt", {}).get("onnx_path"),
+                )
+                engine_path, _ = build_or_load_engine(config)
+
+            if engine_path is None:
+                raise RuntimeError("Failed to build or load TensorRT engine")
+
+            self._engine = TensorRTArcFace(engine_path=engine_path)
+            LOGGER.info("TensorRT embedding backend ready: %s", engine_path)
+
+        except ImportError as e:
+            raise ImportError(
+                f"TensorRT backend requires tensorrt and pycuda: {e}. "
+                "Install with: pip install tensorrt pycuda"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize TensorRT backend: {e}") from e
+
+    @property
+    def resolved_device(self) -> str:
+        """Return the resolved device name."""
+        return self._resolved_device
+
+    def encode(self, crops: list[np.ndarray]) -> np.ndarray:
+        """Encode face crops to embeddings using TensorRT.
+
+        Args:
+            crops: List of BGR face crops
+
+        Returns:
+            L2-normalized embeddings array of shape (N, 512)
+        """
+        if not crops:
+            return np.zeros((0, 512), dtype=np.float32)
+
+        self.ensure_ready()
+
+        # Resize crops to 112x112 for ArcFace
+        resized_batch: list[np.ndarray] = []
+        valid_indices: list[int] = []
+        embeddings: list[np.ndarray] = [np.zeros(512, dtype=np.float32)] * len(crops)
+
+        for i, crop in enumerate(crops):
+            if crop is None or crop.size == 0:
+                continue
+            resized = _resize_for_arcface(crop)
+            if resized is None:
+                continue
+            resized_batch.append(resized)
+            valid_indices.append(i)
+
+        if not resized_batch:
+            return np.vstack(embeddings)
+
+        # Stack into batch array
+        batch_array = np.stack(resized_batch, axis=0)
+
+        # Run TensorRT inference
+        feats = self._engine.embed(batch_array)
+
+        # Place embeddings back into result array
+        for idx, valid_idx in enumerate(valid_indices):
+            embeddings[valid_idx] = feats[idx]
+
+        return np.vstack(embeddings)
+
+
+def get_embedding_backend(
+    backend_type: str = "pytorch",
+    device: str = "auto",
+    tensorrt_config: str = "config/pipeline/arcface_tensorrt.yaml",
+    allow_cpu_fallback: bool = True,
+) -> EmbeddingBackend:
+    """
+    Factory function to get the appropriate embedding backend.
+
+    Args:
+        backend_type: "pytorch" or "tensorrt"
+        device: Device for PyTorch backend ("auto", "cuda", "cpu", "mps")
+        tensorrt_config: Path to TensorRT config YAML
+        allow_cpu_fallback: Allow CPU fallback for PyTorch backend
+
+    Returns:
+        Embedding backend instance
+    """
+    if backend_type == "tensorrt":
+        return TensorRTEmbeddingBackend(config_path=tensorrt_config)
+    else:
+        # Default to PyTorch/ONNX Runtime backend
+        return ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
+
+
+# Alias for backwards compatibility
+PyTorchEmbeddingBackend = ArcFaceEmbedder
+
+
 class ArcFaceEmbedder:
     def __init__(self, device: str, allow_cpu_fallback: bool = True) -> None:
         self.device = device
@@ -2640,7 +2854,8 @@ class ThumbWriter:
                 # entity_id includes track and frame info
                 entity_id = f"track_{track_id:04d}/thumb_{frame_idx:06d}"
                 result = self._storage_backend.write_thumbnail(
-                    self.ep_id, "track", entity_id, img_data, use_png=self.use_png
+                    self.ep_id, "track", entity_id, img_data,
+                    content_type="image/png" if self.use_png else "image/jpeg",
                 )
                 if result.success:
                     self.thumbs_written += 1
@@ -3141,7 +3356,8 @@ class FrameExporter:
                     else:
                         img_data = encode_jpeg_bytes(image, quality=self.jpeg_quality, color="bgr")
                     result = self._storage_backend.write_frame(
-                        self.ep_id, frame_idx, img_data, use_png=self.use_png
+                        self.ep_id, frame_idx, img_data,
+                        content_type="image/png" if self.use_png else "image/jpeg",
                     )
                     if result.success:
                         self.frames_written += 1
@@ -3295,7 +3511,8 @@ class FrameExporter:
                 else:
                     img_data = encode_jpeg_bytes(crop, quality=self.jpeg_quality, color="bgr")
                 result = self._storage_backend.write_crop(
-                    self.ep_id, track_id, frame_idx, img_data, use_png=self.use_png
+                    self.ep_id, track_id, frame_idx, img_data,
+                    content_type="image/png" if self.use_png else "image/jpeg",
                 )
                 ok = result.success
                 save_err = result.error if not ok else None
@@ -6201,6 +6418,41 @@ def _run_detect_track_stage(
         progress.close()
 
 
+def _load_alignment_quality_index(manifest_dir: Path) -> Dict[Tuple[int, int], float]:
+    """
+    Load alignment quality scores from aligned_faces.jsonl.
+
+    Args:
+        manifest_dir: Path to episode manifest directory
+
+    Returns:
+        Dict mapping (track_id, frame_idx) to alignment_quality score
+    """
+    aligned_faces_path = manifest_dir / "face_alignment" / "aligned_faces.jsonl"
+    if not aligned_faces_path.exists():
+        return {}
+
+    index: Dict[Tuple[int, int], float] = {}
+    try:
+        with open(aligned_faces_path) as f:
+            for line in f:
+                data = json.loads(line)
+                track_id = data.get("track_id")
+                frame_idx = data.get("frame_idx")
+                quality = data.get("alignment_quality")
+
+                if track_id is not None and frame_idx is not None and quality is not None:
+                    index[(int(track_id), int(frame_idx))] = float(quality)
+
+        if index:
+            LOGGER.info("Loaded %d alignment quality scores from %s", len(index), aligned_faces_path)
+    except Exception as e:
+        LOGGER.warning("Failed to load alignment quality index: %s", e)
+        return {}
+
+    return index
+
+
 def _run_faces_embed_stage(
     args: argparse.Namespace,
     storage: StorageService | None,
@@ -6221,6 +6473,10 @@ def _run_faces_embed_stage(
         required_fields=["track_id"],
         hint="run detect/track first",
     )
+
+    # Load embedding config early (used for backend selection and alignment gating)
+    embedding_config = _load_embedding_config()
+
     # Sort samples by frame to enable batch embedding per frame
     # Apply per-track sampling to limit embedding/export volume
     samples = _load_track_samples(
@@ -6237,6 +6493,31 @@ def _run_faces_embed_stage(
             "detect/track likely produced tracks without valid bounding boxes",
             track_path,
         )
+
+    # Load alignment quality gating config and data
+    manifests_dir = get_path(args.ep_id, "detections").parent
+    alignment_config = _load_alignment_config()
+    alignment_gating_enabled = (
+        alignment_config.get("quality", {}).get("enabled", False)
+        or embedding_config.get("face_alignment", {}).get("use_for_embedding", False)
+    )
+    min_alignment_quality = (
+        alignment_config.get("quality", {}).get("threshold", 0.3)
+        or embedding_config.get("face_alignment", {}).get("min_alignment_quality", 0.3)
+    )
+
+    alignment_quality_index: Dict[Tuple[int, int], float] = {}
+    if alignment_gating_enabled:
+        alignment_quality_index = _load_alignment_quality_index(manifests_dir)
+        if alignment_quality_index:
+            LOGGER.info(
+                "Alignment quality gating enabled: min_quality=%.2f, faces_with_quality=%d",
+                min_alignment_quality, len(alignment_quality_index)
+            )
+        else:
+            LOGGER.info("Alignment quality gating enabled but no aligned_faces.jsonl found")
+
+    skipped_alignment_quality = 0  # Counter for gated faces
 
     faces_total = len(samples)
     if LOCAL_MODE_INSTRUMENTATION:
@@ -6281,13 +6562,24 @@ def _run_faces_embed_stage(
     # --allow-cpu-fallback OR --no-coreml-only enables CPU fallback
     allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
 
+    # Get backend selection from embedding config (already loaded earlier)
+    embedding_backend_type = embedding_config.get("embedding", {}).get("backend", "pytorch")
+    tensorrt_config_path = embedding_config.get("embedding", {}).get(
+        "tensorrt_config", "config/pipeline/arcface_tensorrt.yaml"
+    )
+
     # Emit progress during model loading (can take time for CoreML compilation)
-    print(f"[INIT] Loading ArcFace embedder (device={device})...", flush=True)
-    embedder = ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
+    print(f"[INIT] Loading embedding backend (type={embedding_backend_type}, device={device})...", flush=True)
+    embedder = get_embedding_backend(
+        backend_type=embedding_backend_type,
+        device=device,
+        tensorrt_config=tensorrt_config_path,
+        allow_cpu_fallback=allow_cpu_fallback,
+    )
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
-    print(f"[INIT] ArcFace embedder ready (resolved_device={embed_device})", flush=True)
+    print(f"[INIT] Embedding backend ready (type={embedding_backend_type}, resolved_device={embed_device})", flush=True)
 
     manifests_dir = get_path(args.ep_id, "detections").parent
     faces_path = manifests_dir / "faces.jsonl"
@@ -6415,6 +6707,26 @@ def _run_faces_embed_stage(
                 track_id = sample["track_id"]
                 ts_val = round(float(sample["ts"]), 4)
                 landmarks = sample.get("landmarks")
+
+                # Check alignment quality gate (if enabled)
+                if alignment_quality_index:
+                    aq_key = (int(track_id), int(frame_idx))
+                    aq_score = alignment_quality_index.get(aq_key)
+                    if aq_score is not None and aq_score < min_alignment_quality:
+                        rows.append(
+                            _make_skip_face_row(
+                                args.ep_id,
+                                track_id,
+                                frame_idx,
+                                ts_val,
+                                bbox,
+                                detector_choice,
+                                f"low_alignment_quality:{aq_score:.3f}",
+                            )
+                        )
+                        skipped_alignment_quality += 1
+                        faces_done = min(faces_total, faces_done + 1)
+                        continue
 
                 # Export frame/crop if requested
                 if exporter and image is not None:
@@ -6780,6 +7092,23 @@ def _run_faces_embed_stage(
             runtime_sec = summary.get("runtime_sec", 0)
             print(f"[LOCAL MODE] faces_embed completed for {args.ep_id}", flush=True)
             print(f"  faces={len(rows)}, runtime={runtime_sec:.1f}s", flush=True)
+
+        # Log alignment quality gating stats
+        if skipped_alignment_quality > 0:
+            LOGGER.info(
+                "Alignment quality gating: skipped %d/%d faces (%.1f%%) below threshold %.2f",
+                skipped_alignment_quality,
+                faces_total,
+                100 * skipped_alignment_quality / max(faces_total, 1),
+                min_alignment_quality,
+            )
+            summary["alignment_quality_gating"] = {
+                "enabled": True,
+                "threshold": min_alignment_quality,
+                "skipped": skipped_alignment_quality,
+                "total": faces_total,
+                "skip_rate": skipped_alignment_quality / max(faces_total, 1),
+            }
 
         return summary
     except Exception as exc:

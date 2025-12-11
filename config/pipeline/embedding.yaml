@@ -3,7 +3,16 @@
 
 # Backend selection
 embedding:
-  backend: tensorrt                # tensorrt | pytorch | onnx
+  backend: pytorch                 # tensorrt | pytorch (default: pytorch)
+  tensorrt_config: config/pipeline/arcface_tensorrt.yaml
+
+# Face alignment quality gating
+# Skip faces with low alignment_quality before embedding to reduce noise
+face_alignment:
+  enabled: true                    # Enable alignment_quality gating
+  use_for_embedding: true          # Use alignment_quality to gate embeddings
+  min_alignment_quality: 0.3       # Skip faces below this threshold (0.0-1.0)
+  # NOTE: Set to 0.0 to disable gating while keeping alignment enabled
 
 # TensorRT configuration
 tensorrt:

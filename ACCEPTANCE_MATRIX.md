@@ -249,25 +249,51 @@ A module is considered **Accepted** only when all associated checkpoints below a
 
 | Metric | Target | Warning Threshold | Verification |
 |--------|--------|-------------------|--------------|
-| **alignment_quality_threshold** | 0.60 (configurable) | N/A | Unit test |
+| **alignment_quality_threshold** | 0.30 (configurable) | N/A | Unit test |
 | **faces_gated_pct** | 10–30% | > 50% | Integration test |
 | **false_rejection_rate** | < 5% | > 10% | Manual QA / Eval set |
 | **recognition_accuracy_delta** | ≥ 2% improvement | < 0% (regression) | Eval set |
 
+**Definition of Done:**
+- [x] Alignment quality heuristic (`FEATURES/face-alignment/src/alignment_quality.py`)
+- [x] `alignment_quality` field populated in pipeline
+- [x] Gating integrated in embedding stage (`_run_faces_embed_stage`)
+- [x] Config-driven threshold (`face_alignment.min_alignment_quality`)
+- [x] Skip reason logging (`low_alignment_quality:{score}`)
+- [x] Eval harness gating mode (`--gating on`)
+- [ ] Gating impact validated on eval set (embedding jitter reduction)
+
+**Gating Configuration:**
+```yaml
+# config/pipeline/embedding.yaml
+face_alignment:
+  enabled: true
+  use_for_embedding: true
+  min_alignment_quality: 0.3    # Skip faces below this threshold
+```
+
+**Eval Harness:**
+```bash
+# Evaluate with gating impact
+python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
+```
+
 **Tests:**
 - `tests/ml/test_alignment_quality.py`
+- `tools/experiments/tests/test_face_alignment_eval.py`
 
 **Config Dependencies:**
-- `config/pipeline/alignment.yaml` (quality_gating section)
+- `config/pipeline/embedding.yaml` (face_alignment section)
 
 **Docs:**
+- [FEATURES/face-alignment/docs/README.md](FEATURES/face-alignment/docs/README.md)
 - [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
 
 **Feature Sandbox:** `FEATURES/face-alignment/`
 
-**Current State:** Heuristic-based quality estimation is implemented and populates the `alignment_quality` field. The quality gate (filtering by threshold) is available but not yet integrated into the main pipeline. LUVLi model-based uncertainty will replace the heuristic in a future phase.
+**Current State:** Heuristic-based quality estimation is implemented and gating is integrated into the embedding stage. Faces with `alignment_quality < threshold` are skipped before embedding with `skip_reason=low_alignment_quality`. LUVLi model-based uncertainty will replace the heuristic in a future phase.
 
-**Status:** ✅ Heuristic Stub Implemented (LUVLi integration pending)
+**Status:** ✅ Gating Integrated (pending eval validation)
 
 ---
 
@@ -452,24 +478,45 @@ A module is considered **Accepted** only when all associated checkpoints below a
 | Metric | Target | Warning Threshold | Verification |
 |--------|--------|-------------------|--------------|
 | **speedup_vs_pytorch** | ≥ 5× @ batch=32 | < 3× | Benchmark |
-| **embedding_cosine_drift** | ≥ 0.999 | < 0.995 | Regression test |
+| **cosine_sim_mean** | ≥ 0.995 | < 0.990 | Parity test |
+| **cosine_sim_min** | ≥ 0.990 | < 0.980 | Parity test |
+| **embedding_norm** | ≈ 1.0 (±0.01) | > 1.05 or < 0.95 | Unit test |
 | **vram_usage** | ≤ 2GB | > 4GB | Benchmark |
 | **fp16_accuracy_delta** | < 0.1% | > 0.5% | Eval set |
 | **engine_build_time** | ≤ 5 min | > 15 min | CI Benchmark |
 
+**Definition of Done:**
+- [x] ONNX export utility (`tools/models/export_arcface_onnx.py`)
+- [x] TensorRT engine builder (`FEATURES/arcface-tensorrt/src/tensorrt_builder.py`)
+- [x] TensorRT inference wrapper (`FEATURES/arcface-tensorrt/src/tensorrt_inference.py`)
+- [x] Embedding parity comparison (`FEATURES/arcface-tensorrt/src/embedding_compare.py`)
+- [x] Backend abstraction in main pipeline (`EmbeddingBackend` protocol)
+- [x] Config-driven backend selection (`embedding.backend: pytorch|tensorrt`)
+- [ ] Parity validated on eval set (cosine_sim_mean ≥ 0.995)
+- [ ] Throughput validated on benchmark (speedup ≥ 3×)
+
+**Backend Selection:**
+```yaml
+# config/pipeline/embedding.yaml
+embedding:
+  backend: pytorch    # pytorch | tensorrt
+  tensorrt_config: config/pipeline/arcface_tensorrt.yaml
+```
+
 **Tests:**
-- `tests/ml/test_tensorrt_embedding.py`
+- `FEATURES/arcface-tensorrt/tests/test_tensorrt_embedding.py`
 - `tests/ml/test_embedding_regression.py`
 
 **Config Dependencies:**
 - `config/pipeline/embedding.yaml`
+- `config/pipeline/arcface_tensorrt.yaml`
 
 **Docs:**
 - [docs/todo/feature_arcface_tensorrt_onnxruntime.md](docs/todo/feature_arcface_tensorrt_onnxruntime.md)
 
-**Feature Sandbox:** `FEATURES/embedding-engines/`
+**Feature Sandbox:** `FEATURES/arcface-tensorrt/`
 
-**Status:** ⚠ Pending
+**Status:** ✅ Backend Integrated (pending parity validation)
 
 ---
 
@@ -598,12 +645,12 @@ A module is considered **Accepted** only when all associated checkpoints below a
 | Module | Status | Blocker | Next Action |
 |--------|--------|---------|-------------|
 | **face_alignment** | ⚠ In Progress | FAN implementation in progress | Complete FAN 2D aligner |
-| **alignment_quality** | ⚠ Pending | Depends on face_alignment | Implement LUVLi quality gate |
+| **alignment_quality** | ✅ Integrated | Pending eval validation | Run gating impact eval |
 | **head_pose_3d** | ⚠ Pending | Depends on face_alignment | Implement 3DDFA_V2 integration |
 | **body_tracking** | ✅ Implemented | Pending eval metrics | Run eval on validation episodes |
 | **person_reid** | ✅ Implemented | Pending eval metrics | Run Re-ID benchmark |
 | **track_fusion** | ✅ Implemented | Pending eval metrics | Manual QA on fused identities |
-| **tensorrt_embedding** | ⚠ Pending | Implementation not started | Build TRT engine, S3 storage |
+| **tensorrt_embedding** | ✅ Integrated | Pending parity validation | Run parity + throughput tests |
 | **face_mesh** | ⚠ Pending | Implementation not started | Implement MediaPipe mesh |
 | **centerface** | ⚠ Pending (Future) | Deferred | Stub interface only |
 

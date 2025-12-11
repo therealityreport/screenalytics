@@ -102,6 +102,56 @@ from FEATURES.face_alignment.src.alignment_quality import filter_by_quality
 passed, rejected = filter_by_quality(aligned_faces, min_quality=0.6)
 ```
 
+## Embedding Pipeline Gating
+
+The `alignment_quality` field is used to gate faces before embedding in the main pipeline. Faces with low quality scores are skipped to reduce noise in embeddings.
+
+### Configuration
+
+Gating is configured in `config/pipeline/embedding.yaml`:
+
+```yaml
+face_alignment:
+  enabled: true
+  use_for_embedding: true        # Enable quality gating
+  min_alignment_quality: 0.3     # Skip faces below this threshold
+```
+
+### How It Works
+
+1. **Pipeline loads `aligned_faces.jsonl`** at embedding stage start
+2. **Builds index** of `(track_id, frame_idx) → alignment_quality`
+3. **For each face to embed:**
+   - Look up quality score by `(track_id, frame_idx)`
+   - If `quality < threshold`: skip with `skip_reason=low_alignment_quality:{score}`
+   - Otherwise: proceed to embedding
+4. **Logs gating stats** at end of stage
+
+### Skip Reason Format
+
+Gated faces have `skip_reason` field in `faces.jsonl`:
+```json
+{
+  "track_id": 123,
+  "frame_idx": 456,
+  "skip_reason": "low_alignment_quality:0.215"
+}
+```
+
+### Verifying Gating
+
+Check gating is working by looking at stats in pipeline output:
+```
+INFO: Face embedding stage complete
+INFO:   Generated 4,521 embeddings
+INFO:   Skipped 312 faces due to low alignment quality (6.5%)
+```
+
+Or run the eval harness with `--gating on`:
+```bash
+python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
+```
+
 ## Evaluation
 
 Measure the impact of FAN alignment using the evaluation harness:
@@ -122,6 +172,14 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 \
 | `id_switch_rate_per_minute` | Track ID discontinuities per minute | Lower |
 | `avg_track_length` | Average frames per track | Higher |
 | `alignment_quality_stats` | Mean, p05, p95 of alignment_quality field | Higher |
+| `gating_rate` | Percentage of faces gated (when `--gating on`) | 10-30% typical |
+| `gated_face_count` | Number of faces skipped due to low quality | - |
+
+**Gating-specific evaluation:**
+```bash
+# Evaluate with gating impact
+python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on --gating-threshold 0.3
+```
 
 **Output:** `data/experiments/face_alignment_eval/{episode_id}.json`
 
