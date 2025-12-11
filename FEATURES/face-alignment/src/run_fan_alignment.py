@@ -56,9 +56,16 @@ class AlignedFace:
     crop: Optional[np.ndarray] = None
     crop_path: Optional[str] = None
 
-    # Quality metrics (for future LUVLi integration)
+    # Quality metrics (LUVLi model or heuristic fallback)
     alignment_quality: Optional[float] = None
+    alignment_quality_source: Optional[str] = None  # "luvli" | "heuristic"
+    alignment_quality_confidence: Optional[float] = None
     landmark_confidences: Optional[List[float]] = None
+
+    # LUVLi-specific uncertainty/visibility fields
+    landmark_uncertainty_mean: Optional[float] = None
+    landmark_uncertainty_p95: Optional[float] = None
+    landmark_visibility_fraction: Optional[float] = None
 
     # Pose estimates (for future 3DDFA_V2 integration)
     pose_yaw: Optional[float] = None
@@ -81,6 +88,19 @@ class AlignedFace:
             d["crop_path"] = self.crop_path
         if self.alignment_quality is not None:
             d["alignment_quality"] = self.alignment_quality
+        if self.alignment_quality_source is not None:
+            d["alignment_quality_source"] = self.alignment_quality_source
+        if self.alignment_quality_confidence is not None:
+            d["alignment_quality_confidence"] = self.alignment_quality_confidence
+        if self.landmark_uncertainty_mean is not None:
+            d["landmark_uncertainty_summary"] = {
+                "mean": self.landmark_uncertainty_mean,
+                "p95": self.landmark_uncertainty_p95,
+            }
+        if self.landmark_visibility_fraction is not None:
+            d["landmark_visibility_summary"] = {
+                "fraction": self.landmark_visibility_fraction,
+            }
         if self.pose_yaw is not None:
             d["pose_yaw"] = self.pose_yaw
         if self.pose_pitch is not None:
@@ -101,6 +121,11 @@ class AlignedFace:
             detection_id=d.get("detection_id"),
             crop_path=d.get("crop_path"),
             alignment_quality=d.get("alignment_quality"),
+            alignment_quality_source=d.get("alignment_quality_source"),
+            alignment_quality_confidence=d.get("alignment_quality_confidence"),
+            landmark_uncertainty_mean=d.get("landmark_uncertainty_summary", {}).get("mean"),
+            landmark_uncertainty_p95=d.get("landmark_uncertainty_summary", {}).get("p95"),
+            landmark_visibility_fraction=d.get("landmark_visibility_summary", {}).get("fraction"),
             pose_yaw=d.get("pose_yaw"),
             pose_pitch=d.get("pose_pitch"),
             pose_roll=d.get("pose_roll"),
