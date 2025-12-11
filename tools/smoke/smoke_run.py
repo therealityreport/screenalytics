@@ -171,8 +171,10 @@ class SmokeRunner:
             tracks_path = self.manifest_dir / "tracks.jsonl"
 
             if detections_path.exists() and tracks_path.exists():
-                num_detections = sum(1 for _ in open(detections_path))
-                num_tracks = sum(1 for _ in open(tracks_path))
+                with open(detections_path) as f:
+                    num_detections = sum(1 for _ in f)
+                with open(tracks_path) as f:
+                    num_tracks = sum(1 for _ in f)
 
                 self.report.stages.append(StageResult(
                     name=stage_name,
@@ -212,7 +214,8 @@ class SmokeRunner:
             aligned_path = self.manifest_dir / "face_alignment" / "aligned_faces.jsonl"
 
             if aligned_path.exists():
-                num_aligned = sum(1 for _ in open(aligned_path))
+                with open(aligned_path) as f:
+                    num_aligned = sum(1 for _ in f)
                 self.report.stages.append(StageResult(
                     name=stage_name,
                     status="success",
@@ -390,7 +393,8 @@ class SmokeRunner:
             body_tracks_path = self.manifest_dir / "body_tracking" / "body_tracks.jsonl"
 
             if body_tracks_path.exists():
-                num_body_tracks = sum(1 for _ in open(body_tracks_path))
+                with open(body_tracks_path) as f:
+                    num_body_tracks = sum(1 for _ in f)
                 self.report.stages.append(StageResult(
                     name=stage_name,
                     status="success",

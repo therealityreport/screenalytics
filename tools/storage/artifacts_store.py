@@ -144,7 +144,6 @@ class ArtifactsStore:
         self,
         remote_uri: str,
         local_path: str,
-        verify_hash: bool = False,
     ) -> bool:
         """Download artifact if it exists in remote storage."""
         if not self.is_available:
@@ -203,7 +202,7 @@ class ArtifactsStore:
                 str(local_path),
                 bucket,
                 key,
-                ExtraArgs=extra_args if extra_args else None,
+                ExtraArgs=extra_args or None,
             )
 
             logger.info(f"Uploaded successfully: {remote_uri}")

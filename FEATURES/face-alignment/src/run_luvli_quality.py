@@ -218,15 +218,15 @@ class LUVLiQualityEstimator:
         size_score = np.clip(face_size / 100.0, 0, 1)
 
         # Aspect ratio score (frontal faces ~0.85 w/h ratio)
-        aspect_ratio = width / max(height, 1)
+        aspect_ratio = width / (height if height > 0 else 1)
         ideal_ratio = 0.85
         aspect_score = np.clip(1.0 - abs(aspect_ratio - ideal_ratio) * 2, 0, 1)
 
         # Landmark spread score (if available)
         landmark_score = 0.5
         if landmarks_68 is not None and len(landmarks_68) >= 68:
-            lm = np.array(landmarks_68)
-            lm_spread = (lm[:, 0].max() - lm[:, 0].min()) / max(width, 1)
+            landmarks_arr = np.array(landmarks_68)
+            lm_spread = (landmarks_arr[:, 0].max() - landmarks_arr[:, 0].min()) / (width if width > 0 else 1)
             landmark_score = np.clip(lm_spread / 0.7, 0, 1)
 
         # Combined score

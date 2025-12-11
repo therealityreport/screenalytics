@@ -28,7 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -298,7 +298,7 @@ def load_embeddings(manifest_dir: Path) -> Tuple[Optional[np.ndarray], List[Dict
     return embeddings, meta
 
 
-def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, any]]:
+def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, Any]]:
     """
     Load alignment quality statistics from aligned_faces.jsonl.
 
@@ -371,7 +371,7 @@ def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, any]]
     return result
 
 
-def load_gating_stats(manifest_dir: Path) -> Optional[Dict[str, any]]:
+def load_gating_stats(manifest_dir: Path) -> Optional[Dict[str, Any]]:
     """
     Load gating statistics from faces.jsonl.
 
