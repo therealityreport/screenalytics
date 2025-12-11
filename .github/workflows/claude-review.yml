@@ -20,14 +20,15 @@ jobs:
       - name: Capture review guidelines (AGENTS.md if present)
         id: guidelines
         run: |
+          DELIM="GUIDELINES_$(openssl rand -hex 8)"
           {
-            echo 'guidelines<<EOF'
+            echo "guidelines<<${DELIM}"
             if [ -f AGENTS.md ]; then
               sed -n '1,400p' AGENTS.md
             else
               echo 'No AGENTS.md found.'
             fi
-            echo 'EOF'
+            echo "${DELIM}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Claude Code Action Official
@@ -35,9 +36,10 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          use_sticky_comment: true
           prompt: |
             Review only the diff for this pull request.
             Identify correctness, security, performance, and maintainability issues.
             Prioritize P0 and P1 items with concrete, minimal fixes.
-            Use the repository’s guidelines:
+            Use the repository's guidelines:
             ${{ steps.guidelines.outputs.guidelines }}

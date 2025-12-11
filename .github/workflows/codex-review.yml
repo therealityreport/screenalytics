@@ -20,14 +20,15 @@ jobs:
       - name: Capture review guidelines (AGENTS.md if present)
         id: guidelines
         run: |
+          DELIM="GUIDELINES_$(openssl rand -hex 8)"
           {
-            echo 'guidelines<<EOF'
+            echo "guidelines<<${DELIM}"
             if [ -f AGENTS.md ]; then
               sed -n '1,400p' AGENTS.md
             else
               echo 'No AGENTS.md found.'
             fi
-            echo 'EOF'
+            echo "${DELIM}"
           } >> "$GITHUB_OUTPUT"
 
       # The official Codex action. It posts feedback on the PR.
