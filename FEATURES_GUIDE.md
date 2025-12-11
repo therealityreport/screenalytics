@@ -290,7 +290,7 @@ If `tools/promote-feature.py` fails:
 
 ## Active Feature Sandboxes
 
-### Body Tracking (`FEATURES/body-tracking/`)
+### Body Tracking (`FEATURES/body_tracking/`)
 
 **Status:** Implemented
 **TTL:** 2026-01-10
@@ -334,19 +334,19 @@ python -m FEATURES.body_tracking --episode-id rhoslc-s06e01 --stage compare
 
 **Tests:**
 ```bash
-pytest FEATURES/body-tracking/tests/ -v
+pytest FEATURES/body_tracking/tests/ -v
 ```
 
 **Docs:**
-- [FEATURES/body-tracking/docs/README.md](FEATURES/body-tracking/docs/README.md)
-- [FEATURES/body-tracking/TODO.md](FEATURES/body-tracking/TODO.md)
+- [FEATURES/body_tracking/docs/README.md](FEATURES/body_tracking/docs/README.md)
+- [FEATURES/body_tracking/TODO.md](FEATURES/body_tracking/TODO.md)
 - [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
 
 **Acceptance Matrix:** Sections 3.10-3.12
 
 ---
 
-### Face Alignment (`FEATURES/face-alignment/`)
+### Face Alignment (`FEATURES/face_alignment/`)
 
 **Status:** In Progress
 **TTL:** 2026-01-10

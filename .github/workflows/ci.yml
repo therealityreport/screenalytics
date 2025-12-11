@@ -43,13 +43,17 @@ jobs:
         run: |
           pip install pytest pytest-cov pyyaml numpy
 
-      - name: Run face-alignment tests
+      - name: Run face_alignment tests
         run: |
-          pytest FEATURES/face-alignment/tests/ -v --tb=short || true
+          pytest FEATURES/face_alignment/tests/ -v --tb=short || true
 
-      - name: Run body-tracking tests
+      - name: Run body_tracking tests
         run: |
-          pytest FEATURES/body-tracking/tests/ -v --tb=short || true
+          pytest FEATURES/body_tracking/tests/ -v --tb=short || true
+
+      - name: Run arcface_tensorrt tests
+        run: |
+          pytest FEATURES/arcface_tensorrt/tests/ -v --tb=short || true
 
       - name: Run eval harness tests
         run: |

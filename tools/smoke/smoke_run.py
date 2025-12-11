@@ -33,11 +33,12 @@ logger = logging.getLogger(__name__)
 class StageResult:
     """Result from running a pipeline stage."""
     name: str
-    status: str  # "success" | "skipped" | "failed"
+    status: str  # "success" | "skipped_by_flag" | "skipped_missing_prereq" | "failed"
     duration_seconds: float = 0.0
     artifact_paths: List[str] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    reason: Optional[str] = None  # Explanation for non-success status
 
 
 @dataclass
@@ -190,9 +191,9 @@ class SmokeRunner:
             else:
                 self.report.stages.append(StageResult(
                     name=stage_name,
-                    status="skipped",
+                    status="skipped_missing_prereq",
                     duration_seconds=time.time() - start_time,
-                    error="No existing detections/tracks - full pipeline run required",
+                    reason="No existing detections/tracks - full pipeline run required",
                 ))
 
         except Exception as e:
@@ -211,6 +212,8 @@ class SmokeRunner:
         start_time = time.time()
 
         try:
+            # Alignment outputs to data/manifests/{ep_id}/face_alignment/aligned_faces.jsonl
+            # This is a FEATURES sandbox feature - run FEATURES.face_alignment separately
             aligned_path = self.manifest_dir / "face_alignment" / "aligned_faces.jsonl"
 
             if aligned_path.exists():
@@ -226,9 +229,9 @@ class SmokeRunner:
             else:
                 self.report.stages.append(StageResult(
                     name=stage_name,
-                    status="skipped",
+                    status="skipped_missing_prereq",
                     duration_seconds=time.time() - start_time,
-                    error="No aligned faces - alignment not run",
+                    reason="No aligned_faces.jsonl - run FEATURES.face_alignment separately",
                 ))
 
         except Exception as e:
@@ -247,7 +250,8 @@ class SmokeRunner:
         start_time = time.time()
 
         try:
-            embeddings_path = self.manifest_dir / "face_embeddings.npy"
+            # Embeddings are stored in data/embeds/{ep_id}/faces.npy
+            embeddings_path = Path(f"data/embeds/{self.episode_id}/faces.npy")
             faces_path = self.manifest_dir / "faces.jsonl"
 
             if embeddings_path.exists() and faces_path.exists():
@@ -281,11 +285,16 @@ class SmokeRunner:
                     },
                 ))
             else:
+                missing = []
+                if not embeddings_path.exists():
+                    missing.append(f"embeddings ({embeddings_path})")
+                if not faces_path.exists():
+                    missing.append(f"faces ({faces_path})")
                 self.report.stages.append(StageResult(
                     name=stage_name,
-                    status="skipped",
+                    status="skipped_missing_prereq",
                     duration_seconds=time.time() - start_time,
-                    error="Embeddings not found",
+                    reason=f"Missing: {', '.join(missing)}",
                 ))
 
         except Exception as e:
@@ -330,9 +339,9 @@ class SmokeRunner:
             else:
                 self.report.stages.append(StageResult(
                     name=stage_name,
-                    status="skipped",
+                    status="skipped_missing_prereq",
                     duration_seconds=time.time() - start_time,
-                    error="Identities not found",
+                    reason=f"Missing: identities ({identities_path})",
                 ))
 
         except Exception as e:
@@ -351,7 +360,8 @@ class SmokeRunner:
         start_time = time.time()
 
         try:
-            screentime_path = self.manifest_dir / "screentime.json"
+            # Screentime is stored in data/analytics/{ep_id}/screentime.json
+            screentime_path = Path(f"data/analytics/{self.episode_id}/screentime.json")
 
             if screentime_path.exists():
                 with open(screentime_path) as f:
@@ -369,9 +379,9 @@ class SmokeRunner:
             else:
                 self.report.stages.append(StageResult(
                     name=stage_name,
-                    status="skipped",
+                    status="skipped_missing_prereq",
                     duration_seconds=time.time() - start_time,
-                    error="Screen time not found",
+                    reason=f"Missing: screentime ({screentime_path})",
                 ))
 
         except Exception as e:
@@ -405,9 +415,9 @@ class SmokeRunner:
             else:
                 self.report.stages.append(StageResult(
                     name=stage_name,
-                    status="skipped",
+                    status="skipped_missing_prereq",
                     duration_seconds=time.time() - start_time,
-                    error="Body tracking not run",
+                    reason="No body_tracks.jsonl - run FEATURES.body_tracking separately",
                 ))
 
         except Exception as e:
@@ -425,7 +435,7 @@ class SmokeRunner:
             "stages_run": len(self.report.stages),
             "stages_success": len([s for s in self.report.stages if s.status == "success"]),
             "stages_failed": len([s for s in self.report.stages if s.status == "failed"]),
-            "stages_skipped": len([s for s in self.report.stages if s.status == "skipped"]),
+            "stages_skipped": len([s for s in self.report.stages if s.status.startswith("skipped")]),
         }
 
         for stage in self.report.stages:
