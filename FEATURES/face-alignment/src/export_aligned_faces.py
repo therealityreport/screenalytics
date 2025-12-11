@@ -162,4 +162,43 @@ def compute_alignment_stats(
         stats["alignment_quality_std"] = float(np.std(qualities))
         stats["quality_above_threshold"] = sum(1 for q in qualities if q >= quality_threshold)
 
+    # Quality source breakdown (LUVLi vs heuristic)
+    sources = [
+        get_attr(f, "alignment_quality_source")
+        for f in aligned_faces
+        if get_attr(f, "alignment_quality_source") is not None
+    ]
+    if sources:
+        luvli_count = sum(1 for s in sources if s == "luvli")
+        heuristic_count = sum(1 for s in sources if s == "heuristic")
+        stats["alignment_quality_source_breakdown"] = {
+            "luvli_count": luvli_count,
+            "heuristic_count": heuristic_count,
+            "luvli_fraction": luvli_count / len(sources) if sources else 0.0,
+        }
+
+    # LUVLi uncertainty stats if available
+    uncertainties = [
+        get_attr(f, "landmark_uncertainty_mean")
+        for f in aligned_faces
+        if get_attr(f, "landmark_uncertainty_mean") is not None
+    ]
+    if uncertainties:
+        stats["landmark_uncertainty_stats"] = {
+            "mean": float(np.mean(uncertainties)),
+            "p95": float(np.percentile(uncertainties, 95)),
+        }
+
+    # Visibility stats if available
+    visibilities = [
+        get_attr(f, "landmark_visibility_fraction")
+        for f in aligned_faces
+        if get_attr(f, "landmark_visibility_fraction") is not None
+    ]
+    if visibilities:
+        stats["landmark_visibility_stats"] = {
+            "mean": float(np.mean(visibilities)),
+            "min": float(np.min(visibilities)),
+        }
+
     return stats
