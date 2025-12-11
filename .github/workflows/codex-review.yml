@@ -37,8 +37,17 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt: |
-            Review only the diff for this pull request.
-            Identify correctness, security, performance, and maintainability issues.
-            Prioritize P0 and P1 items with concrete, minimal fixes.
-            Use the repository’s guidelines:
+            Review PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            First, run `gh pr diff ${{ github.event.pull_request.number }}` to get the actual diff.
+
+            Review the changes for:
+            - Correctness and logic errors
+            - Security vulnerabilities
+            - Performance issues
+            - Maintainability concerns
+
+            Prioritize P0 (critical) and P1 (important) items with concrete, minimal fixes.
+
+            Repository guidelines:
             ${{ steps.guidelines.outputs.guidelines }}
