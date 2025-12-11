@@ -28,7 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -89,6 +89,16 @@ class EpisodeMetrics:
     alignment_quality_p05: Optional[float] = None
     alignment_quality_p95: Optional[float] = None
 
+    # Alignment quality source breakdown (LUVLi vs heuristic)
+    alignment_quality_source_luvli_count: int = 0
+    alignment_quality_source_heuristic_count: int = 0
+    alignment_quality_source_luvli_fraction: float = 0.0
+
+    # LUVLi uncertainty stats
+    landmark_uncertainty_mean: Optional[float] = None
+    landmark_uncertainty_p95: Optional[float] = None
+    landmark_visibility_mean: Optional[float] = None
+
     # Gating metrics (populated when gating is evaluated)
     gating_enabled: bool = False
     gating_threshold: float = 0.0
@@ -145,11 +155,32 @@ class EpisodeMetrics:
         """Return alignment quality stats if available."""
         if self.alignment_quality_mean is None:
             return None
-        return {
+        stats = {
             "mean": round(self.alignment_quality_mean, 4),
             "p05": round(self.alignment_quality_p05, 4) if self.alignment_quality_p05 else None,
             "p95": round(self.alignment_quality_p95, 4) if self.alignment_quality_p95 else None,
         }
+
+        # Add source breakdown if available
+        if self.alignment_quality_source_luvli_count > 0 or self.alignment_quality_source_heuristic_count > 0:
+            stats["source_breakdown"] = {
+                "luvli_count": self.alignment_quality_source_luvli_count,
+                "heuristic_count": self.alignment_quality_source_heuristic_count,
+                "luvli_fraction": round(self.alignment_quality_source_luvli_fraction, 4),
+            }
+
+        # Add LUVLi uncertainty stats if available
+        if self.landmark_uncertainty_mean is not None:
+            stats["luvli_uncertainty"] = {
+                "mean": round(self.landmark_uncertainty_mean, 4),
+                "p95": round(self.landmark_uncertainty_p95, 4) if self.landmark_uncertainty_p95 else None,
+            }
+        if self.landmark_visibility_mean is not None:
+            stats["luvli_visibility"] = {
+                "mean": round(self.landmark_visibility_mean, 4),
+            }
+
+        return stats
 
 
 @dataclass
@@ -267,11 +298,11 @@ def load_embeddings(manifest_dir: Path) -> Tuple[Optional[np.ndarray], List[Dict
     return embeddings, meta
 
 
-def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, float]]:
+def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, Any]]:
     """
     Load alignment quality statistics from aligned_faces.jsonl.
 
-    Returns dict with 'mean', 'p05', 'p95' or None if file doesn't exist.
+    Returns dict with quality stats including source breakdown, or None if file doesn't exist.
     """
     aligned_faces_path = manifest_dir / "face_alignment" / "aligned_faces.jsonl"
 
@@ -280,6 +311,10 @@ def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, float
         return None
 
     qualities = []
+    sources = []
+    uncertainties = []
+    visibilities = []
+
     with open(aligned_faces_path) as f:
         for line in f:
             data = json.loads(line)
@@ -287,18 +322,56 @@ def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, float
             if quality is not None:
                 qualities.append(quality)
 
+            source = data.get("alignment_quality_source")
+            if source is not None:
+                sources.append(source)
+
+            # LUVLi-specific fields
+            uncertainty_summary = data.get("landmark_uncertainty_summary", {})
+            if uncertainty_summary.get("mean") is not None:
+                uncertainties.append(uncertainty_summary["mean"])
+
+            visibility_summary = data.get("landmark_visibility_summary", {})
+            if visibility_summary.get("fraction") is not None:
+                visibilities.append(visibility_summary["fraction"])
+
     if not qualities:
         return None
 
     qualities_arr = np.array(qualities)
-    return {
+    result = {
         "mean": float(np.mean(qualities_arr)),
         "p05": float(np.percentile(qualities_arr, 5)),
         "p95": float(np.percentile(qualities_arr, 95)),
     }
 
+    # Source breakdown
+    if sources:
+        luvli_count = sum(1 for s in sources if s == "luvli")
+        heuristic_count = sum(1 for s in sources if s == "heuristic")
+        result["source_breakdown"] = {
+            "luvli_count": luvli_count,
+            "heuristic_count": heuristic_count,
+            "luvli_fraction": luvli_count / len(sources) if sources else 0.0,
+        }
 
-def load_gating_stats(manifest_dir: Path) -> Optional[Dict[str, any]]:
+    # LUVLi uncertainty stats
+    if uncertainties:
+        result["uncertainty_stats"] = {
+            "mean": float(np.mean(uncertainties)),
+            "p95": float(np.percentile(uncertainties, 95)),
+        }
+
+    # Visibility stats
+    if visibilities:
+        result["visibility_stats"] = {
+            "mean": float(np.mean(visibilities)),
+        }
+
+    return result
+
+
+def load_gating_stats(manifest_dir: Path) -> Optional[Dict[str, Any]]:
     """
     Load gating statistics from faces.jsonl.
 
@@ -528,6 +601,30 @@ def run_evaluation(
             metrics.alignment_quality_p95 = quality_stats["p95"]
             logger.info(f"  Alignment quality: mean={quality_stats['mean']:.4f}, "
                        f"p05={quality_stats['p05']:.4f}, p95={quality_stats['p95']:.4f}")
+
+            # Source breakdown
+            source_breakdown = quality_stats.get("source_breakdown")
+            if source_breakdown:
+                metrics.alignment_quality_source_luvli_count = source_breakdown.get("luvli_count", 0)
+                metrics.alignment_quality_source_heuristic_count = source_breakdown.get("heuristic_count", 0)
+                metrics.alignment_quality_source_luvli_fraction = source_breakdown.get("luvli_fraction", 0.0)
+                logger.info(f"  Quality source: LUVLi={source_breakdown['luvli_count']}, "
+                           f"heuristic={source_breakdown['heuristic_count']} "
+                           f"({source_breakdown['luvli_fraction']:.1%} LUVLi)")
+
+            # LUVLi uncertainty stats
+            uncertainty_stats = quality_stats.get("uncertainty_stats")
+            if uncertainty_stats:
+                metrics.landmark_uncertainty_mean = uncertainty_stats.get("mean")
+                metrics.landmark_uncertainty_p95 = uncertainty_stats.get("p95")
+                logger.info(f"  LUVLi uncertainty: mean={uncertainty_stats['mean']:.4f}, "
+                           f"p95={uncertainty_stats['p95']:.4f}")
+
+            # Visibility stats
+            visibility_stats = quality_stats.get("visibility_stats")
+            if visibility_stats:
+                metrics.landmark_visibility_mean = visibility_stats.get("mean")
+                logger.info(f"  LUVLi visibility: mean={visibility_stats['mean']:.4f}")
 
     # Gating metrics
     # Auto-detect gating if not specified

@@ -901,9 +901,18 @@ if st.session_state.get(_sync_key):
                 localStorage.removeItem(timeKey);
 
                 // Redirect with the captured timestamp
-                const url = new URL(window.location.href);
-                url.searchParams.set('capture_ts', val);
-                window.location.href = url.toString();
+                // IMPORTANT: components.html runs inside an iframe. We must
+                // navigate the parent page so Streamlit sees the new query param.
+                try {{
+                    const url = new URL(window.parent.location.href);
+                    url.searchParams.set('capture_ts', val);
+                    window.parent.location.href = url.toString();
+                }} catch (e) {{
+                    // Fallback: at least navigate this frame.
+                    const url = new URL(window.location.href);
+                    url.searchParams.set('capture_ts', val);
+                    window.location.href = url.toString();
+                }}
             }} else {{
                 // Stale capture, clear it
                 localStorage.removeItem(key);

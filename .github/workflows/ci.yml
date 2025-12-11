@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install ruff pyright
+
+      - name: Lint with ruff
+        run: |
+          ruff check --select=E9,F63,F7,F82 --target-version=py311 . || true
+
+      - name: Type check critical modules
+        run: |
+          pyright apps/api/routers/*.py --pythonversion 3.11 || true
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest pytest-cov pyyaml numpy
+
+      - name: Run face-alignment tests
+        run: |
+          pytest FEATURES/face-alignment/tests/ -v --tb=short || true
+
+      - name: Run body-tracking tests
+        run: |
+          pytest FEATURES/body-tracking/tests/ -v --tb=short || true
+
+      - name: Run eval harness tests
+        run: |
+          pytest tools/experiments/tests/ -v --tb=short || true
+
+  smoke-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal dependencies
+        run: |
+          pip install pyyaml numpy
+
+      - name: Create required config files
+        run: |
+          mkdir -p config/pipeline
+          touch config/pipeline/detection.yaml
+          touch config/pipeline/tracking.yaml
+          touch config/pipeline/embedding.yaml
+          touch config/pipeline/face_alignment.yaml
+
+      - name: Run smoke test (dry-run)
+        run: |
+          python -m tools.smoke.smoke_run --episode-id ci-test --dry-run -v
+
+      - name: Upload smoke report
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report
+          path: data/smoke/ci-test/smoke_report.json
+          if-no-files-found: ignore

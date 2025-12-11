@@ -291,9 +291,15 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 
 **Feature Sandbox:** `FEATURES/face-alignment/`
 
-**Current State:** Heuristic-based quality estimation is implemented and gating is integrated into the embedding stage. Faces with `alignment_quality < threshold` are skipped before embedding with `skip_reason=low_alignment_quality`. LUVLi model-based uncertainty will replace the heuristic in a future phase.
+**Current State:** Quality estimation supports both LUVLi model-based and heuristic fallback modes. The system automatically falls back to heuristics when LUVLi is unavailable. Faces with `alignment_quality < threshold` are skipped before embedding with `skip_reason=low_alignment_quality`.
 
-**Status:** ✅ Gating Integrated (pending eval validation)
+**LUVLi Integration:**
+- Quality source tracked via `alignment_quality_source` field ("luvli" | "heuristic")
+- Per-landmark uncertainty in `landmark_uncertainty_summary` (mean, p95)
+- Landmark visibility in `landmark_visibility_summary` (fraction)
+- Eval harness reports `alignment_quality_source_breakdown` with LUVLi/heuristic counts
+
+**Status:** ✅ LUVLi Integrated (pending eval validation)
 
 ---
 
@@ -645,7 +651,7 @@ embedding:
 | Module | Status | Blocker | Next Action |
 |--------|--------|---------|-------------|
 | **face_alignment** | ⚠ In Progress | FAN implementation in progress | Complete FAN 2D aligner |
-| **alignment_quality** | ✅ Integrated | Pending eval validation | Run gating impact eval |
+| **alignment_quality** | ✅ LUVLi Integrated | Pending eval validation | Run gating impact eval |
 | **head_pose_3d** | ⚠ Pending | Depends on face_alignment | Implement 3DDFA_V2 integration |
 | **body_tracking** | ✅ Implemented | Pending eval metrics | Run eval on validation episodes |
 | **person_reid** | ✅ Implemented | Pending eval metrics | Run Re-ID benchmark |

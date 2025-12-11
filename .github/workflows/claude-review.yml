@@ -1,0 +1,53 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR merge ref
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Capture review guidelines
+        id: guidelines
+        run: |
+          DELIM="GUIDELINES_$(openssl rand -hex 8)"
+          {
+            echo "guidelines<<${DELIM}"
+            if [ -f AGENTS.md ]; then
+              sed -n '1,400p' AGENTS.md
+            else
+              echo 'No AGENTS.md found.'
+            fi
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            First, run `gh pr diff ${{ github.event.pull_request.number }}` to get the actual diff.
+
+            Review the changes for:
+            - Correctness and logic errors
+            - Security vulnerabilities
+            - Performance issues
+            - Maintainability concerns
+
+            Prioritize P0 (critical) and P1 (important) items with concrete, minimal fixes.
+
+            Repository guidelines:
+            ${{ steps.guidelines.outputs.guidelines }}
