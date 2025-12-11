@@ -35,9 +35,6 @@ jobs:
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # The action reads the PR diff automatically via GITHUB_* env.
-          # Provide additional instructions. The guidelines block is optional.
           prompt: |
             Review only the diff for this pull request.
             Identify correctness, security, performance, and maintainability issues.
