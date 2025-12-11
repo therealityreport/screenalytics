@@ -335,6 +335,10 @@ Full troubleshooting guide: [docs/ops/troubleshooting_faces_pipeline.md](docs/op
 
 See [FEATURES_GUIDE.md](FEATURES_GUIDE.md) for the promotion workflow.
 
+### Dev Tools
+
+- **Claude Code Action**: Tag `@claude` in any Issue or PR comment to get AI assistance. See [docs/dev/claude-code-action.md](docs/dev/claude-code-action.md) for setup and usage.
+
 ---
 
 ## License
