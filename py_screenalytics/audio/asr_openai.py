@@ -490,88 +490,10 @@ def check_api_available() -> bool:
     return bool(os.environ.get("OPENAI_API_KEY"))
 
 
-def transcribe_with_diarization(
-    audio_path: Path,
-    output_path: Path,
-    known_speaker_names: Optional[List[str]] = None,
-    known_speaker_audio_paths: Optional[List[Path]] = None,
-    overwrite: bool = False,
-) -> List[ASRSegment]:
-    """Transcribe audio with speaker diarization using gpt-4o-transcribe-diarize.
-
-    This is a unified transcription+diarization function that can replace
-    both pyannote diarization and whisper transcription in one API call.
-
-    Args:
-        audio_path: Path to input audio file
-        output_path: Path for ASR manifest (JSONL)
-        known_speaker_names: Optional list of known speaker names (up to 4)
-        known_speaker_audio_paths: Optional list of audio reference files for known speakers
-        overwrite: Whether to overwrite existing results
-
-    Returns:
-        List of ASRSegment objects with speaker labels
-    """
-    import base64
-
-    if output_path.exists() and not overwrite:
-        LOGGER.info(f"ASR+diarization results already exist: {output_path}")
-        return _load_asr_manifest(output_path)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    client = _get_openai_client()
-
-    LOGGER.info(f"Transcribing audio with diarization: {audio_path}")
-
-    # Prepare known speaker references if provided
-    extra_body = {}
-    if known_speaker_names and known_speaker_audio_paths:
-        # Limit to 4 speakers as per OpenAI docs
-        names = known_speaker_names[:4]
-        refs = []
-        for path in known_speaker_audio_paths[:4]:
-            if Path(path).exists():
-                with open(path, "rb") as f:
-                    audio_data = base64.b64encode(f.read()).decode("utf-8")
-                    # Determine MIME type
-                    suffix = Path(path).suffix.lower()
-                    mime = {
-                        ".wav": "audio/wav",
-                        ".mp3": "audio/mpeg",
-                        ".m4a": "audio/mp4",
-                    }.get(suffix, "audio/wav")
-                    refs.append(f"data:{mime};base64,{audio_data}")
-
-        if refs:
-            extra_body = {
-                "known_speaker_names": names,
-                "known_speaker_references": refs,
-            }
-            LOGGER.info(f"Using {len(refs)} known speaker references")
-
-    with audio_path.open("rb") as f:
-        if extra_body:
-            response = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe-diarize",
-                file=f,
-                response_format="diarized_json",
-                chunking_strategy="auto",
-                extra_body=extra_body,
-            )
-        else:
-            response = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe-diarize",
-                file=f,
-                response_format="diarized_json",
-                chunking_strategy="auto",
-            )
-
-    segments = _parse_diarized_response(response)
-
-    # Save manifest
-    _save_asr_manifest(segments, output_path)
-
-    speaker_count = len(set(s.speaker for s in segments if s.speaker))
-    LOGGER.info(f"Transcription+diarization complete: {len(segments)} segments, {speaker_count} speakers")
-
-    return segments
+# DEPRECATED: transcribe_with_diarization removed
+# Speaker diarization is now handled by NeMo MSDD (diarization_nemo.py)
+# Transcription remains separate using transcribe_audio() below
+#
+# def transcribe_with_diarization(...):
+#     """Removed - use NeMo MSDD for diarization instead."""
+#     pass

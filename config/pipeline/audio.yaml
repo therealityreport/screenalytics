@@ -4,7 +4,7 @@
 # Stack:
 # - MDX-Extra for stem separation (speech vs music/SFX)
 # - Resemble Enhance for denoise/enhance
-# - Pyannote for diarization
+# - NeMo MSDD for overlap-aware speaker diarization
 # - OpenAI Whisper as primary ASR (API-based)
 # - Gemini 3 as optional second-pass (cleanup, enrichment, alt-ASR)
 
@@ -26,23 +26,21 @@ audio_pipeline:
     retry_delay_seconds: 2
 
   # Speaker diarization settings
-  # Uses official PyannoteAI v1 API workflow
+  # Uses NeMo MSDD (Multi-Scale Diarization Decoder) for overlap-aware diarization
   diarization:
-    provider: "pyannote"
-    backend: "precision-2"           # "precision-2" (cloud API) | "oss-3.1" (local)
-    model_name: "pyannote/speaker-diarization-precision-2"
-    min_speech: 0.8                  # Minimum speech duration (seconds) - filters out very short segments
-    max_overlap: 0.1                 # Maximum allowed overlap ratio
-    merge_gap_ms: 150                # Gap threshold for merging segments (lower = less merging)
-    min_speakers: 4                  # HINT: minimum expected speakers (auto-calculated from cast ±3)
-    max_speakers: 15                 # HINT: maximum expected (auto-calculated from cast ±3)
+    provider: "nemo"
+    backend: "msdd"                  # NeMo Multi-Scale Diarization Decoder
+    model_name: "diar_msdd_telephonic"
+    min_speech: 0.2                  # Minimum speech duration (seconds)
+    max_overlap: 0.1                 # Quality control threshold
+    merge_gap_ms: 300                # Gap threshold for merging segments
+    min_speakers: 1                  # HINT: minimum expected speakers
+    max_speakers: 8                  # HINT: maximum expected (reality TV upper bound)
     # num_speakers: null             # FORCE exact count (uncomment to override min/max)
 
-    # Official API workflow settings (precision-2 only)
-    use_exclusive_diarization: true  # Always use exclusive mode for clean segment merging
-    webhook_url: null                # Optional: webhook URL for async job completion
-    api_poll_interval_base: 6.0      # Base polling interval in seconds (5-8s per official docs)
-    api_poll_interval_jitter: 2.0    # Random jitter added to polling interval
+    # NeMo-specific settings
+    overlap_threshold: 0.5           # Probability threshold for multi-speaker detection
+    embedding_model: "titanet_large" # Speaker embedding model
 
   # Automatic speech recognition settings
   asr:
@@ -58,10 +56,10 @@ audio_pipeline:
 
   # Voice clustering and bank settings
   voice_clustering:
-    use_diarization_labels: true     # Use pyannote speaker labels directly (skip embedding clustering)
-    similarity_threshold: 0.30       # Cosine similarity for clustering (only if use_diarization_labels=false)
+    use_diarization_labels: true     # Use diarization speaker labels directly (skip embedding clustering)
+    similarity_threshold: 0.65       # Cosine similarity for clustering (only if use_diarization_labels=false)
     min_segments_per_cluster: 1      # Allow single-segment clusters for trailers/short content
-    embedding_model: "pyannote/embedding"
+    embedding_model: "titanet_large" # NeMo TitaNet (192-dim embeddings)
     centroid_method: "mean"          # "mean" | "median"
 
   # Voice bank configuration
@@ -97,4 +95,4 @@ s3_layout:
   qc_subdir: "qc"
 
 # Description
-description: "Audio pipeline: MDX-Extra + Resemble + Pyannote + OpenAI Whisper for episode transcription"
+description: "Audio pipeline: MDX-Extra + Resemble + NeMo MSDD + OpenAI Whisper for episode transcription"

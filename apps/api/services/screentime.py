@@ -12,9 +12,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+from enum import Enum
+
 from py_screenalytics.artifacts import get_path
 
 LOGGER = logging.getLogger(__name__)
+
+
+class OverlapPolicy(str, Enum):
+    """Policy for handling overlapping speech in speaking time calculation."""
+    SHARED = "shared"       # Split duration between active speakers
+    FULL = "full"           # Each speaker gets full credit
+    PRIMARY_ONLY = "primary"  # Only highest-probability speaker gets credit
 
 
 @dataclass
@@ -30,6 +39,8 @@ class ScreenTimeConfig:
     # Minimum duration for a single-face interval to avoid zero-duration entries
     # Default: 1/30s (~33ms) which is approximately one frame at 30fps
     min_interval_duration_s: float = 0.033
+    # Policy for handling overlapping speech (shared, full, primary)
+    overlap_policy: OverlapPolicy = OverlapPolicy.SHARED
 
 
 @dataclass
@@ -88,25 +99,39 @@ class ScreenTimeAnalyzer:
         tracks = self._load_tracks(ep_id)
         identities = self._load_identities(ep_id)
         people, show_id = self._load_people(ep_id)
+        cast_members = self._load_cast_members(show_id)
 
         diagnostics["faces_loaded"] = len(faces)
         diagnostics["tracks_loaded"] = len(tracks)
         diagnostics["identities_loaded"] = len(identities)
         diagnostics["people_loaded"] = len(people)
+        diagnostics["cast_members_loaded"] = len(cast_members)
 
         LOGGER.info(
             f"[screentime] Loaded {len(faces)} faces, {len(tracks)} tracks, "
-            f"{len(identities)} identities, {len(people)} people"
+            f"{len(identities)} identities, {len(people)} people, {len(cast_members)} cast"
         )
 
         # Count identities with person_id
-        diagnostics["identities_with_person_id"] = sum(1 for identity in identities if identity.get("person_id"))
+        identities_with_person = sum(1 for identity in identities if identity.get("person_id"))
+        diagnostics["identities_with_person_id"] = identities_with_person
+        diagnostics["identities_without_person_id"] = len(identities) - identities_with_person
+
+        # Compute assignment status
+        if len(identities) == 0:
+            diagnostics["assignment_status"] = "no_clusters"
+        elif identities_with_person == 0:
+            diagnostics["assignment_status"] = "none"
+        elif identities_with_person < len(identities):
+            diagnostics["assignment_status"] = "partial"
+        else:
+            diagnostics["assignment_status"] = "complete"
 
         # Build mapping chain: track_id -> identity_id -> person_id -> cast_id
         track_to_identity = self._build_track_to_identity_map(identities)
         person_to_cast = self._build_person_to_cast_map(people)
-        person_to_name = self._build_person_to_name_map(people)
-        identity_to_person = self._build_identity_to_person_map(ep_id, people)
+        person_to_name = self._build_person_to_name_map(people, cast_members)
+        identity_to_person = self._build_identity_to_person_map(ep_id, people, identities)
         tracks_by_id = self._index_tracks(tracks)
 
         diagnostics["tracks_mapped_to_identity"] = len(track_to_identity)
@@ -143,6 +168,8 @@ class ScreenTimeAnalyzer:
         # Analyze each cast member
         cast_metrics_map: Dict[str, CastMetrics] = {}
         cast_intervals: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+        # Collect intervals for unassigned tracks (have identity but no person/cast)
+        unassigned_intervals: List[Tuple[float, float]] = []
 
         for track_id, track_faces in faces_by_track.items():
             # Resolve track -> identity -> person -> cast
@@ -155,12 +182,24 @@ class ScreenTimeAnalyzer:
             if not person_id:
                 diagnostics["tracks_missing_person"] += 1
                 LOGGER.debug(f"[screentime] Track {track_id} -> identity {identity_id} has no person_id mapping")
+                # Collect interval for unassigned track
+                track_meta = tracks_by_id.get(track_id)
+                valid_faces = [face for face in track_faces if face.get("quality", 1.0) >= self.config.quality_min]
+                if valid_faces:
+                    intervals = self._build_track_intervals(track_id, valid_faces, track_meta)
+                    unassigned_intervals.extend(intervals)
                 continue
 
             cast_id = person_to_cast.get(person_id)
             if not cast_id:
                 diagnostics["tracks_missing_cast"] += 1
                 LOGGER.debug(f"[screentime] Track {track_id} -> person {person_id} has no cast_id, skipping")
+                # Collect interval for track without cast assignment
+                track_meta = tracks_by_id.get(track_id)
+                valid_faces = [face for face in track_faces if face.get("quality", 1.0) >= self.config.quality_min]
+                if valid_faces:
+                    intervals = self._build_track_intervals(track_id, valid_faces, track_meta)
+                    unassigned_intervals.extend(intervals)
                 continue
 
             # This track has a full chain to cast_id
@@ -218,11 +257,15 @@ class ScreenTimeAnalyzer:
             cast_intervals[cast_id].extend(intervals)
             diagnostics["tracks_used_for_visuals"] += 1
 
+        # Store merged intervals for timeline visualization
+        cast_merged_intervals: Dict[str, List[Tuple[float, float]]] = {}
+
         # Merge intervals per cast member and compute durations
         for cast_id, metrics in cast_metrics_map.items():
             intervals = cast_intervals.get(cast_id, [])
             if not intervals:
                 metrics.visual_s = 0.0
+                cast_merged_intervals[cast_id] = []
                 continue
 
             padded = self._apply_edge_padding(intervals)
@@ -230,6 +273,7 @@ class ScreenTimeAnalyzer:
             raw_duration = sum(self._interval_duration(interval) for interval in padded)
             merged_duration = sum(self._interval_duration(interval) for interval in merged)
             metrics.visual_s = merged_duration
+            cast_merged_intervals[cast_id] = merged
 
             if LOGGER.isEnabledFor(logging.DEBUG):
                 LOGGER.debug(
@@ -264,6 +308,53 @@ class ScreenTimeAnalyzer:
         LOGGER.info(f"[screentime] Analyzed {len(cast_metrics_map)} cast members")
         LOGGER.info(f"[screentime] Diagnostics: {diagnostics}")
 
+        # Compute speaking time from transcript (if available)
+        transcript = self._load_transcript(ep_id)
+        voice_mapping = self._load_voice_mapping(ep_id)
+
+        if transcript and voice_mapping:
+            speaking_times = self._compute_speaking_time(transcript, voice_mapping)
+            LOGGER.info(f"[screentime] Computed speaking times for {len(speaking_times)} cast members")
+
+            # Apply speaking times to cast metrics
+            for cast_id, metrics in cast_metrics_map.items():
+                metrics.speaking_s = speaking_times.get(cast_id, 0.0)
+
+            # Add diagnostics
+            diagnostics["transcript_rows"] = len(transcript)
+            diagnostics["voice_mappings"] = len(voice_mapping)
+            diagnostics["speaking_time_computed"] = True
+        else:
+            diagnostics["transcript_rows"] = 0
+            diagnostics["voice_mappings"] = 0
+            diagnostics["speaking_time_computed"] = False
+            if not transcript:
+                LOGGER.info("[screentime] No transcript available, speaking_s will be 0")
+            if not voice_mapping:
+                LOGGER.info("[screentime] No voice mapping available, speaking_s will be 0")
+
+        # Merge unassigned intervals
+        merged_unassigned = self._merge_intervals(unassigned_intervals) if unassigned_intervals else []
+
+        # Build timeline data for visualization
+        timeline_data = []
+        for m in sorted(cast_metrics_map.values(), key=lambda x: x.visual_s, reverse=True):
+            name = person_to_name.get(m.person_id, "Unknown")
+            intervals = cast_merged_intervals.get(m.cast_id, [])
+            timeline_data.append({
+                "name": name,
+                "cast_id": m.cast_id,
+                "intervals": [[round(start, 2), round(end, 2)] for start, end in intervals],
+            })
+
+        # Add unassigned track timeline entry
+        if merged_unassigned:
+            timeline_data.append({
+                "name": "Unassigned",
+                "cast_id": None,
+                "intervals": [[round(start, 2), round(end, 2)] for start, end in merged_unassigned],
+            })
+
         # Convert to output format
         return {
             "episode_id": ep_id,
@@ -283,6 +374,7 @@ class ScreenTimeAnalyzer:
                 }
                 for m in sorted(cast_metrics_map.values(), key=lambda x: x.visual_s, reverse=True)
             ],
+            "timeline": timeline_data,
         }
 
     def _load_faces(self, ep_id: str) -> List[Dict[str, Any]]:
@@ -334,6 +426,130 @@ class ScreenTimeAnalyzer:
 
         return data.get("identities", [])
 
+    def _load_transcript(self, ep_id: str) -> List[Dict[str, Any]]:
+        """Load transcript JSONL for an episode.
+
+        Returns empty list if transcript doesn't exist (audio pipeline not run).
+        """
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+        transcript_path = data_root / "manifests" / ep_id / "transcript.jsonl"
+
+        if not transcript_path.exists():
+            LOGGER.debug(f"[screentime] No transcript found: {transcript_path}")
+            return []
+
+        rows = []
+        with transcript_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        return rows
+
+    def _load_voice_mapping(self, ep_id: str) -> Dict[str, str]:
+        """Load voice bank mapping (voice_cluster_id -> cast_id).
+
+        Returns empty dict if voice mapping doesn't exist.
+        """
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+        mapping_path = data_root / "manifests" / ep_id / "voice_bank_mapping.json"
+
+        if not mapping_path.exists():
+            LOGGER.debug(f"[screentime] No voice mapping found: {mapping_path}")
+            return {}
+
+        try:
+            with mapping_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Build voice_cluster_id -> cast_id mapping
+            mapping = {}
+            for entry in data.get("mappings", []):
+                voice_cluster_id = entry.get("voice_cluster_id")
+                cast_id = entry.get("cast_id")
+                if voice_cluster_id and cast_id:
+                    mapping[voice_cluster_id] = cast_id
+            return mapping
+        except (json.JSONDecodeError, KeyError) as e:
+            LOGGER.warning(f"[screentime] Error loading voice mapping: {e}")
+            return {}
+
+    def _compute_speaking_time(
+        self,
+        transcript: List[Dict[str, Any]],
+        voice_mapping: Dict[str, str],
+    ) -> Dict[str, float]:
+        """Compute speaking time per cast member from transcript.
+
+        Args:
+            transcript: Transcript rows with speaker info and overlap fields
+            voice_mapping: Mapping from voice_cluster_id to cast_id
+
+        Returns:
+            Dict mapping cast_id to speaking time in seconds
+        """
+        speaking_time: Dict[str, float] = defaultdict(float)
+
+        for row in transcript:
+            start = row.get("start", 0.0)
+            end = row.get("end", 0.0)
+            duration = max(0.0, end - start)
+
+            if duration <= 0:
+                continue
+
+            voice_cluster_id = row.get("voice_cluster_id")
+            voice_bank_id = row.get("voice_bank_id")
+
+            # Try to map to cast_id
+            cast_id = None
+            if voice_cluster_id and voice_cluster_id in voice_mapping:
+                cast_id = voice_mapping[voice_cluster_id]
+            elif voice_bank_id and voice_bank_id.startswith("voice_"):
+                # voice_bank_id format: "voice_{cast_id}"
+                potential_cast = voice_bank_id.replace("voice_", "", 1)
+                if potential_cast in voice_mapping.values():
+                    cast_id = potential_cast
+
+            if not cast_id:
+                continue
+
+            # Check for overlap and apply policy
+            is_overlap = row.get("overlap", False)
+            secondary_speakers = row.get("secondary_speakers", [])
+
+            if is_overlap and secondary_speakers:
+                if self.config.overlap_policy == OverlapPolicy.SHARED:
+                    # Split duration among all active speakers
+                    num_speakers = 1 + len(secondary_speakers)
+                    speaking_time[cast_id] += duration / num_speakers
+
+                    # Also credit secondary speakers if they map to cast
+                    for sec_speaker in secondary_speakers:
+                        sec_cast_id = voice_mapping.get(sec_speaker)
+                        if sec_cast_id:
+                            speaking_time[sec_cast_id] += duration / num_speakers
+
+                elif self.config.overlap_policy == OverlapPolicy.FULL:
+                    # Each speaker gets full credit
+                    speaking_time[cast_id] += duration
+
+                    for sec_speaker in secondary_speakers:
+                        sec_cast_id = voice_mapping.get(sec_speaker)
+                        if sec_cast_id:
+                            speaking_time[sec_cast_id] += duration
+
+                else:  # PRIMARY_ONLY
+                    # Only primary speaker gets credit
+                    speaking_time[cast_id] += duration
+            else:
+                # No overlap - full credit to primary speaker
+                speaking_time[cast_id] += duration
+
+        return dict(speaking_time)
+
     def _load_people(self, ep_id: str) -> Tuple[List[Dict[str, Any]], str]:
         """Load people.json for the show."""
         # Parse episode ID to get show
@@ -382,20 +598,76 @@ class ScreenTimeAnalyzer:
 
         return mapping
 
-    def _build_person_to_name_map(self, people: List[Dict[str, Any]]) -> Dict[str, str]:
-        """Build mapping from person_id to name."""
+    def _load_cast_members(self, show_id: str) -> List[Dict[str, Any]]:
+        """Load cast members for a show."""
+        from apps.api.services.cast import CastService
+        cast_service = CastService()
+        try:
+            return cast_service.list_cast(show_id)
+        except Exception as e:
+            LOGGER.warning(f"[screentime] Could not load cast members for {show_id}: {e}")
+            return []
+
+    def _build_person_to_name_map(
+        self, people: List[Dict[str, Any]], cast_members: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, str]:
+        """Build mapping from person_id to name.
+
+        Falls back to cast member name if person name is None or "None".
+        """
+        # Build cast_id -> name lookup for fallback
+        cast_name_lookup = {}
+        if cast_members:
+            for cast in cast_members:
+                cast_id = cast.get("cast_id")
+                cast_name = cast.get("name")
+                if cast_id and cast_name:
+                    cast_name_lookup[cast_id] = cast_name
+
         mapping = {}
         for person in people:
             person_id = person.get("person_id")
             name = person.get("name")
-            if person_id and name:
+            cast_id = person.get("cast_id")
+
+            # Skip if no person_id
+            if not person_id:
+                continue
+
+            # Use person name if valid (not None, not empty, not the string "None")
+            if name and name != "None":
                 mapping[person_id] = name
+            # Fall back to cast member name
+            elif cast_id and cast_id in cast_name_lookup:
+                mapping[person_id] = cast_name_lookup[cast_id]
+            # Use person_id as last resort
+            else:
+                mapping[person_id] = person_id
 
         return mapping
 
-    def _build_identity_to_person_map(self, ep_id: str, people: List[Dict[str, Any]]) -> Dict[str, str]:
-        """Build mapping from identity_id (with ep_id prefix) to person_id."""
-        mapping = {}
+    def _build_identity_to_person_map(
+        self,
+        ep_id: str,
+        people: List[Dict[str, Any]],
+        identities: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, str]:
+        """Build mapping from identity_id to person_id.
+
+        PRIMARY: Use identity.person_id directly from identities.json (most reliable)
+        FALLBACK: Use people.cluster_ids for backwards compatibility
+        """
+        mapping: Dict[str, str] = {}
+
+        # PRIMARY: Use person_id directly from identities (most reliable source)
+        if identities:
+            for identity in identities:
+                identity_id = identity.get("identity_id")
+                person_id = identity.get("person_id")
+                if identity_id and person_id:
+                    mapping[identity_id] = person_id
+
+        # FALLBACK: Fill gaps from people.cluster_ids (backwards compat)
         for person in people:
             person_id = person.get("person_id")
             if not person_id:
@@ -406,9 +678,9 @@ class ScreenTimeAnalyzer:
                 # cluster_id format: "ep_id:identity_id"
                 if ":" in cluster_id:
                     episode, identity = cluster_id.split(":", 1)
-                    if episode == ep_id:
+                    if episode == ep_id and identity not in mapping:
                         mapping[identity] = person_id
-                else:
+                elif cluster_id not in mapping:
                     # Legacy format without episode prefix
                     mapping[cluster_id] = person_id
 

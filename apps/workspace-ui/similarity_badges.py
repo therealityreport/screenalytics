@@ -1347,12 +1347,15 @@ def render_singleton_risk_badge(
         origin_text = origin_labels.get(origin, origin)
         tooltip += f" | Origin: {origin_text}"
 
+    # Use different emoji based on risk level for clarity
+    risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk_level, "⚪")
+
     return (
         f'<span class="sim-badge sim-badge-singleton-risk" '
         f'style="background-color: {color}; color: white; '
         f'padding: 2px 6px; border-radius: 3px; font-size: 0.75em; font-weight: bold; cursor: help;" '
         f'title="{tooltip}">'
-        f"🎯 {risk_level}</span>"
+        f"{risk_emoji} Risk: {risk_level}</span>"
     )
 
 

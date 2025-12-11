@@ -672,6 +672,11 @@ class GroupingService:
         manifests_dir = get_path(ep_id, "detections").parent
         return manifests_dir / "faces.jsonl"
 
+    def _tracks_path(self, ep_id: str) -> Path:
+        """Get path to tracks.jsonl for an episode."""
+        manifests_dir = get_path(ep_id, "detections").parent
+        return manifests_dir / "tracks.jsonl"
+
     def _group_log_path(self, ep_id: str) -> Path:
         """Get path to group_log.json for an episode."""
         manifests_dir = get_path(ep_id, "detections").parent
@@ -2306,6 +2311,25 @@ class GroupingService:
                 raise ValueError("No valid clusters found")
 
             proto = l2_normalize(np.mean(centroids_to_merge, axis=0))
+
+            # AUTO-CREATE cast member when name provided but no cast_id
+            # This ensures Screentime can show the person's name instead of "Unknown"
+            if name and not cast_id:
+                try:
+                    cast_member = self.cast_service.create_cast_member(
+                        show_id=show_id,
+                        name=name,
+                        role="other",
+                        status="active",
+                    )
+                    cast_id = cast_member["cast_id"]
+                    LOGGER.info(
+                        f"[{ep_id}] Auto-created cast member {cast_id} for name '{name}'"
+                    )
+                except Exception as e:
+                    LOGGER.warning(f"[{ep_id}] Failed to auto-create cast member for '{name}': {e}")
+                    # Continue without cast_id - person will still be created
+
             LOGGER.info(
                 "manual_assign_clusters creating person for cast",
                 extra={"ep_id": ep_id, "show_id": show_id, "cast_id": cast_id, "cluster_ids": cluster_ids},
@@ -3198,6 +3222,496 @@ class GroupingService:
             "suggestions": suggestions,
             "mismatched_embeddings": mismatched_embeddings,
             "quality_only_clusters": quality_only_clusters,
+        }
+
+    def analyze_singletons_batch(
+        self,
+        ep_id: str,
+        include_archive: bool = False,
+        min_similarity: float = 0.30,
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        """Batch analyze all singleton clusters against assigned track embeddings.
+
+        This method performs efficient batch comparison of ALL singleton clusters
+        (clusters with exactly 1 track) against ALL assigned track embeddings from
+        this episode. Results are grouped by suggested person for efficient UI review.
+
+        Args:
+            ep_id: Episode ID
+            include_archive: If True, also compare singletons against archived item centroids
+            min_similarity: Minimum similarity threshold for suggestions (default 0.30)
+            top_k: Max suggestions per singleton (default 3)
+
+        Returns:
+            {
+                "person_groups": [
+                    {
+                        "person_id": "p_001",
+                        "person_name": "Lisa",
+                        "cast_id": "cast_001",
+                        "matches": [
+                            {
+                                "track_id": 142,
+                                "identity_id": "id_042",
+                                "similarity": 0.92,
+                                "confidence": "high",
+                                "best_match_track_id": 15,
+                                "thumbnail_url": "...",
+                                "face_count": 3,
+                                "singleton_risk": "MEDIUM"
+                            },
+                            ...
+                        ],
+                        "total_faces": 12,
+                        "avg_similarity": 0.87,
+                        "confidence_breakdown": {"high": 6, "medium": 2, "low": 0}
+                    },
+                    ...
+                ],
+                "archive_matches": [...],
+                "unmatched": [...],
+                "stats": {...}
+            }
+        """
+        from apps.api.services.facebank import cosine_similarity
+
+        parsed = _parse_ep_id(ep_id)
+        if not parsed:
+            raise ValueError(f"Invalid episode ID: {ep_id}")
+        show_id = parsed["show"]
+
+        # Load identities
+        identities_path = self._identities_path(ep_id)
+        if not identities_path.exists():
+            raise FileNotFoundError(f"identities.json not found for {ep_id}")
+
+        identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+        identities = identities_data.get("identities", [])
+
+        # Load centroids
+        try:
+            centroids_data = self.load_cluster_centroids(ep_id)
+            centroids_map = _normalize_centroids_to_map(centroids_data.get("centroids", {}), validate=True)
+        except FileNotFoundError:
+            return {
+                "person_groups": [],
+                "archive_matches": [],
+                "unmatched": [],
+                "stats": {"error": "No centroids found. Run clustering first."},
+            }
+
+        # Load cast members and people
+        cast_members = self.cast_service.list_cast(show_id)
+        cast_lookup = {member["cast_id"]: member for member in cast_members if member.get("cast_id")}
+
+        people = self.people_service.list_people(show_id)
+        person_lookup: Dict[str, Dict[str, Any]] = {}
+        person_to_cast: Dict[str, str] = {}
+        for p in people:
+            if p.get("person_id"):
+                person_lookup[p["person_id"]] = p
+                if p.get("cast_id"):
+                    person_to_cast[p["person_id"]] = p["cast_id"]
+        people_with_cast = set(person_to_cast.keys())
+
+        # Load archived cluster IDs to exclude them from singletons
+        archived_cluster_ids: set = set()
+        try:
+            archived_data = self.archive_service.list_archived(
+                show_id, item_type="cluster", episode_id=ep_id, limit=10000
+            )
+            for item in archived_data.get("items", []):
+                original_id = item.get("original_id")
+                if original_id:
+                    archived_cluster_ids.add(original_id)
+            LOGGER.info(f"[{ep_id}] Excluding {len(archived_cluster_ids)} archived clusters from singleton analysis")
+        except Exception as e:
+            LOGGER.warning(f"[{ep_id}] Could not load archived clusters: {e}")
+
+        # Separate singletons from assigned clusters
+        singletons: List[Dict[str, Any]] = []  # Clusters with 1 track, unassigned
+        assigned_by_person: Dict[str, List[str]] = {}  # person_id -> [cluster_ids]
+        cluster_to_tracks: Dict[str, List[int]] = {}
+
+        for identity in identities:
+            cluster_id = identity.get("identity_id")
+            person_id = identity.get("person_id")
+            track_ids = identity.get("track_ids", [])
+            track_ids_int = [int(tid) for tid in track_ids]
+            cluster_to_tracks[cluster_id] = track_ids_int
+
+            is_singleton = len(track_ids) == 1
+            is_assigned = person_id and person_id in people_with_cast
+
+            if is_assigned:
+                assigned_by_person.setdefault(person_id, []).append(cluster_id)
+            elif is_singleton and cluster_id in centroids_map:
+                # Skip archived clusters
+                if cluster_id in archived_cluster_ids:
+                    continue
+                # This is an unassigned singleton with embeddings
+                singletons.append({
+                    "identity_id": cluster_id,
+                    "track_id": track_ids_int[0] if track_ids_int else None,
+                    "person_id": person_id,
+                })
+
+        LOGGER.info(
+            f"[{ep_id}] Singleton analysis: {len(singletons)} singletons, "
+            f"{len(assigned_by_person)} persons with assignments"
+        )
+
+        if not singletons:
+            return {
+                "person_groups": [],
+                "archive_matches": [],
+                "unmatched": [],
+                "stats": {
+                    "total_singletons": 0,
+                    "with_suggestions": 0,
+                    "unmatched_count": 0,
+                    "message": "No unassigned singletons found",
+                },
+            }
+
+        # Build track_id -> person_id map for assigned tracks
+        track_to_person: Dict[int, str] = {}
+        for person_id, cluster_ids in assigned_by_person.items():
+            for cid in cluster_ids:
+                for tid in cluster_to_tracks.get(cid, []):
+                    track_to_person[tid] = person_id
+
+        # Load face embeddings grouped by person_id
+        embeddings_by_person: Dict[str, Dict[int, List[np.ndarray]]] = {}  # person_id -> track_id -> [embeddings]
+        singleton_track_ids = {s["track_id"] for s in singletons if s["track_id"]}
+        singleton_embeddings: Dict[int, List[np.ndarray]] = {}
+
+        faces_path = self._faces_path(ep_id)
+        if faces_path.exists():
+            with faces_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        face = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    track_id = face.get("track_id")
+                    embedding = face.get("embedding")
+                    if track_id is None or not embedding:
+                        continue
+
+                    tid = int(track_id)
+                    emb_vec = np.array(embedding, dtype=np.float32)
+
+                    # Assigned track embeddings
+                    person_id = track_to_person.get(tid)
+                    if person_id:
+                        if person_id not in embeddings_by_person:
+                            embeddings_by_person[person_id] = {}
+                        embeddings_by_person[person_id].setdefault(tid, []).append(emb_vec)
+
+                    # Singleton track embeddings
+                    if tid in singleton_track_ids:
+                        singleton_embeddings.setdefault(tid, []).append(emb_vec)
+
+        LOGGER.info(
+            f"[{ep_id}] Loaded embeddings for {len(embeddings_by_person)} assigned persons, "
+            f"{len(singleton_embeddings)} singleton tracks"
+        )
+
+        # Load tracks for metadata (thumbnails, face counts)
+        tracks_path = self._tracks_path(ep_id)
+        track_lookup: Dict[int, Dict[str, Any]] = {}
+        if tracks_path.exists():
+            with tracks_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        track = json.loads(line)
+                        tid = int(track.get("track_id", -1))
+                        track_lookup[tid] = track
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
+
+        # Load faces for face count per track
+        face_counts: Dict[int, int] = {}
+        if faces_path.exists():
+            with faces_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        face = json.loads(line)
+                        tid = int(face.get("track_id", -1))
+                        face_counts[tid] = face_counts.get(tid, 0) + 1
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
+
+        # Compute centroids per person (mean of all their track embeddings)
+        person_centroids: Dict[str, np.ndarray] = {}
+        cast_id_to_person: Dict[str, str] = {}  # For facebank fallback
+
+        for person_id, track_embeddings in embeddings_by_person.items():
+            all_embeddings = []
+            for tid, embs in track_embeddings.items():
+                all_embeddings.extend(embs)
+            if all_embeddings:
+                all_embeddings = _validate_embedding_dimensions(all_embeddings, f"person_{person_id}")
+                if all_embeddings:
+                    person_centroids[person_id] = np.mean(all_embeddings, axis=0)
+
+        # FALLBACK: If no assigned clusters, use facebank seeds for cast members
+        using_facebank_fallback = False
+        if not person_centroids:
+            LOGGER.info(f"[{ep_id}] No assigned clusters found - falling back to facebank seeds")
+            using_facebank_fallback = True
+
+            # Load facebank seeds for all cast members
+            seeds = self.facebank_service.get_all_seeds_for_show(show_id)
+            seeds_by_cast: Dict[str, List[np.ndarray]] = {}
+            for seed in seeds:
+                cast_id = seed.get("cast_id")
+                if cast_id and seed.get("embedding"):
+                    emb_vec = np.array(seed["embedding"], dtype=np.float32)
+                    seeds_by_cast.setdefault(cast_id, []).append(emb_vec)
+
+            # Create pseudo-person entries for each cast member with seeds
+            for cast_id, seed_embeddings in seeds_by_cast.items():
+                if seed_embeddings:
+                    seed_embeddings = _validate_embedding_dimensions(seed_embeddings, f"cast_{cast_id}")
+                    if seed_embeddings:
+                        # Use cast_id as pseudo person_id
+                        pseudo_person_id = f"cast:{cast_id}"
+                        person_centroids[pseudo_person_id] = np.mean(seed_embeddings, axis=0)
+                        cast_id_to_person[pseudo_person_id] = cast_id
+                        # Also update person_lookup with cast info
+                        cast_data = cast_lookup.get(cast_id, {})
+                        person_lookup[pseudo_person_id] = {
+                            "person_id": pseudo_person_id,
+                            "name": cast_data.get("name", cast_id),
+                            "cast_id": cast_id,
+                        }
+                        person_to_cast[pseudo_person_id] = cast_id
+
+            LOGGER.info(f"[{ep_id}] Loaded {len(person_centroids)} cast members from facebank")
+
+        # For each singleton, compute similarity against all person centroids
+        # Group results by best matching person
+        person_matches: Dict[str, List[Dict[str, Any]]] = {}  # person_id -> [singleton matches]
+        unmatched: List[Dict[str, Any]] = []
+
+        for singleton in singletons:
+            track_id = singleton["track_id"]
+            identity_id = singleton["identity_id"]
+
+            if track_id is None:
+                continue
+
+            # Get singleton centroid (use cluster centroid if available, else compute from faces)
+            centroid_data = centroids_map.get(identity_id)
+            if centroid_data:
+                singleton_centroid = centroid_data["centroid"]
+            else:
+                # Compute from faces
+                singleton_embs = singleton_embeddings.get(track_id, [])
+                if not singleton_embs:
+                    continue
+                singleton_embs = _validate_embedding_dimensions(singleton_embs, f"singleton_{track_id}")
+                if not singleton_embs:
+                    continue
+                singleton_centroid = np.mean(singleton_embs, axis=0)
+
+            # Compare against all person centroids
+            suggestions_for_singleton: List[Dict[str, Any]] = []
+            for person_id, person_centroid in person_centroids.items():
+                if person_centroid.shape[0] != singleton_centroid.shape[0]:
+                    continue  # Dimension mismatch
+
+                sim = cosine_similarity(singleton_centroid, person_centroid)
+
+                if sim >= min_similarity:
+                    # Find best matching track within this person's tracks
+                    best_track_id = None
+                    best_track_sim = -1.0
+                    for tid, embs in embeddings_by_person.get(person_id, {}).items():
+                        for emb in embs:
+                            if emb.shape[0] != singleton_centroid.shape[0]:
+                                continue
+                            track_sim = cosine_similarity(singleton_centroid, emb)
+                            if track_sim > best_track_sim:
+                                best_track_sim = track_sim
+                                best_track_id = tid
+
+                    suggestions_for_singleton.append({
+                        "person_id": person_id,
+                        "similarity": float(sim),
+                        "best_match_track_id": best_track_id,
+                        "best_track_similarity": float(best_track_sim) if best_track_sim > 0 else None,
+                    })
+
+            # Sort by similarity and keep top_k
+            suggestions_for_singleton.sort(key=lambda x: x["similarity"], reverse=True)
+            top_suggestions = suggestions_for_singleton[:top_k]
+
+            # Get track metadata
+            track_data = track_lookup.get(track_id, {})
+            face_count = face_counts.get(track_id, track_data.get("faces_count", 0))
+
+            # Determine singleton risk
+            if face_count == 1:
+                singleton_risk = "HIGH"
+            elif face_count <= 3:
+                singleton_risk = "MEDIUM"
+            else:
+                singleton_risk = "LOW"
+
+            # Build thumbnail URL
+            thumbnail_url = track_data.get("best_crop_s3_key") or track_data.get("thumb_s3_key")
+
+            if top_suggestions:
+                # Group by best match person
+                best_suggestion = top_suggestions[0]
+                best_person_id = best_suggestion["person_id"]
+
+                # Determine confidence
+                best_sim = best_suggestion["similarity"]
+                if best_sim >= 0.80:
+                    confidence = "high"
+                elif best_sim >= 0.60:
+                    confidence = "medium"
+                else:
+                    confidence = "low"
+
+                match_entry = {
+                    "track_id": track_id,
+                    "identity_id": identity_id,
+                    "similarity": round(best_sim, 4),
+                    "confidence": confidence,
+                    "best_match_track_id": best_suggestion.get("best_match_track_id"),
+                    "thumbnail_url": thumbnail_url,
+                    "face_count": face_count,
+                    "singleton_risk": singleton_risk,
+                    "alternative_suggestions": [
+                        {
+                            "person_id": s["person_id"],
+                            "similarity": round(s["similarity"], 4),
+                        }
+                        for s in top_suggestions[1:]
+                    ],
+                }
+
+                person_matches.setdefault(best_person_id, []).append(match_entry)
+            else:
+                # No good suggestions
+                unmatched.append({
+                    "track_id": track_id,
+                    "identity_id": identity_id,
+                    "thumbnail_url": thumbnail_url,
+                    "face_count": face_count,
+                    "singleton_risk": singleton_risk,
+                    "best_similarity": 0.0,
+                    "best_match_name": None,
+                })
+
+        # Build person_groups with metadata
+        person_groups: List[Dict[str, Any]] = []
+        for person_id, matches in person_matches.items():
+            person_data = person_lookup.get(person_id, {})
+            cast_id = person_to_cast.get(person_id)
+            cast_data = cast_lookup.get(cast_id, {}) if cast_id else {}
+
+            # Calculate aggregate stats
+            similarities = [m["similarity"] for m in matches]
+            avg_similarity = sum(similarities) / len(similarities) if similarities else 0
+            total_faces = sum(m["face_count"] for m in matches)
+
+            confidence_breakdown = {"high": 0, "medium": 0, "low": 0}
+            for m in matches:
+                conf = m.get("confidence", "low")
+                confidence_breakdown[conf] = confidence_breakdown.get(conf, 0) + 1
+
+            # Sort matches by similarity (highest first)
+            matches.sort(key=lambda x: x["similarity"], reverse=True)
+
+            person_groups.append({
+                "person_id": person_id,
+                "person_name": person_data.get("name") or cast_data.get("name") or person_id,
+                "cast_id": cast_id,
+                "matches": matches,
+                "total_faces": total_faces,
+                "avg_similarity": round(avg_similarity, 4),
+                "confidence_breakdown": confidence_breakdown,
+            })
+
+        # Sort person_groups by number of matches (descending), then by avg similarity
+        person_groups.sort(key=lambda x: (len(x["matches"]), x["avg_similarity"]), reverse=True)
+
+        # Optional: compare against archived items
+        archive_matches: List[Dict[str, Any]] = []
+        if include_archive:
+            try:
+                archived_centroids = self.archive_service.get_archived_centroids(show_id, episode_id=ep_id)
+                for singleton in singletons:
+                    track_id = singleton["track_id"]
+                    identity_id = singleton["identity_id"]
+                    if track_id is None:
+                        continue
+
+                    centroid_data = centroids_map.get(identity_id)
+                    if not centroid_data:
+                        continue
+
+                    singleton_centroid = centroid_data["centroid"]
+
+                    for archived in archived_centroids:
+                        arch_centroid = archived.get("centroid")
+                        if not arch_centroid:
+                            continue
+                        arch_vec = np.array(arch_centroid, dtype=np.float32)
+                        if arch_vec.shape[0] != singleton_centroid.shape[0]:
+                            continue
+
+                        sim = cosine_similarity(singleton_centroid, arch_vec)
+                        if sim >= 0.70:  # Archive match threshold
+                            archive_matches.append({
+                                "track_id": track_id,
+                                "identity_id": identity_id,
+                                "archive_id": archived.get("archive_id"),
+                                "archive_type": archived.get("type", "unknown"),
+                                "similarity": round(float(sim), 4),
+                                "archived_name": archived.get("name"),
+                                "thumbnail_url": archived.get("rep_crop_url"),
+                            })
+            except Exception as e:
+                LOGGER.warning(f"[{ep_id}] Failed to load archived centroids: {e}")
+
+        # Build stats
+        stats = {
+            "total_singletons": len(singletons),
+            "with_suggestions": len(singletons) - len(unmatched),
+            "unmatched_count": len(unmatched),
+            "persons_with_matches": len(person_groups),
+            "archive_matches_count": len(archive_matches) if include_archive else None,
+        }
+
+        LOGGER.info(
+            f"[{ep_id}] Singleton analysis complete: {stats['with_suggestions']}/{stats['total_singletons']} "
+            f"with suggestions, grouped into {len(person_groups)} persons"
+        )
+
+        return {
+            "ep_id": ep_id,
+            "person_groups": person_groups,
+            "archive_matches": archive_matches,
+            "unmatched": unmatched,
+            "stats": stats,
         }
 
     def auto_link_high_confidence_matches(

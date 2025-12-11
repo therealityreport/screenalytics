@@ -1,0 +1,74 @@
+# Face Alignment Configuration
+# Documentation: docs/todo/feature_face_alignment_fan_luvli_3ddfa.md
+
+# Alignment backend selection
+aligner: fan_2d                    # fan_2d | fan_3d | insightface
+
+# FAN 2D Configuration (68-point landmarks)
+fan_2d:
+  detector: s3fd                   # s3fd | blazeface
+  device: auto                     # auto | cuda | cpu | mps
+  flip_input: false                # Horizontal flip for augmentation
+  face_detector_kwargs:
+    filter_threshold: 0.5
+
+# FAN 3D Configuration (optional)
+fan_3d:
+  detector: s3fd
+  device: auto
+
+# Fallback behavior
+fallback_on_failure: true          # Use insightface if FAN fails
+log_fallback_events: true          # Log when fallback is used
+
+# Quality gating (LUVLi-based)
+quality_gating:
+  enabled: true
+  min_alignment_quality: 0.60      # [0, 1], higher = stricter
+
+  # Per-landmark weights for quality computation
+  landmark_weights:
+    eyes: 1.5                      # Most important for identity
+    nose: 1.0
+    mouth: 0.8
+    chin: 0.5
+    ears: 0.3
+
+  # Uncertainty thresholds
+  max_uncertainty: 0.3             # Skip if avg uncertainty exceeds this
+
+# 3DDFA_V2 Configuration (selective 3D alignment)
+ddfa_v2:
+  enabled: true
+  device: auto
+
+  # Adaptive execution strategy
+  execution:
+    run_every_n_frames: 10         # Sample rate per track
+    run_on_uncertain: true         # Run if alignment_quality < threshold
+    uncertainty_threshold: 0.50    # Quality below this triggers 3D
+
+  # Pose limits for embedding eligibility
+  pose_limits:
+    max_yaw_for_embedding: 75      # Degrees, skip near-profile
+    max_pitch_for_embedding: 60    # Degrees, skip extreme up/down
+    max_roll_for_embedding: 45     # Degrees, skip extreme tilt
+
+  # Pose jump detection (track QA)
+  pose_qc:
+    max_yaw_jump: 30               # Degrees per frame
+    max_pitch_jump: 25
+    max_roll_jump: 20
+    flag_suspicious_jumps: true
+
+# Output configuration
+output:
+  store_landmarks: true            # Store 68-point landmarks in metadata
+  store_quality_scores: true       # Store per-face alignment_quality
+  store_head_pose: true            # Store yaw/pitch/roll
+  landmarks_format: flat           # flat | nested
+
+# Performance
+performance:
+  batch_size: 16                   # Faces per batch for FAN
+  cache_model: true                # Keep model in memory between calls

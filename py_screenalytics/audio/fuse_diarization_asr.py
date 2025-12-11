@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .models import (
     ASRSegment,
@@ -36,7 +36,7 @@ def fuse_transcript(
     output_vtt: Path,
     include_speaker_notes: bool = True,
     overwrite: bool = False,
-    diarization_source: str = "pyannote",
+    diarization_source: str = "nemo",
 ) -> List[TranscriptRow]:
     """Fuse diarization, ASR, and voice mapping into final transcript.
 
@@ -96,6 +96,8 @@ def fuse_transcript(
                     cluster_id,
                     mapping,
                 )
+                # Extract NeMo overlap info if available
+                is_overlap, secondary_speakers = _extract_overlap_info(diar_match)
                 words.append({
                     "w": w.w,
                     "t0": w.t0,
@@ -105,6 +107,8 @@ def fuse_transcript(
                     "voice_cluster_id": cluster_id,
                     "voice_bank_id": voice_bank_id,
                     "conf": w.t1 - w.t0,  # placeholder; whisper does not include per-word conf
+                    "overlap": is_overlap,
+                    "secondary_speakers": secondary_speakers,
                 })
         else:
             diar_match = _find_best_diarization_match(asr_segment, diarization_segments)
@@ -127,6 +131,8 @@ def fuse_transcript(
                 cluster_id,
                 mapping,
             )
+            # Extract NeMo overlap info if available
+            is_overlap, secondary_speakers = _extract_overlap_info(diar_match)
             words.append({
                 "w": asr_segment.text,
                 "t0": asr_segment.start,
@@ -136,6 +142,8 @@ def fuse_transcript(
                 "voice_cluster_id": cluster_id,
                 "voice_bank_id": voice_bank_id,
                 "conf": asr_segment.confidence,
+                "overlap": is_overlap,
+                "secondary_speakers": secondary_speakers,
             })
 
     words = sorted(words, key=lambda w: w.get("t0", 0.0))
@@ -164,9 +172,9 @@ def _build_group_cluster_lookup(
     """Map speaker_group_id -> voice_cluster_id.
 
     Handles multiple speaker ID formats for cross-source lookups:
-    - Raw speaker label: "SPEAKER_00"
-    - Pyannote prefixed: "pyannote:SPEAKER_00"
-    - GPT-4o prefixed: "gpt4o:Speaker 1"
+    - Raw speaker label: "SPEAKER_00", "spk_00"
+    - NeMo prefixed: "nemo:spk_00"
+    - Legacy prefixes for backward compatibility: "pyannote:SPEAKER_00", "gpt4o:Speaker 1"
     """
     mapping: Dict[str, str] = {}
     for cluster in voice_clusters:
@@ -174,9 +182,10 @@ def _build_group_cluster_lookup(
             if seg.diar_speaker:
                 # Map raw speaker label
                 mapping[seg.diar_speaker] = cluster.voice_cluster_id
-                # Map with pyannote prefix (common format)
+                # Map with nemo prefix (current format)
+                mapping[f"nemo:{seg.diar_speaker}"] = cluster.voice_cluster_id
+                # Legacy prefixes for backward compatibility with old manifests
                 mapping[f"pyannote:{seg.diar_speaker}"] = cluster.voice_cluster_id
-                # Map with gpt4o prefix for cross-source compatibility
                 mapping[f"gpt4o:{seg.diar_speaker}"] = cluster.voice_cluster_id
         for gid in cluster.speaker_group_ids:
             mapping[gid] = cluster.voice_cluster_id
@@ -227,6 +236,32 @@ def _find_best_diarization_match(
             best_match = diar_seg
 
     return best_match
+
+
+def _extract_overlap_info(diar_segment: Optional[Any]) -> Tuple[bool, List[str]]:
+    """Extract overlap information from a diarization segment.
+
+    Works with both NeMoDiarizationSegment (has overlap fields) and
+    standard DiarizationSegment (no overlap fields).
+
+    Args:
+        diar_segment: A diarization segment (NeMo or standard)
+
+    Returns:
+        Tuple of (is_overlap, secondary_speakers)
+    """
+    if diar_segment is None:
+        return False, []
+
+    # Check for NeMo overlap fields
+    is_overlap = getattr(diar_segment, "overlap", False)
+    active_speakers = getattr(diar_segment, "active_speakers", [])
+    primary_speaker = diar_segment.speaker
+
+    # Secondary speakers are active speakers minus the primary
+    secondary_speakers = [s for s in active_speakers if s != primary_speaker]
+
+    return is_overlap, secondary_speakers
 
 
 def _find_nearest_speaker(
@@ -431,6 +466,14 @@ def _merge_consecutive_speaker_rows(
             else:
                 merged_conf = current.conf or row.conf
 
+            # Merge overlap info: row has overlap if either row does
+            merged_overlap = current.overlap or row.overlap
+            # Combine secondary speakers, preserving uniqueness
+            merged_secondary = list(current.secondary_speakers)
+            for sp in row.secondary_speakers:
+                if sp not in merged_secondary:
+                    merged_secondary.append(sp)
+
             current = TranscriptRow(
                 start=current.start,
                 end=row.end,
@@ -441,6 +484,8 @@ def _merge_consecutive_speaker_rows(
                 text=f"{current.text} {row.text}".strip(),
                 conf=merged_conf,
                 words=merged_words,
+                overlap=merged_overlap,
+                secondary_speakers=merged_secondary,
             )
         else:
             merged.append(current)
@@ -470,6 +515,16 @@ def _rows_from_words(words: List[dict], max_gap: float = 0.8) -> List[Transcript
         end = current_words[-1]["t1"]
         confs = [w.get("conf") for w in current_words if w.get("conf") is not None]
         conf = sum(confs) / len(confs) if confs else None
+
+        # Aggregate overlap info: row has overlap if any word does
+        has_overlap = any(w.get("overlap", False) for w in current_words)
+        # Collect all unique secondary speakers from all words
+        all_secondary: List[str] = []
+        for w in current_words:
+            for sp in w.get("secondary_speakers", []):
+                if sp not in all_secondary:
+                    all_secondary.append(sp)
+
         rows.append(
             TranscriptRow(
                 start=start,
@@ -483,6 +538,8 @@ def _rows_from_words(words: List[dict], max_gap: float = 0.8) -> List[Transcript
                 words=[
                     WordTiming(w=w["w"], t0=w["t0"], t1=w["t1"]) for w in current_words
                 ],
+                overlap=has_overlap,
+                secondary_speakers=all_secondary,
             )
         )
 

@@ -1,0 +1,53 @@
+# Face Alignment Configuration
+# Documentation: docs/todo/feature_face_alignment_fan_luvli_3ddfa.md
+
+# Master switch
+face_alignment:
+  enabled: true
+
+  # Model configuration
+  model:
+    type: 2d                       # 2d | 3d
+    landmarks_type: 2D             # 2D | 3D | 2.5D
+    flip_input: false              # Flip for ensemble (slower but more robust)
+
+  # Processing
+  processing:
+    batch_size: 16                 # Faces per batch
+    stride: 1                      # Process every Nth frame (1 = all)
+    device: auto                   # auto | cuda | cpu
+
+  # Quality thresholds
+  quality:
+    min_face_size: 20              # Minimum face box size in pixels
+    min_confidence: 0.5            # Minimum detection confidence
+
+  # Output
+  output:
+    export_crops: false            # Save aligned crop images
+    crop_size: 112                 # ArcFace standard size
+    crop_margin: 0.0               # Margin around aligned face
+    jpeg_quality: 95               # Quality for JPEG crops
+
+# Quality gating (future: LUVLi integration)
+quality_gating:
+  enabled: false                   # Enable when LUVLi is implemented
+  threshold: 0.60                  # Minimum alignment_quality to pass
+  uncertainty_weight: 0.5          # Weight for landmark uncertainty
+
+# 3D head pose (future: 3DDFA_V2 integration)
+head_pose_3d:
+  enabled: false                   # Enable when 3DDFA_V2 is implemented
+  run_every_n_frames: 10           # Run 3D on every Nth frame
+  run_on_uncertain: true           # Also run on low-quality faces
+  uncertainty_threshold: 0.7       # Faces below this get 3D pose
+
+# Performance
+performance:
+  cache_model: true                # Keep FAN model in memory
+  warmup_batches: 2                # Warmup before timing
+
+# Logging
+logging:
+  log_per_frame: false             # Log every frame (verbose)
+  log_every_n: 100                 # Log progress every N faces

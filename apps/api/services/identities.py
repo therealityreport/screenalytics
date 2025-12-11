@@ -201,24 +201,56 @@ def write_identities(ep_id: str, payload: Dict[str, Any]) -> Path:
     return path
 
 
+def _fast_line_count(path: Path) -> int:
+    """Count non-empty lines without parsing JSON (much faster for large files)."""
+    if not path.exists():
+        return 0
+    count = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
 def update_identity_stats(ep_id: str, payload: Dict[str, Any]) -> None:
-    faces_count = len(load_faces(ep_id))
+    # Fast line count instead of loading entire faces.jsonl
+    faces_count = _fast_line_count(_faces_path(ep_id))
     payload.setdefault("stats", {})
     payload["stats"]["faces"] = faces_count
     payload["stats"]["clusters"] = len(payload.get("identities", []))
 
 
-def sync_manifests(ep_id: str, *paths: Path) -> None:
+def sync_manifests(ep_id: str, *paths: Path, async_upload: bool = False) -> None:
+    """Sync manifest files to S3.
+
+    Args:
+        ep_id: Episode ID
+        *paths: File paths to sync
+        async_upload: If True, upload in background thread (fire-and-forget)
+    """
     try:
         ctx = episode_context_from_id(ep_id)
     except ValueError:
         return
-    for path in paths:
-        if path and path.exists():
-            try:
-                STORAGE.put_artifact(ctx, "manifests", path, path.name)
-            except Exception:
-                continue
+
+    def _do_sync():
+        for path in paths:
+            if path and path.exists():
+                try:
+                    STORAGE.put_artifact(ctx, "manifests", path, path.name)
+                except Exception:
+                    continue
+
+    if async_upload:
+        import threading
+        thread = threading.Thread(target=_do_sync, daemon=True)
+        thread.start()
+    else:
+        _do_sync()
 
 
 def _identity_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -411,7 +443,27 @@ def cluster_track_summary(
             continue
         if include_set and identity_id.lower() not in include_set:
             continue
-        track_ids = identity.get("track_ids", []) or []
+        # Normalize track IDs; fallback to cluster centroids when identities.json is missing them
+        raw_track_ids = identity.get("track_ids", []) or []
+        if not raw_track_ids:
+            centroid_tracks = cluster_centroids_data.get(identity_id, {}).get("tracks") or []
+            if centroid_tracks:
+                LOGGER.info(
+                    "[cluster-track-summary] Using centroid tracks for %s in %s because identity.track_ids is empty",
+                    identity_id,
+                    ep_id,
+                )
+            raw_track_ids = centroid_tracks
+
+        track_ids: List[int] = []
+        for raw_tid in raw_track_ids:
+            tid_val = raw_tid
+            if isinstance(tid_val, str) and tid_val.startswith("track_"):
+                tid_val = tid_val.replace("track_", "")
+            try:
+                track_ids.append(int(tid_val))
+            except (TypeError, ValueError):
+                continue
 
         # Get cluster centroid for similarity computation
         cluster_centroid = None
@@ -420,11 +472,7 @@ def cluster_track_summary(
             cluster_centroid = cluster_data.get("centroid")
 
         tracks_payload: List[Dict[str, Any]] = []
-        for raw_tid in track_ids:
-            try:
-                tid = int(raw_tid)
-            except (TypeError, ValueError):
-                continue
+        for tid in track_ids:
             track_row = track_lookup.get(tid)
             if not track_row:
                 continue
@@ -461,7 +509,7 @@ def cluster_track_summary(
             limit = max(1, int(limit_per_cluster))
             tracks_payload = tracks_payload[:limit]
         track_count = len(track_ids)
-        face_total = identity.get("faces") or sum(face_counts.get(int(tid), 0) for tid in track_ids)
+        face_total = identity.get("faces") or sum(face_counts.get(tid, 0) for tid in track_ids)
 
         # Compute singleton risk level for this cluster
         singleton_origin = identity.get("origin")  # May be set during clustering
@@ -614,7 +662,8 @@ def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, An
     payload["identities"] = [item for item in identities if item.get("identity_id") != source_id]
     update_identity_stats(ep_id, payload)
     identities_path = write_identities(ep_id, payload)
-    sync_manifests(ep_id, identities_path)
+    # Async S3 upload for snappy UI response
+    sync_manifests(ep_id, identities_path, async_upload=True)
     return target
 
 
@@ -725,6 +774,9 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
     - move_track()
     - Merge operations
 
+    Also removes clusters where track_ids exist but the actual tracks are missing
+    from tracks.jsonl (orphaned track references).
+
     Args:
         ep_id: Episode identifier
         show_id: Show identifier (extracted from ep_id if not provided)
@@ -743,7 +795,21 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
     all_identities = identities.get("identities", [])
     identities_before = len(all_identities)
 
-    # Find empty clusters (no track_ids)
+    # Load tracks.jsonl to check for orphaned track references
+    tracks_path = get_path(ep_id, "tracks")
+    existing_track_ids: set = set()
+    if tracks_path.exists():
+        try:
+            import jsonlines
+            with jsonlines.open(tracks_path, mode="r") as reader:
+                for track in reader:
+                    tid = track.get("track_id")
+                    if tid is not None:
+                        existing_track_ids.add(int(tid))
+        except Exception as e:
+            LOGGER.warning(f"[{ep_id}] Could not load tracks.jsonl for cleanup: {e}")
+
+    # Find empty clusters (no track_ids OR all track_ids are orphaned)
     empty_cluster_ids = []
     kept_identities = []
     for identity in all_identities:
@@ -751,10 +817,32 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
         if not track_ids:
             empty_cluster_ids.append(identity.get("identity_id"))
             LOGGER.info(
-                "Removing empty cluster %s from episode %s",
+                "Removing empty cluster %s from episode %s (no track_ids)",
                 identity.get("identity_id"),
                 ep_id,
             )
+        elif existing_track_ids:
+            # Check if any track_ids actually exist in tracks.jsonl
+            valid_tracks = [tid for tid in track_ids if int(tid) in existing_track_ids]
+            if not valid_tracks:
+                empty_cluster_ids.append(identity.get("identity_id"))
+                LOGGER.info(
+                    "Removing orphaned cluster %s from episode %s (tracks %s not in tracks.jsonl)",
+                    identity.get("identity_id"),
+                    ep_id,
+                    track_ids,
+                )
+            else:
+                # Update the identity to only include valid track_ids
+                if len(valid_tracks) != len(track_ids):
+                    identity["track_ids"] = valid_tracks
+                    LOGGER.info(
+                        "Cleaned orphaned track refs from cluster %s: %d -> %d tracks",
+                        identity.get("identity_id"),
+                        len(track_ids),
+                        len(valid_tracks),
+                    )
+                kept_identities.append(identity)
         else:
             kept_identities.append(identity)
 
@@ -1177,8 +1265,24 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
             target_identity = entry
             track_ids_for_identity = normalized
             break
+    # CASE 0: Unclustered track - create a new identity for it
     if target_identity is None:
-        raise ValueError("track_not_found")
+        # Track is not in any identity cluster - create a new one
+        new_identity_id = _next_identity_id(entries)
+        target_identity = {
+            "identity_id": new_identity_id,
+            "label": None,
+            "track_ids": [track_id_int],
+            "name": trimmed,
+        }
+        payload.setdefault("identities", []).append(target_identity)
+        entries = _identity_rows(payload)  # Refresh entries list
+
+        result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
+        result["track_id"] = track_id_int
+        result["split"] = False
+        result["created_identity"] = True
+        return result
 
     identity_id = target_identity.get("identity_id") or target_identity.get("id")
     if not identity_id:

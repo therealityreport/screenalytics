@@ -132,9 +132,21 @@ class VoiceBank:
             return self._create_unlabeled_match(show_id, cluster)
 
         cluster_embedding = np.array(cluster.centroid)
+        cluster_dim = cluster_embedding.shape[0]
 
         # Use cached centroids for efficient matching
         entry_centroids = self._get_entry_centroids(show_id)
+
+        # Check for embedding dimension mismatch (e.g., TitaNet 192-dim vs older 512-dim)
+        if entry_centroids:
+            first_entry_dim = entry_centroids[0][1].shape[0]
+            if cluster_dim != first_entry_dim:
+                LOGGER.warning(
+                    f"Embedding dimension mismatch: cluster has {cluster_dim}-dim, "
+                    f"voice bank has {first_entry_dim}-dim. Cannot match - treating as new voice. "
+                    f"Re-generate voice bank with consistent embedding model to enable matching."
+                )
+                return self._create_unlabeled_match(show_id, cluster)
 
         best_match: Optional[VoiceBankEntry] = None
         best_similarity = 0.0

@@ -367,14 +367,14 @@ def episode_audio_diarize_task(
     ep_id: str,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
-    """Run speaker diarization using Pyannote."""
+    """Run speaker diarization using NeMo MSDD."""
     job_id = self.request.id
     LOGGER.info(f"[{job_id}] Starting diarization for {ep_id}")
     _write_progress(ep_id, "diarize", "Running speaker diarization...", 0.0)
 
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
-        from py_screenalytics.audio.diarization_pyannote import run_diarization
+        from py_screenalytics.audio.diarization_nemo import run_diarization_nemo, NeMoDiarizationConfig
         from py_screenalytics.audio.episode_audio_pipeline import _get_audio_paths, _load_config
 
         config = _load_config()
@@ -394,12 +394,21 @@ def episode_audio_diarize_task(
                 f"Ensure previous pipeline stages (separate, enhance) completed successfully."
             )
 
-        segments = run_diarization(
+        # Build NeMo config from pipeline config
+        nemo_config = NeMoDiarizationConfig(
+            max_num_speakers=config.diarization.max_speakers,
+            min_num_speakers=config.diarization.min_speakers,
+            num_speakers=config.diarization.num_speakers,
+            overlap_threshold=getattr(config.diarization, 'overlap_threshold', 0.5),
+        )
+
+        result = run_diarization_nemo(
             audio_path,
             paths["diarization"],
-            config.diarization,
+            nemo_config,
             overwrite=overwrite,
         )
+        segments = result.segments
 
         speakers = set(s.speaker for s in segments)
 
@@ -451,7 +460,7 @@ def episode_audio_voices_task(
         sys.path.insert(0, str(PROJECT_ROOT))
         from py_screenalytics.audio.voice_clusters import cluster_episode_voices
         from py_screenalytics.audio.voice_bank import match_voice_clusters_to_bank
-        from py_screenalytics.audio.diarization_pyannote import _load_diarization_manifest
+        from py_screenalytics.audio.diarization_nemo import load_diarization_manifest
         from py_screenalytics.audio.episode_audio_pipeline import (
             _get_audio_paths,
             _get_show_id,
@@ -465,12 +474,8 @@ def episode_audio_voices_task(
         # Validate diarization completed
         _check_required_file(paths["diarization"], "voices", "diarization manifest")
 
-        # Load diarization segments (prefer combined pyannote+GPT-4o if available)
-        diar_path = paths.get("diarization_combined", paths["diarization"])
-        if diar_path.exists():
-            diarization_segments = _load_diarization_manifest(diar_path)
-        else:
-            diarization_segments = _load_diarization_manifest(paths["diarization"])
+        # Load diarization segments
+        diarization_segments = load_diarization_manifest(paths["diarization"])
 
         # Use enhanced vocals if available
         audio_path = paths["vocals_enhanced"]
@@ -621,7 +626,7 @@ def episode_audio_align_task(
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
         from py_screenalytics.audio.fuse_diarization_asr import fuse_transcript
-        from py_screenalytics.audio.diarization_pyannote import _load_diarization_manifest
+        from py_screenalytics.audio.diarization_nemo import load_diarization_manifest
         from py_screenalytics.audio.asr_openai import _load_asr_manifest
         from py_screenalytics.audio.voice_clusters import _load_voice_clusters
         from py_screenalytics.audio.voice_bank import _load_voice_mapping
@@ -633,7 +638,7 @@ def episode_audio_align_task(
 
         # Load all inputs
         _write_progress(ep_id, "align", "Loading diarization and ASR data...", 0.2)
-        diarization_segments = _load_diarization_manifest(paths["diarization"])
+        diarization_segments = load_diarization_manifest(paths["diarization"])
         asr_segments = _load_asr_manifest(paths["asr_raw"])
         voice_clusters = _load_voice_clusters(paths["voice_clusters"])
         voice_mapping = _load_voice_mapping(paths["voice_mapping"])
@@ -653,7 +658,7 @@ def episode_audio_align_task(
             paths["transcript_vtt"],
             config.export.vtt_include_speaker_notes,
             overwrite=overwrite,
-            diarization_source="pyannote",
+            diarization_source="nemo",
         )
 
         _write_progress(ep_id, "align", f"Generated {len(transcript_rows)} transcript rows", 1.0)
@@ -693,7 +698,7 @@ def episode_audio_qc_task(
         sys.path.insert(0, str(PROJECT_ROOT))
         from py_screenalytics.audio.qc import run_qc_checks, get_qc_summary
         from py_screenalytics.audio.io import compute_snr, get_audio_duration
-        from py_screenalytics.audio.diarization_pyannote import _load_diarization_manifest
+        from py_screenalytics.audio.diarization_nemo import load_diarization_manifest
         from py_screenalytics.audio.asr_openai import _load_asr_manifest
         from py_screenalytics.audio.voice_clusters import _load_voice_clusters
         from py_screenalytics.audio.voice_bank import _load_voice_mapping
@@ -720,7 +725,7 @@ def episode_audio_qc_task(
 
         # Load data
         _write_progress(ep_id, "qc", "Loading pipeline artifacts...", 0.2)
-        diarization_segments = _load_diarization_manifest(paths["diarization"])
+        diarization_segments = load_diarization_manifest(paths["diarization"])
         asr_segments = _load_asr_manifest(paths["asr_raw"])
         voice_clusters = _load_voice_clusters(paths["voice_clusters"])
         voice_mapping = _load_voice_mapping(paths["voice_mapping"])

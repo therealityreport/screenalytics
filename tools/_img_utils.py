@@ -74,17 +74,53 @@ def safe_crop(
     return to_u8_bgr(crop), clipped, None
 
 
-def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | None]:
-    """Write JPEGs with variance + size guards."""
+def safe_imwrite(
+    path: str | Path,
+    image,
+    jpg_q: int = 85,
+    *,
+    use_png: bool = False,
+    png_compression: int = 3,
+) -> tuple[bool, str | None]:
+    """Write images with variance + size guards.
+
+    Args:
+        path: Output file path (extension determines format if use_png not set)
+        image: Image array to write
+        jpg_q: JPEG quality (1-100, default 85)
+        use_png: Force PNG format for maximum quality (lossless)
+        png_compression: PNG compression level (0-9, default 3 for balance)
+
+    Returns:
+        (success, error_reason) tuple
+    """
     if image is None:
         return False, "image_missing"
     img = to_u8_bgr(np.asarray(image))
     out_path = Path(path)
+
+    # Determine format from extension or use_png flag
+    suffix = out_path.suffix.lower()
+    is_png = use_png or suffix == ".png"
+
+    # If use_png is True but path has .jpg, change extension
+    if use_png and suffix in (".jpg", ".jpeg"):
+        out_path = out_path.with_suffix(".png")
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    jpeg_q = max(1, min(int(jpg_q or 85), 100))
+
     variance = float(np.std(img)) if img.size else 0.0
     range_val = float(np.nanmax(img)) - float(np.nanmin(img)) if img.size else 0.0
-    ok = cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+
+    if is_png:
+        # PNG: lossless compression for maximum quality
+        compression = max(0, min(int(png_compression), 9))
+        ok = cv2.imwrite(str(out_path), img, [cv2.IMWRITE_PNG_COMPRESSION, compression])
+    else:
+        # JPEG: lossy compression
+        jpeg_q = max(1, min(int(jpg_q or 85), 100))
+        ok = cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+
     if not ok:
         return False, "imwrite_failed"
     try:
@@ -114,3 +150,29 @@ def safe_imwrite(path: str | Path, image, jpg_q: int = 85) -> tuple[bool, str | 
         )
         return False, "near_uniform_gray"
     return True, None
+
+
+def encode_png_bytes(image, *, color: str = "bgr", compression: int = 3) -> bytes | None:
+    """Encode image to PNG bytes for S3 upload (lossless).
+
+    Args:
+        image: Image array
+        color: Color space ("bgr" or "rgb")
+        compression: PNG compression level (0-9)
+
+    Returns:
+        PNG bytes or None if encoding fails
+    """
+    if image is None:
+        return None
+    arr = np.asarray(image)
+    if arr.size == 0:
+        return None
+    arr = to_u8_bgr(arr)
+    if color == "rgb":
+        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    compression = max(0, min(int(compression), 9))
+    success, encoded = cv2.imencode(".png", arr, [cv2.IMWRITE_PNG_COMPRESSION, compression])
+    if not success:
+        return None
+    return encoded.tobytes()

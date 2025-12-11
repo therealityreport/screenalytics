@@ -104,13 +104,15 @@ def _get_audio_paths(ep_id: str, data_root: Optional[Path] = None) -> dict:
         "vocals_enhanced": audio_dir / "episode_vocals_enhanced.wav",
         "final_voice_only": audio_dir / "episode_final_voice_only.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
-        "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
-        "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
-        "diarization_combined": manifests_dir / "audio_diarization_combined.jsonl",
-        "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
+        "diarization_embeddings": manifests_dir / "audio_diarization.embeddings.json",
+        # DEPRECATED: Legacy pyannote/gpt4o paths (kept for backward compat reading)
+        # "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
+        # "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
+        # "diarization_combined": manifests_dir / "audio_diarization_combined.jsonl",
+        # "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
         "asr_raw": manifests_dir / "audio_asr_raw.jsonl",
         "voice_clusters": manifests_dir / "audio_voice_clusters.json",
-        "voice_clusters_gpt4o": manifests_dir / "audio_voice_clusters_gpt4o.json",
+        # DEPRECATED: "voice_clusters_gpt4o": manifests_dir / "audio_voice_clusters_gpt4o.json",
         "voice_mapping": manifests_dir / "audio_voice_mapping.json",
         "transcript_jsonl": manifests_dir / "episode_transcript.jsonl",
         "transcript_vtt": manifests_dir / "episode_transcript.vtt",
@@ -171,97 +173,7 @@ def _get_cast_count_for_episode(ep_id: str) -> int:
         return 0
 
 
-def _save_diarization_comparison(
-    pyannote_segments: list,
-    gpt4o_segments: list,
-    output_path: Path,
-) -> dict:
-    """Compare pyannote and GPT-4o diarization outputs and save report.
-
-    Args:
-        pyannote_segments: Diarization segments from pyannote
-        gpt4o_segments: Diarization segments from GPT-4o
-        output_path: Path to save comparison JSON
-
-    Returns:
-        Comparison report dict
-    """
-    import json
-
-    # Get pyannote stats
-    pyannote_speakers = set(s.speaker for s in pyannote_segments)
-    pyannote_duration = sum(s.end - s.start for s in pyannote_segments)
-
-    # Get GPT-4o stats
-    gpt4o_speakers = set(s.speaker for s in gpt4o_segments if s.speaker)
-    gpt4o_duration = sum(s.end - s.start for s in gpt4o_segments) if gpt4o_segments else 0
-
-    # Build comparison report
-    comparison = {
-        "pyannote": {
-            "segment_count": len(pyannote_segments),
-            "speaker_count": len(pyannote_speakers),
-            "speakers": sorted(pyannote_speakers),
-            "total_speech_duration_s": round(pyannote_duration, 2),
-            "avg_segment_duration_s": round(pyannote_duration / len(pyannote_segments), 2) if pyannote_segments else 0,
-        },
-        "gpt4o": {
-            "segment_count": len(gpt4o_segments),
-            "speaker_count": len(gpt4o_speakers),
-            "speakers": sorted(gpt4o_speakers),
-            "total_speech_duration_s": round(gpt4o_duration, 2),
-            "avg_segment_duration_s": round(gpt4o_duration / len(gpt4o_segments), 2) if gpt4o_segments else 0,
-            "has_transcription": True if gpt4o_segments else False,
-        },
-        "comparison": {
-            "speaker_count_diff": len(gpt4o_speakers) - len(pyannote_speakers),
-            "segment_count_diff": len(gpt4o_segments) - len(pyannote_segments),
-            "duration_diff_s": round(gpt4o_duration - pyannote_duration, 2),
-        },
-        # Sample segments for manual review
-        "samples": {
-            "pyannote_first_5": [
-                {"start": s.start, "end": s.end, "speaker": s.speaker}
-                for s in pyannote_segments[:5]
-            ],
-            "gpt4o_first_5": [
-                {"start": s.start, "end": s.end, "speaker": s.speaker, "text": s.text[:100] if hasattr(s, 'text') else ""}
-                for s in gpt4o_segments[:5]
-            ],
-        },
-        # Full segment lists for downstream UI/flagging
-        "segments": {
-            "pyannote": [
-                {
-                    "start": s.start,
-                    "end": s.end,
-                    "speaker": s.speaker,
-                }
-                for s in pyannote_segments
-            ],
-            "gpt4o": [
-                {
-                    "segment_id": f"gpt4o_{i+1:04d}",
-                    "start": s.start,
-                    "end": s.end,
-                    "speaker": getattr(s, "speaker", None),
-                    "raw_text": getattr(s, "text", None)[:400] if getattr(s, "text", None) else None,
-                }
-                for i, s in enumerate(gpt4o_segments)
-            ],
-        },
-    }
-
-    # Save comparison
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(comparison, f, indent=2)
-
-    LOGGER.info(f"Diarization comparison saved: {output_path}")
-    LOGGER.info(f"  Pyannote: {len(pyannote_speakers)} speakers, {len(pyannote_segments)} segments")
-    LOGGER.info(f"  GPT-4o: {len(gpt4o_speakers)} speakers, {len(gpt4o_segments)} segments")
-
-    return comparison
+# DEPRECATED: _save_diarization_comparison removed - no longer using dual diarization
 
 
 def run_episode_audio_pipeline(
@@ -469,93 +381,53 @@ def run_episode_audio_pipeline(
             enhanced_path = Path(checkpoint_mgr.get_stage_output("enhance", "enhanced") or paths["vocals_enhanced"])
             result.audio_artifacts.vocals_enhanced = enhanced_path
 
-        # Step 4: Diarization (dual mode: pyannote + GPT-4o for comparison)
+        # Step 4: Diarization (NeMo MSDD - overlap-aware speaker diarization)
         # Use vocals (separated, no music) for diarization - better for speaker detection
         # Enhancement can alter voice characteristics, so we use the cleaner separated vocals
-        backend_name = getattr(config.diarization, "backend", "oss-3.1")
-        _update_progress("diarize", 0.0, f"Running dual diarization (pyannote {backend_name} + GPT-4o)...")
+        _update_progress("diarize", 0.0, "Running NeMo MSDD diarization...")
 
-        # 4a: Run pyannote diarization (Precision-2 API or OSS 3.1 based on config)
-        from .diarization_pyannote import run_diarization, get_current_backend
+        from .diarization_nemo import (
+            run_diarization_nemo,
+            NeMoDiarizationConfig,
+            get_current_backend as get_nemo_backend,
+        )
 
-        _update_progress("diarize", 0.1, f"Running pyannote diarization ({backend_name})...")
-        pyannote_segments = run_diarization(
+        # Build NeMo config from pipeline config
+        nemo_config = NeMoDiarizationConfig(
+            max_num_speakers=config.diarization.max_speakers,
+            min_num_speakers=config.diarization.min_speakers,
+            oracle_num_speakers=config.diarization.num_speakers,
+            merge_gap_ms=config.diarization.merge_gap_ms,
+            min_speech_duration=config.diarization.min_speech,
+        )
+
+        _update_progress("diarize", 0.1, "Running NeMo MSDD diarization...")
+        nemo_result = run_diarization_nemo(
             vocals_path,  # Use separated vocals (no music) for better speaker detection
-            paths["diarization_pyannote"],
-            config.diarization,
+            paths["diarization"],
+            nemo_config,
             overwrite=overwrite,
         )
-        actual_backend = get_current_backend() or backend_name
-        LOGGER.info(f"Pyannote diarization ({actual_backend}): {len(pyannote_segments)} segments, "
-                   f"{len(set(s.speaker for s in pyannote_segments))} speakers")
 
-        # 4b: Run GPT-4o diarization (unified transcription + diarization)
-        _update_progress("diarize", 0.5, "Running GPT-4o diarization...")
-        gpt4o_diar_segments = []
-        try:
-            from .asr_openai import transcribe_with_diarization, check_api_available
+        # Convert NeMo segments to standard DiarizationSegment for downstream compatibility
+        diarization_segments = [seg.to_standard_segment() for seg in nemo_result.segments]
+        clustering_segments = diarization_segments
 
-            if check_api_available():
-                gpt4o_segments = transcribe_with_diarization(
-                    vocals_path,
-                    paths["diarization_gpt4o"],
-                    overwrite=overwrite,
-                )
-                gpt4o_speakers = len(set(s.speaker for s in gpt4o_segments if s.speaker))
-                LOGGER.info(f"GPT-4o diarization: {len(gpt4o_segments)} segments, {gpt4o_speakers} speakers")
-                # Convert GPT-4o diarization segments to DiarizationSegment for downstream use
-                from .models import DiarizationSegment
-                for seg in gpt4o_segments:
-                    if seg.start is None or seg.end is None:
-                        continue
-                    if seg.end <= seg.start:
-                        continue
-                    speaker_label = seg.speaker or "GPT4O_SPK"
-                    gpt4o_diar_segments.append(DiarizationSegment(
-                        start=float(seg.start),
-                        end=float(seg.end),
-                        speaker=speaker_label,
-                        confidence=seg.confidence,
-                    ))
-            else:
-                LOGGER.warning("OpenAI API not available, skipping GPT-4o diarization")
-                gpt4o_segments = []
-        except Exception as e:
-            LOGGER.warning(f"GPT-4o diarization failed: {e}")
-            gpt4o_segments = []
+        actual_backend = get_nemo_backend() or "nemo-msdd"
+        speaker_count = nemo_result.speaker_count
+        overlap_duration = nemo_result.overlap_duration
 
-        # 4c: Create comparison report
-        _update_progress("diarize", 0.8, "Generating diarization comparison...")
-        _save_diarization_comparison(
-            pyannote_segments,
-            gpt4o_segments,
-            paths["diarization_comparison"],
+        LOGGER.info(
+            f"NeMo MSDD diarization ({actual_backend}): {len(diarization_segments)} segments, "
+            f"{speaker_count} speakers, {overlap_duration:.1f}s overlap"
         )
 
-        # Use pyannote as primary manifest, but create a combined manifest for clustering (pyannote + GPT-4o)
-        import shutil
-        if paths["diarization_pyannote"].exists():
-            shutil.copy(paths["diarization_pyannote"], paths["diarization"])
-        result.manifest_artifacts.diarization_pyannote = paths["diarization_pyannote"]
-        clustering_segments = pyannote_segments
-        if gpt4o_diar_segments:
-            try:
-                from .diarization_pyannote import _save_diarization_manifest
-                clustering_segments = pyannote_segments + gpt4o_diar_segments
-                _save_diarization_manifest(clustering_segments, paths["diarization_combined"])
-                result.manifest_artifacts.diarization_gpt4o = paths["diarization_gpt4o"]
-            except Exception as err:
-                LOGGER.warning(f"Failed to save combined diarization manifest: {err}")
-                clustering_segments = pyannote_segments
-        diarization_segments = pyannote_segments
         result.manifest_artifacts.diarization = paths["diarization"]
 
-        # 4d: Build speaker groups manifest (primary surface for UI)
+        # Build speaker groups manifest (primary surface for UI)
         from .speaker_groups import build_speaker_groups_manifest
 
-        speaker_group_sources = {"pyannote": pyannote_segments}
-        if gpt4o_diar_segments:
-            speaker_group_sources["gpt4o"] = gpt4o_diar_segments
+        speaker_group_sources = {"nemo": diarization_segments}
 
         speaker_groups_manifest = build_speaker_groups_manifest(
             ep_id,
@@ -565,7 +437,7 @@ def run_episode_audio_pipeline(
         )
         result.manifest_artifacts.speaker_groups = paths["speaker_groups"]
 
-        _update_progress("diarize", 1.0, f"Dual diarization complete: pyannote ({actual_backend})={len(pyannote_segments)}, gpt4o={len(gpt4o_segments)}")
+        _update_progress("diarize", 1.0, f"NeMo diarization complete: {len(diarization_segments)} segments, {speaker_count} speakers")
 
         # Step 5: Voice clustering + voice bank mapping
         _update_progress("voices", 0.0, "Clustering voices...")
@@ -582,17 +454,6 @@ def run_episode_audio_pipeline(
             speaker_groups_manifest=speaker_groups_manifest,
         )
         result.manifest_artifacts.voice_clusters = paths["voice_clusters"]
-
-        # Also produce GPT-4o-only clusters (one per diarization label) when available for diagnostics
-        if gpt4o_diar_segments:
-            try:
-                from .voice_clusters import _clusters_from_diarization_labels, _save_voice_clusters
-
-                gpt4o_clusters = _clusters_from_diarization_labels(gpt4o_diar_segments)
-                _save_voice_clusters(gpt4o_clusters, paths["voice_clusters_gpt4o"])
-                LOGGER.info(f"Saved GPT-4o-only clusters: {len(gpt4o_clusters)}")
-            except Exception as err:
-                LOGGER.warning(f"Failed to build GPT-4o-only clusters: {err}")
 
         _update_progress("voices", 0.5, f"Found {len(voice_clusters)} voice clusters")
 
@@ -779,8 +640,8 @@ def check_pipeline_prerequisites() -> dict:
         pass
 
     try:
-        import pyannote.audio
-        status["pyannote"] = True
+        import nemo.collections.asr as nemo_asr
+        status["nemo"] = True
     except ImportError:
         pass
 

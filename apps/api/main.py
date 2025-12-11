@@ -22,8 +22,10 @@ from apps.api.routers import (
     audio,
     cast,
     config,
+    diagnostics,
     episodes,
     facebank,
+    face_review,
     files,
     grouping,
     identities,
@@ -57,10 +59,12 @@ app.include_router(files.router, tags=["files"])
 app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(people.router, tags=["people"])
 app.include_router(grouping.router, tags=["grouping"])
+app.include_router(face_review.router, tags=["face_review"])
 app.include_router(metadata.router)
 app.include_router(archive.router, tags=["archive"])
 app.include_router(audio.router, tags=["audio"])
 app.include_router(audio.edit_router, tags=["audio"])
+app.include_router(diagnostics.router, tags=["diagnostics"])
 
 # Celery is optional in local dev; guard the import so /healthz stays alive even if
 # celery[redis] is not installed. Expose a 503 stub so callers see a clear error.
@@ -95,20 +99,23 @@ else:
 
 @app.on_event("startup")
 async def _cleanup_stale_jobs() -> None:
-    """Clean up stale audio pipeline locks and progress files on startup.
+    """Clean up stale locks, progress files, and zombie jobs on startup.
 
-    When the API/worker crashes or restarts, locks can be left in Redis and
-    progress files can show stale "running" state. This clears them so new
+    When the API/worker crashes or restarts, locks can be left in Redis/filesystem
+    and progress files can show stale "running" state. This clears them so new
     jobs can start fresh.
     """
     import os
     import json
+    import subprocess
     from pathlib import Path
+    from datetime import datetime, timezone
 
     data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
     manifests_dir = data_root / "manifests"
+    jobs_dir = data_root / "jobs"
 
-    # Mark all in-progress audio_progress.json files as stale
+    # 1. Mark all in-progress audio_progress.json files as stale
     if manifests_dir.exists():
         for ep_dir in manifests_dir.iterdir():
             if not ep_dir.is_dir():
@@ -127,7 +134,87 @@ async def _cleanup_stale_jobs() -> None:
                 except Exception as e:
                     LOGGER.warning(f"Failed to check progress file {progress_file}: {e}")
 
-    # Clear audio pipeline locks from Redis
+    # 2. Clean up stale file-based locks (older than 1 hour or PID dead)
+    stale_lock_threshold = 3600  # 1 hour in seconds
+    locks_cleaned = 0
+    if manifests_dir.exists():
+        for ep_dir in manifests_dir.iterdir():
+            if not ep_dir.is_dir():
+                continue
+            for lock_file in ep_dir.glob(".lock_*"):
+                try:
+                    lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+                    lock_pid = lock_data.get("pid")
+                    lock_started = lock_data.get("started_at", "")
+
+                    # Check if lock is stale by time
+                    is_stale = False
+                    if lock_started:
+                        try:
+                            started_dt = datetime.fromisoformat(lock_started.replace("Z", "+00:00"))
+                            age_seconds = (datetime.now(timezone.utc) - started_dt).total_seconds()
+                            if age_seconds > stale_lock_threshold:
+                                is_stale = True
+                                LOGGER.info(f"[startup] Lock {lock_file.name} is {age_seconds/3600:.1f}h old (stale)")
+                        except Exception:
+                            pass
+
+                    # Check if PID is dead
+                    if lock_pid and not is_stale:
+                        try:
+                            subprocess.run(["kill", "-0", str(lock_pid)], check=True, capture_output=True)
+                            # Process is alive, skip
+                            continue
+                        except subprocess.CalledProcessError:
+                            # Process is dead
+                            is_stale = True
+                            LOGGER.info(f"[startup] Lock {lock_file.name} PID {lock_pid} is dead (stale)")
+
+                    if is_stale:
+                        lock_file.unlink()
+                        locks_cleaned += 1
+                        LOGGER.info(f"[startup] Removed stale lock: {lock_file}")
+
+                except Exception as e:
+                    LOGGER.warning(f"[startup] Failed to check lock {lock_file}: {e}")
+
+    if locks_cleaned > 0:
+        LOGGER.info(f"[startup] Cleaned {locks_cleaned} stale file-based locks")
+
+    # 3. Clean up zombie jobs (running state but PID dead)
+    zombies_cleaned = 0
+    if jobs_dir.exists():
+        for job_file in jobs_dir.glob("*.json"):
+            try:
+                job_data = json.loads(job_file.read_text(encoding="utf-8"))
+                if job_data.get("state") != "running":
+                    continue
+
+                job_pid = job_data.get("pid")
+                if not job_pid:
+                    continue
+
+                # Check if PID is dead
+                try:
+                    subprocess.run(["kill", "-0", str(job_pid)], check=True, capture_output=True)
+                    # Process is alive, skip
+                    continue
+                except subprocess.CalledProcessError:
+                    # Process is dead - mark as failed
+                    job_data["state"] = "failed"
+                    job_data["error"] = "Marked as failed on startup - process no longer exists"
+                    job_data["ended_at"] = datetime.now(timezone.utc).isoformat()
+                    job_file.write_text(json.dumps(job_data, indent=2), encoding="utf-8")
+                    zombies_cleaned += 1
+                    LOGGER.info(f"[startup] Marked zombie job as failed: {job_file.name}")
+
+            except Exception as e:
+                LOGGER.warning(f"[startup] Failed to check job {job_file}: {e}")
+
+    if zombies_cleaned > 0:
+        LOGGER.info(f"[startup] Cleaned {zombies_cleaned} zombie jobs")
+
+    # 4. Clear audio pipeline locks from Redis
     try:
         from apps.api.tasks import _get_redis
         r = _get_redis()
@@ -146,6 +233,50 @@ async def _cleanup_stale_jobs() -> None:
             LOGGER.info(f"Cleared {cleared} stale audio pipeline locks from Redis")
     except Exception as e:
         LOGGER.warning(f"Failed to clear stale locks from Redis: {e}")
+
+
+@app.on_event("startup")
+async def _initialize_safeguards() -> None:
+    """Initialize manifest safeguards: checksums directory and backup rotation.
+
+    This enables the D31 (checksums) and backup rotation features.
+    """
+    import os
+    from pathlib import Path
+
+    data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
+    manifests_dir = data_root / "manifests"
+    checksums_dir = data_root / "checksums"
+
+    # 1. Create checksums directory to enable D31
+    try:
+        checksums_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info(f"[startup] Checksums directory ready: {checksums_dir}")
+    except Exception as e:
+        LOGGER.warning(f"[startup] Failed to create checksums directory: {e}")
+
+    # 2. Rotate old backup files (keep max 3 per manifest)
+    max_backups = 3
+    backups_deleted = 0
+
+    if manifests_dir.exists():
+        from apps.api.services.manifests import rotate_backups
+
+        for ep_dir in manifests_dir.iterdir():
+            if not ep_dir.is_dir():
+                continue
+
+            # Find all manifest files and rotate their backups
+            for manifest_file in ep_dir.iterdir():
+                if manifest_file.is_file() and manifest_file.suffix in (".json", ".jsonl"):
+                    try:
+                        deleted = rotate_backups(manifest_file, max_backups)
+                        backups_deleted += deleted
+                    except Exception as e:
+                        LOGGER.warning(f"[startup] Failed to rotate backups for {manifest_file}: {e}")
+
+    if backups_deleted > 0:
+        LOGGER.info(f"[startup] Cleaned {backups_deleted} old backup files")
 
 
 @app.on_event("startup")

@@ -1,0 +1,86 @@
+# Face-Body Track Fusion Configuration
+# Documentation: docs/todo/feature_body_tracking_reid_fusion.md
+
+# Master switch
+track_fusion:
+  enabled: true
+
+# IoU-based association (when face visible)
+iou_association:
+  enabled: true
+  iou_threshold: 0.50              # Minimum IoU for face inside body
+  min_overlap_ratio: 0.7           # Face area overlap with body
+
+  # Spatial constraints
+  face_in_upper_body: true         # Face should be in upper portion of body
+  upper_body_fraction: 0.5         # Top 50% of body box
+
+# Re-ID handoff (when face disappears)
+reid_handoff:
+  enabled: true
+  similarity_threshold: 0.70       # Cosine similarity for match
+  use_temporal_context: true       # Use motion prediction
+
+  # Handoff timing
+  handoff:
+    max_gap_seconds: 30            # Max time to maintain association
+    min_gap_frames: 3              # Min frames before handoff kicks in
+    confidence_decay_rate: 0.95    # Per-second decay
+    min_confidence: 0.30           # Drop association below this
+
+  # Re-ID matching
+  matching:
+    top_k_candidates: 5            # Body tracks to consider
+    require_motion_consistency: true
+    max_distance_px: 200           # Max centroid movement
+
+# Ambiguity resolution
+ambiguity:
+  # Multiple faces in one body box
+  multi_face_strategy: spatial     # spatial | largest | none
+  face_clustering_distance: 50     # Pixels for spatial clustering
+
+  # Similar clothing
+  similar_clothing_penalty: 0.10   # Reduce Re-ID score
+  detect_similar_clothing: true
+  clothing_similarity_threshold: 0.85
+
+  # Motion consistency
+  motion_consistency_weight: 0.30  # Weight in final score
+  max_velocity_change: 100         # Pixels per frame
+
+  # Long occlusion handling
+  long_occlusion:
+    threshold_seconds: 10          # Seconds for "long" occlusion
+    require_higher_reid: true      # Stricter matching
+    reid_boost_threshold: 0.10     # Add to normal threshold
+
+# Screen time fusion
+screen_time:
+  # Priority when both face and body visible
+  priority: face                   # face | body | both
+
+  # Segment merging
+  merge_short_gaps: true
+  max_merge_gap_seconds: 1.0       # Merge segments with small gaps
+
+  # Visibility classification
+  visibility_classes:
+    frontal:
+      max_yaw: 30
+    profile:
+      max_yaw: 75
+    back_of_head:
+      max_yaw: 180
+
+# Output
+output:
+  store_associations: true         # Store face-body links
+  store_handoff_events: true       # Log handoff timestamps
+  store_visibility_breakdown: true # Face vs body time per identity
+
+# Diagnostics
+diagnostics:
+  log_association_decisions: true
+  log_ambiguity_resolutions: true
+  save_association_timeline: true  # Timeline JSON per identity

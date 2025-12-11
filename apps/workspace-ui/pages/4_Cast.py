@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -172,6 +173,7 @@ def _render_cast_edit_form(member: Dict[str, Any], show_id: str) -> None:
                 if result:
                     st.success("Cast member updated.")
                     _reset_cast_edit_state()
+                    time.sleep(0.5)
                     st.rerun()
 
 
@@ -240,7 +242,7 @@ def _api_post(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any
 
 
 def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    base = st.session_state.get("api_base")
+    base = cfg.get("api_base") or st.session_state.get("api_base")
     if not base:
         st.error("API base URL missing; re-run init_page().")
         return None
@@ -254,7 +256,7 @@ def _api_patch(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, An
 
 
 def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    base = st.session_state.get("api_base")
+    base = cfg.get("api_base") or st.session_state.get("api_base")
     if not base:
         st.error("API base URL missing; re-run init_page().")
         return None
@@ -277,7 +279,7 @@ def _format_seed_upload_error(resp: requests.Response, exc: requests.HTTPError) 
                 detail = json.dumps(payload)
         else:
             detail = payload
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
         detail = resp.text or None
     if isinstance(detail, (dict, list)):
         detail = json.dumps(detail)
@@ -342,7 +344,8 @@ ep_id_param = helpers.get_ep_id_from_query_params()
 ep_show_slug = None
 if ep_id_param:
     episode_detail = _api_get(f"/episodes/{ep_id_param}")
-    ep_show_slug = (episode_detail.get("show_slug") or episode_detail.get("show") or "").strip().lower() if episode_detail else None
+    if episode_detail and isinstance(episode_detail, dict):
+        ep_show_slug = (episode_detail.get("show_slug") or episode_detail.get("show") or "").strip().lower()
 
 # Normalize show options for lookup and set session default from ep_id when available
 option_lookup = {opt.lower(): opt for opt in show_options}
@@ -730,7 +733,7 @@ if selected_cast_id:
                             if st.button("☆ Feature", key=f"feature_seed_{fb_id}"):
                                 _mark_featured_seed(show_id, selected_cast_id, fb_id)
                         sim_info = per_seed_similarity.get(fb_id) if isinstance(per_seed_similarity, dict) else None
-                        if isinstance(sim_info, dict) and sim_info.get("mean") is not None:
+                        if isinstance(sim_info, dict) and isinstance(sim_info.get("mean"), (int, float)):
                             sim_badge = render_similarity_badge(sim_info["mean"], SimilarityType.CAST)
                             st.markdown(sim_badge, unsafe_allow_html=True)
 

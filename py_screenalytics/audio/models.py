@@ -54,41 +54,42 @@ class EnhanceConfig(BaseModel):
 class DiarizationConfig(BaseModel):
     """Configuration for speaker diarization.
 
-    Note: min_speakers/max_speakers are HINTS, not guarantees. Pyannote may still
-    detect fewer speakers if it determines they are similar. Use num_speakers to
-    force a specific count when you know it ahead of time.
+    Note: min_speakers/max_speakers are HINTS, not guarantees. The diarization
+    model may detect fewer speakers if it determines they are similar. Use
+    num_speakers to force a specific count when you know it ahead of time.
 
     Backend options:
-    - "precision-2": pyannoteAI cloud API (requires PYANNOTEAI_API_KEY)
-    - "oss-3.1": Local open-source pyannote/speaker-diarization-3.1 model
+    - "nemo-msdd": NeMo MSDD (Multi-Scale Diarization Decoder) - default, GPU required
+    - "precision-2": DEPRECATED - pyannoteAI cloud API
+    - "oss-3.1": DEPRECATED - Local pyannote model
 
-    When backend="precision-2" and PYANNOTEAI_API_KEY is not set, falls back to oss-3.1.
-
-    Official API workflow:
-    - Speaker range is automatically calculated from cast count (cast ± 3)
-    - exclusive=True for clean segment merging (non-overlapping speakers)
-    - Poll interval is 5-8 seconds per official docs
-    - Webhook support for async completion
+    NeMo MSDD features:
+    - Overlap-aware speaker detection
+    - Multi-speaker segments with probability scores
+    - TitaNet speaker embeddings (192-dim)
     """
     model_config = {"protected_namespaces": ()}
-    provider: str = "pyannote"
-    backend: str = "precision-2"  # "precision-2" (API) | "oss-3.1" (local)
-    model_name: str = "pyannote/speaker-diarization-precision-2"
+    provider: str = "nemo"  # "nemo" (default) | "pyannote" (deprecated)
+    backend: str = "msdd"  # "msdd" (NeMo) | "precision-2" | "oss-3.1" (deprecated)
+    model_name: str = "diar_msdd_telephonic"
     min_speech: float = 0.2
     max_overlap: float = 0.1
     merge_gap_ms: int = 300
     min_speakers: int = 1
-    max_speakers: int = 10  # Safe upper bound for reality TV
+    max_speakers: int = 8  # Upper bound for reality TV
     # Force exact speaker count (overrides min/max if set)
     num_speakers: Optional[int] = None
-    # API timeout in seconds for cloud diarization (precision-2)
-    api_timeout_seconds: int = 900  # 15 minutes - allows for long episodes and API load
 
-    # Official API workflow fields
-    use_exclusive_diarization: bool = True  # Always use exclusive mode for clean merging
-    webhook_url: Optional[str] = None  # Optional webhook URL for async notification
-    api_poll_interval_base: float = 6.0  # Base polling interval (5-8s per docs)
-    api_poll_interval_jitter: float = 2.0  # Random jitter for polling
+    # NeMo-specific settings
+    overlap_threshold: float = 0.5  # Probability threshold for multi-speaker detection
+    embedding_model: str = "titanet_large"  # "titanet_large" | "ecapa_tdnn"
+
+    # DEPRECATED: pyannote API workflow fields (kept for backward compat)
+    api_timeout_seconds: int = 900
+    use_exclusive_diarization: bool = True
+    webhook_url: Optional[str] = None
+    api_poll_interval_base: float = 6.0
+    api_poll_interval_jitter: float = 2.0
 
 
 class ASRConfig(BaseModel):
@@ -98,7 +99,9 @@ class ASRConfig(BaseModel):
     - whisper-1: Legacy model, supports word timestamps
     - gpt-4o-transcribe: Higher quality, no word timestamps
     - gpt-4o-mini-transcribe: Faster, good quality, no word timestamps
-    - gpt-4o-transcribe-diarize: Includes speaker diarization (can replace pyannote)
+
+    Note: Speaker diarization is now handled separately by NeMo MSDD,
+    not combined with transcription.
     """
     provider: str = "openai_whisper"
     model: str = "gpt-4o-transcribe"  # Default to higher quality model
@@ -108,8 +111,8 @@ class ASRConfig(BaseModel):
     temperature: float = 0.0
     gemini_model: str = "gemini-2.0-flash-exp"
     gemini_use_for_cleanup: bool = True
-    # For gpt-4o-transcribe-diarize: use known speaker references
-    use_diarization_model: bool = False  # Set True to use gpt-4o-transcribe-diarize
+    # DEPRECATED: GPT-4o diarization removed - use NeMo MSDD for speaker diarization
+    use_diarization_model: bool = False
     known_speaker_names: List[str] = Field(default_factory=list)
     known_speaker_audio_paths: List[str] = Field(default_factory=list)
 
@@ -121,10 +124,10 @@ class VoiceClusteringConfig(BaseModel):
     # 0.65 works well for separating distinct speakers
     similarity_threshold: float = 0.65
     min_segments_per_cluster: int = 1  # Allow single-segment clusters for trailers
-    embedding_model: str = "pyannote/embedding"
+    embedding_model: str = "titanet_large"  # NeMo TitaNet (192-dim) | "pyannote/embedding" (deprecated)
     centroid_method: str = "mean"
-    # Skip embedding-based clustering and use pyannote speaker labels directly
-    # Set True when pyannote diarization is accurate and clustering causes over-merging
+    # Skip embedding-based clustering and use diarization speaker labels directly
+    # Set True when diarization is accurate and clustering causes over-merging
     use_diarization_labels: bool = False
 
 
@@ -416,6 +419,9 @@ class TranscriptRow(BaseModel):
     text: str = Field(..., description="Transcribed text")
     conf: Optional[float] = Field(None, description="Confidence score")
     words: Optional[List[WordTiming]] = Field(None, description="Word-level timings")
+    # NeMo overlap fields
+    overlap: bool = Field(False, description="Whether multiple speakers are active in this segment")
+    secondary_speakers: List[str] = Field(default_factory=list, description="Other speakers active during this segment")
 
 
 # ============================================================================

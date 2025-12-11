@@ -1054,6 +1054,153 @@ def _estimate_runtime_seconds(frames: int, device_value: str) -> float:
     return frames / rate
 
 
+# =============================================================================
+# Improve Faces Modal (Episode Detail version)
+# =============================================================================
+
+def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
+    """Fetch initial suggestions and activate the Improve Faces modal on Episode Detail."""
+    try:
+        resp = helpers.api_get(f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions")
+    except Exception as exc:
+        st.error(f"Failed to load Improve Faces suggestions: {exc}")
+        return False
+
+    suggestions = resp.get("suggestions", []) if isinstance(resp, dict) else []
+    initial_done = bool(resp.get("initial_pass_done")) if isinstance(resp, dict) else False
+
+    if not suggestions or initial_done:
+        if force:
+            st.info("No Improve Faces suggestions right now.")
+        st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+        st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+        st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+        # Mark that review is complete so we show the Faces Review button
+        st.session_state[f"{ep_id}::improve_faces_complete"] = True
+        return False
+
+    st.session_state[f"{ep_id}::improve_faces_active"] = True
+    st.session_state[f"{ep_id}::improve_faces_suggestions"] = suggestions
+    st.session_state[f"{ep_id}::improve_faces_index"] = 0
+    st.session_state.pop(f"{ep_id}::trigger_improve_faces", None)
+    st.session_state.pop(f"{ep_id}::improve_faces_complete", None)
+    st.rerun()
+    return True
+
+
+def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
+    """Render Improve Faces dialog on Episode Detail page if active."""
+    if not st.session_state.get(f"{ep_id}::improve_faces_active"):
+        return
+
+    suggestions = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
+    idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+
+    @st.dialog("Improve Face Clustering", width="large")
+    def _dialog():
+        suggestions_local = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
+        current_idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+
+        def _render_thumb(url: str | None) -> None:
+            """Render face crop filling the column width."""
+            if not url:
+                st.markdown("*No image available*")
+                return
+            st.image(url, use_container_width=True)
+
+        if not suggestions_local or current_idx >= len(suggestions_local):
+            st.success("All suggestions reviewed!")
+            st.markdown("Click **Faces Review** to continue assigning faces to cast members.")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Faces Review", type="primary", use_container_width=True, key="improve_go_faces_review"):
+                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.session_state[f"{ep_id}::improve_faces_complete"] = True
+                    st.switch_page("pages/3_Faces_Review.py")
+            with col2:
+                if st.button("Close", use_container_width=True, key="improve_close"):
+                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.session_state[f"{ep_id}::improve_faces_complete"] = True
+                    st.rerun()
+            return
+
+        suggestion = suggestions_local[current_idx]
+        cluster_a = suggestion.get("cluster_a", {}) if isinstance(suggestion, dict) else {}
+        cluster_b = suggestion.get("cluster_b", {}) if isinstance(suggestion, dict) else {}
+        similarity = suggestion.get("similarity", 0)
+
+        st.markdown(f"**Are they the same person?** — {current_idx + 1} of {len(suggestions_local)}")
+        st.progress((current_idx + 1) / len(suggestions_local))
+
+        img_col1, img_col2 = st.columns(2)
+        with img_col1:
+            crop_url_a = cluster_a.get("crop_url")
+            resolved_a = helpers.resolve_thumb(crop_url_a) if crop_url_a else None
+            _render_thumb(resolved_a)
+            st.caption(f"Cluster: {cluster_a.get('id', '?')}")
+            st.caption(f"Tracks: {cluster_a.get('tracks', 0)} · Faces: {cluster_a.get('faces', 0)}")
+
+        with img_col2:
+            crop_url_b = cluster_b.get("crop_url")
+            resolved_b = helpers.resolve_thumb(crop_url_b) if crop_url_b else None
+            _render_thumb(resolved_b)
+            st.caption(f"Cluster: {cluster_b.get('id', '?')}")
+            st.caption(f"Tracks: {cluster_b.get('tracks', 0)} · Faces: {cluster_b.get('faces', 0)}")
+
+        st.caption(f"Similarity: {similarity:.1%}")
+
+        btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 1])
+
+        def _advance():
+            st.session_state[f"{ep_id}::improve_faces_index"] = current_idx + 1
+
+        with btn_col1:
+            if st.button("Yes", type="primary", use_container_width=True, key=f"ep_improve_yes_{current_idx}"):
+                exec_mode = helpers.get_execution_mode(ep_id)
+                payload = {
+                    "pair_type": "unassigned_unassigned",
+                    "cluster_a_id": cluster_a.get("id"),
+                    "cluster_b_id": cluster_b.get("id"),
+                    "decision": "merge",
+                    "execution_mode": "redis" if exec_mode != "local" else "local",
+                }
+                try:
+                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
+                except Exception:
+                    pass
+                _advance()
+
+        with btn_col2:
+            if st.button("No", use_container_width=True, key=f"ep_improve_no_{current_idx}"):
+                exec_mode = helpers.get_execution_mode(ep_id)
+                payload = {
+                    "pair_type": "unassigned_unassigned",
+                    "cluster_a_id": cluster_a.get("id"),
+                    "cluster_b_id": cluster_b.get("id"),
+                    "decision": "reject",
+                    "execution_mode": "redis" if exec_mode != "local" else "local",
+                }
+                try:
+                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
+                except Exception:
+                    pass
+                _advance()
+
+        with btn_col3:
+            if st.button("Skip All", use_container_width=True, key=f"ep_improve_skip_{current_idx}"):
+                st.session_state.pop(f"{ep_id}::improve_faces_active", None)
+                st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
+                st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                st.session_state[f"{ep_id}::improve_faces_complete"] = True
+                st.rerun()
+
+    _dialog()
+
+
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_count_manifest_rows(path_str: str, mtime: float) -> int | None:
@@ -1520,6 +1667,23 @@ if canonical_ep_id != ep_id:
     helpers.set_ep_id(canonical_ep_id)
     st.rerun()
 ep_id = canonical_ep_id
+
+# Legacy: Smart Suggestions navigation (now replaced by Improve Faces modal)
+# Clear any stale navigation flags from previous sessions
+_autorun_navigate_key = f"{ep_id}::autorun_navigate_to_suggestions"
+st.session_state.pop(_autorun_navigate_key, None)
+
+# Trigger Improve Faces modal if flag is set (after cluster completion)
+if st.session_state.get(f"{ep_id}::trigger_improve_faces"):
+    LOGGER.info("[IMPROVE_FACES] Trigger flag detected, starting Improve Faces modal")
+    _start_improve_faces_ep_detail(ep_id)
+
+# Render Improve Faces modal if active
+_render_improve_faces_modal_ep_detail(ep_id)
+# Skip heavy page rendering while modal is open to speed up YES/NO flows
+if st.session_state.get(f"{ep_id}::improve_faces_active"):
+    st.stop()
+
 running_job_key = f"{ep_id}::pipeline_job_running"
 if running_job_key not in st.session_state:
     st.session_state[running_job_key] = False
@@ -3010,7 +3174,8 @@ with col_detect:
     # Skip if we already marked this job as complete (prevents infinite refresh loop)
     detect_job_complete_key = f"{ep_id}::detect_job_complete"
     if running_detect_job and not st.session_state.get(detect_job_complete_key):
-        job_id = running_detect_job.get("job_id", "unknown")
+        # Bug 6 fix: Generate unique key even if job_id is missing
+        job_id = running_detect_job.get("job_id") or f"detect_{hash(str(running_detect_job)) % 10000}"
         progress_pct = running_detect_job.get("progress_pct", 0)
         frames_done = running_detect_job.get("frames_done", 0)
         frames_total = running_detect_job.get("frames_total", 0)
@@ -3465,7 +3630,8 @@ with col_faces:
     # Skip if we already marked this job as complete (prevents infinite refresh loop)
     faces_job_complete_key = f"{ep_id}::faces_job_complete"
     if running_faces_job and not st.session_state.get(faces_job_complete_key):
-        job_id = running_faces_job.get("job_id", "unknown")
+        # Bug 6 fix: Generate unique key even if job_id is missing
+        job_id = running_faces_job.get("job_id") or f"faces_{hash(str(running_faces_job)) % 10000}"
         progress_pct = running_faces_job.get("progress_pct", 0)
         state = running_faces_job.get("state", "running")
 
@@ -3933,7 +4099,8 @@ with col_cluster:
     # Skip if we already marked this job as complete (prevents infinite refresh loop)
     cluster_job_complete_key = f"{ep_id}::cluster_job_complete"
     if running_cluster_job and not st.session_state.get(cluster_job_complete_key):
-        job_id = running_cluster_job.get("job_id", "unknown")
+        # Bug 6 fix: Generate unique key even if job_id is missing
+        job_id = running_cluster_job.get("job_id") or f"cluster_{hash(str(running_cluster_job)) % 10000}"
         progress_pct = running_cluster_job.get("progress_pct", 0)
         state = running_cluster_job.get("state", "running")
 
@@ -3945,19 +4112,18 @@ with col_cluster:
             st.session_state[cluster_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
+            # Trigger Improve Faces when cluster finishes
+            st.session_state[f"{ep_id}::trigger_improve_faces"] = True
 
             # Check if auto-run is active - this is the final phase, mark complete
             if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
                 st.success("🎉 **Auto-Run Pipeline Complete!** All phases finished successfully.")
                 st.session_state[_autorun_key] = False
                 st.session_state[_autorun_phase_key] = None
-                # Suggestion 3: No delay for auto-run completion
-                st.rerun()
-            else:
-                st.caption("Refreshing to show results...")
-                # Brief delay for manual runs to show success message
-                time.sleep(0.5)
-                st.rerun()
+            # Trigger Improve Faces modal on this page (not redirect)
+            st.caption("Opening Improve Faces...")
+            time.sleep(0.3)
+            st.rerun()
 
         st.info(f"🔄 **Cluster job running** ({state})")
         st.progress(min(progress_pct / 100, 1.0))
@@ -4109,6 +4275,7 @@ with col_cluster:
             "strategy": "auto",
             "protect_manual": True,
             "facebank_first": True,
+            "skip_cast_assignment": False,  # Auto-assign clusters to cast members
         }
         try:
             resp = helpers.api_post(f"/episodes/{ep_id}/clusters/group", json=payload, timeout=300)
@@ -4297,7 +4464,8 @@ with col_cluster:
                     st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
                     st.session_state[_autorun_key] = False
                     st.session_state[_autorun_phase_key] = None
-                    st.toast("🎉 Auto-Run Pipeline Complete!")
+                    # Don't navigate away - let Improve Faces modal show on this page
+                    st.toast("🎉 Auto-Run Pipeline Complete! Opening Improve Faces...")
 
             if error_message:
                 # Bug 2 fix: Stop auto-run on error to prevent getting stuck
@@ -4341,13 +4509,30 @@ with col_cluster:
                     flash_msg = f"Auto-Run Pipeline Complete! ({completion_summary}) " + flash_msg
 
                 st.session_state["episode_detail_flash"] = flash_msg
-                # Note: status refresh and auto-run completion are now set BEFORE this block
+
+                # Trigger Improve Faces modal on this page (not redirect)
+                st.session_state[f"{ep_id}::trigger_improve_faces"] = True
+                LOGGER.info("[CLUSTER_COMPLETE] Set trigger flag for Improve Faces modal, ep_id=%s", ep_id)
+
+                st.toast("🎯 Cluster complete! Opening Improve Faces...")
                 st.rerun()
 
     # Keep latest cluster log handy for copy/paste
     helpers.render_previous_logs(ep_id, "cluster", expanded=False)
 
-st.divider()
+    # Show appropriate button based on state
+    if cluster_status_value == "success":
+        # If Improve Faces was completed, show "FACES REVIEW" button
+        if st.session_state.get(f"{ep_id}::improve_faces_complete"):
+            if st.button("📋 FACES REVIEW", key=f"faces_review_cta_{ep_id}", use_container_width=True, type="primary"):
+                st.switch_page("pages/3_Faces_Review.py")
+        else:
+            # Manual Improve Faces launcher
+            if st.button("🎯 Improve Faces", key=f"improve_faces_cta_{ep_id}", use_container_width=True):
+                st.session_state[f"{ep_id}::trigger_improve_faces"] = True
+                st.rerun()
+
+    st.divider()
 
 st.subheader("Artifacts")
 
@@ -4491,10 +4676,16 @@ if _execution_mode == "local" and not _any_job_running:
 
 if _local_job_just_completed:
     # Local mode job just completed - refresh once to show updated status
-    st.caption("✅ Job completed! Refreshing to show results...")
-    import time as _time
-    _time.sleep(1.5)
-    st.rerun()
+    if st.session_state.get(f"{ep_id}::trigger_improve_faces"):
+        st.caption("✅ Cluster completed! Opening Improve Faces...")
+        import time as _time
+        _time.sleep(0.5)
+        st.rerun()  # Stay on this page, modal will open
+    else:
+        st.caption("✅ Job completed! Refreshing to show results...")
+        import time as _time
+        _time.sleep(1.5)
+        st.rerun()
 elif _any_job_running and _execution_mode != "local":
     # Celery mode: poll for updates since jobs run in background
     import time as _time

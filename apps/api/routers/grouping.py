@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from apps.api.services.grouping import GroupingService, _parse_ep_id
 from apps.api.services.cast import CastService
+from apps.api.services.people import PeopleService
 from apps.api.services.dismissed_suggestions import dismissed_suggestions_service
 from apps.api.routers.episodes import _refresh_similarity_indexes
 
@@ -24,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 router = APIRouter()
 grouping_service = GroupingService()
 cast_service = CastService()
+people_service = PeopleService()
 
 # Lazy imports for Celery (only when needed)
 _celery_available = None
@@ -55,7 +57,7 @@ class GroupClustersRequest(BaseModel):
     name: Optional[str] = Field(None, description="Name for new person (when target_person_id is None)")
     protect_manual: bool = Field(True, description="If True, don't merge manually assigned clusters to different people")
     facebank_first: bool = Field(True, description="If True, try facebank matching before people prototypes (more accurate)")
-    skip_cast_assignment: bool = Field(True, description="If True, only group similar clusters without assigning to cast members. Set to False to enable auto-assignment to cast.")
+    skip_cast_assignment: bool = Field(False, description="If False (default), auto-assign clusters to cast members based on facebank matches. Set to True to only group similar clusters without assigning.")
     execution_mode: Optional[Literal["redis", "local"]] = Field(
         "redis",
         description="Execution mode: 'redis' enqueues job via Celery, 'local' runs synchronously in-process"
@@ -740,6 +742,139 @@ def list_unlinked_entities(ep_id: str) -> dict:
             status_code=500,
             detail=f"Failed to load unlinked entities: {str(e)}",
         )
+
+
+@router.get("/episodes/{ep_id}/find_similar_unassigned")
+def find_similar_unassigned(
+    ep_id: str,
+    person_id: str = Query(None, description="Person ID to find similar clusters for"),
+    cast_id: str = Query(None, description="Cast ID to find similar clusters for"),
+    min_similarity: float = Query(0.50, ge=0.3, le=1.0, description="Minimum similarity threshold"),
+) -> dict:
+    """Find unassigned clusters similar to a given person or cast member.
+
+    Used after accepting a suggestion to find additional singletons that might
+    belong to the same person but weren't in the original suggestion group.
+
+    Args:
+        ep_id: Episode ID
+        person_id: Person ID to match against (uses person's assigned clusters' centroid)
+        cast_id: Cast ID to match against (uses facebank seeds)
+        min_similarity: Minimum cosine similarity threshold (default 0.50)
+
+    Returns:
+        similar_clusters: List of unassigned cluster IDs with their similarity scores
+    """
+    import numpy as np
+    from apps.api.services.facebank import cosine_similarity, FacebankService
+    import re
+
+    if not person_id and not cast_id:
+        raise HTTPException(status_code=400, detail="Either person_id or cast_id required")
+
+    # Parse episode ID for show
+    pattern = r"^(?P<show>.+)-s(?P<season>\d{2})e(?P<episode>\d{2})$"
+    match = re.match(pattern, ep_id, re.IGNORECASE)
+    if not match:
+        raise HTTPException(status_code=400, detail=f"Invalid episode ID: {ep_id}")
+    show_id = match.group("show").upper()
+
+    try:
+        # Load cluster centroids
+        centroids_data = grouping_service.load_cluster_centroids(ep_id)
+        centroids = centroids_data.get("centroids", {})
+        if not centroids:
+            return {"status": "success", "similar_clusters": [], "message": "No centroids found"}
+
+        # Load identities to find assigned/unassigned
+        from apps.api.services.identities import load_identities
+        identities_data = load_identities(ep_id)
+        identities = identities_data.get("identities", [])
+
+        # Build lookup: cluster_id -> person_id
+        cluster_to_person = {}
+        for ident in identities:
+            cid = ident.get("identity_id")
+            pid = ident.get("person_id")
+            if cid:
+                cluster_to_person[cid] = pid
+
+        # Get reference embedding(s) to compare against
+        reference_embeddings = []
+
+        if cast_id:
+            # Use facebank seeds for this cast member
+            facebank_service = FacebankService()
+            seeds = facebank_service.list_seeds(show_id, cast_id=cast_id)
+            for seed in seeds:
+                emb = seed.get("embedding")
+                if emb:
+                    reference_embeddings.append(np.array(emb, dtype=np.float32))
+
+        if person_id:
+            # Use centroids of clusters assigned to this person
+            for ident in identities:
+                if ident.get("person_id") == person_id:
+                    cid = ident.get("identity_id")
+                    if cid and cid in centroids:
+                        centroid = centroids[cid].get("centroid")
+                        if centroid:
+                            reference_embeddings.append(np.array(centroid, dtype=np.float32))
+
+        if not reference_embeddings:
+            return {"status": "success", "similar_clusters": [], "message": "No reference embeddings found"}
+
+        # Average reference embeddings
+        ref_vec = np.mean(reference_embeddings, axis=0)
+        ref_vec = ref_vec / (np.linalg.norm(ref_vec) + 1e-8)
+
+        # Find unassigned clusters similar to reference
+        similar_clusters = []
+        for cluster_id, cluster_data in centroids.items():
+            # Skip if already assigned to a person with cast link
+            pid = cluster_to_person.get(cluster_id)
+            if pid:
+                # Check if this person has a cast_id
+                from apps.api.services.people import PeopleService
+                people_service = PeopleService()
+                person = people_service.get_person(show_id, pid)
+                if person and person.get("cast_id"):
+                    continue  # Already assigned to cast, skip
+
+            centroid = cluster_data.get("centroid")
+            if not centroid:
+                continue
+
+            cluster_vec = np.array(centroid, dtype=np.float32)
+            cluster_vec = cluster_vec / (np.linalg.norm(cluster_vec) + 1e-8)
+
+            sim = float(cosine_similarity(ref_vec, cluster_vec))
+            if sim >= min_similarity:
+                similar_clusters.append({
+                    "cluster_id": cluster_id,
+                    "similarity": sim,
+                    "tracks": cluster_data.get("track_count", 1),
+                    "faces": cluster_data.get("face_count", 0),
+                })
+
+        # Sort by similarity descending
+        similar_clusters.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "person_id": person_id,
+            "cast_id": cast_id,
+            "min_similarity": min_similarity,
+            "similar_clusters": similar_clusters,
+            "count": len(similar_clusters),
+        }
+
+    except FileNotFoundError as e:
+        return {"status": "success", "similar_clusters": [], "message": str(e)}
+    except Exception as e:
+        LOGGER.exception(f"[{ep_id}] Failed to find similar unassigned: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/episodes/{ep_id}/analyze_unassigned")
@@ -1549,6 +1684,77 @@ def get_outlier_audit(
         tb = traceback.format_exc()
         LOGGER.error(f"[outlier_audit] Failed for {ep_id}: {e}\n{tb}")
         raise HTTPException(status_code=500, detail=f"Failed to audit outliers: {str(e)}")
+
+
+@router.post("/shows/{show_id}/fix_unnamed_people")
+def fix_unnamed_people(show_id: str) -> dict:
+    """Create cast members for people without cast_ids.
+
+    This fixes the "Unknown" issue in Screentime where people were created
+    during Faces Review without corresponding cast members.
+
+    Returns:
+        {
+            "status": "success",
+            "show_id": str,
+            "fixed_count": int,
+            "fixed_people": [{"person_id": str, "name": str, "new_cast_id": str}, ...]
+        }
+    """
+    try:
+        people = people_service.list_people(show_id)
+        fixed_people = []
+
+        for person in people:
+            person_id = person.get("person_id")
+            cast_id = person.get("cast_id")
+            name = person.get("name")
+
+            # Skip if already has cast_id
+            if cast_id:
+                continue
+
+            # Skip if no person_id
+            if not person_id:
+                continue
+
+            # Determine name to use for cast member
+            display_name = name if name else person_id
+
+            try:
+                # Create cast member
+                cast_member = cast_service.create_cast_member(
+                    show_id=show_id,
+                    name=display_name,
+                    role="other",
+                    status="active",
+                )
+                new_cast_id = cast_member["cast_id"]
+
+                # Update person with cast_id
+                people_service.update_person(show_id, person_id, cast_id=new_cast_id)
+
+                fixed_people.append({
+                    "person_id": person_id,
+                    "name": display_name,
+                    "new_cast_id": new_cast_id,
+                })
+                LOGGER.info(f"[{show_id}] Fixed person {person_id}: created cast member {new_cast_id} for '{display_name}'")
+
+            except Exception as e:
+                LOGGER.warning(f"[{show_id}] Failed to fix person {person_id}: {e}")
+                continue
+
+        return {
+            "status": "success",
+            "show_id": show_id,
+            "fixed_count": len(fixed_people),
+            "fixed_people": fixed_people,
+        }
+
+    except Exception as e:
+        LOGGER.error(f"[{show_id}] Failed to fix unnamed people: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fix unnamed people: {str(e)}")
 
 
 __all__ = ["router"]

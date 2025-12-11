@@ -25,11 +25,21 @@ from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit.runtime.scriptrunner.script_run_context import (
-    add_script_run_ctx,
-    get_script_run_ctx,
-)
-from streamlit.runtime.scriptrunner.script_requests import RerunData
+# Streamlit 1.44+ reorganized internal modules - use try/except for compatibility
+try:
+    # Streamlit 1.44+
+    from streamlit.runtime.scriptrunner import (
+        add_script_run_ctx,
+        get_script_run_ctx,
+        RerunData,
+    )
+except ImportError:
+    # Streamlit < 1.44
+    from streamlit.runtime.scriptrunner.script_run_context import (
+        add_script_run_ctx,
+        get_script_run_ctx,
+    )
+    from streamlit.runtime.scriptrunner.script_requests import RerunData
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -2899,7 +2909,7 @@ def identity_card(title: str, subtitle: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.markdown(f"**{title}**")
         if subtitle:
             st.caption(subtitle)
@@ -2912,7 +2922,7 @@ def track_card(title: str, caption: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.markdown(f"**{title}**")
         st.caption(caption)
         if extra:
@@ -2924,7 +2934,7 @@ def frame_card(title: str, image_url: str | None, extra=None):
     card = st.container(border=True)
     with card:
         if image_url:
-            st.image(image_url, use_column_width=True)
+            st.image(image_url, use_container_width=True)
         st.caption(title)
         if extra:
             extra()
@@ -3897,6 +3907,7 @@ def _get_audio_paths(ep_id: str) -> Dict[str, Path]:
         "vocals": manifests_dir / "episode_vocals.wav",
         "vocals_enhanced": manifests_dir / "episode_vocals_enhanced.wav",
         "diarization": manifests_dir / "audio_diarization.jsonl",
+        # Legacy paths for backward compatibility
         "diarization_pyannote": manifests_dir / "audio_diarization_pyannote.jsonl",
         "diarization_gpt4o": manifests_dir / "audio_diarization_gpt4o.jsonl",
         "diarization_comparison": manifests_dir / "audio_diarization_comparison.json",
@@ -3944,9 +3955,9 @@ def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
 
     Returns dict with:
         - complete: bool - True if diarization and ASR exist
-        - diarization: bool - True if diarization exists
-        - diarization_pyannote: bool - True if pyannote diarization exists
-        - diarization_gpt4o: bool - True if GPT-4o diarization exists
+        - diarization: bool - True if diarization exists (NeMo MSDD)
+        - diarization_pyannote: bool - (Legacy) True if old pyannote diarization exists
+        - diarization_gpt4o: bool - (Legacy) True if old GPT-4o diarization exists
         - asr: bool - True if ASR raw transcript exists
         - voice_clusters: bool - True if initial voice clusters exist
         - segment_count: int - Number of diarization segments
@@ -3956,6 +3967,7 @@ def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
     paths = _get_audio_paths(ep_id)
 
     diarization = paths["diarization"].exists()
+    # Legacy paths for backward compatibility
     diarization_pyannote = paths["diarization_pyannote"].exists()
     diarization_gpt4o = paths["diarization_gpt4o"].exists()
     asr = paths["asr_raw"].exists()
@@ -3991,8 +4003,8 @@ def check_diarization_complete(ep_id: str) -> Dict[str, Any]:
     return {
         "complete": diarization and asr,
         "diarization": diarization,
-        "diarization_pyannote": diarization_pyannote,
-        "diarization_gpt4o": diarization_gpt4o,
+        "diarization_pyannote": diarization_pyannote,  # Legacy
+        "diarization_gpt4o": diarization_gpt4o,  # Legacy
         "asr": asr,
         "voice_clusters": voice_clusters,
         "segment_count": segment_count,

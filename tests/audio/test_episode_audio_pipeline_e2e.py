@@ -39,7 +39,7 @@ class TestAudioPipelineE2E:
     @patch("py_screenalytics.audio.separation_mdx.separate_vocals")
     @patch("py_screenalytics.audio.enhance_resemble.check_api_available")
     @patch("py_screenalytics.audio.enhance_resemble.enhance_audio_local")
-    @patch("py_screanalytics.audio.diarization_pyannote.run_diarization")
+    @patch("py_screenalytics.audio.diarization_nemo.run_diarization_nemo")
     @patch("py_screenalytics.audio.voice_clusters.cluster_episode_voices")
     @patch("py_screanalytics.audio.voice_bank.match_voice_clusters_to_bank")
     @patch("py_screanalytics.audio.asr_openai.transcribe_audio")

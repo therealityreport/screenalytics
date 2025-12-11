@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import shutil
 import numpy as np
 
-from .diarization_pyannote import _save_diarization_manifest, extract_speaker_embeddings
+from .diarization_nemo import save_diarization_manifest, extract_speaker_embeddings
 from .episode_audio_pipeline import _get_audio_paths, _get_show_id, _load_config
 from .models import (
     ASRSegment,
@@ -44,7 +44,7 @@ from .voice_bank import match_voice_clusters_to_bank
 from .voice_clusters import cluster_episode_voices
 from .fuse_diarization_asr import fuse_transcript
 from .asr_openai import _load_asr_manifest
-from .diarization_pyannote import _load_diarization_manifest
+from .diarization_nemo import load_diarization_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -320,7 +320,7 @@ def smart_split_segment_by_words(
     # Update diarization manifest
     diar_path = paths.get("diarization_pyannote") if source == "pyannote" else paths.get("diarization_gpt4o")
     if diar_path and diar_path.exists():
-        diar_segments = _load_diarization_manifest(diar_path)
+        diar_segments = load_diarization_manifest(diar_path)
         # Remove original segment
         filtered = [
             d for d in diar_segments
@@ -334,7 +334,7 @@ def smart_split_segment_by_words(
                 speaker=target_group.speaker_label,
             ))
         filtered.sort(key=lambda d: d.start)
-        _save_diarization_manifest(filtered, diar_path)
+        save_diarization_manifest(filtered, diar_path)
 
         # Copy to primary diarization if pyannote
         if source == "pyannote" and paths.get("diarization"):
@@ -395,7 +395,7 @@ def _rebuild_downstream_artifacts(ep_id: str, paths: dict, source: str) -> None:
 
         diar_path = paths.get("diarization")
         if diar_path and diar_path.exists():
-            diarization_segments = _load_diarization_manifest(diar_path)
+            diarization_segments = load_diarization_manifest(diar_path)
             asr_segments = _load_asr_manifest(paths["asr_raw"])
             fuse_transcript(
                 diarization_segments,
@@ -730,7 +730,7 @@ def smart_split_segment(
     # Update diarization manifest for the source to reflect new splits
     diar_path = paths.get("diarization_pyannote") if source == "pyannote" else paths.get("diarization_gpt4o")
     if diar_path and diar_path.exists():
-        diar_segments = _load_diarization_manifest(diar_path)
+        diar_segments = load_diarization_manifest(diar_path)
         filtered = [d for d in diar_segments if not (abs(d.start - seg_start) < 1e-3 and abs(d.end - seg_end) < 1e-3 and d.speaker == target_group.speaker_label)]
         for subseg in subsegments:
             filtered.append(
@@ -741,7 +741,7 @@ def smart_split_segment(
                 )
             )
         filtered.sort(key=lambda d: d.start)
-        _save_diarization_manifest(filtered, diar_path)
+        save_diarization_manifest(filtered, diar_path)
         if source == "pyannote" and paths.get("diarization"):
             try:
                 shutil.copy(diar_path, paths["diarization"])
@@ -767,7 +767,7 @@ def smart_split_segment(
         overwrite=True,
     )
 
-    diarization_segments = _load_diarization_manifest(paths["diarization"])
+    diarization_segments = load_diarization_manifest(paths["diarization"])
     asr_segments = _load_asr_manifest(paths["asr_raw"])
     fuse_transcript(
         diarization_segments,

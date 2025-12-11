@@ -8,12 +8,13 @@ import re
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Set
 
 import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -71,6 +72,33 @@ def _faces_path(ep_id: str) -> Path:
 
 def _faces_ops_path(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "faces_ops.jsonl"
+
+
+@lru_cache(maxsize=8)
+def _load_detections_by_frame(ep_id: str, mtime: float) -> Dict[int, List[Dict]]:
+    """Load detections and index by frame_idx. Cached with mtime for invalidation."""
+    detections_path = get_path(ep_id, "detections")
+    result: Dict[int, List[Dict]] = {}
+    if detections_path.exists():
+        with open(detections_path, "r") as f:
+            for line in f:
+                try:
+                    det = json.loads(line)
+                    fidx = det.get("frame_idx")
+                    if fidx is not None:
+                        if fidx not in result:
+                            result[fidx] = []
+                        result[fidx].append(det)
+                except json.JSONDecodeError:
+                    continue
+    return result
+
+
+def _get_detections_by_frame(ep_id: str) -> Dict[int, List[Dict]]:
+    """Get cached detections indexed by frame. Cache invalidates on file change."""
+    detections_path = get_path(ep_id, "detections")
+    mtime = detections_path.stat().st_mtime if detections_path.exists() else 0.0
+    return _load_detections_by_frame(ep_id, mtime)
 
 
 def _append_face_ops(ep_id: str, entries: Iterable[Dict[str, Any]]) -> None:
@@ -3332,6 +3360,643 @@ def list_identities_with_metrics(
     return {"identities": identities, "stats": payload.get("stats", {})}
 
 
+@router.get("/episodes/{ep_id}/unclustered_tracks")
+def list_unclustered_tracks(ep_id: str) -> dict:
+    """List tracks that are not in any identity cluster.
+
+    Returns tracks from tracks.jsonl that have no corresponding identity_id
+    in identities.json. These are tracks that were detected but not yet
+    assigned to any cluster.
+    """
+    # Load all tracks
+    all_tracks = _load_tracks(ep_id)
+
+    # Build lookup of track_ids that are in identities
+    identities_payload = _load_identities(ep_id)
+    clustered_track_ids: set[int] = set()
+    for identity in identities_payload.get("identities", []):
+        for raw_tid in identity.get("track_ids", []) or []:
+            try:
+                clustered_track_ids.add(int(raw_tid))
+            except (TypeError, ValueError):
+                continue
+
+    # Find tracks not in any identity
+    first_faces = _first_face_lookup(ep_id)
+
+    # Build face count lookups from faces.jsonl for tracks with missing faces_count
+    # This handles cases where tracks.jsonl wasn't properly populated during pipeline
+    # Count ALL faces (including skipped) for display - users need to see total faces
+    faces_by_track: Dict[int, int] = {}  # Total faces (including skipped)
+    skipped_by_track: Dict[int, int] = {}  # Skipped faces count
+    emb_by_track: Dict[int, int] = {}  # Faces with embeddings count
+    blur_by_track: Dict[int, List[float]] = {}  # Blur scores for avg calculation
+    skip_reasons_by_track: Dict[int, List[str]] = {}  # Skip reasons for diagnostics
+    for face in _load_faces(ep_id, include_skipped=True):  # Include ALL faces
+        tid = face.get("track_id")
+        if tid is not None:
+            try:
+                tid_int = int(tid)
+                faces_by_track[tid_int] = faces_by_track.get(tid_int, 0) + 1
+                # Count skipped separately
+                skip_val = face.get("skip")
+                if skip_val:
+                    skipped_by_track[tid_int] = skipped_by_track.get(tid_int, 0) + 1
+                    # Collect skip reasons for diagnostics
+                    if tid_int not in skip_reasons_by_track:
+                        skip_reasons_by_track[tid_int] = []
+                    skip_reasons_by_track[tid_int].append(str(skip_val))
+                # Count faces with embeddings
+                if face.get("embedding") or face.get("has_embedding"):
+                    emb_by_track[tid_int] = emb_by_track.get(tid_int, 0) + 1
+                # Collect blur scores
+                blur = face.get("blur")
+                if blur is not None:
+                    if tid_int not in blur_by_track:
+                        blur_by_track[tid_int] = []
+                    blur_by_track[tid_int].append(float(blur))
+            except (TypeError, ValueError):
+                continue
+
+    unclustered = []
+    for track in all_tracks:
+        try:
+            track_id = int(track.get("track_id", -1))
+        except (TypeError, ValueError):
+            continue
+
+        if track_id < 0 or track_id in clustered_track_ids:
+            continue
+
+        # Build unclustered track entry
+        # Fall back to counting faces from faces.jsonl if tracks.jsonl has no count
+        faces_count = track.get("faces_count")
+        if faces_count is None or faces_count == 0:
+            faces_count = faces_by_track.get(track_id, 0)
+        else:
+            faces_count = int(faces_count)
+
+        # Also populate skipped/embeddings from face data if tracks.jsonl doesn't have it
+        faces_skipped = track.get("faces_skipped")
+        if faces_skipped is None or faces_skipped == 0:
+            faces_skipped = skipped_by_track.get(track_id, 0)
+        else:
+            faces_skipped = int(faces_skipped)
+
+        faces_with_embeddings = track.get("faces_with_embeddings")
+        if faces_with_embeddings is None or faces_with_embeddings == 0:
+            faces_with_embeddings = emb_by_track.get(track_id, 0)
+        else:
+            faces_with_embeddings = int(faces_with_embeddings)
+
+        # Determine singleton risk based on track properties
+        if faces_count == 1:
+            risk = "HIGH"
+        elif faces_count <= 3:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
+
+        # Get thumbnail URL
+        preview_url = _resolve_face_media_url(ep_id, first_faces.get(track_id))
+        if not preview_url:
+            preview_url = _resolve_thumb_url(
+                ep_id,
+                track.get("rep_thumb_rel_path"),
+                track.get("rep_thumb_s3_key"),
+            )
+
+        # Calculate blur stats for this track
+        blur_scores = blur_by_track.get(track_id, [])
+        avg_blur = sum(blur_scores) / len(blur_scores) if blur_scores else None
+        max_blur = max(blur_scores) if blur_scores else None
+
+        # Determine skip reason with diagnostic details
+        skip_reason = None
+        skip_detail = None
+        if faces_with_embeddings == 0:
+            # No embeddings - check why faces were skipped
+            track_skip_reasons = skip_reasons_by_track.get(track_id, [])
+            if track_skip_reasons:
+                # Parse skip reasons to find most common
+                reason_counts: Dict[str, int] = {}
+                for sr in track_skip_reasons:
+                    # Extract base reason (e.g., "blurry" from "blurry:10.8")
+                    base_reason = sr.split(":")[0] if ":" in sr else sr
+                    reason_counts[base_reason] = reason_counts.get(base_reason, 0) + 1
+                primary_reason = max(reason_counts.items(), key=lambda x: x[1])[0]
+                skip_reason = f"no_embedding:{primary_reason}"
+                skip_detail = f"All {faces_count} face(s) skipped. Primary reason: {primary_reason}. " \
+                              f"Max blur: {max_blur}, threshold: 18.0"
+            else:
+                skip_reason = "no_embedding:unknown"
+                skip_detail = f"Track has {faces_count} face(s) but no embeddings generated"
+        else:
+            # Has embeddings but not clustered - likely outlier or clustering not run
+            skip_reason = "not_clustered"
+            skip_detail = f"Track has {faces_with_embeddings} embedding(s) but wasn't assigned to a cluster. " \
+                          "May be outlier (below min_identity_sim threshold) or clustering not run."
+
+        unclustered.append({
+            "track_id": track_id,
+            "faces": faces_count,
+            "faces_skipped": faces_skipped,
+            "faces_with_embeddings": faces_with_embeddings,
+            "singleton_risk": risk,
+            "rep_thumbnail_url": preview_url,
+            "avg_blur": round(avg_blur, 1) if avg_blur is not None else None,
+            "max_blur": round(max_blur, 1) if max_blur is not None else None,
+            "skip_reason": skip_reason,
+            "skip_detail": skip_detail,
+        })
+
+    # Include config thresholds for reference (from config/pipeline/)
+    config_thresholds = {
+        "embedding": {
+            "min_blur_score": 18.0,  # faces_embed_sampling.yaml
+            "min_confidence": 0.45,
+        },
+        "clustering": {
+            "cluster_thresh": 0.52,  # clustering.yaml
+            "min_identity_sim": 0.45,
+            "min_cluster_size": 1,
+        },
+    }
+
+    return {
+        "unclustered_tracks": unclustered,
+        "count": len(unclustered),
+        "total_tracks": len(all_tracks),
+        "config_thresholds": config_thresholds,
+    }
+
+
+# --- Singleton Analysis (Batch) ---
+
+
+class SingletonAnalysisRequest(BaseModel):
+    """Request for batch singleton analysis."""
+
+    include_archive: bool = Field(
+        default=False,
+        description="Compare singletons against archived item centroids",
+    )
+    min_similarity: float = Field(
+        default=0.30,
+        description="Minimum similarity threshold for suggestions",
+        ge=0.0,
+        le=1.0,
+    )
+    top_k: int = Field(
+        default=3,
+        description="Maximum suggestions per singleton",
+        ge=1,
+        le=10,
+    )
+
+
+@router.post("/episodes/{ep_id}/singleton_analysis")
+def analyze_singletons_batch(
+    ep_id: str,
+    request: SingletonAnalysisRequest = Body(default=SingletonAnalysisRequest()),
+) -> dict:
+    """Batch analyze all singleton clusters against assigned track embeddings.
+
+    This performs efficient batch comparison of ALL singleton clusters (clusters with
+    exactly 1 track) against ALL assigned track embeddings from this episode.
+    Results are grouped by suggested person for efficient UI review.
+
+    Returns:
+        - person_groups: List of person groups, each containing singletons suggested for that person
+        - archive_matches: Singletons similar to archived items (if include_archive=True)
+        - unmatched: Singletons with no good suggestions
+        - stats: Summary statistics
+    """
+    from apps.api.services.grouping import GroupingService
+
+    ep_id = normalize_ep_id(ep_id)
+    grouping_service = GroupingService()
+
+    try:
+        result = grouping_service.analyze_singletons_batch(
+            ep_id=ep_id,
+            include_archive=request.include_archive,
+            min_similarity=request.min_similarity,
+            top_k=request.top_k,
+        )
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/episodes/{ep_id}/singletons/{track_id}/nearby_suggestions")
+def get_singleton_nearby_suggestions(
+    ep_id: str,
+    track_id: int,
+    time_window: float = Query(10.0, description="Time window in seconds to search for nearby tracks"),
+    top_k: int = Query(3, description="Number of top suggestions to return"),
+) -> dict:
+    """Suggest cast members based on nearby assigned tracks.
+
+    This finds tracks within the specified time window that are already assigned
+    to cast members, compares their embeddings to the singleton, and suggests
+    the most similar cast member.
+
+    Returns:
+        - suggestions: List of cast member suggestions with similarity scores
+        - nearby_tracks: List of assigned tracks found nearby
+        - singleton_info: Info about the singleton track being analyzed
+    """
+    import numpy as np
+
+    # Load all faces with embeddings
+    all_faces = list(_load_faces(ep_id, include_skipped=True))
+
+    # Get faces for the target singleton track
+    singleton_faces = [f for f in all_faces if int(f.get("track_id", -1)) == track_id]
+    if not singleton_faces:
+        return {"error": "Track not found", "suggestions": [], "nearby_tracks": []}
+
+    # Get singleton's timestamp range and embeddings
+    singleton_timestamps = [f.get("ts", 0) for f in singleton_faces if f.get("ts") is not None]
+    singleton_embeddings = [f.get("embedding") for f in singleton_faces if f.get("embedding")]
+
+    if not singleton_timestamps:
+        return {"error": "Track has no timestamps", "suggestions": [], "nearby_tracks": []}
+
+    min_ts = min(singleton_timestamps)
+    max_ts = max(singleton_timestamps)
+    search_start = max(0, min_ts - time_window)
+    search_end = max_ts + time_window
+
+    # Compute singleton's mean embedding
+    if not singleton_embeddings:
+        return {"error": "Track has no embeddings", "suggestions": [], "nearby_tracks": []}
+
+    singleton_mean = np.mean(singleton_embeddings, axis=0)
+    singleton_mean = singleton_mean / (np.linalg.norm(singleton_mean) + 1e-8)
+
+    # Load identities to find which tracks are assigned to cast members
+    identities_path = _identities_path(ep_id)
+    if not identities_path.exists():
+        return {"error": "No identities found", "suggestions": [], "nearby_tracks": []}
+
+    identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+    identities = identities_data.get("identities", [])
+
+    # Build track_id -> (identity_id, person_id, name) lookup
+    track_to_assignment: Dict[int, Dict[str, Any]] = {}
+    for identity in identities:
+        person_id = identity.get("person_id")
+        name = identity.get("name")
+        if not person_id and not name:
+            continue  # Not assigned
+        for tid in identity.get("track_ids", []):
+            try:
+                track_to_assignment[int(tid)] = {
+                    "identity_id": identity.get("identity_id"),
+                    "person_id": person_id,
+                    "name": name,
+                }
+            except (TypeError, ValueError):
+                continue
+
+    # Find nearby faces from assigned tracks
+    nearby_faces_by_track: Dict[int, List[Dict]] = {}
+    for face in all_faces:
+        face_tid = face.get("track_id")
+        face_ts = face.get("ts")
+        face_emb = face.get("embedding")
+
+        if face_tid is None or face_ts is None or face_emb is None:
+            continue
+
+        try:
+            face_tid_int = int(face_tid)
+        except (TypeError, ValueError):
+            continue
+
+        # Skip the singleton itself
+        if face_tid_int == track_id:
+            continue
+
+        # Check if within time window
+        if not (search_start <= face_ts <= search_end):
+            continue
+
+        # Check if track is assigned
+        if face_tid_int not in track_to_assignment:
+            continue
+
+        # Collect this face
+        if face_tid_int not in nearby_faces_by_track:
+            nearby_faces_by_track[face_tid_int] = []
+        nearby_faces_by_track[face_tid_int].append({
+            "ts": face_ts,
+            "embedding": face_emb,
+        })
+
+    if not nearby_faces_by_track:
+        return {
+            "suggestions": [],
+            "nearby_tracks": [],
+            "singleton_info": {
+                "track_id": track_id,
+                "timestamp_range": [min_ts, max_ts],
+                "faces_count": len(singleton_faces),
+            },
+            "message": "No assigned tracks found within time window",
+        }
+
+    # Compute similarity to each nearby assigned track
+    track_similarities: List[Dict[str, Any]] = []
+    for nearby_tid, faces in nearby_faces_by_track.items():
+        # Compute mean embedding for nearby track
+        embeddings = [f["embedding"] for f in faces]
+        nearby_mean = np.mean(embeddings, axis=0)
+        nearby_mean = nearby_mean / (np.linalg.norm(nearby_mean) + 1e-8)
+
+        # Cosine similarity
+        similarity = float(np.dot(singleton_mean, nearby_mean))
+
+        assignment = track_to_assignment[nearby_tid]
+        track_similarities.append({
+            "track_id": nearby_tid,
+            "similarity": similarity,
+            "faces_count": len(faces),
+            "min_ts": min(f["ts"] for f in faces),
+            "max_ts": max(f["ts"] for f in faces),
+            "identity_id": assignment.get("identity_id"),
+            "person_id": assignment.get("person_id"),
+            "name": assignment.get("name"),
+        })
+
+    # Sort by similarity (highest first)
+    track_similarities.sort(key=lambda x: x["similarity"], reverse=True)
+
+    # Aggregate by cast member (person_id or name)
+    cast_scores: Dict[str, Dict[str, Any]] = {}
+    for ts in track_similarities:
+        key = ts.get("person_id") or ts.get("name") or ts.get("identity_id")
+        if not key:
+            continue
+        if key not in cast_scores:
+            cast_scores[key] = {
+                "person_id": ts.get("person_id"),
+                "name": ts.get("name"),
+                "best_similarity": ts["similarity"],
+                "track_count": 0,
+                "total_faces": 0,
+            }
+        cast_scores[key]["track_count"] += 1
+        cast_scores[key]["total_faces"] += ts["faces_count"]
+        # Keep best similarity
+        if ts["similarity"] > cast_scores[key]["best_similarity"]:
+            cast_scores[key]["best_similarity"] = ts["similarity"]
+
+    # Convert to sorted list
+    suggestions = sorted(
+        cast_scores.values(),
+        key=lambda x: x["best_similarity"],
+        reverse=True
+    )[:top_k]
+
+    # Add confidence level
+    for s in suggestions:
+        sim = s["best_similarity"]
+        if sim >= 0.70:
+            s["confidence"] = "high"
+        elif sim >= 0.55:
+            s["confidence"] = "medium"
+        else:
+            s["confidence"] = "low"
+
+    return {
+        "suggestions": suggestions,
+        "nearby_tracks": track_similarities[:10],  # Top 10 nearby tracks
+        "singleton_info": {
+            "track_id": track_id,
+            "timestamp_range": [min_ts, max_ts],
+            "faces_count": len(singleton_faces),
+            "embeddings_count": len(singleton_embeddings),
+        },
+        "search_window": {
+            "start": search_start,
+            "end": search_end,
+            "window_seconds": time_window,
+        },
+    }
+
+
+@router.post("/episodes/{ep_id}/generate_singleton_suggestions")
+def generate_singleton_suggestions(
+    ep_id: str,
+    top_k: int = Query(3, description="Number of top suggestions per singleton"),
+) -> dict:
+    """Generate cast suggestions for all singletons by comparing against assigned tracks.
+
+    This searches ALL assigned tracks/clusters globally (not time-limited) and finds
+    the most similar cast members for each singleton based on embedding similarity.
+
+    Returns:
+        - suggestions: Dict mapping track_id -> list of cast suggestions
+        - stats: Summary statistics
+        - errors: List of tracks that couldn't be processed
+    """
+    import numpy as np
+
+    # Load all faces with embeddings
+    all_faces = list(_load_faces(ep_id, include_skipped=True))
+
+    # Count faces with embeddings
+    faces_with_emb = [f for f in all_faces if f.get("embedding")]
+    if not faces_with_emb:
+        return {
+            "error": "No faces have embeddings. Run 'faces_embed' job first.",
+            "suggestions": {},
+            "stats": {"total_faces": len(all_faces), "faces_with_embeddings": 0},
+            "action_required": "faces_embed",
+        }
+
+    # Load identities to find assigned tracks
+    identities_path = _identities_path(ep_id)
+    if not identities_path.exists():
+        return {"error": "No identities found", "suggestions": {}, "stats": {}}
+
+    identities_data = json.loads(identities_path.read_text(encoding="utf-8"))
+    identities = identities_data.get("identities", [])
+
+    # Build track_id -> assignment lookup for assigned tracks
+    assigned_track_ids: set = set()
+    track_to_cast: Dict[int, Dict[str, Any]] = {}
+    singleton_track_ids: set = set()  # Tracks in singleton clusters (1 track)
+    unassigned_track_ids: set = set()  # Tracks in unassigned clusters
+
+    for identity in identities:
+        person_id = identity.get("person_id")
+        name = identity.get("name")
+        track_ids = identity.get("track_ids", [])
+
+        for tid in track_ids:
+            try:
+                tid_int = int(tid)
+                if person_id or name:
+                    # This track is assigned
+                    assigned_track_ids.add(tid_int)
+                    track_to_cast[tid_int] = {
+                        "identity_id": identity.get("identity_id"),
+                        "person_id": person_id,
+                        "name": name,
+                        "cast_id": person_id,  # For quick assign
+                    }
+                else:
+                    # Unassigned track
+                    unassigned_track_ids.add(tid_int)
+                    if len(track_ids) == 1:
+                        singleton_track_ids.add(tid_int)
+            except (TypeError, ValueError):
+                continue
+
+    # Load unclustered tracks
+    all_tracks = list(_load_tracks(ep_id))
+    clustered_track_ids = assigned_track_ids | unassigned_track_ids
+    unclustered_track_ids = set()
+    for t in all_tracks:
+        try:
+            tid = int(t.get("track_id", -1))
+            if tid not in clustered_track_ids:
+                unclustered_track_ids.add(tid)
+        except (TypeError, ValueError):
+            continue
+
+    # All singletons = singleton clusters + unclustered tracks
+    all_singleton_ids = singleton_track_ids | unclustered_track_ids
+
+    if not assigned_track_ids:
+        return {
+            "error": "No assigned tracks found. Assign some tracks to cast members first.",
+            "suggestions": {},
+            "stats": {"singletons": len(all_singleton_ids), "assigned_tracks": 0},
+        }
+
+    # Build embeddings by track
+    embeddings_by_track: Dict[int, List] = {}
+    for face in faces_with_emb:
+        tid = face.get("track_id")
+        emb = face.get("embedding")
+        if tid is not None and emb is not None:
+            try:
+                tid_int = int(tid)
+                if tid_int not in embeddings_by_track:
+                    embeddings_by_track[tid_int] = []
+                embeddings_by_track[tid_int].append(emb)
+            except (TypeError, ValueError):
+                continue
+
+    # Compute mean embedding for each assigned track
+    assigned_embeddings: Dict[int, np.ndarray] = {}
+    for tid in assigned_track_ids:
+        if tid in embeddings_by_track:
+            embs = embeddings_by_track[tid]
+            mean_emb = np.mean(embs, axis=0)
+            mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-8)
+            assigned_embeddings[tid] = mean_emb
+
+    if not assigned_embeddings:
+        return {
+            "error": "Assigned tracks have no embeddings. Run 'faces_embed' job first.",
+            "suggestions": {},
+            "stats": {"assigned_tracks": len(assigned_track_ids), "with_embeddings": 0},
+            "action_required": "faces_embed",
+        }
+
+    # Generate suggestions for each singleton
+    suggestions: Dict[str, List[Dict]] = {}
+    errors: List[Dict] = []
+    processed = 0
+
+    for singleton_tid in all_singleton_ids:
+        # Get singleton embeddings
+        if singleton_tid not in embeddings_by_track:
+            errors.append({"track_id": singleton_tid, "error": "no_embeddings"})
+            continue
+
+        singleton_embs = embeddings_by_track[singleton_tid]
+        singleton_mean = np.mean(singleton_embs, axis=0)
+        singleton_mean = singleton_mean / (np.linalg.norm(singleton_mean) + 1e-8)
+
+        # Compare against all assigned tracks
+        similarities: List[Dict] = []
+        for assigned_tid, assigned_emb in assigned_embeddings.items():
+            sim = float(np.dot(singleton_mean, assigned_emb))
+            cast_info = track_to_cast[assigned_tid]
+            similarities.append({
+                "track_id": assigned_tid,
+                "similarity": sim,
+                "person_id": cast_info.get("person_id"),
+                "name": cast_info.get("name"),
+                "cast_id": cast_info.get("cast_id"),
+                "identity_id": cast_info.get("identity_id"),
+            })
+
+        # Sort by similarity and group by cast member
+        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # Aggregate by cast (person_id or name)
+        cast_scores: Dict[str, Dict] = {}
+        for s in similarities:
+            key = s.get("person_id") or s.get("name")
+            if not key:
+                continue
+            if key not in cast_scores:
+                cast_scores[key] = {
+                    "person_id": s.get("person_id"),
+                    "name": s.get("name"),
+                    "cast_id": s.get("cast_id"),
+                    "best_similarity": s["similarity"],
+                    "track_count": 0,
+                    "best_track_id": s["track_id"],
+                }
+            cast_scores[key]["track_count"] += 1
+            if s["similarity"] > cast_scores[key]["best_similarity"]:
+                cast_scores[key]["best_similarity"] = s["similarity"]
+                cast_scores[key]["best_track_id"] = s["track_id"]
+
+        # Sort by best similarity and take top_k
+        top_suggestions = sorted(
+            cast_scores.values(),
+            key=lambda x: x["best_similarity"],
+            reverse=True
+        )[:top_k]
+
+        # Add confidence levels
+        for sug in top_suggestions:
+            sim = sug["best_similarity"]
+            if sim >= 0.70:
+                sug["confidence"] = "high"
+            elif sim >= 0.55:
+                sug["confidence"] = "medium"
+            else:
+                sug["confidence"] = "low"
+
+        suggestions[str(singleton_tid)] = top_suggestions
+        processed += 1
+
+    return {
+        "suggestions": suggestions,
+        "stats": {
+            "total_singletons": len(all_singleton_ids),
+            "processed": processed,
+            "with_suggestions": len([s for s in suggestions.values() if s]),
+            "errors": len(errors),
+            "assigned_tracks_with_embeddings": len(assigned_embeddings),
+        },
+        "errors": errors[:20],  # Limit error list
+    }
+
+
 @router.get("/episodes/{ep_id}/tracks/{track_id}")
 def track_detail(ep_id: str, track_id: int) -> dict:
     faces = [row for row in _load_faces(ep_id, include_skipped=False) if int(row.get("track_id", -1)) == track_id]
@@ -4258,22 +4923,11 @@ def generate_timestamp_preview(
         # 2. Tracks - faces grouped into tracks by ByteTrack
         # 3. Faces (harvested) - faces that passed quality gating and were embedded
 
-        detections_path = get_path(ep_id, "detections")
         tracks_path = get_path(ep_id, "tracks")
-        faces_path = detections_path.parent / "faces.jsonl"  # faces.jsonl is in manifests dir
 
-        # Load detections for this frame
-        frame_detections = []
-        if detections_path.exists():
-            import json
-            with open(detections_path, "r") as f:
-                for line in f:
-                    try:
-                        det = json.loads(line)
-                        if det.get("frame_idx") == frame_idx:
-                            frame_detections.append(det)
-                    except json.JSONDecodeError:
-                        continue
+        # Load detections using cached helper (avoids re-parsing JSONL on repeated requests)
+        detections_by_frame = _get_detections_by_frame(ep_id)
+        frame_detections = detections_by_frame.get(frame_idx, [])
 
         # Load tracks - build mapping of track_id -> frame_span
         # tracks.jsonl uses frame_span: [start_frame, end_frame] format
@@ -4326,32 +4980,21 @@ def generate_timestamp_preview(
         gap_seconds = 0.0
 
         # If no detections at exact frame, find closest frame with detections
-        if not frame_detections:
-            # Load all detections to find closest frame
-            all_detections = []
-            if detections_path.exists():
-                with open(detections_path, "r") as f:
-                    for line in f:
-                        try:
-                            det = json.loads(line)
-                            all_detections.append(det)
-                        except json.JSONDecodeError:
-                            continue
+        # Uses already-loaded detections_by_frame dict (no redundant file read)
+        if not frame_detections and detections_by_frame:
+            all_det_frames = sorted(detections_by_frame.keys())
+            if all_det_frames:
+                closest_frame = min(all_det_frames, key=lambda f: abs(f - frame_idx))
+                gap = abs(closest_frame - frame_idx)
+                gap_seconds = gap / fps if fps > 0 else 0
 
-            if all_detections:
-                all_det_frames = sorted(set(d.get("frame_idx") for d in all_detections if d.get("frame_idx") is not None))
-                if all_det_frames:
-                    closest_frame = min(all_det_frames, key=lambda f: abs(f - frame_idx))
-                    gap = abs(closest_frame - frame_idx)
-                    gap_seconds = gap / fps if fps > 0 else 0
+                frame_detections = detections_by_frame[closest_frame]
+                frame_idx = closest_frame
 
-                    frame_detections = [d for d in all_detections if d.get("frame_idx") == closest_frame]
-                    frame_idx = closest_frame
-
-                    LOGGER.info(
-                        f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
-                        f"closest detected frame is {closest_frame} (gap={gap} frames, {gap_seconds:.2f}s)"
-                    )
+                LOGGER.info(
+                    f"[TIMESTAMP_PREVIEW] Requested frame {original_frame_idx} (ts={timestamp_s:.2f}s), "
+                    f"closest detected frame is {closest_frame} (gap={gap} frames, {gap_seconds:.2f}s)"
+                )
 
         if not frame_detections:
             raise HTTPException(
@@ -4483,7 +5126,46 @@ def generate_timestamp_preview(
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness
                 )
 
-                face_info.append({
+                # Determine WHY this face is unidentified
+                unidentified_reason = None
+                if not name:
+                    if not is_harvested:
+                        unidentified_reason = "not_harvested"  # Face didn't pass quality gating
+                    elif not is_clustered:
+                        unidentified_reason = "not_clustered"  # Face not assigned to identity
+                    elif not person_id:
+                        unidentified_reason = "no_person"  # Identity not linked to person
+                    elif not cast_id:
+                        unidentified_reason = "no_cast"  # Person not linked to cast
+                    else:
+                        unidentified_reason = "no_name"  # Cast has no name
+
+                # Get quality scores from harvested face if available
+                quality_scores = {}
+                harvested_face = harvested_faces_lookup.get((track_id, frame_idx))
+                if harvested_face:
+                    quality_scores = {
+                        "quality": round(harvested_face.get("quality", 0), 3),
+                        "blur": round(harvested_face.get("blur", 0), 3),
+                        "pose_yaw": round(harvested_face.get("pose_yaw", 0), 1),
+                        "pose_pitch": round(harvested_face.get("pose_pitch", 0), 1),
+                        "pose_roll": round(harvested_face.get("pose_roll", 0), 1),
+                        "det_score": round(harvested_face.get("det_score", conf), 3),
+                        "embedding_norm": round(harvested_face.get("embedding_norm", 0), 3),
+                    }
+                elif detection:
+                    # Use detection scores if no harvested face
+                    quality_scores = {
+                        "det_score": round(conf, 3),
+                    }
+                    # Check if there's a nearby harvested face for this track
+                    for (tid, fidx), hf in harvested_faces_lookup.items():
+                        if tid == track_id:
+                            quality_scores["quality"] = round(hf.get("quality", 0), 3)
+                            quality_scores["blur"] = round(hf.get("blur", 0), 3)
+                            break
+
+                face_entry = {
                     "track_id": track_id,
                     "bbox": bbox,
                     "conf": round(conf, 3),
@@ -4496,7 +5178,17 @@ def generate_timestamp_preview(
                     "tracked": is_tracked,
                     "harvested": is_harvested,
                     "clustered": is_clustered,
-                })
+                }
+
+                # Add diagnostic info for unidentified faces
+                if not name:
+                    face_entry["unidentified_reason"] = unidentified_reason
+
+                # Add quality scores
+                if quality_scores:
+                    face_entry["scores"] = quality_scores
+
+                face_info.append(face_entry)
             except (TypeError, ValueError):
                 continue
 
@@ -4609,6 +5301,55 @@ def generate_frame_preview(
 
     # Reuse the timestamp preview endpoint
     return generate_timestamp_preview(ep_id, timestamp_s, include_unidentified)
+
+
+@router.get("/episodes/{ep_id}/frames_with_faces")
+def get_frames_with_faces(
+    ep_id: str,
+    min_frame: int = Query(0, ge=0, description="Minimum frame index"),
+    max_frame: Optional[int] = Query(None, ge=0, description="Maximum frame index (None for all)"),
+) -> dict:
+    """Get a sorted list of frame indices that have face detections.
+
+    This is useful for navigation - jumping to the next/previous frame with faces.
+
+    Args:
+        ep_id: Episode identifier
+        min_frame: Minimum frame index to include
+        max_frame: Maximum frame index to include (None = no limit)
+
+    Returns:
+        {
+            "frames": [0, 24, 48, 72, ...],  # Sorted list of frame indices with faces
+            "count": 150,  # Total count
+            "min_frame": 0,
+            "max_frame": 3600
+        }
+    """
+    detections_path = get_path(ep_id, "detections")
+    if not detections_path.exists():
+        return {"frames": [], "count": 0, "min_frame": min_frame, "max_frame": max_frame}
+
+    frame_set = set()
+    with open(detections_path, "r") as f:
+        for line in f:
+            try:
+                det = json.loads(line)
+                frame_idx = det.get("frame_idx")
+                if frame_idx is not None:
+                    if frame_idx >= min_frame:
+                        if max_frame is None or frame_idx <= max_frame:
+                            frame_set.add(frame_idx)
+            except json.JSONDecodeError:
+                continue
+
+    frames = sorted(frame_set)
+    return {
+        "frames": frames,
+        "count": len(frames),
+        "min_frame": min_frame,
+        "max_frame": max_frame,
+    }
 
 
 class VideoClipRequest(BaseModel):
@@ -4936,6 +5677,261 @@ def generate_video_clip(ep_id: str, body: VideoClipRequest) -> dict:
 
     finally:
         cap.release()
+
+
+@router.get("/episodes/{ep_id}/timeline_export")
+def export_timeline_data(
+    ep_id: str,
+    interval_s: float = Query(1.0, ge=0.1, le=10.0, description="Time interval for binning (seconds)"),
+    include_unassigned: bool = Query(True, description="Include unassigned tracks/clusters"),
+    format: str = Query("json", description="Output format: json or csv"),
+) -> dict:
+    """Export timeline data showing who appears at each second of the video.
+
+    Returns a second-by-second breakdown of detected faces, their identities,
+    and cast member names. Useful for external analysis or verification.
+
+    Args:
+        ep_id: Episode identifier
+        interval_s: Time interval for binning (default 1 second)
+        include_unassigned: Include tracks without cast assignment
+        format: Output format (json or csv)
+
+    Returns:
+        {
+            "episode_id": "...",
+            "duration_s": 2700.0,
+            "interval_s": 1.0,
+            "timeline": [
+                {
+                    "time_s": 0.0,
+                    "frame_start": 0,
+                    "frame_end": 30,
+                    "faces": [
+                        {"track_id": 1, "identity_id": "...", "name": "Lisa", "cast_id": "..."},
+                        {"track_id": 5, "identity_id": "...", "name": null, "reason": "no_person"},
+                    ]
+                },
+                ...
+            ],
+            "summary": {
+                "total_intervals": 2700,
+                "cast_appearances": {"Lisa": 450, "Mary": 380, ...},
+                "unassigned_intervals": 120
+            }
+        }
+    """
+    import csv
+    import io
+    from apps.api.services.people import PeopleService
+
+    # Get video metadata
+    video_path = get_path(ep_id, "video")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not open video file")
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_s = total_frames / fps
+    finally:
+        cap.release()
+
+    # Load faces
+    faces = identity_service.load_faces(ep_id)
+    if not faces:
+        raise HTTPException(status_code=404, detail="No faces found for episode")
+
+    # Build mapping chains
+    identities_payload = _load_identities(ep_id)
+    identities_list = identities_payload.get("identities", [])
+
+    track_to_identity = {}
+    for identity in identities_list:
+        identity_id = identity.get("identity_id")
+        for track_id in identity.get("track_ids", []) or []:
+            try:
+                track_to_identity[int(track_id)] = identity
+            except (TypeError, ValueError):
+                continue
+
+    # Load people
+    ep_ctx = episode_context_from_id(ep_id)
+    show_id = ep_ctx.show_slug.upper()
+    people_service = PeopleService()
+    people = people_service.list_people(show_id)
+
+    person_to_cast = {}
+    for person in people:
+        person_id = person.get("person_id")
+        if person_id:
+            person_to_cast[person_id] = {
+                "name": person.get("name") or person.get("display_name"),
+                "cast_id": person.get("cast_id"),
+            }
+
+    # Index faces by timestamp interval
+    faces_by_interval: Dict[int, List[Dict[str, Any]]] = {}
+    for face in faces:
+        ts = face.get("ts")
+        if ts is None:
+            frame_idx = face.get("frame_idx", 0)
+            ts = frame_idx / fps
+
+        interval_idx = int(ts / interval_s)
+        if interval_idx not in faces_by_interval:
+            faces_by_interval[interval_idx] = []
+
+        track_id = face.get("track_id")
+        identity = track_to_identity.get(track_id)
+        identity_id = identity.get("identity_id") if identity else None
+        person_id = identity.get("person_id") if identity else None
+        cast_info = person_to_cast.get(person_id) if person_id else None
+        name = cast_info.get("name") if cast_info else None
+        cast_id = cast_info.get("cast_id") if cast_info else None
+
+        # Determine reason for unassigned
+        reason = None
+        if not name:
+            if not identity_id:
+                reason = "not_clustered"
+            elif not person_id:
+                reason = "no_person"
+            elif not cast_id:
+                reason = "no_cast"
+            else:
+                reason = "no_name"
+
+        # Skip unassigned if not requested
+        if not include_unassigned and not name:
+            continue
+
+        face_entry = {
+            "track_id": track_id,
+            "identity_id": identity_id,
+            "name": name,
+            "cast_id": cast_id,
+            "quality": round(face.get("quality", 0), 3),
+        }
+        if reason:
+            face_entry["reason"] = reason
+
+        faces_by_interval[interval_idx].append(face_entry)
+
+    # Build timeline
+    total_intervals = int(duration_s / interval_s) + 1
+    timeline = []
+    cast_appearances: Dict[str, int] = {}
+    unassigned_intervals = 0
+
+    for interval_idx in range(total_intervals):
+        time_s = interval_idx * interval_s
+        frame_start = int(time_s * fps)
+        frame_end = int((time_s + interval_s) * fps)
+
+        interval_faces = faces_by_interval.get(interval_idx, [])
+
+        # Deduplicate by track_id
+        seen_tracks = set()
+        unique_faces = []
+        for f in interval_faces:
+            tid = f.get("track_id")
+            if tid not in seen_tracks:
+                seen_tracks.add(tid)
+                unique_faces.append(f)
+
+        # Count appearances
+        has_unassigned = False
+        for f in unique_faces:
+            name = f.get("name")
+            if name:
+                cast_appearances[name] = cast_appearances.get(name, 0) + 1
+            else:
+                has_unassigned = True
+
+        if has_unassigned:
+            unassigned_intervals += 1
+
+        timeline.append({
+            "time_s": round(time_s, 2),
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "faces": unique_faces,
+        })
+
+    result = {
+        "episode_id": ep_id,
+        "duration_s": round(duration_s, 2),
+        "interval_s": interval_s,
+        "fps": fps,
+        "total_frames": total_frames,
+        "timeline": timeline,
+        "summary": {
+            "total_intervals": total_intervals,
+            "cast_appearances": cast_appearances,
+            "unassigned_intervals": unassigned_intervals,
+        },
+    }
+
+    # Return CSV format if requested
+    if format.lower() == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        # Header
+        writer.writerow([
+            "time_s", "frame_start", "frame_end",
+            "track_id", "identity_id", "name", "cast_id", "quality", "reason"
+        ])
+
+        # Rows
+        for interval in timeline:
+            for face in interval.get("faces", []):
+                writer.writerow([
+                    interval["time_s"],
+                    interval["frame_start"],
+                    interval["frame_end"],
+                    face.get("track_id"),
+                    face.get("identity_id"),
+                    face.get("name"),
+                    face.get("cast_id"),
+                    face.get("quality"),
+                    face.get("reason", ""),
+                ])
+
+        csv_content = output.getvalue()
+
+        # Save to S3 or return inline
+        csv_filename = f"{ep_id}_timeline.csv"
+        s3_key = f"artifacts/{ep_id}/exports/{csv_filename}"
+
+        if STORAGE.backend in {"s3", "minio"} and STORAGE._client is not None:
+            STORAGE._client.put_object(
+                Bucket=STORAGE.bucket,
+                Key=s3_key,
+                Body=csv_content.encode("utf-8"),
+                ContentType="text/csv",
+            )
+            url = STORAGE.presign_get(s3_key, expires_in=3600)
+            return {
+                "format": "csv",
+                "url": url,
+                "s3_key": s3_key,
+                "rows": len(timeline),
+            }
+        else:
+            # Return inline for local mode
+            return {
+                "format": "csv",
+                "content": csv_content,
+                "rows": len(timeline),
+            }
+
+    return result
 
 
 @router.delete("/episodes/{ep_id}/identities/{identity_id}")
@@ -5454,3 +6450,234 @@ def get_artifact_status(ep_id: str) -> Dict[str, Any]:
         result["sync_status"] = "unknown"
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Episode Pipeline Report Export
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/episodes/{ep_id}/report.pdf")
+def get_episode_report_pdf(
+    ep_id: str,
+    include_appendix: bool = Query(False, description="Include raw data samples in appendix"),
+    format: Literal["pdf", "snapshot"] = Query("pdf", description="Output format: pdf or snapshot (JSON)"),
+    experiment_tag: Optional[str] = Query(None, description="Experiment tag/label for this run"),
+    save_snapshot: bool = Query(True, description="Save snapshot for run comparison"),
+) -> Response:
+    """Generate a comprehensive PDF report of the episode pipeline run.
+
+    This endpoint generates a detailed report containing:
+    - Pipeline metadata and execution info
+    - Effective configuration snapshot
+    - Audio/diarization summary (if available)
+    - Transcript summary (if available)
+    - Speaker linking and cast assignments
+    - Video/face detection analysis
+    - Timing and frame details
+    - Screen time and speaking time analytics
+    - Errors, warnings, and anomalies
+    - Run comparison (if previous snapshot exists)
+
+    The report reads from existing manifest files and does NOT re-run any ML models.
+
+    Args:
+        ep_id: Episode identifier (e.g., 'rhoslc-s06e99')
+        include_appendix: Include raw data samples in the appendix section
+        format: Output format - 'pdf' for PDF document, 'snapshot' for JSON snapshot
+        experiment_tag: Optional label for this run (for comparison tracking)
+        save_snapshot: Whether to save snapshot for future run comparison
+
+    Returns:
+        PDF file or JSON snapshot depending on format parameter
+    """
+    from py_screenalytics.reports.snapshot_builder import (
+        build_episode_snapshot,
+        save_snapshot as persist_snapshot,
+    )
+    from py_screenalytics.reports.episode_report_pdf import EpisodeReportPDF
+    from py_screenalytics.reports.metrics_export import export_metrics_deltas
+
+    ep_id = normalize_ep_id(ep_id)
+
+    # Resolve experiment_tag with precedence: query_param > env > config default
+    resolved_tag = experiment_tag
+    if resolved_tag is None:
+        resolved_tag = os.environ.get("EXPERIMENT_TAG")
+    if resolved_tag is None:
+        # Load default from config
+        import yaml
+        config_path = PROJECT_ROOT / "config" / "pipeline" / "reports.yaml"
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f) or {}
+                resolved_tag = config.get("default_experiment_tag", "") or None
+
+    LOGGER.info(f"[report] Generating {format} report for {ep_id} (tag: {resolved_tag})")
+
+    # Check that episode exists
+    manifests_dir = _manifests_dir(ep_id)
+    if not manifests_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Episode not found: {ep_id}")
+
+    try:
+        # Build the snapshot
+        snapshot = build_episode_snapshot(
+            ep_id,
+            include_appendix=include_appendix,
+            experiment_tag=resolved_tag,
+        )
+
+        # Save snapshot for future comparison
+        if save_snapshot:
+            try:
+                persist_snapshot(snapshot)
+                LOGGER.info(f"[report] Saved snapshot {snapshot.snapshot_id} for {ep_id}")
+            except Exception as save_err:
+                LOGGER.warning(f"[report] Failed to save snapshot: {save_err}")
+
+        # Export metrics deltas if we have a run comparison
+        if snapshot.run_comparison:
+            try:
+                export_metrics_deltas(snapshot)
+                LOGGER.info(f"[report] Exported metrics_deltas.json for {ep_id}")
+            except Exception as export_err:
+                LOGGER.warning(f"[report] Failed to export metrics deltas: {export_err}")
+
+        if format == "snapshot":
+            # Return JSON snapshot
+            return Response(
+                content=snapshot.model_dump_json(indent=2),
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{ep_id}_snapshot.json"'
+                },
+            )
+
+        # Generate PDF
+        renderer = EpisodeReportPDF(snapshot)
+        pdf_bytes = renderer.generate()
+
+        LOGGER.info(f"[report] Generated PDF report for {ep_id}: {len(pdf_bytes)} bytes")
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{ep_id}_report.pdf"'
+            },
+        )
+
+    except ImportError as e:
+        LOGGER.error(f"[report] Missing dependency: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing dependency for PDF generation: {e}. Install reportlab with: pip install reportlab"
+        )
+    except FileNotFoundError as e:
+        LOGGER.error(f"[report] Missing data for {ep_id}: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        LOGGER.error(f"[report] Failed to generate report for {ep_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {e}")
+
+
+class SnapshotListItem(BaseModel):
+    """Summary info for a saved snapshot."""
+    snapshot_id: str
+    generated_at: str
+    experiment_tag: Optional[str] = None
+    pinned: bool = False
+
+
+@router.get("/episodes/{ep_id}/snapshots")
+def list_episode_snapshots(ep_id: str) -> List[SnapshotListItem]:
+    """List all saved snapshots for an episode.
+
+    Returns:
+        List of snapshot summaries, newest first
+    """
+    ep_id = normalize_ep_id(ep_id)
+    snapshots_dir = PROJECT_ROOT / "data" / "snapshots" / ep_id
+
+    if not snapshots_dir.exists():
+        return []
+
+    result = []
+    for snapshot_file in sorted(snapshots_dir.glob("*.json"), reverse=True):
+        if snapshot_file.name == "latest.json":
+            continue  # Skip the symlink/copy
+        try:
+            with open(snapshot_file, "r") as f:
+                data = json.load(f)
+            result.append(SnapshotListItem(
+                snapshot_id=data.get("snapshot_id", snapshot_file.stem),
+                generated_at=data.get("generated_at", "unknown"),
+                experiment_tag=data.get("pipeline_metadata", {}).get("experiment_tag"),
+                pinned=data.get("pinned", False),
+            ))
+        except Exception as e:
+            LOGGER.warning(f"[snapshots] Failed to read {snapshot_file}: {e}")
+            continue
+
+    return result
+
+
+@router.delete("/episodes/{ep_id}/snapshots/{snapshot_id}")
+def delete_episode_snapshot(ep_id: str, snapshot_id: str) -> Dict[str, str]:
+    """Delete a specific snapshot.
+
+    Args:
+        ep_id: Episode identifier
+        snapshot_id: Snapshot ID to delete
+
+    Returns:
+        Confirmation message
+
+    Raises:
+        HTTPException 404: Snapshot not found
+        HTTPException 400: Cannot delete pinned snapshot
+    """
+    ep_id = normalize_ep_id(ep_id)
+    snapshots_dir = PROJECT_ROOT / "data" / "snapshots" / ep_id
+    snapshot_file = snapshots_dir / f"{snapshot_id}.json"
+
+    if not snapshot_file.exists():
+        raise HTTPException(status_code=404, detail=f"Snapshot not found: {snapshot_id}")
+
+    # Check if pinned
+    try:
+        with open(snapshot_file, "r") as f:
+            data = json.load(f)
+        if data.get("pinned", False):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete pinned snapshot. Unpin it first."
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # If we can't read it, allow deletion
+
+    snapshot_file.unlink()
+    LOGGER.info(f"[snapshots] Deleted snapshot {snapshot_id} for {ep_id}")
+
+    # Update latest.json if needed
+    latest_file = snapshots_dir / "latest.json"
+    if latest_file.exists():
+        try:
+            with open(latest_file, "r") as f:
+                latest_data = json.load(f)
+            if latest_data.get("snapshot_id") == snapshot_id:
+                # Find next most recent
+                remaining = sorted(snapshots_dir.glob("*.json"), reverse=True)
+                remaining = [f for f in remaining if f.name != "latest.json"]
+                if remaining:
+                    import shutil
+                    shutil.copy2(remaining[0], latest_file)
+                else:
+                    latest_file.unlink()
+        except Exception as e:
+            LOGGER.warning(f"[snapshots] Failed to update latest.json: {e}")
+
+    return {"status": "deleted", "snapshot_id": snapshot_id}
