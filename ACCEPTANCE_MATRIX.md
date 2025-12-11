@@ -188,6 +188,236 @@ A module is considered **Accepted** only when all associated checkpoints below a
 
 ---
 
+### 3.7 Face Alignment (`face_alignment`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **landmark_jitter_px** | < 2.0 px | > 5.0 px | Integration test |
+| **alignment_quality_mean** | ≥ 0.75 | < 0.60 | Integration test |
+| **pose_accuracy_degrees** | ≤ 5° MAE | > 10° | Manual QA / Eval set |
+| **track_fragmentation_delta** | ≥ 10% reduction | < 5% reduction | Integration test |
+| **Runtime (1hr episode)** | ≤ 5 min | > 10 min | Benchmark |
+
+**Tests:**
+- `tests/ml/test_face_alignment.py`
+- `tests/ml/test_fan_alignment.py`
+
+**Config Dependencies:**
+- `config/pipeline/alignment.yaml`
+
+**Docs:**
+- [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
+- [docs/features/vision_alignment_and_body_tracking.md](docs/features/vision_alignment_and_body_tracking.md)
+
+**Feature Sandbox:** `FEATURES/face-alignment/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.8 Alignment Quality Gate (`alignment_quality`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **alignment_quality_threshold** | 0.60 (configurable) | N/A | Unit test |
+| **faces_gated_pct** | 10–30% | > 50% | Integration test |
+| **false_rejection_rate** | < 5% | > 10% | Manual QA / Eval set |
+| **recognition_accuracy_delta** | ≥ 2% improvement | < 0% (regression) | Eval set |
+
+**Tests:**
+- `tests/ml/test_alignment_quality.py`
+
+**Config Dependencies:**
+- `config/pipeline/alignment.yaml` (quality_gating section)
+
+**Docs:**
+- [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
+
+**Feature Sandbox:** `FEATURES/face-alignment/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.9 3D Head Pose (`head_pose_3d`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **pose_yaw_accuracy** | ≤ 5° MAE | > 10° | Eval set |
+| **pose_pitch_accuracy** | ≤ 5° MAE | > 10° | Eval set |
+| **pose_roll_accuracy** | ≤ 3° MAE | > 7° | Eval set |
+| **pose_jump_detection** | ≥ 95% | < 85% | Integration test |
+| **Runtime (per face)** | ≤ 10ms (GPU) | > 20ms | Benchmark |
+
+**Tests:**
+- `tests/ml/test_3ddfa.py`
+
+**Config Dependencies:**
+- `config/pipeline/alignment.yaml` (ddfa_v2 section)
+
+**Docs:**
+- [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
+
+**Feature Sandbox:** `FEATURES/face-alignment/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.10 Body Detection & Tracking (`body_tracking`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **person_recall** | ≥ 90% | < 80% | Eval set |
+| **person_precision** | ≥ 85% | < 75% | Eval set |
+| **body_track_fragmentation** | < 0.15 | > 0.25 | Integration test |
+| **body_id_switch_rate** | < 0.05 | > 0.10 | Integration test |
+| **Runtime (1hr episode)** | ≤ 15 min (GPU) | > 25 min | Benchmark |
+
+**Tests:**
+- `tests/ml/test_body_tracking.py`
+- `tests/ml/test_person_detection.py`
+
+**Config Dependencies:**
+- `config/pipeline/body_detection.yaml`
+
+**Docs:**
+- [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
+- [docs/features/vision_alignment_and_body_tracking.md](docs/features/vision_alignment_and_body_tracking.md)
+
+**Feature Sandbox:** `FEATURES/body-tracking/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.11 Person Re-ID (`person_reid`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **reid_mAP** | ≥ 0.80 | < 0.70 | Eval set |
+| **reid_rank1_accuracy** | ≥ 0.90 | < 0.80 | Eval set |
+| **embedding_dimension** | 256 (OSNet) | varies by model | Unit test |
+| **embedding_norm** | ≈ 1.0 (±0.01) | > 1.05 or < 0.95 | Unit test |
+| **Runtime (per crop)** | ≤ 5ms (GPU) | > 10ms | Benchmark |
+
+**Tests:**
+- `tests/ml/test_person_reid.py`
+
+**Config Dependencies:**
+- `config/pipeline/body_detection.yaml` (person_reid section)
+
+**Docs:**
+- [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
+
+**Feature Sandbox:** `FEATURES/body-tracking/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.12 Face↔Body Track Fusion (`track_fusion`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **association_accuracy** | ≥ 95% | < 90% | Manual QA / Annotated set |
+| **false_association_rate** | < 2% | > 5% | Manual QA |
+| **screen_time_gap_reduction** | ≥ 30% | < 15% | Integration test |
+| **handoff_latency_frames** | ≤ 3 | > 10 | Integration test |
+| **reid_handoff_accuracy** | ≥ 90% | < 80% | Eval set |
+
+**Tests:**
+- `tests/ml/test_track_fusion.py`
+
+**Config Dependencies:**
+- `config/pipeline/track_fusion.yaml`
+
+**Docs:**
+- [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
+
+**Feature Sandbox:** `FEATURES/body-tracking/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.13 TensorRT Embedding (`tensorrt_embedding`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **speedup_vs_pytorch** | ≥ 5× @ batch=32 | < 3× | Benchmark |
+| **embedding_cosine_drift** | ≥ 0.999 | < 0.995 | Regression test |
+| **vram_usage** | ≤ 2GB | > 4GB | Benchmark |
+| **fp16_accuracy_delta** | < 0.1% | > 0.5% | Eval set |
+| **engine_build_time** | ≤ 5 min | > 15 min | CI Benchmark |
+
+**Tests:**
+- `tests/ml/test_tensorrt_embedding.py`
+- `tests/ml/test_embedding_regression.py`
+
+**Config Dependencies:**
+- `config/pipeline/embedding.yaml`
+
+**Docs:**
+- [docs/todo/feature_arcface_tensorrt_onnxruntime.md](docs/todo/feature_arcface_tensorrt_onnxruntime.md)
+
+**Feature Sandbox:** `FEATURES/embedding-engines/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.14 Face Mesh Analytics (`face_mesh`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **mesh_stability_px** | < 3.0 px | > 6.0 px | Integration test |
+| **visibility_fraction_accuracy** | ≥ 90% | < 80% | Manual QA / Labeled set |
+| **gaze_category_accuracy** | ≥ 85% | < 75% | Labeled set |
+| **runtime_per_face** | ≤ 15ms | > 30ms | Benchmark |
+| **selective_execution_savings** | ≥ 80% compute reduction | < 60% | Integration test |
+
+**Tests:**
+- `tests/ml/test_face_mesh.py`
+- `tests/ml/test_visibility.py`
+
+**Config Dependencies:**
+- `config/pipeline/analytics.yaml`
+
+**Docs:**
+- [docs/todo/feature_mesh_and_advanced_visibility.md](docs/todo/feature_mesh_and_advanced_visibility.md)
+
+**Feature Sandbox:** `FEATURES/vision-analytics/`
+
+**Status:** ⚠ Pending
+
+---
+
+### 3.15 CenterFace Detector (`centerface`)
+
+| Metric | Target | Warning Threshold | Verification |
+|--------|--------|-------------------|--------------|
+| **precision** | ≥ 0.90 | < 0.85 | Eval set |
+| **recall** | ≥ 0.85 | < 0.80 | Eval set |
+| **agreement_with_retinaface** | ≥ 90% | < 85% | Integration test |
+| **runtime_cpu** | ≤ 50ms/frame | > 100ms | Benchmark |
+| **runtime_gpu** | ≤ 10ms/frame | > 25ms | Benchmark |
+
+**Tests:**
+- `tests/ml/test_centerface.py`
+
+**Config Dependencies:**
+- `config/pipeline/detection.yaml` (centerface section)
+
+**Docs:**
+- [docs/todo/feature_mesh_and_advanced_visibility.md](docs/todo/feature_mesh_and_advanced_visibility.md)
+
+**Feature Sandbox:** `FEATURES/vision-analytics/`
+
+**Status:** ⚠ Pending (Future Work)
+
+---
+
 ## 4. API & UI Modules
 
 | Module | Scope | Acceptance Criteria | Verification | Status |
@@ -246,6 +476,8 @@ A module is considered **Accepted** only when all associated checkpoints below a
 
 ## 9. Module Status Summary
 
+### Core Pipeline Modules (3.1-3.6)
+
 | Module | Status | Blocker | Next Action |
 |--------|--------|---------|-------------|
 | **detect_track** | ⚠ Pending | Integration tests not passing thresholds | Tune thresholds, add test assertions |
@@ -254,11 +486,30 @@ A module is considered **Accepted** only when all associated checkpoints below a
 | **episode_cleanup** | ⚠ Pending | Tests not implemented | Write integration tests |
 | **audio_pipeline** | ⚠ Pending | E2E tests incomplete | Add voice clustering + bank tests |
 | **facebank** | ⚠ Pending | Cross-episode matching not validated | Manual QA on validation episodes |
+
+### Vision Enhancement Modules (3.7-3.15) — NEW
+
+| Module | Status | Blocker | Next Action |
+|--------|--------|---------|-------------|
+| **face_alignment** | ⚠ Pending | Implementation not started | Implement FAN 2D aligner |
+| **alignment_quality** | ⚠ Pending | Depends on face_alignment | Implement LUVLi quality gate |
+| **head_pose_3d** | ⚠ Pending | Depends on face_alignment | Implement 3DDFA_V2 integration |
+| **body_tracking** | ⚠ Pending | Implementation not started | Implement YOLO person detector |
+| **person_reid** | ⚠ Pending | Depends on body_tracking | Implement OSNet embedder |
+| **track_fusion** | ⚠ Pending | Depends on body_tracking | Implement face↔body association |
+| **tensorrt_embedding** | ⚠ Pending | Implementation not started | Build TRT engine, S3 storage |
+| **face_mesh** | ⚠ Pending | Implementation not started | Implement MediaPipe mesh |
+| **centerface** | ⚠ Pending (Future) | Deferred | Stub interface only |
+
+### API & UI Modules
+
+| Module | Status | Blocker | Next Action |
+|--------|--------|---------|-------------|
 | **jobs_api** | ⚠ Pending | Integration tests incomplete | Extend API test coverage |
 | **facebank_ui** | ⚠ Pending | UI smoke tests not automated | Add Playwright/Cypress tests |
 | **agents** | ⚠ Pending | Playbooks not validated | Test doc-sync automation |
 
 ---
 
-**Next Review:** After Phase 2 completion
+**Next Review:** After Vision Enhancement Phase 1 (FAN + TensorRT)
 **Maintainers:** Screenalytics Engineering + QA

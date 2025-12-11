@@ -1,0 +1,123 @@
+# Vision Analytics Configuration
+# Documentation: docs/todo/feature_mesh_and_advanced_visibility.md
+
+# Face Mesh (MediaPipe)
+face_mesh:
+  enabled: true
+
+  # Model configuration
+  static_image_mode: true          # Treat each frame independently
+  max_num_faces: 1                 # Per crop (already cropped faces)
+  refine_landmarks: true           # Include iris landmarks
+
+  # Confidence thresholds
+  confidence:
+    min_detection: 0.5
+    min_tracking: 0.5
+
+  # Selective execution (save compute)
+  execution:
+    closeup_threshold: 0.05        # Face area / frame area ratio
+    sample_rate: 30                # Every Nth frame (if not closeup)
+    always_run_on_quality_faces: true  # Run if alignment_quality > 0.8
+
+# Visibility computation
+visibility:
+  enabled: true
+
+  # Computation method
+  method: landmark_based           # landmark_based | area_based | hybrid
+
+  # Regional breakdown
+  regions:
+    left_eye:
+      enabled: true
+      weight: 1.5                  # High importance for identity
+    right_eye:
+      enabled: true
+      weight: 1.5
+    nose:
+      enabled: true
+      weight: 1.0
+    mouth:
+      enabled: true
+      weight: 0.8
+    forehead:
+      enabled: true
+      weight: 0.5
+    chin:
+      enabled: true
+      weight: 0.5
+
+  # Occlusion detection
+  occlusion:
+    enabled: true
+    partial_threshold: 0.7         # < 70% visible = partial occlusion
+    significant_threshold: 0.5     # < 50% = significant occlusion
+
+  # Face visibility classification
+  classification:
+    full_frontal:
+      min_visibility: 0.9
+      max_yaw: 15
+    frontal:
+      min_visibility: 0.8
+      max_yaw: 30
+    three_quarter:
+      min_visibility: 0.6
+      max_yaw: 60
+    profile:
+      min_visibility: 0.3
+      max_yaw: 90
+
+# Gaze estimation
+gaze:
+  enabled: true
+  use_iris: true                   # Use refined iris landmarks
+
+  # Thresholds for coarse categories
+  thresholds:
+    center_threshold: 15           # Degrees from center = "center"
+    extreme_threshold: 45          # Beyond this = "extreme"
+
+  # Confidence
+  confidence:
+    min_confidence: 0.6            # Below this, gaze = "unknown"
+
+  # Output
+  output_continuous: true          # Include continuous angles
+  output_categories: true          # Include left/center/right
+
+# Future: Expression analytics (not yet implemented)
+expression:
+  enabled: false                   # Set to true when implemented
+
+  features:
+    mouth_open: true
+    eyes_open: true
+    smile: true
+    eyebrow_raise: true
+
+  thresholds:
+    mouth_open: 0.3                # Lip distance normalized
+    eyes_closed: 0.2               # Eye aspect ratio
+    smile: 0.5                     # Mouth corner angles
+
+# CenterFace detector (future - stub)
+centerface:
+  enabled: false                   # Not yet implemented
+  model_path: null
+  confidence_threshold: 0.5
+
+# Output
+output:
+  store_mesh_landmarks: false      # Full 468 landmarks (large)
+  store_visibility_fraction: true
+  store_regional_breakdown: true
+  store_gaze: true
+  store_per_frame: false           # Per-frame vs aggregated
+
+# Performance
+performance:
+  mesh_batch_size: 8               # Faces per mesh batch
+  cache_mediapipe: true            # Keep model loaded

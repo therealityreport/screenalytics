@@ -1,0 +1,75 @@
+# Body Detection and Tracking Configuration
+# Documentation: docs/todo/feature_body_tracking_reid_fusion.md
+
+# Master switch
+body_tracking:
+  enabled: true
+
+# Person detection (YOLO)
+person_detection:
+  model: yolov8n                   # yolov8n | yolov8s | yolov8m | rtdetr
+  confidence_threshold: 0.50       # Detection confidence
+  nms_iou_threshold: 0.45          # Non-max suppression IoU
+  min_height_px: 50                # Ignore very small persons
+  min_width_px: 25
+  device: auto                     # auto | cuda | cpu | mps
+
+  # Class filtering (COCO)
+  classes: [0]                     # 0 = person in COCO
+
+  # Frame sampling (optional)
+  detect_every_n_frames: 1         # 1 = every frame
+
+# Person tracking (ByteTrack)
+person_tracking:
+  tracker: bytetrack               # bytetrack | botsort | strongsort
+  track_thresh: 0.50               # Confidence to continue tracking
+  new_track_thresh: 0.55           # Confidence to start new tracks
+  match_thresh: 0.70               # IoU threshold for matching
+  track_buffer: 120                # Frames to keep lost tracks (5s @ 24fps)
+
+  # Track ID namespace
+  id_offset: 100000                # Avoid collision with face track IDs
+
+  # Motion model
+  use_kalman: true                 # Kalman filter for motion prediction
+
+# Person Re-ID (OSNet)
+person_reid:
+  enabled: true
+  model: osnet_x1_0                # osnet_x1_0 | osnet_ain_x1_0 | osnet_x0_25
+  embedding_dim: 256               # Output dimension
+
+  # Model loading
+  device: auto
+  pretrained: true
+  weights_path: null               # Custom weights (optional)
+
+  # Crop preprocessing
+  crop:
+    margin: 0.1                    # Expand bbox by 10%
+    target_size: [256, 128]        # Height x Width
+    min_height_px: 64
+    min_width_px: 32
+    normalize: true                # ImageNet normalization
+
+  # Quality gating
+  quality:
+    min_aspect_ratio: 0.3          # Height/width
+    max_aspect_ratio: 4.0
+    min_crop_area: 2048            # Pixels
+
+  # Backend (pluggable for future)
+  backend: torchreid               # torchreid | custom
+
+# Performance
+performance:
+  detection_batch_size: 4          # Frames per detection batch
+  reid_batch_size: 32              # Crops per Re-ID batch
+  cache_reid_model: true           # Keep model in memory
+
+# Output
+output:
+  store_body_boxes: true           # Store body bbox in detections
+  store_body_embeddings: true      # Store Re-ID embeddings
+  store_body_tracks: true          # Create body track entries

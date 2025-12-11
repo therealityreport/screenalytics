@@ -1,0 +1,83 @@
+# Face Embedding Engine Configuration
+# Documentation: docs/todo/feature_arcface_tensorrt_onnxruntime.md
+
+# Backend selection
+embedding:
+  backend: tensorrt                # tensorrt | pytorch | onnx
+
+# TensorRT configuration
+tensorrt:
+  # Precision
+  precision: fp16                  # fp16 | fp32 | int8
+
+  # Batching
+  batch_size: 32                   # Faces per inference batch
+  max_batch_size: 64               # Max batch for engine building
+
+  # Engine building
+  workspace_gb: 2.0                # TRT workspace size
+  build_timeout_seconds: 600       # Max time to build engine
+
+  # Model
+  model_name: arcface_r100_v1      # Model identifier
+  onnx_path: null                  # Custom ONNX path (optional)
+
+# PyTorch configuration (reference/fallback)
+pytorch:
+  model_name: arcface_r100_v1
+  device: auto                     # auto | cuda | cpu | mps
+
+# ONNX Runtime configuration (future)
+onnx:
+  providers:                       # Execution providers in priority order
+    - TensorrtExecutionProvider
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  model_path: null                 # Custom ONNX path
+
+# Engine storage (S3/MinIO)
+storage:
+  type: s3                         # s3 | local
+  bucket: screenalytics-models
+  prefix: engines/
+  region: us-east-1
+
+  # Local cache
+  cache_dir: ~/.cache/screenalytics/engines
+  cache_ttl_days: 30               # Refresh from S3 after this
+
+  # Versioning: {model_name}-{version}-sm{arch}.trt
+  # Example: arcface_r100_v1-sm75.trt (Ampere)
+
+# Fallback behavior
+fallback:
+  build_locally: true              # Build TRT engine if not in S3
+  fallback_to_pytorch: true        # Use PyTorch if TRT fails
+  log_fallback_events: true
+
+# Embedding validation
+validation:
+  enabled: true
+  max_drift_cosine: 0.001          # Max tolerated drift vs PyTorch
+  eval_set_size: 100               # Faces for validation
+  run_on_startup: true             # Validate when loading engine
+  fail_on_drift: false             # Warn only vs hard fail
+
+# Output
+output:
+  embedding_dim: 512               # ArcFace output dimension
+  normalize: true                  # L2 normalize embeddings
+  dtype: float32                   # Output dtype
+
+# Performance tuning
+performance:
+  warmup_batches: 3                # Warmup before benchmarking
+  pin_memory: true                 # CUDA pinned memory
+  non_blocking: true               # Async transfers
+
+# Logging
+logging:
+  log_throughput: true             # Log faces/sec
+  log_latency: true                # Log batch latency
+  log_memory: true                 # Log GPU memory usage
+  benchmark_interval: 100          # Batches between benchmarks
