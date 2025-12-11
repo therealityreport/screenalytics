@@ -102,6 +102,31 @@ from FEATURES.face_alignment.src.alignment_quality import filter_by_quality
 passed, rejected = filter_by_quality(aligned_faces, min_quality=0.6)
 ```
 
+## Evaluation
+
+Measure the impact of FAN alignment using the evaluation harness:
+
+```bash
+# Evaluate single episode (reads existing artifacts)
+python -m tools.experiments.face_alignment_eval --episode-id rhoslc-s06e01
+
+# Compare baseline vs aligned (requires two pipeline runs with different settings)
+python -m tools.experiments.face_alignment_eval --episode-id ep1 \
+    --baseline-dir path/to/baseline --aligned-dir path/to/aligned --alignment-enabled both
+```
+
+**Metrics computed:**
+| Metric | Description | Better |
+|--------|-------------|--------|
+| `embedding_jitter_mean` | Mean cosine distance between consecutive embeddings in tracks | Lower |
+| `id_switch_rate_per_minute` | Track ID discontinuities per minute | Lower |
+| `avg_track_length` | Average frames per track | Higher |
+| `alignment_quality_stats` | Mean, p05, p95 of alignment_quality field | Higher |
+
+**Output:** `data/experiments/face_alignment_eval/{episode_id}.json`
+
+See [tools/experiments/face_alignment_eval.py](../../../tools/experiments/face_alignment_eval.py) for full documentation.
+
 ## Configuration
 
 See `config/pipeline/face_alignment.yaml`:

@@ -84,6 +84,11 @@ class EpisodeMetrics:
     # Runtime
     pipeline_runtime_seconds: float = 0.0
 
+    # Alignment quality stats (only populated when alignment_enabled=True)
+    alignment_quality_mean: Optional[float] = None
+    alignment_quality_p05: Optional[float] = None
+    alignment_quality_p95: Optional[float] = None
+
     def to_dict(self) -> dict:
         return {
             "episode_id": self.episode_id,
@@ -113,6 +118,17 @@ class EpisodeMetrics:
                 },
             },
             "runtime_seconds": round(self.pipeline_runtime_seconds, 2),
+            "alignment_quality_stats": self._get_alignment_quality_stats(),
+        }
+
+    def _get_alignment_quality_stats(self) -> Optional[dict]:
+        """Return alignment quality stats if available."""
+        if self.alignment_quality_mean is None:
+            return None
+        return {
+            "mean": round(self.alignment_quality_mean, 4),
+            "p05": round(self.alignment_quality_p05, 4) if self.alignment_quality_p05 else None,
+            "p95": round(self.alignment_quality_p95, 4) if self.alignment_quality_p95 else None,
         }
 
 
@@ -229,6 +245,37 @@ def load_embeddings(manifest_dir: Path) -> Tuple[Optional[np.ndarray], List[Dict
             meta = json.load(f)
 
     return embeddings, meta
+
+
+def load_alignment_quality_stats(manifest_dir: Path) -> Optional[Dict[str, float]]:
+    """
+    Load alignment quality statistics from aligned_faces.jsonl.
+
+    Returns dict with 'mean', 'p05', 'p95' or None if file doesn't exist.
+    """
+    aligned_faces_path = manifest_dir / "face_alignment" / "aligned_faces.jsonl"
+
+    if not aligned_faces_path.exists():
+        logger.debug(f"No aligned faces found at {aligned_faces_path}")
+        return None
+
+    qualities = []
+    with open(aligned_faces_path) as f:
+        for line in f:
+            data = json.loads(line)
+            quality = data.get("alignment_quality")
+            if quality is not None:
+                qualities.append(quality)
+
+    if not qualities:
+        return None
+
+    qualities_arr = np.array(qualities)
+    return {
+        "mean": float(np.mean(qualities_arr)),
+        "p05": float(np.percentile(qualities_arr, 5)),
+        "p95": float(np.percentile(qualities_arr, 95)),
+    }
 
 
 def compute_embedding_jitter(
@@ -400,6 +447,16 @@ def run_evaluation(
     # Screen time
     metrics.screen_time_per_identity = compute_screen_time(identities)
     metrics.total_screen_time_seconds = sum(metrics.screen_time_per_identity.values())
+
+    # Alignment quality stats (when alignment is enabled)
+    if alignment_enabled:
+        quality_stats = load_alignment_quality_stats(manifest_dir)
+        if quality_stats:
+            metrics.alignment_quality_mean = quality_stats["mean"]
+            metrics.alignment_quality_p05 = quality_stats["p05"]
+            metrics.alignment_quality_p95 = quality_stats["p95"]
+            logger.info(f"  Alignment quality: mean={quality_stats['mean']:.4f}, "
+                       f"p05={quality_stats['p05']:.4f}, p95={quality_stats['p95']:.4f}")
 
     logger.info(f"  Tracks: {metrics.num_tracks}, Avg length: {metrics.avg_track_length:.1f}")
     logger.info(f"  Clusters: {metrics.cluster_count}, Singletons: {metrics.singleton_count}")

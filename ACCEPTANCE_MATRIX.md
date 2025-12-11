@@ -232,6 +232,15 @@ A module is considered **Accepted** only when all associated checkpoints below a
 
 **Note:** The `alignment_quality` field is currently heuristic-based. There is no hard numeric acceptance bound for this phase; the field is primarily diagnostic. Model-based thresholds will be added with LUVLi integration.
 
+**Evaluation (via `tools/experiments/face_alignment_eval.py`):**
+
+| Metric | Target | Verification |
+|--------|--------|--------------|
+| `embedding_jitter_mean` | No regression (≤ baseline + 0.005) | Eval script |
+| `id_switch_rate_per_minute` | No increase (≤ baseline + 0.1/min) | Eval script |
+| `avg_track_length` | No decrease (≥ baseline - 0.5) | Eval script |
+| `alignment_quality_mean` | ≥ 0.60 | Eval script |
+
 **Status:** ✅ Scaffold Implemented (pending eval)
 
 ---
