@@ -1,0 +1,43 @@
+name: Claude Code Action Official
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR merge ref
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Capture review guidelines (AGENTS.md if present)
+        id: guidelines
+        run: |
+          {
+            echo 'guidelines<<EOF'
+            if [ -f AGENTS.md ]; then
+              sed -n '1,400p' AGENTS.md
+            else
+              echo 'No AGENTS.md found.'
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude Code Action Official
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            Review only the diff for this pull request.
+            Identify correctness, security, performance, and maintainability issues.
+            Prioritize P0 and P1 items with concrete, minimal fixes.
+            Use the repository’s guidelines:
+            ${{ steps.guidelines.outputs.guidelines }}
