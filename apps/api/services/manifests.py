@@ -535,7 +535,11 @@ class ChecksumRegistry:
                 path: ArtifactChecksum.from_dict(data)
                 for path, data in registry.items()
             }
-        except Exception:
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(f"[checksum] Failed to parse registry for {ep_id}: {exc}")
+            return {}
+        except (OSError, KeyError, ValueError) as exc:
+            LOGGER.warning(f"[checksum] Failed to read registry for {ep_id}: {exc}")
             return {}
 
 
@@ -1049,8 +1053,8 @@ def rotate_backups(path: Path, max_backups: int = 3) -> int:
             try:
                 mtime = f.stat().st_mtime
                 backups.append((mtime, f))
-            except Exception:
-                pass
+            except OSError:
+                pass  # File may have been deleted between glob and stat
 
     if len(backups) <= max_backups:
         return 0

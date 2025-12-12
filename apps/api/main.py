@@ -46,8 +46,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(origins),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 app.include_router(config.router, tags=["config"])
 app.include_router(episodes.router, tags=["episodes"])
@@ -156,8 +156,8 @@ async def _cleanup_stale_jobs() -> None:
                             if age_seconds > stale_lock_threshold:
                                 is_stale = True
                                 LOGGER.info(f"[startup] Lock {lock_file.name} is {age_seconds/3600:.1f}h old (stale)")
-                        except Exception:
-                            pass
+                        except (ValueError, TypeError, OverflowError) as exc:
+                            LOGGER.debug(f"[startup] Failed to parse lock timestamp: {exc}")
 
                     # Check if PID is dead
                     if lock_pid and not is_stale:

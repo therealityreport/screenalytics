@@ -15,6 +15,10 @@ LOGGER = logging.getLogger(__name__)
 router = APIRouter()
 storage_service = StorageService()
 
+# Resource limits for health check endpoint (prevent OOM)
+MAX_HEALTH_CHECK_SIZE = 50_000_000  # 50 MB max file size for health check
+MAX_IMAGE_DIMENSION = 8000  # Max width/height before skipping memory analysis
+
 # Allowed roots for file access - prevents arbitrary file disclosure
 DATA_ROOT_ENV = "SCREENALYTICS_DATA_ROOT"
 
@@ -90,6 +94,18 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
             p = Path(path_or_key)
             if p.exists() and p.is_file():
                 size = p.stat().st_size
+
+                # Resource limit: prevent OOM from reading huge files
+                if size > MAX_HEALTH_CHECK_SIZE:
+                    return {
+                        "exists": True,
+                        "size": size,
+                        "error": f"File too large for health check ({size} bytes > {MAX_HEALTH_CHECK_SIZE})",
+                        "source": "local",
+                        "presign_ok": False,
+                        "mime_guess": mime_guess,
+                    }
+
                 data = p.read_bytes()
                 sha1 = hashlib.sha1(data).hexdigest()
 
@@ -115,9 +131,13 @@ def check_image_health(path_or_key: str = Query(..., description="Local path or 
                                 "height": img.height,
                                 "mode": img.mode,
                             }
-                            # Calculate std dev for diagnostic
-                            arr = np.asarray(img)
-                            result["std_dev"] = float(arr.std())
+                            # Resource limit: skip memory-intensive analysis for huge images
+                            if img.width > MAX_IMAGE_DIMENSION or img.height > MAX_IMAGE_DIMENSION:
+                                result["image_error"] = f"Dimensions too large for memory analysis ({img.width}x{img.height} > {MAX_IMAGE_DIMENSION})"
+                            else:
+                                # Calculate std dev for diagnostic
+                                arr = np.asarray(img)
+                                result["std_dev"] = float(arr.std())
                             pil_mime = Image.MIME.get(getattr(img, "format", "") or "")
                             result["mime_image"] = pil_mime
                             if pil_mime:

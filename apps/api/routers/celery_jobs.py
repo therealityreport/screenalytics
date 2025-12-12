@@ -828,6 +828,10 @@ def _apply_profile_defaults(
 
 DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
 EXECUTION_MODE_LITERAL = Literal["redis", "local"]
+# Input validation for subprocess command arguments (defense-in-depth)
+DETECTOR_LITERAL = Literal["retinaface"]
+TRACKER_LITERAL = Literal["bytetrack", "strongsort"]
+SCENE_DETECTOR_LITERAL = Literal["pyscenedetect", "internal", "off"]
 
 
 class DetectTrackCeleryRequest(BaseModel):
@@ -836,14 +840,14 @@ class DetectTrackCeleryRequest(BaseModel):
     stride: int = Field(6, description="Frame stride for detection sampling")
     fps: Optional[float] = Field(None, description="Optional target FPS for sampling")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
-    detector: str = Field("retinaface", description="Face detector backend")
-    tracker: str = Field("bytetrack", description="Tracker backend")
+    detector: DETECTOR_LITERAL = Field("retinaface", description="Face detector backend")
+    tracker: TRACKER_LITERAL = Field("bytetrack", description="Tracker backend")
     save_frames: bool = Field(False, description="Save sampled frames")
     save_crops: bool = Field(False, description="Save face crops")
     jpeg_quality: int = Field(72, ge=1, le=100, description="JPEG quality")
     det_thresh: Optional[float] = Field(0.5, ge=0.0, le=1.0, description="Detection threshold")
     max_gap: Optional[int] = Field(30, ge=1, description="Max frame gap before new track")
-    scene_detector: Optional[str] = Field(None, description="Scene detector backend")
+    scene_detector: Optional[SCENE_DETECTOR_LITERAL] = Field(None, description="Scene detector backend")
     scene_threshold: Optional[float] = Field(None, description="Scene cut threshold")
     scene_min_len: Optional[int] = Field(None, ge=1, description="Minimum frames between scene cuts")
     scene_warmup_dets: Optional[int] = Field(None, ge=0, description="Forced detections after each cut")
@@ -1017,12 +1021,17 @@ async def stream_celery_job(job_id: str, ep_id: str | None = None):
 
     def _read_progress_file(ep_id: str) -> dict | None:
         """Read audio_progress.json for the episode if it exists."""
+        MAX_PROGRESS_FILE_SIZE = 10_000_000  # 10 MB - consistent with tasks.py
         if not ep_id:
             return None
         data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data"))
         progress_file = data_root / "manifests" / ep_id / "audio_progress.json"
         if progress_file.exists():
             try:
+                file_size = progress_file.stat().st_size
+                if file_size > MAX_PROGRESS_FILE_SIZE:
+                    LOGGER.warning("[audio-progress] Progress file too large (%d bytes), skipping", file_size)
+                    return None
                 return json.loads(progress_file.read_text(encoding="utf-8"))
             except Exception as exc:
                 LOGGER.debug("[audio-progress] Failed to read progress file %s: %s", progress_file, exc)
