@@ -11,6 +11,13 @@ CELERY_LOG="$ROOT/celery_worker.log"
 # ============================================================================
 # Detect VS Code and offer to use VS Code Tasks instead
 # ============================================================================
+is_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [[ "${TERM_PROGRAM:-}" == "vscode" ]]; then
     echo ""
     echo "=============================================="
@@ -29,12 +36,26 @@ if [[ "${TERM_PROGRAM:-}" == "vscode" ]]; then
     echo ""
     echo "To kill all services: Run task 'Dev: Kill All Services'"
     echo ""
-    read -p "Continue with background mode anyway? [y/N] " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Exiting. Use VS Code Tasks for the best experience."
-        exit 0
+
+    # Non-interactive / CI-safe behavior: allow skipping the prompt.
+    if is_truthy "${DEV_AUTO_YES:-}"; then
+        echo "[dev_auto] DEV_AUTO_YES is set; skipping prompt."
+    else
+        # If stdin is not a TTY, don't block on read().
+        if [[ ! -t 0 ]]; then
+            echo "[dev_auto] Non-interactive stdin detected. Set DEV_AUTO_YES=1 to run anyway."
+            echo "Exiting. Use VS Code Tasks for the best experience."
+            exit 0
+        fi
+
+        read -p "Continue with background mode anyway? [y/N] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Exiting. Use VS Code Tasks for the best experience."
+            exit 0
+        fi
     fi
+
     # Force background mode when in VS Code
     OPEN_IN_TERMINALS="false"
     echo ""
@@ -260,12 +281,29 @@ echo "[dev_auto] API started (PID: $API_PID, log: $API_LOG)"
 # ============================================================================
 echo "[dev_auto] Waiting for API to be ready..."
 API_READY=false
-for i in {1..30}; do
+API_READY_MAX_SECONDS="${API_READY_MAX_SECONDS:-60}"
+
+elapsed=0
+while [[ "$elapsed" -lt "$API_READY_MAX_SECONDS" ]]; do
+    # Fail fast if the API process died.
+    if [ -n "$API_PID" ] && ! kill -0 "$API_PID" 2>/dev/null; then
+        echo "[dev_auto] ERROR: API process died (PID: $API_PID)."
+        echo "[dev_auto] Last 200 lines of $API_LOG:"
+        tail -n 200 "$API_LOG" | cat
+        exit 1
+    fi
+
     if curl -s http://127.0.0.1:8000/health >/dev/null 2>&1; then
         API_READY=true
         break
     fi
+
+    if (( elapsed % 5 == 0 )); then
+        echo "[dev_auto] Still waiting for API... (${elapsed}s/${API_READY_MAX_SECONDS}s)"
+    fi
+
     sleep 1
+    elapsed=$((elapsed + 1))
 done
 
 if $API_READY; then
@@ -274,7 +312,9 @@ if $API_READY; then
     curl -s -X POST http://127.0.0.1:8000/celery_jobs/kill_all_local >/dev/null 2>&1 || true
     echo "[dev_auto] Stale jobs cleanup complete"
 else
-    echo "[dev_auto] WARNING: API not ready after 30s, skipping job cleanup"
+    echo "[dev_auto] WARNING: API not ready after ${API_READY_MAX_SECONDS}s, skipping job cleanup"
+    echo "[dev_auto] Last 120 lines of $API_LOG:"
+    tail -n 120 "$API_LOG" | cat
 fi
 
 # ============================================================================

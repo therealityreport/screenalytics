@@ -355,25 +355,67 @@ class ScreenTimeAnalyzer:
                 "intervals": [[round(start, 2), round(end, 2)] for start, end in merged_unassigned],
             })
 
+        # Load body tracking comparison data if available
+        body_comparison = self._load_body_comparison(ep_id)
+        body_tracking_enabled = body_comparison is not None
+
+        # Build identity to body metrics map
+        identity_to_body_metrics: Dict[str, Dict[str, float]] = {}
+        if body_comparison:
+            for breakdown in body_comparison.get("breakdowns", []):
+                identity_id = breakdown.get("identity_id")
+                if identity_id:
+                    identity_to_body_metrics[identity_id] = {
+                        "body_visible_seconds": breakdown.get("combined", {}).get("duration", 0.0),
+                        "body_only_seconds": breakdown.get("breakdown", {}).get("body_only_duration", 0.0),
+                        "gap_bridged_seconds": breakdown.get("delta", {}).get("duration_gain", 0.0),
+                    }
+
+        # Build cast_id to identity_id reverse map for body metrics lookup
+        cast_to_identity: Dict[str, str] = {}
+        for identity in identities:
+            identity_id = identity.get("cluster_id") or identity.get("identity_id")
+            person_id = identity_to_person.get(identity_id)
+            if person_id:
+                cast_id = person_to_cast.get(person_id)
+                if cast_id and identity_id:
+                    cast_to_identity[cast_id] = identity_id
+
         # Convert to output format
+        metrics_list = []
+        for m in sorted(cast_metrics_map.values(), key=lambda x: x.visual_s, reverse=True):
+            # Look up body metrics via cast_id -> identity_id
+            identity_id = cast_to_identity.get(m.cast_id)
+            body_metrics = identity_to_body_metrics.get(identity_id, {}) if identity_id else {}
+
+            metric_entry = {
+                "name": person_to_name.get(m.person_id, "Unknown"),
+                "cast_id": m.cast_id,
+                "person_id": m.person_id,
+                # New explicit field names
+                "face_visible_seconds": round(m.visual_s, 2),
+                "body_visible_seconds": round(body_metrics.get("body_visible_seconds", 0.0), 2) if body_tracking_enabled else None,
+                "body_only_seconds": round(body_metrics.get("body_only_seconds", 0.0), 2) if body_tracking_enabled else None,
+                "gap_bridged_seconds": round(body_metrics.get("gap_bridged_seconds", 0.0), 2) if body_tracking_enabled else None,
+                # Legacy field for backwards compat
+                "visual_s": round(m.visual_s, 2),
+                "speaking_s": round(m.speaking_s, 2),
+                "both_s": round(m.both_s, 2),
+                "confidence": round(m.confidence, 3),
+                "tracks_count": m.tracks_count,
+                "faces_count": m.faces_count,
+            }
+            metrics_list.append(metric_entry)
+
         return {
             "episode_id": ep_id,
             "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "diagnostics": diagnostics,
-            "metrics": [
-                {
-                    "name": person_to_name.get(m.person_id, "Unknown"),
-                    "cast_id": m.cast_id,
-                    "person_id": m.person_id,
-                    "visual_s": round(m.visual_s, 2),
-                    "speaking_s": round(m.speaking_s, 2),
-                    "both_s": round(m.both_s, 2),
-                    "confidence": round(m.confidence, 3),
-                    "tracks_count": m.tracks_count,
-                    "faces_count": m.faces_count,
-                }
-                for m in sorted(cast_metrics_map.values(), key=lambda x: x.visual_s, reverse=True)
-            ],
+            "metadata": {
+                "body_tracking_enabled": body_tracking_enabled,
+                "body_metrics_available": body_tracking_enabled and len(identity_to_body_metrics) > 0,
+            },
+            "metrics": metrics_list,
             "timeline": timeline_data,
         }
 
@@ -425,6 +467,25 @@ class ScreenTimeAnalyzer:
             data = json.load(f)
 
         return data.get("identities", [])
+
+    def _load_body_comparison(self, ep_id: str) -> Optional[Dict[str, Any]]:
+        """Load body tracking screentime comparison data if available.
+
+        Returns None if body tracking comparison doesn't exist.
+        """
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+        comparison_path = data_root / "manifests" / ep_id / "body_tracking" / "screentime_comparison.json"
+
+        if not comparison_path.exists():
+            LOGGER.debug(f"[screentime] No body tracking comparison found: {comparison_path}")
+            return None
+
+        try:
+            with comparison_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            LOGGER.warning(f"[screentime] Failed to load body comparison: {e}")
+            return None
 
     def _load_transcript(self, ep_id: str) -> List[Dict[str, Any]]:
         """Load transcript JSONL for an episode.

@@ -199,7 +199,7 @@ A module is considered **Accepted** only when all associated checkpoints below a
 | **Runtime (1hr episode)** | ≤ 5 min | > 10 min | Benchmark |
 
 **Definition of Done:**
-- [x] FAN aligner scaffold in `FEATURES/face-alignment/src/`
+- [x] FAN aligner scaffold in `FEATURES/face_alignment/src/`
 - [x] 68-point landmark extraction interface (`FANAligner` class)
 - [x] 5-point extraction from 68-point for ArcFace alignment
 - [x] Aligned crop generation with similarity transform
@@ -213,8 +213,8 @@ A module is considered **Accepted** only when all associated checkpoints below a
 - [ ] Metrics validated on eval set
 
 **Tests:**
-- `FEATURES/face-alignment/tests/test_face_alignment.py` - Unit + integration tests
-- `FEATURES/face-alignment/tests/fixtures.py` - Synthetic test data
+- `FEATURES/face_alignment/tests/test_face_alignment.py` - Unit + integration tests
+- `FEATURES/face_alignment/tests/fixtures.py` - Synthetic test data
 
 **Config Dependencies:**
 - `config/pipeline/face_alignment.yaml`
@@ -226,9 +226,9 @@ A module is considered **Accepted** only when all associated checkpoints below a
 **Docs:**
 - [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
 - [docs/features/vision_alignment_and_body_tracking.md](docs/features/vision_alignment_and_body_tracking.md)
-- [FEATURES/face-alignment/TODO.md](FEATURES/face-alignment/TODO.md)
+- [FEATURES/face_alignment/TODO.md](FEATURES/face_alignment/TODO.md)
 
-**Feature Sandbox:** `FEATURES/face-alignment/`
+**Feature Sandbox:** `FEATURES/face_alignment/`
 
 **Note:** The `alignment_quality` field is currently heuristic-based. There is no hard numeric acceptance bound for this phase; the field is primarily diagnostic. Model-based thresholds will be added with LUVLi integration.
 
@@ -255,7 +255,7 @@ A module is considered **Accepted** only when all associated checkpoints below a
 | **recognition_accuracy_delta** | ≥ 2% improvement | < 0% (regression) | Eval set |
 
 **Definition of Done:**
-- [x] Alignment quality heuristic (`FEATURES/face-alignment/src/alignment_quality.py`)
+- [x] Alignment quality heuristic (`FEATURES/face_alignment/src/alignment_quality.py`)
 - [x] `alignment_quality` field populated in pipeline
 - [x] Gating integrated in embedding stage (`_run_faces_embed_stage`)
 - [x] Config-driven threshold (`face_alignment.min_alignment_quality`)
@@ -286,10 +286,10 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 - `config/pipeline/embedding.yaml` (face_alignment section)
 
 **Docs:**
-- [FEATURES/face-alignment/docs/README.md](FEATURES/face-alignment/docs/README.md)
+- [FEATURES/face_alignment/docs/README.md](FEATURES/face_alignment/docs/README.md)
 - [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
 
-**Feature Sandbox:** `FEATURES/face-alignment/`
+**Feature Sandbox:** `FEATURES/face_alignment/`
 
 **Current State:** Quality estimation supports both LUVLi model-based and heuristic fallback modes. The system automatically falls back to heuristics when LUVLi is unavailable. Faces with `alignment_quality < threshold` are skipped before embedding with `skip_reason=low_alignment_quality`.
 
@@ -322,7 +322,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 **Docs:**
 - [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
 
-**Feature Sandbox:** `FEATURES/face-alignment/`
+**Feature Sandbox:** `FEATURES/face_alignment/`
 
 **Status:** ⚠ Pending
 
@@ -348,8 +348,8 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 - [ ] Metrics validated on eval set
 
 **Tests:**
-- `FEATURES/body-tracking/tests/test_body_tracking.py` - Unit + integration tests
-- `FEATURES/body-tracking/tests/fixtures.py` - Synthetic test data
+- `FEATURES/body_tracking/tests/test_body_tracking.py` - Unit + integration tests
+- `FEATURES/body_tracking/tests/fixtures.py` - Synthetic test data
 
 **Config Dependencies:**
 - `config/pipeline/body_detection.yaml`
@@ -359,11 +359,11 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 - `person_detection.device: cpu` - Force CPU mode
 
 **Docs:**
-- [FEATURES/body-tracking/docs/README.md](FEATURES/body-tracking/docs/README.md)
+- [FEATURES/body_tracking/docs/README.md](FEATURES/body_tracking/docs/README.md)
 - [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
 - [docs/features/vision_alignment_and_body_tracking.md](docs/features/vision_alignment_and_body_tracking.md)
 
-**Feature Sandbox:** `FEATURES/body-tracking/`
+**Feature Sandbox:** `FEATURES/body_tracking/`
 
 **Status:** ⚠ Implemented (pending eval)
 
@@ -389,7 +389,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 **Design Note:** Re-ID is pluggable - can swap OSNet for heavier models (MGN/BoT) later.
 
 **Tests:**
-- `FEATURES/body-tracking/tests/test_body_tracking.py` (TestConfigLoading)
+- `FEATURES/body_tracking/tests/test_body_tracking.py` (TestConfigLoading)
 
 **Config Dependencies:**
 - `config/pipeline/body_detection.yaml` (person_reid section)
@@ -400,7 +400,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 **Docs:**
 - [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
 
-**Feature Sandbox:** `FEATURES/body-tracking/`
+**Feature Sandbox:** `FEATURES/body_tracking/`
 
 **Status:** ⚠ Implemented (pending eval)
 
@@ -426,7 +426,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 - [ ] Metrics validated on annotated episodes
 
 **Tests:**
-- `FEATURES/body-tracking/tests/test_body_tracking.py` (TestTrackFusion, TestScreenTimeComparison)
+- `FEATURES/body_tracking/tests/test_body_tracking.py` (TestTrackFusion, TestScreenTimeComparison)
 
 **Config Dependencies:**
 - `config/pipeline/track_fusion.yaml`
@@ -445,10 +445,10 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 - Validation: `validate_acceptance_metrics()` checks thresholds
 
 **Docs:**
-- [FEATURES/body-tracking/docs/README.md](FEATURES/body-tracking/docs/README.md)
+- [FEATURES/body_tracking/docs/README.md](FEATURES/body_tracking/docs/README.md)
 - [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
 
-**Feature Sandbox:** `FEATURES/body-tracking/`
+**Feature Sandbox:** `FEATURES/body_tracking/`
 
 **Status:** ⚠ Implemented (pending eval)
 
@@ -465,7 +465,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 | **false_rejection_rate** | < 5% | > 10% | Manual QA / Eval set |
 | **recognition_accuracy_delta** | ≥ 2% improvement | < 0% (regression) | Eval set |
 
-**Status:** ⚠ Not yet implemented - design ready (see [TODO.md](FEATURES/face-alignment/TODO.md))
+**Status:** ⚠ Not yet implemented - design ready (see [TODO.md](FEATURES/face_alignment/TODO.md))
 
 #### 3.13.2 3D Head Pose Consistency (`head_pose_consistency`) - FUTURE
 
@@ -475,7 +475,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 | **profile_detection_accuracy** | ≥ 95% | < 85% | Eval set |
 | **visibility_estimation_accuracy** | ≥ 90% | < 80% | Manual QA |
 
-**Status:** ⚠ Not yet implemented - design ready (see [TODO.md](FEATURES/face-alignment/TODO.md))
+**Status:** ⚠ Not yet implemented - design ready (see [TODO.md](FEATURES/face_alignment/TODO.md))
 
 ---
 
@@ -493,9 +493,9 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 
 **Definition of Done:**
 - [x] ONNX export utility (`tools/models/export_arcface_onnx.py`)
-- [x] TensorRT engine builder (`FEATURES/arcface-tensorrt/src/tensorrt_builder.py`)
-- [x] TensorRT inference wrapper (`FEATURES/arcface-tensorrt/src/tensorrt_inference.py`)
-- [x] Embedding parity comparison (`FEATURES/arcface-tensorrt/src/embedding_compare.py`)
+- [x] TensorRT engine builder (`FEATURES/arcface_tensorrt/src/tensorrt_builder.py`)
+- [x] TensorRT inference wrapper (`FEATURES/arcface_tensorrt/src/tensorrt_inference.py`)
+- [x] Embedding parity comparison (`FEATURES/arcface_tensorrt/src/embedding_compare.py`)
 - [x] Backend abstraction in main pipeline (`EmbeddingBackend` protocol)
 - [x] Config-driven backend selection (`embedding.backend: pytorch|tensorrt`)
 - [ ] Parity validated on eval set (cosine_sim_mean ≥ 0.995)
@@ -510,7 +510,7 @@ embedding:
 ```
 
 **Tests:**
-- `FEATURES/arcface-tensorrt/tests/test_tensorrt_embedding.py`
+- `FEATURES/arcface_tensorrt/tests/test_tensorrt_embedding.py`
 - `tests/ml/test_embedding_regression.py`
 
 **Config Dependencies:**
@@ -520,7 +520,7 @@ embedding:
 **Docs:**
 - [docs/todo/feature_arcface_tensorrt_onnxruntime.md](docs/todo/feature_arcface_tensorrt_onnxruntime.md)
 
-**Feature Sandbox:** `FEATURES/arcface-tensorrt/`
+**Feature Sandbox:** `FEATURES/arcface_tensorrt/`
 
 **Status:** ✅ Backend Integrated (pending parity validation)
 
@@ -546,7 +546,7 @@ embedding:
 **Docs:**
 - [docs/todo/feature_mesh_and_advanced_visibility.md](docs/todo/feature_mesh_and_advanced_visibility.md)
 
-**Feature Sandbox:** `FEATURES/vision-analytics/`
+**Feature Sandbox:** `FEATURES/vision_analytics/`
 
 **Status:** ⚠ Pending
 
@@ -571,7 +571,7 @@ embedding:
 **Docs:**
 - [docs/todo/feature_mesh_and_advanced_visibility.md](docs/todo/feature_mesh_and_advanced_visibility.md)
 
-**Feature Sandbox:** `FEATURES/vision-analytics/`
+**Feature Sandbox:** `FEATURES/vision_analytics/`
 
 **Status:** ⚠ Pending (Future Work)
 
