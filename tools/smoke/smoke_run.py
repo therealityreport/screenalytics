@@ -154,13 +154,30 @@ class SmokeRunner:
     def _run_stages(self):
         """Run actual pipeline stages."""
         self._run_stage_detect_track()
+
+        # Face alignment stage (optional)
         if self.alignment:
             self._run_stage_alignment()
+        else:
+            self.report.stages.append(StageResult(
+                name="face_alignment",
+                status="skipped_by_flag",
+                reason="Disabled via --alignment off",
+            ))
+
         self._run_stage_embeddings()
         self._run_stage_clustering()
         self._run_stage_screentime()
+
+        # Body tracking stage (optional)
         if self.body_tracking:
             self._run_stage_body_tracking()
+        else:
+            self.report.stages.append(StageResult(
+                name="body_tracking",
+                status="skipped_by_flag",
+                reason="Disabled (pass --body-tracking to enable)",
+            ))
 
     def _run_stage_detect_track(self):
         """Run face detection and tracking stage."""
@@ -434,6 +451,13 @@ class SmokeRunner:
         if tracks_loaded > 0 and len(metrics) == 0:
             errors.append(f"No cast metrics but {tracks_loaded} tracks loaded")
 
+        # Validate metadata fields
+        metadata = screentime.get("metadata", {})
+        if "body_tracking_enabled" not in metadata:
+            errors.append("Missing metadata.body_tracking_enabled")
+        if "body_metrics_available" not in metadata:
+            errors.append("Missing metadata.body_metrics_available")
+
         # Validate individual metrics
         for i, m in enumerate(metrics):
             name = m.get("name", f"metric_{i}")
@@ -450,6 +474,11 @@ class SmokeRunner:
             body_only = m.get("body_only_seconds")
             if body_only is not None and body_only < 0:
                 errors.append(f"{name}: negative body_only_seconds ({body_only})")
+
+            # Check gap_bridged_seconds is non-negative if present
+            gap_bridged = m.get("gap_bridged_seconds")
+            if gap_bridged is not None and gap_bridged < 0:
+                errors.append(f"{name}: negative gap_bridged_seconds ({gap_bridged})")
 
             # Check confidence is in valid range
             confidence = m.get("confidence", 0)
