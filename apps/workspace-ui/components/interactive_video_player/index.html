@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; overflow: visible; }
+
+    .player-container {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .video-wrapper {
+      width: 100%;
+      background: #000;
+      border-radius: 8px 8px 0 0;
+      overflow: hidden;
+      line-height: 0;
+      flex-shrink: 0;
+    }
+
+    video {
+      width: 100%;
+      display: block;
+      aspect-ratio: 16/9;
+      max-height: 540px;
+      object-fit: contain;
+      background: #000;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #1e1e2e;
+      border-radius: 0 0 8px 8px;
+    }
+
+    .play-pause {
+      background: #4CAF50;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 13px;
+      min-width: 60px;
+    }
+    .play-pause:hover { background: #45a049; }
+    .play-pause.playing { background: #ff9800; }
+    .play-pause.playing:hover { background: #f57c00; }
+
+    .time-display {
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      color: #fff;
+      background: #333;
+      padding: 5px 10px;
+      border-radius: 4px;
+      min-width: 100px;
+      text-align: center;
+    }
+
+    .capture-btn {
+      background: linear-gradient(135deg, #ff4b4b, #ff6b6b);
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 13px;
+    }
+    .capture-btn:hover { background: linear-gradient(135deg, #ff3333, #ff5555); }
+
+    .captured-display {
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      color: #4CAF50;
+      background: #1a3d1a;
+      padding: 5px 10px;
+      border-radius: 4px;
+      min-width: 100px;
+      text-align: center;
+    }
+
+    .seek-btns { display: flex; gap: 3px; }
+    .seek-btn {
+      background: #333;
+      color: white;
+      border: 1px solid #555;
+      padding: 4px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .seek-btn:hover { background: #444; }
+
+    .progress-container {
+      flex: 1;
+      min-width: 80px;
+      height: 6px;
+      background: #333;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .progress-bar {
+      height: 100%;
+      background: #ff4b4b;
+      border-radius: 3px;
+      width: 0%;
+    }
+
+    .duration {
+      font-family: monospace;
+      font-size: 12px;
+      color: #888;
+    }
+
+    .divider {
+      width: 1px;
+      height: 24px;
+      background: #444;
+      margin: 0 4px;
+    }
+
+    .volume-container { display: flex; align-items: center; gap: 4px; }
+    .volume-icon { font-size: 14px; cursor: pointer; user-select: none; }
+    .volume-slider {
+      width: 60px;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #444;
+      border-radius: 2px;
+      cursor: pointer;
+    }
+    .volume-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 12px;
+      height: 12px;
+      background: #fff;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    .status-msg {
+      font-size: 11px;
+      color: #4CAF50;
+    }
+  </style>
+</head>
+<body>
+  <div class="player-container">
+    <div class="video-wrapper">
+      <video id="mainVideo" preload="metadata">
+        <source id="videoSource" src="" type="video/mp4">
+        Your browser does not support video playback.
+      </video>
+    </div>
+
+    <div class="controls">
+      <button class="play-pause" id="playPauseBtn">Play</button>
+
+      <div class="seek-btns">
+        <button class="seek-btn" id="seekNeg5">-5f</button>
+        <button class="seek-btn" id="seekNeg1">-1f</button>
+        <button class="seek-btn" id="seekPos1">+1f</button>
+        <button class="seek-btn" id="seekPos5">+5f</button>
+      </div>
+
+      <div class="time-display" id="currentTime">00:00.000</div>
+
+      <div class="progress-container" id="progressContainer">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+
+      <span class="duration" id="duration">/ --:--</span>
+
+      <div class="volume-container">
+        <span class="volume-icon" id="volumeIcon">🔊</span>
+        <input type="range" class="volume-slider" id="volumeSlider" min="0" max="1" step="0.1" value="1">
+      </div>
+
+      <div class="divider"></div>
+
+      <button class="capture-btn" id="captureBtn">Capture Timestamp</button>
+      <div class="captured-display" id="capturedTime">--:--</div>
+      <span class="status-msg" id="statusMsg"></span>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('mainVideo');
+    const videoSource = document.getElementById('videoSource');
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    const currentTimeEl = document.getElementById('currentTime');
+    const capturedTimeEl = document.getElementById('capturedTime');
+    const progressBar = document.getElementById('progressBar');
+    const progressContainer = document.getElementById('progressContainer');
+    const durationEl = document.getElementById('duration');
+    const statusMsg = document.getElementById('statusMsg');
+    const volumeIcon = document.getElementById('volumeIcon');
+    const volumeSlider = document.getElementById('volumeSlider');
+    const captureBtn = document.getElementById('captureBtn');
+
+    const seekNeg5 = document.getElementById('seekNeg5');
+    const seekNeg1 = document.getElementById('seekNeg1');
+    const seekPos1 = document.getElementById('seekPos1');
+    const seekPos5 = document.getElementById('seekPos5');
+
+    let frameDuration = 1.0 / 24.0;
+    let lastVolume = 1;
+    let lastSentEpochMs = 0;
+
+    function postToStreamlit(type, payload) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type,
+        ...payload,
+      }, '*');
+    }
+
+    function setComponentValue(value) {
+      postToStreamlit('streamlit:setComponentValue', { value });
+    }
+
+    function setFrameHeight() {
+      const height = document.documentElement.scrollHeight;
+      postToStreamlit('streamlit:setFrameHeight', { height });
+    }
+
+    function componentReady() {
+      postToStreamlit('streamlit:componentReady', {});
+      setFrameHeight();
+    }
+
+    function formatTime(seconds) {
+      const mins = Math.floor(seconds / 60);
+      const secs = seconds % 60;
+      return mins.toString().padStart(2, '0') + ':' + secs.toFixed(3).padStart(6, '0');
+    }
+
+    function formatDuration(seconds) {
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+      return mins.toString().padStart(2, '0') + ':' + secs.toString().padStart(2, '0');
+    }
+
+    function togglePlay() {
+      if (video.paused) {
+        video.play();
+      } else {
+        video.pause();
+      }
+    }
+
+    function seekFrames(numFrames) {
+      video.currentTime = Math.max(0, Math.min(video.duration || 0, video.currentTime + (numFrames * frameDuration)));
+    }
+
+    function seekToPosition(event) {
+      const rect = progressContainer.getBoundingClientRect();
+      const percent = (event.clientX - rect.left) / rect.width;
+      if (video.duration) {
+        video.currentTime = percent * video.duration;
+      }
+    }
+
+    function setVolume(val) {
+      const v = Math.max(0, Math.min(1, parseFloat(val)));
+      video.volume = v;
+      lastVolume = v > 0 ? v : lastVolume;
+      updateVolumeIcon();
+    }
+
+    function toggleMute() {
+      if (video.volume > 0) {
+        lastVolume = video.volume;
+        video.volume = 0;
+        volumeSlider.value = 0;
+      } else {
+        video.volume = lastVolume || 1;
+        volumeSlider.value = video.volume;
+      }
+      updateVolumeIcon();
+    }
+
+    function updateVolumeIcon() {
+      if (video.volume === 0) {
+        volumeIcon.textContent = '🔇';
+      } else if (video.volume < 0.5) {
+        volumeIcon.textContent = '🔉';
+      } else {
+        volumeIcon.textContent = '🔊';
+      }
+    }
+
+    function captureTimestamp() {
+      const ts = video.currentTime;
+      const formatted = formatTime(ts);
+      capturedTimeEl.textContent = formatted;
+
+      // Copy to clipboard (best-effort)
+      navigator.clipboard.writeText(formatted).catch(() => {});
+
+      const now = Date.now();
+      // Avoid double-sending the exact same click if Streamlit re-renders quickly.
+      if (Math.abs(now - lastSentEpochMs) < 250) {
+        return;
+      }
+      lastSentEpochMs = now;
+
+      statusMsg.textContent = 'Captured!';
+      statusMsg.style.color = '#4CAF50';
+
+      setComponentValue({
+        event: 'capture',
+        timestamp_s: Number(ts.toFixed(3)),
+        timestamp_display: formatted,
+        epoch_ms: now,
+      });
+    }
+
+    // Streamlit render message handler (provides args)
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (!data || typeof data.type !== 'string') return;
+
+      if (data.type === 'streamlit:render') {
+        const args = (data.args || {});
+        const nextUrl = args.video_url || '';
+        const fps = Number(args.fps || 24);
+        frameDuration = fps > 0 ? (1.0 / fps) : (1.0 / 24.0);
+
+        // Update video src only when it changes.
+        if (nextUrl && videoSource.getAttribute('src') !== nextUrl) {
+          videoSource.setAttribute('src', nextUrl);
+          video.load();
+        }
+
+        // Clear status on rerender.
+        statusMsg.textContent = '';
+
+        setFrameHeight();
+      }
+    });
+
+    // Wire UI events
+    playPauseBtn.addEventListener('click', togglePlay);
+    captureBtn.addEventListener('click', captureTimestamp);
+
+    seekNeg5.addEventListener('click', () => seekFrames(-5));
+    seekNeg1.addEventListener('click', () => seekFrames(-1));
+    seekPos1.addEventListener('click', () => seekFrames(1));
+    seekPos5.addEventListener('click', () => seekFrames(5));
+
+    progressContainer.addEventListener('click', seekToPosition);
+
+    volumeSlider.addEventListener('input', (e) => setVolume(e.target.value));
+    volumeIcon.addEventListener('click', toggleMute);
+
+    video.addEventListener('timeupdate', () => {
+      currentTimeEl.textContent = formatTime(video.currentTime);
+      if (video.duration) {
+        progressBar.style.width = (video.currentTime / video.duration * 100) + '%';
+        durationEl.textContent = '/ ' + formatDuration(video.duration);
+      }
+    });
+
+    video.addEventListener('play', () => {
+      playPauseBtn.textContent = 'Pause';
+      playPauseBtn.classList.add('playing');
+    });
+
+    video.addEventListener('pause', () => {
+      playPauseBtn.textContent = 'Play';
+      playPauseBtn.classList.remove('playing');
+    });
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.code === 'ArrowLeft') {
+        seekFrames(-1);
+      } else if (e.code === 'ArrowRight') {
+        seekFrames(1);
+      } else if (e.code === 'KeyC') {
+        captureTimestamp();
+      } else if (e.code === 'KeyM') {
+        toggleMute();
+      }
+    });
+
+    window.addEventListener('load', componentReady);
+    window.addEventListener('resize', setFrameHeight);
+  </script>
+</body>
+</html>

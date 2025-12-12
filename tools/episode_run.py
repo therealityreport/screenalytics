@@ -1917,10 +1917,6 @@ def get_embedding_backend(
         return ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
 
 
-# Alias for backwards compatibility
-PyTorchEmbeddingBackend = ArcFaceEmbedder
-
-
 class ArcFaceEmbedder:
     def __init__(self, device: str, allow_cpu_fallback: bool = True) -> None:
         self.device = device
@@ -2008,6 +2004,10 @@ class ArcFaceEmbedder:
                     pass
 
         return np.vstack(embeddings)
+
+
+    # Alias for backwards compatibility
+    PyTorchEmbeddingBackend = ArcFaceEmbedder
 
 
 def _resize_for_arcface(image):

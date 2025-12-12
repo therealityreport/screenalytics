@@ -43,6 +43,7 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+from interactive_video_player_component import interactive_video_player  # noqa: E402
 
 # ── Page Init ─────────────────────────────────────────────────────────────────
 cfg = helpers.init_page("Interactive Viewer")
@@ -65,11 +66,14 @@ _captured_ts_key = f"{ep_id}::captured_timestamps_v2"
 _video_url_key = f"{ep_id}::interactive_video_url"
 _capture_processed_key = f"{ep_id}::capture_processed"
 _capture_log_key = f"{ep_id}::capture_log"
+_capture_event_processed_key = f"{ep_id}::iv_last_capture_epoch_ms"
 
 if _captured_ts_key not in st.session_state:
     st.session_state[_captured_ts_key] = []
 if _capture_log_key not in st.session_state:
     st.session_state[_capture_log_key] = []
+if _capture_event_processed_key not in st.session_state:
+    st.session_state[_capture_event_processed_key] = 0
 
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
@@ -109,6 +113,23 @@ def _parse_timestamp_input(ts_str: str) -> float | None:
         return float(ts_str)
     except ValueError:
         return None
+
+
+def _format_timestamp_display(ts_seconds: float) -> str:
+    """Format seconds into MM:SS.mmm for consistent UI display."""
+    if ts_seconds is None:
+        return "00:00.000"
+    try:
+        ts_seconds = float(ts_seconds)
+    except (TypeError, ValueError):
+        return "00:00.000"
+
+    if ts_seconds < 0:
+        ts_seconds = 0.0
+
+    minutes = int(ts_seconds // 60)
+    seconds = ts_seconds % 60
+    return f"{minutes:02d}:{seconds:06.3f}"
 
 
 def build_full_face_table(faces: list) -> list:
@@ -340,6 +361,7 @@ def _add_captured_timestamp(ep_id: str, ts_seconds: float, fps_hint: float | Non
     )
     captured_entry = {
         "timestamp_s": ts_seconds,
+        "timestamp_display": _format_timestamp_display(ts_seconds),
         "frame_idx": preview_resp.get("frame_idx"),
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "notes": "",
@@ -349,11 +371,12 @@ def _add_captured_timestamp(ep_id: str, ts_seconds: float, fps_hint: float | Non
         "pipeline_summary": preview_resp.get("pipeline_summary", {}),
         "fps": preview_resp.get("fps", fps_hint or 24),
     }
-    captured.append(captured_entry)
-    captured.sort(key=lambda x: x["timestamp_s"])
+
+    # Newest-first (prepend) so it appears immediately at the top.
+    captured.insert(0, captured_entry)
     st.session_state[_captured_ts_key] = captured
     st.session_state[_capture_processed_key] = f"{ts_seconds:.3f}"
-    ts_str = f"{int(ts_seconds//60):02d}:{ts_seconds%60:05.2f}"
+    ts_str = _format_timestamp_display(ts_seconds)
     st.toast(f"Added timestamp {ts_str} with {len(captured_entry['faces'])} faces")
     _log_capture_event(f"Captured at {ts_str} (frame {captured_entry.get('frame_idx', '?')})")
     return True
@@ -409,33 +432,6 @@ def _log_capture_event(message: str) -> None:
     log = st.session_state[_capture_log_key]
     log.append(f"[{now}] {message}")
     st.session_state[_capture_log_key] = log[-50:]
-
-# ── Handle Auto-Capture from Video Player ─────────────────────────────────────
-# Check for capture_ts query parameter (set by video player's Capture button)
-_capture_ts_param = st.query_params.get("capture_ts")
-if _capture_ts_param:
-    # Clear query params FIRST to prevent retriggering
-    st.query_params.clear()
-
-    # Check if we already processed this exact capture (guard against rapid reruns)
-    processed_ts = st.session_state.get(_capture_processed_key)
-    if processed_ts != _capture_ts_param:
-        try:
-            ts_seconds = float(_capture_ts_param)
-            try:
-                _log_capture_event(f"Received capture_ts={ts_seconds:.3f}s from query params")
-                added = _add_captured_timestamp(ep_id, ts_seconds, fps_hint=24)
-                if not added:
-                    _log_capture_event(f"Skipped duplicate capture at {ts_seconds:.3f}s")
-            except requests.RequestException as exc:
-                error_msg = helpers.describe_error(f"/episodes/{ep_id}/timestamp/{ts_seconds}/preview", exc)
-                st.toast(error_msg, icon="⚠️")
-                _log_capture_event(f"Error: {error_msg}")
-        except (ValueError, TypeError):
-            pass
-
-    # Explicit rerun to ensure state is committed and UI refreshes
-    st.rerun()
 
 
 # ── Get Video URL ─────────────────────────────────────────────────────────────
@@ -504,427 +500,41 @@ with st.expander("Video Info", expanded=False):
     st.code(_overlay_video_url or "No URL", language=None)
     st.caption(f"FPS: {_overlay_video_fps} | Duration: {_video_duration}s")
 
-# Custom HTML5 video player with built-in timestamp capture
-# Use the actual FPS for frame-based seeking
-_frame_duration = 1.0 / _overlay_video_fps if _overlay_video_fps > 0 else 1.0 / 24.0
-
-video_player_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<style>
-    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    html, body {{
-        margin: 0;
-        padding: 0;
-        overflow: visible;
-    }}
-    body {{
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        background: #0e1117;
-    }}
-    .player-container {{
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-    }}
-    .video-wrapper {{
-        width: 100%;
-        background: #000;
-        border-radius: 8px 8px 0 0;
-        overflow: hidden;
-        line-height: 0;
-        flex-shrink: 0;
-    }}
-    video {{
-        width: 100%;
-        display: block;
-        aspect-ratio: 16/9;
-        max-height: 540px;
-        object-fit: contain;
-        background: #000;
-    }}
-    .controls {{
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-        padding: 10px 12px;
-        background: #1e1e2e;
-        border-radius: 0 0 8px 8px;
-    }}
-    .play-pause {{
-        background: #4CAF50;
-        color: white;
-        border: none;
-        padding: 6px 14px;
-        border-radius: 4px;
-        cursor: pointer;
-        font-weight: bold;
-        font-size: 13px;
-        min-width: 60px;
-    }}
-    .play-pause:hover {{ background: #45a049; }}
-    .play-pause.playing {{ background: #ff9800; }}
-    .play-pause.playing:hover {{ background: #f57c00; }}
-    .time-display {{
-        font-family: 'Courier New', monospace;
-        font-size: 14px;
-        color: #fff;
-        background: #333;
-        padding: 5px 10px;
-        border-radius: 4px;
-        min-width: 100px;
-        text-align: center;
-    }}
-    .capture-btn {{
-        background: linear-gradient(135deg, #ff4b4b, #ff6b6b);
-        color: white;
-        border: none;
-        padding: 6px 14px;
-        border-radius: 4px;
-        cursor: pointer;
-        font-weight: bold;
-        font-size: 13px;
-    }}
-    .capture-btn:hover {{ background: linear-gradient(135deg, #ff3333, #ff5555); }}
-    .captured-display {{
-        font-family: 'Courier New', monospace;
-        font-size: 13px;
-        color: #4CAF50;
-        background: #1a3d1a;
-        padding: 5px 10px;
-        border-radius: 4px;
-        min-width: 100px;
-        text-align: center;
-    }}
-    .seek-btns {{
-        display: flex;
-        gap: 3px;
-    }}
-    .seek-btn {{
-        background: #333;
-        color: white;
-        border: 1px solid #555;
-        padding: 4px 8px;
-        border-radius: 3px;
-        cursor: pointer;
-        font-size: 11px;
-    }}
-    .seek-btn:hover {{ background: #444; }}
-    .progress-container {{
-        flex: 1;
-        min-width: 80px;
-        height: 6px;
-        background: #333;
-        border-radius: 3px;
-        cursor: pointer;
-    }}
-    .progress-bar {{
-        height: 100%;
-        background: #ff4b4b;
-        border-radius: 3px;
-        width: 0%;
-    }}
-    .duration {{
-        font-family: monospace;
-        font-size: 12px;
-        color: #888;
-    }}
-    .divider {{
-        width: 1px;
-        height: 24px;
-        background: #444;
-        margin: 0 4px;
-    }}
-    .volume-container {{
-        display: flex;
-        align-items: center;
-        gap: 4px;
-    }}
-    .volume-icon {{
-        font-size: 14px;
-        cursor: pointer;
-        user-select: none;
-    }}
-    .volume-slider {{
-        width: 60px;
-        height: 4px;
-        -webkit-appearance: none;
-        background: #444;
-        border-radius: 2px;
-        cursor: pointer;
-    }}
-    .volume-slider::-webkit-slider-thumb {{
-        -webkit-appearance: none;
-        width: 12px;
-        height: 12px;
-        background: #fff;
-        border-radius: 50%;
-        cursor: pointer;
-    }}
-    .status-msg {{
-        font-size: 11px;
-        color: #4CAF50;
-    }}
-</style>
-</head>
-<body>
-<div class="player-container">
-    <div class="video-wrapper">
-        <video id="mainVideo" preload="metadata">
-            <source src="{_safe_overlay_video_url}" type="video/mp4">
-            Your browser does not support video playback.
-        </video>
-    </div>
-    <div class="controls">
-        <button class="play-pause" id="playPauseBtn" onclick="togglePlay()">Play</button>
-        <div class="seek-btns">
-            <button class="seek-btn" onclick="seekFrames(-5)">-5f</button>
-            <button class="seek-btn" onclick="seekFrames(-1)">-1f</button>
-            <button class="seek-btn" onclick="seekFrames(1)">+1f</button>
-            <button class="seek-btn" onclick="seekFrames(5)">+5f</button>
-        </div>
-        <div class="time-display" id="currentTime">00:00.000</div>
-        <div class="progress-container" id="progressContainer" onclick="seekToPosition(event)">
-            <div class="progress-bar" id="progressBar"></div>
-        </div>
-        <span class="duration" id="duration">/ --:--</span>
-        <div class="volume-container">
-            <span class="volume-icon" id="volumeIcon" onclick="toggleMute()">🔊</span>
-            <input type="range" class="volume-slider" id="volumeSlider" min="0" max="1" step="0.1" value="1" oninput="setVolume(this.value)">
-        </div>
-        <div class="divider"></div>
-        <button class="capture-btn" onclick="captureAndAdd()">Capture Timestamp</button>
-        <div class="captured-display" id="capturedTime">--:--</div>
-        <span class="status-msg" id="statusMsg"></span>
-    </div>
-</div>
-<script>
-    const video = document.getElementById('mainVideo');
-    const playPauseBtn = document.getElementById('playPauseBtn');
-    const currentTimeEl = document.getElementById('currentTime');
-    const capturedTimeEl = document.getElementById('capturedTime');
-    const progressBar = document.getElementById('progressBar');
-    const durationEl = document.getElementById('duration');
-    const statusMsg = document.getElementById('statusMsg');
-    const volumeIcon = document.getElementById('volumeIcon');
-    const volumeSlider = document.getElementById('volumeSlider');
-    const FRAME_DURATION = {_frame_duration};
-    let lastVolume = 1;
-
-    function formatTime(seconds) {{
-        const mins = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        return mins.toString().padStart(2, '0') + ':' + secs.toFixed(3).padStart(6, '0');
-    }}
-
-    function formatDuration(seconds) {{
-        const mins = Math.floor(seconds / 60);
-        const secs = Math.floor(seconds % 60);
-        return mins.toString().padStart(2, '0') + ':' + secs.toString().padStart(2, '0');
-    }}
-
-    function togglePlay() {{
-        if (video.paused) {{
-            video.play();
-        }} else {{
-            video.pause();
-        }}
-    }}
-
-    function seekFrames(numFrames) {{
-        video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + (numFrames * FRAME_DURATION)));
-    }}
-
-    function seekToPosition(event) {{
-        const container = document.getElementById('progressContainer');
-        const rect = container.getBoundingClientRect();
-        const percent = (event.clientX - rect.left) / rect.width;
-        video.currentTime = percent * video.duration;
-    }}
-
-    function setVolume(val) {{
-        video.volume = val;
-        lastVolume = val > 0 ? val : lastVolume;
-        updateVolumeIcon();
-    }}
-
-    function toggleMute() {{
-        if (video.volume > 0) {{
-            lastVolume = video.volume;
-            video.volume = 0;
-            volumeSlider.value = 0;
-        }} else {{
-            video.volume = lastVolume || 1;
-            volumeSlider.value = video.volume;
-        }}
-        updateVolumeIcon();
-    }}
-
-    function updateVolumeIcon() {{
-        if (video.volume === 0) {{
-            volumeIcon.textContent = '🔇';
-        }} else if (video.volume < 0.5) {{
-            volumeIcon.textContent = '🔉';
-        }} else {{
-            volumeIcon.textContent = '🔊';
-        }}
-    }}
-
-    function captureAndAdd() {{
-        const ts = video.currentTime;
-        const formatted = formatTime(ts);
-        capturedTimeEl.textContent = formatted;
-
-        // Copy to clipboard
-        navigator.clipboard.writeText(formatted).catch(() => {{}});
-
-        // Store in localStorage for Streamlit to read via sync button
-        const key = 'iv_pending_capture_{ep_id}';
-        localStorage.setItem(key, ts.toFixed(3));
-        localStorage.setItem(key + '_time', Date.now().toString());
-
-        // Show success status
-        statusMsg.textContent = 'Captured! Click Sync below.';
-        statusMsg.style.color = '#4CAF50';
-
-        // Try to navigate parent (may fail due to iframe security)
-        try {{
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('capture_ts', ts.toFixed(3));
-            window.parent.location.href = url.toString();
-        }} catch (e) {{
-            // Navigation blocked - user will need to use Sync button
-            console.log('Parent navigation blocked, use Sync button');
-        }}
-    }}
-
-    // Tell Streamlit our iframe height so the component renders correctly
-    function reportHeight() {{
-        const height = document.documentElement.scrollHeight;
-        window.parent.postMessage({{
-            isStreamlitMessage: true,
-            type: 'streamlit:componentReady',
-            height: height,
-        }}, '*');
-    }}
-    window.addEventListener('load', reportHeight);
-    window.addEventListener('resize', reportHeight);
-
-    video.addEventListener('timeupdate', () => {{
-        currentTimeEl.textContent = formatTime(video.currentTime);
-        if (video.duration) {{
-            progressBar.style.width = (video.currentTime / video.duration * 100) + '%';
-        }}
-    }});
-
-    video.addEventListener('loadedmetadata', () => {{
-        durationEl.textContent = '/ ' + formatDuration(video.duration);
-    }});
-
-    video.addEventListener('play', () => {{
-        playPauseBtn.textContent = 'Pause';
-        playPauseBtn.classList.add('playing');
-    }});
-
-    video.addEventListener('pause', () => {{
-        playPauseBtn.textContent = 'Play';
-        playPauseBtn.classList.remove('playing');
-    }});
-
-    video.addEventListener('ended', () => {{
-        playPauseBtn.textContent = 'Play';
-        playPauseBtn.classList.remove('playing');
-    }});
-
-    // Keyboard shortcuts
-    document.addEventListener('keydown', (e) => {{
-        if (e.code === 'Space') {{
-            e.preventDefault();
-            togglePlay();
-        }} else if (e.code === 'ArrowLeft') {{
-            seekFrames(-1);
-        }} else if (e.code === 'ArrowRight') {{
-            seekFrames(1);
-        }} else if (e.code === 'KeyC') {{
-            captureAndAdd();
-        }} else if (e.code === 'KeyM') {{
-            toggleMute();
-        }}
-    }});
-</script>
-</body>
-</html>
-"""
-
-# Provide enough height for 16:9 video (~540px) + controls (~50px) + padding
-# Note: components.html() doesn't support bi-directional communication.
-# Capture is handled via query parameters set by the JavaScript captureAndAdd() function.
-components.html(
-    video_player_html,
-    height=620,
-    scrolling=False,
+player_event = interactive_video_player(
+    video_url=_safe_overlay_video_url,
+    fps=_overlay_video_fps,
+    key=f"{ep_id}::iv_player",
 )
+
+if isinstance(player_event, dict) and player_event.get("event") == "capture":
+    try:
+        epoch_ms = int(player_event.get("epoch_ms") or 0)
+    except (TypeError, ValueError):
+        epoch_ms = 0
+
+    last_epoch_ms = int(st.session_state.get(_capture_event_processed_key) or 0)
+    if epoch_ms and epoch_ms != last_epoch_ms:
+        st.session_state[_capture_event_processed_key] = epoch_ms
+        try:
+            ts_seconds = float(player_event.get("timestamp_s") or 0.0)
+            ts_display = str(player_event.get("timestamp_display") or _format_timestamp_display(ts_seconds))
+        except (TypeError, ValueError):
+            ts_seconds = 0.0
+            ts_display = "00:00.000"
+
+        with st.spinner("Capturing frame data..."):
+            try:
+                _log_capture_event(f"Capture button: {ts_display}")
+                _add_captured_timestamp(ep_id, ts_seconds, fps_hint=_overlay_video_fps)
+            except requests.RequestException as exc:
+                error_msg = helpers.describe_error(f"/episodes/{ep_id}/timestamp/{ts_seconds}/preview", exc)
+                st.toast(error_msg, icon="⚠️")
+                _log_capture_event(f"Error: {error_msg}")
+
+        st.rerun()
 
 # ── Keyboard Shortcuts ────────────────────────────────────────────────────────
 st.caption("**Shortcuts:** Space = Play/Pause | ← → = ±1 frame | C = Capture Timestamp | M = Mute")
-
-# ── Sync Captures from Video Player ──────────────────────────────────────────
-# This provides a fallback when iframe navigation is blocked by browser security
-_sync_key = f"{ep_id}::sync_capture_trigger"
-_pending_capture_key = f"iv_pending_capture_{ep_id}"
-
-sync_col1, sync_col2 = st.columns([1, 4])
-with sync_col1:
-    if st.button("Sync Capture", key=f"{ep_id}::iv_sync_btn", type="primary", help="Click after using Capture button in video player"):
-        st.session_state[_sync_key] = True
-        st.rerun()
-
-# JavaScript to read localStorage and pass to Streamlit via query params
-if st.session_state.get(_sync_key):
-    st.session_state[_sync_key] = False
-    # Inject JavaScript to read localStorage and redirect with the value
-    sync_js = f"""
-    <script>
-        const key = '{_pending_capture_key}';
-        const val = localStorage.getItem(key);
-        const timeKey = key + '_time';
-        const captureTime = localStorage.getItem(timeKey);
-
-        if (val && captureTime) {{
-            // Only process if capture is recent (within 60 seconds)
-            const age = Date.now() - parseInt(captureTime);
-            if (age < 60000) {{
-                // Clear the pending capture
-                localStorage.removeItem(key);
-                localStorage.removeItem(timeKey);
-
-                // Redirect with the captured timestamp
-                // IMPORTANT: components.html runs inside an iframe. We must
-                // navigate the parent page so Streamlit sees the new query param.
-                try {{
-                    const url = new URL(window.parent.location.href);
-                    url.searchParams.set('capture_ts', val);
-                    window.parent.location.href = url.toString();
-                }} catch (e) {{
-                    // Fallback: at least navigate this frame.
-                    const url = new URL(window.location.href);
-                    url.searchParams.set('capture_ts', val);
-                    window.location.href = url.toString();
-                }}
-            }} else {{
-                // Stale capture, clear it
-                localStorage.removeItem(key);
-                localStorage.removeItem(timeKey);
-            }}
-        }}
-    </script>
-    """
-    components.html(sync_js, height=0)
-
-with sync_col2:
-    st.caption("If the Capture button doesn't auto-add, click **Sync Capture** to add pending timestamps.")
 
 # ── Capture Run Log ───────────────────────────────────────────────────────────
 with st.expander("Capture Run Log", expanded=False):
@@ -954,37 +564,16 @@ with st.expander("Manual Timestamp Entry", expanded=False):
     if add_clicked and capture_input:
         ts_seconds = _parse_timestamp_input(_auto_format_timestamp(capture_input))
         if ts_seconds is not None and ts_seconds >= 0:
-            captured = st.session_state[_captured_ts_key]
-            existing_ts = [e["timestamp_s"] for e in captured]
-            # Use tolerance-based duplicate check (consistent with auto-capture)
-            is_duplicate = any(abs(ts_seconds - t) < 0.1 for t in existing_ts)
-            if not is_duplicate:
-                with st.spinner("Capturing frame data..."):
-                    try:
-                        preview_resp = helpers.api_get(
-                            f"/episodes/{ep_id}/timestamp/{ts_seconds}/preview",
-                            timeout=30,
-                        )
-                        captured_entry = {
-                            "timestamp_s": ts_seconds,
-                            "frame_idx": preview_resp.get("frame_idx"),
-                            "captured_at": datetime.now(timezone.utc).isoformat(),
-                            "notes": "",
-                            "annotation_data": None,
-                            "screenshot_url": preview_resp.get("url"),
-                            "faces": preview_resp.get("faces", []),
-                            "pipeline_summary": preview_resp.get("pipeline_summary", {}),
-                            "fps": preview_resp.get("fps", _overlay_video_fps),
-                        }
-                        captured.append(captured_entry)
-                        captured.sort(key=lambda x: x["timestamp_s"])
-                        st.session_state[_captured_ts_key] = captured
-                        st.success(f"Added {capture_input} with {len(captured_entry['faces'])} faces")
+            with st.spinner("Capturing frame data..."):
+                try:
+                    added = _add_captured_timestamp(ep_id, ts_seconds, fps_hint=_overlay_video_fps)
+                    if added:
+                        st.success(f"Added {_format_timestamp_display(ts_seconds)}")
                         st.rerun()
-                    except requests.RequestException as exc:
-                        st.error(helpers.describe_error(f"/episodes/{ep_id}/timestamp/{ts_seconds}/preview", exc))
-            else:
-                st.warning("Timestamp already in list (within 0.1s tolerance)")
+                    else:
+                        st.warning("Timestamp already in list (within 0.1s tolerance)")
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"/episodes/{ep_id}/timestamp/{ts_seconds}/preview", exc))
         else:
             st.error("Invalid timestamp format")
 
@@ -1004,9 +593,7 @@ if captured_timestamps:
     # Display each captured timestamp
     for i, entry in enumerate(captured_timestamps):
         ts = entry["timestamp_s"]
-        ts_mm = int(ts // 60)
-        ts_ss = ts % 60
-        ts_formatted = f"{ts_mm:02d}:{ts_ss:06.3f}"
+        ts_formatted = entry.get("timestamp_display") or _format_timestamp_display(ts)
         face_count = len(entry.get("faces", []))
 
         with st.expander(f"{ts_formatted} - Frame {entry.get('frame_idx', '?')} ({face_count} faces)", expanded=False):
