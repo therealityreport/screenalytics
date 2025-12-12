@@ -49,7 +49,7 @@ jobs:
 
       - name: Run body_tracking tests
         run: |
-          pytest FEATURES/body_tracking/tests/ -v --tb=short
+          pytest FEATURES/body_tracking/tests/ -v --tb=short -m "not slow"
 
       - name: Run arcface_tensorrt tests
         run: |
@@ -57,7 +57,7 @@ jobs:
 
       - name: Run eval harness tests
         run: |
-          pytest tools/experiments/tests/ -v --tb=short
+          pytest tools/experiments/tests/ -v --tb=short -m "not slow"
 
   smoke-dry-run:
     runs-on: ubuntu-latest

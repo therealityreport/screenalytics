@@ -1022,7 +1022,11 @@ class ScreenTimeAnalyzer:
                 "name",
                 "cast_id",
                 "person_id",
-                "visual_s",
+                "face_visible_seconds",  # New explicit field
+                "body_visible_seconds",  # Body tracking metrics
+                "body_only_seconds",
+                "gap_bridged_seconds",
+                "visual_s",  # Legacy fields preserved
                 "speaking_s",
                 "both_s",
                 "confidence",
@@ -1030,7 +1034,7 @@ class ScreenTimeAnalyzer:
                 "faces_count",
             ]
             with csv_path.open("w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(metrics)
 
