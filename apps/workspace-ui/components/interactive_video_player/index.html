@@ -238,7 +238,7 @@
     }
 
     function componentReady() {
-      postToStreamlit('streamlit:componentReady', {});
+      postToStreamlit('streamlit:componentReady', { apiVersion: 1 });
       setFrameHeight();
     }
 

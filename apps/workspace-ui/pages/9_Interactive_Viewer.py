@@ -640,7 +640,7 @@ if captured_timestamps:
 
             # Drawing annotations
             if HAS_DRAWABLE_CANVAS:
-                with st.expander("Draw Annotations", expanded=False):
+                if st.checkbox("Show Drawing Canvas", key=f"{ep_id}::iv_draw_toggle_{i}", value=False):
                     render_annotation_canvas(entry, i, ep_id)
             else:
                 st.caption("*Drawing: Install `streamlit-drawable-canvas` to enable*")

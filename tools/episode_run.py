@@ -2006,8 +2006,8 @@ class ArcFaceEmbedder:
         return np.vstack(embeddings)
 
 
-    # Alias for backwards compatibility
-    PyTorchEmbeddingBackend = ArcFaceEmbedder
+# Alias for backwards compatibility
+PyTorchEmbeddingBackend = ArcFaceEmbedder
 
 
 def _resize_for_arcface(image):

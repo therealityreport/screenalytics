@@ -5020,20 +5020,31 @@ def generate_timestamp_preview(
                 except (TypeError, ValueError):
                     continue
 
-        # Load people for cast name mapping
+        # Load people and cast for name mapping
         ep_ctx = episode_context_from_id(ep_id)
         show_id = ep_ctx.show_slug.upper()
         people_service = PeopleService()
         people = people_service.list_people(show_id)
+
+        # Load cast members for name lookup (people may have name=None but cast_id set)
+        from apps.api.services.cast import CastService
+        cast_service = CastService()
+        cast_members = cast_service.list_cast(show_id)
+        cast_name_lookup = {c.get("cast_id"): c.get("name") for c in cast_members if c.get("cast_id")}
 
         # person_id -> cast info (name, cast_id)
         person_to_cast = {}
         for person in people:
             person_id = person.get("person_id")
             if person_id:
+                # Try person's name first, then fall back to cast lookup
+                name = person.get("name") or person.get("display_name")
+                cast_id = person.get("cast_id")
+                if not name and cast_id:
+                    name = cast_name_lookup.get(cast_id)
                 person_to_cast[person_id] = {
-                    "name": person.get("name") or person.get("display_name"),
-                    "cast_id": person.get("cast_id"),
+                    "name": name,
+                    "cast_id": cast_id,
                 }
 
         # Extract the video frame
@@ -5453,19 +5464,30 @@ def generate_video_clip(ep_id: str, body: VideoClipRequest) -> dict:
                 except (TypeError, ValueError):
                     continue
 
-        # Load people for cast name mapping
+        # Load people and cast for name mapping
         ep_ctx = episode_context_from_id(ep_id)
         show_id = ep_ctx.show_slug.upper()
         people_service = PeopleService()
         people = people_service.list_people(show_id)
 
+        # Load cast members for name lookup (people may have name=None but cast_id set)
+        from apps.api.services.cast import CastService
+        cast_service = CastService()
+        cast_members = cast_service.list_cast(show_id)
+        cast_name_lookup = {c.get("cast_id"): c.get("name") for c in cast_members if c.get("cast_id")}
+
         person_to_cast = {}
         for person in people:
             person_id = person.get("person_id")
             if person_id:
+                # Try person's name first, then fall back to cast lookup
+                name = person.get("name") or person.get("display_name")
+                cast_id = person.get("cast_id")
+                if not name and cast_id:
+                    name = cast_name_lookup.get(cast_id)
                 person_to_cast[person_id] = {
-                    "name": person.get("name") or person.get("display_name"),
-                    "cast_id": person.get("cast_id"),
+                    "name": name,
+                    "cast_id": cast_id,
                 }
 
         # Colors for different tracks
