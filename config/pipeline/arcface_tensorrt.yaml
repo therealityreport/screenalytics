@@ -1,5 +1,5 @@
 # ArcFace TensorRT Configuration
-# Documentation: FEATURES/arcface-tensorrt/docs/README.md
+# Documentation: FEATURES/arcface_tensorrt/docs/README.md
 
 # Master switch
 arcface_tensorrt:

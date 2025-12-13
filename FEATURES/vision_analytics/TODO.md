@@ -44,9 +44,9 @@ computation, gaze direction estimation, and CenterFace detector stub.
 
 ## Promotion Checklist
 
-- [ ] Tests present and passing (`pytest FEATURES/vision-analytics/tests/ -v`)
+- [ ] Tests present and passing (`pytest FEATURES/vision_analytics/tests/ -v`)
 - [ ] Lint clean (`black`, `ruff`, `mypy`)
-- [ ] Docs complete (`FEATURES/vision-analytics/docs/`)
+- [ ] Docs complete (`FEATURES/vision_analytics/docs/`)
 - [ ] Config-driven (no hardcoded thresholds)
 - [ ] Integration tests passing
 - [ ] Row added to `ACCEPTANCE_MATRIX.md` (sections 3.14, 3.15)

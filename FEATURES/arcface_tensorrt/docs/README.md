@@ -142,10 +142,10 @@ embedding:
 
 ```bash
 # Run unit tests (no TensorRT required)
-pytest FEATURES/arcface-tensorrt/tests/ -v
+pytest FEATURES/arcface_tensorrt/tests/ -v
 
 # Run full tests including TensorRT (requires GPU)
-pytest FEATURES/arcface-tensorrt/tests/ -v -m slow
+pytest FEATURES/arcface_tensorrt/tests/ -v -m slow
 ```
 
 ## Troubleshooting

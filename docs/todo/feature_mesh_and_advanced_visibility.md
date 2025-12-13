@@ -1,12 +1,12 @@
 # TODO: Face Mesh + Advanced Visibility Analytics
 
 Version: 1.0
-Status: IN_PROGRESS
+Status: PLANNED (docs/config only)
 Owner: Engineering
 Created: 2025-12-11
 TTL: 2026-01-10
 
-**Feature Sandbox:** `FEATURES/vision-analytics/`
+**Feature Sandbox:** `FEATURES/vision_analytics/` (docs-only today; `src/` not implemented yet)
 
 ---
 
@@ -45,7 +45,7 @@ pip install mediapipe>=0.10.0
 
 **Goal:** Extract 468-point face mesh on close-up faces.
 
-- [ ] **A1.** Create `FEATURES/vision-analytics/src/face_mesh.py`
+- [ ] **A1.** Create `FEATURES/vision_analytics/src/face_mesh.py`
   ```python
   class FaceMeshExtractor:
       """
@@ -126,7 +126,7 @@ pip install mediapipe>=0.10.0
       min_tracking: 0.5
   ```
 
-- [ ] **A5.** Write tests: `FEATURES/vision-analytics/tests/test_face_mesh.py`
+- [ ] **A5.** Write tests: `FEATURES/vision_analytics/tests/test_face_mesh.py`
   - Test mesh extraction on sample faces
   - Test selective execution logic
   - Test landmark subset extraction
@@ -142,7 +142,7 @@ pip install mediapipe>=0.10.0
 
 **Goal:** Compute what fraction of face is visible in frame.
 
-- [ ] **B1.** Create `FEATURES/vision-analytics/src/visibility.py`
+- [ ] **B1.** Create `FEATURES/vision_analytics/src/visibility.py`
   ```python
   def compute_visibility_fraction(
       mesh: FaceMeshResult,
@@ -207,7 +207,7 @@ pip install mediapipe>=0.10.0
   - Store mean, min, max visibility
   - Add to `tracks.jsonl` schema
 
-- [ ] **B5.** Write tests: `FEATURES/vision-analytics/tests/test_visibility.py`
+- [ ] **B5.** Write tests: `FEATURES/vision_analytics/tests/test_visibility.py`
   - Test visibility computation on known cases
   - Test regional breakdown accuracy
   - Test occlusion detection
@@ -223,7 +223,7 @@ pip install mediapipe>=0.10.0
 
 **Goal:** Estimate coarse gaze direction from face mesh.
 
-- [ ] **C1.** Create `FEATURES/vision-analytics/src/gaze.py`
+- [ ] **C1.** Create `FEATURES/vision_analytics/src/gaze.py`
   ```python
   class GazeEstimator:
       """
@@ -317,7 +317,7 @@ pip install mediapipe>=0.10.0
 
 **Goal:** Stub interface for CPU-friendly detector (future work).
 
-- [ ] **D1.** Create `FEATURES/vision-analytics/src/centerface.py`
+- [ ] **D1.** Create `FEATURES/vision_analytics/src/centerface.py`
   ```python
   class CenterFaceDetector:
       """

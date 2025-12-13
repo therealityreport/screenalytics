@@ -25,39 +25,36 @@ Use this skill to debug body tracking and face-body association issues.
 
 ## Key Skills
 
-### `track_persons_over_time()`
-Run body tracking pipeline on video.
+### Run body tracking pipeline
+
+Run the sandbox pipeline on an episode (writes artifacts under `data/manifests/{ep_id}/body_tracking/`).
 
 ```python
-from FEATURES.body_tracking.src.person_detector import YOLOPersonDetector
-from FEATURES.body_tracking.src.body_tracker import BodyTracker
+from pathlib import Path
 
-detector = YOLOPersonDetector()
-tracker = BodyTracker()
+from FEATURES.body_tracking.src.body_tracking_runner import BodyTrackingRunner
 
-for frame in video:
-    detections = detector.detect(frame)
-    tracks = tracker.update(detections)
+runner = BodyTrackingRunner(
+    episode_id="my-episode",
+    config_path=Path("config/pipeline/body_detection.yaml"),
+    fusion_config_path=Path("config/pipeline/track_fusion.yaml"),
+)
+runner.run_full_pipeline()
 ```
 
-### `associate_body_with_face_tracks()`
-Link face tracks with body tracks.
+### Fuse face ↔ body tracks
 
 ```python
 from FEATURES.body_tracking.src.track_fusion import TrackFusion
 
-fusion = TrackFusion(config)
-associations = fusion.associate(face_tracks, body_tracks)
+fusion = TrackFusion()
+identities = fusion.fuse_tracks(face_tracks=face_tracks, body_tracks=body_tracks)
 ```
 
-### `compute_body_visible_screen_time()`
-Calculate body-only screen time.
+### Compute body-only screentime deltas
 
-```python
-from FEATURES.body_tracking.src.screen_time import compute_body_screen_time
-
-result = compute_body_screen_time(identity, face_timeline, body_timeline)
-# Returns: {face_visible: 125.5, body_only: 45.2, total: 170.7}
+```bash
+python -m FEATURES.body_tracking --episode-id <EP_ID> --stage compare
 ```
 
 ## Config Reference
@@ -69,17 +66,19 @@ result = compute_body_screen_time(identity, face_timeline, body_timeline)
 | `body_tracking.enabled` | true | Enable body tracking |
 | `person_detection.model` | `yolov8n` | Detector model |
 | `person_detection.confidence_threshold` | 0.50 | Detection confidence |
+| `person_tracking.track_buffer` | 120 | Frames to keep lost tracks |
+| `person_reid.enabled` | true | Enable Re-ID embeddings |
 | `person_reid.model` | `osnet_x1_0` | Re-ID model |
-| `person_reid.embedding_dim` | 256 | Embedding size |
 
 **File:** `config/pipeline/track_fusion.yaml`
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `association_iou_thresh` | 0.50 | Face-body IoU threshold |
-| `reid_similarity_thresh` | 0.70 | Re-ID match threshold |
-| `max_gap_seconds` | 30 | Max time for Re-ID handoff |
-| `confidence_decay_rate` | 0.95 | Per-second confidence decay |
+| `track_fusion.enabled` | true | Enable fusion stage |
+| `iou_association.iou_threshold` | 0.50 | Face-in-body IoU threshold |
+| `reid_handoff.similarity_threshold` | 0.70 | Re-ID match threshold |
+| `reid_handoff.handoff.max_gap_seconds` | 30 | Max time for handoff |
+| `reid_handoff.handoff.confidence_decay_rate` | 0.95 | Per-second decay |
 
 ## Common Issues
 
@@ -166,9 +165,11 @@ person_tracking:
 
 | File | Purpose |
 |------|---------|
-| `FEATURES/body-tracking/src/person_detector.py` | YOLO detection |
-| `FEATURES/body-tracking/src/person_embedder.py` | OSNet Re-ID |
-| `FEATURES/body-tracking/src/track_fusion.py` | Face-body fusion |
+| `FEATURES/body_tracking/src/detect_bodies.py` | YOLO person detection |
+| `FEATURES/body_tracking/src/track_bodies.py` | Body tracking (ByteTrack + fallback) |
+| `FEATURES/body_tracking/src/body_embeddings.py` | OSNet Re-ID embeddings |
+| `FEATURES/body_tracking/src/track_fusion.py` | Face↔body fusion |
+| `FEATURES/body_tracking/src/screentime_compare.py` | Screentime comparison |
 | `config/pipeline/body_detection.yaml` | Detection config |
 | `config/pipeline/track_fusion.yaml` | Fusion config |
 

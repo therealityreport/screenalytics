@@ -209,7 +209,8 @@ A module is considered **Accepted** only when all associated checkpoints below a
 - [x] Unit tests for data structures and math utilities
 - [x] Alignment quality heuristic wired into pipeline (populates `alignment_quality` field)
 - [ ] Install `face-alignment` package and validate with real model
-- [ ] Integration with main pipeline (`tools/episode_run.py`)
+- [x] Main pipeline consumes `alignment_quality` for optional embedding gating (when `face_alignment/aligned_faces.jsonl` exists)
+- [ ] Auto-run face alignment in the main pipeline (requires promotion out of `FEATURES/`; CI blocks production imports from `FEATURES/**`)
 - [ ] Metrics validated on eval set
 
 **Tests:**
@@ -220,8 +221,8 @@ A module is considered **Accepted** only when all associated checkpoints below a
 - `config/pipeline/face_alignment.yaml`
 
 **Rollback Levers:**
-- `face_alignment.enabled: false` - Disable alignment
-- `face_alignment.aligner: insightface` - Revert to 5-point InsightFace
+- `config/pipeline/face_alignment.yaml` → `face_alignment.enabled: false` - Disable producing alignment artifacts
+- Disable embedding gating: `config/pipeline/embedding.yaml` → `face_alignment.enabled: false` (or set `min_alignment_quality: 0.0`)
 
 **Docs:**
 - [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
@@ -258,7 +259,7 @@ A module is considered **Accepted** only when all associated checkpoints below a
 - [x] Alignment quality heuristic (`FEATURES/face_alignment/src/alignment_quality.py`)
 - [x] `alignment_quality` field populated in pipeline
 - [x] Gating integrated in embedding stage (`_run_faces_embed_stage`)
-- [x] Config-driven threshold (`face_alignment.min_alignment_quality`)
+- [x] Config-driven threshold (`config/pipeline/embedding.yaml` → `face_alignment.min_alignment_quality`)
 - [x] Skip reason logging (`low_alignment_quality:{score}`)
 - [x] Eval harness gating mode (`--gating on`)
 - [ ] Gating impact validated on eval set (embedding jitter reduction)
@@ -279,7 +280,7 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 ```
 
 **Tests:**
-- `tests/ml/test_alignment_quality.py`
+- `tests/integration/test_face_alignment_pipeline.py`
 - `tools/experiments/tests/test_face_alignment_eval.py`
 
 **Config Dependencies:**
@@ -291,15 +292,9 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 
 **Feature Sandbox:** `FEATURES/face_alignment/`
 
-**Current State:** Quality estimation supports both LUVLi model-based and heuristic fallback modes. The system automatically falls back to heuristics when LUVLi is unavailable. Faces with `alignment_quality < threshold` are skipped before embedding with `skip_reason=low_alignment_quality`.
+**Current State:** `alignment_quality` is heuristic-based (see `FEATURES/face_alignment/src/alignment_quality.py`). LUVLi-style scaffolding exists, but a faithful LUVLi uncertainty/visibility model is not implemented yet; treat any per-landmark uncertainty/visibility fields as non-acceptance-grade until the model is integrated and validated.
 
-**LUVLi Integration:**
-- Quality source tracked via `alignment_quality_source` field ("luvli" | "heuristic")
-- Per-landmark uncertainty in `landmark_uncertainty_summary` (mean, p95)
-- Landmark visibility in `landmark_visibility_summary` (fraction)
-- Eval harness reports `alignment_quality_source_breakdown` with LUVLi/heuristic counts
-
-**Status:** ✅ LUVLi Integrated (pending eval validation)
+**Status:** ✅ Heuristic Gating Integrated (pending eval validation)
 
 ---
 
@@ -314,10 +309,10 @@ python -m tools.experiments.face_alignment_eval --episode-id ep1 --gating on
 | **Runtime (per face)** | ≤ 10ms (GPU) | > 20ms | Benchmark |
 
 **Tests:**
-- `tests/ml/test_3ddfa.py`
+- (None yet; feature not implemented)
 
 **Config Dependencies:**
-- `config/pipeline/alignment.yaml` (ddfa_v2 section)
+- `config/pipeline/face_alignment.yaml` (`head_pose_3d` section)
 
 **Docs:**
 - [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
@@ -511,7 +506,7 @@ embedding:
 
 **Tests:**
 - `FEATURES/arcface_tensorrt/tests/test_tensorrt_embedding.py`
-- `tests/ml/test_embedding_regression.py`
+- `tests/ml/test_arcface_embeddings.py` (ML-gated; baseline embedding invariants)
 
 **Config Dependencies:**
 - `config/pipeline/embedding.yaml`
@@ -537,8 +532,7 @@ embedding:
 | **selective_execution_savings** | ≥ 80% compute reduction | < 60% | Integration test |
 
 **Tests:**
-- `tests/ml/test_face_mesh.py`
-- `tests/ml/test_visibility.py`
+- (None yet; feature not implemented)
 
 **Config Dependencies:**
 - `config/pipeline/analytics.yaml`
@@ -563,10 +557,10 @@ embedding:
 | **runtime_gpu** | ≤ 10ms/frame | > 25ms | Benchmark |
 
 **Tests:**
-- `tests/ml/test_centerface.py`
+- (None yet; feature not implemented)
 
 **Config Dependencies:**
-- `config/pipeline/detection.yaml` (centerface section)
+- `config/pipeline/analytics.yaml` (centerface section)
 
 **Docs:**
 - [docs/todo/feature_mesh_and_advanced_visibility.md](docs/todo/feature_mesh_and_advanced_visibility.md)
@@ -650,8 +644,8 @@ embedding:
 
 | Module | Status | Blocker | Next Action |
 |--------|--------|---------|-------------|
-| **face_alignment** | ⚠ In Progress | FAN implementation in progress | Complete FAN 2D aligner |
-| **alignment_quality** | ✅ LUVLi Integrated | Pending eval validation | Run gating impact eval |
+| **face_alignment** | ✅ Scaffold Implemented | Not auto-run by main pipeline | Validate with real model + decide promotion/integration path |
+| **alignment_quality** | ✅ Heuristic Integrated | Pending eval validation | Run gating impact eval |
 | **head_pose_3d** | ⚠ Pending | Depends on face_alignment | Implement 3DDFA_V2 integration |
 | **body_tracking** | ✅ Implemented | Pending eval metrics | Run eval on validation episodes |
 | **person_reid** | ✅ Implemented | Pending eval metrics | Run Re-ID benchmark |

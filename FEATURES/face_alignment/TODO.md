@@ -221,9 +221,9 @@ def should_run_3d_pose(
 
 ## Promotion Checklist
 
-- [ ] Tests present and passing (`pytest FEATURES/face-alignment/tests/ -v`)
+- [ ] Tests present and passing (`pytest FEATURES/face_alignment/tests/ -v`)
 - [ ] Lint clean (`black`, `ruff`, `mypy`)
-- [ ] Docs complete (`FEATURES/face-alignment/docs/`)
+- [ ] Docs complete (`FEATURES/face_alignment/docs/`)
 - [ ] Config-driven (no hardcoded thresholds)
 - [ ] Integration tests passing
 - [ ] Row added to `ACCEPTANCE_MATRIX.md` (sections 3.7, 3.8, 3.9)
@@ -244,9 +244,7 @@ def should_run_3d_pose(
 
 ## Key Files
 
-- `src/fan_aligner.py` - FAN 2D/3D landmark extraction
-- `src/luvli_quality.py` - Alignment quality scoring
-- `src/ddfa_v2.py` - 3DDFA_V2 integration
-- `tests/test_fan_alignment.py` - Alignment tests
-- `tests/test_alignment_quality.py` - Quality gate tests
-- `tests/test_3ddfa.py` - 3D pose tests
+- `src/run_fan_alignment.py` - FAN landmark extraction + crop alignment
+- `src/alignment_quality.py` - Heuristic `alignment_quality` scoring
+- `src/run_luvli_quality.py` - LUVLi-style scaffolding (not true LUVLi yet)
+- `tests/test_face_alignment.py` - Unit + synthetic tests

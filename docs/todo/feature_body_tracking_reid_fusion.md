@@ -1,12 +1,12 @@
 # TODO: Body Tracking + Person Re-ID + Track Fusion
 
 Version: 1.0
-Status: IN_PROGRESS
+Status: IMPLEMENTED (sandbox)
 Owner: Engineering
 Created: 2025-12-11
 TTL: 2026-01-10
 
-**Feature Sandbox:** `FEATURES/body-tracking/`
+**Feature Sandbox:** `FEATURES/body_tracking/`
 
 ---
 
@@ -51,36 +51,25 @@ pip install torchreid>=1.4.0
 
 **Goal:** Detect all persons in frame, producing bounding boxes.
 
-- [ ] **A1.** Create `FEATURES/body-tracking/src/person_detector.py`
+- [x] **A1.** Implement YOLO person detection: `FEATURES/body_tracking/src/detect_bodies.py`
   ```python
-  class YOLOPersonDetector:
-      """
-      Detect persons using YOLOv8.
+  from FEATURES.body_tracking.src.detect_bodies import BodyDetector
 
-      Filters COCO detections to only "person" class (class_id=0).
-      """
-      def __init__(self, model_name: str = "yolov8n.pt", device: str = "auto"):
-          ...
-
-      def detect(self, frame: np.ndarray) -> List[PersonDetection]:
-          """
-          Returns list of PersonDetection with bbox, confidence.
-          """
+  detector = BodyDetector(model_name="yolov8n", device="auto")
+  detections = detector.detect_frame(frame, frame_idx=0, timestamp=0.0)
   ```
 
-- [ ] **A2.** Define `PersonDetection` dataclass
+- [x] **A2.** Define `BodyDetection` dataclass
   ```python
   @dataclass
-  class PersonDetection:
-      bbox_xyxy: Tuple[int, int, int, int]
-      confidence: float
+  class BodyDetection:
+      bbox: List[float]      # [x1, y1, x2, y2]
+      score: float
       frame_idx: int
       timestamp: float
-      # Optional: keypoints if using pose model
-      keypoints: Optional[np.ndarray] = None
   ```
 
-- [ ] **A3.** Create config: `config/pipeline/body_detection.yaml`
+- [x] **A3.** Create config: `config/pipeline/body_detection.yaml`
   ```yaml
   body_tracking:
     enabled: true
@@ -93,10 +82,8 @@ pip install torchreid>=1.4.0
     device: auto
   ```
 
-- [ ] **A4.** Write tests: `FEATURES/body-tracking/tests/test_person_detection.py`
-  - Test detection on sample frames
-  - Test confidence filtering
-  - Test COCO class filtering (only persons)
+- [x] **A4.** Write tests: `FEATURES/body_tracking/tests/test_body_tracking.py`
+  - Includes detection + filtering coverage (synthetic fixtures)
 
 **Acceptance Criteria (Phase A):**
 - [ ] Person recall: ≥90% on test frames
@@ -109,10 +96,8 @@ pip install torchreid>=1.4.0
 
 **Goal:** Track persons across frames, maintaining temporal consistency.
 
-- [ ] **B1.** Extend ByteTrack for body tracking
-  - Reuse existing `ByteTrackAdapter` from face tracking
-  - Create separate tracker instance for body tracks
-  - Maintain separate `body_track_id` namespace
+- [x] **B1.** Implement body tracking in `FEATURES/body_tracking/src/track_bodies.py`
+  - Track IDs are offset (default `100000+`) to avoid collisions with face IDs.
 
 - [ ] **B2.** Add body track management
   ```python
@@ -130,7 +115,7 @@ pip install torchreid>=1.4.0
           ...
   ```
 
-- [ ] **B3.** Define `BodyTrack` dataclass
+- [x] **B3.** Define `BodyTrack` dataclass
   ```python
   @dataclass
   class BodyTrack:
@@ -144,7 +129,7 @@ pip install torchreid>=1.4.0
       association_confidence: float = 0.0
   ```
 
-- [ ] **B4.** Update tracking config
+- [x] **B4.** Update tracking config
   ```yaml
   # config/pipeline/body_detection.yaml
   person_tracking:
@@ -154,7 +139,7 @@ pip install torchreid>=1.4.0
     track_buffer: 120           # Keep lost tracks 5 seconds
   ```
 
-- [ ] **B5.** Write tests: `FEATURES/body-tracking/tests/test_body_tracking.py`
+- [x] **B5.** Write tests: `FEATURES/body_tracking/tests/test_body_tracking.py`
   - Test track continuity across frames
   - Test track buffer behavior
   - Test ID consistency
@@ -170,29 +155,12 @@ pip install torchreid>=1.4.0
 
 **Goal:** Generate embeddings for body crops to enable re-identification.
 
-- [ ] **C1.** Create `FEATURES/body-tracking/src/person_embedder.py`
+- [x] **C1.** Implement OSNet embeddings via torchreid: `FEATURES/body_tracking/src/body_embeddings.py`
   ```python
-  class OSNetEmbedder:
-      """
-      Generate Re-ID embeddings using OSNet.
-
-      Default: osnet_x1_0 (256-d embeddings)
-      """
-      def __init__(self, model_name: str = "osnet_x1_0", device: str = "auto"):
-          self.model = torchreid.models.build_model(
-              name=model_name,
-              num_classes=1,  # Feature extraction only
-              pretrained=True
-          )
-
-      def encode(self, crops: List[np.ndarray]) -> np.ndarray:
-          """
-          Input: List of body crops (BGR, any size)
-          Output: (N, 256) normalized embeddings
-          """
+  # See: FEATURES/body_tracking/src/body_embeddings.py (BodyEmbedder)
   ```
 
-- [ ] **C2.** Implement body crop extraction
+- [x] **C2.** Implement body crop extraction
   ```python
   def extract_body_crop(frame: np.ndarray, bbox: Tuple, config: CropConfig) -> np.ndarray:
       """
@@ -204,12 +172,12 @@ pip install torchreid>=1.4.0
       """
   ```
 
-- [ ] **C3.** Add quality gating for body crops
+- [x] **C3.** Add quality gating for body crops
   - Check minimum size (width, height)
   - Check occlusion ratio (if keypoints available)
   - Check aspect ratio validity
 
-- [ ] **C4.** Update config for Re-ID
+- [x] **C4.** Update config for Re-ID
   ```yaml
   # config/pipeline/body_detection.yaml
   person_reid:
@@ -227,7 +195,7 @@ pip install torchreid>=1.4.0
     backend: torchreid          # torchreid | custom
   ```
 
-- [ ] **C5.** Write tests: `FEATURES/body-tracking/tests/test_person_reid.py`
+- [x] **C5.** Write tests: `FEATURES/body_tracking/tests/test_body_tracking.py`
   - Test embedding generation
   - Test embedding normalization (L2 norm = 1)
   - Test same-person similarity > different-person similarity
@@ -243,7 +211,7 @@ pip install torchreid>=1.4.0
 
 **Goal:** Link face tracks with body tracks to create unified identities.
 
-- [ ] **D1.** Create `FEATURES/body-tracking/src/track_fusion.py`
+- [x] **D1.** Implement face↔body fusion: `FEATURES/body_tracking/src/track_fusion.py`
   ```python
   class TrackFusion:
       """
@@ -316,7 +284,7 @@ pip install torchreid>=1.4.0
       motion_consistency_weight: 0.30   # Use motion for disambiguation
   ```
 
-- [ ] **D6.** Write tests: `FEATURES/body-tracking/tests/test_track_fusion.py`
+- [x] **D6.** Write tests: `FEATURES/body_tracking/tests/test_body_tracking.py`
   - Test IoU association on synthetic data
   - Test Re-ID handoff when face disappears
   - Test ambiguity resolution
@@ -407,7 +375,7 @@ pip install torchreid>=1.4.0
 
 ### Testing Integration
 
-- [ ] Move tests from `FEATURES/body-tracking/tests/` to `tests/ml/`
+- [ ] Move tests from `FEATURES/body_tracking/tests/` to `tests/ml/` (only if promoting to production)
 - [ ] Add body tracking benchmarks to CI
 - [ ] Create annotated test videos with ground truth
 

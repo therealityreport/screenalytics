@@ -5,7 +5,7 @@ description: Advanced visibility analysis using head pose, face mesh, and tempor
 
 # Vision Analytics Skill
 
-Use this skill for advanced visibility metrics and analytics.
+Use this skill for planned advanced visibility metrics and analytics (mesh/visibility/gaze). As of 2025-12-13 this is docs/config scaffolding only.
 
 ## When to Use
 
@@ -23,32 +23,26 @@ Use this skill for advanced visibility metrics and analytics.
 
 ## Key Skills
 
-### `compute_visibility_labels()`
-Compute per-frame visibility metrics.
+### `compute_visibility_labels()` (planned)
+Compute per-frame visibility metrics (not implemented yet).
 
 ```python
-from FEATURES.vision_analytics.src.visibility import compute_visibility
+# Planned module: FEATURES/vision_analytics/src/visibility.py
+# from FEATURES.vision_analytics.src.visibility import compute_visibility
 
-result = compute_visibility(
-    mesh=face_mesh_result,
-    face_bbox=bbox,
-    frame_shape=(1080, 1920)
-)
-# Returns: VisibilityResult with overall and regional breakdown
+# Planned API:
+# result = compute_visibility(mesh=face_mesh_result, face_bbox=bbox, frame_shape=(1080, 1920))
 ```
 
-### `generate_screen_time_breakdown()`
-Generate face vs body timeline for an identity.
+### `generate_screen_time_breakdown()` (planned)
+Generate face vs body timeline for an identity (not implemented yet).
 
 ```python
-from FEATURES.vision_analytics.src.timeline import generate_screen_time_breakdown
+# Planned module: FEATURES/vision_analytics/src/timeline.py
+# from FEATURES.vision_analytics.src.timeline import generate_screen_time_breakdown
 
-breakdown = generate_screen_time_breakdown(
-    identity=identity,
-    face_segments=face_timeline,
-    body_segments=body_timeline
-)
-# Returns: {frontal: 0.65, profile: 0.25, body_only: 0.10}
+# Planned API:
+# breakdown = generate_screen_time_breakdown(identity=identity, face_segments=face_timeline, body_segments=body_timeline)
 ```
 
 ## Config Reference
@@ -57,7 +51,7 @@ breakdown = generate_screen_time_breakdown(
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `face_mesh.enabled` | true | Enable mesh extraction |
+| `face_mesh.enabled` | true | Enable mesh extraction (planned; no runnable implementation yet) |
 | `face_mesh.execution.closeup_threshold` | 0.05 | Face area / frame area |
 | `face_mesh.execution.sample_rate` | 30 | Every Nth frame |
 | `gaze.enabled` | true | Enable gaze estimation |
@@ -181,12 +175,10 @@ face_mesh:
 
 | File | Purpose |
 |------|---------|
-| `FEATURES/vision-analytics/src/face_mesh.py` | MediaPipe mesh |
-| `FEATURES/vision-analytics/src/visibility.py` | Visibility fraction |
-| `FEATURES/vision-analytics/src/gaze.py` | Gaze estimation |
+| `FEATURES/vision_analytics/docs/README.md` | Feature notes (planned) |
+| `FEATURES/vision_analytics/TODO.md` | Sandbox TODO (planned) |
 | `config/pipeline/analytics.yaml` | Configuration |
-| `tests/ml/test_face_mesh.py` | Mesh tests |
-| `tests/ml/test_visibility.py` | Visibility tests |
+| `docs/todo/feature_mesh_and_advanced_visibility.md` | Implementation plan + QA checklist |
 
 ## Related Skills
 

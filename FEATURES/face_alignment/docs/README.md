@@ -232,10 +232,10 @@ runner.run_full_pipeline(video_path)
 
 ```bash
 # Run unit tests
-pytest FEATURES/face-alignment/tests/ -v
+pytest FEATURES/face_alignment/tests/ -v
 
 # Run with coverage
-pytest FEATURES/face-alignment/tests/ --cov=FEATURES.face_alignment
+pytest FEATURES/face_alignment/tests/ --cov=FEATURES.face_alignment
 ```
 
 ## Rollback

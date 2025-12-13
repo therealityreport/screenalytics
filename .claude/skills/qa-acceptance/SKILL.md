@@ -17,34 +17,38 @@ Use this skill to validate features against acceptance criteria.
 
 ## Key Skills
 
-### `run_acceptance_checks(feature_name)`
-Validate a feature against its acceptance criteria.
+### Run smoke validation against `ACCEPTANCE_MATRIX.md`
 
-```python
-from tools.acceptance_check import run_acceptance_checks
+Use the smoke runner to validate required artifacts + basic invariants (and optionally fail if anything is skipped).
 
-result = run_acceptance_checks(
-    feature_name="face_alignment",
-    episode_id="test-episode-001"
-)
+```bash
+# Minimal (will mark missing prereqs as skipped)
+python -m tools.smoke.smoke_run --episode-id <EP_ID> --max-frames 300
 
-print(f"Status: {result.status}")  # PASS, WARN, FAIL
-for check in result.checks:
-    print(f"  {check.metric}: {check.value} ({check.status})")
+# Strict (fails if any requested stage is skipped/failed)
+python -m tools.smoke.smoke_run --episode-id <EP_ID> --max-frames 300 --strict
+
+# Include body-tracking artifact checks (requires you ran FEATURES.body_tracking separately)
+python -m tools.smoke.smoke_run --episode-id <EP_ID> --body-tracking --strict
 ```
 
-### `summarize_regressions_and_passes()`
-Generate a summary report of all acceptance checks.
+### Run targeted pytest checks
 
-```python
-from tools.acceptance_check import summarize_acceptance
+```bash
+# Face alignment sandbox
+pytest FEATURES/face_alignment/tests/test_face_alignment.py -v
 
-report = summarize_acceptance(
-    features=["face_alignment", "body_tracking", "tensorrt_embedding"],
-    episode_id="test-episode-001"
-)
+# Face alignment integration helpers
+pytest tests/integration/test_face_alignment_pipeline.py -v
 
-print(report.to_markdown())
+# Body tracking sandbox
+pytest FEATURES/body_tracking/tests/test_body_tracking.py -v
+
+# TensorRT embedding sandbox
+pytest FEATURES/arcface_tensorrt/tests/test_tensorrt_embedding.py -v
+
+# ML-gated pipeline embedding invariants (requires RUN_ML_TESTS=1)
+RUN_ML_TESTS=1 pytest tests/ml/test_arcface_embeddings.py -v
 ```
 
 ## Acceptance Workflow
@@ -100,21 +104,22 @@ print(report.to_markdown())
 | `association_accuracy` | >= 95% | < 90% |
 | `screen_time_gap_reduction` | >= 30% | < 15% |
 
-### TensorRT Embedding (3.13)
+### TensorRT Embedding (3.14)
 
 | Metric | Target | Warning |
 |--------|--------|---------|
 | `speedup_vs_pytorch` | >= 5x | < 3x |
-| `embedding_cosine_drift` | >= 0.999 | < 0.995 |
+| `cosine_sim_mean` | >= 0.995 | < 0.990 |
+| `cosine_sim_min` | >= 0.990 | < 0.980 |
 
-### Face Mesh (3.14)
+### Face Mesh (3.15)
 
 | Metric | Target | Warning |
 |--------|--------|---------|
 | `mesh_stability_px` | < 3.0 | > 6.0 |
 | `visibility_fraction_accuracy` | >= 90% | < 80% |
 
-### CenterFace (3.15)
+### CenterFace (3.16)
 
 | Metric | Target | Warning |
 |--------|--------|---------|
@@ -140,9 +145,8 @@ print(report.to_markdown())
 
 ## Tests
 
-- [x] test_fan_alignment.py - PASSED
-- [x] test_alignment_quality.py - PASSED
-- [x] test_3ddfa.py - PASSED
+- [x] FEATURES/face_alignment/tests/test_face_alignment.py - PASSED
+- [x] tests/integration/test_face_alignment_pipeline.py - PASSED
 
 ## Notes
 
@@ -154,12 +158,9 @@ All acceptance criteria met. Ready for promotion.
 Add to GitHub Actions:
 
 ```yaml
-- name: Run Acceptance Checks
+- name: Smoke (fast)
   run: |
-    python tools/acceptance_check.py \
-      --feature face_alignment \
-      --episode test-episode-001 \
-      --output acceptance_report.md
+    python -m tools.smoke.smoke_run --episode-id $EP_ID --max-frames 300 --strict
 ```
 
 ## Key Files
@@ -167,8 +168,8 @@ Add to GitHub Actions:
 | File | Purpose |
 |------|---------|
 | `ACCEPTANCE_MATRIX.md` | Acceptance criteria |
-| `tools/acceptance_check.py` | CLI tool |
-| `tests/ml/` | Feature tests |
+| `tools/smoke/smoke_run.py` | Smoke runner (artifact checks + invariants) |
+| `tests/ml/` | ML-gated integration tests |
 | `tests/integration/` | Integration tests |
 
 ## Related Skills

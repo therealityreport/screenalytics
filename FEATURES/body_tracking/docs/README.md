@@ -210,10 +210,10 @@ pyyaml
 
 ```bash
 # Unit tests (no ML dependencies required)
-pytest FEATURES/body-tracking/tests/test_body_tracking.py -v
+pytest FEATURES/body_tracking/tests/test_body_tracking.py -v
 
 # Skip tests requiring ultralytics/torchreid
-pytest FEATURES/body-tracking/tests/ -v -k "not integration"
+pytest FEATURES/body_tracking/tests/ -v -k "not integration"
 ```
 
 ## Related Documentation
