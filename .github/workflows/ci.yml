@@ -41,23 +41,23 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          pip install pytest pytest-cov pyyaml numpy
+          pip install pytest pytest-cov pyyaml numpy opencv-python-headless
 
       - name: Run face_alignment tests
         run: |
-          pytest FEATURES/face_alignment/tests/ -v --tb=short || true
+          pytest FEATURES/face_alignment/tests/ -v --tb=short -m "not slow"
 
       - name: Run body_tracking tests
         run: |
-          pytest FEATURES/body_tracking/tests/ -v --tb=short || true
+          pytest FEATURES/body_tracking/tests/ -v --tb=short -m "not slow"
 
       - name: Run arcface_tensorrt tests
         run: |
-          pytest FEATURES/arcface_tensorrt/tests/ -v --tb=short || true
+          pytest FEATURES/arcface_tensorrt/tests/ -v --tb=short -m "not slow"
 
       - name: Run eval harness tests
         run: |
-          pytest tools/experiments/tests/ -v --tb=short || true
+          pytest tools/experiments/tests/ -v --tb=short -m "not slow"
 
   smoke-dry-run:
     runs-on: ubuntu-latest

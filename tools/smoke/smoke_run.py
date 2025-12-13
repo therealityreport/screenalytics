@@ -154,13 +154,30 @@ class SmokeRunner:
     def _run_stages(self):
         """Run actual pipeline stages."""
         self._run_stage_detect_track()
+
+        # Face alignment stage (optional)
         if self.alignment:
             self._run_stage_alignment()
+        else:
+            self.report.stages.append(StageResult(
+                name="face_alignment",
+                status="skipped_by_flag",
+                reason="Disabled via --alignment off",
+            ))
+
         self._run_stage_embeddings()
         self._run_stage_clustering()
         self._run_stage_screentime()
+
+        # Body tracking stage (optional)
         if self.body_tracking:
             self._run_stage_body_tracking()
+        else:
+            self.report.stages.append(StageResult(
+                name="body_tracking",
+                status="skipped_by_flag",
+                reason="Disabled (pass --body-tracking to enable)",
+            ))
 
     def _run_stage_detect_track(self):
         """Run face detection and tracking stage."""
@@ -419,14 +436,22 @@ class SmokeRunner:
         """Validate screentime output structure and values.
 
         Returns list of validation error messages (empty if valid).
+
+        Schema notes:
+        - 'both_s' is reserved/legacy and currently not computed (always 0.0)
+        - Body metrics are only validated when body_tracking_enabled AND body_metrics_available
         """
         errors = []
+
+        # Check required top-level keys
+        for key in ["episode_id", "generated_at", "metrics", "metadata"]:
+            if key not in screentime:
+                errors.append(f"Missing required key: {key}")
 
         # Check for metrics array
         metrics = screentime.get("metrics")
         if metrics is None:
-            errors.append("Missing 'metrics' field")
-            return errors
+            return errors  # Can't continue validation without metrics
 
         # Check for non-empty identities when we expect them
         diagnostics = screentime.get("diagnostics", {})
@@ -434,15 +459,41 @@ class SmokeRunner:
         if tracks_loaded > 0 and len(metrics) == 0:
             errors.append(f"No cast metrics but {tracks_loaded} tracks loaded")
 
+        # Validate metadata fields
+        metadata = screentime.get("metadata", {})
+        body_tracking_enabled = metadata.get("body_tracking_enabled", False)
+        body_metrics_available = metadata.get("body_metrics_available", False)
+
         # Validate individual metrics
         for i, m in enumerate(metrics):
             name = m.get("name", f"metric_{i}")
+
+            # Required fields: name, face_visible_seconds OR visual_s, confidence
+            if "name" not in m:
+                errors.append(f"metric_{i}: missing 'name' field")
+            if "face_visible_seconds" not in m and "visual_s" not in m:
+                errors.append(f"{name}: missing face_visible_seconds/visual_s")
+            if "confidence" not in m:
+                errors.append(f"{name}: missing 'confidence' field")
 
             # Check for non-negative values
             face_visible = m.get("face_visible_seconds", m.get("visual_s", 0))
             if face_visible is not None and face_visible < 0:
                 errors.append(f"{name}: negative face_visible_seconds ({face_visible})")
 
+            speaking_s = m.get("speaking_s", 0)
+            if speaking_s is not None and speaking_s < 0:
+                errors.append(f"{name}: negative speaking_s ({speaking_s})")
+
+            # Note: both_s is reserved/legacy and may be 0.0 - not validated
+
+            # Body fields: only validate if body tracking ran AND metrics available
+            if body_tracking_enabled and body_metrics_available:
+                for field in ["body_visible_seconds", "body_only_seconds"]:
+                    if field not in m or m[field] is None:
+                        errors.append(f"{name}: body tracking enabled but {field} missing")
+
+            # Validate body metrics are non-negative when present
             body_visible = m.get("body_visible_seconds")
             if body_visible is not None and body_visible < 0:
                 errors.append(f"{name}: negative body_visible_seconds ({body_visible})")
@@ -450,6 +501,11 @@ class SmokeRunner:
             body_only = m.get("body_only_seconds")
             if body_only is not None and body_only < 0:
                 errors.append(f"{name}: negative body_only_seconds ({body_only})")
+
+            # Check gap_bridged_seconds is non-negative if present
+            gap_bridged = m.get("gap_bridged_seconds")
+            if gap_bridged is not None and gap_bridged < 0:
+                errors.append(f"{name}: negative gap_bridged_seconds ({gap_bridged})")
 
             # Check confidence is in valid range
             confidence = m.get("confidence", 0)
@@ -529,6 +585,9 @@ def main():
     parser.add_argument("--alignment-gating", choices=["off", "on"], default="on")
     parser.add_argument("--body-tracking", action="store_true", default=False)
     parser.add_argument("--dry-run", action="store_true", help="Validate config only")
+    parser.add_argument("--strict", action="store_true",
+        help="Fail if any requested stage has skipped_missing_prereq or failed status")
+    parser.add_argument("--skip-ui", action="store_true", help="Skip UI-related stages")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -549,6 +608,25 @@ def main():
     )
 
     success = runner.run()
+
+    # Strict mode enforcement: fail on any non-success status except skipped_by_flag
+    strict_failures = []
+    if args.strict:
+        for stage in runner.report.stages:
+            # skipped_by_flag is OK (stage was explicitly disabled)
+            if stage.status == "skipped_by_flag":
+                continue
+            # Any other non-success status fails strict mode
+            if stage.status != "success":
+                strict_failures.append(
+                    f"  - {stage.name}: {stage.status} ({stage.reason or 'no reason'})"
+                )
+
+    if strict_failures:
+        logger.error("[STRICT] The following stages did not succeed:")
+        for failure in strict_failures:
+            logger.error(failure)
+        success = False
 
     print(f"\nStatus: {'PASS' if success else 'FAIL'}")
     print(f"Duration: {runner.report.total_duration_seconds:.2f}s")
