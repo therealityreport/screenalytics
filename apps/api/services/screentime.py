@@ -768,11 +768,19 @@ class ScreenTimeAnalyzer:
         return mapping
 
     def _load_cast_members(self, show_id: str) -> List[Dict[str, Any]]:
-        """Load cast members for a show."""
-        from apps.api.services.cast import CastService
-        cast_service = CastService()
+        """Load cast members for a show.
+
+        This method is optional-dependency safe: if CastService is unavailable
+        (e.g., in CI/test contexts), it gracefully returns an empty list and
+        the analyzer continues with best-effort name resolution from people.json.
+        """
         try:
+            from apps.api.services.cast import CastService
+            cast_service = CastService()
             return cast_service.list_cast(show_id)
+        except ImportError as e:
+            LOGGER.debug(f"[screentime] CastService not available (import failed): {e}")
+            return []
         except Exception as e:
             LOGGER.warning(f"[screentime] Could not load cast members for {show_id}: {e}")
             return []

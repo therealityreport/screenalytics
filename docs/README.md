@@ -1,6 +1,7 @@
 # Screenalytics Documentation
 
-This repository’s canonical documentation lives under `docs/`.
+> **This is the authoritative documentation entry point.** All canonical docs live under `docs/`.
+> Archived/superseded docs are kept in `docs/_archive/` for historical reference only.
 
 ## Start Here
 

@@ -80,27 +80,47 @@ It represents additional visible time gained when bodies are used to bridge face
 
 ## 3) New Models and Where They Plug In
 
-### 3.1 Face Detection and Tracking
+This section helps developers understand where pipeline outputs connect to screentime analysis.
+
+### 3.1 Implementation Entry Points
+
+| Component | Location |
+|-----------|----------|
+| **Screentime analyzer** | `apps/api/services/screentime.py` → `ScreenTimeAnalyzer.analyze_episode()` |
+| **API endpoint** | `apps/api/routers/episodes.py` → `POST /episodes/{ep_id}/screentime/analyze` |
+| **Celery task** | `apps/api/tasks.py` → `task_analyze_screentime` |
+| **Config presets** | `config/pipeline/screen_time_v2.yaml` |
+
+### 3.2 Face Detection and Tracking
 - **Detection:** RetinaFace (`config/pipeline/detection.yaml`)
 - **Tracking:** ByteTrack (`config/pipeline/tracking.yaml`)
+- **Artifacts consumed:** `faces.jsonl`, `tracks.jsonl`
 
 These artifacts drive face visibility aggregation and identity formation.
 
-### 3.2 Face Alignment + Embeddings
+### 3.3 Face Alignment + Embeddings
 - **Alignment (optional):** `config/pipeline/face_alignment.yaml` (feature sandbox: `FEATURES/face_alignment/`)
 - **Embeddings:** ArcFace 512-d (`config/pipeline/embedding.yaml`)
   - Optional TensorRT backend configured via `config/pipeline/arcface_tensorrt.yaml`
+- **Artifacts consumed:** `faces.jsonl` (quality scores from alignment)
 
 Alignment quality can be used as a gating signal before embedding (`embedding.yaml: face_alignment.*`).
 
-### 3.3 Body Tracking (Optional)
+### 3.4 Identity and Cast Mapping
+- **Artifacts consumed:** `identities.json`, `data/shows/{SHOW_ID}/people.json`
+- **Services:** `apps/api/services/people.py`, `apps/api/services/cast.py`
+
+The analyzer builds a mapping chain: `track_id` → `identity_id` → `person_id` → `cast_id`.
+
+### 3.5 Body Tracking (Optional)
 Body tracking can supplement face-only visibility:
 - Config: `config/pipeline/body_detection.yaml`, `config/pipeline/track_fusion.yaml`
-- Feature sandbox entrypoint: `python -m FEATURES.body_tracking` (see `FEATURES/body-tracking/`)
+- Feature sandbox entrypoint: `python -m FEATURES.body_tracking` (see `FEATURES/body_tracking/`)
+- **Artifacts consumed:** `body_tracking/screentime_comparison.json`
 
 Outputs used by screentime are summarized in `body_tracking/screentime_comparison.json`.
 
-### 3.4 Audio Pipeline (Optional)
+### 3.6 Audio Pipeline (Optional)
 Speaking time requires:
 - `episode_transcript.jsonl`: speaker-labeled transcript rows
 - `audio_voice_mapping.json`: voice_cluster → voice bank match results
