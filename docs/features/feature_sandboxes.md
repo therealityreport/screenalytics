@@ -1,4 +1,4 @@
-# FEATURES_GUIDE.md — Screenalytics
+# Feature Sandboxes — Screenalytics
 
 Version: 2.0
 Last Updated: 2025-11-18
@@ -282,9 +282,9 @@ If `tools/promote-feature.py` fails:
 
 ## References
 
-- **[Directory Structure](docs/architecture/directory_structure.md)** — Full promotion workflow
-- **[ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md)** — Quality gates and acceptance criteria
-- **[Pipeline Overview](docs/pipeline/overview.md)** — How features integrate into pipeline
+- **[Directory Structure](../architecture/directory_structure.md)** — Full promotion workflow
+- **[ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md)** — Quality gates and acceptance criteria
+- **[Pipeline Overview](../pipeline/overview.md)** — How features integrate into pipeline
 
 ---
 
@@ -338,9 +338,9 @@ pytest FEATURES/body_tracking/tests/ -v
 ```
 
 **Docs:**
-- [FEATURES/body_tracking/docs/README.md](FEATURES/body_tracking/docs/README.md)
-- [FEATURES/body_tracking/TODO.md](FEATURES/body_tracking/TODO.md)
-- [docs/todo/feature_body_tracking_reid_fusion.md](docs/todo/feature_body_tracking_reid_fusion.md)
+- [FEATURES/body_tracking/docs/README.md](../../FEATURES/body_tracking/docs/README.md)
+- [FEATURES/body_tracking/TODO.md](../../FEATURES/body_tracking/TODO.md)
+- [docs/todo/feature_body_tracking_reid_fusion.md](../todo/feature_body_tracking_reid_fusion.md)
 
 **Acceptance Matrix:** Sections 3.10-3.12
 

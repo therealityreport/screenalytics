@@ -19,15 +19,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install ruff pyright
+          pip install ruff
 
       - name: Lint with ruff
         run: |
-          ruff check --select=E9,F63,F7,F82 --target-version=py311 . || true
+          ruff check --select=E9,F63,F7,F82 --target-version=py311 .
 
-      - name: Type check critical modules
+      - name: Compile critical modules
         run: |
-          pyright apps/api/routers/*.py --pythonversion 3.11 || true
+          python -m py_compile apps/api/main.py apps/api/routers/*.py apps/api/services/*.py apps/api/tasks.py
 
   unit-tests:
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          pip install pytest pytest-cov pyyaml numpy opencv-python-headless
+          pip install pytest pytest-cov pyyaml numpy opencv-python-headless fastapi httpx requests pillow
 
       - name: Run face_alignment tests
         run: |
@@ -58,6 +58,15 @@ jobs:
       - name: Run eval harness tests
         run: |
           pytest tools/experiments/tests/ -v --tb=short -m "not slow"
+
+      - name: Run core unit tests
+        run: |
+          pytest -q \
+            tests/unit/test_profiles_config_resolution.py \
+            tests/api/test_episode_status.py \
+            tests/api/test_screentime.py \
+            tests/ml/test_sse_progress.py \
+            --tb=short -m "not slow"
 
   smoke-dry-run:
     runs-on: ubuntu-latest

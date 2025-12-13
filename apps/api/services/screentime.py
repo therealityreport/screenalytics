@@ -493,10 +493,17 @@ class ScreenTimeAnalyzer:
         Returns empty list if transcript doesn't exist (audio pipeline not run).
         """
         data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-        transcript_path = data_root / "manifests" / ep_id / "transcript.jsonl"
+        ep_dir = data_root / "manifests" / ep_id
+        transcript_path = ep_dir / "episode_transcript.jsonl"
+        legacy_transcript_path = ep_dir / "transcript.jsonl"
+
+        # Prefer the current audio pipeline output, but keep legacy fallback
+        # for older episodes and backfills.
+        if not transcript_path.exists():
+            transcript_path = legacy_transcript_path
 
         if not transcript_path.exists():
-            LOGGER.debug(f"[screentime] No transcript found: {transcript_path}")
+            LOGGER.debug("[screentime] No transcript found: %s", transcript_path)
             return []
 
         rows = []
@@ -516,26 +523,127 @@ class ScreenTimeAnalyzer:
         Returns empty dict if voice mapping doesn't exist.
         """
         data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-        mapping_path = data_root / "manifests" / ep_id / "voice_bank_mapping.json"
+        ep_dir = data_root / "manifests" / ep_id
+        mapping_path = ep_dir / "audio_voice_mapping.json"
+        legacy_mapping_path = ep_dir / "voice_bank_mapping.json"
+
+        # Prefer the current audio pipeline output, but keep legacy fallback
+        # for older episodes and backfills.
+        if not mapping_path.exists():
+            mapping_path = legacy_mapping_path
 
         if not mapping_path.exists():
-            LOGGER.debug(f"[screentime] No voice mapping found: {mapping_path}")
+            LOGGER.debug("[screentime] No voice mapping found: %s", mapping_path)
             return {}
 
         try:
             with mapping_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Build voice_cluster_id -> cast_id mapping
-            mapping = {}
-            for entry in data.get("mappings", []):
-                voice_cluster_id = entry.get("voice_cluster_id")
-                cast_id = entry.get("cast_id")
-                if voice_cluster_id and cast_id:
-                    mapping[voice_cluster_id] = cast_id
-            return mapping
+
+            # Current format: list[VoiceBankMatchResult] (audio_voice_mapping.json)
+            if isinstance(data, list):
+                show_id = self._parse_show_id(ep_id)
+                voice_bank_lookup = self._load_voice_bank_cast_lookup(data_root, show_id)
+
+                mapping: Dict[str, str] = {}
+                for entry in data:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    voice_cluster_id = entry.get("voice_cluster_id")
+                    if not voice_cluster_id:
+                        continue
+
+                    voice_bank_id = entry.get("voice_bank_id")
+                    speaker_id = entry.get("speaker_id")
+
+                    cast_id: str | None = None
+                    if voice_bank_id and voice_bank_id in voice_bank_lookup:
+                        cast_id = voice_bank_lookup[voice_bank_id]
+                    elif isinstance(speaker_id, str):
+                        cast_id = self._cast_id_from_speaker_id(speaker_id)
+                    if not cast_id and isinstance(voice_bank_id, str):
+                        cast_id = self._cast_id_from_voice_bank_id(voice_bank_id)
+
+                    if cast_id:
+                        mapping[voice_cluster_id] = cast_id
+
+                return mapping
+
+            # Legacy format: {"mappings": [{"voice_cluster_id": "...", "cast_id": "..."}]}
+            if isinstance(data, dict):
+                mapping: Dict[str, str] = {}
+                for entry in data.get("mappings", []):
+                    voice_cluster_id = entry.get("voice_cluster_id")
+                    cast_id = entry.get("cast_id")
+                    if voice_cluster_id and cast_id:
+                        mapping[voice_cluster_id] = str(cast_id)
+                return mapping
+
+            LOGGER.warning("[screentime] Unexpected voice mapping format: %s", type(data).__name__)
+            return {}
         except (json.JSONDecodeError, KeyError) as e:
             LOGGER.warning(f"[screentime] Error loading voice mapping: {e}")
             return {}
+
+    @staticmethod
+    def _parse_show_id(ep_id: str) -> str:
+        """Parse show_id from ep_id (e.g., rhobh-s05e17 -> RHOBH)."""
+        parts = ep_id.split("-")
+        return parts[0].upper() if parts else ep_id.upper()
+
+    @staticmethod
+    def _cast_id_from_speaker_id(speaker_id: str) -> str | None:
+        """Best-effort cast_id extraction from speaker_id (e.g., SPK_<CAST_ID>)."""
+        if not speaker_id.startswith("SPK_"):
+            return None
+        raw = speaker_id.removeprefix("SPK_").strip()
+        if not raw:
+            return None
+        if raw.upper().startswith("UNLABELED"):
+            return None
+        return raw.lower()
+
+    @staticmethod
+    def _cast_id_from_voice_bank_id(voice_bank_id: str) -> str | None:
+        """Best-effort cast_id extraction from voice_bank_id (e.g., voice_<cast_id>)."""
+        vb = voice_bank_id.strip()
+        if not vb:
+            return None
+        vb_lower = vb.lower()
+        if not vb_lower.startswith("voice_"):
+            return None
+        if vb_lower.startswith("voice_unlabeled"):
+            return None
+        return vb_lower.removeprefix("voice_")
+
+    @staticmethod
+    def _load_voice_bank_cast_lookup(data_root: Path, show_id: str) -> Dict[str, str]:
+        """Load voice_bank_id -> cast_id from the show voice bank, if present."""
+        voice_bank_path = data_root / "voice_bank" / f"{show_id.lower()}.json"
+        if not voice_bank_path.exists():
+            return {}
+
+        try:
+            with voice_bank_path.open("r", encoding="utf-8") as f:
+                entries = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning("[screentime] Failed to load voice bank %s: %s", voice_bank_path, exc)
+            return {}
+
+        if not isinstance(entries, list):
+            return {}
+
+        lookup: Dict[str, str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            voice_bank_id = entry.get("voice_bank_id")
+            cast_id = entry.get("cast_id")
+            if not voice_bank_id or not cast_id:
+                continue
+            lookup[str(voice_bank_id)] = str(cast_id).lower()
+        return lookup
 
     def _compute_speaking_time(
         self,

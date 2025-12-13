@@ -4,11 +4,16 @@ TensorRT Inference for ArcFace Embeddings.
 Runs face embedding inference using TensorRT-accelerated ArcFace model.
 """
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .tensorrt_builder import TensorRTConfig
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +30,7 @@ class TensorRTArcFace:
     def __init__(
         self,
         engine_path: Optional[Path] = None,
-        config: Optional["TensorRTConfig"] = None,
+        config: TensorRTConfig | None = None,
     ):
         """
         Initialize TensorRT ArcFace embedder.

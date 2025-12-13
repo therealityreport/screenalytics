@@ -89,7 +89,7 @@ FACES_REVIEW_GUIDE_URL = os.environ.get(
 )
 FACES_REVIEW_GUIDE_FALLBACK = os.environ.get(
     "SCREENALYTICS_FACES_REVIEW_GUIDE_FALLBACK",
-    "https://github.com/therealityreport/screenalytics/blob/nov-24/docs/ops/faces_review_guide.md",
+    "https://github.com/therealityreport/screenalytics/blob/main/docs/ops/faces_review_guide.md",
 )
 
 

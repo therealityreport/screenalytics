@@ -9,9 +9,10 @@ Screenalytics ingests an episode, detects and tracks faces, recognizes cast memb
 ## Quick Links
 
 **Architecture & Design**
-- [Solution Architecture](SOLUTION_ARCHITECTURE.md) → [Full Details](docs/architecture/solution_architecture.md)
-- [Directory Structure](DIRECTORY_STRUCTURE.md) → [Full Details](docs/architecture/directory_structure.md)
-- [Configuration Guide](CONFIG_GUIDE.md) → [Full Reference](docs/reference/config/pipeline_configs.md)
+- [Docs Index](docs/README.md)
+- [Solution Architecture](docs/architecture/solution_architecture.md)
+- [Directory Structure](docs/architecture/directory_structure.md)
+- [Pipeline Config Reference](docs/reference/config/pipeline_configs.md)
 
 **Pipeline Documentation**
 - [Pipeline Overview](docs/pipeline/overview.md) - High-level pipeline stages and data flow
@@ -19,6 +20,8 @@ Screenalytics ingests an episode, detects and tracks faces, recognizes cast memb
 - [Faces Harvest](docs/pipeline/faces_harvest.md) - Face embedding extraction
 - [Cluster Identities](docs/pipeline/cluster_identities.md) - Identity clustering
 - [Episode Cleanup](docs/pipeline/episode_cleanup.md) - Track refinement and cleanup
+- [Audio Pipeline](docs/pipeline/audio_pipeline.md) - Diarization + ASR (optional)
+- [Screentime Optimization](docs/pipeline/screentime_analytics_optimization.md) - Metrics, gap handling, tuning, troubleshooting
 
 **Operations & Troubleshooting**
 - [Performance Tuning](docs/ops/performance_tuning_faces_pipeline.md) - Speed vs accuracy optimization
@@ -28,7 +31,7 @@ Screenalytics ingests an episode, detects and tracks faces, recognizes cast memb
 **Reference**
 - [Artifact Schemas](docs/reference/artifacts_faces_tracks_identities.md) - JSONL/NPY file formats
 - [Facebank](docs/reference/facebank.md) - Facebank structure and management
-- [API Reference](API.md) - HTTP endpoints
+- [API Reference](docs/reference/api.md) - HTTP endpoints
 - [Acceptance Matrix](ACCEPTANCE_MATRIX.md) - Quality gates and metrics
 
 ---
@@ -38,28 +41,15 @@ Screenalytics ingests an episode, detects and tracks faces, recognizes cast memb
 This repository now hosts two main code paths:
 
 - **Python ML/Streamlit** (existing): pipelines, API, and tools at the repo root.
-- **Next.js + TypeScript + Prisma** web app under `web/` for the Youth League Team Builder (event/division admin and agents).
+- **Next.js (optional / experimental):** `web/` contains a Next.js workspace prototype for Screenalytics (see `docs/WEB_APP_MIGRATION_PLAN.md`). It is not required for the ML pipeline.
 
-Quickstart for the web app:
+Quickstart for the web app (optional):
 
 ```bash
 cd web
 npm install
-cp .env.example .env.local    # provide DATABASE_URL, OPENAI_API_KEY, etc.
-npx prisma generate
-npx prisma migrate dev        # creates local schema; requires DATABASE_URL
 npm run dev                   # http://localhost:3000
 ```
-
-API stubs available at:
-- `GET /api/events`
-- `GET /api/divisions?eventId=...`
-- `POST /api/agent-run`
-- `GET /api/agent-status`
-
-UI stubs:
-- Home (`/`) lists events.
-- Request Analysis (`/request-analysis`) can start a dummy agent run and poll status.
 
 ---
 
@@ -208,7 +198,7 @@ All thresholds are **config-driven** (no hardcoded magic numbers):
 
 **Override precedence:** CLI args > Environment variables > Performance profile > Stage config > Defaults
 
-See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for quick reference or [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md) for complete documentation.
+See [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md) for profile/override details.
 
 ---
 
@@ -246,7 +236,7 @@ POST /jobs/episode_cleanup_async
 }
 ```
 
-See [API.md](API.md) for complete endpoint documentation.
+See [docs/reference/api.md](docs/reference/api.md) for complete endpoint documentation.
 
 ---
 
@@ -256,7 +246,7 @@ See [API.md](API.md) for complete endpoint documentation.
 - Promotion requires: tests, docs, acceptance checks, PR review
 - CI blocks imports from `FEATURES/**` in production code
 
-See [FEATURES_GUIDE.md](FEATURES_GUIDE.md) and [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md).
+See [docs/features/feature_sandboxes.md](docs/features/feature_sandboxes.md) and [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md).
 
 ---
 
@@ -331,15 +321,15 @@ Full troubleshooting guide: [docs/ops/troubleshooting_faces_pipeline.md](docs/op
 - Open a draft PR early
 - Add tests and docs for promoted features
 - Use `FEATURES/` for experimental work
-- Follow `CODING_STANDARDS.md`
+- Follow `CONTRIBUTING.md`
 
-See [FEATURES_GUIDE.md](FEATURES_GUIDE.md) for the promotion workflow.
+See [docs/features/feature_sandboxes.md](docs/features/feature_sandboxes.md) for the promotion workflow.
 
 ---
 
 ## License
 
-MIT or Apache-2.0 (choose before public release)
+MIT (see `LICENSE`)
 
 ---
 
@@ -352,7 +342,7 @@ MIT or Apache-2.0 (choose before public release)
 - ✅ Phase 2: Config-driven refactoring with metrics, guardrails, and performance profiles
 - 🚧 Phase 3: Hardening, API integration, and comprehensive testing (in progress)
 
-See [REFACTORING_COMPLETE_SUMMARY.md](REFACTORING_COMPLETE_SUMMARY.md) and [PHASE_2_IMPLEMENTATION_SUMMARY.md](PHASE_2_IMPLEMENTATION_SUMMARY.md) for complete change history.
+See `docs/changes/` and `docs/code-updates/` for historical notes.
 
 ---
 

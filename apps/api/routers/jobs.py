@@ -86,11 +86,11 @@ async def _reject_legacy_payload(request: Request) -> None:
 
 DEVICE_LITERAL = Literal["auto", "cpu", "mps", "coreml", "metal", "apple", "cuda"]
 # Performance profiles:
-# - low_power: Lower resource usage for laptops/quiet operation (stride 12, 15fps)
-# - balanced: Default setting for most workloads (stride 6, 24fps)
-# - performance: Higher quality/faster processing with more resources (stride 4, 30fps)
+# - low_power: Lower resource usage for laptops/quiet operation (stride 8, ≤8fps)
+# - balanced: Default setting for most workloads (stride 5, ≤24fps)
+# - high_accuracy: Maximum recall for powerful systems (stride 1, 30fps)
 # - fast_cpu: Alias for low_power
-# - high_accuracy: Alias for performance
+# - performance: Legacy alias for high_accuracy
 PROFILE_LITERAL = Literal["fast_cpu", "low_power", "balanced", "performance", "high_accuracy"]
 
 

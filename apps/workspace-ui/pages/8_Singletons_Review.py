@@ -49,7 +49,7 @@ st.title("Singletons Review")
 # API Client Setup
 # ============================================================================
 
-API_BASE = st.session_state.get("api_base") or os.environ.get("API_BASE", "http://127.0.0.1:8000")
+API_BASE = st.session_state.get("api_base") or os.environ.get("API_BASE", "http://localhost:8000")
 
 _retry_session: Optional[requests.Session] = None
 
@@ -655,7 +655,7 @@ def render_archive_matches_section(
 
         col1, col2 = st.columns([1, 3])
         with col1:
-            if st.button("Archive All Similar", key="archive_all_similar"):
+            if st.button("Archive All Similar", key=f"{ep_id}::archive_all_similar"):
                 progress = batch_archive_matches(ep_id=ep_id, matches=archive_matches)
                 st.success(f"Archived {progress.succeeded}/{progress.total}")
                 actions_taken = progress.succeeded
@@ -733,10 +733,10 @@ st.markdown("---")
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
 with col1:
-    include_archive = st.checkbox("Include archive comparison", value=False, key="include_archive")
+    include_archive = st.checkbox("Include archive comparison", value=False, key=f"{ep_id}::include_archive")
 
 with col2:
-    min_sim = st.slider("Min similarity", 0.0, 1.0, 0.30, 0.05, key="min_sim")
+    min_sim = st.slider("Min similarity", 0.0, 1.0, 0.30, 0.05, key=f"{ep_id}::min_sim")
 
 with col3:
     if st.button("Generate Analysis", type="primary"):

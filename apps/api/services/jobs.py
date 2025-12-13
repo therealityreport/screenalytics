@@ -71,29 +71,50 @@ except ValueError:
     _CPULIMIT_PERCENT = 0
 
 # ─── Performance Profile Configuration ──────────────────────────────────────
-PROFILE_DEFAULTS = {
+# Source of truth is config/pipeline/performance_profiles.yaml. Keep a small
+# in-code fallback so API + tests still work if YAML/pyyaml is unavailable.
+_PROFILE_DEFAULTS_FALLBACK: dict[str, dict[str, Any]] = {
     "low_power": {
-        "frame_stride": 12,
-        "detection_fps_limit": 15.0,
+        "frame_stride": 8,
+        "detection_fps_limit": 8.0,
         "save_frames": False,
-        "save_crops": True,
+        "save_crops": False,
         "cpu_threads": 2,
     },
     "balanced": {
-        "frame_stride": 6,
+        "frame_stride": 5,
         "detection_fps_limit": 24.0,
-        "save_frames": False,
-        "save_crops": True,
-        "cpu_threads": 4,
     },
-    "performance": {
-        "frame_stride": 4,
+    "high_accuracy": {
+        "frame_stride": 1,
         "detection_fps_limit": 30.0,
-        "save_frames": False,
-        "save_crops": True,
-        "cpu_threads": 8,
     },
 }
+
+
+def _load_profile_defaults_from_yaml() -> dict[str, dict[str, Any]]:
+    path = PROJECT_ROOT / "config" / "pipeline" / "performance_profiles.yaml"
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - CI/runtime should install pyyaml
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # pragma: no cover - malformed config
+        LOGGER.warning("Failed to read performance profiles from %s: %s", path, exc)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    profiles: dict[str, dict[str, Any]] = {}
+    for name, cfg in data.items():
+        if isinstance(name, str) and isinstance(cfg, dict):
+            profiles[name.strip().lower()] = cfg
+    return profiles
+
+
+PROFILE_DEFAULTS = _load_profile_defaults_from_yaml() or _PROFILE_DEFAULTS_FALLBACK
 
 DEVICE_DEFAULT_PROFILE = {
     "coreml": "low_power",
@@ -119,7 +140,7 @@ def load_performance_profile(profile_value: str | None) -> dict:
 
     Supports aliases:
       - fast_cpu -> low_power
-      - high_accuracy -> performance
+      - performance -> high_accuracy (legacy)
     """
     if not profile_value:
         return PROFILE_DEFAULTS.get("balanced", {})
@@ -127,8 +148,8 @@ def load_performance_profile(profile_value: str | None) -> dict:
     # Handle aliases
     if normalized == "fast_cpu":
         normalized = "low_power"
-    elif normalized == "high_accuracy":
-        normalized = "performance"
+    elif normalized == "performance":
+        normalized = "high_accuracy"
     return PROFILE_DEFAULTS.get(normalized, PROFILE_DEFAULTS.get("balanced", {}))
 
 
@@ -1045,6 +1066,7 @@ class JobService:
 
             except Exception as exc:
                 LOGGER.exception("Episode run job %s failed: %s", job_id, exc)
+                error_text = str(exc)
 
                 def _apply_error(rec: JobRecord) -> None:
                     if rec.get("state") == "canceled":
@@ -1052,7 +1074,7 @@ class JobService:
                     rec["state"] = "failed"
                     rec["ended_at"] = self._now()
                     rec["return_code"] = -1
-                    rec["error"] = str(exc)
+                    rec["error"] = error_text
 
                 try:
                     self._mutate_job(job_id, _apply_error)

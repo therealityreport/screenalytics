@@ -40,7 +40,7 @@ EST_TZ = ZoneInfo("America/New_York")
 
 # Detection defaults (config/pipeline/detection.yaml)
 DETECT_CONFIDENCE_DEFAULT = 0.50  # detection.yaml: confidence_th
-DETECT_MIN_SIZE_DEFAULT = 24  # detection.yaml: min_size
+DETECT_MIN_SIZE_DEFAULT = 16  # detection.yaml: min_size
 DETECT_IOU_DEFAULT = 0.5  # detection.yaml: iou_th
 
 # Tracking defaults (config/pipeline/tracking.yaml)
@@ -50,9 +50,9 @@ TRACK_NEW_THRESH_DEFAULT = 0.60  # tracking.yaml: new_track_thresh
 TRACK_BUFFER_DEFAULT = 90  # tracking.yaml: track_buffer
 
 # Clustering defaults (config/pipeline/clustering.yaml)
-CLUSTER_THRESH_DEFAULT = 0.58  # clustering.yaml: cluster_thresh
+CLUSTER_THRESH_DEFAULT = 0.52  # clustering.yaml: cluster_thresh
 CLUSTER_MIN_SIZE_DEFAULT = 1  # clustering.yaml: min_cluster_size
-CLUSTER_MIN_IDENTITY_SIM_DEFAULT = 0.50  # clustering.yaml: min_identity_sim
+CLUSTER_MIN_IDENTITY_SIM_DEFAULT = 0.45  # clustering.yaml: min_identity_sim
 
 # Faces harvest defaults
 FACES_THUMB_SIZE_DEFAULT = 256
@@ -3748,7 +3748,7 @@ with col_faces:
                 "Run **Detect/Track Faces** again to regenerate detections before harvesting faces."
             )
         st.warning(message)
-        if detect_track_info and detect_track_info.get("detector") == "pyscenedetect":
+        if detect_phase_status and detect_phase_status.get("detector") == "pyscenedetect":
             st.error(
                 "⚠️ **Scene detection only**: Your last run only executed scene detection (PySceneDetect), "
                 "not full face detection + tracking. Please run **Detect/Track Faces** again to generate tracks."

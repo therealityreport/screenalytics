@@ -1,6 +1,7 @@
 # Directory Structure — Screenalytics
 
-**Quick Reference** | [Full Documentation →](docs/architecture/directory_structure.md)
+
+**Quick Reference** | [Full Documentation →](../../architecture/directory_structure.md)
 
 ---
 
@@ -62,7 +63,7 @@ Temporary experimental code (30-day TTL). **No production imports allowed.**
 
 **For complete details, see:**
 
-- **[Full Directory Structure](docs/architecture/directory_structure.md)** — Detailed repo map, policies, promotion workflow
+- **[Full Directory Structure](../../architecture/directory_structure.md)** — Detailed repo map, policies, promotion workflow
 - **[FEATURES_GUIDE.md](FEATURES_GUIDE.md)** — Feature sandbox workflow
 - **[ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md)** — Quality gates
 

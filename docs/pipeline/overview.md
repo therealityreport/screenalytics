@@ -26,9 +26,14 @@ This document provides a high-level overview of the complete pipeline. For detai
 
                               ↓
 
-6. AUDIO DIARIZE (optional) → 7. A/V FUSION (optional) → 8. AGGREGATE
-        ↓                              ↓                      ↓
-   speech_segments.jsonl          av_links.jsonl      screentime.json
+6. AUDIO PIPELINE (optional)     7. BODY TRACKING (optional)
+        ↓                                  ↓
+ episode_transcript.jsonl       body_tracking/screentime_comparison.json
+                 \                /
+                  ▼              ▼
+                 8. SCREENTIME ANALYZE
+                           ↓
+                screentime.json (+ screentime.csv)
 ```
 
 ### Stage Summary
@@ -40,9 +45,9 @@ This document provides a high-level overview of the complete pipeline. For detai
 | **3. Embed** | episode.mp4, tracks.jsonl | faces.jsonl, faces.npy, crops/*.jpg | ArcFace ONNX | Extract 512-d embeddings from face crops with quality gating |
 | **4. Cluster** | faces.jsonl, faces.npy | identities.json, thumbs/*.jpg | Agglomerative Clustering | Group tracks by identity using track-level embeddings |
 | **5. Cleanup** | tracks.jsonl, faces.jsonl, identities.json | Updated artifacts, cleanup_report.json | Detect/Track/Embed/Cluster (re-run) | Split long tracks, re-embed, re-cluster, group identities |
-| **6. Audio Diarize** | episode.mp4 (audio) | speech_segments.jsonl, transcripts.jsonl | Pyannote + Faster-Whisper | Segment speakers and transcribe speech |
-| **7. A/V Fusion** | tracks.jsonl, speech_segments.jsonl | av_links.jsonl | Temporal + Spatial Overlap | Link face tracks with speech segments |
-| **8. Aggregate** | identities.json, av_links.jsonl | screentime.json, screentime.csv | Pandas | Compute visual/speaking/overlap time per person |
+| **6. Audio Pipeline** | episode.mp4 (audio) | episode_transcript.jsonl, audio_voice_mapping.json | NeMo MSDD + OpenAI Whisper | Produce speaker-labeled transcript + voice→cast mapping inputs for speaking time |
+| **7. Body Tracking** | episode.mp4 | body_tracking/*, screentime_comparison.json | YOLO + ByteTrack + OSNet Re-ID | Preserve identity through face loss; compute optional body visibility metrics |
+| **8. Screentime Analyze** | faces/tracks/identities (+ optional audio/body inputs) | screentime.json, screentime.csv | ScreenTimeAnalyzer | Compute per-cast face/speaking (and optional body) seconds |
 
 ---
 
@@ -78,26 +83,26 @@ episode.mp4 (input video)
 
 ```
 episode.mp4 (audio stream)
-    ├─► [6. AUDIO DIARIZE] Pyannote
-    │   └─► speech_segments.jsonl
-    │       - segment_id, start_s, end_s, speaker_label
+    ├─► [6. DIARIZE] NeMo MSDD (default)
+    │   └─► audio_diarization.jsonl
+    │       - start, end, speaker_label, (optional) confidence / overlap fields
     │
-    └─► [6. TRANSCRIBE] Faster-Whisper
-        └─► transcripts.jsonl
-            - segment_id, text, confidence, language
+    └─► [6. ASR] OpenAI Whisper (default)
+        └─► audio_asr_raw.jsonl
+            - start, end, text, (optional) words[], confidence
 ```
 
 ### 3.3 Fusion & Aggregation
 
 ```
-tracks.jsonl + speech_segments.jsonl
-    ├─► [7. A/V FUSION] Temporal + Spatial Overlap
-    │   └─► av_links.jsonl
-    │       - link_id, track_id, segment_id, overlap_s, spatial_score
-    │
-    └─► [8. AGGREGATE] Pandas
+faces.jsonl + tracks.jsonl + identities.json + shows/{SHOW}/people.json
+    ├─► (optional) episode_transcript.jsonl + audio_voice_mapping.json
+    ├─► (optional) body_tracking/screentime_comparison.json
+    └─► [8. SCREENTIME ANALYZE] ScreenTimeAnalyzer
         └─► screentime.json
-            - person_id, visual_s, speaking_s, both_s (overlap), confidence
+            - face_visible_seconds (+ legacy visual_s)
+            - speaking_s
+            - body_visible_seconds / body_only_seconds / gap_bridged_seconds (optional)
         └─► screentime.csv
 ```
 
@@ -111,8 +116,8 @@ tracks.jsonl + speech_segments.jsonl
 - **Config:** `config/pipeline/detection.yaml`
 - **Key Params:**
   - `stride`: Process every Nth frame (higher = faster, lower recall)
-  - `min_size`: Minimum face size in pixels (default 90)
-  - `confidence_th`: Detection confidence threshold (default 0.8)
+  - `min_size`: Minimum face size in pixels (see `config/pipeline/detection.yaml`)
+  - `confidence_th`: Detection confidence threshold (see `config/pipeline/detection.yaml`)
   - `device`: `auto`, `cpu`, `cuda`, `mps` (Apple Silicon)
 - **Artifacts:**
   - `data/manifests/{ep_id}/detections.jsonl`
@@ -123,10 +128,10 @@ tracks.jsonl + speech_segments.jsonl
 - **CLI:** Runs automatically after detect (same `episode_run.py` invocation)
 - **Config:** `config/pipeline/tracking.yaml`
 - **Key Params:**
-  - `track_thresh`: Min confidence to start/continue track (default 0.70)
-  - `match_thresh`: IoU threshold for bbox matching (default 0.85)
-  - `track_buffer`: Frames to keep track alive (default 90 ≈ 3-4 sec)
-  - `new_track_thresh`: Higher threshold for new tracks (default 0.85)
+  - `track_thresh`: Min confidence to continue a track (see `config/pipeline/tracking.yaml`)
+  - `match_thresh`: IoU threshold for bbox matching (see `config/pipeline/tracking.yaml`)
+  - `track_buffer`: Frames to keep track alive (see `config/pipeline/tracking.yaml`)
+  - `new_track_thresh`: Threshold for starting new tracks (see `config/pipeline/tracking.yaml`)
   - Appearance gate: `TRACK_GATE_APPEAR_HARD`, `TRACK_GATE_APPEAR_SOFT`, `TRACK_GATE_APPEAR_STREAK`
 - **Artifacts:**
   - `data/manifests/{ep_id}/tracks.jsonl`
@@ -152,8 +157,8 @@ tracks.jsonl + speech_segments.jsonl
 - **API:** `POST /jobs/cluster`
 - **Config:** `config/pipeline/recognition.yaml` (TBD) or inline params
 - **Key Params:**
-  - `cluster_thresh`: Cosine similarity threshold (default 0.58)
-  - `min_cluster_size`: Minimum tracks per cluster (default 2)
+  - `cluster_thresh`: Cosine similarity threshold (see `config/pipeline/clustering.yaml`)
+  - `min_cluster_size`: Minimum tracks per cluster (see `config/pipeline/clustering.yaml`)
   - Outlier handling: Singletons with `cluster_id = null` or noise label
 - **Artifacts:**
   - `data/manifests/{ep_id}/identities.json`
@@ -178,8 +183,8 @@ tracks.jsonl + speech_segments.jsonl
 - **Models:**
   - MDX-Extra/Demucs for stem separation
   - Resemble Enhance for audio denoising
-  - Pyannote 3.1 for speaker diarization
-  - OpenAI Whisper (primary) or Gemini (secondary) for ASR
+  - NeMo MSDD for overlap-aware speaker diarization
+  - OpenAI Whisper (primary) with optional Gemini cleanup/enrichment
 - **Artifacts:**
   - `data/audio/{ep_id}/episode_original.wav`
   - `data/audio/{ep_id}/episode_vocals.wav`
@@ -193,16 +198,17 @@ tracks.jsonl + speech_segments.jsonl
   - `data/manifests/{ep_id}/audio_qc.json`
 - **Docs:** [audio_pipeline.md](audio_pipeline.md)
 
-### 4.7 A/V Fusion (Optional, TBD)
-- **CLI:** `python tools/episode_run.py --ep-id <ep_id> --av-fusion`
-- **Artifacts:**
-  - `data/manifests/{ep_id}/av_links.jsonl`
-
-### 4.8 Aggregate (Optional, TBD)
-- **CLI:** `python tools/episode_run.py --ep-id <ep_id> --aggregate`
+### 4.7 Screentime (Implemented)
+- **CLI:** `python -m tools.analyze_screen_time --ep-id <ep_id>`
+- **API:** `POST /jobs/screen_time/analyze`
+- **Config:** `config/pipeline/screen_time_v2.yaml`
 - **Artifacts:**
   - `data/analytics/{ep_id}/screentime.json`
   - `data/analytics/{ep_id}/screentime.csv`
+- **Notes:**
+  - If `episode_transcript.jsonl` + `audio_voice_mapping.json` exist, screentime includes `speaking_s`.
+  - If `body_tracking/screentime_comparison.json` exists, screentime includes body metrics and `gap_bridged_seconds`.
+- **Docs:** [screentime_analytics_optimization.md](screentime_analytics_optimization.md)
 
 ---
 

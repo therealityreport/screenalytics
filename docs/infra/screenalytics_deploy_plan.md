@@ -352,7 +352,6 @@ DATABASE_URL=postgresql://user:pass@rds-host:5432/screenalytics
 
 # External APIs (audio pipeline)
 RESEMBLE_API_KEY=xxx
-PYANNOTEAI_API_KEY=xxx
 OPENAI_API_KEY=xxx
 ```
 

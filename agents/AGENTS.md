@@ -38,9 +38,9 @@ Screenalytics uses **Codex SDK** and **Claude API** agents for autonomous docume
 **Actions:**
 1. Detect file changes via Git hooks or CI
 2. Update these docs only:
-   - `SOLUTION_ARCHITECTURE.md` — Adjust affected components/paths
-   - `DIRECTORY_STRUCTURE.md` — Update tree and descriptions
-   - `PRD.md` — Mark feature addition/removal
+   - `docs/architecture/solution_architecture.md` — Adjust affected components/paths
+   - `docs/architecture/directory_structure.md` — Update tree and descriptions
+   - `docs/product/prd.md` — Mark feature addition/removal
    - `README.md` — Reflect new/removed directories
 3. Commit with message: `docs(sync): auto-update architecture after file change`
 
@@ -194,13 +194,13 @@ scope:
 
 actions:
   - update_file:
-      path: SOLUTION_ARCHITECTURE.md
+      path: docs/architecture/solution_architecture.md
       method: sync_components
   - update_file:
-      path: DIRECTORY_STRUCTURE.md
+      path: docs/architecture/directory_structure.md
       method: sync_tree
   - update_file:
-      path: PRD.md
+      path: docs/product/prd.md
       method: sync_features
   - update_file:
       path: README.md
@@ -243,9 +243,9 @@ enabled = true
 playbook = "agents/playbooks/update-docs-on-change.yaml"
 trigger = "file_change"
 allowed_files = [
-  "SOLUTION_ARCHITECTURE.md",
-  "DIRECTORY_STRUCTURE.md",
-  "PRD.md",
+  "docs/architecture/solution_architecture.md",
+  "docs/architecture/directory_structure.md",
+  "docs/product/prd.md",
   "README.md"
 ]
 
@@ -260,9 +260,9 @@ trigger = "pr_label:promotion"
 ```yaml
 auto_doc_update: true
 allowed_write_paths:
-  - SOLUTION_ARCHITECTURE.md
-  - DIRECTORY_STRUCTURE.md
-  - PRD.md
+  - docs/architecture/solution_architecture.md
+  - docs/architecture/directory_structure.md
+  - docs/product/prd.md
   - README.md
   - FEATURES/*/docs/**
 
@@ -287,7 +287,7 @@ touch apps/api/new_module.py
 codex exec --config config/codex.config.toml --playbook agents/playbooks/update-docs-on-change.yaml
 
 # Verify docs updated
-git diff SOLUTION_ARCHITECTURE.md DIRECTORY_STRUCTURE.md
+git diff docs/architecture/solution_architecture.md docs/architecture/directory_structure.md
 ```
 
 ### 2. Test Promotion Check in CI
@@ -330,7 +330,7 @@ gh pr create --title "Promote my-feature" --label promotion
 ## References
 
 - **[Directory Structure](../docs/architecture/directory_structure.md)** — Promotion workflow
-- **[FEATURES_GUIDE.md](../FEATURES_GUIDE.md)** — Feature sandbox workflow
+- **[Feature sandboxes](../docs/features/feature_sandboxes.md)** — Feature sandbox workflow
 - **[ACCEPTANCE_MATRIX.md](../ACCEPTANCE_MATRIX.md)** — Quality gates
 
 ---

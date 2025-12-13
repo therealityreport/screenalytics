@@ -1254,7 +1254,7 @@ if preview_result:
                     if st.session_state.get(f"{ep_id}::ai_diag_loading_{track_id}"):
                         with st.spinner("Analyzing with AI..."):
                             try:
-                                api_url = st.session_state.get("API_URL", "http://localhost:8000")
+                                api_url = st.session_state.get("api_base") or "http://localhost:8000"
                                 resp = requests.post(
                                     f"{api_url}/diagnostics/episodes/{ep_id}/diagnose_track/{track_id}",
                                     json={"use_ai": True, "force_refresh": False},
@@ -1276,30 +1276,32 @@ if preview_result:
                     ai_result = st.session_state.get(f"{ep_id}::ai_diag_result_{track_id}")
                     if ai_result and ai_result.get("ai_analysis"):
                         ai = ai_result["ai_analysis"]
-                        with st.expander("🤖 AI Analysis", expanded=True):
-                            st.markdown(f"**Explanation:** {ai.get('explanation', 'N/A')}")
-                            st.markdown(f"**Root Cause:** `{ai.get('root_cause', 'N/A')}`")
-                            st.markdown(f"**Blocked By:** `{ai.get('blocked_by', 'N/A')}`")
+                        # Avoid nested expanders (Streamlit limitation); this section already lives inside
+                        # the per-face expander.
+                        st.markdown("#### 🤖 AI Analysis")
+                        st.markdown(f"**Explanation:** {ai.get('explanation', 'N/A')}")
+                        st.markdown(f"**Root Cause:** `{ai.get('root_cause', 'N/A')}`")
+                        st.markdown(f"**Blocked By:** `{ai.get('blocked_by', 'N/A')}`")
 
-                            if ai.get("suggested_fixes"):
-                                st.markdown("**Suggested Fixes:**")
-                                for fix in ai["suggested_fixes"]:
-                                    st.markdown(f"- {fix}")
+                        if ai.get("suggested_fixes"):
+                            st.markdown("**Suggested Fixes:**")
+                            for fix in ai["suggested_fixes"]:
+                                st.markdown(f"- {fix}")
 
-                            if ai.get("config_changes"):
-                                st.markdown("**Config Changes:**")
-                                for change in ai["config_changes"]:
-                                    st.code(
-                                        f"{change.get('file', 'unknown')}\n"
-                                        f"  {change.get('key', '?')}: {change.get('current', '?')} → {change.get('suggested', '?')}\n"
-                                        f"  # {change.get('reason', '')}",
-                                        language="yaml"
-                                    )
+                        if ai.get("config_changes"):
+                            st.markdown("**Config Changes:**")
+                            for change in ai["config_changes"]:
+                                st.code(
+                                    f"{change.get('file', 'unknown')}\n"
+                                    f"  {change.get('key', '?')}: {change.get('current', '?')} → {change.get('suggested', '?')}\n"
+                                    f"  # {change.get('reason', '')}",
+                                    language="yaml",
+                                )
 
-                            if ai.get("_fallback"):
-                                st.caption("ℹ️ Rule-based analysis (OpenAI unavailable)")
-                            else:
-                                st.caption("ℹ️ Powered by GPT-4o")
+                        if ai.get("_fallback"):
+                            st.caption("ℹ️ Rule-based analysis (OpenAI unavailable)")
+                        else:
+                            st.caption("ℹ️ Powered by GPT-4o")
 
                     # COPY DIAGNOSTICS button
                     st.markdown("---")

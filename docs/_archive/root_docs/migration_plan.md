@@ -1,5 +1,6 @@
 # Migration Plan: Streamlit to Next.js/FastAPI UI
 
+
 ## Goals
 - Replace Streamlit workspace UI with a typed Next.js (App Router) front end backed by the existing FastAPI API and pipeline tooling.
 - Preserve pipeline guardrails: detect/track readiness, faces manifest fallback, cluster merge semantics, screentime job tracking, and explicit error surfacing.

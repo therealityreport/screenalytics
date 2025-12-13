@@ -61,26 +61,23 @@ S3_BUCKET=screenalytics
 OPENAI_API_KEY=sk-xxxx
 ```
 
-### pyannoteAI Setup (Recommended for Diarization)
+### Audio Pipeline Setup (NeMo MSDD + OpenAI Whisper)
 
-The audio pipeline supports two diarization backends:
+The default audio pipeline uses:
+- **NeMo MSDD** for overlap-aware speaker diarization (GPU recommended)
+- **OpenAI Whisper** for transcription (requires `OPENAI_API_KEY`)
 
-| Backend | Description | Env Var |
-|---------|-------------|---------|
-| `precision-2` | **Recommended.** pyannoteAI cloud API with superior accuracy for overlapping speech | `PYANNOTEAI_API_KEY` |
-| `oss-3.1` | Local open-source pyannote 3.1 model (fallback) | `PYANNOTE_AUTH_TOKEN` |
+**Required (for ASR):**
+```
+OPENAI_API_KEY=sk-xxxx
+```
 
-**To use Precision-2 (recommended):**
-1. Sign up at [https://www.pyannote.ai/](https://www.pyannote.ai/)
-2. Get your API key from the dashboard
-3. Add to `.env`:
-   ```
-   PYANNOTEAI_API_KEY=your-api-key-here
-   ```
+**Optional (audio enhancement):**
+```
+RESEMBLE_API_KEY=...
+```
 
-The pipeline defaults to `precision-2`. If `PYANNOTEAI_API_KEY` is not set, it automatically falls back to the local OSS 3.1 model.
-
-**Cost notes:** pyannoteAI charges per audio minute processed. Check their pricing at [pyannote.ai](https://www.pyannote.ai/).
+**Legacy (deprecated):** pyannote diarization workflows are still supported for older episodes/backfills, but are no longer the recommended path. If you need them, set `PYANNOTEAI_API_KEY` (cloud) or `PYANNOTE_AUTH_TOKEN` (local OSS model) and configure `config/pipeline/audio.yaml` accordingly.
 
 ---
 
@@ -190,43 +187,46 @@ identities.json ───────────┘
 
 ### Schema Documentation
 
-For complete schema definitions and field descriptions, see:
-- [docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md)
-- [docs/reference/schemas/identities_v1_spec.md](docs/reference/schemas/identities_v1_spec.md)
+For schema definitions and field descriptions, see:
+- [docs/reference/artifacts_faces_tracks_identities.md](docs/reference/artifacts_faces_tracks_identities.md)
+- [docs/audio/diarization_manifest.md](docs/audio/diarization_manifest.md)
+- [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) (thresholds and CI gates)
 
 ---
 
 ## 9️⃣ Documentation Index
 
-All comprehensive documentation from Phase 1:
+Canonical documentation lives under `docs/`:
+- [docs/README.md](docs/README.md)
 
 **Pipeline Overview:**
 - [docs/pipeline/overview.md](docs/pipeline/overview.md) – End-to-end pipeline architecture
-- [docs/pipeline/detect_track_stage.md](docs/pipeline/detect_track_stage.md) – Detection & tracking details
-- [docs/pipeline/faces_embed_stage.md](docs/pipeline/faces_embed_stage.md) – Face sampling & embedding
-- [docs/pipeline/clustering_stage.md](docs/pipeline/clustering_stage.md) – Identity clustering
-- [docs/pipeline/cleanup_stage.md](docs/pipeline/cleanup_stage.md) – Outlier removal & post-processing
+- [docs/pipeline/detect_track_faces.md](docs/pipeline/detect_track_faces.md) – Detection & tracking details
+- [docs/pipeline/faces_harvest.md](docs/pipeline/faces_harvest.md) – Face sampling & embedding
+- [docs/pipeline/cluster_identities.md](docs/pipeline/cluster_identities.md) – Identity clustering
+- [docs/pipeline/episode_cleanup.md](docs/pipeline/episode_cleanup.md) – Track refinement & post-processing
+- [docs/pipeline/audio_pipeline.md](docs/pipeline/audio_pipeline.md) – Audio pipeline (diarization/ASR)
 
 **Configuration & Tuning:**
-- [CONFIG_GUIDE.md](CONFIG_GUIDE.md) – Quick config reference
 - [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md) – All config parameters
 - [docs/ops/performance_tuning_faces_pipeline.md](docs/ops/performance_tuning_faces_pipeline.md) – Speed vs accuracy tuning
 
 **Schemas & Metrics:**
-- [docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md) – All artifact schemas
-- [docs/reference/metrics/derived_metrics.md](docs/reference/metrics/derived_metrics.md) – Calculated metrics & guardrails
-- [docs/reference/metrics/acceptance_matrix.md](docs/reference/metrics/acceptance_matrix.md) – Quality thresholds
+- [docs/reference/artifacts_faces_tracks_identities.md](docs/reference/artifacts_faces_tracks_identities.md) – Vision artifact schemas (detections/tracks/faces/identities)
+- [docs/audio/diarization_manifest.md](docs/audio/diarization_manifest.md) – Audio diarization/ASR manifests
+- [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) – Quality thresholds and verification
+- [docs/reference/api.md](docs/reference/api.md) – API endpoints and request/response shapes
 
 **Operations:**
-- [docs/ops/monitoring_logging_faces_pipeline.md](docs/ops/monitoring_logging_faces_pipeline.md) – Logging & debugging
-- [docs/ops/episode_cleanup.md](docs/ops/episode_cleanup.md) – Cleanup workflow
+- [docs/ops/troubleshooting_faces_pipeline.md](docs/ops/troubleshooting_faces_pipeline.md) – Debugging & common fixes
+- [docs/ops/ARTIFACTS_STORE.md](docs/ops/ARTIFACTS_STORE.md) – Storage layout and artifact handling
 
 ---
 
 ## 🔟 Agents & automation
 * Codex config: `config/codex.config.toml`
 * Claude policy: `config/claude.policies.yaml`
-* Agents auto-update docs (README, PRD, SolutionArchitecture, DirectoryStructure) when files change.
+* Agents auto-update `README.md`, `docs/architecture/solution_architecture.md`, `docs/architecture/directory_structure.md`, and `docs/product/prd.md` when files change.
 
 To run Codex locally:
 ```bash

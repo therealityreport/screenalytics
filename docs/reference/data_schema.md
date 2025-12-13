@@ -1,4 +1,5 @@
-# DATA_SCHEMA.md — Screenalytics
+# Data Schema — Screenalytics
+
 
 Version: 1.0
 Status: Draft (ready to implement)
@@ -167,9 +168,11 @@ episode+person ──< screen_time
 ### screen_time
 - ep_id (fk)
 - person_id (fk)
-- visual_s (float)
+- face_visible_seconds (float)  -- legacy alias: visual_s
 - speaking_s (float)
-- both_s (float)
+- body_visible_seconds (float, null)
+- body_only_seconds (float, null)
+- gap_bridged_seconds (float, null)
 - confidence (float)
 - primary key(ep_id, person_id)
 

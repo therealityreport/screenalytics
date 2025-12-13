@@ -24,8 +24,17 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
-# Streamlit 1.44+ reorganized internal modules - use try/except for compatibility
+
+# `streamlit` is an optional dependency in some CI/test contexts (e.g. unit tests that
+# load helpers to validate non-UI utilities). Keep imports defensive so importing this
+# module doesn't require Streamlit to be fully installed.
+try:  # pragma: no cover
+    import streamlit.components.v1 as components
+except Exception:  # pragma: no cover
+    components = None  # type: ignore[assignment]
+
+# Streamlit 1.44+ reorganized internal modules - use try/except for compatibility.
+# In non-Streamlit test environments, fall back to minimal stubs.
 try:
     # Streamlit 1.44+
     from streamlit.runtime.scriptrunner import (
@@ -33,13 +42,25 @@ try:
         get_script_run_ctx,
         RerunData,
     )
-except ImportError:
-    # Streamlit < 1.44
-    from streamlit.runtime.scriptrunner.script_run_context import (
-        add_script_run_ctx,
-        get_script_run_ctx,
-    )
-    from streamlit.runtime.scriptrunner.script_requests import RerunData
+except Exception:  # pragma: no cover
+    try:  # pragma: no cover
+        # Streamlit < 1.44
+        from streamlit.runtime.scriptrunner.script_run_context import (
+            add_script_run_ctx,
+            get_script_run_ctx,
+        )
+        from streamlit.runtime.scriptrunner.script_requests import RerunData
+    except Exception:  # pragma: no cover
+        def get_script_run_ctx():  # type: ignore[no-redef]
+            return None
+
+        def add_script_run_ctx(*_args, **_kwargs):  # type: ignore[no-redef]
+            return None
+
+        class RerunData:  # type: ignore[no-redef]
+            def __init__(self, *args, **kwargs) -> None:
+                self.query_string = kwargs.get("query_string")
+                self.page_script_hash = kwargs.get("page_script_hash")
 
 DEFAULT_TITLE = "SCREENALYTICS"
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -72,6 +93,11 @@ def _diag(tag: str, **kw) -> None:
     """Diagnostic logger enabled via DIAG_LOG=1."""
     if DIAG:
         LOGGER.info("[DIAG:%s] %s", tag, json.dumps(kw, ensure_ascii=False))
+
+
+def _now_iso() -> str:
+    """UTC timestamp in ISO-8601 with 'Z' suffix."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1059,11 +1085,12 @@ def render_sidebar_episode_selector() -> str | None:
         st.sidebar.info("No episodes yet — upload one to get started.")
         return None
 
-    # Sort by created_at descending (most recent first)
-    # Fallback to ep_id sorting if created_at is missing
+    # Sort by updated_at descending (most recently worked on first)
+    # Fallback to created_at, then ep_id for stable sorting
     def sort_key(ep: Dict[str, Any]) -> tuple:
+        updated_at = ep.get("updated_at", "")
         created_at = ep.get("created_at", "")
-        return (created_at, ep.get("ep_id", ""))
+        return (updated_at, created_at, ep.get("ep_id", ""))
 
     episodes = sorted(episodes, key=sort_key, reverse=True)
 
@@ -1184,6 +1211,17 @@ def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[st
         raise RuntimeError("init_page() must be called before API access")
     timeout = kwargs.pop("timeout", 60)
     resp = requests.post(f"{base}{path}", json=json or {}, timeout=timeout, **kwargs)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_patch(path: str, json: Dict[str, Any] | None = None, **kwargs) -> Dict[str, Any]:
+    """Send a PATCH request to the API."""
+    base = st.session_state.get("api_base")
+    if not base:
+        raise RuntimeError("init_page() must be called before API access")
+    timeout = kwargs.pop("timeout", 60)
+    resp = requests.patch(f"{base}{path}", json=json or {}, timeout=timeout, **kwargs)
     resp.raise_for_status()
     return resp.json()
 
