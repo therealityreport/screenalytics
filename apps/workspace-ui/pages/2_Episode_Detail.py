@@ -2865,8 +2865,10 @@ if autorun_active:
             pass
         return None
 
-    # Helper: Get manifest file mtime (returns 0 if doesn't exist)
-    def _get_manifest_mtime(filename: str) -> float:
+    # Helper: Get manifest file mtime (returns 0 if doesn't exist).
+    # NOTE: Avoid shadowing the global `_get_manifest_mtime(ep_id, phase)` helper used by
+    # `_should_retry_phase_trigger()` later in this file (auto-run retry path).
+    def _get_manifest_file_mtime(filename: str) -> float:
         manifest_path = helpers.DATA_ROOT / "manifests" / ep_id / filename
         try:
             if manifest_path.exists():
@@ -2877,7 +2879,7 @@ if autorun_active:
 
     # Helper: Check if manifest was updated recently (within N seconds)
     def _is_manifest_fresh(filename: str, max_age_sec: float = 120.0) -> bool:
-        mtime = _get_manifest_mtime(filename)
+        mtime = _get_manifest_file_mtime(filename)
         return mtime > 0 and (time.time() - mtime) < max_age_sec
 
     def _get_progress_mtime() -> float:
@@ -2912,7 +2914,7 @@ if autorun_active:
             st.session_state[f"{ep_id}::autorun_started_at"] = autorun_started_at
 
         # Check if tracks manifest is from current auto-run session
-        tracks_manifest_mtime = _get_manifest_mtime("tracks.jsonl")
+        tracks_manifest_mtime = _get_manifest_file_mtime("tracks.jsonl")
         tracks_manifest_from_current_run = tracks_manifest_mtime > detect_baseline
 
         # Also check run marker mtime as additional signal
@@ -3057,7 +3059,7 @@ if autorun_active:
         faces_baseline = st.session_state.get(f"{ep_id}::autorun_faces_baseline_mtime", autorun_started_at)
 
         # Check manifest mtime - must be newer than when auto-run started
-        faces_manifest_mtime = _get_manifest_mtime("faces.jsonl")
+        faces_manifest_mtime = _get_manifest_file_mtime("faces.jsonl")
         faces_manifest_from_current_run = faces_manifest_mtime > faces_baseline
 
         # Also check run marker mtime - this is written when faces_embed completes
