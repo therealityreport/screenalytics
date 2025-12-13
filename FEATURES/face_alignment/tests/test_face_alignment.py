@@ -457,7 +457,7 @@ class TestSmokeWithRealFAN:
     """
     Smoke tests that require the real face-alignment package.
 
-    Run with: pytest FEATURES/face-alignment/tests/ -v -m slow
+    Run with: pytest FEATURES/face_alignment/tests/ -v -m slow
 
     These tests are marked @pytest.mark.slow and skipped by default.
     """

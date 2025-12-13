@@ -347,7 +347,7 @@ class TestSmokeWithTensorRT:
     """
     Smoke tests that require TensorRT installation.
 
-    Run with: pytest FEATURES/arcface-tensorrt/tests/ -v -m slow
+    Run with: pytest FEATURES/arcface_tensorrt/tests/ -v -m slow
     """
 
     @pytest.mark.slow

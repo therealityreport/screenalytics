@@ -1,12 +1,12 @@
 # TODO: ArcFace TensorRT + ONNXRuntime Embedding Engines
 
 Version: 1.0
-Status: IN_PROGRESS
+Status: PARTIAL (TensorRT implemented; registry/service planned)
 Owner: Engineering
 Created: 2025-12-11
 TTL: 2026-01-10
 
-**Feature Sandbox:** `FEATURES/embedding-engines/`
+**Feature Sandbox:** `FEATURES/arcface_tensorrt/` (implementation), `FEATURES/embedding_engines/` (planning/docs)
 
 ---
 
@@ -54,7 +54,7 @@ pip install insightface>=0.7.0
 
 **Goal:** Build and deploy TensorRT engine for ArcFace embedding.
 
-- [ ] **A1.** Create `FEATURES/embedding-engines/src/tensorrt_arcface.py`
+- [x] **A1.** Implement TensorRT inference wrapper: `FEATURES/arcface_tensorrt/src/tensorrt_inference.py`
   ```python
   class TensorRTArcFace:
       """
@@ -80,7 +80,7 @@ pip install insightface>=0.7.0
           """
   ```
 
-- [ ] **A2.** Implement engine building
+- [x] **A2.** Implement engine building + caching: `FEATURES/arcface_tensorrt/src/tensorrt_builder.py`
   ```python
   def build_trt_engine(
       onnx_path: str,
@@ -113,7 +113,7 @@ pip install insightface>=0.7.0
       ...
   ```
 
-- [ ] **A3.** Implement S3/MinIO engine storage
+- [x] **A3.** Implement optional S3 engine download/upload (boto3): `FEATURES/arcface_tensorrt/src/tensorrt_builder.py`
   ```python
   class EngineStorage:
       """
@@ -136,7 +136,7 @@ pip install insightface>=0.7.0
           """Upload built engine to S3."""
   ```
 
-- [ ] **A4.** Add local build fallback
+- [x] **A4.** Add local build/load fallback: `build_or_load_engine()` in `FEATURES/arcface_tensorrt/src/tensorrt_builder.py`
   ```python
   def get_or_build_engine(config: EngineConfig) -> str:
       """
@@ -158,29 +158,34 @@ pip install insightface>=0.7.0
           return build_trt_engine(onnx_path, local_path, config)
   ```
 
-- [ ] **A5.** Create config: `config/pipeline/embedding.yaml`
+- [x] **A5.** Create config: `config/pipeline/embedding.yaml`
   ```yaml
   embedding:
-    backend: tensorrt           # tensorrt | pytorch | onnx
+    backend: pytorch                 # pytorch | tensorrt
+    tensorrt_config: config/pipeline/arcface_tensorrt.yaml
 
-    tensorrt:
-      precision: fp16           # fp16 | fp32 | int8
-      batch_size: 32
-      max_batch_size: 64
-      workspace_gb: 2.0
+  tensorrt:
+    precision: fp16                  # fp16 | fp32 | int8
+    batch_size: 32
+    max_batch_size: 64
+    workspace_gb: 2.0
 
-    storage:
-      type: s3                  # s3 | local
-      bucket: screenalytics-models
-      prefix: engines/
-      cache_dir: ~/.cache/screenalytics/engines
+  storage:
+    type: s3                         # s3 | local
+    bucket: screenalytics-models
+    prefix: engines/
+    cache_dir: ~/.cache/screenalytics/engines
 
-    fallback:
-      build_locally: true       # Build if not in S3
-      fallback_to_pytorch: true # Use PyTorch if TRT fails
+  fallback:
+    build_locally: true
+    fallback_to_pytorch: true
+
+  validation:
+    enabled: true
+    max_drift_cosine: 0.001
   ```
 
-- [ ] **A6.** Write tests: `FEATURES/embedding-engines/tests/test_tensorrt_embedding.py`
+- [x] **A6.** Write tests: `FEATURES/arcface_tensorrt/tests/test_tensorrt_embedding.py`
   - Test engine loading and inference
   - Test batch inference
   - Test precision modes (fp16, fp32)
@@ -197,7 +202,9 @@ pip install insightface>=0.7.0
 
 **Goal:** Ensure TensorRT embeddings match PyTorch reference.
 
-- [ ] **B1.** Create `FEATURES/embedding-engines/src/arcface_pytorch.py`
+- [x] **B1.** Use `insightface` as the reference ArcFace runtime (in-process)
+  - Pipeline runtime: `tools/episode_run.py` (default backend)
+  - Model fetch: `scripts/fetch_models.py`
   ```python
   class PyTorchArcFace:
       """
@@ -214,7 +221,7 @@ pip install insightface>=0.7.0
           ...
   ```
 
-- [ ] **B2.** Implement embedding comparison
+- [x] **B2.** Implement embedding comparison: `FEATURES/arcface_tensorrt/src/embedding_compare.py`
   ```python
   def compare_embeddings(
       pytorch_embeddings: np.ndarray,
@@ -235,7 +242,7 @@ pip install insightface>=0.7.0
       )
   ```
 
-- [ ] **B3.** Create regression test suite
+- [x] **B3.** Provide parity utilities + unit coverage (GPU parity still needs real hardware)
   ```python
   def run_embedding_regression_tests(
       eval_faces: np.ndarray,
@@ -259,7 +266,7 @@ pip install insightface>=0.7.0
       return True
   ```
 
-- [ ] **B4.** Add drift check config
+- [x] **B4.** Add drift check config
   ```yaml
   # config/pipeline/embedding.yaml
   validation:
@@ -269,7 +276,9 @@ pip install insightface>=0.7.0
     run_on_startup: true        # Validate when loading engine
   ```
 
-- [ ] **B5.** Write tests: `FEATURES/embedding-engines/tests/test_embedding_regression.py`
+- [x] **B5.** Write tests (synthetic/unit + ML-gated)
+  - `FEATURES/arcface_tensorrt/tests/test_tensorrt_embedding.py`
+  - `tests/ml/test_arcface_embeddings.py` (ML-gated; validates embedding invariants)
   - Test PyTorch vs TensorRT on eval set
   - Test different batch sizes produce same results
   - Test FP16 vs FP32 drift
@@ -285,7 +294,7 @@ pip install insightface>=0.7.0
 
 **Goal:** Unified interface for multiple embedding backends.
 
-- [ ] **C1.** Create `FEATURES/embedding-engines/src/engine_registry.py`
+- [ ] **C1.** Create `FEATURES/embedding_engines/src/engine_registry.py` (optional; `FEATURES/embedding_engines/` is docs-only today)
   ```python
   class EmbeddingEngine(Protocol):
       """Protocol for embedding backends."""
@@ -333,7 +342,9 @@ pip install insightface>=0.7.0
       ...
   ```
 
-- [ ] **C2.** Update pipeline to use registry
+- [x] **C2.** Backend is switchable via config today
+  - `config/pipeline/embedding.yaml` selects `embedding.backend: pytorch|tensorrt`
+  - `tools/episode_run.py` uses `get_embedding_backend()` to select + initialize the backend
   ```python
   # In tools/episode_run.py
   def _init_embedder(config: EmbedConfig) -> EmbeddingEngine:
@@ -343,7 +354,7 @@ pip install insightface>=0.7.0
       )
   ```
 
-- [ ] **C3.** Add automatic fallback
+- [x] **C3.** Automatic fallback exists (TRT → PyTorch) via embedding config + backend loader
   ```python
   class FallbackEmbedder(EmbeddingEngine):
       """
@@ -431,10 +442,10 @@ pip install insightface>=0.7.0
 
 ### Code Integration
 
-- [ ] Update `tools/episode_run.py`:
-  - Replace `ArcFaceEmbedder` with `EngineRegistry.get()`
-  - Add engine selection in `_init_models()`
-  - Add embedding validation on startup
+- [x] Backend selection + fallback integrated in `tools/episode_run.py`
+  - Backend loader: `get_embedding_backend()` (selects `pytorch` vs `tensorrt`)
+  - Config: `config/pipeline/embedding.yaml` + `config/pipeline/arcface_tensorrt.yaml`
+  - Validation knobs: `embedding.yaml` → `validation.*` (runtime behavior may be environment-dependent)
 
 - [ ] Update `py_screenalytics/pipeline/constants.py`:
   - Add engine storage paths
@@ -442,8 +453,9 @@ pip install insightface>=0.7.0
 
 ### Config Integration
 
-- [ ] Create `config/pipeline/embedding.yaml`
-- [ ] Update `EpisodeRunConfig` with embedding backend fields
+- [x] `config/pipeline/embedding.yaml` (backend selection + gating + validation)
+- [x] `config/pipeline/arcface_tensorrt.yaml` (TensorRT builder/runtime configuration)
+- [ ] Update `EpisodeRunConfig` with embedding backend fields (only if exposing via API payload/schema)
 
 ### CI/CD Integration
 
@@ -539,5 +551,5 @@ def benchmark_embedder(
 ## Related Documents
 
 - [Feature Overview](../features/vision_alignment_and_body_tracking.md)
-- [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) - Section 3.13
+- [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) - Section 3.14
 - [Skill: embedding-engine](../../.claude/skills/embedding-engine/SKILL.md)

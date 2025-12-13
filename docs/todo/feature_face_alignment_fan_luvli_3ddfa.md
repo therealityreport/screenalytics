@@ -6,7 +6,7 @@ Owner: Engineering
 Created: 2025-12-11
 TTL: 2026-01-10
 
-**Feature Sandbox:** `FEATURES/face-alignment/`
+**Feature Sandbox:** `FEATURES/face_alignment/`
 
 ---
 
@@ -45,37 +45,33 @@ pip install face-alignment>=1.3.5
 
 **Goal:** Replace InsightFace 5-point with FAN 68-point for better alignment.
 
-- [ ] **A1.** Create `FEATURES/face-alignment/src/fan_aligner.py`
-  - Implement `FAN2DAligner` class
-  - Load pretrained FAN model (s3fd detector + 2D landmarks)
-  - Input: BGR image + bbox → Output: 68 landmarks + confidence
+- [x] **A1.** Implement FAN aligner + aligned-face schema
+  - `FEATURES/face_alignment/src/run_fan_alignment.py` (`FANAligner`, `AlignedFace`)
+  - Lazy-loads the `face-alignment` model; bbox-in → 68 landmarks (+ optional aligned crop)
 
-- [ ] **A2.** Implement landmark-to-alignment transform
-  - Define 5-point subset from 68 for ArcFace alignment (eyes, nose)
-  - Implement similarity transform to 112x112 aligned crop
-  - Preserve compatibility with InsightFace `face_align.norm_crop()`
+- [x] **A2.** Implement landmark→ArcFace alignment transform
+  - 68→5 point subset + similarity transform to 112×112 crops (ArcFace size)
 
-- [ ] **A3.** Modify `_prepare_face_crop()` in `tools/episode_run.py`
-  - Add `aligner` config switch: `fan_2d` | `insightface`
-  - Default to `fan_2d`, fallback to `insightface` if FAN fails
-  - Log alignment source for debugging
+- [ ] **A3.** Decide main-pipeline integration approach (do not import from `FEATURES/**`)
+  - Current integration is artifact-based: `tools/episode_run.py` can *consume* `alignment_quality` from `face_alignment/aligned_faces.jsonl` for embedding gating.
+  - If crop generation is needed in the main pipeline, **promote** required code out of `FEATURES/` (CI blocks production imports from `FEATURES/**`).
 
-- [ ] **A4.** Create config: `config/pipeline/alignment.yaml`
+- [x] **A4.** Create config: `config/pipeline/face_alignment.yaml`
   ```yaml
-  aligner: fan_2d              # fan_2d | fan_3d | insightface
-  fan_2d:
-    detector: s3fd             # s3fd | blazeface
-    device: auto               # auto | cuda | cpu
-    flip_input: false          # horizontal flip for augmentation
-
-  fallback_on_failure: true    # Use insightface if FAN fails
+  face_alignment:
+    enabled: true
+    model:
+      type: 2d                 # 2d | 3d
+      landmarks_type: 2D       # 2D | 3D | 2.5D
+    processing:
+      stride: 1
+      batch_size: 16
+      device: auto
   ```
 
-- [ ] **A5.** Write unit tests: `FEATURES/face-alignment/tests/test_fan_alignment.py`
-  - Test landmark detection on frontal/profile faces
-  - Test alignment transform produces 112x112 crops
-  - Test fallback behavior when FAN fails
-  - Benchmark: FAN vs InsightFace on 100 test faces
+- [x] **A5.** Write tests: `FEATURES/face_alignment/tests/test_face_alignment.py`
+  - Includes synthetic fixtures and math/crop validation
+  - Real-model validation remains environment-dependent (`face-alignment` install + weights)
 
 **Acceptance Criteria (Phase A):**
 - [ ] FAN detects 68 landmarks on ≥95% of faces where InsightFace succeeds
@@ -90,11 +86,10 @@ pip install face-alignment>=1.3.5
 
 **Reference:** "LUVLi Face Alignment: Estimating Landmarks' Location, Uncertainty, and Visibility Likelihood" (CVPR 2020)
 
-- [ ] **B1.** Create `FEATURES/face-alignment/src/luvli_quality.py`
-  - Port LUVLi uncertainty estimation from paper/reference implementation
-  - Input: image + landmarks → Output: per-landmark uncertainty + visibility
+- [x] **B1.** Add LUVLi-style scaffolding (heuristic fallback today)
+  - `FEATURES/face_alignment/src/run_luvli_quality.py` provides uncertainty/visibility *shape* but is not a faithful LUVLi port yet.
 
-- [ ] **B2.** Define `alignment_quality` metric
+- [x] **B2.** Define `alignment_quality` metric (heuristic)
   ```python
   def compute_alignment_quality(landmarks, uncertainties, visibilities):
       """
@@ -107,31 +102,19 @@ pip install face-alignment>=1.3.5
       # Normalize to [0, 1]
   ```
 
-- [ ] **B3.** Add quality gating to embedding pipeline
-  - In `tools/episode_run.py`, check `alignment_quality >= min_alignment_quality`
-  - If below threshold, skip embedding (log skip reason)
-  - Store `alignment_quality` in face metadata
+- [x] **B3.** Add quality gating to embedding pipeline (artifact-based)
+  - `tools/episode_run.py` loads `alignment_quality` from `face_alignment/aligned_faces.jsonl` (when present) and gates embeddings via `config/pipeline/embedding.yaml`.
 
-- [ ] **B4.** Update config with quality thresholds
+- [x] **B4.** Add gating knobs in `config/pipeline/embedding.yaml`
   ```yaml
-  # config/pipeline/alignment.yaml
-  quality_gating:
+  # config/pipeline/embedding.yaml
+  face_alignment:
     enabled: true
-    min_alignment_quality: 0.60  # [0, 1], higher = stricter
-
-    # Per-landmark weights for quality computation
-    landmark_weights:
-      eyes: 1.5
-      nose: 1.0
-      mouth: 0.8
-      chin: 0.5
-      ears: 0.3
+    min_alignment_quality: 0.30
   ```
 
-- [ ] **B5.** Write tests: `FEATURES/face-alignment/tests/test_alignment_quality.py`
-  - Test quality computation on known good/bad faces
-  - Test gating correctly filters low-quality faces
-  - Test skip reasons logged correctly
+- [ ] **B5.** Add tests for model-based (true) LUVLi uncertainty
+  - Heuristic quality is covered indirectly in `FEATURES/face_alignment/tests/test_face_alignment.py`.
 
 **Acceptance Criteria (Phase B):**
 - [ ] Quality gate filters 10-30% of faces (tunable via threshold)
@@ -146,7 +129,7 @@ pip install face-alignment>=1.3.5
 
 **Reference:** cleardusk/3DDFA_V2 - "Towards Fast, Accurate and Stable 3D Dense Face Alignment"
 
-- [ ] **C1.** Create `FEATURES/face-alignment/src/ddfa_v2.py`
+- [ ] **C1.** Create `FEATURES/face_alignment/src/ddfa_v2.py`
   - Integrate 3DDFA_V2 model (ONNX or PyTorch)
   - Input: image + bbox → Output: 3DMM params, pose, visibility
 
@@ -181,19 +164,13 @@ pip install face-alignment>=1.3.5
 
 - [ ] **C5.** Update config for 3D alignment
   ```yaml
-  # config/pipeline/alignment.yaml
-  ddfa_v2:
-    enabled: true
-    run_every_n_frames: 10        # Sampling rate
-    run_on_uncertain: true        # Run if alignment_quality < threshold
-    uncertainty_threshold: 0.50   # Trigger 3D below this quality
-
-    pose_limits:
-      max_yaw_for_embedding: 75   # Skip near-profile
-      max_pitch_for_embedding: 60
+  # config/pipeline/face_alignment.yaml
+  head_pose_3d:
+    enabled: false
+    run_every_n_frames: 10
   ```
 
-- [ ] **C6.** Write tests: `FEATURES/face-alignment/tests/test_3ddfa.py`
+- [ ] **C6.** Write tests: `FEATURES/face_alignment/tests/test_3ddfa.py`
   - Test pose extraction accuracy on labeled set
   - Test adaptive execution triggers correctly
   - Test pose-based filtering
@@ -209,11 +186,9 @@ pip install face-alignment>=1.3.5
 
 ### Code Integration
 
-- [ ] Update `tools/episode_run.py`:
-  - Import alignment modules
-  - Add aligner initialization in `_init_models()`
-  - Modify `_prepare_face_crop()` to use configurable aligner
-  - Add alignment_quality to face metadata
+- [ ] If alignment is promoted to production:
+  - Move required code out of `FEATURES/` (CI blocks production imports from `FEATURES/**`)
+  - Decide whether the main pipeline should use aligned crops vs use alignment only for gating/diagnostics
 
 - [ ] Update `py_screenalytics/pipeline/constants.py`:
   - Add alignment artifact paths
@@ -225,13 +200,13 @@ pip install face-alignment>=1.3.5
 
 ### Config Integration
 
-- [ ] Create `config/pipeline/alignment.yaml`
+- [x] Create `config/pipeline/face_alignment.yaml`
 - [ ] Update `EpisodeRunConfig` dataclass with alignment fields
 - [ ] Add alignment section to `config/pipeline/README.md`
 
 ### Testing Integration
 
-- [ ] Move tests from `FEATURES/face-alignment/tests/` to `tests/ml/`
+- [ ] Move tests from `FEATURES/face_alignment/tests/` to `tests/ml/` (only if promoting to production)
 - [ ] Add alignment benchmarks to CI
 - [ ] Add alignment metrics to acceptance checks
 

@@ -46,9 +46,9 @@ pluggable backend architecture, and ONNXRuntime C++ service planning.
 
 ## Promotion Checklist
 
-- [ ] Tests present and passing (`pytest FEATURES/embedding-engines/tests/ -v`)
+- [ ] Tests present and passing (`pytest FEATURES/embedding_engines/tests/ -v`)
 - [ ] Lint clean (`black`, `ruff`, `mypy`)
-- [ ] Docs complete (`FEATURES/embedding-engines/docs/`)
+- [ ] Docs complete (`FEATURES/embedding_engines/docs/`)
 - [ ] Config-driven (no hardcoded thresholds)
 - [ ] Integration tests passing
 - [ ] Row added to `ACCEPTANCE_MATRIX.md` (section 3.13)

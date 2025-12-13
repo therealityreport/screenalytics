@@ -89,10 +89,10 @@ python -m FEATURES.body_tracking --episode-id rhoslc-s06e01 --stage compare
 
 ## Promotion Checklist
 
-- [x] Tests present (`pytest FEATURES/body-tracking/tests/ -v`)
+- [x] Tests present (`pytest FEATURES/body_tracking/tests/ -v`)
 - [ ] Tests passing (requires ultralytics, torchreid dependencies)
 - [ ] Lint clean (`black`, `ruff`, `mypy`)
-- [x] Docs complete (`FEATURES/body-tracking/docs/`)
+- [x] Docs complete (`FEATURES/body_tracking/docs/`)
 - [x] Config-driven (no hardcoded thresholds)
 - [ ] Integration tests with real video
 - [x] Row added to `ACCEPTANCE_MATRIX.md` (sections 3.10, 3.11, 3.12)

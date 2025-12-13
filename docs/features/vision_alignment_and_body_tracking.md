@@ -2,7 +2,7 @@
 
 Version: 1.0
 Status: In Development
-Last Updated: 2025-12-11
+Last Updated: 2025-12-13
 
 ---
 
@@ -99,21 +99,29 @@ Video Frames
 
 ## Feature Modules
 
+**Current reality (as of this doc update):**
+- Face alignment + body tracking are **FEATURE sandbox modules** you run explicitly (`python -m FEATURES.face_alignment`, `python -m FEATURES.body_tracking`).
+- The “main” detect→embed pipeline consumes their outputs **only if artifacts exist** (e.g., embedding gating reads `face_alignment/aligned_faces.jsonl`; screentime reads `body_tracking/screentime_comparison.json`).
+- TensorRT embeddings are a **selectable backend** via `config/pipeline/embedding.yaml` and `tools/episode_run.py`.
+- Vision analytics (mesh/visibility/gaze/centerface) is **planned-only** (configs + TODOs exist; no runnable `FEATURES/vision_analytics/src/` yet).
+
+See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_alignment_body_tracking_status.md)
+
 ### 1. Face Alignment (Priority 1)
 
 | Component | Library | Purpose |
 |-----------|---------|---------|
 | FAN 2D | face-alignment 1.3.5+ | 68-point 2D landmarks |
-| LUVLi | custom integration | Per-landmark uncertainty |
-| 3DDFA_V2 | cleardusk/3DDFA_V2 | 3D head pose (selective) |
+| LUVLi (style) | heuristic + scaffolding | Uncertainty/visibility fields (not true LUVLi yet) |
+| 3DDFA_V2 | planned | 3D head pose (selective) |
 
 **Integration Points:**
-- `tools/episode_run.py:2033` - `_prepare_face_crop()` function
-- `tools/episode_run.py:1710` - `ArcFaceEmbedder` class
+- Run alignment (sandbox): `FEATURES/face_alignment/src/face_alignment_runner.py` (`python -m FEATURES.face_alignment`)
+- Consume quality for embedding gating: `_load_alignment_quality_index()` in `tools/episode_run.py`
 
-**Config:** `config/pipeline/alignment.yaml`
+**Config:** `config/pipeline/face_alignment.yaml` (canonical)
 
-**Feature Sandbox:** `FEATURES/face-alignment/`
+**Feature Sandbox:** `FEATURES/face_alignment/`
 
 **TODO Doc:** [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](../todo/feature_face_alignment_fan_luvli_3ddfa.md)
 
@@ -129,12 +137,12 @@ Video Frames
 | Track Fusion | custom | Face↔body association |
 
 **Integration Points:**
-- `tools/episode_run.py:1309` - `ByteTrackAdapter` (reuse for body)
-- `tools/episode_run.py:982` - `DetectionSample` dataclass
+- Run pipeline (sandbox): `FEATURES/body_tracking/src/body_tracking_runner.py` (`python -m FEATURES.body_tracking`)
+- Screentime reads comparison artifact (if present): `apps/api/services/screentime.py`
 
 **Config:** `config/pipeline/body_detection.yaml`, `config/pipeline/track_fusion.yaml`
 
-**Feature Sandbox:** `FEATURES/body-tracking/`
+**Feature Sandbox:** `FEATURES/body_tracking/`
 
 **TODO Doc:** [docs/todo/feature_body_tracking_reid_fusion.md](../todo/feature_body_tracking_reid_fusion.md)
 
@@ -144,18 +152,19 @@ Video Frames
 
 | Component | Backend | Purpose |
 |-----------|---------|---------|
-| TensorRT ArcFace | tensorrtx / ONNX→TRT | GPU-optimized FP16 inference |
-| PyTorch Reference | InsightFace_Pytorch | Training/evaluation baseline |
-| ONNXRuntime C++ | Future | High-load microservice |
+| TensorRT ArcFace | ONNX→TRT | GPU-optimized FP16 inference |
+| PyTorch/ONNX Runtime (in-proc) | `insightface` Python package | Reference runtime (models via `scripts/fetch_models.py`) |
+| ONNXRuntime C++ | planned | High-load microservice (future architecture) |
 
 **Integration Points:**
-- `tools/episode_run.py:1710` - `ArcFaceEmbedder` class (replace/extend)
+- Backend selection: `config/pipeline/embedding.yaml` + `tools/episode_run.py`
+- TensorRT implementation: `FEATURES/arcface_tensorrt/src/`
 
 **Storage:** S3/MinIO with versioning: `{model}-{version}-sm{arch}.trt`
 
 **Config:** `config/pipeline/embedding.yaml`
 
-**Feature Sandbox:** `FEATURES/embedding-engines/`
+**Feature Sandbox:** `FEATURES/arcface_tensorrt/` (implementation), `FEATURES/embedding_engines/` (docs-only planning)
 
 **TODO Doc:** [docs/todo/feature_arcface_tensorrt_onnxruntime.md](../todo/feature_arcface_tensorrt_onnxruntime.md)
 
@@ -172,15 +181,19 @@ Video Frames
 
 **Config:** `config/pipeline/analytics.yaml`
 
-**Feature Sandbox:** `FEATURES/vision-analytics/`
+**Feature Sandbox:** `FEATURES/vision_analytics/` (docs-only today)
 
 **TODO Doc:** [docs/todo/feature_mesh_and_advanced_visibility.md](../todo/feature_mesh_and_advanced_visibility.md)
 
 ---
 
-## Data Schema Extensions
+## Data Schema Extensions (Proposed / Future)
 
-### Extended Track Schema (`tracks.jsonl`)
+The schemas below describe a **target** model, not a production guarantee today.
+Current implementations write dedicated artifacts under `data/manifests/{ep_id}/face_alignment/` and
+`data/manifests/{ep_id}/body_tracking/` (see the audit doc linked above).
+
+### Proposed Track Schema (`tracks.jsonl`)
 
 ```json
 {
@@ -202,7 +215,7 @@ Video Frames
 }
 ```
 
-### Extended Identity Schema (`identities.json`)
+### Proposed Identity Schema (`identities.json`)
 
 ```json
 {
@@ -226,11 +239,11 @@ Video Frames
 
 | Feature | Config Flag | Rollback Behavior |
 |---------|-------------|-------------------|
-| FAN Alignment | `aligner: insightface` | Use 5-point InsightFace |
-| Quality Gate | `alignment_gate_enabled: false` | Skip quality check |
-| Body Tracking | `body_tracking_enabled: false` | Face-only mode |
-| TensorRT | `embedding_backend: pytorch` | PyTorch fallback |
-| Face Mesh | `mesh_enabled: false` | Skip mesh inference |
+| FAN Alignment | `config/pipeline/face_alignment.yaml` → `face_alignment.enabled: false` | Do not generate alignment artifacts |
+| Quality Gate | `config/pipeline/embedding.yaml` → `face_alignment.enabled: false` or `min_alignment_quality: 0.0` | Disable gating |
+| Body Tracking | `config/pipeline/body_detection.yaml` → `body_tracking.enabled: false` | Face-only mode |
+| TensorRT | `config/pipeline/embedding.yaml` → `embedding.backend: pytorch` | PyTorch fallback |
+| Face Mesh | `config/pipeline/analytics.yaml` → `face_mesh.enabled: false` | Skip mesh inference (planned-only today) |
 
 ---
 
@@ -239,6 +252,7 @@ Video Frames
 - [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) - Sections 3.7-3.15
 - [Feature sandboxes](feature_sandboxes.md) - Feature sandbox workflow
 - [docs/pipeline/overview.md](../pipeline/overview.md) - Existing pipeline docs
+- [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_alignment_body_tracking_status.md) - Code-vs-docs audit
 
 ---
 

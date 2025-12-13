@@ -51,9 +51,9 @@ Targets 5x+ speedup over PyTorch with < 0.5% accuracy loss.
 
 ## Promotion Checklist
 
-- [ ] Tests present and passing (`pytest FEATURES/arcface-tensorrt/tests/ -v`)
+- [ ] Tests present and passing (`pytest FEATURES/arcface_tensorrt/tests/ -v`)
 - [ ] Lint clean (`black`, `ruff`, `mypy`)
-- [ ] Docs complete (`FEATURES/arcface-tensorrt/docs/`)
+- [ ] Docs complete (`FEATURES/arcface_tensorrt/docs/`)
 - [ ] Config-driven (no hardcoded paths)
 - [ ] Comparison passes acceptance threshold
 - [ ] Row added to `ACCEPTANCE_MATRIX.md` (section 3.14)

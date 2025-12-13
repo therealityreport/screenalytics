@@ -141,7 +141,7 @@ It merges legacy Codex review guidance with current operational guardrails.
 **Scope:** Person detection, tracking, Re-ID, and face↔body fusion.
 
 **Owns:**
-- `FEATURES/body-tracking/src/` - Body tracking implementation
+- `FEATURES/body_tracking/src/` - Body tracking implementation
 - `config/pipeline/body_detection.yaml` - Detection and Re-ID config
 - `config/pipeline/track_fusion.yaml` - Fusion rules
 
@@ -174,7 +174,7 @@ It merges legacy Codex review guidance with current operational guardrails.
 **Scope:** Face alignment, landmark extraction, and quality gating.
 
 **Owns:**
-- `FEATURES/face-alignment/src/` - Alignment implementation
+- `FEATURES/face_alignment/src/` - Alignment implementation
 - `config/pipeline/face_alignment.yaml` - Alignment config
 
 **Key Tasks:**
@@ -189,8 +189,7 @@ It merges legacy Codex review guidance with current operational guardrails.
 
 **Config Flags (rollback levers):**
 - `face_alignment.enabled: false` - Disable alignment
-- `face_alignment.aligner: insightface` - Revert to 5-point
-- `quality_gating.enabled: false` - Disable quality gate
+- Disable embedding gating: `config/pipeline/embedding.yaml` → `face_alignment.enabled: false` (or set `min_alignment_quality: 0.0`)
 
 **Acceptance Matrix:** Sections 3.7-3.9
 
