@@ -165,6 +165,52 @@ class EpisodeStore:
         records = [EpisodeRecord(**data) for data in content.values()]  # type: ignore[arg-type]
         return sorted(records, key=lambda record: record.updated_at, reverse=True)
 
+    def update_metadata(
+        self,
+        *,
+        ep_id: str,
+        title: Optional[str] = None,
+        air_date: Optional[date | str] = None,
+    ) -> EpisodeRecord:
+        """Update metadata fields for an existing episode.
+
+        Only updates fields that are explicitly provided (not None).
+        Always updates updated_at timestamp.
+
+        Args:
+            ep_id: Episode identifier
+            title: New title (or None to keep existing)
+            air_date: New air date (or None to keep existing)
+
+        Returns:
+            Updated EpisodeRecord
+
+        Raises:
+            ValueError: If episode does not exist
+        """
+        ep_id = self.normalize_ep_id(ep_id)
+        content = self._read()
+
+        if ep_id not in content:
+            raise ValueError(f"Episode {ep_id} not found")
+
+        record = content[ep_id].copy()
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        # Only update fields that were explicitly provided
+        if title is not None:
+            record["title"] = title if title else None
+        if air_date is not None:
+            record["air_date"] = (
+                air_date.isoformat() if isinstance(air_date, date) else air_date
+            ) if air_date else None
+
+        record["updated_at"] = now
+        content[ep_id] = record
+        self._write(content)
+
+        return EpisodeRecord(**record)  # type: ignore[arg-type]
+
     def delete(self, ep_id: str) -> bool:
         ep_id = self.normalize_ep_id(ep_id)
         content = self._read()

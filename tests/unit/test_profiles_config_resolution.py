@@ -131,15 +131,15 @@ def test_all_job_types_support_profile() -> None:
 
 
 def test_profile_resolution_order_documentation() -> None:
-    """Verify that profile resolution order is documented in API.md."""
-    api_doc_path = PROJECT_ROOT / "API.md"
-    assert api_doc_path.exists(), "API.md not found"
+    """Verify that profile resolution order is documented in docs/reference/api.md."""
+    api_doc_path = PROJECT_ROOT / "docs" / "reference" / "api.md"
+    assert api_doc_path.exists(), "docs/reference/api.md not found"
 
     content = api_doc_path.read_text(encoding="utf-8")
 
     # Check for profile resolution order documentation
     assert "Profile Resolution Order" in content, \
-        "Profile Resolution Order section missing from API.md"
+        "Profile Resolution Order section missing from docs/reference/api.md"
 
     # Check for the correct precedence order
     precedence_keywords = [
@@ -156,11 +156,11 @@ def test_profile_resolution_order_documentation() -> None:
 
 
 def test_config_guide_documents_profiles() -> None:
-    """Verify that CONFIG_GUIDE.md documents all profile names."""
-    config_guide_path = PROJECT_ROOT / "CONFIG_GUIDE.md"
+    """Verify that docs/reference/config/pipeline_configs.md documents all profile names."""
+    config_guide_path = PROJECT_ROOT / "docs" / "reference" / "config" / "pipeline_configs.md"
 
     if not config_guide_path.exists():
-        pytest.skip("CONFIG_GUIDE.md not found")
+        pytest.skip("docs/reference/config/pipeline_configs.md not found")
 
     content = config_guide_path.read_text(encoding="utf-8")
 
@@ -169,7 +169,7 @@ def test_config_guide_documents_profiles() -> None:
 
     for profile in profile_names:
         assert profile in content, \
-            f"Profile '{profile}' not documented in CONFIG_GUIDE.md"
+            f"Profile '{profile}' not documented in docs/reference/config/pipeline_configs.md"
 
 
 def test_acceptance_matrix_references_metrics() -> None:

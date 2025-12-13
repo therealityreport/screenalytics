@@ -41,7 +41,9 @@ screenalytics/
 │   │   ├── tracking-strict.yaml # Strict tracking variant
 │   │   ├── faces_embed_sampling.yaml  # Faces harvest quality gating
 │   │   ├── performance_profiles.yaml  # Device-aware performance profiles
-│   │   ├── audio.yaml           # Pyannote/Whisper settings (TBD)
+│   │   ├── audio.yaml           # NeMo diarization + ASR settings
+│   │   ├── body_detection.yaml  # Body tracking (YOLO + ByteTrack + Re-ID)
+│   │   ├── track_fusion.yaml    # Face↔body fusion rules
 │   │   └── screen_time_v2.yaml  # Screentime DAG + presets
 │   ├── agents/                  # Agent policies
 │   │   └── policies.yaml        # Agent write rules
@@ -115,23 +117,22 @@ screenalytics/
 │
 ├── .github/                     # CI/CD workflows and promotion checks (ENFORCED)
 │   └── workflows/
+│       ├── ci.yml               # Lint + unit tests + smoke dry-run
 │       ├── on-push-doc-sync.yml # Auto-sync docs on push
-│       ├── feature-promote.yml  # Feature promotion checks
-│       └── doc-policy.yml       # Acceptance matrix validation
+│       ├── codex-review.yml     # Automated PR review (Codex)
+│       ├── codex-manual.yml     # Manual Codex workflow trigger
+│       └── claude-review.yml    # Automated PR review (Claude)
 │
-└── (root files)                 # Top-level docs and config
-    ├── README.md                # High-level entrypoint (quickstart, pipeline summary)
+└── (root files)                 # Minimal root entrypoints / CI gates
+    ├── README.md                # High-level entrypoint (quickstart, links)
     ├── SETUP.md                 # Environment bootstrap and infra
-    ├── PRD.md                   # Product requirements
-    ├── API.md                   # API endpoint reference
-    ├── SOLUTION_ARCHITECTURE.md # Thin entrypoint → docs/architecture/
-    ├── DIRECTORY_STRUCTURE.md   # Thin entrypoint → docs/architecture/
-    ├── CONFIG_GUIDE.md          # Thin entrypoint → docs/reference/config/
-    ├── ACCEPTANCE_MATRIX.md     # Quality gates and acceptance criteria
-    ├── FEATURES_GUIDE.md        # Feature sandbox workflow
+    ├── ACCEPTANCE_MATRIX.md     # Quality gates and acceptance criteria (CI/test referenced)
+    ├── CONTRIBUTING.md          # Contribution workflow
+    ├── AGENTS.md                # Repo agent policy
+    ├── LICENSE                  # Project license
     ├── .env.example             # Environment variable template
     ├── requirements.txt         # Python dependencies
-    ├── pyproject.toml           # Python project metadata (uv)
+    ├── pyproject.toml           # Python project metadata
     └── ...                      # Other root files
 ```
 
@@ -238,9 +239,9 @@ FEATURES/<feature>/
 ┌─────────────────────────────────────────────────────────────────┐
 │ 5. Agents Auto-Update Docs                                      │
 │    - README.md (pipeline summary, quickstart)                   │
-│    - PRD.md (feature addition under "Core Features")            │
-│    - SOLUTION_ARCHITECTURE.md (component/path updates)          │
-│    - DIRECTORY_STRUCTURE.md (tree and descriptions)             │
+│    - docs/product/prd.md (feature addition under "Core Features") │
+│    - docs/architecture/solution_architecture.md (component/path updates) │
+│    - docs/architecture/directory_structure.md (tree and descriptions) │
 │    Playbook: agents/playbooks/update-docs-on-change.yaml        │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -281,9 +282,9 @@ Any file `add`, `delete`, or `rename` event under:
 
 **Behavior:**
 - For each detected file change, open or update:
-  - `SOLUTION_ARCHITECTURE.md` → Adjust affected components/paths
-  - `DIRECTORY_STRUCTURE.md` → Update tree and descriptions
-  - `PRD.md` → Mark feature addition/removal under "Core Features"
+  - `docs/architecture/solution_architecture.md` → Adjust affected components/paths
+  - `docs/architecture/directory_structure.md` → Update tree and descriptions
+  - `docs/product/prd.md` → Mark feature addition/removal under "Core Features"
   - `README.md` → Reflect new/removed directories in "Repository Layout"
 - Commit changes with message:
   ```
@@ -349,16 +350,14 @@ from FEATURES.identity.src.cluster import ClusterExperiment
 
 ## 9. Documentation Hierarchy
 
-### 9.1 Root-Level Docs (Thin Entrypoints)
-- `README.md` — High-level quickstart, pipeline summary
-- `SETUP.md` — Environment bootstrap, infra setup
-- `PRD.md` — Product requirements
-- `API.md` — API endpoint reference
-- `SOLUTION_ARCHITECTURE.md` → Links to `docs/architecture/solution_architecture.md`
-- `DIRECTORY_STRUCTURE.md` → Links to `docs/architecture/directory_structure.md` (this file)
-- `CONFIG_GUIDE.md` → Links to `docs/reference/config/pipeline_configs.md`
-- `ACCEPTANCE_MATRIX.md` — Quality gates and acceptance criteria
-- `FEATURES_GUIDE.md` — Feature sandbox workflow
+### 9.1 Root-Level Docs
+- `README.md` — High-level quickstart and links
+- `SETUP.md` — Environment bootstrap and infra setup
+- `ACCEPTANCE_MATRIX.md` — CI/test-referenced quality gates and thresholds
+- `CONTRIBUTING.md` — Contribution workflow
+- `AGENTS.md` — Repo agent policy and guardrails
+
+Deprecated root docs that have been superseded are archived under `docs/_archive/root_docs/`.
 
 ### 9.2 Deep Documentation (`docs/`)
 - **Architecture:** System design, component diagrams, data model
@@ -370,20 +369,11 @@ from FEATURES.identity.src.cluster import ClusterExperiment
 
 ## 10. CI/CD Workflows
 
-### 10.1 `.github/workflows/on-push-doc-sync.yml`
-- **Trigger:** Push to `main`
-- **Action:** Run Codex playbook to sync docs
-- **Artifacts:** Updated README, PRD, SOLUTION_ARCHITECTURE, DIRECTORY_STRUCTURE
+Selected workflows (see `.github/workflows/` for the full list):
 
-### 10.2 `.github/workflows/feature-promote.yml`
-- **Trigger:** PR labeled `promotion`
-- **Action:** Validate TODO → PROMOTED, tests exist, docs present, imports clean
-- **Gates:** Fail if missing tests, docs, or ACCEPTANCE_MATRIX entry
-
-### 10.3 `.github/workflows/doc-policy.yml`
-- **Trigger:** PR to `main`
-- **Action:** Run `tools/check-acceptance-matrix.py` to block promotion if production feature lacks ✅ entry
-- **Gates:** Fail if promoted code missing from ACCEPTANCE_MATRIX
+- `ci.yml` — Lint/typecheck + unit tests + smoke dry-run
+- `on-push-doc-sync.yml` — Auto-sync docs on push to `main`
+- `codex-review.yml` / `claude-review.yml` — Automated PR review workflows
 
 ---
 
@@ -392,7 +382,7 @@ from FEATURES.identity.src.cluster import ClusterExperiment
 - [Solution Architecture](solution_architecture.md) — System design and data flow
 - [Pipeline Overview](../pipeline/overview.md) — Stage-by-stage pipeline details
 - [Config Reference](../reference/config/pipeline_configs.md) — Key-by-key config docs
-- [FEATURES_GUIDE.md](../../FEATURES_GUIDE.md) — Feature sandbox workflow
+- [Feature sandboxes](../features/feature_sandboxes.md) — Feature sandbox workflow
 - [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) — Quality gates
 
 ---

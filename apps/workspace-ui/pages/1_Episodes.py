@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +168,80 @@ selected_ep_id = st.selectbox(
 if st.button("Open Episode Detail", use_container_width=True, type="primary", key="open_episode_detail_btn"):
     helpers.set_ep_id(selected_ep_id)
     st.switch_page("pages/2_Episode_Detail.py")
+
+# Edit Episode Info section
+st.divider()
+st.markdown("#### Edit Episode Info")
+
+selected_ep = option_lookup.get(selected_ep_id, {})
+edit_key = f"episodes_edit_mode_{selected_ep_id}"
+
+if not st.session_state.get(edit_key):
+    # Display current info with edit button
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption(f"**Title:** {selected_ep.get('title') or '(no title)'}")
+        st.caption(f"**Air Date:** {selected_ep.get('air_date') or '(not set)'}")
+    with col2:
+        if st.button("Edit", key=f"edit_ep_btn_{selected_ep_id}"):
+            st.session_state[edit_key] = True
+            st.rerun()
+else:
+    # Edit form
+    with st.form(f"episode_edit_form_{selected_ep_id}"):
+        st.caption("Update episode metadata. Show/Season/Episode cannot be changed.")
+
+        new_title = st.text_input(
+            "Title",
+            value=selected_ep.get("title") or "",
+            max_chars=200,
+            key=f"edit_title_{selected_ep_id}",
+            placeholder="e.g., Amsterdamn",
+        )
+
+        # Parse existing air_date for date_input
+        existing_date = None
+        if selected_ep.get("air_date"):
+            try:
+                existing_date = datetime.fromisoformat(selected_ep["air_date"]).date()
+            except (ValueError, TypeError):
+                pass
+
+        new_air_date = st.date_input(
+            "Air Date",
+            value=existing_date,
+            key=f"edit_air_date_{selected_ep_id}",
+        )
+
+        btn_cols = st.columns(2)
+        with btn_cols[0]:
+            submit = st.form_submit_button("Save changes", type="primary")
+        with btn_cols[1]:
+            cancel = st.form_submit_button("Cancel")
+
+        if cancel:
+            st.session_state[edit_key] = False
+            st.rerun()
+
+        if submit:
+            payload: dict[str, Any] = {}
+            # Only include changed fields
+            current_title = selected_ep.get("title") or ""
+            if new_title != current_title:
+                payload["title"] = new_title if new_title else None
+            if new_air_date != existing_date:
+                payload["air_date"] = new_air_date.isoformat() if new_air_date else None
+
+            if not payload:
+                st.info("No changes detected.")
+            else:
+                try:
+                    resp = helpers.api_patch(f"/episodes/{selected_ep_id}", json=payload, timeout=30)
+                    st.success(f"Episode {selected_ep_id} updated.")
+                    st.session_state[edit_key] = False
+                    st.rerun()
+                except requests.RequestException as exc:
+                    st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{selected_ep_id}", exc))
 
 st.divider()
 _show_single_delete(selected_ep_id)

@@ -179,9 +179,9 @@ def test_screentime_basic_analysis(temp_episode_data: tuple[str, Path]):
     # Track 1: 1.0s -> 1.5s -> 2.0s (continuous, gaps ≤ 0.5s)
     #   Duration: 2.0 - 1.0 = 1.0s
     # Track 2: 5.0s -> 6.0s (gap = 1.0s > 0.5s tolerance, so two separate intervals)
-    #   Intervals: (5.0, 5.0) = 0.0s and (6.0, 6.0) = 0.0s
-    # Total: 1.0s
-    assert alice_metrics["visual_s"] == 1.0
+    #   Intervals are single-point spans and get a minimum duration to avoid 0s.
+    expected_visual = round(1.0 + (2 * config.min_interval_duration_s), 2)
+    assert alice_metrics["visual_s"] == expected_visual
 
     # Verify track and face counts
     assert alice_metrics["tracks_count"] == 2  # tracks 1 and 2
@@ -194,6 +194,101 @@ def test_screentime_basic_analysis(temp_episode_data: tuple[str, Path]):
     # Verify confidence is calculated
     assert alice_metrics["confidence"] > 0.0
     assert alice_metrics["confidence"] <= 1.0
+
+
+def test_screentime_computes_speaking_time_from_audio_pipeline_outputs(
+    temp_episode_data: tuple[str, Path],
+):
+    """Speaking time should be computed from episode_transcript.jsonl + audio_voice_mapping.json."""
+    ep_id, data_root = temp_episode_data
+    manifests_dir = data_root / "manifests" / ep_id
+
+    # Audio pipeline artifacts (current names)
+    transcript_rows = [
+        {
+            "start": 0.0,
+            "end": 2.0,
+            "speaker_id": "SPK_CAST_ALICE",
+            "speaker_display_name": "Alice",
+            "voice_cluster_id": "VC_01",
+            "voice_bank_id": "voice_cast_alice",
+            "text": "hello",
+            "overlap": False,
+            "secondary_speakers": [],
+        },
+        {
+            "start": 2.0,
+            "end": 5.0,
+            "speaker_id": "SPK_CAST_ALICE",
+            "speaker_display_name": "Alice",
+            "voice_cluster_id": "VC_01",
+            "voice_bank_id": "voice_cast_alice",
+            "text": "world",
+            "overlap": False,
+            "secondary_speakers": [],
+        },
+    ]
+    transcript_path = manifests_dir / "episode_transcript.jsonl"
+    with transcript_path.open("w", encoding="utf-8") as f:
+        for row in transcript_rows:
+            f.write(json.dumps(row) + "\n")
+
+    voice_mapping_path = manifests_dir / "audio_voice_mapping.json"
+    voice_mapping = [
+        {
+            "voice_cluster_id": "VC_01",
+            "voice_bank_id": "voice_cast_alice",
+            "speaker_id": "SPK_CAST_ALICE",
+            "speaker_display_name": "Alice",
+            "similarity": 0.9,
+            "is_new_entry": False,
+        }
+    ]
+    voice_mapping_path.write_text(json.dumps(voice_mapping, indent=2), encoding="utf-8")
+
+    analyzer = ScreenTimeAnalyzer()
+    result = analyzer.analyze_episode(ep_id)
+    metrics = result["metrics"]
+
+    assert len(metrics) == 1
+    assert metrics[0]["cast_id"] == "cast_alice"
+    assert metrics[0]["speaking_s"] == 5.0
+
+
+def test_screentime_audio_legacy_fallback(temp_episode_data: tuple[str, Path]):
+    """Legacy audio artifact names should still be supported for backfills."""
+    ep_id, data_root = temp_episode_data
+    manifests_dir = data_root / "manifests" / ep_id
+
+    transcript_rows = [
+        {
+            "start": 0.0,
+            "end": 3.0,
+            "speaker_id": "SPK_CAST_ALICE",
+            "speaker_display_name": "Alice",
+            "voice_cluster_id": "VC_01",
+            "voice_bank_id": "voice_cast_alice",
+            "text": "legacy",
+            "overlap": False,
+            "secondary_speakers": [],
+        }
+    ]
+    legacy_transcript_path = manifests_dir / "transcript.jsonl"
+    with legacy_transcript_path.open("w", encoding="utf-8") as f:
+        for row in transcript_rows:
+            f.write(json.dumps(row) + "\n")
+
+    legacy_mapping_path = manifests_dir / "voice_bank_mapping.json"
+    legacy_mapping = {"mappings": [{"voice_cluster_id": "VC_01", "cast_id": "cast_alice"}]}
+    legacy_mapping_path.write_text(json.dumps(legacy_mapping, indent=2), encoding="utf-8")
+
+    analyzer = ScreenTimeAnalyzer()
+    result = analyzer.analyze_episode(ep_id)
+    metrics = result["metrics"]
+
+    assert len(metrics) == 1
+    assert metrics[0]["cast_id"] == "cast_alice"
+    assert metrics[0]["speaking_s"] == 3.0
 
 
 def test_screentime_ignores_non_cast(temp_episode_data: tuple[str, Path]):
@@ -242,7 +337,8 @@ def test_screentime_quality_threshold(temp_episode_data: tuple[str, Path], monke
     # Track 2: keeps 6.0s (0.9); drops 5.0s (0.8)
     #   Single point: 6.0s - 6.0s = 0.0s
     # Total: 0.0s
-    assert alice_metrics["visual_s"] == 0.0
+    expected_visual = round(3 * config.min_interval_duration_s, 2)
+    assert alice_metrics["visual_s"] == expected_visual
 
     # Face count should be lower (only high-quality faces)
     # Track 1: 2 faces (quality >= 0.9)
@@ -408,10 +504,14 @@ def test_screentime_confidence_calculation(temp_episode_data: tuple[str, Path], 
     metrics = result["metrics"]
     alice_metrics = metrics[0]
 
-    # Confidence formula: min(1.0, 0.5 + (tracks_count * 0.05))
-    # tracks_count = 2
-    # confidence = 0.5 + (2 * 0.05) = 0.6
-    expected_confidence = min(1.0, 0.5 + (2 * 0.05))
+    # Confidence formula:
+    # base (0.5) + track_bonus (0.025/track, capped) + density_bonus (0.04 * faces/track, capped)
+    tracks_count = alice_metrics["tracks_count"]
+    faces_count = alice_metrics["faces_count"]
+    track_bonus = min(0.3, tracks_count * 0.025)
+    avg_faces_per_track = faces_count / tracks_count if tracks_count else 0.0
+    density_bonus = min(0.2, avg_faces_per_track * 0.04)
+    expected_confidence = round(min(1.0, 0.5 + track_bonus + density_bonus), 3)
     assert alice_metrics["confidence"] == expected_confidence
 
 

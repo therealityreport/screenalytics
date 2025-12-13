@@ -1,6 +1,7 @@
 # Solution Architecture — Screenalytics
 
-**Quick Reference** | [Full Documentation →](docs/architecture/solution_architecture.md)
+
+**Quick Reference** | [Full Documentation →](../../architecture/solution_architecture.md)
 
 ---
 
@@ -79,11 +80,11 @@ Screenalytics transforms raw video episodes into structured, per-person screenti
 
 **For complete details, see:**
 
-- **[Full Solution Architecture](docs/architecture/solution_architecture.md)** — System design, data model, configuration layers
-- **[Directory Structure](docs/architecture/directory_structure.md)** — Repo layout, promotion policy
-- **[Pipeline Overview](docs/pipeline/overview.md)** — Stage-by-stage pipeline guide
-- **[Performance Tuning](docs/ops/performance_tuning_faces_pipeline.md)** — Speed vs accuracy tuning
-- **[Troubleshooting](docs/ops/troubleshooting_faces_pipeline.md)** — Common issues and fixes
+- **[Full Solution Architecture](../../architecture/solution_architecture.md)** — System design, data model, configuration layers
+- **[Directory Structure](../../architecture/directory_structure.md)** — Repo layout, promotion policy
+- **[Pipeline Overview](../../pipeline/overview.md)** — Stage-by-stage pipeline guide
+- **[Performance Tuning](../../ops/performance_tuning_faces_pipeline.md)** — Speed vs accuracy tuning
+- **[Troubleshooting](../../ops/troubleshooting_faces_pipeline.md)** — Common issues and fixes
 
 ---
 

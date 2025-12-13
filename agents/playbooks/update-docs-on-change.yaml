@@ -6,19 +6,19 @@ steps:
       into: "docs_summary"
       from: "${changed_files}"
   - write:
-      path: "SOLUTION_ARCHITECTURE.md"
+      path: "docs/architecture/solution_architecture.md"
       mode: patch
       content_from_prompt: |
         Update affected components/paths based on:
         ${docs_summary}
   - write:
-      path: "DIRECTORY_STRUCTURE.md"
+      path: "docs/architecture/directory_structure.md"
       mode: patch
       content_from_prompt: |
         Update tree map and folder descriptions for:
         ${docs_summary}
   - write:
-      path: "PRD.md"
+      path: "docs/product/prd.md"
       mode: patch
       content_from_prompt: |
         Reflect feature additions/removals under Core Features for:

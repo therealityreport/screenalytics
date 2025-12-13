@@ -237,7 +237,7 @@ Video Frames
 ## Related Documentation
 
 - [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) - Sections 3.7-3.15
-- [FEATURES_GUIDE.md](../../FEATURES_GUIDE.md) - Feature sandbox workflow
+- [Feature sandboxes](feature_sandboxes.md) - Feature sandbox workflow
 - [docs/pipeline/overview.md](../pipeline/overview.md) - Existing pipeline docs
 
 ---

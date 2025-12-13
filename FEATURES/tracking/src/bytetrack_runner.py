@@ -5,7 +5,7 @@ The implementation favors deterministic behaviour suitable for CI:
 * Detections are filtered by `track_thresh`.
 * Tracks are matched via IoU with a configurable `match_thresh`.
 * Tracks remain active for `track_buffer` frames of inactivity.
-* Output adheres to `track_v1` (DATA_SCHEMA.md) and adds basic stats.
+* Output adheres to `track_v1` (docs/reference/data_schema.md) and adds basic stats.
 """
 
 from __future__ import annotations

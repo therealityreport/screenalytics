@@ -45,7 +45,7 @@ Screenalytics delivers automated face, voice, and screen-time intelligence for u
 
 ## 14. Acceptance Criteria
 
-All acceptance criteria are **defined and enforced** in [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md). High-level requirements:
+All acceptance criteria are **defined and enforced** in [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md). High-level requirements:
 
 ### Pipeline Metrics (see ACCEPTANCE_MATRIX.md for full thresholds)
 
@@ -68,13 +68,13 @@ All acceptance criteria are **defined and enforced** in [ACCEPTANCE_MATRIX.md](A
 - Runtime: ≤ 10 sec for 1hr episode
 
 ### Quality Gates
-- ✅ All artifacts validate against schemas ([docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md))
-- ✅ Integration tests pass with metric assertions ([ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) section 3)
-- ✅ All configs documented ([CONFIG_GUIDE.md](CONFIG_GUIDE.md))
+- ✅ Artifacts follow documented formats ([docs/reference/artifacts_faces_tracks_identities.md](../reference/artifacts_faces_tracks_identities.md))
+- ✅ Integration tests pass with metric assertions ([ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) section 3)
+- ✅ All configs documented ([docs/reference/config/pipeline_configs.md](../reference/config/pipeline_configs.md))
 - ✅ Performance profiles verified on CPU and GPU
 - ✅ Guardrails trigger warnings when metrics exceed thresholds
 
-**For complete acceptance criteria, thresholds, and verification methods**, see [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md).
+**For complete acceptance criteria, thresholds, and verification methods**, see [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md).
 
 ---
 
@@ -90,33 +90,36 @@ All acceptance criteria are **defined and enforced** in [ACCEPTANCE_MATRIX.md](A
 ## 16. References
 
 ### Top-Level Documentation
-- [README.md](README.md) — Project overview and quick start
-- [SETUP.md](SETUP.md) — Installation, artifact pipeline, hardware requirements
-- [CONFIG_GUIDE.md](CONFIG_GUIDE.md) — Configuration quick reference
-- [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) — QA checklist with metrics & thresholds
-- [SOLUTION_ARCHITECTURE.md](SOLUTION_ARCHITECTURE.md) — System architecture diagram
-- [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md) — Repository layout
-- [FEATURES_GUIDE.md](FEATURES_GUIDE.md) — Feature promotion policy
+- [README.md](../../README.md) — Project overview and quick start
+- [SETUP.md](../../SETUP.md) — Installation, artifact pipeline, hardware requirements
+- [docs/README.md](../README.md) — Canonical docs index
+- [docs/reference/api.md](../reference/api.md) — API endpoint reference
+- [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_configs.md) — Configuration reference
+- [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) — QA checklist with metrics & thresholds
+- [docs/architecture/solution_architecture.md](../architecture/solution_architecture.md) — System architecture diagram
+- [docs/architecture/directory_structure.md](../architecture/directory_structure.md) — Repository layout
+- [docs/features/feature_sandboxes.md](../features/feature_sandboxes.md) — Feature sandbox workflow
 
 ### Pipeline Documentation
-- [docs/pipeline/overview.md](docs/pipeline/overview.md) — End-to-end pipeline architecture
-- [docs/pipeline/detect_track_stage.md](docs/pipeline/detect_track_stage.md) — Detection & tracking
-- [docs/pipeline/faces_embed_stage.md](docs/pipeline/faces_embed_stage.md) — Face sampling & embedding
-- [docs/pipeline/clustering_stage.md](docs/pipeline/clustering_stage.md) — Identity clustering
-- [docs/pipeline/cleanup_stage.md](docs/pipeline/cleanup_stage.md) — Outlier removal & post-processing
+- [docs/pipeline/overview.md](../pipeline/overview.md) — End-to-end pipeline architecture
+- [docs/pipeline/detect_track_faces.md](../pipeline/detect_track_faces.md) — Detection & tracking
+- [docs/pipeline/faces_harvest.md](../pipeline/faces_harvest.md) — Face sampling & embedding
+- [docs/pipeline/cluster_identities.md](../pipeline/cluster_identities.md) — Identity clustering
+- [docs/pipeline/episode_cleanup.md](../pipeline/episode_cleanup.md) — Post-processing & cleanup
+- [docs/pipeline/audio_pipeline.md](../pipeline/audio_pipeline.md) — Audio pipeline and A/V fusion inputs
 
 ### Configuration & Tuning
-- [docs/reference/config/pipeline_configs.md](docs/reference/config/pipeline_configs.md) — Complete config parameters
-- [docs/ops/performance_tuning_faces_pipeline.md](docs/ops/performance_tuning_faces_pipeline.md) — Speed vs accuracy tuning
-- [docs/ops/monitoring_logging_faces_pipeline.md](docs/ops/monitoring_logging_faces_pipeline.md) — Logging & debugging
+- [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_configs.md) — Complete config parameters
+- [docs/ops/performance_tuning_faces_pipeline.md](../ops/performance_tuning_faces_pipeline.md) — Speed vs accuracy tuning
+- [docs/ops/troubleshooting_faces_pipeline.md](../ops/troubleshooting_faces_pipeline.md) — Debugging & common fixes
 
 ### Schemas & Metrics
-- [docs/reference/schemas/artifacts_schemas.md](docs/reference/schemas/artifacts_schemas.md) — All artifact schemas
-- [docs/reference/schemas/identities_v1_spec.md](docs/reference/schemas/identities_v1_spec.md) — Identity cluster schema
-- [docs/reference/metrics/derived_metrics.md](docs/reference/metrics/derived_metrics.md) — Calculated metrics & guardrails
+- [docs/reference/artifacts_faces_tracks_identities.md](../reference/artifacts_faces_tracks_identities.md) — Vision artifact schemas
+- [docs/audio/diarization_manifest.md](../audio/diarization_manifest.md) — Audio diarization/ASR manifests
+- [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) — Metric thresholds and guardrails
 
 ### Operations
-- [docs/ops/episode_cleanup.md](docs/ops/episode_cleanup.md) — Cleanup workflow and configuration
+- [docs/ops/ARTIFACTS_STORE.md](../ops/ARTIFACTS_STORE.md) — Storage layout and artifact handling
 
 ---
 

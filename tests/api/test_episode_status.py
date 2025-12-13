@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
@@ -22,12 +23,36 @@ def test_episode_status_from_run_markers_and_outputs(tmp_path, monkeypatch) -> N
     manifests_dir = get_path(ep_id, "detections").parent
     run_dir = manifests_dir / "runs"
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Make marker timestamps slightly *newer* than the manifest mtimes so the
+    # status endpoint does not mark downstream phases as stale.
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    finished_dt = now + timedelta(seconds=30)
+    started_dt = finished_dt - timedelta(minutes=5)
+    started_at = started_dt.isoformat().replace("+00:00", "Z")
+    finished_at = finished_dt.isoformat().replace("+00:00", "Z")
     (run_dir / "faces_embed.json").write_text(
-        '{"phase": "faces_embed", "status": "success", "faces": 6, "started_at": "2024-12-01T09:55:00Z", "finished_at": "2024-12-01T10:00:00Z"}',
+        json.dumps(
+            {
+                "phase": "faces_embed",
+                "status": "success",
+                "faces": 6,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "cluster.json").write_text(
-        '{"phase": "cluster", "status": "success", "faces": 6, "identities": 2, "started_at": "2024-12-01T10:00:00Z", "finished_at": "2024-12-01T10:05:00Z"}',
+        json.dumps(
+            {
+                "phase": "cluster",
+                "status": "success",
+                "faces": 6,
+                "identities": 2,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+        ),
         encoding="utf-8",
     )
 

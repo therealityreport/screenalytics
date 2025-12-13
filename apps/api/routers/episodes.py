@@ -1487,6 +1487,8 @@ class EpisodeSummary(BaseModel):
     episode_number: int
     title: str | None
     air_date: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class EpisodeListResponse(BaseModel):
@@ -1500,6 +1502,17 @@ class EpisodeUpsert(BaseModel):
     episode: int = Field(..., ge=0, le=999)
     title: str | None = Field(None, max_length=200)
     air_date: date | None = None
+
+
+class EpisodeUpdateRequest(BaseModel):
+    """Request body for updating episode metadata (non-identity fields only).
+
+    Note: show/season/episode cannot be changed as they determine the ep_id
+    which is used as a filesystem key throughout the system.
+    """
+
+    title: str | None = Field(None, max_length=200, description="Episode title")
+    air_date: date | None = Field(None, description="Air date (YYYY-MM-DD)")
 
 
 class FaceMoveRequest(BaseModel):
@@ -1756,7 +1769,7 @@ class PurgeAllIn(BaseModel):
 
 @router.get("/episodes", response_model=EpisodeListResponse, tags=["episodes"])
 def list_episodes() -> EpisodeListResponse:
-    """List all episodes.
+    """List all episodes with timestamps for sorting by recent activity.
 
     Show slugs are normalized to UPPERCASE for consistent display.
     """
@@ -1770,6 +1783,8 @@ def list_episodes() -> EpisodeListResponse:
             episode_number=record.episode_number,
             title=record.title,
             air_date=record.air_date,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
         )
         for record in records
     ]
@@ -2132,6 +2147,38 @@ def create_episode(payload: EpisodeCreateRequest) -> EpisodeCreateResponse:
         air_date=payload.air_date,
     )
     return EpisodeCreateResponse(ep_id=record.ep_id)
+
+
+@router.patch("/episodes/{ep_id}", tags=["episodes"])
+def update_episode(ep_id: str, payload: EpisodeUpdateRequest) -> dict:
+    """Update episode metadata (title, air_date only).
+
+    Note: show/season/episode cannot be changed as they determine the ep_id
+    which is used as a filesystem key.
+    """
+    ep_id = normalize_ep_id(ep_id)
+    record = EPISODE_STORE.get(ep_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Episode {ep_id} not found")
+
+    try:
+        updated = EPISODE_STORE.update_metadata(
+            ep_id=ep_id,
+            title=payload.title,
+            air_date=payload.air_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return {
+        "ep_id": updated.ep_id,
+        "show_slug": updated.show_ref,
+        "season_number": updated.season_number,
+        "episode_number": updated.episode_number,
+        "title": updated.title,
+        "air_date": updated.air_date,
+        "updated_at": updated.updated_at,
+    }
 
 
 @router.post("/episodes/upsert_by_id", tags=["episodes"])

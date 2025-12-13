@@ -99,7 +99,7 @@ Screenalytics transforms raw video and audio into structured cast-level analytic
   3. **Faces Embed:** ArcFace embedding extraction with quality gating
   4. **Cluster:** Agglomerative clustering of track-level embeddings
   5. **Episode Cleanup:** Track splitting, re-embedding, re-clustering, grouping
-  6. **Audio Diarize:** Pyannote speaker diarization + Faster-Whisper ASR
+  6. **Audio Pipeline:** NeMo MSDD diarization + OpenAI Whisper ASR (+ optional Gemini cleanup)
   7. **A/V Fusion:** Link face tracks with speech segments
   8. **Screentime Aggregate:** Compute visual/speaking/overlap metrics per person
 
@@ -173,21 +173,19 @@ The complete pipeline transforms a raw `.mp4` episode into structured screentime
    Tool:   tools/episode_cleanup.py or POST /jobs/episode_cleanup_async
    Actions: split_tracks, reembed, recluster, group_clusters
 
-6. AUDIO DIARIZATION (optional)
+6. AUDIO PIPELINE (optional)
    Input:  episode.mp4 (audio stream)
-   Output: speech_segments, transcripts
-   Tool:   Pyannote diarization, Faster-Whisper ASR
+   Output: audio_diarization.jsonl, audio_asr_raw.jsonl, episode_transcript.jsonl, audio_voice_mapping.json
+   Tool:   POST /jobs/episode_audio_pipeline
+   Models: NeMo MSDD diarization, OpenAI Whisper ASR (+ optional Gemini cleanup)
 
-7. A/V FUSION (optional)
-   Input:  tracks.jsonl, speech_segments
-   Output: av_links (track_id + segment_id associations)
-   Algorithm: Temporal overlap + spatial face-speaker association
-
-8. SCREENTIME AGGREGATE (optional)
-   Input:  identities.json, av_links
+7. SCREENTIME ANALYZE (optional)
+   Input:  faces.jsonl, tracks.jsonl, identities.json, shows/{SHOW}/people.json
+           + (optional) episode_transcript.jsonl + audio_voice_mapping.json (speaking_s)
+           + (optional) body_tracking/screentime_comparison.json (body metrics)
    Output: screentime.json, screentime.csv
-   Tool:   Pandas aggregation per person_id
-   Metrics: visual_s, speaking_s, both_s (overlap)
+   Tool:   POST /jobs/screen_time/analyze (or python -m tools.analyze_screen_time)
+   Metrics: face_visible_seconds (+ legacy visual_s), speaking_s, (optional) body_visible_seconds/body_only_seconds/gap_bridged_seconds
 ```
 
 ### 4.2 Artifact Dependencies
@@ -249,7 +247,7 @@ All pipeline behavior is config-driven (no hardcoded thresholds).
   - `recognition.yaml` — ArcFace model ID, similarity_th, hysteresis (TBD)
   - `faces_embed_sampling.yaml` — Quality gating, max_crops_per_track, sampling strategy
   - `performance_profiles.yaml` — Device-aware profiles (fast_cpu, balanced, high_accuracy)
-  - `audio.yaml` — Pyannote/Whisper settings (TBD)
+  - `audio.yaml` — NeMo diarization + ASR settings
   - `screen_time_v2.yaml` — DAG stage toggles, presets
 
 ### 6.2 Agents & Automation
@@ -343,9 +341,9 @@ See [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_con
 ### 11.2 Actions
 - **Playbook:** `agents/playbooks/update-docs-on-change.yaml`
 - **Updates:**
-  - `SOLUTION_ARCHITECTURE.md` — Adjust affected components/paths
-  - `DIRECTORY_STRUCTURE.md` — Update tree and descriptions
-  - `PRD.md` — Mark feature addition/removal
+  - `docs/architecture/solution_architecture.md` — Adjust affected components/paths
+  - `docs/architecture/directory_structure.md` — Update tree and descriptions
+  - `docs/product/prd.md` — Mark feature addition/removal
   - `README.md` — Reflect new/removed directories
 
 ### 11.3 MCP Integration

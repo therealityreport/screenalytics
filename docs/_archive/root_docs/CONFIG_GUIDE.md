@@ -1,6 +1,7 @@
 # Configuration Guide — Screenalytics
 
-**Quick Reference** | [Full Documentation →](docs/reference/config/pipeline_configs.md)
+
+**Quick Reference** | [Full Documentation →](../../reference/config/pipeline_configs.md)
 
 ---
 
@@ -121,9 +122,9 @@ POST /jobs/detect_track { "ep_id": "...", "profile": "balanced" }
 
 **For complete details, see:**
 
-- **[Pipeline Configs Reference](docs/reference/config/pipeline_configs.md)** — Key-by-key documentation
-- **[Performance Tuning](docs/ops/performance_tuning_faces_pipeline.md)** — Speed vs accuracy tuning
-- **[Pipeline Overview](docs/pipeline/overview.md)** — How configs affect each stage
+- **[Pipeline Configs Reference](../../reference/config/pipeline_configs.md)** — Key-by-key documentation
+- **[Performance Tuning](../../ops/performance_tuning_faces_pipeline.md)** — Speed vs accuracy tuning
+- **[Pipeline Overview](../../pipeline/overview.md)** — How configs affect each stage
 
 ---
 

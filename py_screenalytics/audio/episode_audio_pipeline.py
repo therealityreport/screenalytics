@@ -742,7 +742,9 @@ def sync_audio_artifacts_to_s3(
             upload_status["qc"][key] = ok
 
     # Upload diagnostic GPT-4o-only clusters if present
-    diag_path = paths.get("voice_clusters_gpt4o")
+    diag_path: Path | None = None
+    if result.manifest_artifacts.voice_clusters:
+        diag_path = result.manifest_artifacts.voice_clusters.parent / "audio_voice_clusters_gpt4o.json"
     if diag_path and diag_path.exists():
         ok = STORAGE.put_artifact(ep_ctx, "audio_qc", diag_path, f"{base_name}_audio_voice_clusters_gpt4o.json")
         upload_status["diagnostics"]["voice_clusters_gpt4o"] = ok

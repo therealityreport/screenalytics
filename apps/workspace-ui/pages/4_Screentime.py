@@ -613,6 +613,17 @@ if json_path.exists():
     # Display metadata
     generated_at = data.get("generated_at", "unknown")
     st.caption(f"Generated: {generated_at[:19].replace('T', ' ')}")
+    metadata = data.get("metadata") or {}
+    diagnostics = data.get("diagnostics") or {}
+    body_tracking_enabled = bool(metadata.get("body_tracking_enabled", False))
+    body_metrics_available = bool(metadata.get("body_metrics_available", False))
+    speaking_time_computed = bool(diagnostics.get("speaking_time_computed", False))
+    st.caption(
+        "Metadata: "
+        f"body_tracking_enabled={body_tracking_enabled} · "
+        f"body_metrics_available={body_metrics_available} · "
+        f"speaking_time_computed={speaking_time_computed}"
+    )
 
     # Overlay export quick actions tied to last generated results
     export_info = _ensure_export_job(ep_id)
@@ -641,14 +652,36 @@ if json_path.exists():
     metrics = data.get("metrics", [])
     if metrics:
         # Summary stats at the top
-        total_time = sum(m.get("visual_s", 0.0) for m in metrics)
+        def _face_visible_seconds(metric: dict) -> float:
+            value = metric.get("face_visible_seconds")
+            if value is None:
+                value = metric.get("visual_s", 0.0)
+            return float(value or 0.0)
+
+        def _safe_seconds(metric: dict, key: str) -> float:
+            value = metric.get(key)
+            return float(value or 0.0) if isinstance(value, (int, float)) else 0.0
+
+        total_time = sum(_face_visible_seconds(m) for m in metrics)
+        total_speaking = sum(_safe_seconds(m, "speaking_s") for m in metrics)
+        total_body_visible = (
+            sum(_safe_seconds(m, "body_visible_seconds") for m in metrics) if body_metrics_available else 0.0
+        )
+        total_body_only = (
+            sum(_safe_seconds(m, "body_only_seconds") for m in metrics) if body_metrics_available else 0.0
+        )
         total_tracks = sum(m.get("tracks_count", 0) for m in metrics)
         total_faces = sum(m.get("faces_count", 0) for m in metrics)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Screen Time", f"{total_time:.1f}s ({total_time / 60:.1f} min)")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Face Visible", f"{total_time:.1f}s ({total_time / 60:.1f} min)")
         col2.metric("Cast Members", len(metrics))
-        col3.metric("Total Faces", total_faces)
+        col3.metric("Total Speaking", f"{total_speaking:.1f}s")
+        col4.metric("Total Faces", total_faces)
+        if body_metrics_available:
+            st.caption(
+                f"Body metrics: total_body_visible={total_body_visible:.1f}s · total_body_only={total_body_only:.1f}s"
+            )
 
         st.divider()
 
@@ -848,25 +881,35 @@ if json_path.exists():
 
         # Prepare data for display
         display_rows = []
+        has_speaking = any(_safe_seconds(m, "speaking_s") > 0 for m in metrics)
         for m in metrics:
-            visual_s = m.get("visual_s", 0.0)
+            face_s = _face_visible_seconds(m)
+            speaking_s = _safe_seconds(m, "speaking_s")
+            body_visible_s = m.get("body_visible_seconds") if body_metrics_available else None
+            body_only_s = m.get("body_only_seconds") if body_metrics_available else None
+            gap_bridged_s = m.get("gap_bridged_seconds") if body_metrics_available else None
             name = m.get("name", "Unknown")
 
             row = {
                 "Name": name,
-                "Computed": format_time(visual_s),
-                "Percentage": f"{(visual_s / max(total_time, 1)) * 100:.1f}%",
+                "Face Visible": format_time(face_s),
+                "Percentage": f"{(face_s / max(total_time, 1)) * 100:.1f}%",
+                "Speaking": format_time(speaking_s) if has_speaking else None,
                 "Tracks": m.get("tracks_count", 0),
                 "Faces": m.get("faces_count", 0),
                 "Confidence": f"{m.get('confidence', 0.0):.3f}",
-                "_visual_s": visual_s,  # Hidden column for sorting
+                "_face_s": face_s,  # Hidden column for sorting
             }
+            if body_metrics_available:
+                row["Body Visible"] = format_time(body_visible_s) if isinstance(body_visible_s, (int, float)) else "-"
+                row["Body Only"] = format_time(body_only_s) if isinstance(body_only_s, (int, float)) else "-"
+                row["Gap Bridged"] = format_time(gap_bridged_s) if isinstance(gap_bridged_s, (int, float)) else "-"
 
             # Add manual comparison columns if manual values exist
             if manual_screentime:
                 manual_s = find_manual_value(name, manual_screentime)
                 if manual_s > 0:
-                    difference = visual_s - manual_s
+                    difference = face_s - manual_s
                     error_pct = abs(difference) / manual_s * 100
                     row["Manual"] = format_time(manual_s)
                     row["Diff"] = f"{difference:+.1f}s"
@@ -895,7 +938,11 @@ if json_path.exists():
 
         # Interactive table with sorting
         st.subheader("Per-Cast Breakdown")
-        sort_options = ["Computed", "Percentage", "Tracks", "Faces", "Confidence", "Name"]
+        sort_options = ["Face Visible", "Percentage", "Tracks", "Faces", "Confidence", "Name"]
+        if has_speaking:
+            sort_options.insert(2, "Speaking")
+        if body_metrics_available:
+            sort_options.extend(["Body Visible", "Body Only", "Gap Bridged"])
         if manual_screentime:
             sort_options.extend(["Manual", "Error %"])
 
@@ -907,8 +954,8 @@ if json_path.exists():
         ascending = st.checkbox("Ascending order", value=False)
 
         # Sort the dataframe
-        if sort_by == "Computed":
-            df_sorted = df.sort_values("_visual_s", ascending=ascending)
+        if sort_by == "Face Visible":
+            df_sorted = df.sort_values("_face_s", ascending=ascending)
         elif sort_by == "Manual" and "_manual_s" in df.columns:
             df_sorted = df.sort_values("_manual_s", ascending=ascending)
         elif sort_by == "Error %" and "_error_pct" in df.columns:
@@ -917,12 +964,16 @@ if json_path.exists():
             df_sorted = df.sort_values(sort_by, ascending=ascending)
 
         # Display without hidden columns, in specific order
-        hidden_cols = ["_visual_s", "_manual_s", "_error_pct"]
+        hidden_cols = ["_face_s", "_manual_s", "_error_pct"]
         if manual_screentime:
-            # Order: Name, Computed, Manual, Diff, Error %, Percentage, Tracks, Faces, Confidence
-            desired_order = ["Name", "Computed", "Manual", "Diff", "Error %", "Percentage", "Tracks", "Faces", "Confidence"]
+            desired_order = ["Name", "Face Visible", "Manual", "Diff", "Error %", "Percentage"]
         else:
-            desired_order = ["Name", "Computed", "Percentage", "Tracks", "Faces", "Confidence"]
+            desired_order = ["Name", "Face Visible", "Percentage"]
+        if has_speaking:
+            desired_order.append("Speaking")
+        if body_metrics_available:
+            desired_order.extend(["Body Visible", "Body Only", "Gap Bridged"])
+        desired_order.extend(["Tracks", "Faces", "Confidence"])
         display_cols = [c for c in desired_order if c in df_sorted.columns and c not in hidden_cols]
         display_df = df_sorted[display_cols]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -940,9 +991,9 @@ if json_path.exists():
             chart_data = pd.DataFrame(
                 {
                     "Cast Member": [m.get("name", m.get("person_id", "unknown")) for m in metrics],
-                    "Screen Time (s)": [m.get("visual_s", 0.0) for m in metrics],
+                    "Face Visible (s)": [_face_visible_seconds(m) for m in metrics],
                 }
-            ).sort_values("Screen Time (s)", ascending=False)
+            ).sort_values("Face Visible (s)", ascending=False)
 
             st.bar_chart(chart_data.set_index("Cast Member"), height=400)
 
@@ -951,15 +1002,15 @@ if json_path.exists():
             pie_data = pd.DataFrame(
                 {
                     "Cast Member": [m.get("name", m.get("person_id", "unknown")) for m in metrics],
-                    "Screen Time": [m.get("visual_s", 0.0) for m in metrics],
+                    "Face Visible": [_face_visible_seconds(m) for m in metrics],
                 }
             )
 
             fig = px.pie(
                 pie_data,
-                values="Screen Time",
+                values="Face Visible",
                 names="Cast Member",
-                title="Screen Time Distribution",
+                title="Face Visible Distribution",
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -970,7 +1021,7 @@ if json_path.exists():
                     "Cast Member": [m.get("name", m.get("person_id", "unknown")) for m in metrics],
                     "Tracks": [m.get("tracks_count", 0) for m in metrics],
                     "Faces": [m.get("faces_count", 0) for m in metrics],
-                    "Screen Time (s)": [m.get("visual_s", 0.0) for m in metrics],
+                    "Face Visible (s)": [_face_visible_seconds(m) for m in metrics],
                 }
             )
 
@@ -978,9 +1029,9 @@ if json_path.exists():
                 scatter_data,
                 x="Tracks",
                 y="Faces",
-                size="Screen Time (s)",
+                size="Face Visible (s)",
                 hover_data=["Cast Member"],
-                title="Tracks vs Faces (bubble size = screen time)",
+                title="Tracks vs Faces (bubble size = face visible)",
             )
             st.plotly_chart(fig2, use_container_width=True)
 

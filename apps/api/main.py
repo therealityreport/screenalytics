@@ -9,7 +9,7 @@ apply_global_cpu_limits()
 import asyncio
 import logging
 import os
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

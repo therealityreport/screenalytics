@@ -1,7 +1,7 @@
 """RetinaFace detection runner for Screenalytics.
 
 This module bridges config-driven RetinaFace inference with the JSONL artifacts
-described in DATA_SCHEMA.md (`det_v1`).  It supports two execution modes:
+described in docs/reference/data_schema.md (`det_v1`).  It supports two execution modes:
 
 1. A real InsightFace-backed RetinaFace detector (default) that runs on CPU or
    GPU depending on `ctx_id`.

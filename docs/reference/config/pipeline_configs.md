@@ -1,337 +1,210 @@
 # Pipeline Configuration Reference
 
-**Version:** 2.0
-**Last Updated:** 2025-11-18
+**Last Updated:** 2025-12-13
+
+This document describes the **active** pipeline YAML files under `config/pipeline/` and the knobs that matter most in practice. The YAML files are the source of truth; treat this doc as an index + tuning guide to reduce doc drift.
 
 ---
 
-## 1. Overview
+## 1) Quick Map (`config/pipeline/*.yaml`)
 
-All pipeline behavior is **config-driven** (no hardcoded thresholds). This document provides a key-by-key reference for all pipeline YAML configs.
-
-**Location:** `config/pipeline/*.yaml`
+| File | Purpose | High-impact knobs |
+|------|---------|-------------------|
+| `detection.yaml` | Face detection (RetinaFace) | `min_size`, `confidence_th`, `wide_shot_*` |
+| `tracking.yaml` | Face tracking (ByteTrack) | `match_thresh`, `track_buffer`, `new_track_thresh` |
+| `faces_embed_sampling.yaml` | Face sampling + quality gating for embedding/export | `quality_gating.*`, `limits.*` |
+| `embedding.yaml` | Embedding engine selection + TRT cache | `embedding.backend`, `tensorrt.batch_size`, `storage.cache_dir` |
+| `face_alignment.yaml` | Face alignment (feature sandbox) | `face_alignment.enabled`, `processing.batch_size` |
+| `clustering.yaml` | Identity clustering + singleton merge | `cluster_thresh`, `min_identity_sim`, `singleton_merge.*` |
+| `audio.yaml` | Audio pipeline (diarization + ASR) | `diarization.*`, `asr.*`, `voice_clustering.*` |
+| `screen_time_v2.yaml` | Screentime presets + smoothing | `gap_tolerance_s`, `screen_time_mode`, `track_coverage_min` |
+| `body_detection.yaml` | Body tracking (feature sandbox) | `body_tracking.enabled`, `person_reid.enabled` |
+| `track_fusion.yaml` | Face↔body fusion rules | `iou_association.*`, `reid_handoff.*` |
+| `performance_profiles.yaml` | System-level speed/thermal presets | `frame_stride`, `detection_fps_limit` |
 
 ---
 
-## 2. Detection Config (`detection.yaml`)
+## 2) Detection (`detection.yaml`)
 
-### 2.1 Model
+Core keys (see `config/pipeline/detection.yaml` for full context):
 ```yaml
 model_id: retinaface_r50
-```
-- **Type:** string
-- **Default:** `retinaface_r50`
-- **Valid values:** `retinaface_r50`, `retinaface_mnet` (mobile)
-- **Effect:** Which RetinaFace ONNX weights to load
-
-### 2.2 Thresholds
-```yaml
-min_size: 90
-confidence_th: 0.8
-iou_th: 0.5
+min_size: 16
+confidence_th: 0.50
+wide_shot_mode: true
+wide_shot_input_size: 960
+wide_shot_confidence_th: 0.40
 ```
 
-| Key | Type | Default | Range | Effect |
-|-----|------|---------|-------|--------|
-| `min_size` | int | 90 | 32–256 | Minimum face size (pixels); lower = more small faces, slower |
-| `confidence_th` | float | 0.8 | 0.0–1.0 | Detection confidence threshold; lower = more faces, more false positives |
-| `iou_th` | float | 0.5 | 0.0–1.0 | NMS IoU threshold; lower = stricter NMS (fewer overlaps) |
-
-### 2.3 Adaptive Confidence
-```yaml
-adaptive_confidence: false
-min_confidence: 0.6
-max_confidence: 0.9
-```
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `adaptive_confidence` | bool | false | Enable adaptive thresholding for low-light scenes |
-| `min_confidence` | float | 0.6 | Minimum threshold for dark scenes |
-| `max_confidence` | float | 0.9 | Maximum threshold for well-lit scenes |
-
-### 2.4 NMS Mode
-```yaml
-nms_mode: hard
-soft_nms_sigma: 0.5
-```
-
-| Key | Type | Default | Valid Values | Effect |
-|-----|------|---------|--------------|--------|
-| `nms_mode` | string | hard | `hard`, `soft` | NMS algorithm; soft-NMS better for overlapping faces (hugs, crowds) |
-| `soft_nms_sigma` | float | 0.5 | 0.1–1.0 | Gaussian decay parameter for soft-NMS (lower = more aggressive) |
-
-### 2.5 Pose Quality
-```yaml
-check_pose_quality: true
-max_yaw_angle: 45.0
-```
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `check_pose_quality` | bool | true | Enable pose-based landmark filtering |
-| `max_yaw_angle` | float | 45.0 | Max head rotation (degrees); faces beyond this angle discarded |
-
-### 2.6 Letterbox Detection
-```yaml
-auto_crop_letterbox: false
-letterbox_threshold: 20
-```
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `auto_crop_letterbox` | bool | false | Auto-detect and crop black bars (letterbox/pillarbox) |
-| `letterbox_threshold` | int | 20 | Pixel intensity threshold (0–255) for detecting black bars |
+Notes:
+- `min_size` and `confidence_th` are the main recall/perf tradeoffs.
+- `wide_shot_*` controls a higher-resolution pass for distant faces.
+- `enable_person_fallback` enables a person/body fallback path for “face-missing” scenes.
 
 ---
 
-## 3. Tracking Config (`tracking.yaml`)
+## 3) Tracking (`tracking.yaml`)
 
-### 3.1 ByteTrack Spatial Matching
+ByteTrack thresholds:
 ```yaml
-track_thresh: 0.70
-match_thresh: 0.85
+track_thresh: 0.55
+match_thresh: 0.65
 track_buffer: 90
-max_track_buffer: 300
-```
-
-| Key | Type | Default | Range | Effect |
-|-----|------|---------|-------|--------|
-| `track_thresh` | float | 0.70 | 0.0–1.0 | Min confidence to continue track; lower = more tracks, more noise |
-| `match_thresh` | float | 0.85 | 0.0–1.0 | IoU threshold for bbox association; higher = stricter matching |
-| `track_buffer` | int | 90 | 30–300 | Frames to keep track alive after last detection (~3–4s); higher = fewer ID switches, longer tracks |
-| `max_track_buffer` | int | 300 | 90–600 | Cap on buffer to prevent runaway memory |
-
-### 3.2 New Track Threshold
-```yaml
-new_track_thresh: 0.85
-```
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `new_track_thresh` | float | 0.85 | Higher threshold for starting new tracks (reduces ghost tracks) |
-
-### 3.3 AppearanceGate
-```yaml
+new_track_thresh: 0.60
 gate_enabled: true
 ```
 
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `gate_enabled` | bool | true | Enable appearance-based track splitting (via embeddings) |
-
-**Appearance gate thresholds (via environment variables):**
-- `TRACK_GATE_APPEAR_HARD`: default 0.65 (hard split if similarity < 65%)
-- `TRACK_GATE_APPEAR_SOFT`: default 0.75 (soft split if similarity < 75%)
-- `TRACK_GATE_APPEAR_STREAK`: default 3 (consecutive low-sim frames before split)
-- `TRACK_GATE_IOU`: default 0.50 (split if spatial jump, IoU < 50%)
-- `TRACK_GATE_EMB_EVERY`: default 24 (extract embeddings every N frames)
-
-### 3.4 Global Motion Compensation (GMC)
-Set via `SCREENALYTICS_GMC_METHOD` environment variable:
-- `"sparseOptFlow"` (default): Sparse optical flow for camera motion
-- `"orb"`: ORB feature matching
-- `"off"`: Disable GMC
+Additional knobs are environment-driven (see comments in `config/pipeline/tracking.yaml`):
+- `TRACK_GATE_APPEAR_HARD`, `TRACK_GATE_APPEAR_SOFT`, `TRACK_GATE_APPEAR_STREAK`
+- `TRACK_GATE_IOU`, `TRACK_GATE_EMB_EVERY`
+- `SCREENALYTICS_GMC_METHOD` (global motion compensation)
+- `TRACK_MAX_GAP_SEC` (time-based max gap for linking)
 
 ---
 
-## 4. Performance Profiles (`performance_profiles.yaml`)
+## 4) Face Sampling for Embeddings (`faces_embed_sampling.yaml`)
 
-### 4.1 Profiles
+Quality gating (relaxed defaults for reality TV):
 ```yaml
-low_power:
-  description: "Optimized for fanless/low-power devices"
-  coreml_input_size: 384
-  detection_fps_limit: 8
-  frame_stride: 8
-  min_size: 120
-  adaptive_confidence: true
-  nms_mode: hard
-  check_pose_quality: false
-  cpu_threads: 2
-
-balanced:
-  description: "Balanced performance and quality"
-  coreml_input_size: 480
-  detection_fps_limit: 24
-  frame_stride: 5
-  min_size: 90
-  adaptive_confidence: false
-  nms_mode: hard
-  check_pose_quality: true
-
-high_accuracy:
-  description: "Maximum quality for powerful systems"
-  coreml_input_size: 640
-  detection_fps_limit: 30
-  frame_stride: 1
-  min_size: 64
-  adaptive_confidence: true
-  nms_mode: soft
-  soft_nms_sigma: 0.5
-  check_pose_quality: true
+quality_gating:
+  min_quality_score: 1.5
+  min_confidence: 0.45
+  min_blur_score: 18.0
+  min_std: 0.5
+  max_yaw_angle: 60.0
+  max_pitch_angle: 45.0
 ```
 
-| Profile | Device | Stride | FPS | Use Case |
-|---------|--------|--------|-----|----------|
-| `low_power` | CPU/CoreML | 8 | 8 | Exploratory, thermal-constrained |
-| `balanced` | CPU/MPS | 5 | 24 | Standard local dev |
-| `high_accuracy` | GPU (CUDA) | 1 | 30 | Production, max recall |
-
-**Compatibility:** The API treats `fast_cpu` as an alias for `low_power` for legacy clients.
-
----
-
-## 5. Faces Embed Sampling (`faces_embed_sampling.yaml`)
-
-### 5.1 Quality Gating
+Volume/sampling limits are profile-aware:
 ```yaml
-min_quality: 0.7
-min_confidence: 0.8
-min_face_size: 64
-max_blur: 100
-```
-
-| Key | Type | Default | Range | Effect |
-|-----|------|---------|-------|--------|
-| `min_quality` | float | 0.7 | 0.0–1.0 | Combined quality score threshold; higher = fewer but better faces |
-| `min_confidence` | float | 0.8 | 0.0–1.0 | RetinaFace confidence threshold |
-| `min_face_size` | int | 64 | 32–256 | Minimum face size (pixels) |
-| `max_blur` | int | 100 | 0–500 | Laplacian variance threshold (lower = more blur tolerated) |
-
-### 5.2 Volume Control
-```yaml
-max_crops_per_track: 50
-max_crops_per_episode: 5000
-```
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `max_crops_per_track` | int | 50 | Limit crops per track to avoid embedding thousands of near-identical faces |
-| `max_crops_per_episode` | int | 5000 | Global episode limit (optional) |
-
-### 5.3 Sampling Strategy
-```yaml
-sampling_mode: uniform
-sample_interval: 24
-```
-
-| Key | Type | Default | Valid Values | Effect |
-|-----|------|---------|--------------|--------|
-| `sampling_mode` | string | uniform | `uniform`, `quality-weighted`, `stratified` | How to sample frames along track |
-| `sample_interval` | int | 24 | 1–60 | Sample every Nth frame (uniform mode only) |
-
-### 5.4 Crop Generation
-```yaml
-thumb_size: 224
-jpeg_quality: 90
-check_pose_quality: true
-max_yaw_angle: 45.0
-```
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `thumb_size` | int | 224 | Output crop size (before resize to 112x112 for ArcFace) |
-| `jpeg_quality` | int | 90 | JPEG quality for saved crops (0–100) |
-| `check_pose_quality` | bool | true | Enable pose filtering |
-| `max_yaw_angle` | float | 45.0 | Max head rotation (degrees) |
-
----
-
-## 6. Clustering Config (TBD: `recognition.yaml`)
-
-**Note:** Currently passed via CLI/API args; future config file:
-
-```yaml
-algorithm: agglomerative
-linkage: average
-cluster_thresh: 0.58
-min_cluster_size: 2
-outlier_mode: singleton
-pooling_method: mean
-```
-
-| Key | Type | Default | Valid Values | Effect |
-|-----|------|---------|--------------|--------|
-| `algorithm` | string | agglomerative | `agglomerative`, `dbscan`, `hdbscan` | Clustering algorithm |
-| `linkage` | string | average | `ward`, `average`, `complete` | Hierarchical linkage method |
-| `cluster_thresh` | float | 0.58 | 0.0–1.0 | Cosine similarity threshold; lower = more clusters |
-| `min_cluster_size` | int | 2 | 1–10 | Minimum tracks per cluster |
-| `outlier_mode` | string | singleton | `singleton`, `noise` | How to handle outliers (cluster_id=null vs -1) |
-| `pooling_method` | string | mean | `mean`, `median`, `max` | Track-level embedding pooling |
-
----
-
-## 7. Audio Config (TBD: `audio.yaml`)
-
-**Placeholder for future audio diarization/ASR config:**
-
-```yaml
-diarization:
-  model: pyannote/speaker-diarization
-  min_speakers: 1
-  max_speakers: 10
-
-asr:
-  model: faster-whisper/large-v2
-  language: en
-  beam_size: 5
+limits:
+  default:
+    max_samples_per_track: 5
+    max_faces_per_episode: 10000
+  profiles:
+    low_power:
+      max_faces_per_episode: 6000
 ```
 
 ---
 
-## 8. Screen Time Config (`screen_time_v2.yaml`)
+## 5) Embedding Engine (`embedding.yaml`)
 
+Backend selection:
+```yaml
+embedding:
+  backend: pytorch  # tensorrt | pytorch
+  tensorrt_config: config/pipeline/arcface_tensorrt.yaml
+```
+
+Performance knobs:
+- `tensorrt.batch_size`, `tensorrt.max_batch_size`
+- TRT engine cache: `storage.cache_dir` (local) and `storage.bucket/prefix` (S3)
+
+Alignment gating before embedding:
+- `face_alignment.enabled`, `face_alignment.min_alignment_quality`
+
+---
+
+## 6) Face Alignment (`face_alignment.yaml`)
+
+This is a feature sandbox stage that can produce aligned crops and per-face alignment quality.
+Key knobs:
+- `face_alignment.enabled`
+- `processing.batch_size`, `processing.device`
+- `quality.min_face_size`, `quality.min_confidence`
+
+---
+
+## 7) Clustering (`clustering.yaml`)
+
+Core thresholds:
+```yaml
+cluster_thresh: 0.52
+min_cluster_size: 1
+min_identity_sim: 0.45
+```
+
+Optional singleton merge pass (used when singleton fraction is high):
+```yaml
+singleton_merge:
+  enabled: true
+  trigger_singleton_frac: 0.40
+  similarity_thresh: 0.55
+```
+
+---
+
+## 8) Audio Pipeline (`audio.yaml`)
+
+Audio pipeline stages (see `config/pipeline/audio.yaml` for defaults):
+- `separation` (MDX-Extra)
+- `enhance` (Resemble)
+- `diarization` (**NeMo MSDD**, overlap-aware)
+- `asr` (**OpenAI Whisper**)
+- `voice_clustering` (often `use_diarization_labels: true` to skip embedding clustering)
+
+Artifacts produced include:
+- `audio_diarization.jsonl`, `audio_asr_raw.jsonl`
+- `audio_voice_mapping.json`, `episode_transcript.jsonl`
+
+---
+
+## 9) Body Tracking + Fusion (`body_detection.yaml`, `track_fusion.yaml`)
+
+Body tracking is a feature sandbox that can compute body-only visibility and face↔body fusion metrics.
+Key toggles:
+- `body_tracking.enabled`
+- `person_reid.enabled`
+- `track_fusion.enabled`
+
+---
+
+## 10) Screentime (`screen_time_v2.yaml`)
+
+Screentime uses named presets (default `preset: bravo_default`) to control smoothing and interval derivation:
 ```yaml
 screen_time_presets:
   bravo_default:
-    quality_min: 0.7
-    gap_tolerance_s: 1.0
-    screen_time_mode: track
-    edge_padding_s: 0.5
-    track_coverage_min: 0.5
-    use_video_decode: false
+    gap_tolerance_s: 1.2
+    screen_time_mode: tracks
+    edge_padding_s: 0.2
+    track_coverage_min: 0.35
 ```
 
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `quality_min` | float | 0.7 | Minimum quality for screentime inclusion |
-| `gap_tolerance_s` | float | 1.0 | Max gap (seconds) to merge adjacent appearances |
-| `screen_time_mode` | string | track | `track` or `frame` aggregation |
-| `edge_padding_s` | float | 0.5 | Edge padding (seconds) |
-| `track_coverage_min` | float | 0.5 | Minimum track coverage fraction |
-| `use_video_decode` | bool | false | Decode video for frame-level validation |
+Docs: `docs/pipeline/screentime_analytics_optimization.md`
 
 ---
 
-## 9. Config Override Precedence
+## 11) Performance Profiles (`performance_profiles.yaml`)
 
-1. **CLI args** (highest priority): `--stride 3 --device cuda`
-2. **Environment variables**: `TRACK_THRESH=0.75`
-3. **Profile-specific config**: `performance_profiles.yaml:balanced` (applied by API/job layer; CLI must pass equivalent flags)
-4. **Stage-specific config**: `tracking.yaml`, `detection.yaml`
-5. **Default values** (lowest priority): Hardcoded in code
+Profiles are applied by the API/job layer to choose stride/FPS defaults for different hardware.
+The CLI expects explicit flags (no `--profile` switch).
 
-**Example:**
-```bash
-export TRACK_THRESH=0.75
-python tools/episode_run.py --ep-id <ep_id> --video <path> --stride 5 --fps 24
-```
-Effective config:
-- `stride: 5` (CLI overrides profile)
-- `track_thresh: 0.75` (env overrides profile + stage config)
-- Other params from `balanced` profile
+Profile names (API-facing):
+- `fast_cpu` (legacy alias)
+- `low_power`
+- `balanced`
+- `high_accuracy`
+
+Docs: `docs/ops/performance_tuning_faces_pipeline.md`
 
 ---
 
-## 10. References
+## 12) Override Precedence
 
-- [Pipeline Overview](../../pipeline/overview.md)
-- [Detect & Track](../../pipeline/detect_track_faces.md)
-- [Faces Harvest](../../pipeline/faces_harvest.md)
-- [Cluster Identities](../../pipeline/cluster_identities.md)
-- [Performance Tuning](../../ops/performance_tuning_faces_pipeline.md)
+Highest → lowest:
+1. CLI args (e.g., `--stride 5 --fps 24`)
+2. Environment variables (where supported; see file comments)
+3. API profile presets (`performance_profiles.yaml`)
+4. Stage YAML config (`config/pipeline/*.yaml`)
+5. Code defaults
 
 ---
 
-**Maintained by:** Screenalytics Engineering
+## 13) References
+
+- `docs/pipeline/overview.md`
+- `docs/pipeline/audio_pipeline.md`
+- `docs/pipeline/screentime_analytics_optimization.md`
+- `docs/ops/performance_tuning_faces_pipeline.md`

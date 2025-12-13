@@ -1,5 +1,6 @@
 # Master WEB To-Do List (Streamlit → Next.js)
 
+
 Status: Phase 1 → Phase 2 transition  
 Owner: Screenalytics eng (assign per feature)  
 Scope: Next.js app under `web/` to reach feature parity with Streamlit workspace UI (Upload, Episode Detail, Faces Review) while keeping pipeline guardrails intact.

@@ -14,8 +14,16 @@ import logging
 import os
 from typing import Any, List, Mapping, Optional
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Optional dependency: psycopg2 is only needed if TRR_DB_URL is configured.
+# This allows the module to be imported in CI/test contexts without psycopg2.
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    _PSYCOPG2_AVAILABLE = True
+except ImportError:
+    psycopg2 = None  # type: ignore[assignment]
+    RealDictCursor = None  # type: ignore[assignment,misc]
+    _PSYCOPG2_AVAILABLE = False
 
 TRR_DB_URL_ENV = "TRR_DB_URL"
 LOGGER = logging.getLogger(__name__)
@@ -28,9 +36,11 @@ def get_conn():
         psycopg2 connection with RealDictCursor (returns rows as dicts)
 
     Raises:
-        RuntimeError: If TRR_DB_URL is not set
+        RuntimeError: If TRR_DB_URL is not set or psycopg2 is not installed
         psycopg2.Error: If connection fails
     """
+    if not _PSYCOPG2_AVAILABLE:
+        raise RuntimeError("psycopg2 is not installed; TRR metadata DB is unavailable")
     url = os.getenv(TRR_DB_URL_ENV)
     if not url:
         raise RuntimeError(f"{TRR_DB_URL_ENV} is not set")

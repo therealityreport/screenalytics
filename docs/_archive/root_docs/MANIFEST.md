@@ -1,5 +1,6 @@
 # Screenalytics — Project Manifest
 
+
 ## 1. Origin
 Successor to **Screenalyzer v2**.
 Built to eliminate legacy path drift, silent errors, and configuration sprawl.
