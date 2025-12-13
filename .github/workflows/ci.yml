@@ -85,9 +85,13 @@ jobs:
         run: |
           python -m tools.smoke.smoke_run --episode-id ci-test --dry-run -v
 
-      - name: Upload smoke report
+      - name: Upload smoke artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: smoke-report
-          path: data/smoke/ci-test/smoke_report.json
+          name: smoke-artifacts
+          path: |
+            data/smoke/**/smoke_report.json
+            data/smoke/**
+            data/analytics/**/screentime.json
           if-no-files-found: ignore
