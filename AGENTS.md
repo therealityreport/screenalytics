@@ -10,7 +10,7 @@ It merges legacy Codex review guidance with current operational guardrails.
 - Repo: `github.com/therealityreport/screenalytics`
 - Primary branches:
   - `main` - stable
-  - `nov-24` - active working branch (default unless a task says otherwise)
+  - `nov-24` - historical working branch (not default)
 - Hard boundaries:
   - Do not touch or reference other repos (THB-BBL, basketball projects, etc.).
   - Do not create cross-repo folders or assumptions.
@@ -33,16 +33,20 @@ It merges legacy Codex review guidance with current operational guardrails.
 
 ## 2. Branching and Git Usage
 
-- Default working branch: `nov-24` (unless a task specifies another).
+- Default base branch: `origin/main` (unless a task specifies another).
+- Use a worktree for tasks/PRs; do not commit directly on `main`.
 - Keep changes scoped and coherent; prefer small, focused edits over broad refactors.
 - Agents do not auto-run shell commands. When the user should run git, provide a command block at the end of the report, for example:
   ```bash
-  git checkout nov-24
+  git fetch origin
+  git worktree add -b <branch> ../wt/<branch> origin/main
+  cd ../wt/<branch>
   git status
   git diff
   git add -A
   git commit -m "Short, precise message"
-  git push origin nov-24
+  git push -u origin <branch>
+  gh pr create --fill
   ```
 
 ## 3. Task Types and Severity (operational)

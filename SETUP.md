@@ -236,10 +236,10 @@ codex exec --config config/codex.config.toml --task agents/tasks/aggregate-scree
 ---
 
 ## 1️⃣1️⃣ Promotion workflow
-1. Create feature via `python tools/new-feature.py <name>`
+1. Create a feature sandbox under `FEATURES/<name>/` (see `docs/features/feature_sandboxes.md`)
 2. Work inside `FEATURES/<name>/`
 3. Pass CI (tests + docs)
-4. Promote: `python tools/promote-feature.py <name>`
+4. Promote via PR: move code/tests/docs out of `FEATURES/` into `apps/` / `web/` / `packages/`
 5. CI + Agents update docs automatically
 
 ---

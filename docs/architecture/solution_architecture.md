@@ -321,7 +321,7 @@ See [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_con
    - 30-day TTL
    - Tests + docs present
    - No imports from `FEATURES/**` in production code
-3. Promote via `tools/promote-feature.py`
+3. Promote via PR: move code/tests/docs out of `FEATURES/` into production paths (`apps/`, `web/`, `packages/`)
 4. Post-promotion CI re-runs end-to-end sample clip
 5. Agents auto-update docs (README, PRD, Solution Architecture, Directory Structure)
 
