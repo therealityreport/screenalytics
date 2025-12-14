@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Apply global CPU limits BEFORE importing any ML libraries or heavy dependencies
 # Uses centralized configuration from apps.common.cpu_limits (default: 3 threads = ~300% CPU)
-# Override with env var: SCREANALYTICS_MAX_CPU_THREADS=N
+# Override with env var: SCREENALYTICS_MAX_CPU_THREADS=N
 from apps.common.cpu_limits import apply_global_cpu_limits
 apply_global_cpu_limits()
 
@@ -217,18 +217,19 @@ async def _cleanup_stale_jobs() -> None:
     # 4. Clear audio pipeline locks from Redis
     try:
         from apps.api.tasks import _get_redis
+        from apps.api.services import redis_keys
+
         r = _get_redis()
-        # Find all audio_pipeline lock keys
-        lock_pattern = "screanalytics:job_lock:*:audio_pipeline"
-        cursor = 0
         cleared = 0
-        while True:
-            cursor, keys = r.scan(cursor=cursor, match=lock_pattern, count=100)
-            for key in keys:
-                r.delete(key)
-                cleared += 1
-            if cursor == 0:
-                break
+        for lock_pattern in redis_keys.job_lock_patterns("audio_pipeline"):
+            cursor = 0
+            while True:
+                cursor, keys = r.scan(cursor=cursor, match=lock_pattern, count=100)
+                for key in keys:
+                    r.delete(key)
+                    cleared += 1
+                if cursor == 0:
+                    break
         if cleared > 0:
             LOGGER.info(f"Cleared {cleared} stale audio pipeline locks from Redis")
     except Exception as e:

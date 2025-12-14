@@ -713,7 +713,6 @@ def _run_job_with_optional_sse(
     env = os.environ.copy()
     # Apply CPU thread limits if specified
     if cpu_threads is not None:
-        env["SCREANALYTICS_MAX_CPU_THREADS"] = str(cpu_threads)
         env["SCREENALYTICS_MAX_CPU_THREADS"] = str(cpu_threads)
         env["OMP_NUM_THREADS"] = str(cpu_threads)
         env["MKL_NUM_THREADS"] = str(cpu_threads)
@@ -1195,6 +1194,8 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             fps=effective["fps"],
             device=req.device,
             video_path=video_path,
+            profile=effective["profile"],
+            cpu_threads=effective["cpu_threads"],
             save_frames=effective["save_frames"],
             save_crops=effective["save_crops"],
             jpeg_quality=req.jpeg_quality,
@@ -1210,8 +1211,6 @@ async def enqueue_detect_track_async(req: DetectTrackRequest, request: Request) 
             new_track_thresh=req.new_track_thresh,
             track_buffer=req.track_buffer,
             min_box_area=req.min_box_area,
-            # Note: profile and cpu_threads are used internally for stride/fps defaults
-            # but not passed to the job service (it uses the resolved values above)
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1235,6 +1234,8 @@ async def enqueue_faces_embed_async(req: FacesEmbedRequest, request: Request) ->
         job = JOB_SERVICE.start_faces_embed_job(
             ep_id=req.ep_id,
             device=req.device or "auto",
+            profile=req.profile,
+            cpu_threads=req.cpu_threads,
             save_frames=req.save_frames,
             save_crops=req.save_crops,
             jpeg_quality=req.jpeg_quality,

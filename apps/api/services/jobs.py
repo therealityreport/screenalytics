@@ -156,7 +156,7 @@ def load_performance_profile(profile_value: str | None) -> dict:
 def _maybe_wrap_with_cpulimit(command: list[str]) -> list[str]:
     """Prefix detect jobs with cpulimit when configured.
     
-    Logs a warning if SCREANALYTICS_CPULIMIT_PERCENT is set but cpulimit
+    Logs a warning if SCREENALYTICS_CPULIMIT_PERCENT is set but cpulimit
     binary is unavailable, so operators know the CPU cap is not enforced.
     """
     if _CPULIMIT_PERCENT <= 0:
@@ -164,13 +164,26 @@ def _maybe_wrap_with_cpulimit(command: list[str]) -> list[str]:
     binary = shutil.which("cpulimit")
     if not binary:
         LOGGER.warning(
-            "SCREANALYTICS_CPULIMIT_PERCENT=%d is set but 'cpulimit' binary not found. "
+            "SCREENALYTICS_CPULIMIT_PERCENT=%d is set but 'cpulimit' binary not found. "
             "CPU usage will NOT be capped. Install cpulimit (brew install cpulimit / apt install cpulimit) "
             "or the process will use fallback CPU affinity if psutil is available.",
             _CPULIMIT_PERCENT,
         )
         return command
     return [binary, "-l", str(_CPULIMIT_PERCENT), "-i", "--", *command]
+
+
+def _apply_cpu_threads_env(env: dict[str, str], cpu_threads: int) -> None:
+    """Set env vars used by ML libraries to cap CPU threads for a subprocess."""
+    env["SCREENALYTICS_MAX_CPU_THREADS"] = str(cpu_threads)
+    env["OMP_NUM_THREADS"] = str(cpu_threads)
+    env["MKL_NUM_THREADS"] = str(cpu_threads)
+    env["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    env["VECLIB_MAXIMUM_THREADS"] = str(cpu_threads)
+    env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    env["OPENCV_NUM_THREADS"] = str(cpu_threads)
+    env["ORT_INTRA_OP_NUM_THREADS"] = str(cpu_threads)
+    env["ORT_INTER_OP_NUM_THREADS"] = "1"
 
 
 def _apply_cpu_affinity_fallback(pid: int, limit_percent: int) -> None:
@@ -394,6 +407,17 @@ class JobService:
         stderr_log_path = stderr_log_dir / f"job-{job_id}.stderr.log"
 
         env = os.environ.copy()
+        cpu_threads_raw = requested.get("cpu_threads")
+        if cpu_threads_raw is not None:
+            try:
+                cpu_threads = int(cpu_threads_raw)
+            except (TypeError, ValueError):
+                LOGGER.warning("Invalid cpu_threads=%r; ignoring thread override", cpu_threads_raw)
+            else:
+                if cpu_threads >= 1:
+                    _apply_cpu_threads_env(env, cpu_threads)
+                else:
+                    LOGGER.warning("Invalid cpu_threads=%d; ignoring thread override", cpu_threads)
         # Bug 8 fix: Open stderr log for subprocess, will be closed by monitor thread
         stderr_file = open(stderr_log_path, "w", encoding="utf-8")  # noqa: SIM115
         effective_command = _maybe_wrap_with_cpulimit(command)
@@ -470,6 +494,8 @@ class JobService:
         new_track_thresh: float | None = None,
         track_buffer: int | None = None,
         min_box_area: float | None = None,
+        profile: str | None = None,
+        cpu_threads: int | None = None,
     ) -> JobRecord:
         if not video_path.exists():
             raise FileNotFoundError(f"Episode video not found: {video_path}")
@@ -499,6 +525,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         if fps and fps > 0:
             command += ["--fps", str(fps)]
         if save_frames:
@@ -527,6 +555,8 @@ class JobService:
             "fps": fps,
             "device": device,
             "resolved_detect_device": resolved_detect_device or device,
+            "profile": profile,
+            "cpu_threads": cpu_threads,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,
@@ -556,6 +586,8 @@ class JobService:
         *,
         ep_id: str,
         device: str,
+        profile: str | None = None,
+        cpu_threads: int | None = None,
         save_frames: bool,
         save_crops: bool,
         jpeg_quality: int,
@@ -578,6 +610,8 @@ class JobService:
             "--progress-file",
             str(progress_path),
         ]
+        if profile:
+            command += ["--profile", profile]
         if save_frames:
             command.append("--save-frames")
         if save_crops:
@@ -589,6 +623,8 @@ class JobService:
         requested = {
             "device": device_value,
             "resolved_embed_device": resolved_embed_device or device_value,
+            "profile": profile,
+            "cpu_threads": cpu_threads,
             "save_frames": save_frames,
             "save_crops": save_crops,
             "jpeg_quality": jpeg_quality,

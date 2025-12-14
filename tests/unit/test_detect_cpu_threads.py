@@ -81,7 +81,6 @@ def test_launch_job_sets_cpu_thread_env(monkeypatch, tmp_path):
     assert env_seen["OPENCV_NUM_THREADS"] == "2"
     assert env_seen["ORT_INTRA_OP_NUM_THREADS"] == "2"
     assert env_seen["ORT_INTER_OP_NUM_THREADS"] == "1"
-    assert env_seen["SCREANALYTICS_MAX_CPU_THREADS"] == "2"
     assert env_seen["SCREENALYTICS_MAX_CPU_THREADS"] == "2"
 
 
