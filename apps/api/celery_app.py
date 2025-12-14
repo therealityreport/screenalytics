@@ -1,4 +1,4 @@
-"""Celery application configuration for SCREANALYTICS background jobs.
+"""Celery application configuration for Screenalytics background jobs.
 
 This module sets up Celery with Redis as broker and result backend.
 Used for long-running operations like cluster assignments and auto-grouping.
@@ -10,18 +10,14 @@ Worker command:
     celery -A apps.api.celery_app:celery_app worker -l info
 """
 
-import os
+from __future__ import annotations
 
-# CRITICAL: Set CPU thread limits BEFORE importing numpy/torch/etc.
-# This prevents ML models from using all CPU cores and overheating laptops.
-# Default to 2 threads; override with SCREENALYTICS_MAX_CPU_THREADS.
-_MAX_THREADS = os.environ.get("SCREENALYTICS_MAX_CPU_THREADS", "2")
-os.environ.setdefault("OMP_NUM_THREADS", _MAX_THREADS)
-os.environ.setdefault("MKL_NUM_THREADS", _MAX_THREADS)
-os.environ.setdefault("OPENBLAS_NUM_THREADS", _MAX_THREADS)
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _MAX_THREADS)
-os.environ.setdefault("NUMEXPR_NUM_THREADS", _MAX_THREADS)
-os.environ.setdefault("TORCH_NUM_THREADS", _MAX_THREADS)
+# CRITICAL: Apply CPU thread limits BEFORE importing numpy/torch/etc.
+from apps.common.cpu_limits import apply_global_cpu_limits
+
+apply_global_cpu_limits()
+
+import os
 
 from kombu import Queue
 from celery import Celery

@@ -24,6 +24,7 @@ from celery.result import AsyncResult, GroupResult
 
 from apps.api.celery_app import celery_app
 from apps.api.config import REDIS_URL
+from apps.api.services import redis_keys
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,7 +64,12 @@ def _get_redis() -> redis.Redis:
 
 def _lock_key(episode_id: str, operation: str) -> str:
     """Generate Redis key for job lock."""
-    return f"screanalytics:job_lock:{episode_id}:{operation}"
+    return redis_keys.job_lock_key(episode_id, operation)
+
+
+def _lock_keys(episode_id: str, operation: str) -> list[str]:
+    """Generate canonical + legacy Redis keys for a job lock (canonical first)."""
+    return redis_keys.job_lock_keys(episode_id, operation)
 
 
 def check_active_job(episode_id: str, operation: str) -> Optional[str]:
@@ -73,8 +79,13 @@ def check_active_job(episode_id: str, operation: str) -> Optional[str]:
     """
     try:
         r = _get_redis()
-        lock_key = _lock_key(episode_id, operation)
-        job_id = r.get(lock_key)
+        job_id = None
+        lock_key = None
+        for candidate in _lock_keys(episode_id, operation):
+            job_id = r.get(candidate)
+            if job_id:
+                lock_key = candidate
+                break
 
         if job_id:
             # Verify the job is still running
@@ -82,7 +93,8 @@ def check_active_job(episode_id: str, operation: str) -> Optional[str]:
             if result.state in (states.PENDING, states.RECEIVED, states.STARTED):
                 return job_id
             # Job finished or failed, clean up lock
-            r.delete(lock_key)
+            if lock_key is not None:
+                r.delete(lock_key)
 
         return None
     except Exception as e:
@@ -121,21 +133,30 @@ def _acquire_lock(episode_id: str, operation: str, job_id: str, ttl: int = None)
 
     try:
         r = _get_redis()
-        lock_key = _lock_key(episode_id, operation)
-
-        # Check if there's an existing lock
-        existing = r.get(lock_key)
-        if existing:
-            # Verify the existing job is still running
+        # Check for any existing lock keys (canonical or legacy)
+        for candidate in _lock_keys(episode_id, operation):
+            existing = r.get(candidate)
+            if not existing:
+                continue
             result = AsyncResult(existing, app=celery_app)
             if result.state in (states.PENDING, states.RECEIVED, states.STARTED):
                 return False  # Another job is running
             # Old job finished - explicitly delete stale lock before acquiring (Bug 8 fix)
-            r.delete(lock_key)
-            LOGGER.info(f"Cleaned up stale lock for {episode_id}:{operation} (job {existing} state={result.state})")
+            r.delete(candidate)
+            LOGGER.info(
+                "Cleaned up stale lock for %s:%s (key=%s job=%s state=%s)",
+                episode_id,
+                operation,
+                candidate,
+                existing,
+                result.state,
+            )
 
-        # Set lock with TTL
-        r.setex(lock_key, ttl, job_id)
+        # Set canonical lock with TTL (NX to avoid races)
+        lock_key = _lock_key(episode_id, operation)
+        acquired = r.set(lock_key, job_id, nx=True, ex=ttl)
+        if not acquired:
+            return False
         return True
     except Exception as e:
         LOGGER.error(f"Failed to acquire lock for {episode_id}:{operation}: {e}")
@@ -148,11 +169,11 @@ def _release_lock(episode_id: str, operation: str, job_id: str) -> None:
     """Release job lock."""
     try:
         r = _get_redis()
-        lock_key = _lock_key(episode_id, operation)
-        # Only release if we own the lock
-        current = r.get(lock_key)
-        if current == job_id:
-            r.delete(lock_key)
+        # Only release if we own the lock (for canonical and legacy keys)
+        for lock_key in _lock_keys(episode_id, operation):
+            current = r.get(lock_key)
+            if current == job_id:
+                r.delete(lock_key)
     except Exception as e:
         LOGGER.warning(f"Failed to release lock: {e}")
 
@@ -165,8 +186,8 @@ def _force_release_lock(episode_id: str, operation: str) -> None:
     """
     try:
         r = _get_redis()
-        lock_key = _lock_key(episode_id, operation)
-        r.delete(lock_key)
+        for lock_key in _lock_keys(episode_id, operation):
+            r.delete(lock_key)
         LOGGER.info(f"Force released lock for {episode_id}:{operation}")
     except Exception as e:
         LOGGER.warning(f"Failed to force release lock: {e}")
@@ -1513,7 +1534,6 @@ def get_parallel_job_status(group_id: str) -> Dict[str, Any]:
 # Enhancement #9: Job Progress Persistence
 # =============================================================================
 
-_JOB_HISTORY_KEY = "screanalytics:job_history"
 _JOB_HISTORY_MAX = 100  # Keep last 100 jobs per user
 
 
@@ -1555,7 +1575,7 @@ def persist_job_record(
         }
 
         # Use a sorted set with timestamp as score for ordering
-        key = f"{_JOB_HISTORY_KEY}:{user_id or 'anonymous'}"
+        key = redis_keys.job_history_user_key(user_id)
         r.zadd(key, {json.dumps(record): time.time()})
 
         # Trim to max entries
@@ -1600,13 +1620,19 @@ def get_job_history(
     """
     try:
         r = _get_redis()
-        key = f"{_JOB_HISTORY_KEY}:{user_id or 'anonymous'}"
+        primary, *fallbacks = redis_keys.job_history_user_keys(user_id)
+        key = primary
 
         # Get entries in reverse order (newest first)
         start = -(offset + limit)
         end = -(offset + 1) if offset > 0 else -1
 
         entries = r.zrevrange(key, offset, offset + limit - 1)
+        if not entries:
+            for fallback in fallbacks:
+                entries = r.zrevrange(fallback, offset, offset + limit - 1)
+                if entries:
+                    break
 
         records = []
         for entry in entries:

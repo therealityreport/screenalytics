@@ -235,8 +235,8 @@ celery -A apps.api.celery_app:celery_app flower --port=5555
 
 ```bash
 redis-cli
-> KEYS screanalytics:*
-> GET screanalytics:job_lock:rhobh-s01e01:auto_group
+> KEYS screenalytics:*
+> GET screenalytics:job_lock:rhobh-s01e01:auto_group
 ```
 
 ## Troubleshooting

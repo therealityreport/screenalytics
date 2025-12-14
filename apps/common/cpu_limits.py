@@ -1,5 +1,5 @@
 """
-Central CPU thread limit configuration for SCREANALYTICS.
+Central CPU thread limit configuration for SCREENALYTICS.
 
 This module provides a consistent way to cap CPU usage across all ML workloads
 by limiting thread counts in BLAS libraries, ONNX Runtime, PyTorch, and thread pools.
@@ -8,8 +8,12 @@ Default behavior targets ~300% CPU usage (roughly 3 logical cores) to prevent
 overheating on laptops while maintaining good performance.
 
 Environment Variables:
-    SCREANALYTICS_MAX_CPU_THREADS: Integer core/thread cap (default: 3)
-    SCREANALYTICS_MAX_CPU_PERCENT: Alternative percentage-based limit (e.g., 300 for 3 cores)
+    SCREENALYTICS_MAX_CPU_THREADS: Integer core/thread cap (default: 3)
+    SCREENALYTICS_MAX_CPU_PERCENT: Alternative percentage-based limit (e.g., 300 for 3 cores)
+
+    Deprecated aliases (backward compatible for now):
+        SCREANALYTICS_MAX_CPU_THREADS
+        SCREANALYTICS_MAX_CPU_PERCENT
 
 Usage:
     Call apply_global_cpu_limits() once at the very top of each process entrypoint,
@@ -35,12 +39,21 @@ DEFAULT_MAX_THREADS = 3
 
 _limits_applied = False
 
+_warned_deprecated_env_vars: set[str] = set()
+
+
+def _warn_deprecated_env_var(deprecated: str, canonical: str) -> None:
+    if deprecated in _warned_deprecated_env_vars:
+        return
+    _warned_deprecated_env_vars.add(deprecated)
+    LOGGER.warning("Deprecated env var %s is set; use %s instead", deprecated, canonical)
+
 
 def get_max_threads_from_env(default_cores: int = DEFAULT_MAX_THREADS) -> int:
     """
     Determine the maximum number of threads to use based on environment configuration.
 
-    Checks SCREANALYTICS_MAX_CPU_THREADS first, then SCREANALYTICS_MAX_CPU_PERCENT.
+    Checks SCREENALYTICS_MAX_CPU_THREADS first, then SCREENALYTICS_MAX_CPU_PERCENT.
     Falls back to min(default_cores, actual_cpu_count) to prevent over-subscribing
     on low-core machines.
 
@@ -50,25 +63,50 @@ def get_max_threads_from_env(default_cores: int = DEFAULT_MAX_THREADS) -> int:
     Returns:
         Maximum number of threads (integer >= 1)
     """
+    threads_key = "SCREENALYTICS_MAX_CPU_THREADS"
+    percent_key = "SCREENALYTICS_MAX_CPU_PERCENT"
+    deprecated_threads_key = "SCREANALYTICS_MAX_CPU_THREADS"
+    deprecated_percent_key = "SCREANALYTICS_MAX_CPU_PERCENT"
+
     # Direct thread count override
-    if "SCREANALYTICS_MAX_CPU_THREADS" in os.environ:
+    if threads_key in os.environ:
         try:
-            max_threads = int(os.environ["SCREANALYTICS_MAX_CPU_THREADS"])
+            max_threads = int(os.environ[threads_key])
             if max_threads >= 1:
                 return max_threads
-            LOGGER.warning("SCREANALYTICS_MAX_CPU_THREADS=%d is invalid; using default", max_threads)
+            LOGGER.warning("%s=%d is invalid; using default", threads_key, max_threads)
         except (ValueError, TypeError):
-            LOGGER.warning("Invalid SCREANALYTICS_MAX_CPU_THREADS value; using default")
+            LOGGER.warning("Invalid %s value; using default", threads_key)
+
+    if threads_key not in os.environ and deprecated_threads_key in os.environ:
+        _warn_deprecated_env_var(deprecated_threads_key, threads_key)
+        try:
+            max_threads = int(os.environ[deprecated_threads_key])
+            if max_threads >= 1:
+                return max_threads
+            LOGGER.warning("%s=%d is invalid; using default", deprecated_threads_key, max_threads)
+        except (ValueError, TypeError):
+            LOGGER.warning("Invalid %s value; using default", deprecated_threads_key)
 
     # Percentage-based limit (e.g., 300 = 3 cores at 100% each)
-    if "SCREANALYTICS_MAX_CPU_PERCENT" in os.environ:
+    if percent_key in os.environ:
         try:
-            percent = int(os.environ["SCREANALYTICS_MAX_CPU_PERCENT"])
+            percent = int(os.environ[percent_key])
             max_threads = max(1, percent // 100)
-            LOGGER.info("Computed max_threads=%d from SCREANALYTICS_MAX_CPU_PERCENT=%d", max_threads, percent)
+            LOGGER.info("Computed max_threads=%d from %s=%d", max_threads, percent_key, percent)
             return max_threads
         except (ValueError, TypeError):
-            LOGGER.warning("Invalid SCREANALYTICS_MAX_CPU_PERCENT value; using default")
+            LOGGER.warning("Invalid %s value; using default", percent_key)
+
+    if percent_key not in os.environ and deprecated_percent_key in os.environ:
+        _warn_deprecated_env_var(deprecated_percent_key, percent_key)
+        try:
+            percent = int(os.environ[deprecated_percent_key])
+            max_threads = max(1, percent // 100)
+            LOGGER.info("Computed max_threads=%d from %s=%d", max_threads, deprecated_percent_key, percent)
+            return max_threads
+        except (ValueError, TypeError):
+            LOGGER.warning("Invalid %s value; using default", deprecated_percent_key)
 
     # Fallback: don't exceed physical core count
     try:
