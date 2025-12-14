@@ -129,6 +129,33 @@ class DismissedSuggestionsService:
         """
         return self._save_dismissed(ep_id, set())
 
+    def reset_state(self, ep_id: str, *, archive_existing: bool = True) -> Dict[str, Any]:
+        """Reset dismissed suggestions state for an episode.
+
+        The default behavior preserves user intent by archiving the existing file
+        before clearing it.
+        """
+        dismissed_file = self._get_dismissed_file_path(ep_id)
+        archived_name: str | None = None
+
+        if archive_existing and dismissed_file.exists():
+            archive_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            archived_path = dismissed_file.with_name(f"{dismissed_file.name}.{archive_suffix}.bak")
+            try:
+                dismissed_file.rename(archived_path)
+                archived_name = archived_path.name
+                LOGGER.info("[%s] Archived dismissed suggestions: %s", ep_id, archived_name)
+            except OSError as exc:
+                LOGGER.error("[%s] Failed to archive dismissed suggestions: %s", ep_id, exc)
+                return {"ok": False, "error": f"Failed to archive existing dismissed suggestions: {exc}"}
+
+        self.invalidate_cache(ep_id)
+        dismissed_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._save_dismissed(ep_id, set()):
+            return {"ok": False, "error": "Failed to write dismissed suggestions"}
+
+        return {"ok": True, "archived": archived_name}
+
     def is_dismissed(self, ep_id: str, suggestion_id: str) -> bool:
         """Check if a suggestion is dismissed.
 

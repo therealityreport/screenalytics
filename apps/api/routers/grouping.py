@@ -1383,6 +1383,15 @@ class DismissRequest(BaseModel):
     suggestion_ids: List[str] = Field(..., description="List of suggestion IDs to dismiss")
 
 
+class ResetDismissedSuggestionsRequest(BaseModel):
+    """Request to reset dismissed suggestions state."""
+
+    archive_existing: bool = Field(
+        True,
+        description="If true, archive the existing dismissed suggestions file before clearing.",
+    )
+
+
 @router.get("/episodes/{ep_id}/dismissed_suggestions")
 def get_dismissed_suggestions(ep_id: str) -> dict:
     """Get all dismissed suggestions for an episode.
@@ -1481,6 +1490,31 @@ def clear_dismissed_suggestions(ep_id: str) -> dict:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear dismissed suggestions: {str(e)}")
+
+
+@router.post("/episodes/{ep_id}/dismissed_suggestions/reset_state")
+def reset_dismissed_suggestions_state(ep_id: str, req: ResetDismissedSuggestionsRequest) -> dict:
+    """Reset dismissed Smart Suggestions (explicit, user-controlled).
+
+    By default, archives the prior file so user intent is preserved and can be restored if needed.
+    """
+    try:
+        result = dismissed_suggestions_service.reset_state(ep_id, archive_existing=req.archive_existing)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("error") or "Failed to reset dismissed suggestions",
+            )
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "archived": result.get("archived"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reset dismissed suggestions: {str(e)}")
 
 
 @router.get("/episodes/{ep_id}/outlier_audit")

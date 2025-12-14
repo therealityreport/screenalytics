@@ -1060,6 +1060,8 @@ def _estimate_runtime_seconds(frames: int, device_value: str) -> float:
 
 def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
     """Fetch initial suggestions and activate the Improve Faces modal on Episode Detail."""
+    # Ensure any one-shot trigger only fires once (prevents re-opening on each rerender).
+    st.session_state.pop(f"{ep_id}::trigger_improve_faces", None)
     try:
         resp = helpers.api_get(f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions")
     except Exception as exc:
@@ -1082,7 +1084,6 @@ def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
     st.session_state[f"{ep_id}::improve_faces_active"] = True
     st.session_state[f"{ep_id}::improve_faces_suggestions"] = suggestions
     st.session_state[f"{ep_id}::improve_faces_index"] = 0
-    st.session_state.pop(f"{ep_id}::trigger_improve_faces", None)
     st.session_state.pop(f"{ep_id}::improve_faces_complete", None)
     st.rerun()
     return True
@@ -2699,14 +2700,88 @@ with st.container():
         else:
             # Disable if no video or job already running
             autorun_disabled = not local_video_exists or st.session_state.get(running_job_key, False)
-            if st.button(
-                "🚀 Auto-Run Pipeline",
-                key="start_autorun",
-                use_container_width=True,
-                type="primary",
+            autorun_reset_review_state_key = f"{ep_id}::autorun_reset_review_state"
+            autorun_reset_review_state_confirm_key = f"{ep_id}::autorun_confirm_reset_review_state"
+            autorun_start_requested_key = f"{ep_id}::autorun_start_requested"
+
+            reset_review_state = st.checkbox(
+                "Reset review state",
+                key=autorun_reset_review_state_key,
                 disabled=autorun_disabled,
-                help="Run Detect/Track → Faces Harvest → Cluster automatically with current settings",
-            ):
+                help="Clears dismissed Smart Suggestions and Improve Faces decisions (archives first).",
+            )
+
+            if st.session_state.get(autorun_reset_review_state_confirm_key):
+                st.warning(
+                    "⚠️ **Reset review state?** This clears dismissed Smart Suggestions and Improve Faces decisions "
+                    "(existing files are archived first)."
+                )
+                confirm_col1, confirm_col2 = st.columns(2)
+                with confirm_col1:
+                    if st.button(
+                        "✓ Reset + Auto-Run",
+                        key=f"{ep_id}::autorun_confirm_reset_review_state_yes",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        with st.spinner("Resetting review state..."):
+                            try:
+                                helpers.api_post(
+                                    f"/episodes/{ep_id}/dismissed_suggestions/reset_state",
+                                    json={"archive_existing": True},
+                                    timeout=15,
+                                )
+                                helpers.api_post(
+                                    f"/episodes/{ep_id}/face_review/reset_state",
+                                    json={"archive_existing": True},
+                                    timeout=15,
+                                )
+                            except Exception as exc:
+                                st.error(f"Reset failed: {exc}")
+                                st.exception(exc)
+                                st.session_state.pop(autorun_reset_review_state_confirm_key, None)
+                                st.stop()
+
+                        # Clear local UI session state so the next cluster run can re-open Improve Faces cleanly.
+                        for key in (
+                            f"{ep_id}::improve_faces_complete",
+                            f"{ep_id}::improve_faces_active",
+                            f"{ep_id}::improve_faces_suggestions",
+                            f"{ep_id}::improve_faces_index",
+                        ):
+                            st.session_state.pop(key, None)
+
+                        st.session_state.pop(autorun_reset_review_state_confirm_key, None)
+                        st.session_state[autorun_start_requested_key] = True
+                        st.rerun()
+                with confirm_col2:
+                    if st.button(
+                        "Cancel",
+                        key=f"{ep_id}::autorun_confirm_reset_review_state_no",
+                        use_container_width=True,
+                    ):
+                        st.session_state.pop(autorun_reset_review_state_confirm_key, None)
+                        st.rerun()
+            else:
+                if st.button(
+                    "🚀 Auto-Run Pipeline",
+                    key="start_autorun",
+                    use_container_width=True,
+                    type="primary",
+                    disabled=autorun_disabled,
+                    help="Run Detect/Track → Faces Harvest → Cluster automatically with current settings",
+                ):
+                    if reset_review_state:
+                        st.session_state[autorun_reset_review_state_confirm_key] = True
+                        st.rerun()
+                    st.session_state[autorun_start_requested_key] = True
+                    st.rerun()
+
+            if st.session_state.pop(autorun_start_requested_key, False):
+                if autorun_disabled:
+                    st.error("Auto-run is disabled (missing video or another job is running).")
+                    st.stop()
+
                 # Clear old manifest data to prevent stale data confusion
                 # Archive old run markers and clear status cache
                 _manifests_dir = helpers.DATA_ROOT / "manifests" / ep_id
