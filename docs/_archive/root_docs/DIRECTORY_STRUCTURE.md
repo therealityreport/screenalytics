@@ -41,7 +41,7 @@ Production-ready code that has passed promotion gates. Changes require PR review
 ### FEATURES Sandboxes
 Temporary experimental code (30-day TTL). **No production imports allowed.**
 - Structure: `FEATURES/<name>/` with `src/`, `tests/`, `docs/`, `TODO.md`
-- Promotion: `tools/promote-feature.py <name>`
+- Promotion: follow the manual worktree + PR workflow in the full Directory Structure doc
 
 ### Import Policy
 ✅ **ALLOWED:** Production imports from `apps/`, `web/`, `packages/`
@@ -53,8 +53,8 @@ Temporary experimental code (30-day TTL). **No production imports allowed.**
 
 1. Develop in `FEATURES/<name>/`
 2. Pass CI (tests + docs + lint)
-3. Run `tools/promote-feature.py <name> --dest <path>`
-4. Code moves to target path, docs updated automatically
+3. Open a PR that promotes the feature by moving code into the target path (use `git mv` to preserve history)
+4. Update docs + `ACCEPTANCE_MATRIX.md` entries as needed
 5. CI verifies ACCEPTANCE_MATRIX.md entry exists
 
 ---

@@ -32,7 +32,7 @@ This caused:
 - Process continued after page refresh (wrong)
 - No synchronous behavior (wrong)
 
-## Fix Applied (nov-24 branch)
+## Fix Applied (main)
 
 ### 1. Backend: New Blocking Subprocess Runner
 
@@ -152,4 +152,4 @@ After the fix, verify:
 1. **d499c64**: Introduced async local mode with job IDs (problem started here)
 2. **45b5d96**: Attempted fix but incomplete
 3. **4badd97**: Regression - reintroduced async local mode
-4. **Current (nov-24)**: Proper fix with truly synchronous local mode
+4. **Current (main)**: Proper fix with truly synchronous local mode

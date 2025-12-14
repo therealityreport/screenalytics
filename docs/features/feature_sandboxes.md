@@ -14,7 +14,7 @@ Last Updated: 2025-11-18
 ## Structure
 
 ```
-FEATURES/<feature-name>/
+FEATURES/<feature_name>/
 ├── src/              # Throwaway implementation
 ├── tests/            # Focused tests for this feature
 ├── docs/             # Working notes (agents write here)
@@ -39,12 +39,12 @@ FEATURES/<feature-name>/
 ## Creating a New Feature
 
 ```bash
-python tools/new-feature.py <feature-name>
+mkdir -p FEATURES/<feature_name>/{src,tests,docs}
 ```
 
-This creates:
+Then add a `TODO.md` and start implementing:
 ```
-FEATURES/<feature-name>/
+FEATURES/<feature_name>/
 ├── src/
 ├── tests/
 ├── docs/
@@ -57,7 +57,7 @@ FEATURES/<feature-name>/
 
 ### 1. Implement in `src/`
 ```python
-# FEATURES/my-feature/src/my_module.py
+# FEATURES/my_feature/src/my_module.py
 def my_function():
     # Implementation
     pass
@@ -65,7 +65,7 @@ def my_function():
 
 ### 2. Write Tests in `tests/`
 ```python
-# FEATURES/my-feature/tests/test_my_module.py
+# FEATURES/my_feature/tests/test_my_module.py
 from FEATURES.my_feature.src.my_module import my_function
 
 def test_my_function():
@@ -74,7 +74,7 @@ def test_my_function():
 
 ### 3. Document in `docs/`
 ```markdown
-# FEATURES/my-feature/docs/README.md
+# FEATURES/my_feature/docs/README.md
 
 ## Overview
 This feature does X, Y, Z.
@@ -89,7 +89,7 @@ This feature does X, Y, Z.
 
 ### 4. Update `TODO.md`
 ```markdown
-# TODO: my-feature
+# TODO: my_feature
 
 **Status:** IN_PROGRESS
 **Owner:** jane-doe
@@ -168,19 +168,18 @@ When your feature is ready for production:
 - [ ] Integration tests passing (if applicable)
 - [ ] Row added to `ACCEPTANCE_MATRIX.md`
 
-### 2. Run Promotion Script
+### 2. Promote (manual)
 
-```bash
-python tools/promote-feature.py <feature-name> --dest <target-path>
-```
+Promote by opening a PR that moves code out of `FEATURES/<feature_name>/` into production paths (`apps/`, `web/`, `packages/`).
 
 **Example:**
 ```bash
-python tools/promote-feature.py my-feature --dest apps/api/services/
+git mv FEATURES/my_feature/src/my_module.py apps/api/services/my_module.py
+git mv FEATURES/my_feature/tests/test_my_module.py tests/api/services/test_my_module.py
 ```
 
 **What happens:**
-1. Code moves from `FEATURES/my-feature/src/` → `apps/api/services/my_module.py`
+1. Code moves from `FEATURES/my_feature/src/` → `apps/api/services/my_module.py`
 2. Tests move to `tests/api/services/test_my_module.py`
 3. Docs merge into `docs/` (or link from existing docs)
 4. `TODO.md` status → `PROMOTED`
@@ -229,13 +228,13 @@ Before marking a feature **Accepted** in `ACCEPTANCE_MATRIX.md`:
 Features older than **30 days** without promotion are flagged by CI:
 
 ```
-⚠️ WARNING: FEATURES/stale-feature/ is 35 days old (TTL: 30 days)
+⚠️ WARNING: FEATURES/stale_feature/ is 35 days old (TTL: 30 days)
 Action required: Promote or archive
 ```
 
 **Options:**
-1. **Promote:** Run `tools/promote-feature.py stale-feature`
-2. **Archive:** Move to `archive/FEATURES/stale-feature/` (for reference only)
+1. **Promote:** Open a PR that moves code/tests/docs out of `FEATURES/stale_feature/`
+2. **Archive:** Move to `archive/FEATURES/stale_feature/` (for reference only)
 3. **Delete:** Remove entirely if no longer needed
 
 ---
@@ -245,19 +244,20 @@ Action required: Promote or archive
 ### Quick Feature → Promotion
 ```bash
 # 1. Create feature
-python tools/new-feature.py my-feature
+mkdir -p FEATURES/my_feature/{src,tests,docs}
 
 # 2. Implement
-vim FEATURES/my-feature/src/my_module.py
+vim FEATURES/my_feature/src/my_module.py
 
 # 3. Test
-pytest FEATURES/my-feature/tests/ -v
+pytest FEATURES/my_feature/tests/ -v
 
 # 4. Document
-vim FEATURES/my-feature/docs/README.md
+vim FEATURES/my_feature/docs/README.md
 
-# 5. Promote
-python tools/promote-feature.py my-feature --dest apps/api/services/
+# 5. Promote (via PR / git mv)
+git mv FEATURES/my_feature/src/my_module.py apps/api/services/my_module.py
+git mv FEATURES/my_feature/tests/test_my_module.py tests/api/services/test_my_module.py
 ```
 
 ### Integration Testing During Development
@@ -270,13 +270,13 @@ cat data/manifests/<test-ep-id>/track_metrics.json | jq .
 ```
 
 ### Debugging Failed Promotion
-If `tools/promote-feature.py` fails:
+If your promotion PR fails CI:
 
 1. Check CI output for specific failures
 2. Verify tests pass: `pytest FEATURES/<name>/tests/ -v`
 3. Verify lint: `black --check FEATURES/<name>/ && ruff check FEATURES/<name>/`
 4. Verify `ACCEPTANCE_MATRIX.md` row exists
-5. Re-run promotion with `--verbose` flag
+5. Ensure production code does not import from `FEATURES/**`
 
 ---
 

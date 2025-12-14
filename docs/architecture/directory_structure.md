@@ -110,8 +110,8 @@ screenalytics/
 ├── tools/                       # Helper scripts (SUPPORT)
 │   ├── episode_run.py           # CLI for detect/track/embed/cluster
 │   ├── episode_cleanup.py       # CLI for episode cleanup workflow
-│   ├── new-feature.py           # Create new feature sandbox
-│   ├── promote-feature.py       # Promote feature to production
+│   ├── run_pipeline.py          # Orchestrate multi-stage runs
+│   ├── analyze_screen_time.py   # Generate screentime.json/csv
 │   ├── dev-up.sh                # Start local dev stack
 │   └── ...                      # Other utility scripts
 │
@@ -179,12 +179,11 @@ FEATURES/<feature>/
   - ✅ CI green (lint, tests, acceptance checks)
   - ✅ Row in `ACCEPTANCE_MATRIX.md` marked ✅ Accepted
 - **Promotion process:**
-  1. Run `tools/promote-feature.py <feature-name> --dest <final-path>`
-  2. Code moves from `FEATURES/<feature>/src/` to target path (e.g., `apps/`, `web/`, `packages/`)
-  3. Tests move to `tests/`
-  4. Docs move to `docs/` (or merged into existing docs)
-  5. `TODO.md` status → `PROMOTED`
-  6. Agents auto-update root docs (README, PRD, Solution Architecture, Directory Structure)
+  1. Open a PR that moves code out of `FEATURES/<feature>/src/` into production paths (`apps/`, `web/`, `packages/`)
+  2. Move tests into `tests/`
+  3. Merge docs into `docs/` (or link into existing docs)
+  4. Update `TODO.md` status → `PROMOTED` (or archive/remove the sandbox)
+  5. Agents auto-update root docs (README, PRD, Solution Architecture, Directory Structure)
 
 ### 3.3 CI Enforcement
 - **Feature expiry:** CI flags features older than 30 days
@@ -217,13 +216,12 @@ FEATURES/<feature>/
                  │
                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 3. Run Promotion                                                 │
-│    $ tools/promote-feature.py <name> --dest <path>              │
-│    - Move src/ → target path (apps/, web/, packages/)           │
-│    - Move tests/ → tests/<category>/                            │
-│    - Merge docs/ → docs/<category>/                             │
-│    - Update TODO.md status → PROMOTED                           │
-│    - Add row to ACCEPTANCE_MATRIX.md                            │
+│ 3. Promote via PR                                                │
+│    - Move src/ → target path (apps/, web/, packages/)            │
+│    - Move tests/ → tests/<category>/                             │
+│    - Merge docs/ → docs/<category>/                              │
+│    - Update TODO.md status → PROMOTED (or archive/remove)        │
+│    - Add row to ACCEPTANCE_MATRIX.md                             │
 └────────────────┬────────────────────────────────────────────────┘
                  │
                  ▼

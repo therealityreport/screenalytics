@@ -4,8 +4,8 @@
 
 **Finding: `main` is already the most complete branch.**
 
-- `nov-24` was only 1 commit ahead (a stripped Voices Review that would be destructive)
-- `main` is 18 commits ahead of `nov-24` with all audio pipeline work, CI fixes, and the screen-time engine
+- The legacy branch was only 1 commit ahead (a stripped Voices Review that would be destructive)
+- `main` is 18 commits ahead of the legacy branch with all audio pipeline work, CI fixes, and the screen-time engine
 - **Infra branches are OLD snapshots** that would DELETE 10,000-15,000 lines if merged
 
 **Status: Cleanup complete. `main` is the canonical trunk.**
@@ -22,7 +22,7 @@
 | `nov-29-audio-pipeline` | ✅ | ✅ | Fully merged |
 | `feature/screen-time-engine-refactor` | ✅ | ✅ | Cherry-picked to main |
 | `feature/pyannote-official-workflow` | ✅ | N/A | Content on main |
-| `nov-24` | ✅ | ✅ | Would overwrite Voices Review |
+| `legacy branch (retired)` | ✅ | ✅ | Would overwrite Voices Review |
 | `nov-29-voices-review` | ✅ | ✅ | WIP superseded |
 | `rescue/local-sync-2025-11-29` | ✅ | ✅ | Old snapshot |
 | `review/codex-full-snapshot` | ✅ | ✅ | Just a review snapshot |
