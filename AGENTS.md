@@ -8,9 +8,14 @@ It merges legacy Codex review guidance with current operational guardrails.
 ## 0. Repository and Branch
 
 - Repo: `github.com/therealityreport/screenalytics`
-- Primary branches:
+- Primary branch:
   - `main` - stable
-  - `nov-24` - historical working branch (not default)
+- Default working base: `origin/main`
+- Work happens on a feature branch off `main` using standard prefixes:
+  - `fix/<slug>` (bugfix)
+  - `feat/<slug>` (feature)
+  - `chore/<slug>` (docs/hygiene)
+- Never push directly to `main`; open a PR targeting `main`.
 - Hard boundaries:
   - Do not touch or reference other repos (THB-BBL, basketball projects, etc.).
   - Do not create cross-repo folders or assumptions.
@@ -33,20 +38,21 @@ It merges legacy Codex review guidance with current operational guardrails.
 
 ## 2. Branching and Git Usage
 
-- Default base branch: `origin/main` (unless a task specifies another).
-- Use a worktree for tasks/PRs; do not commit directly on `main`.
+- Default base: `origin/main` (unless a task specifies otherwise).
+- Do all work on a feature branch off `main` (e.g., `fix/<slug>`, `feat/<slug>`, `chore/<slug>`).
+- Never push directly to `main`; open a PR targeting `main`.
+- If local work exists on a deprecated branch name, rename the current branch in place to a `fix/…`, `feat/…`, or `chore/…` branch (do not check out the deprecated name).
 - Keep changes scoped and coherent; prefer small, focused edits over broad refactors.
 - Agents do not auto-run shell commands. When the user should run git, provide a command block at the end of the report, for example:
   ```bash
-  git fetch origin
-  git worktree add -b <branch> ../wt/<branch> origin/main
-  cd ../wt/<branch>
+  git checkout main
+  git pull --rebase
+  git checkout -b fix/<slug>
   git status
   git diff
   git add -A
   git commit -m "Short, precise message"
-  git push -u origin <branch>
-  gh pr create --fill
+  git push -u origin fix/<slug>
   ```
 
 ## 3. Task Types and Severity (operational)

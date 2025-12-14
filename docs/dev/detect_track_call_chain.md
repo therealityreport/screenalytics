@@ -4,7 +4,7 @@
 
 This document describes how Detect/Track operations flow through the system for both execution modes: **Local Worker (direct)** and **Redis/Celery (queued)**.
 
-## Current Implementation (fixed in nov-24 branch)
+## Current Implementation (main)
 
 ### Local Mode Call Chain
 
@@ -148,7 +148,7 @@ Commit `45b5d96` attempted to fix this but was incomplete:
 - Made UI use blocking request
 - But backend still started detached process
 
-### Current Fix (nov-24 branch)
+### Current Fix (main)
 
 The current implementation properly fixes local mode:
 - Backend: `_run_local_subprocess_blocking()` uses `communicate()` for true blocking

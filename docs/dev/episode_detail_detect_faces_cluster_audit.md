@@ -1,10 +1,10 @@
 # Episode Detail Pipeline Audit (Detect/Track, Faces Harvest, Cluster)
 
 **Date:** 2025-11-29 (reconciled)  
-**Branch:** nov-24  
+**Base:** `main`  
 **Status:** Merged audit + fixes todo
 
-This document merges the two prior audits. Code on branch `nov-24` is the source of truth; issues marked NO ISSUE in the second audit were re-checked and downgraded only where the code actually fixed them.
+This document merges the two prior audits. Code on `main` is the source of truth; issues marked NO ISSUE in the second audit were re-checked and downgraded only where the code actually fixed them.
 
 ---
 
