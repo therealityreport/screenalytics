@@ -150,6 +150,7 @@ class DismissedSuggestionsService:
                 return {"ok": False, "error": f"Failed to archive existing dismissed suggestions: {exc}"}
 
         self.invalidate_cache(ep_id)
+        dismissed_file.parent.mkdir(parents=True, exist_ok=True)
         if not self._save_dismissed(ep_id, set()):
             return {"ok": False, "error": "Failed to write dismissed suggestions"}
 
