@@ -61,6 +61,15 @@ class DecisionRequest(BaseModel):
     )
 
 
+class ResetFaceReviewStateRequest(BaseModel):
+    """Request body for resetting face review state."""
+
+    archive_existing: bool = Field(
+        True,
+        description="If true, archive the existing face review state file before resetting.",
+    )
+
+
 @router.get("/{ep_id}/face_review/initial_unassigned_suggestions")
 def get_initial_unassigned_suggestions(
     ep_id: str,
@@ -175,4 +184,27 @@ def reset_initial_pass(ep_id: str):
         return {"status": "success", "ep_id": ep_id}
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to reset initial pass: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{ep_id}/face_review/reset_state")
+def reset_face_review_state(ep_id: str, request: ResetFaceReviewStateRequest) -> dict:
+    """Reset Improve Faces decisions and initial-pass state (explicit, user-controlled).
+
+    By default, archives the prior state file so user intent is preserved and can be restored if needed.
+    """
+    try:
+        result = face_review_service.reset_state(ep_id, archive_existing=request.archive_existing)
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error") or "Failed to reset face review state")
+
+        return {
+            "status": "success",
+            "ep_id": ep_id,
+            "archived": result.get("archived"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOGGER.error(f"[{ep_id}] Failed to reset face review state: {e}")
         raise HTTPException(status_code=500, detail=str(e))

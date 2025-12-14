@@ -130,6 +130,38 @@ class FaceReviewService:
         state["initial_unassigned_pass_done"] = False
         return self._save_state(ep_id, state)
 
+    def reset_state(self, ep_id: str, *, archive_existing: bool = True) -> Dict[str, Any]:
+        """Reset face review state (decisions + initial pass) for an episode.
+
+        The default behavior preserves user intent by archiving the existing state file
+        before writing a fresh empty state.
+        """
+        state_file = self._get_state_file_path(ep_id)
+        archived_name: str | None = None
+
+        if archive_existing and state_file.exists():
+            archive_suffix = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            archived_path = state_file.with_name(f"{state_file.name}.{archive_suffix}.bak")
+            try:
+                state_file.rename(archived_path)
+                archived_name = archived_path.name
+                LOGGER.info("[%s] Archived face review state: %s", ep_id, archived_name)
+            except OSError as exc:
+                LOGGER.error("[%s] Failed to archive face review state: %s", ep_id, exc)
+                return {"ok": False, "error": f"Failed to archive existing face review state: {exc}"}
+
+        self._invalidate_cache(ep_id)
+        default_state = {
+            "initial_unassigned_pass_done": False,
+            "decisions": [],
+            "updated_at": None,
+        }
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._save_state(ep_id, default_state):
+            return {"ok": False, "error": "Failed to write face review state"}
+
+        return {"ok": True, "archived": archived_name}
+
     def get_decision(
         self,
         ep_id: str,
