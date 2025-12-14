@@ -871,7 +871,7 @@ def _get_carousel_page_key(entity_id: str) -> str:
 
 def _render_carousel_thumbnails(
     thumb_urls: List[str],
-    entity_id: str,
+    entity_id: Any,
     page_size: int = CAROUSEL_PAGE_SIZE,
 ) -> None:
     """Render thumbnails with carousel navigation if needed.
@@ -886,8 +886,13 @@ def _render_carousel_thumbnails(
         st.caption("No thumbnails available")
         return
 
-    # Get current page index from session state
-    page_key = _get_carousel_page_key(entity_id)
+    entity_key = "" if entity_id is None else str(entity_id).strip()
+    ep_prefix = f"{ep_id}::"
+    if entity_key and not entity_key.startswith(ep_prefix):
+        entity_key = f"{ep_id}::{entity_key}"
+
+    # Get current page index from session state (episode-namespaced to avoid key collisions)
+    page_key = _get_carousel_page_key(entity_key)
     page_index = st.session_state.get(page_key, 0)
 
     # Calculate page bounds
@@ -902,7 +907,7 @@ def _render_carousel_thumbnails(
     if page_count > 1:
         nav_cols = st.columns([1, 6, 1])
         with nav_cols[0]:
-            if st.button("◀", key=f"carousel_prev_{entity_id}", disabled=page_index == 0, use_container_width=True):
+            if st.button("◀", key=f"{entity_key}::carousel_prev", disabled=page_index == 0, use_container_width=True):
                 st.session_state[page_key] = page_index - 1
                 st.rerun()
         with nav_cols[1]:
@@ -920,7 +925,7 @@ def _render_carousel_thumbnails(
             # Page indicator
             st.caption(f"{start_idx + 1}–{end_idx} of {total}")
         with nav_cols[2]:
-            if st.button("▶", key=f"carousel_next_{entity_id}", disabled=page_index >= page_count - 1, use_container_width=True):
+            if st.button("▶", key=f"{entity_key}::carousel_next", disabled=page_index >= page_count - 1, use_container_width=True):
                 st.session_state[page_key] = page_index + 1
                 st.rerun()
     else:
@@ -1102,7 +1107,7 @@ if _storage_backend == "s3":
             "👤 **Placeholder icons** indicate thumbnails haven't been synced to S3 yet. "
             "Click below to upload local thumbnails to S3 for proper display."
         )
-        if st.button("📤 Sync Thumbnails to S3", key="sync_thumbs_s3_smart", use_container_width=True):
+        if st.button("📤 Sync Thumbnails to S3", key=f"{ep_id}::sync_thumbs_s3_smart", use_container_width=True):
             with st.spinner("Syncing thumbnails and crops to S3..."):
                 try:
                     resp = requests.post(f"{_api_base}/episodes/{ep_id}/sync_thumbnails_to_s3", timeout=120)
@@ -1249,7 +1254,7 @@ if suggestions_status == "error" and suggestions_error:
     st.error(f"⚠️ **Smart Suggestions API failed:** {suggestions_error}")
     col_retry, col_spacer = st.columns([1, 4])
     with col_retry:
-        if st.button("🔄 Retry", key="retry_suggestions_top"):
+        if st.button("🔄 Retry", key=f"{ep_id}::retry_suggestions_top"):
             st.session_state[status_key] = "loading"
             with st.spinner("Retrying..."):
                 result = _recompute_cast_suggestions(ep_id, show_slug)
@@ -1531,7 +1536,7 @@ with col4:
     st.metric("Dismissed", dismissed_count)
 with col5:
     # Refresh button with proper error handling
-    if st.button("Refresh Suggestions", key="refresh_all_suggestions", use_container_width=True):
+    if st.button("Refresh Suggestions", key=f"{ep_id}::refresh_all_suggestions", use_container_width=True):
         st.session_state[status_key] = "loading"
         with st.spinner("Recomputing suggestions from latest cast assignments..."):
             result = _recompute_cast_suggestions(ep_id, show_slug)
@@ -1556,7 +1561,7 @@ last_action = _get_last_undo_action(ep_id)
 if last_action:
     undo_col1, undo_col2 = st.columns([1, 5])
     with undo_col1:
-        if st.button(f"↩️ Undo: {last_action.describe()}", key="undo_last_action", use_container_width=True):
+        if st.button(f"↩️ Undo: {last_action.describe()}", key=f"{ep_id}::undo_last_action", use_container_width=True):
             action = _pop_undo_action(ep_id)
             if action:
                 if action.action_type == "dismiss":
@@ -1716,14 +1721,23 @@ with st.expander("🔍 Audit All Assignments (Check for Outliers)", expanded=Fal
 
                             btn_col1, btn_col2 = st.columns(2)
                             with btn_col1:
-                                if st.button("✓ Keep", key=f"keep_outlier_{idx}_{track_id}", use_container_width=True):
+                                if st.button(
+                                    "✓ Keep",
+                                    key=f"{ep_id}::keep_outlier::{idx}::{track_id}",
+                                    use_container_width=True,
+                                ):
                                     st.toast(f"Kept track {track_id} with {cast_name}")
                                     # Mark as reviewed (remove from list)
                                     outliers_copy = [o for o in outliers if o.get("track_id") != track_id]
                                     st.session_state[audit_key]["outliers"] = outliers_copy
                                     st.rerun()
                             with btn_col2:
-                                if st.button(f"→ {sugg_name}", key=f"reassign_outlier_{idx}_{track_id}", type="primary", use_container_width=True):
+                                if st.button(
+                                    f"→ {sugg_name}",
+                                    key=f"{ep_id}::reassign_outlier::{idx}::{track_id}",
+                                    type="primary",
+                                    use_container_width=True,
+                                ):
                                     # Reassign the track/cluster to the suggested cast member
                                     with st.spinner(f"Reassigning to {sugg_name}..."):
                                         # Use the assign endpoint to reassign
@@ -1747,7 +1761,11 @@ with st.expander("🔍 Audit All Assignments (Check for Outliers)", expanded=Fal
                                             st.error(f"Reassignment failed: {reassign_result.error}")
                         else:
                             st.write("No suggested reassignment")
-                            if st.button("✓ Confirm", key=f"confirm_outlier_{idx}_{track_id}", use_container_width=True):
+                            if st.button(
+                                "✓ Confirm",
+                                key=f"{ep_id}::confirm_outlier::{idx}::{track_id}",
+                                use_container_width=True,
+                            ):
                                 st.toast(f"Confirmed track {track_id} with {cast_name}")
                                 outliers_copy = [o for o in outliers if o.get("track_id") != track_id]
                                 st.session_state[audit_key]["outliers"] = outliers_copy
@@ -1841,7 +1859,7 @@ with bulk_col:
         high_count = len(high_conf_entries)
 
         # Check for pending confirmation (episode-namespaced to avoid cross-tab leakage)
-        if _confirm_action(f"{ep_id}::bulk_accept_high", "Accept All High", high_count):
+        if _confirm_action(f"{ep_id}::bulk_accept_high", "GLOBAL: Accept High", high_count):
             with st.spinner(f"Accepting {high_count} high-confidence clusters..."):
                 accepted = 0
                 failed = 0
@@ -1882,7 +1900,12 @@ with bulk_col:
                 st.toast(f"Assigned {accepted} high-confidence clusters" + (f" ({failed} failed)" if failed else ""))
                 st.rerun()
 
-        if st.button(f"✓ Accept All High ({high_count})", key=f"{ep_id}::bulk_accept_high", disabled=high_count == 0, use_container_width=True):
+        if st.button(
+            f"GLOBAL: Accept High ({high_count})",
+            key=f"{ep_id}::bulk_accept_high",
+            disabled=high_count == 0,
+            use_container_width=True,
+        ):
             if high_count > 3:  # Only confirm for more than 3 items
                 _request_confirmation(f"{ep_id}::bulk_accept_high")
                 st.rerun()
@@ -1981,7 +2004,7 @@ with bulk_col:
             singleton_count = len(high_risk_singletons)
             if st.button(
                 f"🎯 Triage Singletons ({singleton_count})",
-                key="bulk_triage_singletons",
+                key=f"{ep_id}::bulk_triage_singletons",
                 disabled=singleton_count == 0,
                 use_container_width=True,
                 help="Review HIGH-risk singletons with decent matches"
@@ -2026,7 +2049,7 @@ if not suggestion_entries and not person_suggestion_entries:
         st.info("No pending suggestions. Click 'Refresh Suggestions' to find matches for unassigned clusters.")
     # Clear dismissed button if there are dismissed entries
     if dismissed:
-        if st.button("Clear All Dismissed", key="clear_all_dismissed", use_container_width=True):
+        if st.button("Clear All Dismissed", key=f"{ep_id}::clear_all_dismissed", use_container_width=True):
             _clear_dismissed_via_api()  # Persist to disk
             st.session_state[dismissed_key] = set()
             st.rerun()
@@ -2154,7 +2177,7 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                 st.markdown(
                     f'<span style="background-color: {conf_color}; color: white; '
                     f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
-                    f'{conf_level.upper()}</span>{rescued_badge}{temporal_badge} {cast_badge} → **{cast_name}** '
+                    f'{conf_level.upper()}</span>{rescued_badge}{temporal_badge} {cast_badge} Suggested: **{cast_name}** '
                     f'<span style="font-size: 0.75em; color: #888;">({source_label}){margin_html}</span>',
                     unsafe_allow_html=True,
                 )
@@ -2222,7 +2245,7 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
             # Action buttons - stacked vertically
             # Only show Accept button if there are suggestions
             if has_suggestions and cast_id:
-                if st.button("✓ Accept", key=f"sp_accept_{cluster_id}", use_container_width=True):
+                if st.button("✓ Accept", key=f"{ep_id}::sp_accept::{cluster_id}", use_container_width=True):
                     # Find or create person for this cast member
                     people_resp = _fetch_people_cached(show_slug)
                     people = people_resp.get("people", []) if people_resp else []
@@ -2259,7 +2282,7 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                         st.error(f"⚠️ Assignment failed: {error_detail}")
                         LOGGER.error(f"[{ep_id}] Failed to accept suggestion for cluster {cluster_id}: {error_detail}")
 
-            if st.button("View", key=f"sp_view_{cluster_id}", use_container_width=True):
+            if st.button("View", key=f"{ep_id}::sp_view::{cluster_id}", use_container_width=True):
                 # Smart navigation based on cluster structure
                 st.session_state["facebank_ep"] = ep_id
                 st.session_state.pop("facebank_query_applied", None)
@@ -2306,7 +2329,7 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
 
                 helpers.try_switch_page("pages/3_Faces_Review.py")
 
-            if st.button("✗ Skip", key=f"sp_dismiss_{cluster_id}", use_container_width=True):
+            if st.button("✗ Skip", key=f"{ep_id}::sp_dismiss::{cluster_id}", use_container_width=True):
                 # Archive the cluster before dismissing
                 _archive_cluster(cluster_id, cluster_data, reason="user_skipped")
                 dismissed.add(cluster_id)
@@ -2326,7 +2349,10 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                 if track_list:
                     first_track_id = track_list[0].get("track_id")
                 if first_track_id is not None:
-                    if st.button("🔧 Rescue", key=f"sp_rescue_{cluster_id}", use_container_width=True,
+                    if st.button(
+                        "🔧 Rescue",
+                        key=f"{ep_id}::sp_rescue::{cluster_id}",
+                        use_container_width=True,
                                  help="Force-embed low-quality faces to generate suggestions"):
                         try:
                             result = _api_post(
@@ -2361,6 +2387,15 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
     quality_metrics = person_entry.get("quality_metrics", {})
     has_suggestions = not person_entry.get("no_suggestions", False)
 
+    name_match_cast_id: str | None = None
+    name_match_cast_name: str | None = None
+    normalized_person_name = (person_name or "").strip().lower()
+    if normalized_person_name and cast_options:
+        matches = [cid for cid, name in cast_options.items() if (name or "").strip().lower() == normalized_person_name]
+        if len(matches) == 1:
+            name_match_cast_id = matches[0]
+            name_match_cast_name = cast_options.get(name_match_cast_id)
+
     with st.container(border=True):
         thumb_col, info_col, action_col = st.columns([3, 3, 1])
 
@@ -2372,7 +2407,7 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
             risk_badge_html = ""
             if outlier_risk and len(episode_clusters) > 1:
                 risk_badge_html = _render_outlier_risk_badge(outlier_risk)
-            st.markdown(f"**{person_name}** `{person_id}` {risk_badge_html}", unsafe_allow_html=True)
+            st.markdown(f"**Person** `{person_id}` {risk_badge_html}", unsafe_allow_html=True)
             cluster_count = len(episode_clusters)
             cluster_str = f"{cluster_count} cluster{'s' if cluster_count != 1 else ''}"
             counts_str = _format_counts(faces, tracks)
@@ -2427,7 +2462,7 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
                 st.markdown(
                     f'<span style="background-color: {conf_color}; color: white; '
                     f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
-                    f'{conf_level.upper()}</span> {cast_badge} → **{cast_name}** '
+                    f'{conf_level.upper()}</span> {cast_badge} Suggested: **{cast_name}** '
                     f'<span style="font-size: 0.75em; color: #888;">({source}){margin_html}</span>',
                     unsafe_allow_html=True,
                 )
@@ -2450,16 +2485,48 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
                 st.caption("💡 Click 'Refresh Suggestions' to find cast matches")
 
         with action_col:
+            if name_match_cast_id and name_match_cast_name:
+                if st.button(
+                    "✓ Link by name",
+                    key=f"{ep_id}::sp_link_person_by_name::{person_id}",
+                    use_container_width=True,
+                    help=f"Person name matches cast member '{name_match_cast_name}'",
+                ):
+                    result = _api_patch(f"/shows/{show_slug}/people/{person_id}", {"cast_id": name_match_cast_id})
+                    if result.ok:
+                        _push_undo_action(ep_id, UndoAction(
+                            action_type="link",
+                            ep_id=ep_id,
+                            person_id=person_id,
+                            cast_id=name_match_cast_id,
+                            cast_name=name_match_cast_name,
+                        ))
+                        st.toast(f"Linked {person_name} to {name_match_cast_name}")
+                        people_cache_key = f"people_cache:{show_slug}"
+                        if people_cache_key in st.session_state:
+                            del st.session_state[people_cache_key]
+                        st.rerun()
+                    else:
+                        st.error(f"⚠️ Link failed: {result.error_message}")
+                        LOGGER.error(f"[{ep_id}] Failed to link person {person_id}: {result.error_message}")
+
             if best_suggestion:
                 cast_id = best_suggestion.get("cast_id")
                 # Safely extract cast name for display
                 raw_name = best_suggestion.get("name") or cast_options.get(cast_id)
                 cast_name = _safe_cast_name(raw_name, fallback=cast_id if cast_id else "(Unknown)")
 
-                if st.button("✓ Link", key=f"sp_link_person_{person_id}", use_container_width=True):
+                if st.button("✓ Link", key=f"{ep_id}::sp_link_person::{person_id}", use_container_width=True):
                     payload = {"cast_id": cast_id}
                     result = _api_patch(f"/shows/{show_slug}/people/{person_id}", payload)
                     if result.ok:
+                        _push_undo_action(ep_id, UndoAction(
+                            action_type="link",
+                            ep_id=ep_id,
+                            person_id=person_id,
+                            cast_id=cast_id,
+                            cast_name=cast_name,
+                        ))
                         st.toast(f"Linked {person_name} to {cast_name}")
                         people_cache_key = f"people_cache:{show_slug}"
                         if people_cache_key in st.session_state:
@@ -2469,7 +2536,7 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
                         st.error(f"⚠️ Link failed: {result.error_message}")
                         LOGGER.error(f"[{ep_id}] Failed to link person {person_id}: {result.error_message}")
 
-            if st.button("View", key=f"sp_view_person_{person_id}", use_container_width=True):
+            if st.button("View", key=f"{ep_id}::sp_view_person::{person_id}", use_container_width=True):
                 # Smart navigation based on person structure
                 st.session_state["facebank_ep"] = ep_id
                 st.session_state.pop("facebank_query_applied", None)
@@ -2540,7 +2607,7 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
 
                 helpers.try_switch_page("pages/3_Faces_Review.py")
 
-            if st.button("✗ Skip", key=f"sp_dismiss_person_{person_id}", use_container_width=True):
+            if st.button("✗ Skip", key=f"{ep_id}::sp_dismiss_person::{person_id}", use_container_width=True):
                 # Archive all clusters belonging to this person
                 for cid in episode_clusters:
                     cdata = cluster_lookup.get(cid, {})
@@ -2625,8 +2692,8 @@ def render_grouped_cast_row(
     }
     conf_color = conf_colors.get(confidence_level, "#9E9E9E")
 
-    # Generate unique key for this group
-    group_key = f"cast_{cast_id}_{confidence_level}"
+    # Generate unique key for this group (episode-namespaced to avoid key collisions)
+    group_key = f"{ep_id}::cast_{cast_id}_{confidence_level}"
 
     # Build cast dropdown options for container: suggested cast first, then others alphabetically
     container_cast_options = [(cast_id, cast_name)]  # Suggested cast is default
@@ -2643,7 +2710,7 @@ def render_grouped_cast_row(
 
         with info_col:
             # Show cast member name prominently
-            st.markdown(f"### → **{cast_name}**")
+            st.markdown(f"### Suggested: **{cast_name}**")
 
             # Show aggregate stats
             st.caption(
@@ -2703,44 +2770,8 @@ def render_grouped_cast_row(
                         if cluster_id in cast_suggestions:
                             del cast_suggestions[cluster_id]
 
-                # After assigning primary clusters, find and assign similar unassigned singletons
-                extra_assigned = 0
-                if accepted > 0 and (target_person_id or selected_container_cast_id):
-                    similar_resp = _safe_api_get(
-                        f"/episodes/{ep_id}/find_similar_unassigned",
-                        params={
-                            "person_id": target_person_id or "",
-                            "cast_id": selected_container_cast_id or "",
-                            "min_similarity": 0.55,  # Slightly looser threshold for singletons
-                        },
-                    )
-                    if similar_resp and similar_resp.get("similar_clusters"):
-                        for sim_cluster in similar_resp["similar_clusters"]:
-                            sim_cid = sim_cluster["cluster_id"]
-                            # Skip if already in primary set or dismissed
-                            if sim_cid in primary_cluster_ids or sim_cid in dismissed:
-                                continue
-                            # Assign to same cast member
-                            assign_result = _api_post(
-                                f"/episodes/{ep_id}/clusters/group",
-                                {
-                                    "strategy": "manual",
-                                    "cluster_ids": [sim_cid],
-                                    "target_person_id": target_person_id,
-                                    "cast_id": selected_container_cast_id,
-                                },
-                                timeout=10,
-                            )
-                            if assign_result.ok:
-                                extra_assigned += 1
-                                if sim_cid in cast_suggestions:
-                                    del cast_suggestions[sim_cid]
-
                 if accepted > 0:
-                    msg = f"Assigned {accepted} cluster(s) to {selected_container_cast_name}"
-                    if extra_assigned > 0:
-                        msg += f" + {extra_assigned} similar singleton(s)"
-                    st.toast(msg)
+                    st.toast(f"Assigned {accepted} cluster(s) to {selected_container_cast_name}")
                     _invalidate_suggestions_cache(ep_id)  # Clear all caches including Singletons Review
                     st.rerun()
 
@@ -2783,7 +2814,7 @@ def render_grouped_cast_row(
                                 unsafe_allow_html=True,
                             )
                         with col2:
-                            if st.button("→ Open", key=f"dialog_view_{cid}", use_container_width=True):
+                            if st.button("→ Open", key=f"{group_key}::dialog_view::{cid}", use_container_width=True):
                                 # Set navigation state and trigger page switch
                                 st.session_state["facebank_ep"] = ep_id
                                 st.session_state["facebank_view"] = "cluster_tracks"
@@ -3066,8 +3097,12 @@ if suggestion_entries or person_suggestion_entries:
         # Batch rescue button
         col1, col2, col3 = st.columns([1, 1, 2])
         with col1:
-            if st.button("🔧 Rescue All", key="batch_rescue_all", use_container_width=True,
-                        help="Force-embed all quality-only clusters at once"):
+            if st.button(
+                "🔧 Rescue All",
+                key=f"{ep_id}::batch_rescue_all",
+                use_container_width=True,
+                help="Force-embed all quality-only clusters at once",
+            ):
                 try:
                     result = _api_post(
                         f"/episodes/{ep_id}/rescue_quality_clusters",
@@ -3088,8 +3123,12 @@ if suggestion_entries or person_suggestion_entries:
                     st.error(f"Error: {e}")
 
         with col2:
-            if st.button("🔗 Merge Adjacent", key="merge_adjacent_quality", use_container_width=True,
-                        help="Merge quality-only clusters that are temporally adjacent (likely same person)"):
+            if st.button(
+                "🔗 Merge Adjacent",
+                key=f"{ep_id}::merge_adjacent_quality",
+                use_container_width=True,
+                help="Merge quality-only clusters that are temporally adjacent (likely same person)",
+            ):
                 try:
                     from apps.api.services.grouping import GroupingService
                     grouping = GroupingService()
@@ -3176,7 +3215,7 @@ This can help you guess who the blurry person might be, even without embeddings.
                     # Force Embed button
                     first_track = track_ids[0] if track_ids else None
                     if first_track is not None:
-                        force_key = f"force_embed_{cluster_id}_{idx}"
+                        force_key = f"{ep_id}::force_embed::{cluster_id}::{idx}"
                         if st.button("🔧 Force Embed", key=force_key, help="Re-embed with lower quality threshold"):
                             try:
                                 result = _api_post(
@@ -3199,7 +3238,7 @@ This can help you guess who the blurry person might be, even without embeddings.
                 with cols[2]:
                     # View in Faces Review button
                     if first_track is not None:
-                        view_key = f"view_quality_{cluster_id}_{idx}"
+                        view_key = f"{ep_id}::view_quality::{cluster_id}::{idx}"
                         if st.button("👁️ View", key=view_key, help="Open in Faces Review with skipped faces visible"):
                             faces_url = f"/3_Faces_Review?ep_id={ep_id}&cluster_id={cluster_id}&low_quality=true"
                             st.markdown(f'<meta http-equiv="refresh" content="0; url={faces_url}">', unsafe_allow_html=True)
@@ -3254,7 +3293,7 @@ This can help you guess who the blurry person might be, even without embeddings.
 # Clear all dismissed button at bottom
 if dismissed:
     st.markdown("---")
-    if st.button("Clear All Dismissed", key="clear_dismissed_bottom", use_container_width=True):
+    if st.button("Clear All Dismissed", key=f"{ep_id}::clear_dismissed_bottom", use_container_width=True):
         _clear_dismissed_via_api()  # Persist to disk
         st.session_state[dismissed_key] = set()
         st.rerun()
@@ -3291,7 +3330,7 @@ if total_archived > 0:
         # Clear All button
         clear_col1, clear_col2 = st.columns([3, 1])
         with clear_col2:
-            if st.button("🗑️ Clear All", key="clear_all_archived_smart", type="secondary"):
+            if st.button("🗑️ Clear All", key=f"{ep_id}::clear_all_archived_smart", type="secondary"):
                 try:
                     clear_url = f"{_api_base}/archive/shows/{show_slug}/clear"
                     resp = requests.delete(clear_url, params={"episode_id": ep_id}, timeout=10)
@@ -3336,7 +3375,7 @@ if total_archived > 0:
                     if item.get("episode_id"):
                         st.caption(f"From: {item['episode_id']}")
                 with item_cols[3]:
-                    if st.button("↩️", key=f"restore_archive_smart_{archive_id}_{idx}", help="Restore item"):
+                    if st.button("↩️", key=f"{ep_id}::restore_archive_smart::{archive_id}::{idx}", help="Restore item"):
                         try:
                             restore_result = _api_post(f"/archive/shows/{show_slug}/restore/{archive_id}", timeout=5)
                             if restore_result.ok:
