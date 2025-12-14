@@ -871,7 +871,7 @@ def _get_carousel_page_key(entity_id: str) -> str:
 
 def _render_carousel_thumbnails(
     thumb_urls: List[str],
-    entity_id: str,
+    entity_id: Any,
     page_size: int = CAROUSEL_PAGE_SIZE,
 ) -> None:
     """Render thumbnails with carousel navigation if needed.
@@ -886,7 +886,7 @@ def _render_carousel_thumbnails(
         st.caption("No thumbnails available")
         return
 
-    entity_key = str(entity_id or "").strip()
+    entity_key = "" if entity_id is None else str(entity_id).strip()
     ep_prefix = f"{ep_id}::"
     if entity_key and not entity_key.startswith(ep_prefix):
         entity_key = f"{ep_id}::{entity_key}"
@@ -2177,7 +2177,7 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
                 st.markdown(
                     f'<span style="background-color: {conf_color}; color: white; '
                     f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
-                    f'{conf_level.upper()}</span>{rescued_badge}{temporal_badge} {cast_badge} → **{cast_name}** '
+                    f'{conf_level.upper()}</span>{rescued_badge}{temporal_badge} {cast_badge} Suggested: **{cast_name}** '
                     f'<span style="font-size: 0.75em; color: #888;">({source_label}){margin_html}</span>',
                     unsafe_allow_html=True,
                 )
@@ -2407,7 +2407,7 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
             risk_badge_html = ""
             if outlier_risk and len(episode_clusters) > 1:
                 risk_badge_html = _render_outlier_risk_badge(outlier_risk)
-            st.markdown(f"**{person_name}** `{person_id}` {risk_badge_html}", unsafe_allow_html=True)
+            st.markdown(f"**Person** `{person_id}` {risk_badge_html}", unsafe_allow_html=True)
             cluster_count = len(episode_clusters)
             cluster_str = f"{cluster_count} cluster{'s' if cluster_count != 1 else ''}"
             counts_str = _format_counts(faces, tracks)
@@ -2462,7 +2462,7 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
                 st.markdown(
                     f'<span style="background-color: {conf_color}; color: white; '
                     f'padding: 3px 8px; border-radius: 4px; font-size: 0.9em; font-weight: bold;">'
-                    f'{conf_level.upper()}</span> {cast_badge} → **{cast_name}** '
+                    f'{conf_level.upper()}</span> {cast_badge} Suggested: **{cast_name}** '
                     f'<span style="font-size: 0.75em; color: #888;">({source}){margin_html}</span>',
                     unsafe_allow_html=True,
                 )
@@ -2710,7 +2710,7 @@ def render_grouped_cast_row(
 
         with info_col:
             # Show cast member name prominently
-            st.markdown(f"### → **{cast_name}**")
+            st.markdown(f"### Suggested: **{cast_name}**")
 
             # Show aggregate stats
             st.caption(
