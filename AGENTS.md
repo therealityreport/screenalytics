@@ -8,18 +8,43 @@ It merges legacy Codex review guidance with current operational guardrails.
 ## 0. Repository and Branch
 
 - Repo: `github.com/therealityreport/screenalytics`
-- Primary branch:
-  - `main` - stable
+- Primary branch: `main` - stable, always deployable
 - Default working base: `origin/main`
-- Work happens on a feature branch off `main` using standard prefixes:
-  - `fix/<slug>` (bugfix)
-  - `feat/<slug>` (feature)
-  - `chore/<slug>` (docs/hygiene)
-- Never push directly to `main`; open a PR targeting `main`.
-- Hard boundaries:
-  - Do not touch or reference other repos (THB-BBL, basketball projects, etc.).
-  - Do not create cross-repo folders or assumptions.
-  - Keep all changes within this codebase and the branch named in the task.
+
+### Single Directory Workflow (REQUIRED)
+
+**All work happens in ONE location:** `/Volumes/HardDrive/SCREENALYTICS`
+
+**Agents must NOT:**
+- Create git worktrees
+- Work in multiple directories simultaneously
+- Use `/Volumes/HardDrive/wt/` or any other worktree folders
+
+**Agents must:**
+- Work only in the repo root directory
+- Create/continue work on a single branch per task
+- Use branch pattern: `screentime-improvements/<task-slug>`
+- Commit frequently (small commits)
+- Push regularly to keep remote updated
+- Not switch branches without committing first
+- Not open a PR until user asks OR checklist is satisfied
+
+### Branch Naming
+
+**Required pattern:** `screentime-improvements/<task-slug>`
+
+Examples:
+- `screentime-improvements/run-isolation-screentime`
+- `screentime-improvements/web-modal-dialogs`
+- `screentime-improvements/workflow-docs-update`
+
+Never push directly to `main`; open a PR targeting `main`.
+
+### Hard Boundaries
+
+- Do not touch or reference other repos (THB-BBL, basketball projects, etc.)
+- Do not create cross-repo folders or assumptions
+- Keep all changes within this codebase and the branch named in the task
 
 ## 1. Codex Review Priorities (legacy rules, still apply)
 
@@ -38,22 +63,43 @@ It merges legacy Codex review guidance with current operational guardrails.
 
 ## 2. Branching and Git Usage
 
-- Default base: `origin/main` (unless a task specifies otherwise).
-- Do all work on a feature branch off `main` (e.g., `fix/<slug>`, `feat/<slug>`, `chore/<slug>`).
-- Never push directly to `main`; open a PR targeting `main`.
-- If local work exists on a deprecated branch name, rename the current branch in place to a `fix/…`, `feat/…`, or `chore/…` branch (do not check out the deprecated name).
-- Keep changes scoped and coherent; prefer small, focused edits over broad refactors.
-- Agents do not auto-run shell commands. When the user should run git, provide a command block at the end of the report, for example:
-  ```bash
-  git checkout main
-  git pull --rebase
-  git checkout -b fix/<slug>
-  git status
-  git diff
-  git add -A
-  git commit -m "Short, precise message"
-  git push -u origin fix/<slug>
-  ```
+See [docs/reference/branching/BRANCHING_STRATEGY.md](docs/reference/branching/BRANCHING_STRATEGY.md) for full workflow.
+
+### Standard Task Lifecycle
+
+```bash
+# 1. Start task
+git switch main
+git pull --ff-only origin main
+git switch -c screentime-improvements/<task-slug>
+
+# 2. Work loop (repeat)
+git add <files>
+git commit -m "<type>: <description>"
+git push -u origin screentime-improvements/<task-slug>
+
+# 3. When ready for PR
+gh pr create --base main
+
+# 4. After merge
+git switch main
+git pull --ff-only origin main
+git branch -d screentime-improvements/<task-slug>
+```
+
+### Required Checkpoints
+
+- Before switching branches: MUST commit or explicitly stash (prefer commit)
+- Before opening PR: MUST push branch and confirm it exists on GitHub
+- Always keep main clean (no direct commits)
+
+### Key Rules
+
+- Default base: `origin/main`
+- Branch pattern: `screentime-improvements/<task-slug>`
+- Keep changes scoped; prefer small, focused edits
+- Commit frequently with descriptive messages
+- Push regularly to keep remote updated
 
 ## 3. Task Types and Severity (operational)
 
@@ -124,10 +170,26 @@ It merges legacy Codex review guidance with current operational guardrails.
 
 ## 8. Reporting Back (agent responses)
 
-- Summarize root causes for fixed bugs with file references.
-- List files changed with short bullets.
-- Describe tests run (e.g., `python -m py_compile ...`, `pytest ...`).
-- Provide git commands as a final block only; do not auto-run them.
+### Standard Report Format
+
+When completing a task, report:
+
+```
+Branch: screentime-improvements/<task-slug>
+Commits: <list of commit hashes with short descriptions>
+Tests: <tests run and results>
+Pushed: yes/no
+PR: <link if created, otherwise "not yet">
+```
+
+### Report Contents
+
+- Summarize root causes for fixed bugs with file references
+- List files changed with short bullets
+- Describe tests run (e.g., `python -m py_compile ...`, `pytest ...`)
+- Include branch name and commit info
+- Note whether pushed to origin
+- Include PR link only when created
 
 ## 9. Things You Must Not Do
 
