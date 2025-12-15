@@ -237,7 +237,7 @@ FEATURES/<feature>/
 ┌─────────────────────────────────────────────────────────────────┐
 │ 5. Agents Auto-Update Docs                                      │
 │    - README.md (pipeline summary, quickstart)                   │
-│    - docs/product/prd.md (feature addition under "Core Features") │
+│    - docs/plans/in_progress/product/prd.md (feature addition under "Core Features") │
 │    - docs/architecture/solution_architecture.md (component/path updates) │
 │    - docs/architecture/directory_structure.md (tree and descriptions) │
 │    Playbook: agents/playbooks/update-docs-on-change.yaml        │
@@ -282,7 +282,7 @@ Any file `add`, `delete`, or `rename` event under:
 - For each detected file change, open or update:
   - `docs/architecture/solution_architecture.md` → Adjust affected components/paths
   - `docs/architecture/directory_structure.md` → Update tree and descriptions
-  - `docs/product/prd.md` → Mark feature addition/removal under "Core Features"
+  - `docs/plans/in_progress/product/prd.md` → Mark feature addition/removal under "Core Features"
   - `README.md` → Reflect new/removed directories in "Repository Layout"
 - Commit changes with message:
   ```

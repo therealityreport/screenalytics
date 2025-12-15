@@ -513,10 +513,10 @@ The audio pipeline has 10 dedicated queues. When audio processing volume increas
 
 ## 10. References
 
-- [Solution Architecture](../architecture/solution_architecture.md) — Overall system design
-- [Render Deployment Guide](../DEPLOYMENT_RENDER.md) — Alternative deployment option
-- [Hardware Sizing](../ops/hardware_sizing.md) — Resource recommendations
-- [.env.example](../../.env.example) — Environment variable template
+- [Solution Architecture](../../../architecture/solution_architecture.md) — Overall system design
+- [Render Deployment Guide](../../../ops/deployment/DEPLOYMENT_RENDER.md) — Alternative deployment option
+- [Hardware Sizing](../../../ops/hardware_sizing.md) — Resource recommendations
+- [.env.example](../../../../.env.example) — Environment variable template
 
 ---
 

@@ -331,7 +331,7 @@ Users can now see the effectiveness of these protections via the Health page met
 
 ## References
 
-- Per-frame TypeError guard: `docs/code-updates/nov-18-detect-track-crop-none-guards.md`
+- Per-frame TypeError guard: `docs/plans/complete/code-updates/nov-18-detect-track-crop-none-guards.md`
 - Bbox validator implementation: `tools/episode_run.py:1057-1098`
 - Health API endpoint: `apps/api/endpoints/episodes.py` (assumed)
 - Progress emission: `tools/episode_run.py` progress.emit() calls

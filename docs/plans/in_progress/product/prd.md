@@ -90,36 +90,36 @@ All acceptance criteria are **defined and enforced** in [ACCEPTANCE_MATRIX.md](.
 ## 16. References
 
 ### Top-Level Documentation
-- [README.md](../../README.md) — Project overview and quick start
-- [SETUP.md](../../SETUP.md) — Installation, artifact pipeline, hardware requirements
-- [docs/README.md](../README.md) — Canonical docs index
-- [docs/reference/api.md](../reference/api.md) — API endpoint reference
-- [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_configs.md) — Configuration reference
-- [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) — QA checklist with metrics & thresholds
-- [docs/architecture/solution_architecture.md](../architecture/solution_architecture.md) — System architecture diagram
-- [docs/architecture/directory_structure.md](../architecture/directory_structure.md) — Repository layout
-- [docs/features/feature_sandboxes.md](../features/feature_sandboxes.md) — Feature sandbox workflow
+- [README.md](../../../../README.md) — Project overview and quick start
+- [SETUP.md](../../../../SETUP.md) — Installation, artifact pipeline, hardware requirements
+- [docs/README.md](../../../README.md) — Canonical docs index
+- [docs/reference/api.md](../../../reference/api.md) — API endpoint reference
+- [docs/reference/config/pipeline_configs.md](../../../reference/config/pipeline_configs.md) — Configuration reference
+- [ACCEPTANCE_MATRIX.md](../../../../ACCEPTANCE_MATRIX.md) — QA checklist with metrics & thresholds
+- [docs/architecture/solution_architecture.md](../../../architecture/solution_architecture.md) — System architecture diagram
+- [docs/architecture/directory_structure.md](../../../architecture/directory_structure.md) — Repository layout
+- [docs/features/feature_sandboxes.md](../../../features/feature_sandboxes.md) — Feature sandbox workflow
 
 ### Pipeline Documentation
-- [docs/pipeline/overview.md](../pipeline/overview.md) — End-to-end pipeline architecture
-- [docs/pipeline/detect_track_faces.md](../pipeline/detect_track_faces.md) — Detection & tracking
-- [docs/pipeline/faces_harvest.md](../pipeline/faces_harvest.md) — Face sampling & embedding
-- [docs/pipeline/cluster_identities.md](../pipeline/cluster_identities.md) — Identity clustering
-- [docs/pipeline/episode_cleanup.md](../pipeline/episode_cleanup.md) — Post-processing & cleanup
-- [docs/pipeline/audio_pipeline.md](../pipeline/audio_pipeline.md) — Audio pipeline and A/V fusion inputs
+- [docs/pipeline/overview.md](../../../pipeline/overview.md) — End-to-end pipeline architecture
+- [docs/pipeline/detect_track_faces.md](../../../pipeline/detect_track_faces.md) — Detection & tracking
+- [docs/pipeline/faces_harvest.md](../../../pipeline/faces_harvest.md) — Face sampling & embedding
+- [docs/pipeline/cluster_identities.md](../../../pipeline/cluster_identities.md) — Identity clustering
+- [docs/pipeline/episode_cleanup.md](../../../pipeline/episode_cleanup.md) — Post-processing & cleanup
+- [docs/pipeline/audio_pipeline.md](../../../pipeline/audio_pipeline.md) — Audio pipeline and A/V fusion inputs
 
 ### Configuration & Tuning
-- [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_configs.md) — Complete config parameters
-- [docs/ops/performance_tuning_faces_pipeline.md](../ops/performance_tuning_faces_pipeline.md) — Speed vs accuracy tuning
-- [docs/ops/troubleshooting_faces_pipeline.md](../ops/troubleshooting_faces_pipeline.md) — Debugging & common fixes
+- [docs/reference/config/pipeline_configs.md](../../../reference/config/pipeline_configs.md) — Complete config parameters
+- [docs/ops/performance_tuning_faces_pipeline.md](../../../ops/performance_tuning_faces_pipeline.md) — Speed vs accuracy tuning
+- [docs/ops/troubleshooting_faces_pipeline.md](../../../ops/troubleshooting_faces_pipeline.md) — Debugging & common fixes
 
 ### Schemas & Metrics
-- [docs/reference/artifacts_faces_tracks_identities.md](../reference/artifacts_faces_tracks_identities.md) — Vision artifact schemas
-- [docs/audio/diarization_manifest.md](../audio/diarization_manifest.md) — Audio diarization/ASR manifests
-- [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) — Metric thresholds and guardrails
+- [docs/reference/artifacts_faces_tracks_identities.md](../../../reference/artifacts_faces_tracks_identities.md) — Vision artifact schemas
+- [docs/pipeline/audio/diarization_manifest.md](../../../pipeline/audio/diarization_manifest.md) — Audio diarization/ASR manifests
+- [ACCEPTANCE_MATRIX.md](../../../../ACCEPTANCE_MATRIX.md) — Metric thresholds and guardrails
 
 ### Operations
-- [docs/ops/ARTIFACTS_STORE.md](../ops/ARTIFACTS_STORE.md) — Storage layout and artifact handling
+- [docs/ops/ARTIFACTS_STORE.md](../../../ops/ARTIFACTS_STORE.md) — Storage layout and artifact handling
 
 ---
 

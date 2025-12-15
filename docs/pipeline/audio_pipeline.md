@@ -138,7 +138,6 @@ When transcripts are present, speaking time is aggregated with an explicit overl
 
 ## 8. Related Docs
 
-- `docs/audio/overview.md`
-- `docs/audio/diarization_manifest.md`
+- `docs/pipeline/audio/overview.md`
+- `docs/pipeline/audio/diarization_manifest.md`
 - `docs/reference/api.md`
-

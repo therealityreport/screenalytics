@@ -204,4 +204,4 @@ If metrics are consistently outside the expected range after a known-good change
 |------|---------|
 | `configs/golden_episodes.py` | Golden episode configuration and expected metrics |
 | `tests/test_golden_screen_time.py` | Regression test script |
-| `docs/golden-episodes.md` | This documentation |
+| `docs/reference/golden-episodes.md` | This documentation |

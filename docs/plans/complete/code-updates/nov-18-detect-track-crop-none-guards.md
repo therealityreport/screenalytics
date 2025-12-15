@@ -359,8 +359,8 @@ Even if Layers 1-3 miss an edge case, Layer 4 (per-frame guard) prevents pipelin
 
 ## References
 
-- Previous bbox validation work: `docs/code-updates/nov-17-detect-track-none-bbox-fix.md`
-- CoreML detection fix: `docs/code-updates/nov-17-detect-track-none-bbox-fix.md` (CoreML section)
+- Previous bbox validation work: `docs/plans/complete/code-updates/nov-17-detect-track-none-bbox-fix.md`
+- CoreML detection fix: `docs/plans/complete/code-updates/nov-17-detect-track-none-bbox-fix.md` (CoreML section)
 - Original error report: User message 2025-11-17
 - ByteTrack tracker: `apps/api/services/tracking.py`
 - RetinaFace detector: `apps/api/services/detection.py`
