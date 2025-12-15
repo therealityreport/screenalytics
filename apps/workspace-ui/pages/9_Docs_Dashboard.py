@@ -45,7 +45,7 @@ def _feature_present_in_code(feature: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 cfg = helpers.init_page("Docs Dashboard")
-helpers.render_page_header("workspace-ui:docs_dashboard", "Docs Dashboard")
+helpers.render_page_header("workspace-ui:9_Docs_Dashboard", "Docs Dashboard")
 st.caption("Read-only view of docs + feature coverage (driven by `docs/_meta/docs_catalog.json`).")
 
 catalog, error = helpers.load_docs_catalog()
@@ -74,9 +74,9 @@ else:
     query_norm = query.strip().lower()
     filtered_docs: list[dict[str, Any]] = []
     for doc in docs:
-        if statuses and doc.get("status") not in statuses:
+        if statuses and str(doc.get("status")) not in statuses:
             continue
-        if types and doc.get("type") not in types:
+        if types and str(doc.get("type")) not in types:
             continue
         if query_norm:
             haystack = " ".join(
