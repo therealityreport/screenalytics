@@ -25,6 +25,7 @@ if str(WORKSPACE_DIR) not in sys.path:
 import ui_helpers as helpers  # noqa: E402
 
 from py_screenalytics.artifacts import get_path  # noqa: E402
+from py_screenalytics import run_layout  # noqa: E402
 
 FRAME_JPEG_SIZE_EST_BYTES = 220_000
 CROP_JPEG_SIZE_EST_BYTES = 40_000
@@ -1262,15 +1263,21 @@ def _cached_episode_details(ep_id: str, cache_key: float) -> Dict[str, Any]:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_episode_status(ep_id: str, cache_key: float, marker_mtimes: tuple) -> Dict[str, Any] | None:
+def _cached_episode_status(
+    ep_id: str,
+    cache_key: float,
+    marker_mtimes: tuple,
+    run_id: str | None = None,
+) -> Dict[str, Any] | None:
     """Cache episode status API response with 10s TTL.
 
     Args:
         ep_id: Episode ID
         cache_key: Fetch token for manual cache busting
         marker_mtimes: Tuple of artifact mtimes to auto-invalidate cache (runs + manifests)
+        run_id: Optional attempt/run_id to scope status.
     """
-    return helpers.get_episode_status(ep_id)
+    return helpers.get_episode_status(ep_id, run_id=run_id)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1722,9 +1729,52 @@ force_refresh_key = _status_force_refresh_key(ep_id)
 force_refresh = bool(st.session_state.pop(force_refresh_key, False))
 fetch_token = st.session_state.get(fetch_token_key, 0)
 status_payload = st.session_state.get(status_cache_key)
-_manifests_dir = get_path(ep_id, "detections").parent
-_runs_dir = _manifests_dir / "runs"
-_track_metrics_path = _manifests_dir / "track_metrics.json"
+
+# Attempt selection (run_id-scoped pipeline artifacts).
+# Store selected attempt in session state; empty string means legacy/unscoped.
+_active_run_id_key = f"{ep_id}::active_run_id"
+_autorun_run_id_key = f"{ep_id}::autorun_run_id"
+_new_attempt_requested_key = f"{ep_id}::new_attempt_requested"
+_attempt_init_key = f"{ep_id}::attempt_selector_initialized"
+if _active_run_id_key not in st.session_state:
+    st.session_state[_active_run_id_key] = ""
+selected_attempt_raw = st.session_state.get(_active_run_id_key)
+selected_attempt = selected_attempt_raw.strip() if isinstance(selected_attempt_raw, str) else ""
+
+if st.session_state.pop(_new_attempt_requested_key, False):
+    selected_attempt = uuid.uuid4().hex
+    st.session_state[_active_run_id_key] = selected_attempt
+    st.session_state[_status_force_refresh_key(ep_id)] = True
+    st.session_state[_attempt_init_key] = True
+
+if not st.session_state.get(_attempt_init_key) and not selected_attempt:
+    try:
+        persisted_run_id = run_layout.read_active_run_id(ep_id)
+    except Exception:
+        persisted_run_id = None
+    if isinstance(persisted_run_id, str) and persisted_run_id.strip():
+        selected_attempt = persisted_run_id.strip()
+        st.session_state[_active_run_id_key] = selected_attempt
+        st.session_state[_attempt_init_key] = True
+
+# Normalize/validate selected attempt (invalid values fall back to legacy).
+selected_attempt_run_id: str | None = None
+if selected_attempt:
+    try:
+        selected_attempt_run_id = run_layout.normalize_run_id(selected_attempt)
+    except ValueError:
+        st.session_state[_active_run_id_key] = ""
+        selected_attempt_run_id = None
+
+_manifests_root = get_path(ep_id, "detections").parent
+_runs_root = _manifests_root / "runs"
+_scoped_manifests_dir = (
+    run_layout.run_root(ep_id, selected_attempt_run_id)
+    if selected_attempt_run_id
+    else _manifests_root
+)
+_scoped_markers_dir = _scoped_manifests_dir if selected_attempt_run_id else _runs_root
+_track_metrics_path = _scoped_manifests_dir / "track_metrics.json"
 
 
 # Batch file stat operations for efficiency - use try/except to avoid separate exists() calls
@@ -1736,14 +1786,15 @@ def _safe_mtime(path: Path) -> float:
 
 
 current_mtimes = (
-    _safe_mtime(_runs_dir / "detect_track.json"),
-    _safe_mtime(_runs_dir / "faces_embed.json"),
-    _safe_mtime(_runs_dir / "cluster.json"),
-    _safe_mtime(_manifests_dir / "detections.jsonl"),
-    _safe_mtime(_manifests_dir / "tracks.jsonl"),
-    _safe_mtime(_manifests_dir / "faces.jsonl"),
+    selected_attempt_run_id or "legacy",
+    _safe_mtime(_scoped_markers_dir / "detect_track.json"),
+    _safe_mtime(_scoped_markers_dir / "faces_embed.json"),
+    _safe_mtime(_scoped_markers_dir / "cluster.json"),
+    _safe_mtime(_scoped_manifests_dir / "detections.jsonl"),
+    _safe_mtime(_scoped_manifests_dir / "tracks.jsonl"),
+    _safe_mtime(_scoped_manifests_dir / "faces.jsonl"),
     _safe_mtime(_track_metrics_path),
-    _safe_mtime(_manifests_dir / "identities.json"),
+    _safe_mtime(_scoped_manifests_dir / "identities.json"),
 )
 cached_mtimes = st.session_state.get(mtimes_key)
 should_refresh_status = force_refresh or _job_active(ep_id) or status_payload is None or cached_mtimes != current_mtimes
@@ -1751,7 +1802,7 @@ if should_refresh_status:
     fetch_token += 1
     st.session_state[fetch_token_key] = fetch_token
     # Include manifests in the cache key so status refreshes when identities/faces/tracks change.
-    status_payload = _cached_episode_status(ep_id, fetch_token, current_mtimes)
+    status_payload = _cached_episode_status(ep_id, fetch_token, current_mtimes, selected_attempt_run_id)
     st.session_state[status_cache_key] = status_payload
     st.session_state[status_ts_key] = time.time()
     st.session_state[mtimes_key] = current_mtimes
@@ -1766,22 +1817,28 @@ else:
     faces_phase_status = status_payload.get("faces_embed") or {}
     cluster_phase_status = status_payload.get("cluster") or {}
 
-# Track the currently selected/active run_id for this episode (default = API active_run_id).
-_active_run_id_key = f"{ep_id}::active_run_id"
-_autorun_run_id_key = f"{ep_id}::autorun_run_id"
 api_active_run_id = (status_payload or {}).get("active_run_id")
-if (_active_run_id_key not in st.session_state) or not st.session_state.get(_active_run_id_key):
+if not st.session_state.get(_attempt_init_key) and not selected_attempt:
     if isinstance(api_active_run_id, str) and api_active_run_id.strip():
         st.session_state[_active_run_id_key] = api_active_run_id.strip()
+        st.session_state[_attempt_init_key] = True
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.rerun()
+    st.session_state[_attempt_init_key] = True
 
 prefixes = helpers.episode_artifact_prefixes(ep_id)
 bucket_name = cfg.get("bucket")
-tracks_path = get_path(ep_id, "tracks")
-detections_path = get_path(ep_id, "detections")
-manifests_dir = detections_path.parent
+manifests_dir = _scoped_manifests_dir
+tracks_path = manifests_dir / "tracks.jsonl"
+detections_path = manifests_dir / "detections.jsonl"
 faces_path = manifests_dir / "faces.jsonl"
 identities_path = manifests_dir / "identities.json"
-screentime_json_path = helpers.DATA_ROOT / "analytics" / ep_id / "screentime.json"
+analytics_dir = (
+    manifests_dir / "analytics"
+    if selected_attempt_run_id
+    else helpers.DATA_ROOT / "analytics" / ep_id
+)
+screentime_json_path = analytics_dir / "screentime.json"
 detect_job_defaults, detect_job_record = _load_job_defaults(ep_id, "detect_track")
 faces_job_defaults, faces_job_record = _load_job_defaults(ep_id, "faces_embed")
 cluster_job_defaults, cluster_job_record = _load_job_defaults(ep_id, "cluster")
@@ -2077,7 +2134,7 @@ if cluster_status_value in {"missing", "unknown"}:
         cluster_phase_status["identities"] = identities_count_manifest
         cluster_phase_status["source"] = cluster_phase_status.get("source") or "manifest_fallback"
         # Read marker file for timestamps and device info FIRST (most authoritative source)
-        _cluster_marker_path = _runs_dir / "cluster.json"
+        _cluster_marker_path = _scoped_markers_dir / "cluster.json"
         if _cluster_marker_path.exists():
             try:
                 _marker_data = json.loads(_cluster_marker_path.read_text(encoding="utf-8"))
@@ -2190,9 +2247,45 @@ with st.expander("Pipeline Status", expanded=False):
     else:
         st.caption("Status will refresh when a job starts or you press refresh.")
 
-    _active_run_id_label = st.session_state.get(_active_run_id_key) or api_active_run_id
-    if isinstance(_active_run_id_label, str) and _active_run_id_label.strip():
-        st.caption(f"Active run_id: `{_active_run_id_label.strip()}`")
+    attempt_col1, attempt_col2 = st.columns([3, 1])
+    with attempt_col1:
+        available_run_ids = run_layout.list_run_ids(ep_id)
+        current_value = st.session_state.get(_active_run_id_key)
+        current_str = current_value.strip() if isinstance(current_value, str) else ""
+        attempt_options = [""] + available_run_ids
+        if current_str and current_str not in attempt_options:
+            attempt_options.append(current_str)
+
+        def _format_attempt(value: str) -> str:
+            return "Legacy (no run_id)" if not value else value
+
+        st.selectbox(
+            "Attempt (run_id)",
+            attempt_options,
+            key=_active_run_id_key,
+            format_func=_format_attempt,
+            help="Scopes status/artifacts and any new Detect/Faces/Cluster runs to this attempt.",
+            disabled=job_running,
+        )
+    with attempt_col2:
+        if st.button(
+            "New attempt",
+            key=f"{ep_id}::new_attempt_btn",
+            use_container_width=True,
+            disabled=job_running,
+        ):
+            st.session_state[_new_attempt_requested_key] = True
+            st.rerun()
+
+    selected_attempt_label = st.session_state.get(_active_run_id_key)
+    selected_attempt_label = selected_attempt_label.strip() if isinstance(selected_attempt_label, str) else ""
+    if selected_attempt_label:
+        st.caption(f"Selected attempt: `{selected_attempt_label}`")
+    else:
+        st.caption("Selected attempt: legacy (no run_id)")
+    if isinstance(api_active_run_id, str) and api_active_run_id.strip():
+        if api_active_run_id.strip() != selected_attempt_label:
+            st.caption(f"API active_run_id: `{api_active_run_id.strip()}`")
     coreml_available = status_payload.get("coreml_available") if status_payload else None
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
@@ -3396,7 +3489,9 @@ with col_detect:
         job_payload["fps"] = fps_value
     mode_label = f"{detect_detector_label} + {detect_tracker_label}"
 
-    if autorun_active:
+    if selected_attempt_run_id:
+        job_payload["run_id"] = selected_attempt_run_id
+    elif autorun_active:
         autorun_run_id = st.session_state.get(_autorun_run_id_key)
         if isinstance(autorun_run_id, str) and autorun_run_id.strip():
             job_payload["run_id"] = autorun_run_id.strip()
@@ -3968,7 +4063,9 @@ with col_faces:
                 "jpeg_quality": int(faces_jpeg_quality),
                 "thumb_size": int(faces_thumb_size),
             }
-            if autorun_active:
+            if selected_attempt_run_id:
+                payload["run_id"] = selected_attempt_run_id
+            elif autorun_active:
                 autorun_run_id = st.session_state.get(_autorun_run_id_key)
                 if isinstance(autorun_run_id, str) and autorun_run_id.strip():
                     payload["run_id"] = autorun_run_id.strip()
@@ -4518,7 +4615,9 @@ with col_cluster:
                 "min_cluster_size": int(min_cluster_size_value),
                 "profile": profile_value,
             }
-            if autorun_active:
+            if selected_attempt_run_id:
+                payload["run_id"] = selected_attempt_run_id
+            elif autorun_active:
                 autorun_run_id = st.session_state.get(_autorun_run_id_key)
                 if isinstance(autorun_run_id, str) and autorun_run_id.strip():
                     payload["run_id"] = autorun_run_id.strip()
@@ -4679,11 +4778,10 @@ detections_key = f"{manifests_prefix}detections.jsonl" if manifests_prefix else 
 tracks_key = f"{manifests_prefix}tracks.jsonl" if manifests_prefix else None
 faces_key = f"{manifests_prefix}faces.jsonl" if manifests_prefix else None
 identities_key = f"{manifests_prefix}identities.json" if manifests_prefix else None
-_render_artifact_entry("Detections", get_path(ep_id, "detections"), "detections", detections_key)
-_render_artifact_entry("Tracks", get_path(ep_id, "tracks"), "tracks", tracks_key)
+_render_artifact_entry("Detections", detections_path, "detections", detections_key)
+_render_artifact_entry("Tracks", tracks_path, "tracks", tracks_key)
 _render_artifact_entry("Faces", faces_path, "faces", faces_key)
 _render_artifact_entry("Identities", identities_path, "identities", identities_key)
-analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
 _render_artifact_entry("Screentime (json)", analytics_dir / "screentime.json", "screentime_json")
 _render_artifact_entry("Screentime (csv)", analytics_dir / "screentime.csv", "screentime_csv")
 
@@ -4715,13 +4813,13 @@ def _read_json_artifact(path: Path, max_lines: int = 2000) -> tuple[str | None, 
 st.subheader("Debug: Raw JSON artifacts")
 artifact_groups = {
     "Detect / Faces / Tracks": [
-        get_path(ep_id, "detections"),
-        get_path(ep_id, "tracks"),
+        detections_path,
+        tracks_path,
         faces_path,
     ],
     "Cluster": [
         identities_path,
-        manifests_dir / "track_metrics.json",
+        _track_metrics_path,
     ],
     "Screentime": [
         analytics_dir / "screentime.json",
