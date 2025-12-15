@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
+from py_screenalytics import run_layout
 from py_screenalytics.facebank_seed import select_facebank_seeds, write_facebank_seeds
 from tools import episode_run
 
@@ -64,6 +65,50 @@ def _diag(tag: str, **kw) -> None:
 
 def _manifests_dir(ep_id: str) -> Path:
     return get_path(ep_id, "detections").parent
+
+
+def _normalize_run_id(run_id: str | None) -> str | None:
+    """Normalize optional run_id for run-scoped artifacts.
+
+    Empty strings are treated as absent for backwards compatibility.
+    """
+    if run_id is None:
+        return None
+    candidate = str(run_id).strip()
+    if not candidate:
+        return None
+    return run_layout.normalize_run_id(candidate)
+
+
+def _manifests_dir_for_run(ep_id: str, run_id: str | None) -> Path:
+    """Return run-scoped manifests directory when run_id is provided."""
+    if not run_id:
+        return _manifests_dir(ep_id)
+    return run_layout.run_root(ep_id, run_id)
+
+
+def _detections_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    if not run_id:
+        return get_path(ep_id, "detections")
+    return _manifests_dir_for_run(ep_id, run_id) / "detections.jsonl"
+
+
+def _tracks_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    if not run_id:
+        return get_path(ep_id, "tracks")
+    return _manifests_dir_for_run(ep_id, run_id) / "tracks.jsonl"
+
+
+def _faces_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    return _manifests_dir_for_run(ep_id, run_id) / "faces.jsonl"
+
+
+def _identities_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    return _manifests_dir_for_run(ep_id, run_id) / "identities.json"
+
+
+def _track_metrics_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    return _manifests_dir_for_run(ep_id, run_id) / "track_metrics.json"
 
 
 def _faces_path(ep_id: str) -> Path:
@@ -282,8 +327,10 @@ def _first_manifest_row(path: Path) -> Dict[str, Any] | None:
     return None
 
 
-def _load_run_marker(ep_id: str, phase: str) -> Dict[str, Any] | None:
-    marker_path = _runs_dir(ep_id) / f"{phase}.json"
+def _load_run_marker(ep_id: str, phase: str, *, run_id: str | None = None) -> Dict[str, Any] | None:
+    marker_path = (
+        _manifests_dir_for_run(ep_id, run_id) / f"{phase}.json" if run_id else _runs_dir(ep_id) / f"{phase}.json"
+    )
     if not marker_path.exists():
         return None
     try:
@@ -361,19 +408,19 @@ def _get_file_mtime_iso(path: Path) -> str | None:
         return None
 
 
-def _faces_phase_status(ep_id: str) -> Dict[str, Any]:
-    marker = _load_run_marker(ep_id, "faces_embed")
+def _faces_phase_status(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
+    marker = _load_run_marker(ep_id, "faces_embed", run_id=run_id)
     if marker:
         result = _phase_status_from_marker("faces_embed", marker)
         # Add manifest existence info even when marker exists
-        faces_path = _faces_path(ep_id)
+        faces_path = _faces_path_for_run(ep_id, run_id)
         result["manifest_exists"] = faces_path.exists()
         # Prefer marker timestamp; fall back to manifest mtime if available
         result["last_run_at"] = marker.get("finished_at") or _get_file_mtime_iso(faces_path)
         faces_count = result.get("faces") or 0
         result["zero_rows"] = result["manifest_exists"] and faces_count == 0
         return result
-    faces_path = _faces_path(ep_id)
+    faces_path = _faces_path_for_run(ep_id, run_id)
     manifest_exists = faces_path.exists()
     faces_count = _count_nonempty_lines(faces_path)
     # SUCCESS if manifest exists (even with 0 rows), MISSING only if no manifest
@@ -439,7 +486,7 @@ def _extract_singleton_merge_stats(payload: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
+def _cluster_phase_status(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
     """Get cluster phase status, checking both identities.json and track_metrics.json.
 
     For staleness detection, we need to check BOTH files because:
@@ -449,11 +496,8 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
     The cluster is considered to have run if EITHER file exists, and last_run_at
     is the max mtime of both files.
     """
-    from py_screenalytics.artifacts import get_path
-
-    identities_path = _identities_path(ep_id)
-    manifests_dir = get_path(ep_id, "detections").parent
-    track_metrics_path = manifests_dir / "track_metrics.json"
+    identities_path = _identities_path_for_run(ep_id, run_id)
+    track_metrics_path = _track_metrics_path_for_run(ep_id, run_id)
 
     # Helper to get max mtime of multiple paths
     def _max_mtime_iso(*paths) -> str | None:
@@ -468,7 +512,7 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
         # ISO timestamps sort lexicographically, so max() works
         return max(mtimes)
 
-    marker = _load_run_marker(ep_id, "cluster")
+    marker = _load_run_marker(ep_id, "cluster", run_id=run_id)
     if marker:
         result = _phase_status_from_marker("cluster", marker)
         # Add manifest existence info even when marker exists
@@ -551,17 +595,17 @@ def _cluster_phase_status(ep_id: str) -> Dict[str, Any]:
     }
 
 
-def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
+def _detect_track_phase_status(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
     """Get detect/track phase status including detector/tracker info.
 
     IMPORTANT: Returns the FACE detector (e.g., retinaface), NOT the scene detector.
     Scene detection (pyscenedetect) is a preliminary step, not the main detect/track operation.
     """
-    marker = _load_run_marker(ep_id, "detect_track")
+    marker = _load_run_marker(ep_id, "detect_track", run_id=run_id)
     if marker:
         result = _phase_status_from_marker("detect_track", marker)
         # Add manifest existence info even when marker exists
-        tracks_path = _tracks_path(ep_id)
+        tracks_path = _tracks_path_for_run(ep_id, run_id)
         result["manifest_exists"] = tracks_path.exists()
         # Prefer marker timestamp for stale detection; fall back to manifest mtime if unavailable
         # This ensures consistent timestamp comparison with faces_embed and cluster phases
@@ -569,10 +613,8 @@ def _detect_track_phase_status(ep_id: str) -> Dict[str, Any]:
         tracks_count = result.get("tracks") or 0
         result["zero_rows"] = result["manifest_exists"] and tracks_count == 0
         return result
-    from py_screenalytics.artifacts import get_path
-
-    tracks_path = get_path(ep_id, "tracks")
-    detections_path = get_path(ep_id, "detections")
+    tracks_path = _tracks_path_for_run(ep_id, run_id)
+    detections_path = _detections_path_for_run(ep_id, run_id)
 
     detections_count = _count_nonempty_lines(detections_path)
     tracks_count = _count_nonempty_lines(tracks_path)
@@ -2012,14 +2054,15 @@ def _status_to_events(ep_id: str, status: EpisodeStatusResponse) -> List[Dict[st
 
 
 async def _status_snapshot(ep_id: str) -> EpisodeStatusResponse:
-    return await asyncio.to_thread(episode_run_status, ep_id)
+    return await asyncio.to_thread(_episode_run_status, ep_id, None)
 
 
-@router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
-def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
-    tracks_path = get_path(ep_id, "tracks")
-    detections_path = get_path(ep_id, "detections")
-    detect_track_payload = _detect_track_phase_status(ep_id)
+def _episode_run_status(ep_id: str, run_id: str | None) -> EpisodeStatusResponse:
+    run_id_norm = _normalize_run_id(run_id)
+
+    tracks_path = _tracks_path_for_run(ep_id, run_id_norm)
+    detections_path = _detections_path_for_run(ep_id, run_id_norm)
+    detect_track_payload = _detect_track_phase_status(ep_id, run_id=run_id_norm)
 
     detections_manifest_ready = _manifest_has_rows(detections_path)
     tracks_manifest_ready = _manifest_has_rows(tracks_path)
@@ -2028,8 +2071,8 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         detect_track_payload["status"] = "stale"
         detect_track_payload["source"] = "missing_artifact"
     detect_track_status = PhaseStatus(**detect_track_payload)
-    faces_payload = _faces_phase_status(ep_id)
-    cluster_payload = _cluster_phase_status(ep_id)
+    faces_payload = _faces_phase_status(ep_id, run_id=run_id_norm)
+    cluster_payload = _cluster_phase_status(ep_id, run_id=run_id_norm)
 
     # Stale detection: compare timestamps to detect outdated downstream artifacts
     detect_track_mtime = _parse_iso_timestamp(detect_track_payload.get("last_run_at"))
@@ -2087,8 +2130,6 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
 
     active_run_id: str | None = None
     try:
-        from py_screenalytics import run_layout
-
         active_run_id = run_layout.read_active_run_id(ep_id)
     except Exception:
         active_run_id = None
@@ -2116,6 +2157,15 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
         faces_manifest_fallback=faces_manifest_fallback,
         tracks_only_fallback=tracks_only_fallback,
     )
+
+
+@router.get("/episodes/{ep_id}/status", response_model=EpisodeStatusResponse, tags=["episodes"])
+def episode_run_status(ep_id: str, run_id: str | None = Query(None)) -> EpisodeStatusResponse:
+    try:
+        return _episode_run_status(ep_id, run_id)
+    except ValueError as exc:
+        # FastAPI will coerce query params to str; validate run_id explicitly.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get(

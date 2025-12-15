@@ -128,3 +128,137 @@ def test_detect_track_tracks_only_marks_stale(tmp_path, monkeypatch) -> None:
     assert payload.get("tracks_ready") is False
     # Scenes are considered ready when tracks manifest exists even if detections are missing
     assert payload.get("scenes_ready") is True
+
+
+def test_episode_status_scopes_to_run_id(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    ep_id = "status-run-id-demo"
+    run_id = "attempt-1"
+
+    client = TestClient(app)
+
+    manifests_dir = get_path(ep_id, "detections").parent
+    runs_dir = manifests_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = runs_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure both legacy and run-scoped manifests exist so detect_track doesn't get marked stale.
+    (manifests_dir / "detections.jsonl").write_text('{"d":1}\n', encoding="utf-8")
+    (manifests_dir / "tracks.jsonl").write_text(
+        json.dumps({"ep_id": ep_id, "track_id": 1, "detector": "retinaface", "tracker": "bytetrack"}) + "\n",
+        encoding="utf-8",
+    )
+    (manifests_dir / "faces.jsonl").write_text('{"f":1}\n', encoding="utf-8")
+    (manifests_dir / "identities.json").write_text(json.dumps({"identities": []}), encoding="utf-8")
+
+    (run_dir / "detections.jsonl").write_text('{"d":1}\n', encoding="utf-8")
+    (run_dir / "tracks.jsonl").write_text(
+        json.dumps({"ep_id": ep_id, "track_id": 1, "detector": "retinaface", "tracker": "bytetrack"}) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "faces.jsonl").write_text('{"f":1}\n{"f":2}\n{"f":3}\n', encoding="utf-8")
+    (run_dir / "identities.json").write_text(json.dumps({"identities": [{}, {}, {}, {}]}), encoding="utf-8")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    detect_finished = now.isoformat().replace("+00:00", "Z")
+    faces_finished = (now + timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+    cluster_finished = (now + timedelta(seconds=20)).isoformat().replace("+00:00", "Z")
+
+    # Legacy markers (runs/*.json)
+    (runs_dir / "detect_track.json").write_text(
+        json.dumps(
+            {
+                "phase": "detect_track",
+                "status": "success",
+                "run_id": "legacy",
+                "tracks": 1,
+                "detections": 1,
+                "finished_at": detect_finished,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runs_dir / "faces_embed.json").write_text(
+        json.dumps(
+            {
+                "phase": "faces_embed",
+                "status": "success",
+                "run_id": "legacy",
+                "faces": 1,
+                "finished_at": faces_finished,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runs_dir / "cluster.json").write_text(
+        json.dumps(
+            {
+                "phase": "cluster",
+                "status": "success",
+                "run_id": "legacy",
+                "faces": 1,
+                "identities": 0,
+                "finished_at": cluster_finished,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Run-scoped markers (runs/{run_id}/*.json)
+    (run_dir / "detect_track.json").write_text(
+        json.dumps(
+            {
+                "phase": "detect_track",
+                "status": "success",
+                "run_id": run_id,
+                "tracks": 2,
+                "detections": 2,
+                "finished_at": detect_finished,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "faces_embed.json").write_text(
+        json.dumps(
+            {
+                "phase": "faces_embed",
+                "status": "success",
+                "run_id": run_id,
+                "faces": 3,
+                "finished_at": faces_finished,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "cluster.json").write_text(
+        json.dumps(
+            {
+                "phase": "cluster",
+                "status": "success",
+                "run_id": run_id,
+                "faces": 3,
+                "identities": 4,
+                "finished_at": cluster_finished,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    run_resp = client.get(f"/episodes/{ep_id}/status", params={"run_id": run_id})
+    assert run_resp.status_code == 200
+    run_payload = run_resp.json()
+    assert run_payload["detect_track"]["run_id"] == run_id
+    assert run_payload["detect_track"]["tracks"] == 2
+    assert run_payload["faces_embed"]["run_id"] == run_id
+    assert run_payload["faces_embed"]["faces"] == 3
+    assert run_payload["cluster"]["run_id"] == run_id
+    assert run_payload["cluster"]["identities"] == 4
+
+    legacy_resp = client.get(f"/episodes/{ep_id}/status")
+    assert legacy_resp.status_code == 200
+    legacy_payload = legacy_resp.json()
+    assert legacy_payload["detect_track"]["run_id"] == "legacy"
+    assert legacy_payload["faces_embed"]["run_id"] == "legacy"
+    assert legacy_payload["faces_embed"]["faces"] == 1

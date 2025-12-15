@@ -2752,13 +2752,14 @@ class ThumbWriter:
         storage_backend=None,
         use_png: bool = True,  # Default to PNG for maximum quality
         png_compression: int = 3,
+        run_id: str | None = None,
     ) -> None:
         self.ep_id = ep_id
         self.size = size
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.use_png = use_png
         self.png_compression = max(0, min(int(png_compression), 9))
-        self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
+        self.root_dir = _frames_root_for_run(ep_id, run_id) / "thumbs"
         self._storage_backend = storage_backend
         # Determine if we should use backend for writes (only for pure S3 mode)
         self._use_backend_writes = (
@@ -2909,8 +2910,10 @@ class ThumbWriter:
         return canvas
 
 
-def _faces_embed_path(ep_id: str) -> Path:
+def _faces_embed_path(ep_id: str, run_id: str | None = None) -> Path:
     embed_dir = DATA_ROOT / "embeds" / ep_id
+    if run_id:
+        embed_dir = embed_dir / "runs" / run_layout.normalize_run_id(run_id)
     embed_dir.mkdir(parents=True, exist_ok=True)
     return embed_dir / "faces.npy"
 
@@ -3276,6 +3279,21 @@ def _detections_path_for_run(ep_id: str, run_id: str | None) -> Path:
     return _manifests_dir_for_run(ep_id, run_id) / "detections.jsonl"
 
 
+def _frames_root_for_run(ep_id: str, run_id: str | None) -> Path:
+    """Return the frames root for a run (optional run-scoped layout).
+
+    Legacy layout (run_id is None):
+        data/frames/{ep_id}/
+
+    Run-scoped layout:
+        data/frames/{ep_id}/runs/{run_id}/
+    """
+    root = get_path(ep_id, "frames_root")
+    if not run_id:
+        return root
+    return root / "runs" / run_layout.normalize_run_id(run_id)
+
+
 def _promote_run_manifests_to_root(ep_id: str, run_id: str, filenames: Iterable[str]) -> None:
     """Copy run-scoped manifests into the legacy root manifests dir.
 
@@ -3347,6 +3365,7 @@ class FrameExporter:
         self,
         ep_id: str,
         *,
+        run_id: str | None = None,
         save_frames: bool,
         save_crops: bool,
         jpeg_quality: int,
@@ -3361,7 +3380,7 @@ class FrameExporter:
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.use_png = use_png
         self.png_compression = max(0, min(int(png_compression), 9))
-        self.root_dir = get_path(ep_id, "frames_root")
+        self.root_dir = _frames_root_for_run(ep_id, run_id)
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
         self._storage_backend = storage_backend
@@ -6328,6 +6347,7 @@ def _run_detect_track_stage(
     frame_exporter = (
         FrameExporter(
             args.ep_id,
+            run_id=getattr(args, "run_id", None),
             save_frames=save_frames,
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
@@ -6655,13 +6675,14 @@ def _run_faces_embed_stage(
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
-    frames_root = get_path(args.ep_id, "frames_root")
+    frames_root = _frames_root_for_run(args.ep_id, run_id)
     debug_logger_obj: JsonlLogger | NullLogger | None = None
     if save_crops and debug_thumbs_enabled():
         debug_logger_obj = init_debug_logger(args.ep_id, frames_root)
     exporter = (
         FrameExporter(
             args.ep_id,
+            run_id=run_id,
             save_frames=save_frames,
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
@@ -6674,7 +6695,11 @@ def _run_faces_embed_stage(
     def _phase_meta(step: str | None = None) -> Dict[str, Any]:
         return _non_video_phase_meta(step, crop_diag_source=exporter)
 
-    thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
+    thumb_writer = ThumbWriter(
+        args.ep_id,
+        size=int(getattr(args, "thumb_size", 256)),
+        run_id=run_id,
+    )
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
     # Determine CPU fallback policy from CLI flags
@@ -7112,7 +7137,7 @@ def _run_faces_embed_stage(
                 cache_stats["size"],
             )
 
-        embed_path = _faces_embed_path(args.ep_id)
+        embed_path = _faces_embed_path(args.ep_id, run_id=run_id)
         if embeddings_array:
             np.save(embed_path, np.vstack(embeddings_array))
         else:
@@ -7735,7 +7760,7 @@ def _run_cluster_stage(
 
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
-        thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
+        thumb_root = _frames_root_for_run(args.ep_id, run_id) / "thumbs"
         faces_done = 0
         # Start identity counter after max preserved ID to avoid collisions
         identity_counter = max_preserved_id + 1

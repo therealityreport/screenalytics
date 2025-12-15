@@ -1835,10 +1835,11 @@ def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
     }
 
 
-def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
+def _episode_status_payload(ep_id: str, run_id: str | None = None) -> Dict[str, Any] | None:
     url = f"{_api_base()}/episodes/{ep_id}/status"
     try:
-        resp = requests.get(url, timeout=15)
+        params = {"run_id": run_id} if run_id else None
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
     except requests.RequestException:
         return None
@@ -1849,8 +1850,8 @@ def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def get_episode_status(ep_id: str) -> Dict[str, Any] | None:
-    return _episode_status_payload(ep_id)
+def get_episode_status(ep_id: str, run_id: str | None = None) -> Dict[str, Any] | None:
+    return _episode_status_payload(ep_id, run_id=run_id)
 
 
 def link_local(path: Path | str) -> str:
