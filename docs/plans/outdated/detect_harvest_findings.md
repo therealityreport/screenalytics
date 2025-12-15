@@ -1,5 +1,7 @@
 # Detect/Track & Harvest Faces review
 
+> Status: outdated — early review notes; for current behavior see `docs/pipeline/detect_track_faces.md` and `docs/pipeline/faces_harvest.md`.
+
 ## Bugs (ranked high → low)
 1. **Faces thumbnail size dropped on synchronous harvest runs** – The `/jobs/faces_embed` path builds the command without `--thumb-size`, so UI selections are ignored and harvests always default to 256px, unlike the async path. (apps/api/routers/jobs.py)
    - **Suggested fix**: Pass `thumb_size` through `_build_faces_command` and include it in the synchronous `/faces_embed` execution to mirror the async launcher.

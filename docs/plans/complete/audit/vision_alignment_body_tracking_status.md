@@ -1,6 +1,6 @@
 # Audit: Vision Alignment / Body Tracking / Embedding Engines — Status
 
-Last updated: 2025-12-13  
+Last updated: 2025-12-15  
 Scope: `FEATURES/face_alignment`, `FEATURES/body_tracking`, `FEATURES/arcface_tensorrt`, `FEATURES/embedding_engines`, `FEATURES/vision_analytics`
 
 This audit is the “single source of truth” for what exists **in code today** vs what is **planned-only** (docs/config scaffolds).
@@ -16,21 +16,24 @@ This audit is the “single source of truth” for what exists **in code today**
 
 | Building Block | Status | Needed Now? | Primary “Where” | Primary Config |
 |---|---|---:|---|---|
-| FAN face alignment (2D/3D landmarks) | Implemented (sandbox) | Core | `FEATURES/face_alignment/src/run_fan_alignment.py` | `config/pipeline/face_alignment.yaml` |
+| FAN face alignment (2D landmarks) | Partial (sandbox MVP; integration pending) | Core | `FEATURES/face_alignment/src/run_fan_alignment.py` | `config/pipeline/face_alignment.yaml` |
 | Body tracking + Re-ID + fusion | Implemented (sandbox) | Scale | `FEATURES/body_tracking/src/body_tracking_runner.py` | `config/pipeline/body_detection.yaml`, `config/pipeline/track_fusion.yaml` |
-| ArcFace TensorRT embeddings | Implemented (sandbox + pipeline backend) | Scale | `FEATURES/arcface_tensorrt/src/` + `tools/episode_run.py` | `config/pipeline/embedding.yaml`, `config/pipeline/arcface_tensorrt.yaml` |
+| ArcFace TensorRT embeddings | Scaffold-only (sandbox) | Scale | `FEATURES/arcface_tensorrt/src/` | `config/pipeline/arcface_tensorrt.yaml` |
 | LUVLi-style quality + visibility gating | Partial (heuristic) | Core | `FEATURES/face_alignment/src/run_luvli_quality.py` | `config/pipeline/embedding.yaml` (gating) |
 | 3DDFA_V2 dense 3D + head pose | Not found (planned-only) | Future | — | `config/pipeline/face_alignment.yaml` (stub) |
 | InsightFace_Pytorch reference ArcFace + eval suite | Not found (planned-only) | Future | — | — |
-| ONNXRuntime C++ embedding service plan | Planned-only | Future | `FEATURES/embedding_engines/docs/` | `docs/todo/feature_arcface_tensorrt_onnxruntime.md` |
-| MediaPipe face mesh / advanced visibility | Planned-only | Advanced | `FEATURES/vision_analytics/docs/` | `config/pipeline/analytics.yaml` |
+| ONNXRuntime C++ embedding service plan | Planned-only | Future | `FEATURES/embedding_engines/docs/` | `docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md` |
+| MediaPipe face mesh / advanced visibility | Not started (docs-only) | Advanced | `FEATURES/vision_analytics/docs/` | `config/pipeline/analytics.yaml` |
 | CenterFace detector (CPU fallback) | Planned-only | Future | `FEATURES/vision_analytics/docs/` | `config/pipeline/analytics.yaml` |
 
 ---
 
-## 1) FAN / Face Alignment (2D/3D landmarks)
+## 1) FAN / Face Alignment (2D landmarks)
 
-- **Status:** Implemented (Feature sandbox; manual run)
+- **Status:** Partial (sandbox MVP; integration pending)
+  - Phase A: FAN 2D integration — complete
+  - Phase B: LUVLi quality gate — heuristic stub only
+  - Phase C: 3DDFA_V2 — not started
 - **Where:**
   - `FEATURES/face_alignment/src/run_fan_alignment.py` (`FANAligner`, `AlignedFace`)
   - `FEATURES/face_alignment/src/face_alignment_runner.py` (`FaceAlignmentRunner`)
@@ -89,24 +92,21 @@ This audit is the “single source of truth” for what exists **in code today**
   - External deps (`ultralytics`, `torchreid`) may not be installed in minimal environments; treat as optional.
 - **Needed now?** Scale — improves continuity and fills “face missing” gaps.
 
-## 3) TensorRT ArcFace via tensorrtx (embedding engine)
+## 3) ArcFace TensorRT (embedding engine)
 
-- **Status:** Implemented (Feature sandbox + selectable backend in embedding pipeline)
+- **Status:** Scaffold-only (sandbox; GPU parity tests/eval pending)
 - **Where:**
   - `FEATURES/arcface_tensorrt/src/tensorrt_builder.py` (engine build/cache)
   - `FEATURES/arcface_tensorrt/src/tensorrt_inference.py` (inference wrapper)
   - `FEATURES/arcface_tensorrt/src/embedding_compare.py` (parity utilities)
-  - `tools/episode_run.py` (backend selection + runtime)
 - **Pipeline wiring:**
-  - Config selects backend:
-    - `config/pipeline/embedding.yaml`: `embedding.backend: pytorch|tensorrt`
-    - `config/pipeline/embedding.yaml`: `embedding.tensorrt_config: config/pipeline/arcface_tensorrt.yaml`
+  - Config scaffolding exists in `config/pipeline/embedding.yaml` + `config/pipeline/arcface_tensorrt.yaml`, but should be treated as experimental until GPU parity tests/eval are complete.
   - CLI for building/benchmarking sandbox: `python -m FEATURES.arcface_tensorrt --mode build|compare|benchmark`
 - **Artifacts:**
   - Engine cache defaults under `data/engines/` (from `config/pipeline/arcface_tensorrt.yaml`) and/or user cache dirs (see `FEATURES/arcface_tensorrt/src/tensorrt_builder.py`).
 - **Config flags / rollback:**
-  - Set `embedding.backend: pytorch` to disable TensorRT.
-  - `config/pipeline/arcface_tensorrt.yaml`: `arcface_tensorrt.enabled` (feature flag for sandbox usage; pipeline uses backend selection).
+  - Keep the baseline embedding runtime unless explicitly testing TensorRT.
+  - `config/pipeline/arcface_tensorrt.yaml`: `arcface_tensorrt.enabled` (feature flag for sandbox usage).
 - **Tests:**
   - `pytest FEATURES/arcface_tensorrt/tests/test_tensorrt_embedding.py -v`
 - **Observability:**
@@ -148,16 +148,16 @@ This audit is the “single source of truth” for what exists **in code today**
 - **Status:** Planned-only
 - **Where:**
   - `FEATURES/embedding_engines/docs/README.md`
-  - `docs/todo/feature_arcface_tensorrt_onnxruntime.md`
+  - `docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md`
 - **Notes:** ONNXRuntime is used **in-process** today (provider selection in `tools/episode_run.py`); the separate C++ service is a future architecture idea.
 - **Needed now?** Future — only needed at higher scale / service boundaries.
 
 ## 8) MediaPipe Face Mesh / Attention Mesh
 
-- **Status:** Planned-only
+- **Status:** Not started (docs-only)
 - **Where:**
   - `FEATURES/vision_analytics/docs/README.md`
-  - `docs/todo/feature_mesh_and_advanced_visibility.md`
+  - `docs/plans/in_progress/feature_mesh_and_advanced_visibility.md`
   - `config/pipeline/analytics.yaml`
 - **Needed now?** Advanced — valuable for visibility analytics, but requires new implementation + labeled QA.
 
@@ -166,6 +166,5 @@ This audit is the “single source of truth” for what exists **in code today**
 - **Status:** Planned-only
 - **Where:**
   - `config/pipeline/analytics.yaml` (`centerface.*`)
-  - `docs/todo/feature_mesh_and_advanced_visibility.md`
+  - `docs/plans/in_progress/feature_mesh_and_advanced_visibility.md`
 - **Needed now?** Future — revisit only if a CPU-only detector fallback is required.
-

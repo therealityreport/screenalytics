@@ -2,7 +2,7 @@
 
 Version: 1.0
 Status: In Development
-Last Updated: 2025-12-13
+Last Updated: 2025-12-15
 
 ---
 
@@ -10,10 +10,31 @@ Last Updated: 2025-12-13
 
 This document describes the extension of Screenalytics from face-only tracking to a comprehensive person tracking system that includes:
 
-1. **Robust Face Alignment** - Using FAN (Face Alignment Network) for 68-point 2D landmarks with quality gating via LUVLi uncertainty estimation
-2. **Body Tracking + Person Re-ID** - Track cast members even when faces aren't visible using YOLO person detection and OSNet Re-ID embeddings
-3. **Optimized Embedding Engines** - TensorRT and ONNXRuntime backends for 5-10x embedding throughput improvement
-4. **Advanced Visibility Analytics** - Face mesh, gaze direction, and fine-grained visibility metrics
+1. **Robust Face Alignment** - FAN 68-point 2D landmarks (implemented); quality gating is a heuristic stub; 3DDFA_V2 is planned-only.
+2. **Body Tracking + Person Re-ID** - Optional FEATURE sandbox for tracking cast members when faces are not visible (YOLO + OSNet + fusion).
+3. **Optimized Embedding Engines** - ArcFace TensorRT work is scaffold-only today; real GPU parity/testing and integration are future work.
+4. **Advanced Visibility Analytics** - Vision analytics (mesh/gaze/visibility) is planned-only today (docs/config only).
+
+---
+
+## Implementation Status Snapshot (current)
+
+These are the current known states we rely on elsewhere in docs/UI:
+
+- **Face Alignment (`FEATURES/face_alignment/`)** — `partial`
+  - Phase A: FAN 2D integration — complete
+  - Phase B: LUVLi quality gate — heuristic stub only
+  - Phase C: 3DDFA_V2 — not started
+  - Pending: main pipeline integration, model-based quality
+- **ArcFace TensorRT (`FEATURES/arcface_tensorrt/`)** — `scaffold_only`
+  - Phase A: engine building — scaffold (pending real ONNX test)
+  - Phase B: inference wrapper — scaffold (pending GPU test)
+  - Phase C: comparison — scaffold (pending eval)
+  - Phase D: integration — future
+  - Pending: real GPU testing, full comparison/eval
+- **Vision Analytics (`FEATURES/vision_analytics/`)** — `not_started`
+  - All phases: not started (docs-only)
+  - Pending: create `src/`, wire visibility labeling, UI surfacing
 
 ---
 
@@ -29,6 +50,8 @@ This document describes the extension of Screenalytics from face-only tracking t
 ---
 
 ## Updated Pipeline Architecture
+
+Note: the diagram below shows a **target** architecture; several components are partial/scaffold/planned-only today (see status snapshot above).
 
 ```
 Video Frames
@@ -102,10 +125,10 @@ Video Frames
 **Current reality (as of this doc update):**
 - Face alignment + body tracking are **FEATURE sandbox modules** you run explicitly (`python -m FEATURES.face_alignment`, `python -m FEATURES.body_tracking`).
 - The “main” detect→embed pipeline consumes their outputs **only if artifacts exist** (e.g., embedding gating reads `face_alignment/aligned_faces.jsonl`; screentime reads `body_tracking/screentime_comparison.json`).
-- TensorRT embeddings are a **selectable backend** via `config/pipeline/embedding.yaml` and `tools/episode_run.py`.
+- ArcFace TensorRT work is **scaffold-only** today; keep PyTorch/ONNXRuntime as the operational baseline until GPU parity tests/eval are complete.
 - Vision analytics (mesh/visibility/gaze/centerface) is **planned-only** (configs + TODOs exist; no runnable `FEATURES/vision_analytics/src/` yet).
 
-See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_alignment_body_tracking_status.md)
+See: [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../plans/complete/audit/vision_alignment_body_tracking_status.md)
 
 ### 1. Face Alignment (Priority 1)
 
@@ -123,7 +146,7 @@ See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_align
 
 **Feature Sandbox:** `FEATURES/face_alignment/`
 
-**TODO Doc:** [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](../todo/feature_face_alignment_fan_luvli_3ddfa.md)
+**TODO Doc:** [docs/plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md](../plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md)
 
 ---
 
@@ -144,7 +167,7 @@ See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_align
 
 **Feature Sandbox:** `FEATURES/body_tracking/`
 
-**TODO Doc:** [docs/todo/feature_body_tracking_reid_fusion.md](../todo/feature_body_tracking_reid_fusion.md)
+**TODO Doc:** [docs/plans/in_progress/feature_body_tracking_reid_fusion.md](../plans/in_progress/feature_body_tracking_reid_fusion.md)
 
 ---
 
@@ -152,7 +175,7 @@ See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_align
 
 | Component | Backend | Purpose |
 |-----------|---------|---------|
-| TensorRT ArcFace | ONNX→TRT | GPU-optimized FP16 inference |
+| TensorRT ArcFace | ONNX→TRT | Scaffold for GPU-optimized FP16 inference (pending GPU parity test/eval) |
 | PyTorch/ONNX Runtime (in-proc) | `insightface` Python package | Reference runtime (models via `scripts/fetch_models.py`) |
 | ONNXRuntime C++ | planned | High-load microservice (future architecture) |
 
@@ -166,7 +189,7 @@ See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_align
 
 **Feature Sandbox:** `FEATURES/arcface_tensorrt/` (implementation), `FEATURES/embedding_engines/` (docs-only planning)
 
-**TODO Doc:** [docs/todo/feature_arcface_tensorrt_onnxruntime.md](../todo/feature_arcface_tensorrt_onnxruntime.md)
+**TODO Doc:** [docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md](../plans/in_progress/feature_arcface_tensorrt_onnxruntime.md)
 
 ---
 
@@ -183,7 +206,7 @@ See: [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_align
 
 **Feature Sandbox:** `FEATURES/vision_analytics/` (docs-only today)
 
-**TODO Doc:** [docs/todo/feature_mesh_and_advanced_visibility.md](../todo/feature_mesh_and_advanced_visibility.md)
+**TODO Doc:** [docs/plans/in_progress/feature_mesh_and_advanced_visibility.md](../plans/in_progress/feature_mesh_and_advanced_visibility.md)
 
 ---
 
@@ -252,7 +275,7 @@ Current implementations write dedicated artifacts under `data/manifests/{ep_id}/
 - [ACCEPTANCE_MATRIX.md](../../ACCEPTANCE_MATRIX.md) - Sections 3.7-3.15
 - [Feature sandboxes](feature_sandboxes.md) - Feature sandbox workflow
 - [docs/pipeline/overview.md](../pipeline/overview.md) - Existing pipeline docs
-- [docs/audit/vision_alignment_body_tracking_status.md](../audit/vision_alignment_body_tracking_status.md) - Code-vs-docs audit
+- [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../plans/complete/audit/vision_alignment_body_tracking_status.md) - Code-vs-docs audit
 
 ---
 

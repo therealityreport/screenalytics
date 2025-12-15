@@ -23,7 +23,7 @@ This document provides a step-by-step guide to implementing the fixes for:
 All implementation guides and helper code have been created:
 
 ### 1. Documentation
-- `docs/code-updates/nov-18-track-reps-face-completeness-and-assignment.md` - Comprehensive technical documentation
+- `docs/plans/complete/code-updates/nov-18-track-reps-face-completeness-and-assignment.md` - Comprehensive technical documentation
 
 ### 2. Implementation Helper Files
 - `apps/api/services/track_reps_completeness.py` - Face completeness detection functions
@@ -499,8 +499,8 @@ git add apps/api/services/track_reps.py \
         tools/episode_run.py \
         tools/appearance_gate_hardening_patch.py \
         tools/detection_backed_tracks_patch.py \
-        docs/code-updates/nov-18-track-reps-face-completeness-and-assignment.md \
-        docs/code-updates/IMPLEMENTATION_SUMMARY_nov-18-track-reps.md
+        docs/plans/complete/code-updates/nov-18-track-reps-face-completeness-and-assignment.md \
+        docs/plans/complete/code-updates/IMPLEMENTATION_SUMMARY_nov-18-track-reps.md
 
 # Commit with detailed message
 git commit -m "fix(track-reps): prefer full faces, safer auto-assignment, and detection-backed tracks (NOV18-REPS-ASSIGN-2025-11-18)
@@ -570,7 +570,7 @@ git push origin nov-18
 
 For questions or issues during implementation:
 
-1. Check `docs/code-updates/nov-18-track-reps-face-completeness-and-assignment.md` for technical details
+1. Check `docs/plans/complete/code-updates/nov-18-track-reps-face-completeness-and-assignment.md` for technical details
 2. Review helper files for code examples
 3. Check logs for diagnostic output during testing
 
@@ -579,8 +579,8 @@ For questions or issues during implementation:
 ## Summary of Files
 
 **Documentation:**
-- `docs/code-updates/nov-18-track-reps-face-completeness-and-assignment.md` (comprehensive technical doc)
-- `docs/code-updates/IMPLEMENTATION_SUMMARY_nov-18-track-reps.md` (this file)
+- `docs/plans/complete/code-updates/nov-18-track-reps-face-completeness-and-assignment.md` (comprehensive technical doc)
+- `docs/plans/complete/code-updates/IMPLEMENTATION_SUMMARY_nov-18-track-reps.md` (this file)
 
 **Helper/Patch Files:**
 - `apps/api/services/track_reps_completeness.py` (face completeness functions)

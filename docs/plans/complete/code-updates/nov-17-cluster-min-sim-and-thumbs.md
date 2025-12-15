@@ -428,8 +428,8 @@ POST /jobs/episode_cleanup_async
 - [apps/api/routers/jobs.py](../../apps/api/routers/jobs.py) - API request models and endpoints
 - [apps/api/services/jobs.py](../../apps/api/services/jobs.py) - Job service with command building
 - [apps/api/services/track_reps.py](../../apps/api/services/track_reps.py) - Thumbnail selection with similarity gating
-- [docs/code-updates/nov-17-episode-detail-detect-track-fallback.md](nov-17-episode-detail-detect-track-fallback.md) - Related manifest fallback changes
-- [docs/code-updates/nov-17-zero-tracks-and-bytetrack-thresholds.md](nov-17-zero-tracks-and-bytetrack-thresholds.md) - ByteTrack threshold improvements
+- [docs/plans/complete/code-updates/nov-17-episode-detail-detect-track-fallback.md](nov-17-episode-detail-detect-track-fallback.md) - Related manifest fallback changes
+- [docs/plans/complete/code-updates/nov-17-zero-tracks-and-bytetrack-thresholds.md](nov-17-zero-tracks-and-bytetrack-thresholds.md) - ByteTrack threshold improvements
 
 ## Technical Details
 

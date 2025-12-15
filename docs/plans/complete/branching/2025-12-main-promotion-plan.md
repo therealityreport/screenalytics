@@ -85,4 +85,4 @@ These branches contain prototype Next.js work. Keep them as reference for when t
 2. Start new feature work from `main` using single-branch workflow
 3. Reference web-app/* branches when building Next.js app
 
-See [BRANCHING_STRATEGY.md](../BRANCHING_STRATEGY.md) for the new workflow.
+See [BRANCHING_STRATEGY.md](../../../reference/branching/BRANCHING_STRATEGY.md) for the new workflow.
