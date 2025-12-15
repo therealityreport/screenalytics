@@ -1,129 +1,253 @@
-# Branching Strategy: Main + 1 Feature Branch
+# Branching Strategy: Single Directory Workflow
 
 ## Overview
 
-Screenalytics uses a simplified branching model with **one stable `main` branch** and **one active feature branch** at a time. This prevents branch sprawl and merge conflicts.
+Screenalytics uses a simplified branching model with **one stable `main` branch** and **one active task branch** at a time. All development happens in a **single working directory** without git worktrees.
 
 ---
 
-## Branch Types
+## Core Principles
 
-### `main` (protected)
-- Always deployable
-- All CI tests must pass before merge
-- Direct commits prohibited except for critical hotfixes
+### Single Working Directory
 
-### `feature/<name>` (working branch)
-- One active feature branch at a time
-- Created from latest `main`
-- Merged back to `main` when complete
-- Deleted after merge
+All development happens inside `/Volumes/HardDrive/SCREENALYTICS`.
+
+**Do NOT use git worktrees in this workflow.** The single-directory approach keeps things simple:
+- One location for all work
+- No confusion about which directory has which changes
+- Easier to track state
+
+### One Branch Per Task
+
+Each task gets exactly one branch. You keep working on that branch until it's ready for PR and merge to main.
 
 ---
 
-## Workflow
+## Branch Naming Convention
 
-### Starting New Work
+**Required pattern**: `screentime-improvements/<task-slug>`
+
+### Naming Rules
+
+| Rule | Example |
+|------|---------|
+| Lowercase only | `screentime-improvements/run-isolation` |
+| Hyphen-separated | `screentime-improvements/face-alignment-qa` |
+| Descriptive slug | `screentime-improvements/web-modal-dialogs` |
+| No spaces/underscores | ~~`screentime-improvements/my_feature`~~ |
+
+### Examples
+
+```
+screentime-improvements/run-isolation-screentime
+screentime-improvements/web-modal-dialogs
+screentime-improvements/workflow-docs-and-repo-structure
+screentime-improvements/face-alignment-phase-b
+```
+
+---
+
+## Task Lifecycle
+
+### Stage 1: Start Task
 
 ```bash
-# 1. Ensure main is up to date
-git checkout main
-git pull origin main
+# Switch to main and pull latest
+git switch main
+git pull --ff-only origin main
 
-# 2. Create feature branch
-git checkout -b feature/my-feature
+# Verify clean state
+git status -sb
 
-# 3. Work on feature, commit regularly
+# Create the task branch
+git switch -c screentime-improvements/<task-slug>
+
+# Confirm you're on the new branch
+git status -sb
+```
+
+### Stage 2: Work Loop (repeat as needed)
+
+```bash
+# Make changes, then stage and commit
+git add <files>
+git commit -m "<type>: <description>"
+
+# Push regularly to keep remote updated
+git push -u origin screentime-improvements/<task-slug>
+
+# Run tests as appropriate
+python -m py_compile <python_files>
+pytest tests/ -v
+```
+
+**Commit frequently.** Small, focused commits are easier to review and debug.
+
+### Stage 3: PR Stage
+
+```bash
+# Ensure all changes are committed and pushed
+git status -sb
+git push
+
+# Verify branch exists on GitHub
+gh pr list
+
+# Open PR
+gh pr create --base main --title "<title>" --body "<description>"
+```
+
+### Stage 4: Merge Stage
+
+```bash
+# After PR is approved and merged on GitHub:
+git switch main
+git pull --ff-only origin main
+
+# Delete local branch
+git branch -d screentime-improvements/<task-slug>
+
+# Delete remote branch (if not auto-deleted by GitHub)
+git push origin --delete screentime-improvements/<task-slug>
+```
+
+---
+
+## Required Checkpoints
+
+### Before Switching Branches
+
+You **must** commit your work OR explicitly stash it:
+
+```bash
+# Option A: Commit (preferred)
 git add .
-git commit -m "feat: description of change"
+git commit -m "wip: <what you were doing>"
 
-# 4. Push to remote
-git push -u origin feature/my-feature
+# Option B: Stash (temporary only)
+git stash push -m "switching to other work"
 ```
 
-### Completing Work
+**Prefer commits over stash.** Stashed work can be lost or forgotten.
+
+### Before Opening a PR
+
+- [ ] All changes committed (`git status` shows clean)
+- [ ] Branch pushed to origin (`git push`)
+- [ ] Branch exists on GitHub (`gh pr list` or check web UI)
+- [ ] Tests pass locally
+- [ ] No merge conflicts with main
+
+### Always Keep Main Clean
+
+- Never commit directly to main
+- Never force-push to main
+- Always use PRs for merging
+
+---
+
+## Complete Command Reference
+
+### Starting a New Task
 
 ```bash
-# 1. Ensure main hasn't diverged
-git fetch origin
-git rebase origin/main  # or merge if preferred
-
-# 2. Push final changes
-git push origin feature/my-feature
-
-# 3. Create PR and wait for CI
-gh pr create --base main
-
-# 4. After merge, delete feature branch
-git checkout main
-git pull origin main
-git branch -d feature/my-feature
-git push origin --delete feature/my-feature
+git switch main
+git pull --ff-only origin main
+git status -sb
+git switch -c screentime-improvements/<task-slug>
+git status -sb
 ```
 
----
-
-## Naming Conventions
-
-| Type | Pattern | Example |
-|------|---------|---------|
-| Feature | `feature/<name>` | `feature/voice-clustering` |
-| Bug fix | `fix/<name>` | `fix/embedding-cache` |
-| Infrastructure | `infra/<name>` | `infra/docker-compose` |
-| Experiment | `exp/<name>` | `exp/whisper-v3` |
-
----
-
-## Pre-Flight Checklist (Before Starting New Feature)
-
-Before creating a new feature branch, verify:
-
-- [ ] All CI checks passing on main
-- [ ] No pending PRs that should be merged first
-- [ ] No uncommitted local changes
-- [ ] Local main is synced with remote
+### Regular Work Cycle
 
 ```bash
-# Quick pre-flight check
-git fetch origin
-git status
-gh pr list --state open
-gh run list --limit 5
+# After making changes
+git add <files>
+git commit -m "<type>: <description>"
+git push -u origin screentime-improvements/<task-slug>
+```
+
+### Opening a PR
+
+```bash
+git status -sb
+git push
+gh pr create --base main --title "<title>" --body "$(cat <<'EOF'
+## Summary
+- <bullet points>
+
+## Test Plan
+- [ ] <checklist>
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+EOF
+)"
+```
+
+### After PR Merge
+
+```bash
+git switch main
+git pull --ff-only origin main
+git branch -d screentime-improvements/<task-slug>
 ```
 
 ---
 
-## Handling Parallel Work
+## Handling Urgent Work
 
-If you need to work on something else while a feature is in progress:
+If you need to handle something urgent while a task is in progress:
 
-1. **Stash current work**: `git stash`
-2. **Create hotfix from main**: `git checkout main && git checkout -b fix/urgent-fix`
-3. **Complete and merge hotfix**
-4. **Return to feature**: `git checkout feature/my-feature && git stash pop`
-5. **Rebase on updated main**: `git rebase origin/main`
+1. **Commit current work** (don't leave uncommitted changes):
+   ```bash
+   git add .
+   git commit -m "wip: pausing for urgent work"
+   git push
+   ```
+
+2. **Switch to main and create urgent branch**:
+   ```bash
+   git switch main
+   git pull --ff-only origin main
+   git switch -c screentime-improvements/urgent-fix
+   ```
+
+3. **Complete and merge urgent work via PR**
+
+4. **Return to original task**:
+   ```bash
+   git switch screentime-improvements/<original-task>
+   git rebase origin/main  # incorporate any changes from main
+   ```
 
 ---
 
 ## Prohibited Patterns
 
-- Multiple long-lived feature branches
-- Branches older than 2 weeks without activity
-- Force-pushing to main
-- Merging without CI passing
-- Keeping branches after merge
+| Don't Do This | Why |
+|---------------|-----|
+| Create git worktrees | Adds complexity, causes confusion |
+| Multiple long-lived branches | Hard to track, causes merge conflicts |
+| Leave uncommitted changes when switching | Changes can be lost |
+| Force-push to main | Destroys history |
+| Merge without CI passing | Breaks main for everyone |
+| Keep branches after merge | Clutters branch list |
+| Branches older than 2 weeks | Stale branches cause merge hell |
 
 ---
 
-## Recovery: Branch Cleanup
+## Quick Reference Card
 
-If branches have accumulated, follow the cleanup process in [2025-12-main-promotion-plan.md](branching/2025-12-main-promotion-plan.md).
-
-```bash
-# List all branches with their status
-for branch in $(git branch -r | grep -v HEAD | sed 's/origin\///'); do
-  ahead=$(git rev-list --count main..origin/$branch 2>/dev/null || echo "?")
-  behind=$(git rev-list --count origin/$branch..main 2>/dev/null || echo "?")
-  echo "$branch: +$ahead -$behind"
-done
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SCREENALYTICS WORKFLOW                                      │
+├─────────────────────────────────────────────────────────────┤
+│ Working Directory: /Volumes/HardDrive/SCREENALYTICS         │
+│ Branch Pattern:    screentime-improvements/<task-slug>      │
+├─────────────────────────────────────────────────────────────┤
+│ START:  git switch main && git pull && git switch -c ...    │
+│ WORK:   edit → git add → git commit → git push              │
+│ PR:     gh pr create --base main                            │
+│ DONE:   git switch main && git pull && git branch -d ...    │
+└─────────────────────────────────────────────────────────────┘
 ```
