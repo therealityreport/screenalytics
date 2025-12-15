@@ -1072,6 +1072,20 @@ def run_detect_track_task(
     """
     job_id = self.request.id
     options = options or {}
+    run_id: str | None = None
+    run_id_raw = options.get("run_id")
+    if isinstance(run_id_raw, str) and run_id_raw.strip():
+        try:
+            from py_screenalytics import run_layout
+
+            run_id = run_layout.normalize_run_id(run_id_raw)
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "episode_id": episode_id,
+                "operation": "detect_track",
+                "error": f"Invalid run_id: {exc}",
+            }
 
     if not _acquire_lock(episode_id, "detect_track", job_id):
         return {
@@ -1095,14 +1109,26 @@ def run_detect_track_task(
 
         # Progress file
         manifests_dir = get_path(episode_id, "detections").parent
-        manifests_dir.mkdir(parents=True, exist_ok=True)
-        progress_file = manifests_dir / "progress.json"
+        if run_id:
+            from py_screenalytics import run_layout
+
+            run_dir = run_layout.run_root(episode_id, run_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = run_dir / "progress.json"
+        else:
+            manifests_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = manifests_dir / "progress.json"
 
         # Build command
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "episode_run.py"),
             "--ep-id", episode_id,
+            *(
+                ["--run-id", run_id]
+                if run_id
+                else []
+            ),
             "--video", str(video_path),
             "--stride", str(options.get("stride", 6)),
             "--device", options.get("device", "auto"),
@@ -1208,6 +1234,20 @@ def run_faces_embed_task(
     """
     job_id = self.request.id
     options = options or {}
+    run_id: str | None = None
+    run_id_raw = options.get("run_id")
+    if isinstance(run_id_raw, str) and run_id_raw.strip():
+        try:
+            from py_screenalytics import run_layout
+
+            run_id = run_layout.normalize_run_id(run_id_raw)
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "episode_id": episode_id,
+                "operation": "faces_embed",
+                "error": f"Invalid run_id: {exc}",
+            }
 
     if not _acquire_lock(episode_id, "faces_embed", job_id):
         return {
@@ -1221,14 +1261,26 @@ def run_faces_embed_task(
 
         # Progress file
         manifests_dir = get_path(episode_id, "detections").parent
-        manifests_dir.mkdir(parents=True, exist_ok=True)
-        progress_file = manifests_dir / "progress.json"
+        if run_id:
+            from py_screenalytics import run_layout
+
+            run_dir = run_layout.run_root(episode_id, run_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = run_dir / "progress.json"
+        else:
+            manifests_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = manifests_dir / "progress.json"
 
         # Build command
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "episode_run.py"),
             "--ep-id", episode_id,
+            *(
+                ["--run-id", run_id]
+                if run_id
+                else []
+            ),
             "--faces-embed",
             "--device", options.get("device", "auto"),
             "--progress-file", str(progress_file),
@@ -1307,6 +1359,20 @@ def run_cluster_task(
     """
     job_id = self.request.id
     options = options or {}
+    run_id: str | None = None
+    run_id_raw = options.get("run_id")
+    if isinstance(run_id_raw, str) and run_id_raw.strip():
+        try:
+            from py_screenalytics import run_layout
+
+            run_id = run_layout.normalize_run_id(run_id_raw)
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "episode_id": episode_id,
+                "operation": "cluster",
+                "error": f"Invalid run_id: {exc}",
+            }
 
     if not _acquire_lock(episode_id, "cluster", job_id):
         return {
@@ -1320,14 +1386,26 @@ def run_cluster_task(
 
         # Progress file
         manifests_dir = get_path(episode_id, "detections").parent
-        manifests_dir.mkdir(parents=True, exist_ok=True)
-        progress_file = manifests_dir / "progress.json"
+        if run_id:
+            from py_screenalytics import run_layout
+
+            run_dir = run_layout.run_root(episode_id, run_id)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = run_dir / "progress.json"
+        else:
+            manifests_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = manifests_dir / "progress.json"
 
         # Build command
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "episode_run.py"),
             "--ep-id", episode_id,
+            *(
+                ["--run-id", run_id]
+                if run_id
+                else []
+            ),
             "--cluster",
             "--device", options.get("device", "auto"),
             "--progress-file", str(progress_file),

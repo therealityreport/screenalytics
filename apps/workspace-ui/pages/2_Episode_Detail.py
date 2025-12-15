@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -1765,6 +1766,14 @@ else:
     faces_phase_status = status_payload.get("faces_embed") or {}
     cluster_phase_status = status_payload.get("cluster") or {}
 
+# Track the currently selected/active run_id for this episode (default = API active_run_id).
+_active_run_id_key = f"{ep_id}::active_run_id"
+_autorun_run_id_key = f"{ep_id}::autorun_run_id"
+api_active_run_id = (status_payload or {}).get("active_run_id")
+if (_active_run_id_key not in st.session_state) or not st.session_state.get(_active_run_id_key):
+    if isinstance(api_active_run_id, str) and api_active_run_id.strip():
+        st.session_state[_active_run_id_key] = api_active_run_id.strip()
+
 prefixes = helpers.episode_artifact_prefixes(ep_id)
 bucket_name = cfg.get("bucket")
 tracks_path = get_path(ep_id, "tracks")
@@ -2180,6 +2189,10 @@ with st.expander("Pipeline Status", expanded=False):
         st.caption(f"Status refreshed at {refreshed_label}")
     else:
         st.caption("Status will refresh when a job starts or you press refresh.")
+
+    _active_run_id_label = st.session_state.get(_active_run_id_key) or api_active_run_id
+    if isinstance(_active_run_id_label, str) and _active_run_id_label.strip():
+        st.caption(f"Active run_id: `{_active_run_id_label.strip()}`")
     coreml_available = status_payload.get("coreml_available") if status_payload else None
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
@@ -2695,6 +2708,7 @@ with st.container():
             if st.button("⏹️ Stop Auto-Run", key="stop_autorun", use_container_width=True, type="secondary"):
                 st.session_state[_autorun_key] = False
                 st.session_state[_autorun_phase_key] = None
+                st.session_state.pop(_autorun_run_id_key, None)
                 st.toast("Auto-run stopped")
                 st.rerun()
         else:
@@ -2781,6 +2795,11 @@ with st.container():
                 if autorun_disabled:
                     st.error("Auto-run is disabled (missing video or another job is running).")
                     st.stop()
+
+                new_run_id = uuid.uuid4().hex
+                st.session_state[_autorun_run_id_key] = new_run_id
+                st.session_state[_active_run_id_key] = new_run_id
+                LOGGER.info("[AUTORUN] Starting new pipeline run_id=%s", new_run_id)
 
                 # Clear old manifest data to prevent stale data confusion
                 # Archive old run markers and clear status cache
@@ -3377,6 +3396,11 @@ with col_detect:
         job_payload["fps"] = fps_value
     mode_label = f"{detect_detector_label} + {detect_tracker_label}"
 
+    if autorun_active:
+        autorun_run_id = st.session_state.get(_autorun_run_id_key)
+        if isinstance(autorun_run_id, str) and autorun_run_id.strip():
+            job_payload["run_id"] = autorun_run_id.strip()
+
     def _process_detect_result(summary: Dict[str, Any] | None, error_message: str | None) -> None:
         # DEBUG: Log entry to help diagnose auto-run issues
         autorun_val = st.session_state.get(_autorun_key)
@@ -3944,6 +3968,10 @@ with col_faces:
                 "jpeg_quality": int(faces_jpeg_quality),
                 "thumb_size": int(faces_thumb_size),
             }
+            if autorun_active:
+                autorun_run_id = st.session_state.get(_autorun_run_id_key)
+                if isinstance(autorun_run_id, str) and autorun_run_id.strip():
+                    payload["run_id"] = autorun_run_id.strip()
             st.session_state[running_job_key] = True
             # Clear completion marker when starting new job
             st.session_state.pop(f"{ep_id}::faces_job_complete", None)
@@ -4490,6 +4518,10 @@ with col_cluster:
                 "min_cluster_size": int(min_cluster_size_value),
                 "profile": profile_value,
             }
+            if autorun_active:
+                autorun_run_id = st.session_state.get(_autorun_run_id_key)
+                if isinstance(autorun_run_id, str) and autorun_run_id.strip():
+                    payload["run_id"] = autorun_run_id.strip()
             st.session_state[running_job_key] = True
             # Clear completion marker when starting new job
             st.session_state.pop(f"{ep_id}::cluster_job_complete", None)

@@ -661,3 +661,82 @@ def test_screentime_empty_results(tmp_path: Path, monkeypatch):
     # Should return empty metrics list
     assert result["episode_id"] == ep_id
     assert result["metrics"] == []
+
+
+def test_screentime_run_id_scopes_manifests(tmp_path: Path, monkeypatch):
+    """Run-scoped analysis must not read legacy/root manifests."""
+    from py_screenalytics import run_layout
+
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "test-s01e99"
+    show_id = "TEST"
+
+    # Show people file (minimum for mapping)
+    shows_dir = data_root / "shows" / show_id
+    shows_dir.mkdir(parents=True, exist_ok=True)
+    (shows_dir / "people.json").write_text(
+        json.dumps(
+            {
+                "people": [
+                    {
+                        "person_id": "person_one",
+                        "name": "Person One",
+                        "cast_id": "cast_one",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _write_run_artifacts(dir_path: Path, *, last_ts: float) -> None:
+        dir_path.mkdir(parents=True, exist_ok=True)
+        (dir_path / "faces.jsonl").write_text(
+            json.dumps({"track_id": 1, "quality": 0.99, "ts": 0.0}) + "\n",
+            encoding="utf-8",
+        )
+        (dir_path / "tracks.jsonl").write_text(
+            json.dumps({"track_id": 1, "first_ts": 0.0, "last_ts": last_ts}) + "\n",
+            encoding="utf-8",
+        )
+        (dir_path / "identities.json").write_text(
+            json.dumps(
+                {
+                    "identities": [
+                        {
+                            "identity_id": "identity_one",
+                            "track_ids": [1],
+                            "person_id": "person_one",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Legacy/root manifests simulate an older run (10s)
+    legacy_manifests_dir = data_root / "manifests" / ep_id
+    _write_run_artifacts(legacy_manifests_dir, last_ts=10.0)
+
+    # Run A (10s) and Run B (5s)
+    run_a = "run_a"
+    run_b = "run_b"
+    _write_run_artifacts(run_layout.run_root(ep_id, run_a), last_ts=10.0)
+    _write_run_artifacts(run_layout.run_root(ep_id, run_b), last_ts=5.0)
+
+    analyzer = ScreenTimeAnalyzer(
+        ScreenTimeConfig(
+            screen_time_mode="tracks",
+            use_video_decode=True,
+            gap_tolerance_s=0.5,
+        )
+    )
+    result = analyzer.analyze_episode(ep_id, run_id=run_b)
+
+    assert result.get("run_id") == run_b
+    metrics = result.get("metrics") or []
+    assert len(metrics) == 1
+    assert metrics[0]["cast_id"] == "cast_one"
+    assert metrics[0]["visual_s"] == 5.0

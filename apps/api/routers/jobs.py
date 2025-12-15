@@ -1328,6 +1328,13 @@ async def enqueue_episode_cleanup_async(req: CleanupJobRequest, request: Request
 
 class AnalyzeScreenTimeRequest(BaseModel):
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: str | None = Field(
+        None,
+        description=(
+            "Optional pipeline run identifier. When omitted, defaults to the most recent successful run "
+            "(when available)."
+        ),
+    )
     quality_min: float | None = Field(None, ge=0.0, le=1.0, description="Minimum face quality threshold")
     gap_tolerance_s: float | None = Field(None, ge=0.0, description="Gap tolerance in seconds")
     use_video_decode: bool | None = Field(None, description="Use video decode for precise timestamps")
@@ -1354,6 +1361,7 @@ async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -
     try:
         job = JOB_SERVICE.start_screen_time_job(
             ep_id=req.ep_id,
+            run_id=req.run_id,
             quality_min=req.quality_min,
             gap_tolerance_s=req.gap_tolerance_s,
             use_video_decode=req.use_video_decode,
