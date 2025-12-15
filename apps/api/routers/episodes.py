@@ -314,6 +314,7 @@ def _phase_status_from_marker(phase: str, marker: Dict[str, Any]) -> Dict[str, A
     return {
         "phase": phase,
         "status": status_value,
+        "run_id": marker.get("run_id"),
         "faces": _safe_int(marker.get("faces")),
         "identities": _safe_int(marker.get("identities")),
         "detections": _safe_int(marker.get("detections")),
@@ -1658,6 +1659,7 @@ class EpisodeDetailResponse(BaseModel):
 class PhaseStatus(BaseModel):
     phase: str
     status: str
+    run_id: str | None = None
     faces: int | None = None
     identities: int | None = None
     detections: int | None = None
@@ -1705,6 +1707,7 @@ class PhaseStatus(BaseModel):
 
 class EpisodeStatusResponse(BaseModel):
     ep_id: str
+    active_run_id: str | None = None
     detect_track: PhaseStatus
     faces_embed: PhaseStatus
     cluster: PhaseStatus
@@ -2082,8 +2085,25 @@ def episode_run_status(ep_id: str) -> EpisodeStatusResponse:
 
     coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
 
+    active_run_id: str | None = None
+    try:
+        from py_screenalytics import run_layout
+
+        active_run_id = run_layout.read_active_run_id(ep_id)
+    except Exception:
+        active_run_id = None
+
+    # Fallback: derive from latest successful phase marker when active_run.json is absent.
+    if not active_run_id:
+        for payload in (cluster_payload, faces_payload, detect_track_payload):
+            rid = payload.get("run_id")
+            if payload.get("status") == "success" and isinstance(rid, str) and rid.strip():
+                active_run_id = rid.strip()
+                break
+
     return EpisodeStatusResponse(
         ep_id=ep_id,
+        active_run_id=active_run_id,
         detect_track=detect_track_status,
         faces_embed=faces_status,
         cluster=cluster_status,

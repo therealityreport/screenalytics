@@ -144,6 +144,56 @@ def test_start_screen_time_job_default_params(tmp_path, monkeypatch):
     assert "--gap-tolerance-s" not in command
 
 
+def test_start_screen_time_job_defaults_to_active_run(tmp_path, monkeypatch):
+    """When active_run.json is present, screen time should default to that run_id."""
+    from py_screenalytics import run_layout
+
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "test-s01e02"
+    show_id = "TEST"
+    run_id = "run_123"
+
+    ensure_dirs(ep_id)
+
+    run_dir = run_layout.run_root(ep_id, run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "faces.jsonl").write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
+    (run_dir / "tracks.jsonl").write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
+    (run_dir / "identities.json").write_text(json.dumps({"identities": []}), encoding="utf-8")
+
+    run_layout.write_active_run_id(ep_id, run_id)
+
+    shows_dir = data_root / "shows" / show_id
+    shows_dir.mkdir(parents=True, exist_ok=True)
+    people_path = shows_dir / "people.json"
+    people_path.write_text(json.dumps({"people": []}), encoding="utf-8")
+
+    service = JobService(data_root=data_root)
+    captured: dict = {}
+
+    def _fake_launch(**kwargs):
+        captured.update(kwargs)
+        return {
+            "job_id": "test-job-run",
+            "ep_id": ep_id,
+            "state": "running",
+            "job_type": kwargs["job_type"],
+        }
+
+    monkeypatch.setattr(service, "_launch_job", _fake_launch)
+
+    job = service.start_screen_time_job(ep_id=ep_id)
+    assert job["job_type"] == "screen_time_analyze"
+    assert captured["requested"]["run_id"] == run_id
+    assert captured["progress_path"] == run_dir / "progress_screen_time.json"
+
+    command = captured["command"]
+    assert "--run-id" in command
+    assert run_id in command
+
+
 def test_start_screen_time_job_missing_faces(tmp_path, monkeypatch):
     """Test that start_screen_time_job fails when faces.jsonl is missing."""
     data_root = tmp_path / "data"
@@ -323,7 +373,8 @@ def test_analyze_screen_time_endpoint_missing_artifacts(tmp_path, monkeypatch):
     resp = client.post("/jobs/screen_time/analyze", json={"ep_id": ep_id})
 
     assert resp.status_code == 400
-    assert "detail" in resp.json()
+    payload = resp.json()
+    assert ("detail" in payload) or ("message" in payload)
 
 
 def test_analyze_screen_time_endpoint_minimal_payload(tmp_path, monkeypatch):

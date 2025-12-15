@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from apps.api.services.screentime import ScreenTimeAnalyzer, ScreenTimeConfig
+from py_screenalytics import run_layout
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,6 +88,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Analyze per-cast screen time from faces and tracks")
     parser.add_argument("--ep-id", required=True, help="Episode identifier (e.g., rhobh-s05e17)")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Optional pipeline run identifier. When provided, artifacts are read only from "
+            "data/manifests/{ep_id}/runs/{run_id}/ and outputs are also written under that run."
+        ),
+    )
     parser.add_argument("--quality-min", type=float, help="Minimum face quality threshold (0.0-1.0)")
     parser.add_argument("--gap-tolerance-s", type=float, help="Gap tolerance in seconds")
     parser.add_argument(
@@ -120,7 +129,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     try:
-        emit_progress("init", f"Starting screen time analysis for {args.ep_id}")
+        run_id = run_layout.normalize_run_id(args.run_id) if args.run_id else None
+        emit_progress("init", f"Starting screen time analysis for {args.ep_id}", run_id=run_id)
 
         # Load config
         raw_config = load_config(args.config)
@@ -159,21 +169,22 @@ def main(argv: list[str] | None = None) -> int:
             config.track_coverage_min,
         )
 
-        emit_progress("loading", "Loading episode artifacts and people data")
+        emit_progress("loading", "Loading episode artifacts and people data", run_id=run_id)
 
         # Run analyzer
         analyzer = ScreenTimeAnalyzer(config)
-        metrics_data = analyzer.analyze_episode(args.ep_id)
+        metrics_data = analyzer.analyze_episode(args.ep_id, run_id=run_id)
 
         emit_progress(
             "analyzing",
             f"Analyzed {len(metrics_data.get('metrics', []))} cast members",
             cast_count=len(metrics_data.get("metrics", [])),
+            run_id=run_id,
         )
 
         # Write outputs
-        emit_progress("writing", "Writing screen time outputs")
-        json_path, csv_path = analyzer.write_outputs(args.ep_id, metrics_data)
+        emit_progress("writing", "Writing screen time outputs", run_id=run_id)
+        json_path, csv_path = analyzer.write_outputs(args.ep_id, metrics_data, run_id=run_id)
 
         emit_progress(
             "done",
@@ -181,23 +192,24 @@ def main(argv: list[str] | None = None) -> int:
             json_path=str(json_path),
             csv_path=str(csv_path),
             cast_count=len(metrics_data.get("metrics", [])),
+            run_id=run_id,
         )
 
         LOGGER.info(f"Analysis complete: {json_path}, {csv_path}")
         return 0
 
     except FileNotFoundError as exc:
-        emit_progress("error", f"Required artifact not found: {exc}")
+        emit_progress("error", f"Required artifact not found: {exc}", run_id=args.run_id)
         LOGGER.error(f"File not found: {exc}")
         return 1
 
     except ValueError as exc:
-        emit_progress("error", f"Invalid input: {exc}")
+        emit_progress("error", f"Invalid input: {exc}", run_id=args.run_id)
         LOGGER.error(f"Invalid input: {exc}")
         return 1
 
     except Exception as exc:
-        emit_progress("error", f"Screen time analysis failed: {exc}")
+        emit_progress("error", f"Screen time analysis failed: {exc}", run_id=args.run_id)
         LOGGER.exception("Screen time analysis failed")
         return 1
 

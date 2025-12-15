@@ -4594,6 +4594,8 @@ def run_pipeline_job_with_mode(
         manifests_dir = DATA_ROOT / "manifests" / ep_id
         run_dir = manifests_dir / "runs"
         now_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        run_id = summary.get("run_id") if isinstance(summary.get("run_id"), str) else None
+        run_id = run_id.strip() if run_id else None
 
         def _count_lines(path: Path) -> int | None:
             try:
@@ -4608,6 +4610,7 @@ def run_pipeline_job_with_mode(
             progress_path = manifests_dir / "progress.json"
             payload = {
                 "ep_id": ep_id,
+                "run_id": run_id,
                 "phase": "done",
                 "step": step_name,
                 "status": "completed",
@@ -4626,6 +4629,11 @@ def run_pipeline_job_with_mode(
                 run_dir.mkdir(parents=True, exist_ok=True)
                 marker_path = run_dir / f"{step_name}.json"
                 marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                if run_id:
+                    per_run_dir = run_dir / run_id
+                    per_run_dir.mkdir(parents=True, exist_ok=True)
+                    per_run_marker = per_run_dir / f"{step_name}.json"
+                    per_run_marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             except OSError as exc:
                 LOGGER.warning("[LOCAL MODE] Failed to write run marker for %s/%s: %s", ep_id, step_name, exc)
 
@@ -4634,6 +4642,7 @@ def run_pipeline_job_with_mode(
             "phase": operation,
             "status": "success",
             "ep_id": ep_id,
+            "run_id": run_id,
             "finished_at": now_iso,
             "started_at": summary.get("started_at") or summary.get("started") or summary.get("start_time"),
             "device": summary.get("device") or summary.get("requested_device"),
@@ -4685,6 +4694,18 @@ def run_pipeline_job_with_mode(
 
         _write_run_marker(operation, marker_payload)
         _write_progress_file(operation)
+
+        if operation == "cluster" and run_id:
+            try:
+                from py_screenalytics import run_layout
+
+                run_layout.write_active_run_id(
+                    ep_id,
+                    run_id,
+                    extra={"phase": "cluster", "status": "success", "finished_at": now_iso},
+                )
+            except Exception as exc:
+                LOGGER.warning("[LOCAL MODE] Failed to write active_run.json for %s: %s", ep_id, exc)
 
     # Add execution_mode to payload
     payload = {**payload, "execution_mode": execution_mode}
@@ -4745,6 +4766,7 @@ def run_pipeline_job_with_mode(
                 resp.raise_for_status()
 
                 summary: Dict[str, Any] = {}
+                stream_run_id: str | None = None
 
                 for raw_line in resp.iter_lines(decode_unicode=True):
                     if not raw_line:
@@ -4766,6 +4788,9 @@ def run_pipeline_job_with_mode(
                         log_placeholder.code("\n".join(log_lines), language="text")
 
                     elif msg_type == "progress":
+                        rid = msg.get("run_id")
+                        if isinstance(rid, str) and rid.strip():
+                            stream_run_id = rid.strip()
                         # Update progress bar with real-time data
                         frames_done = msg.get("frames_done", 0)
                         frames_total = msg.get("frames_total", 1)
@@ -4830,6 +4855,8 @@ def run_pipeline_job_with_mode(
                     # Stream ended without summary - check if manifests exist
                     LOGGER.warning("[LOCAL MODE] No/empty summary for %s/%s - using fallback", ep_id, operation)
                     summary = {"status": "completed", "elapsed_seconds": 0, "fallback": True}
+                if stream_run_id and not summary.get("run_id"):
+                    summary["run_id"] = stream_run_id
 
                 # Process summary
                 status = summary.get("status", "unknown")

@@ -49,6 +49,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from py_screenalytics.artifacts import ensure_dirs, get_path
+from py_screenalytics import run_layout
 
 try:  # pragma: no cover - optional ML stack
     from tools import episode_run  # type: ignore
@@ -809,6 +810,7 @@ class JobService:
         self,
         *,
         ep_id: str,
+        run_id: str | None = None,
         quality_min: float | None = None,
         gap_tolerance_s: float | None = None,
         use_video_decode: bool | None = None,
@@ -821,6 +823,9 @@ class JobService:
 
         Args:
             ep_id: Episode identifier
+            run_id: Optional pipeline run identifier. When omitted, the job
+                defaults to the most recent successful run for the episode
+                (when available); otherwise uses legacy manifests.
             quality_min: Optional minimum face quality threshold (0.0-1.0)
             gap_tolerance_s: Optional gap tolerance in seconds
             use_video_decode: Optional flag to use video decode for timestamps
@@ -835,22 +840,55 @@ class JobService:
         Raises:
             FileNotFoundError: If required artifacts are missing
         """
-        # Validate that required artifacts exist
-        manifests_dir = get_path(ep_id, "detections").parent
-        faces_path = manifests_dir / "faces.jsonl"
-        tracks_path = get_path(ep_id, "tracks")
-        identities_path = manifests_dir / "identities.json"
+        run_id_norm: str | None = None
+        run_id_explicit = run_id is not None
+        if run_id is not None:
+            run_id_norm = run_layout.normalize_run_id(run_id)
+        else:
+            run_id_norm = run_layout.read_active_run_id(ep_id)
+            if run_id_norm is None:
+                marker_path = run_layout.phase_marker_path(ep_id, "cluster")
+                if marker_path.exists():
+                    try:
+                        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        marker = None
+                    if isinstance(marker, dict) and isinstance(marker.get("run_id"), str):
+                        try:
+                            run_id_norm = run_layout.normalize_run_id(marker["run_id"])
+                        except ValueError:
+                            run_id_norm = None
 
-        missing = []
-        if not faces_path.exists():
-            missing.append("faces.jsonl")
-        if not tracks_path.exists():
-            missing.append("tracks.jsonl")
-        if not identities_path.exists():
-            missing.append("identities.json")
+        legacy_manifests_dir = get_path(ep_id, "detections").parent
+
+        def _missing_required(dir_path: Path) -> list[str]:
+            missing_local: list[str] = []
+            if not (dir_path / "faces.jsonl").exists():
+                missing_local.append("faces.jsonl")
+            if not (dir_path / "tracks.jsonl").exists():
+                missing_local.append("tracks.jsonl")
+            if not (dir_path / "identities.json").exists():
+                missing_local.append("identities.json")
+            return missing_local
+
+        manifests_dir = run_layout.run_root(ep_id, run_id_norm) if run_id_norm else legacy_manifests_dir
+        missing = _missing_required(manifests_dir)
+        if missing and run_id_norm and not run_id_explicit:
+            LOGGER.warning(
+                "[jobs] screen_time: run-scoped artifacts missing for %s (run_id=%s). Falling back to legacy manifests.",
+                ep_id,
+                run_id_norm,
+            )
+            run_id_norm = None
+            manifests_dir = legacy_manifests_dir
+            missing = _missing_required(manifests_dir)
 
         if missing:
-            raise FileNotFoundError(f"Required artifacts missing for screen time analysis: {', '.join(missing)}")
+            scope = f"run_id={run_id_norm}" if run_id_norm else "legacy"
+            raise FileNotFoundError(
+                "Required artifacts missing for screen time analysis "
+                f"({scope}, manifests_dir={manifests_dir}): {', '.join(missing)}"
+            )
 
         # Validate people.json exists for the show
         parts = ep_id.split("-")
@@ -863,18 +901,28 @@ class JobService:
             raise FileNotFoundError(f"people.json not found for show {show_id}: {people_path}")
 
         # Build command
-        progress_path = self._progress_path(ep_id)
+        progress_path = (
+            run_layout.run_root(ep_id, run_id_norm) / "progress_screen_time.json"
+            if run_id_norm
+            else self._progress_path(ep_id)
+        )
         command = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "analyze_screen_time.py"),
             "--ep-id",
             ep_id,
+        ]
+        if run_id_norm:
+            command += ["--run-id", run_id_norm]
+        command += [
             "--progress-file",
             str(progress_path),
         ]
 
         # Add optional overrides
         requested = {}
+        if run_id_norm:
+            requested["run_id"] = run_id_norm
         if quality_min is not None:
             command += ["--quality-min", str(quality_min)]
             requested["quality_min"] = quality_min
