@@ -150,7 +150,7 @@ if MOCKED_STREAMLIT:
     helpers.detector_is_face_only = lambda ep_id, detect_status=None: True
 
 cfg = helpers.init_page("Faces & Tracks")
-st.title("Faces & Tracks Review")
+helpers.render_page_header("workspace-ui:3_Faces_Review", "Faces & Tracks Review")
 help_cols = st.columns([3, 1])
 with help_cols[0]:
     st.caption("Need the playbook? Open the full Faces Review guide for flow, job settings, and safety tips.")

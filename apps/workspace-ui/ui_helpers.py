@@ -2440,6 +2440,7 @@ def render_workspace_nav() -> None:
             st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;Cast Members (12)", unsafe_allow_html=True)
             st.page_link("pages/3_Smart_Suggestions.py", label="    Smart Suggestions")
             st.page_link("pages/4_Screentime.py", label="Screentime & Health")
+            st.page_link("pages/9_Docs_Dashboard.py", label="Docs Dashboard")
         else:
             st.button("Home", key="nav_home", on_click=lambda: try_switch_page("streamlit_app.py"))
             st.button("Upload Video", key="nav_upload", on_click=lambda: try_switch_page("pages/0_Upload_Video.py"))
@@ -2450,6 +2451,195 @@ def render_workspace_nav() -> None:
             st.markdown("&nbsp;&nbsp;&nbsp;&nbsp;Cast Members (12)", unsafe_allow_html=True)
             st.button("    Smart Suggestions", key="nav_suggestions", on_click=lambda: try_switch_page("pages/3_Smart_Suggestions.py"))
             st.button("Screentime & Health", key="nav_screentime", on_click=lambda: try_switch_page("pages/4_Screentime.py"))
+            st.button("Docs Dashboard", key="nav_docs_dashboard", on_click=lambda: try_switch_page("pages/9_Docs_Dashboard.py"))
+
+
+# =============================================================================
+# Docs + Feature Coverage UI (read-only)
+# =============================================================================
+
+_DOCS_CATALOG_DEFAULT_RELATIVE_PATH = Path("docs") / "_meta" / "docs_catalog.json"
+
+
+def _repo_root() -> Path:
+    # apps/workspace-ui/ui_helpers.py -> apps/workspace-ui -> apps -> repo root
+    return Path(__file__).resolve().parents[2]
+
+
+def load_docs_catalog(catalog_path: str | Path | None = None) -> tuple[dict[str, Any] | None, str | None]:
+    """Load docs catalog JSON used by docs dashboard + header popovers.
+
+    Returns: (catalog, error). If error is not None, catalog is None.
+    """
+    repo_root = _repo_root()
+    relative_path = Path(catalog_path) if catalog_path is not None else _DOCS_CATALOG_DEFAULT_RELATIVE_PATH
+    catalog_file = (repo_root / relative_path).resolve()
+
+    if not catalog_file.exists():
+        return None, f"Docs catalog not found at `{relative_path}` (expected in repo root)."
+
+    try:
+        raw = catalog_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"Failed to read docs catalog `{relative_path}`: {exc}"
+
+    if not isinstance(data, dict):
+        return None, "Docs catalog must be a JSON object."
+    if not isinstance(data.get("docs"), list):
+        return None, 'Docs catalog missing required key: "docs" (list).'
+    if not isinstance(data.get("features"), dict):
+        return None, 'Docs catalog missing required key: "features" (object).'
+
+    return data, None
+
+
+def _feature_present_in_ui(feature_id: str, catalog: dict[str, Any]) -> bool:
+    docs = catalog.get("docs") or []
+    if not isinstance(docs, list):
+        return False
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        if feature_id not in (doc.get("features") or []):
+            continue
+        surfaces = doc.get("ui_surfaces_expected") or []
+        if any(isinstance(surface, str) and surface.startswith("workspace-ui:") for surface in surfaces):
+            return True
+    return False
+
+
+def _feature_present_in_code(feature: dict[str, Any]) -> tuple[bool, list[str]]:
+    repo_root = _repo_root()
+    paths_expected = feature.get("paths_expected") or []
+    missing: list[str] = []
+    if not isinstance(paths_expected, list):
+        return False, ["<invalid paths_expected>"]
+    for expected in paths_expected:
+        if not isinstance(expected, str) or not expected.strip():
+            continue
+        resolved = repo_root / expected
+        if not resolved.exists():
+            missing.append(expected)
+    return len(missing) == 0, missing
+
+
+def render_page_header(page_id: str, page_title: str) -> None:
+    """Shared header with Docs/Features popovers.
+
+    Keep this function light-weight; it should be safe to call on every rerender.
+    """
+    title_col, features_col, todo_col = st.columns([6, 2, 2], vertical_alignment="center")
+    with title_col:
+        st.title(page_title)
+
+    def _render_features_popover() -> None:
+        catalog, error = load_docs_catalog()
+        if error:
+            st.warning(error)
+            st.caption("Merge the docs catalog PR, or add `docs/_meta/docs_catalog.json`.")
+            return
+
+        assert catalog is not None
+        docs = [d for d in catalog.get("docs", []) if isinstance(d, dict)]
+        relevant_docs = [
+            d
+            for d in docs
+            if page_id in (d.get("ui_surfaces_expected") or [])
+        ]
+
+        features: set[str] = set()
+        models: set[str] = set()
+        jobs: set[str] = set()
+        for doc in relevant_docs:
+            features.update([f for f in (doc.get("features") or []) if isinstance(f, str)])
+            models.update([m for m in (doc.get("models") or []) if isinstance(m, str)])
+            jobs.update([j for j in (doc.get("jobs") or []) if isinstance(j, str)])
+
+        if not relevant_docs:
+            st.info("No docs mapping for this page yet (ui_surfaces_expected). Showing global feature catalog.")
+            features = set([f for f in (catalog.get("features") or {}).keys() if isinstance(f, str)])
+
+        st.markdown("### Features")
+        feature_catalog = catalog.get("features") or {}
+        if not isinstance(feature_catalog, dict):
+            feature_catalog = {}
+
+        for feature_id in sorted(features):
+            feature = feature_catalog.get(feature_id) if isinstance(feature_catalog.get(feature_id), dict) else None
+            if feature is None:
+                st.markdown(f"- `{feature_id}` — status: `unknown` (missing from catalog)")
+                continue
+
+            title = feature.get("title") or feature_id
+            status = feature.get("status") or "unknown"
+            present_in_code, missing_paths = _feature_present_in_code(feature)
+            present_in_ui = _feature_present_in_ui(feature_id, catalog)
+
+            st.markdown(f"#### {title}")
+            st.caption(
+                f"status: `{status}` | present in code: `{present_in_code}` | present in UI: `{present_in_ui}`"
+            )
+            if missing_paths:
+                st.warning("Missing paths: " + ", ".join(f"`{p}`" for p in missing_paths))
+
+            phases = feature.get("phases") or {}
+            if isinstance(phases, dict) and phases:
+                st.markdown("**Phases**")
+                for phase, phase_status in phases.items():
+                    st.markdown(f"- `{phase}`: `{phase_status}`")
+
+        if models:
+            st.markdown("### Models")
+            st.code("\n".join(sorted(models)))
+        if jobs:
+            st.markdown("### Jobs")
+            st.code("\n".join(sorted(jobs)))
+
+    def _render_todo_popover() -> None:
+        catalog, error = load_docs_catalog()
+        if error:
+            st.warning(error)
+            return
+
+        assert catalog is not None
+        docs = [d for d in catalog.get("docs", []) if isinstance(d, dict)]
+        todo_statuses = {"in_progress", "draft", "outdated"}
+        todo_docs = [
+            d for d in docs if d.get("status") in todo_statuses
+        ]
+        todo_docs.sort(key=lambda d: (str(d.get("status")), str(d.get("title"))))
+
+        if not todo_docs:
+            st.info("No in-progress/draft/outdated docs found in catalog.")
+            return
+
+        rows = [
+            {
+                "status": d.get("status", ""),
+                "title": d.get("title", ""),
+                "path": d.get("path", ""),
+                "features": ", ".join(d.get("features") or []),
+            }
+            for d in todo_docs
+        ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    popover = getattr(st, "popover", None)
+    if callable(popover):
+        with features_col:
+            with popover("PAGE FEATURES", use_container_width=True):
+                _render_features_popover()
+        with todo_col:
+            with popover("TO-DO", use_container_width=True):
+                _render_todo_popover()
+    else:
+        with features_col:
+            with st.expander("PAGE FEATURES", expanded=False):
+                _render_features_popover()
+        with todo_col:
+            with st.expander("TO-DO", expanded=False):
+                _render_todo_popover()
 
 
 def format_mmss(seconds: float | int | None) -> str:
