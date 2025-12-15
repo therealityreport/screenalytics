@@ -49,7 +49,7 @@ if "_navigate_to_cluster" in st.session_state:
     st.switch_page("pages/3_Faces_Review.py")
     st.stop()  # Ensure nothing else runs
 
-st.title("Smart Suggestions")
+helpers.render_page_header("workspace-ui:3_Smart_Suggestions", "Smart Suggestions")
 
 
 # --- Undo History ---

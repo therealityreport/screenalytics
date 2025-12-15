@@ -299,7 +299,7 @@ else:
     st.session_state.pop("_ep_id_query_origin", None)
     st.session_state.pop("upload_ep_params_cleaned", None)
 
-st.title("Upload & Run")
+helpers.render_page_header("workspace-ui:0_Upload_Video", "Upload & Run")
 
 # Handle deferred navigation after state flush
 if st.session_state.get("navigate_to_detail"):

@@ -1403,7 +1403,7 @@ def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int |
 
 
 cfg = helpers.init_page("Episode Detail")
-st.title("Episode Detail")
+helpers.render_page_header("workspace-ui:2_Episode_Detail", "Episode Detail")
 helpers.inject_log_container_css()  # Limit log container height with scrolling
 flash_error = st.session_state.pop("episode_detail_flash_error", None)
 flash_message = st.session_state.pop("episode_detail_flash", None)

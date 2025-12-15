@@ -310,7 +310,7 @@ def _ensure_export_job(ep_id: str, include_unidentified: bool = True) -> dict | 
 
 
 cfg = helpers.init_page("Screentime")
-st.title("Screen Time Analysis")
+helpers.render_page_header("workspace-ui:4_Screentime", "Screen Time Analysis")
 
 
 def _stop_forever() -> NoReturn:
