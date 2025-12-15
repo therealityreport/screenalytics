@@ -2525,7 +2525,7 @@ def _feature_present_in_code(feature: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 def render_page_header(page_id: str, page_title: str) -> None:
-    """Shared header with Docs/Features popovers.
+    """Shared header with Docs/Features dialogs.
 
     Keep this function light-weight; it should be safe to call on every rerender.
     """
@@ -2533,7 +2533,7 @@ def render_page_header(page_id: str, page_title: str) -> None:
     with title_col:
         st.title(page_title)
 
-    def _render_features_popover() -> None:
+    def _render_features_body() -> None:
         catalog, error = load_docs_catalog()
         if error:
             st.warning(error)
@@ -2596,7 +2596,66 @@ def render_page_header(page_id: str, page_title: str) -> None:
             st.markdown("### Jobs")
             st.code("\n".join(sorted(jobs)))
 
-    def _render_todo_popover() -> None:
+    def _extract_doc_implementation_hint(path_value: Any, *, max_chars: int = 220) -> str:
+        """Best-effort 1-line hint describing what a TODO doc aims to change."""
+        if not isinstance(path_value, str):
+            return ""
+        rel_path = path_value.strip().lstrip("/\\")
+        if not rel_path:
+            return ""
+        repo_root = _repo_root()
+        file_path = (repo_root / rel_path).resolve()
+        try:
+            raw = file_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
+        # Cap read size to keep UI snappy.
+        raw = raw[:50_000]
+        lines = [ln.strip() for ln in raw.splitlines()]
+
+        # Skip leading frontmatter/title.
+        i = 0
+        if i < len(lines) and lines[i].startswith("---"):
+            i += 1
+            while i < len(lines) and not lines[i].startswith("---"):
+                i += 1
+            i += 1
+        while i < len(lines) and (not lines[i] or lines[i].startswith("#")):
+            i += 1
+
+        # Prefer a short bullet list if present.
+        bullets: list[str] = []
+        for j in range(i, min(i + 80, len(lines))):
+            ln = lines[j]
+            if not ln:
+                if bullets:
+                    break
+                continue
+            if ln.startswith("#"):
+                if bullets:
+                    break
+                continue
+            if ln.startswith(("- ", "* ", "+ ")):
+                bullets.append(ln[2:].strip())
+                if len(bullets) >= 3:
+                    break
+        hint = " · ".join([b for b in bullets if b]) if bullets else ""
+
+        # Fallback: first paragraph-ish line.
+        if not hint:
+            for j in range(i, min(i + 40, len(lines))):
+                ln = lines[j]
+                if not ln or ln.startswith("#"):
+                    continue
+                hint = ln
+                break
+
+        hint = " ".join(hint.split())
+        if len(hint) > max_chars:
+            hint = hint[: max_chars - 1].rstrip() + "…"
+        return hint
+
+    def _render_todo_body() -> None:
         catalog, error = load_docs_catalog()
         if error:
             st.warning(error)
@@ -2614,32 +2673,98 @@ def render_page_header(page_id: str, page_title: str) -> None:
             st.info("No in-progress/draft/outdated docs found in catalog.")
             return
 
-        rows = [
-            {
-                "status": d.get("status", ""),
-                "title": d.get("title", ""),
-                "path": d.get("path", ""),
-                "features": ", ".join(d.get("features") or []),
-            }
-            for d in todo_docs
-        ]
+        feature_catalog = catalog.get("features") or {}
+        if not isinstance(feature_catalog, dict):
+            feature_catalog = {}
+
+        def _feature_statuses_for(features: list[str]) -> str:
+            parts: list[str] = []
+            for fid in features:
+                feature = feature_catalog.get(fid) if isinstance(feature_catalog.get(fid), dict) else None
+                status = (feature or {}).get("status") if isinstance(feature, dict) else None
+                parts.append(f"{fid}:{status or 'unknown'}")
+            return ", ".join(parts)
+
+        def _feature_pending_for(features: list[str]) -> str:
+            pending: list[str] = []
+            for fid in features:
+                feature = feature_catalog.get(fid) if isinstance(feature_catalog.get(fid), dict) else None
+                items = (feature or {}).get("pending") if isinstance(feature, dict) else None
+                if isinstance(items, list):
+                    pending.extend([str(it).strip() for it in items if isinstance(it, str) and it.strip()])
+            deduped: list[str] = []
+            for item in pending:
+                if item not in deduped:
+                    deduped.append(item)
+            return "; ".join(deduped)
+
+        def _paths_expected_for(features: list[str]) -> str:
+            paths: list[str] = []
+            for fid in features:
+                feature = feature_catalog.get(fid) if isinstance(feature_catalog.get(fid), dict) else None
+                items = (feature or {}).get("paths_expected") if isinstance(feature, dict) else None
+                if isinstance(items, list):
+                    paths.extend([str(it).strip() for it in items if isinstance(it, str) and it.strip()])
+            deduped: list[str] = []
+            for item in paths:
+                if item not in deduped:
+                    deduped.append(item)
+            return ", ".join(deduped)
+
+        rows: list[dict[str, Any]] = []
+        for d in todo_docs:
+            features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
+            models_list = [m for m in (d.get("models") or []) if isinstance(m, str)]
+            jobs_list = [j for j in (d.get("jobs") or []) if isinstance(j, str)]
+            surfaces_list = [s for s in (d.get("ui_surfaces_expected") or []) if isinstance(s, str)]
+            path_value = d.get("path", "")
+            rows.append(
+                {
+                    "status": d.get("status", ""),
+                    "type": d.get("type", ""),
+                    "title": d.get("title", ""),
+                    "last_updated": d.get("last_updated", ""),
+                    "features": ", ".join(features_list),
+                    "feature_status": _feature_statuses_for(features_list),
+                    "expected_code_paths": _paths_expected_for(features_list),
+                    "implementation_hint": _extract_doc_implementation_hint(path_value),
+                    "pending": _feature_pending_for(features_list),
+                    "models": ", ".join(models_list),
+                    "jobs": ", ".join(jobs_list),
+                    "ui_surfaces_expected": ", ".join(surfaces_list),
+                    "path": path_value,
+                }
+            )
+
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    popover = getattr(st, "popover", None)
-    if callable(popover):
+    dialog = getattr(st, "dialog", None)
+    if callable(dialog):
+
+        @dialog("PAGE FEATURES", width="large")
+        def _page_features_dialog() -> None:
+            st.caption(f"Page: `{page_id}`")
+            _render_features_body()
+
+        @dialog("TO-DO", width="large")
+        def _todo_dialog() -> None:
+            _render_todo_body()
+
         with features_col:
-            with popover("PAGE FEATURES", use_container_width=True):
-                _render_features_popover()
+            if st.button("PAGE FEATURES", key=f"{page_id}::page_features_dialog", use_container_width=True):
+                _page_features_dialog()
         with todo_col:
-            with popover("TO-DO", use_container_width=True):
-                _render_todo_popover()
-    else:
-        with features_col:
-            with st.expander("PAGE FEATURES", expanded=False):
-                _render_features_popover()
-        with todo_col:
-            with st.expander("TO-DO", expanded=False):
-                _render_todo_popover()
+            if st.button("TO-DO", key=f"{page_id}::todo_dialog", use_container_width=True):
+                _todo_dialog()
+        return
+
+    # Fallback for older Streamlit versions without dialogs.
+    with features_col:
+        with st.expander("PAGE FEATURES", expanded=False):
+            _render_features_body()
+    with todo_col:
+        with st.expander("TO-DO", expanded=False):
+            _render_todo_body()
 
 
 def format_mmss(seconds: float | int | None) -> str:
