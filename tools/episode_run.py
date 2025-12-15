@@ -7497,7 +7497,8 @@ def _run_cluster_stage(
     preservation_error: str | None = None
 
     identities_path = manifests_dir / "identities.json"
-    preserve_assigned = bool(getattr(args, "preserve_assigned", False))
+    # Default to True to preserve cast-assigned clusters (original behavior)
+    preserve_assigned = bool(getattr(args, "preserve_assigned", True))
     if preserve_assigned and identities_path.exists():
         try:
             existing_data = json.loads(identities_path.read_text(encoding="utf-8"))
