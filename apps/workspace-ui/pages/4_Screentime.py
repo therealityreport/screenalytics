@@ -1491,6 +1491,7 @@ if json_path.exists():
                             timeline=timeline_data,
                             ep_id=ep_id,
                             options=options,
+                            analysis=data,
                             scene_cuts_data=scene_cuts_data if scene_cuts_available else None,
                             video_fps=video_fps,
                             generated_at=data.get("generated_at"),
