@@ -168,6 +168,70 @@ def _runs_dir(ep_id: str) -> Path:
     return _manifests_dir(ep_id) / "runs"
 
 
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+_RUN_ACTIVITY_FILES: tuple[str, ...] = (
+    "progress.json",
+    "detect_track.json",
+    "faces_embed.json",
+    "cluster.json",
+    "detections.jsonl",
+    "tracks.jsonl",
+    "faces.jsonl",
+    "identities.json",
+    "track_metrics.json",
+)
+
+
+def _latest_run_id_on_disk(ep_id: str) -> str | None:
+    """Return the most recently updated run_id directory for this episode.
+
+    Uses a small set of known phase markers/manifests/progress files to
+    approximate "latest activity" without trusting legacy marker payloads.
+    """
+    run_ids = run_layout.list_run_ids(ep_id)
+    if not run_ids:
+        return None
+    best_run_id: str | None = None
+    best_mtime = 0.0
+    for candidate in run_ids:
+        try:
+            run_root = run_layout.run_root(ep_id, candidate)
+        except ValueError:
+            continue
+        mtime = 0.0
+        for filename in _RUN_ACTIVITY_FILES:
+            mtime = max(mtime, _safe_mtime(run_root / filename))
+        if mtime > best_mtime:
+            best_mtime = mtime
+            best_run_id = candidate
+    return best_run_id if best_mtime > 0 and best_run_id else None
+
+
+def _resolve_active_run_id(ep_id: str) -> str | None:
+    """Best-effort active run_id for UI defaults.
+
+    Prefer active_run.json when it points to an existing run directory; otherwise
+    fall back to the most recent run directory on disk.
+    """
+    try:
+        candidate = run_layout.read_active_run_id(ep_id)
+    except Exception:
+        candidate = None
+    if candidate:
+        try:
+            if run_layout.run_root(ep_id, candidate).exists():
+                return candidate
+        except ValueError:
+            pass
+    return _latest_run_id_on_disk(ep_id)
+
+
 def _tracks_path(ep_id: str) -> Path:
     return get_path(ep_id, "tracks")
 
@@ -2128,19 +2192,7 @@ def _episode_run_status(ep_id: str, run_id: str | None) -> EpisodeStatusResponse
 
     coreml_available = getattr(episode_run, "COREML_PROVIDER_AVAILABLE", None)
 
-    active_run_id: str | None = None
-    try:
-        active_run_id = run_layout.read_active_run_id(ep_id)
-    except Exception:
-        active_run_id = None
-
-    # Fallback: derive from latest successful phase marker when active_run.json is absent.
-    if not active_run_id:
-        for payload in (cluster_payload, faces_payload, detect_track_payload):
-            rid = payload.get("run_id")
-            if payload.get("status") == "success" and isinstance(rid, str) and rid.strip():
-                active_run_id = rid.strip()
-                break
+    active_run_id: str | None = run_id_norm or _resolve_active_run_id(ep_id)
 
     return EpisodeStatusResponse(
         ep_id=ep_id,
