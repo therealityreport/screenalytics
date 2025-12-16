@@ -9,7 +9,7 @@ API_LOG="$ROOT/api_server.log"
 CELERY_LOG="$ROOT/celery_worker.log"
 
 # ============================================================================
-# Detect VS Code and offer to use VS Code Tasks instead
+# Helper: Check if value is truthy
 # ============================================================================
 is_truthy() {
     case "${1:-}" in
@@ -17,6 +17,49 @@ is_truthy() {
         *) return 1 ;;
     esac
 }
+
+# ============================================================================
+# Kill-only mode: DEV_KILL_ONLY=1 or --kill flag
+# ============================================================================
+kill_all_services() {
+    echo "[dev_auto] Killing all services..."
+
+    # Kill application processes
+    pkill -9 -f "uvicorn.*apps.api" 2>/dev/null || true
+    pkill -9 -f "streamlit run" 2>/dev/null || true
+    pkill -9 -f "celery.*apps.api" 2>/dev/null || true
+
+    # Stop Redis via brew (cleaner than pkill)
+    if command -v brew >/dev/null 2>&1; then
+        brew services stop redis 2>/dev/null || true
+    else
+        pkill -9 redis-server 2>/dev/null || true
+    fi
+
+    # Close Terminal windows (macOS)
+    if [[ "$OSTYPE" == "darwin"* ]] && command -v osascript >/dev/null 2>&1; then
+        osascript <<'EOF' 2>/dev/null || true
+tell application "Terminal"
+    set windowList to every window
+    repeat with w in windowList
+        try
+            set winName to name of w
+            if winName contains "Redis Server" or winName contains "Celery Worker" then
+                close w
+            end if
+        end try
+    end repeat
+end tell
+EOF
+    fi
+
+    echo "[dev_auto] All services stopped."
+}
+
+if is_truthy "${DEV_KILL_ONLY:-}" || [[ "${1:-}" == "--kill" ]]; then
+    kill_all_services
+    exit 0
+fi
 
 if [[ "${TERM_PROGRAM:-}" == "vscode" ]]; then
     echo ""
