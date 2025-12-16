@@ -13,7 +13,7 @@ export function useEpisodeStatus(
     queryKey: ["episode-status", episodeId],
     queryFn: () => fetchEpisodeStatus(episodeId as string),
     enabled: Boolean(episodeId) && (options?.enabled ?? true),
-    refetchInterval: options?.refetchInterval ?? false,
+    refetchInterval: options?.refetchInterval,
   });
 }
 

@@ -121,8 +121,14 @@ Screenalytics processes reality TV episodes through an ML pipeline to identify c
 
 ## Branch Strategy
 
-- `main` - stable
-- `feature/*` - active development
+See [docs/reference/branching/BRANCHING_STRATEGY.md](docs/reference/branching/BRANCHING_STRATEGY.md) for full details.
+
+**Single Directory Workflow:**
+- All work happens in `/Volumes/HardDrive/SCREENALYTICS`
+- Do NOT use git worktrees
+- `main` - stable, always deployable
+- Branch pattern: `screentime-improvements/<task-slug>`
+- One branch per task; commit frequently; push regularly
 - Keep changes scoped; prefer small focused edits
 
 ## Running Tests

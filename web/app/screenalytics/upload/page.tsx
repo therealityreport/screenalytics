@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useReducer, useState } from "react";
+import { Suspense, useEffect, useMemo, useReducer, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { useCreateEpisode, useEpisodeStatus, usePresignAssets, useTriggerPhase } from "@/api/hooks";
 import { normalizeError } from "@/api/client";
@@ -21,7 +21,7 @@ function formatBytes(bytes?: number) {
   return `${size.toFixed(1)} ${units[unit]}`;
 }
 
-export default function UploadPage() {
+function UploadPageContent() {
   const params = useSearchParams();
   const toast = useToast();
   const lockedEpisodeId = params.get("ep_id") || undefined;
@@ -40,7 +40,7 @@ export default function UploadPage() {
 
   const statusQuery = useEpisodeStatus(episodeId, {
     enabled: Boolean(episodeId) && (state.step === "processing" || state.step === "success"),
-    refetchInterval: state.step === "processing" ? 1200 : false,
+    refetchInterval: state.step === "processing" ? 1200 : undefined,
   });
 
   useEffect(() => {
@@ -275,5 +275,13 @@ export default function UploadPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function UploadPage() {
+  return (
+    <Suspense fallback={<div className="card">Loading...</div>}>
+      <UploadPageContent />
+    </Suspense>
   );
 }

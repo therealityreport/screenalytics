@@ -1733,6 +1733,7 @@ status_payload = st.session_state.get(status_cache_key)
 # Attempt selection (run_id-scoped pipeline artifacts).
 # Store selected attempt in session state; empty string means legacy/unscoped.
 _active_run_id_key = f"{ep_id}::active_run_id"
+_active_run_id_pending_key = f"{ep_id}::active_run_id_pending"
 _autorun_run_id_key = f"{ep_id}::autorun_run_id"
 _new_attempt_requested_key = f"{ep_id}::new_attempt_requested"
 _attempt_init_key = f"{ep_id}::attempt_selector_initialized"
@@ -1740,6 +1741,16 @@ if _active_run_id_key not in st.session_state:
     st.session_state[_active_run_id_key] = ""
 selected_attempt_raw = st.session_state.get(_active_run_id_key)
 selected_attempt = selected_attempt_raw.strip() if isinstance(selected_attempt_raw, str) else ""
+
+# Streamlit doesn't allow mutating the session_state for an instantiated widget key.
+# When other UI actions (e.g., Auto-Run) need to programmatically change the selected
+# attempt, they write the desired run_id to this pending key and trigger a rerun.
+_pending_attempt = st.session_state.pop(_active_run_id_pending_key, None)
+if isinstance(_pending_attempt, str) and _pending_attempt.strip():
+    selected_attempt = _pending_attempt.strip()
+    st.session_state[_active_run_id_key] = selected_attempt
+    st.session_state[_status_force_refresh_key(ep_id)] = True
+    st.session_state[_attempt_init_key] = True
 
 if st.session_state.pop(_new_attempt_requested_key, False):
     selected_attempt = uuid.uuid4().hex
@@ -2891,7 +2902,10 @@ with st.container():
 
                 new_run_id = uuid.uuid4().hex
                 st.session_state[_autorun_run_id_key] = new_run_id
-                st.session_state[_active_run_id_key] = new_run_id
+                # Do not modify the attempt selector widget key after it is created.
+                # Instead, set a pending value that is applied at the top of the script
+                # on the next rerun.
+                st.session_state[_active_run_id_pending_key] = new_run_id
                 LOGGER.info("[AUTORUN] Starting new pipeline run_id=%s", new_run_id)
 
                 # Clear old manifest data to prevent stale data confusion
