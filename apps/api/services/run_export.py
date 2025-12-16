@@ -683,10 +683,79 @@ def build_screentime_run_debug_pdf(
     story.append(summary_table)
     story.append(Spacer(1, 12))
 
+    # =========================================================================
+    # RUN HEALTH (Quick Sanity Check)
+    # =========================================================================
+    # Compute effective body_tracking status - check if artifacts exist even if config says disabled
+    body_config_enabled = body_detection_config.get("body_tracking", {}).get("enabled", False)
+    body_artifacts_exist = body_detections_path.exists() and _count_jsonl_lines(body_detections_path) > 0
+    body_enabled_effective = body_config_enabled or body_artifacts_exist
+
+    # Get fused pairs count (identities with both face AND body tracks)
+    fusion_identities = track_fusion_data.get("identities", {})
+    actual_fused_pairs = 0
+    if isinstance(fusion_identities, dict):
+        for identity_data in fusion_identities.values():
+            if isinstance(identity_data, dict):
+                face_tids = identity_data.get("face_track_ids", [])
+                body_tids = identity_data.get("body_track_ids", [])
+                if face_tids and body_tids:
+                    actual_fused_pairs += 1
+
+    # Get screentime values
+    screentime_summary = screentime_data.get("summary", {})
+    face_only_duration = screentime_summary.get("total_face_only_duration", 0)
+    db_connected = db_error is None
+
+    # Health status helper
+    def _health_status(ok: bool) -> str:
+        return "✓ Yes" if ok else "✗ No"
+
+    health_data = [
+        ["Health Check", "Status", "Details"],
+        ["DB Connected", _health_status(db_connected),
+         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")],
+        ["Body Tracking Ran", _health_status(body_enabled_effective),
+         f"Config: {'enabled' if body_config_enabled else 'disabled'} | Artifacts: {'present' if body_artifacts_exist else 'missing'}"],
+        ["Face-Body Pairs Fused", _health_status(actual_fused_pairs > 0),
+         f"{actual_fused_pairs} pairs" if actual_fused_pairs > 0 else "No fusion occurred"],
+        ["Face Duration Tracked", _health_status(face_only_duration > 0),
+         f"{face_only_duration:.1f}s" if face_only_duration > 0 else "No face time recorded"],
+    ]
+    health_table = Table(health_data, colWidths=[1.8 * inch, 0.8 * inch, 3.9 * inch])
+    health_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4a5568")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            # Color code the status column
+            ("TEXTCOLOR", (1, 1), (1, 1), colors.green if db_connected else colors.red),
+            ("TEXTCOLOR", (1, 2), (1, 2), colors.green if body_enabled_effective else colors.red),
+            ("TEXTCOLOR", (1, 3), (1, 3), colors.green if actual_fused_pairs > 0 else colors.red),
+            ("TEXTCOLOR", (1, 4), (1, 4), colors.green if face_only_duration > 0 else colors.red),
+        ])
+    )
+    story.append(Paragraph("Run Health", subsection_style))
+    story.append(health_table)
+
+    # Add warning if config/artifact mismatch for body tracking
+    if body_artifacts_exist and not body_config_enabled:
+        story.append(Paragraph(
+            "⚠️ <b>Config Mismatch:</b> body_tracking.enabled=False in config but body artifacts exist. "
+            "Artifacts may be from a previous run or the config was overridden at runtime.",
+            warning_style
+        ))
+
+    story.append(Spacer(1, 12))
+
     # Executive summary stats
     identities_list = identities_data.get("identities", [])
     cluster_stats = identities_data.get("stats", {})
-    screentime_summary = screentime_data.get("summary", {})
+    # Note: screentime_summary already defined above
     metrics = track_metrics_data.get("metrics", {})
 
     # Calculate track counts
@@ -840,7 +909,7 @@ def build_screentime_run_debug_pdf(
     if isinstance(forced_splits, (int, float)) and forced_splits > 50:
         story.append(Paragraph(
             f"⚠️ High forced splits ({forced_splits}): Appearance gate is aggressively splitting tracks. "
-            "Consider raising TRACK_GATE_APPEAR_HARD threshold or increasing TRACK_GATE_APPEAR_STREAK.",
+            "Consider disabling gate_enabled in tracking.yaml or adjusting appearance thresholds.",
             warning_style
         ))
     if isinstance(id_switches, (int, float)) and id_switches > 20:
@@ -936,9 +1005,18 @@ def build_screentime_run_debug_pdf(
     # Configuration used
     story.append(Paragraph("Configuration (body_detection.yaml):", subsection_style))
     person_det_cfg = body_detection_config.get("person_detection", {})
+
+    # Show effective body_tracking status with explanation
+    if body_artifacts_exist and not body_config_enabled:
+        body_effective_str = "True (effective) - artifacts exist, config=False"
+    elif body_config_enabled:
+        body_effective_str = "True (config enabled)"
+    else:
+        body_effective_str = "False"
+
     body_detect_config_rows = [
         ["Setting", "Value"],
-        ["body_tracking.enabled", str(body_detection_config.get("body_tracking", {}).get("enabled", "N/A"))],
+        ["body_tracking.enabled", body_effective_str],
         ["model", str(person_det_cfg.get("model", "N/A"))],
         ["confidence_threshold", str(person_det_cfg.get("confidence_threshold", "N/A"))],
         ["min_height_px", str(person_det_cfg.get("min_height_px", "N/A"))],
@@ -1140,13 +1218,19 @@ def build_screentime_run_debug_pdf(
     # =========================================================================
     story.append(Paragraph("8. Faces Review (DB State)", section_style))
     assigned_count = sum(1 for i in identities_list if i.get("person_id"))
-    locked_count = len([lock for lock in identity_locks if lock.get("locked")])
+
+    # Show "unavailable" for DB-sourced data when DB is not connected
+    if db_error:
+        locked_count_str = "unavailable (DB error)"
+    else:
+        locked_count = len([lock for lock in identity_locks if lock.get("locked")])
+        locked_count_str = str(locked_count)
 
     review_stats = [
         ["Metric", "Value"],
         ["Total Identities", str(len(identities_list))],
         ["Assigned to Cast", str(assigned_count)],
-        ["Locked Identities", str(locked_count)],
+        ["Locked Identities", locked_count_str],
         ["Unassigned", str(len(identities_list) - assigned_count)],
     ]
     review_table = Table(review_stats, colWidths=[2 * inch, 2 * inch])
@@ -1180,17 +1264,30 @@ def build_screentime_run_debug_pdf(
     # SECTION 9: SMART SUGGESTIONS
     # =========================================================================
     story.append(Paragraph("9. Smart Suggestions", section_style))
-    dismissed_count = sum(1 for s in suggestions_rows if s.get("dismissed"))
-    applied_count = len(suggestion_applies)
 
-    suggestion_stats = [
-        ["Metric", "Value"],
-        ["Suggestion Batches", str(len(suggestion_batches))],
-        ["Total Suggestions", str(len(suggestions_rows))],
-        ["Dismissed", str(dismissed_count)],
-        ["Applied", str(applied_count)],
-        ["Pending", str(len(suggestions_rows) - dismissed_count - applied_count)],
-    ]
+    # Show "unavailable" for DB-sourced data when DB is not connected
+    if db_error:
+        suggestion_stats = [
+            ["Metric", "Value"],
+            ["Suggestion Batches", "unavailable (DB error)"],
+            ["Total Suggestions", "unavailable"],
+            ["Dismissed", "unavailable"],
+            ["Applied", "unavailable"],
+            ["Pending", "unavailable"],
+        ]
+    else:
+        dismissed_count = sum(1 for s in suggestions_rows if s.get("dismissed"))
+        applied_count = len(suggestion_applies)
+        pending_count = len(suggestions_rows) - dismissed_count - applied_count
+        suggestion_stats = [
+            ["Metric", "Value"],
+            ["Suggestion Batches", str(len(suggestion_batches))],
+            ["Total Suggestions", str(len(suggestions_rows))],
+            ["Dismissed", str(dismissed_count)],
+            ["Applied", str(applied_count)],
+            ["Pending", str(pending_count)],
+        ]
+
     suggestion_table = Table(suggestion_stats, colWidths=[2 * inch, 2 * inch])
     suggestion_table.setStyle(
         TableStyle([
@@ -1240,11 +1337,25 @@ def build_screentime_run_debug_pdf(
     )
     story.append(screentime_table)
 
-    story.append(Paragraph(
-        "<b>Note:</b> 'Gain from Body Tracking' represents additional screen time captured when a person's face "
-        "was not visible but their body was tracked and successfully fused with their face identity.",
-        note_style
-    ))
+    # Adjust wording based on whether fusion actually occurred
+    if actual_fused_pairs > 0:
+        story.append(Paragraph(
+            f"<b>Note:</b> 'Gain from Body Tracking' represents body-only duration gain—additional screen time "
+            f"from {actual_fused_pairs} fused face-body pair(s) where faces turned away but bodies remained visible.",
+            note_style
+        ))
+    elif body_enabled_effective and body_track_count > 0:
+        story.append(Paragraph(
+            "<b>Note:</b> Body tracking ran but no face-body pairs were successfully fused. "
+            "This may indicate IoU/Re-ID thresholds need tuning, or faces and bodies didn't overlap temporally.",
+            warning_style
+        ))
+    else:
+        story.append(Paragraph(
+            "<b>Note:</b> Body tracking was not enabled or produced no tracks. "
+            "'Gain from Body Tracking' will be zero without body-based fusion.",
+            note_style
+        ))
 
     # Additional stats
     story.append(Spacer(1, 8))
@@ -1313,7 +1424,7 @@ def build_screentime_run_debug_pdf(
         tuning_suggestions.append((
             "Face Tracking",
             f"High forced splits ({forced_splits})",
-            "Raise TRACK_GATE_APPEAR_HARD (currently ~0.70) to reduce false splits"
+            "Disable gate_enabled in tracking.yaml or adjust appearance thresholds to reduce false splits"
         ))
     if isinstance(id_switches, (int, float)) and id_switches > 20:
         tuning_suggestions.append((
