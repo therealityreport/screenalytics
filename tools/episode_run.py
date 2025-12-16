@@ -3893,9 +3893,14 @@ def _episode_ctx(ep_id: str) -> EpisodeContext | None:
 def _storage_context(
     ep_id: str,
 ) -> tuple[StorageService | None, EpisodeContext | None, Dict[str, str] | None]:
-    # Default to "s3" for consistency with API (apps/api/services/storage.py defaults to "s3")
-    # This ensures artifacts are uploaded to S3 when running in local mode from the API
-    storage_backend = os.environ.get("STORAGE_BACKEND", "s3").lower()
+    # Default storage backend:
+    # - Local mode (streamed subprocess): prefer local filesystem to avoid blocking the UI on S3 uploads.
+    # - Non-local mode (Celery/CI): keep S3 default for parity with the API.
+    storage_backend_env = os.environ.get("STORAGE_BACKEND")
+    if storage_backend_env:
+        storage_backend = storage_backend_env.lower()
+    else:
+        storage_backend = "local" if LOCAL_MODE_INSTRUMENTATION else "s3"
     storage: StorageService | None = None
     if storage_backend in {"s3", "minio"}:
         try:
@@ -6530,7 +6535,9 @@ def _maybe_run_body_tracking_fusion(
             episode_id=ep_id,
             config_path=config_path if config_path.exists() else None,
             fusion_config_path=fusion_config_path if fusion_config_path.exists() else None,
-            video_path=None,  # Not needed for fusion
+            # Provide the canonical local video path to avoid legacy path discovery failures.
+            # Fusion/comparison do not require the video, but the runner resolves it eagerly.
+            video_path=get_path(ep_id, "video"),
             output_dir=output_dir,
             skip_existing=True,
         )
