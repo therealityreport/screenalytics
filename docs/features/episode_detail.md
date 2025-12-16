@@ -23,9 +23,9 @@ When navigating to Faces Review or Smart Suggestions:
 - Child pages operate within that run's scope
 - All mutations affect only the selected run
 
-## Export Run Debug Bundle
+## Export Run Debug Report
 
-The Debug/Export section allows exporting a complete snapshot of a run's state for debugging or archival.
+The Debug/Export section generates a PDF report capturing the run's pipeline statistics, artifact status, and review state.
 
 ### Endpoint
 
@@ -33,36 +33,37 @@ The Debug/Export section allows exporting a complete snapshot of a run's state f
 GET /episodes/{ep_id}/runs/{run_id}/export
 ```
 
-### Export Options
+Returns: `application/pdf` - Screen Time Run Debug Report
 
-| Toggle | Description |
-|--------|-------------|
-| Include Artifacts | Raw JSONL files (tracks, faces, identities) |
-| Include Images | Thumbnails, crops, frames (large) |
-| Include Logs | Pipeline logs and job markers |
+### Report Sections
 
-### Bundle Contents
+The PDF report includes:
 
-The exported ZIP contains:
+1. **Cover / Executive Summary**
+   - Episode ID, Run ID, Generated timestamp
+   - Total face/body tracks, clusters, fused identities, screen time gain
 
-**Always included:**
-- `run_summary.json` - Metadata, schema version, artifact paths
-- `jobs.json` - Job execution history from DB
-- `identity_assignments.json` - Current identity/person mappings
-- `identity_locks.json` - Locked identities for this run
-- `smart_suggestion_batches.json` - Suggestion batch metadata
-- `smart_suggestions.json` - Individual suggestions with evidence
-- `smart_suggestions_applied.json` - Audit trail of applied suggestions
+2. **Face Detect** - Detection counts, artifact size
 
-**With include_artifacts=True:**
-- `detections.jsonl`
-- `tracks.jsonl`
-- `track_metrics.json`
-- `faces.jsonl`
-- `identities.json`
-- `cluster_centroids.json`
-- `body_tracking/` directory
-- `analytics/` directory
+3. **Face Track** - Track metrics (born, lost, ID switches, scene cuts)
+
+4. **Face Harvest / Embed** - Harvested faces, aligned faces, embedding file status
+
+5. **Body Detect** - Body detection counts
+
+6. **Body Track** - Body track counts
+
+7. **Track Fusion** - Face/body track counts, fused identity count
+
+8. **Cluster** - Cluster statistics (count, faces, mixed tracks, low cohesion)
+
+9. **Faces Review** - Assigned/locked identity counts (from DB)
+
+10. **Smart Suggestions** - Batch/suggestion counts, dismissed/applied counts (from DB)
+
+11. **Screen Time Analyze** - Duration gains, face-only vs combined time
+
+12. **Appendix: Artifact Manifest** - Complete listing of all artifacts with status and size
 
 ## Pipeline Jobs
 

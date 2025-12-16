@@ -32,7 +32,7 @@ from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.run_export import build_run_debug_bundle_zip
+from apps.api.services.run_export import build_screentime_run_debug_pdf
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -2368,43 +2368,37 @@ def unlock_identity(
 def export_run_debug_bundle(
     ep_id: str,
     run_id: str,
-    include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities)"),
-    include_images: bool = Query(False, description="Include thumbnails/crops/frames (very large)"),
-    include_logs: bool = Query(True, description="Include persisted logs (recommended)"),
-) -> StreamingResponse:
-    """Export a single zip containing the end-to-end state for one run."""
+) -> Response:
+    """Export a Screen Time Run Debug Report PDF.
+
+    Returns a PDF report containing pipeline statistics, artifact references,
+    and review state for the specified run. Sections include:
+    - Face Detect/Track/Embed
+    - Body Detect/Track
+    - Track Fusion
+    - Clustering
+    - Faces Review
+    - Smart Suggestions
+    - Screen Time Analysis
+    - Artifact Manifest
+    """
     ep_id_norm = normalize_ep_id(ep_id)
 
     try:
-        zip_path, download_name = build_run_debug_bundle_zip(
+        pdf_bytes, download_name = build_screentime_run_debug_pdf(
             ep_id=ep_id_norm,
             run_id=run_id,
-            include_artifacts=include_artifacts,
-            include_images=include_images,
-            include_logs=include_logs,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    file_handle = open(zip_path, "rb")
-
-    def _cleanup() -> None:
-        try:
-            file_handle.close()
-        finally:
-            try:
-                os.unlink(zip_path)
-            except OSError:
-                pass
-
     headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
-    return StreamingResponse(
-        file_handle,
-        media_type="application/zip",
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
         headers=headers,
-        background=BackgroundTask(_cleanup),
     )
 
 

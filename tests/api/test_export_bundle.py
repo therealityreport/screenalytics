@@ -1,13 +1,11 @@
 """Tests for the run debug bundle export endpoint.
 
-Verifies that GET /episodes/{ep_id}/runs/{run_id}/export returns a ZIP archive
-containing the expected files.
+Verifies that GET /episodes/{ep_id}/runs/{run_id}/export returns a PDF report
+containing the expected sections.
 """
 
-import io
 import json
 import os
-import zipfile
 from pathlib import Path
 
 os.environ.setdefault("STORAGE_BACKEND", "local")
@@ -33,8 +31,8 @@ def _write_jsonl(path: Path, rows) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
-def test_export_bundle_contains_expected_files(tmp_path, monkeypatch):
-    """Test that the export bundle contains all expected JSON files."""
+def test_export_bundle_returns_pdf(tmp_path, monkeypatch):
+    """Test that the export endpoint returns a valid PDF."""
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
     monkeypatch.setenv("STORAGE_BACKEND", "local")
@@ -50,6 +48,13 @@ def test_export_bundle_contains_expected_files(tmp_path, monkeypatch):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Write minimal artifacts
+    _write_jsonl(
+        run_dir / "detections.jsonl",
+        [
+            {"frame_idx": 0, "bbox": [100, 100, 200, 200], "score": 0.95},
+            {"frame_idx": 1, "bbox": [110, 110, 210, 210], "score": 0.92},
+        ],
+    )
     _write_jsonl(
         run_dir / "tracks.jsonl",
         [
@@ -72,69 +77,32 @@ def test_export_bundle_contains_expected_files(tmp_path, monkeypatch):
                 {"identity_id": "id_0001", "label": "Person One", "track_ids": [1]},
                 {"identity_id": "id_0002", "label": "Person Two", "track_ids": [2]},
             ],
-            "stats": {},
+            "stats": {"faces": 2, "clusters": 2},
         },
     )
-    _write_json(run_dir / "track_metrics.json", {"ep_id": ep_id, "metrics": {}})
+    _write_json(
+        run_dir / "track_metrics.json",
+        {
+            "ep_id": ep_id,
+            "metrics": {"tracks_born": 2, "tracks_lost": 2, "id_switches": 0},
+            "scene_cuts": {"count": 1},
+        },
+    )
 
     client = TestClient(app)
 
     # Call export endpoint
-    resp = client.get(
-        f"/episodes/{ep_id}/runs/{run_id}/export",
-        params={"include_artifacts": True, "include_images": False, "include_logs": False},
-    )
+    resp = client.get(f"/episodes/{ep_id}/runs/{run_id}/export")
     assert resp.status_code == 200, f"Export failed: {resp.text}"
-    assert resp.headers.get("content-type") == "application/zip"
+    assert resp.headers.get("content-type") == "application/pdf"
 
-    # Verify ZIP contents
-    zip_data = io.BytesIO(resp.content)
-    with zipfile.ZipFile(zip_data, "r") as zf:
-        file_list = zf.namelist()
+    # Verify PDF magic bytes
+    pdf_content = resp.content
+    assert pdf_content[:5] == b"%PDF-", "Response is not a valid PDF"
 
-        # Required metadata files (always present)
-        assert "run_summary.json" in file_list, "Missing run_summary.json"
-        assert "jobs.json" in file_list, "Missing jobs.json"
-        assert "identity_assignments.json" in file_list, "Missing identity_assignments.json"
-        assert "identity_locks.json" in file_list, "Missing identity_locks.json"
-        assert "smart_suggestion_batches.json" in file_list, "Missing smart_suggestion_batches.json"
-        assert "smart_suggestions.json" in file_list, "Missing smart_suggestions.json"
-        assert "smart_suggestions_applied.json" in file_list, "Missing smart_suggestions_applied.json"
-
-        # Verify run_summary.json structure
-        run_summary = json.loads(zf.read("run_summary.json"))
-        assert run_summary["ep_id"] == ep_id
-        assert run_summary["run_id"] == run_id
-        assert "schema_version" in run_summary
-
-        # Verify identity_locks.json structure
-        locks = json.loads(zf.read("identity_locks.json"))
-        assert locks["ep_id"] == ep_id
-        assert locks["run_id"] == run_id
-        assert "locks" in locks
-
-        # Verify smart_suggestion_batches.json structure
-        batches = json.loads(zf.read("smart_suggestion_batches.json"))
-        assert batches["ep_id"] == ep_id
-        assert batches["run_id"] == run_id
-        assert "batches" in batches
-
-        # Verify smart_suggestions.json structure
-        suggestions = json.loads(zf.read("smart_suggestions.json"))
-        assert suggestions["ep_id"] == ep_id
-        assert suggestions["run_id"] == run_id
-        assert "suggestions" in suggestions
-
-        # Verify smart_suggestions_applied.json structure
-        applied = json.loads(zf.read("smart_suggestions_applied.json"))
-        assert applied["ep_id"] == ep_id
-        assert applied["run_id"] == run_id
-        assert "applies" in applied
-
-        # Artifacts should be present (include_artifacts=True)
-        assert "tracks.jsonl" in file_list, "Missing tracks.jsonl artifact"
-        assert "faces.jsonl" in file_list, "Missing faces.jsonl artifact"
-        assert "identities.json" in file_list, "Missing identities.json artifact"
+    # Verify content-disposition header
+    content_disp = resp.headers.get("content-disposition", "")
+    assert "debug_report.pdf" in content_disp, f"Unexpected filename: {content_disp}"
 
 
 def test_export_bundle_404_for_missing_run(tmp_path, monkeypatch):
@@ -154,8 +122,12 @@ def test_export_bundle_404_for_missing_run(tmp_path, monkeypatch):
     assert resp.status_code == 404, f"Expected 404 but got {resp.status_code}"
 
 
-def test_export_bundle_excludes_artifacts_when_disabled(tmp_path, monkeypatch):
-    """Test that include_artifacts=False excludes artifact files."""
+def test_export_pdf_with_body_tracking_data(tmp_path, monkeypatch):
+    """Test that PDF export works with body tracking artifacts.
+
+    This test ensures the PDF generator handles all artifact types correctly,
+    including the body tracking subdirectory.
+    """
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
     monkeypatch.setenv("STORAGE_BACKEND", "local")
@@ -173,27 +145,42 @@ def test_export_bundle_excludes_artifacts_when_disabled(tmp_path, monkeypatch):
     # Write minimal artifacts
     _write_jsonl(run_dir / "tracks.jsonl", [{"track_id": 1}])
     _write_jsonl(run_dir / "faces.jsonl", [{"track_id": 1, "frame_idx": 0}])
-    _write_json(run_dir / "identities.json", {"ep_id": ep_id, "identities": []})
+    _write_json(run_dir / "identities.json", {"ep_id": ep_id, "identities": [], "stats": {}})
+
+    # Add body tracking artifacts
+    body_dir = run_dir / "body_tracking"
+    body_dir.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(body_dir / "body_detections.jsonl", [{"frame_idx": 0, "bbox": [0, 0, 100, 200]}])
+    _write_jsonl(body_dir / "body_tracks.jsonl", [{"track_id": 100001, "frame_count": 5}])
+    _write_json(
+        body_dir / "track_fusion.json",
+        {"num_face_tracks": 1, "num_body_tracks": 1, "num_fused_identities": 2, "identities": {}},
+    )
+    _write_json(
+        body_dir / "screentime_comparison.json",
+        {
+            "summary": {
+                "total_identities": 2,
+                "identities_with_gain": 1,
+                "total_duration_gain": 5.0,
+            },
+            "breakdowns": [],
+        },
+    )
 
     client = TestClient(app)
 
-    # Call export with include_artifacts=False
-    resp = client.get(
-        f"/episodes/{ep_id}/runs/{run_id}/export",
-        params={"include_artifacts": False, "include_images": False, "include_logs": False},
-    )
-    assert resp.status_code == 200
+    # Call export
+    resp = client.get(f"/episodes/{ep_id}/runs/{run_id}/export")
+    assert resp.status_code == 200, f"Export failed: {resp.text}"
 
-    # Verify ZIP contents
-    zip_data = io.BytesIO(resp.content)
-    with zipfile.ZipFile(zip_data, "r") as zf:
-        file_list = zf.namelist()
+    # Verify it's a valid PDF
+    pdf_content = resp.content
+    assert pdf_content[:5] == b"%PDF-", "Response is not a valid PDF"
 
-        # Metadata files should still be present
-        assert "run_summary.json" in file_list
-        assert "jobs.json" in file_list
-        assert "identity_locks.json" in file_list
+    # Verify PDF has reasonable size (should be at least a few KB with all sections)
+    assert len(pdf_content) > 2000, f"PDF too small ({len(pdf_content)} bytes), may be incomplete"
 
-        # Artifacts should NOT be present
-        assert "tracks.jsonl" not in file_list, "tracks.jsonl should be excluded"
-        assert "faces.jsonl" not in file_list, "faces.jsonl should be excluded"
+    # Verify content-disposition header
+    content_disp = resp.headers.get("content-disposition", "")
+    assert "debug_report.pdf" in content_disp
