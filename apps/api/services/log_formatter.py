@@ -489,7 +489,7 @@ class LogFormatter:
         """Format local-mode provider selection into a compact, readable line."""
         collapsed = " ".join(str(line).strip().split())
         # Drop the often-long available=[...] portion to keep UI logs readable.
-        collapsed = re.sub(r",\\s*available=\\[.*\\]\\)$", ")", collapsed)
+        collapsed = re.sub(r",\s*available=\[.*\]\)$", ")", collapsed)
         return collapsed
 
     def finalize(self) -> str | None:
