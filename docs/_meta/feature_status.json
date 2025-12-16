@@ -81,10 +81,12 @@
     },
     "body_tracking": {
       "title": "Body Tracking",
-      "status": "in_progress",
-      "integrated_in_jobs": [],
-      "integrated_in_autorun": false,
-      "enabled_by_default": false,
+      "status": "partial",
+      "integrated_in_jobs": [
+        "detect_track"
+      ],
+      "integrated_in_autorun": true,
+      "enabled_by_default": true,
       "how_to_enable": {
         "config_key": "config/pipeline/body_detection.yaml:body_tracking.enabled",
         "ui_path": null,
@@ -92,6 +94,7 @@
       },
       "evidence_paths": [
         "FEATURES/body_tracking",
+        "tools/episode_run.py",
         "config/pipeline/body_detection.yaml",
         "config/pipeline/track_fusion.yaml"
       ],
@@ -112,17 +115,23 @@
           "notes": "Sandbox pipeline exists; not enabled in production jobs or auto-run."
         },
         "pipeline_integration": {
-          "status": "future",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
-          "enabled_by_default": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "detect_track"
+          ],
+          "integrated_in_autorun": true,
+          "enabled_by_default": true,
           "how_to_enable": {
-            "config_key": null,
+            "config_key": "config/pipeline/body_detection.yaml:body_tracking.enabled",
             "ui_path": null,
             "cli_flag": null
           },
-          "evidence_paths": [],
-          "notes": "Not integrated into production jobs or auto-run yet."
+          "evidence_paths": [
+            "tools/episode_run.py",
+            "FEATURES/body_tracking/src/body_tracking_runner.py",
+            "config/pipeline/body_detection.yaml"
+          ],
+          "notes": "Runs as a best-effort sub-step during detect_track; artifacts are run-scoped under data/manifests/{ep_id}/runs/{run_id}/body_tracking/."
         }
       },
       "docs": [
