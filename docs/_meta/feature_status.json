@@ -85,9 +85,10 @@
       "title": "Body Tracking",
       "status": "partial",
       "created": "2025-12-11",
-      "last_updated": "2025-12-13",
+      "last_updated": "2025-12-16",
       "integrated_in_jobs": [
-        "detect_track"
+        "detect_track",
+        "cluster"
       ],
       "integrated_in_autorun": true,
       "enabled_by_default": true,
@@ -136,6 +137,39 @@
             "config/pipeline/body_detection.yaml"
           ],
           "notes": "Runs as a best-effort sub-step during detect_track; artifacts are run-scoped under data/manifests/{ep_id}/runs/{run_id}/body_tracking/."
+        },
+        "D_track_fusion": {
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "cluster"
+          ],
+          "integrated_in_autorun": true,
+          "enabled_by_default": true,
+          "how_to_enable": {
+            "config_key": "config/pipeline/body_detection.yaml:body_tracking.enabled",
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [
+            "tools/episode_run.py",
+            "FEATURES/body_tracking/src/track_fusion.py",
+            "FEATURES/body_tracking/src/screentime_compare.py",
+            "config/pipeline/track_fusion.yaml"
+          ],
+          "notes": "Face↔body track fusion and screen-time comparison. Runs as best-effort post-processing after cluster stage completes. Generates track_fusion.json and screentime_comparison.json."
+        },
+        "E_unified_screentime": {
+          "status": "not_started",
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [],
+          "notes": "Planned: Unified timeline fusion (face + body), UI visibility breakdown, schema finalization."
         }
       },
       "docs": [
