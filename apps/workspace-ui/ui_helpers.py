@@ -2469,10 +2469,13 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+@st.cache_data(ttl=60)  # Auto-refresh every 60 seconds
 def load_docs_catalog(catalog_path: str | Path | None = None) -> tuple[dict[str, Any] | None, str | None]:
     """Load docs catalog JSON used by docs dashboard + header popovers.
 
     Returns: (catalog, error). If error is not None, catalog is None.
+
+    Note: Cached for 60 seconds via @st.cache_data(ttl=60) for auto-refresh.
     """
     repo_root = _repo_root()
     relative_path = Path(catalog_path) if catalog_path is not None else _DOCS_CATALOG_DEFAULT_RELATIVE_PATH
@@ -2497,12 +2500,15 @@ def load_docs_catalog(catalog_path: str | Path | None = None) -> tuple[dict[str,
     return data, None
 
 
+@st.cache_data(ttl=60)  # Auto-refresh every 60 seconds
 def load_feature_status_registry(
     registry_path: str | Path | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Load feature-status registry JSON used by header popovers.
 
     Returns: (registry, error). If error is not None, registry is None.
+
+    Note: Cached for 60 seconds via @st.cache_data(ttl=60) for auto-refresh.
     """
     repo_root = _repo_root()
     relative_path = Path(registry_path) if registry_path is not None else _FEATURE_STATUS_DEFAULT_RELATIVE_PATH
@@ -2526,9 +2532,10 @@ def load_feature_status_registry(
 
 
 _FEATURE_STATUS_JOB_LABELS = {
-    "detect_track": "Detect/Track",
+    "detect_track": "Detect/Track (+ Body)",
+    "faces_embed": "Align & Embed",  # FAN-2D alignment + ArcFace embedding + quality gating
     "harvest": "Harvest",
-    "cluster": "Cluster",
+    "cluster": "Cluster (+ Fusion)",
 }
 
 
@@ -3961,6 +3968,11 @@ def run_celery_job_with_progress(
                 return result.get("progress"), error_msg
 
             status_placeholder.success(f"✅ {operation} completed successfully")
+
+            # Set completion flags for auto-run advancement (match LOCAL mode behavior)
+            st.session_state[f"{ep_id}::{operation}_just_completed"] = True
+            st.session_state[f"{ep_id}::{operation}_completed_at"] = time.time()
+            st.session_state[f"{ep_id}::{operation}_summary"] = result
 
             # Read progress file for detailed results
             progress_data = result.get("progress")

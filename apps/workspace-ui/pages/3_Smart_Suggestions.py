@@ -275,6 +275,7 @@ def _invalidate_suggestions_cache(ep_id: str) -> None:
     """
     keys_to_clear = [
         f"cast_suggestions:{ep_id}",
+        f"cast_suggestions_attempted:{ep_id}",  # Critical: allow auto-refresh after invalidation
         f"rescued_clusters:{ep_id}",
         f"temporal_only_clusters:{ep_id}",
         f"embedding_mismatches:{ep_id}",
@@ -2396,8 +2397,17 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
             name_match_cast_id = matches[0]
             name_match_cast_name = cast_options.get(name_match_cast_id)
 
+    # Build cast dropdown options: suggested cast first (if any), then others alphabetically
+    suggested_cast_id = best_suggestion.get("cast_id") if best_suggestion else None
+    person_cast_options = []
+    if suggested_cast_id and suggested_cast_id in cast_options:
+        person_cast_options.append((suggested_cast_id, cast_options[suggested_cast_id]))
+    for cid_opt, name_opt in sorted(cast_options.items(), key=lambda x: x[1].lower()):
+        if cid_opt != suggested_cast_id:
+            person_cast_options.append((cid_opt, name_opt))
+
     with st.container(border=True):
-        thumb_col, info_col, action_col = st.columns([3, 3, 1])
+        thumb_col, info_col, dropdown_col, action_col = st.columns([2.5, 2.5, 2, 1])
 
         with thumb_col:
             _render_carousel_thumbnails(person_thumb_urls, f"person_{person_id}")
@@ -2484,6 +2494,22 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
             else:
                 st.caption("💡 Click 'Refresh Suggestions' to find cast matches")
 
+        with dropdown_col:
+            # Cast member dropdown for assigning person to a different cast
+            if person_cast_options:
+                st.caption("Assign to:")
+                person_cast_idx = st.selectbox(
+                    "Assign to cast",
+                    options=range(len(person_cast_options)),
+                    format_func=lambda i: person_cast_options[i][1],
+                    key=f"{ep_id}::person_cast_select::{person_id}",
+                    label_visibility="collapsed",
+                )
+                selected_person_cast_id, selected_person_cast_name = person_cast_options[person_cast_idx]
+            else:
+                selected_person_cast_id = suggested_cast_id
+                selected_person_cast_name = cast_options.get(suggested_cast_id, "(Unknown)") if suggested_cast_id else None
+
         with action_col:
             if name_match_cast_id and name_match_cast_name:
                 if st.button(
@@ -2510,24 +2536,21 @@ def render_person_row(person_entry: Dict[str, Any]) -> None:
                         st.error(f"⚠️ Link failed: {result.error_message}")
                         LOGGER.error(f"[{ep_id}] Failed to link person {person_id}: {result.error_message}")
 
-            if best_suggestion:
-                cast_id = best_suggestion.get("cast_id")
-                # Safely extract cast name for display
-                raw_name = best_suggestion.get("name") or cast_options.get(cast_id)
-                cast_name = _safe_cast_name(raw_name, fallback=cast_id if cast_id else "(Unknown)")
-
+            # Link button - uses selected cast from dropdown (or suggested if no dropdown)
+            if selected_person_cast_id and selected_person_cast_name:
                 if st.button("✓ Link", key=f"{ep_id}::sp_link_person::{person_id}", use_container_width=True):
-                    payload = {"cast_id": cast_id}
+                    payload = {"cast_id": selected_person_cast_id}
                     result = _api_patch(f"/shows/{show_slug}/people/{person_id}", payload)
                     if result.ok:
                         _push_undo_action(ep_id, UndoAction(
                             action_type="link",
                             ep_id=ep_id,
                             person_id=person_id,
-                            cast_id=cast_id,
-                            cast_name=cast_name,
+                            cast_id=selected_person_cast_id,
+                            cast_name=selected_person_cast_name,
                         ))
-                        st.toast(f"Linked {person_name} to {cast_name}")
+                        st.toast(f"Linked {person_name} to {selected_person_cast_name}")
+                        _invalidate_suggestions_cache(ep_id)
                         people_cache_key = f"people_cache:{show_slug}"
                         if people_cache_key in st.session_state:
                             del st.session_state[people_cache_key]

@@ -368,12 +368,14 @@ class FaceReviewService:
         show_id: Optional[str] = None,
         limit: int = 20,
     ) -> Dict[str, Any]:
-        """Get unassigned↔unassigned cluster pairs for the initial post-cluster pass.
+        """Get cluster pairs for the initial post-cluster pass to reduce duplicates.
 
-        Only returns pairs where:
-        - Both clusters are unassigned (no person_id)
-        - Clusters are "borderline" (similar but not auto-merged)
-        - No previous decision exists for the pair
+        Returns pairs where clusters might be the same person but were assigned
+        to different people. This helps reduce the total number of people to deal with.
+
+        Includes:
+        - Unassigned↔unassigned pairs (both without person_id)
+        - Assigned↔assigned pairs (different person_ids, no cast assignment yet)
 
         Args:
             ep_id: Episode ID
@@ -427,24 +429,36 @@ class FaceReviewService:
             LOGGER.warning(f"[{ep_id}] Track reps not computed, using empty dict")
             track_reps = {}
 
-        # Find unassigned clusters
-        unassigned = [
+        # Get ALL clusters with track_ids (both assigned and unassigned)
+        # to find potential duplicates that should be merged
+        all_clusters = [
             ident for ident in identities
-            if not ident.get("person_id") and ident.get("track_ids")
+            if ident.get("track_ids")
         ]
 
-        LOGGER.info(f"[{ep_id}] Found {len(unassigned)} unassigned clusters for initial pass")
+        # Also track unassigned count for logging
+        unassigned_count = sum(1 for c in all_clusters if not c.get("person_id"))
+        assigned_count = len(all_clusters) - unassigned_count
 
-        # Build candidate pairs
+        LOGGER.info(f"[{ep_id}] Found {len(all_clusters)} clusters for duplicate detection "
+                    f"({unassigned_count} unassigned, {assigned_count} assigned)")
+
+        # Build candidate pairs - compare clusters that might be duplicates
         candidates = []
         seen_pairs = set()
 
-        for i, cluster_a in enumerate(unassigned):
-            for cluster_b in unassigned[i + 1:]:
+        for i, cluster_a in enumerate(all_clusters):
+            for cluster_b in all_clusters[i + 1:]:
                 id_a = cluster_a.get("identity_id")
                 id_b = cluster_b.get("identity_id")
+                person_a = cluster_a.get("person_id")
+                person_b = cluster_b.get("person_id")
 
                 if not id_a or not id_b:
+                    continue
+
+                # Skip if both are assigned to the SAME person (already merged)
+                if person_a and person_b and person_a == person_b:
                     continue
 
                 # Skip if we already have a decision
@@ -463,6 +477,8 @@ class FaceReviewService:
                             "cluster_a": cluster_a,
                             "cluster_b": cluster_b,
                             "similarity": sim,
+                            "person_a": person_a,
+                            "person_b": person_b,
                         })
 
         # Sort by similarity (highest first - most likely matches)

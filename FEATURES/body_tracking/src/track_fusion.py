@@ -496,18 +496,54 @@ def fuse_face_body_tracks(
     face_tracks_path = Path(face_tracks_path)
     body_tracks_path = Path(body_tracks_path)
 
-    # Load face tracks
+    # Load face tracks - aggregate individual detections into tracks
+    # faces.jsonl has one line per face detection (not aggregated tracks)
     face_tracks: Dict[int, dict] = {}
     logger.info(f"Loading face tracks from: {face_tracks_path}")
 
     with open(face_tracks_path) as f:
         for line in f:
-            track = json.loads(line)
-            track_id = track.get("track_id")
-            if track_id is not None:
-                face_tracks[track_id] = track
+            face = json.loads(line)
+            track_id = face.get("track_id")
+            if track_id is None:
+                continue
 
-    logger.info(f"Loaded {len(face_tracks)} face tracks")
+            # Initialize track if not seen
+            if track_id not in face_tracks:
+                face_tracks[track_id] = {
+                    "track_id": track_id,
+                    "detections": [],
+                    "start_frame": face.get("frame_idx"),
+                    "end_frame": face.get("frame_idx"),
+                    "start_time": face.get("ts", 0.0),
+                    "end_time": face.get("ts", 0.0),
+                }
+
+            # Add detection
+            face_tracks[track_id]["detections"].append({
+                "frame_idx": face.get("frame_idx"),
+                "timestamp": face.get("ts", 0.0),
+                "bbox": face.get("bbox_xyxy") or face.get("bbox"),
+                "score": face.get("conf", 1.0),
+            })
+
+            # Update track bounds
+            frame_idx = face.get("frame_idx")
+            ts = face.get("ts", 0.0)
+            if frame_idx is not None:
+                if frame_idx < face_tracks[track_id]["start_frame"]:
+                    face_tracks[track_id]["start_frame"] = frame_idx
+                    face_tracks[track_id]["start_time"] = ts
+                if frame_idx > face_tracks[track_id]["end_frame"]:
+                    face_tracks[track_id]["end_frame"] = frame_idx
+                    face_tracks[track_id]["end_time"] = ts
+
+    # Calculate durations and frame counts
+    for track in face_tracks.values():
+        track["frame_count"] = len(track["detections"])
+        track["duration"] = track["end_time"] - track["start_time"]
+
+    logger.info(f"Loaded {len(face_tracks)} face tracks (aggregated from detections)")
 
     # Load body tracks
     body_tracks: Dict[int, dict] = {}
