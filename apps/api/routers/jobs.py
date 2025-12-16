@@ -638,7 +638,7 @@ def _build_faces_command(req: FacesEmbedRequest, progress_path: Path) -> List[st
         req.min_frames_between_crops
         and req.min_frames_between_crops != DEFAULT_MIN_FRAMES_BETWEEN_CROPS
     ):
-        command += ["--min-frames-between-crops", str(req.min_frames_between_crops)]
+        command += ["--sample-every-n-frames", str(req.min_frames_between_crops)]
     if req.thumb_size and req.thumb_size != 256:
         command += ["--thumb-size", str(req.thumb_size)]
     return command

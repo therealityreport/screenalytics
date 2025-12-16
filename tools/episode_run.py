@@ -7004,8 +7004,9 @@ def _run_faces_embed_stage(
     # Log startup for local mode streaming
     if LOCAL_MODE_INSTRUMENTATION:
         device = args.device or "auto"
+        crop_interval_frames = getattr(args, "sample_every_n_frames", 4)
         print(f"[LOCAL MODE] faces_embed starting for {args.ep_id}", flush=True)
-        print(f"  device={device}", flush=True)
+        print(f"  device={device}  •  crop_interval_frames={crop_interval_frames}", flush=True)
 
     run_id = getattr(args, "run_id", None)
     track_path = _tracks_path_for_run(args.ep_id, run_id)
@@ -7184,7 +7185,13 @@ def _run_faces_embed_stage(
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
     embedding_model_name = ARC_FACE_MODEL_NAME
-    print(f"[INIT] Embedding backend ready (type={embedding_backend_type}, resolved_device={embed_device})", flush=True)
+    crop_interval_frames = getattr(args, "sample_every_n_frames", None)
+    print(
+        "[INIT] Embedding backend ready "
+        f"(type={embedding_backend_type}, resolved_device={embed_device}, "
+        f"crop_interval_frames={crop_interval_frames}, allow_cpu_fallback={allow_embedding_fallback})",
+        flush=True,
+    )
 
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
@@ -9014,35 +9021,68 @@ def _sample_track_uniformly(
     Returns:
         Sampled subset of track_samples
     """
-    if len(track_samples) <= max_samples:
-        return track_samples
+    if not track_samples:
+        return []
 
-    # Uniform sampling across the track's frame range
-    sampled = []
-    n = len(track_samples)
+    interval = max(int(sample_interval or 1), 1)
 
-    # Calculate step size for uniform sampling
-    if max_samples >= 2:
-        step = (n - 1) / (max_samples - 1)
-        indices = [int(round(i * step)) for i in range(max_samples)]
+    # First: enforce a minimum spacing between sampled frames (when requested).
+    # This is the "crop interval" control used by Faces Harvest.
+    sampled: list[Dict[str, Any]] = []
+    if interval <= 1:
+        sampled = list(track_samples)
     else:
-        indices = [n // 2]  # Take middle frame if max_samples == 1
+        last_frame: int | None = None
+        for sample in track_samples:
+            try:
+                frame_idx = int(sample.get("frame_idx") or 0)
+            except (TypeError, ValueError):
+                frame_idx = 0
+            if last_frame is None or (frame_idx - last_frame) >= interval:
+                sampled.append(sample)
+                last_frame = frame_idx
+        # Keep the final frame sample to anchor the end of the track.
+        if sampled:
+            try:
+                last_sample_frame = int(sampled[-1].get("frame_idx") or 0)
+            except (TypeError, ValueError):
+                last_sample_frame = None
+            try:
+                final_frame = int(track_samples[-1].get("frame_idx") or 0)
+            except (TypeError, ValueError):
+                final_frame = None
+            if final_frame is not None and last_sample_frame is not None and final_frame != last_sample_frame:
+                sampled.append(track_samples[-1])
 
-    # Ensure we don't duplicate indices
-    indices = sorted(set(indices))
+    # Second: cap volume with uniform downsampling when we still have too many samples.
+    if len(sampled) > max_samples:
+        uniform: list[Dict[str, Any]] = []
+        n = len(sampled)
 
-    for idx in indices:
-        if 0 <= idx < n:
-            sampled.append(track_samples[idx])
+        # Calculate step size for uniform sampling
+        if max_samples >= 2:
+            step = (n - 1) / (max_samples - 1)
+            indices = [int(round(i * step)) for i in range(max_samples)]
+        else:
+            indices = [n // 2]  # Take middle frame if max_samples == 1
+
+        # Ensure we don't duplicate indices
+        indices = sorted(set(indices))
+
+        for idx in indices:
+            if 0 <= idx < n:
+                uniform.append(sampled[idx])
+        sampled = uniform
 
     # Ensure we meet min_samples if the track is long enough
     if len(sampled) < min_samples and len(track_samples) >= min_samples:
         # Add more samples uniformly
         additional_needed = min_samples - len(sampled)
-        step = n / (min_samples + 1)
+        n_full = len(track_samples)
+        step = n_full / (min_samples + 1)
         additional_indices = [int(round((i + 1) * step)) for i in range(additional_needed)]
         for idx in additional_indices:
-            if 0 <= idx < n and track_samples[idx] not in sampled:
+            if 0 <= idx < n_full and track_samples[idx] not in sampled:
                 sampled.append(track_samples[idx])
 
         # Re-sort by frame_idx
