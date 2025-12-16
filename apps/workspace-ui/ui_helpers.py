@@ -2925,6 +2925,13 @@ def render_page_header(page_id: str, page_title: str) -> None:
                         integrated_in_jobs=phase_jobs if isinstance(phase_info, dict) else feature_jobs,
                         integrated_in_autorun=phase_info.get("integrated_in_autorun", False) if isinstance(phase_info, dict) else False,
                     )
+
+                    # Detect mismatch: registry says complete but evidence paths missing
+                    if phase_bucket == "complete" and isinstance(phase_info, dict):
+                        evidence_paths = phase_info.get("evidence_paths") or []
+                        if not evidence_paths:
+                            mismatches.append(f"{fid}.{phase_id} (no evidence_paths)")
+
                     if phase_bucket == "complete":
                         complete_count += 1
                     else:

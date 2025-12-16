@@ -5,6 +5,8 @@
     "face_alignment": {
       "title": "Face Alignment",
       "status": "partial",
+      "created": "2025-12-11",
+      "last_updated": "2025-12-13",
       "integrated_in_jobs": [
         "harvest"
       ],
@@ -82,6 +84,8 @@
     "body_tracking": {
       "title": "Body Tracking",
       "status": "partial",
+      "created": "2025-12-11",
+      "last_updated": "2025-12-13",
       "integrated_in_jobs": [
         "detect_track"
       ],
@@ -142,6 +146,8 @@
     "arcface_tensorrt": {
       "title": "ArcFace TensorRT",
       "status": "implemented_production",
+      "created": "2025-12-11",
+      "last_updated": "2025-12-16",
       "integrated_in_jobs": [
         "harvest"
       ],
@@ -237,6 +243,8 @@
     "vision_analytics": {
       "title": "Vision Analytics",
       "status": "not_started",
+      "created": "2025-12-11",
+      "last_updated": "2025-12-13",
       "integrated_in_jobs": [],
       "integrated_in_autorun": false,
       "enabled_by_default": false,
