@@ -2883,99 +2883,89 @@ def render_page_header(page_id: str, page_title: str) -> None:
         )
 
         if registry_features:
-            todo_rows: list[dict[str, Any]] = []
-            in_progress_rows: list[dict[str, Any]] = []
-            complete_rows: list[dict[str, Any]] = []
+            # New structure: TODO = feature summary, IN PROGRESS = remaining phases
+            feature_todo_rows: list[dict[str, Any]] = []
+            phase_in_progress_rows: list[dict[str, Any]] = []
             mismatches: list[str] = []
+
+            # Statuses that count as "complete" for progress tracking
+            complete_statuses = {"complete", "implemented_production"}
+            # Statuses that are "in progress" (not complete, not future/not_started)
+            in_progress_statuses = {"in_progress", "partial", "implemented_sandbox", "heuristic_stub", "scaffold_only"}
 
             for fid, fmeta in sorted(registry_features.items()):
                 if not isinstance(fmeta, dict):
                     continue
                 feature_title = fmeta.get("title") or fid
-                feature_status = fmeta.get("status") or "unknown"
                 feature_jobs = fmeta.get("integrated_in_jobs") or []
-                feature_autorun = fmeta.get("integrated_in_autorun")
-                feature_enabled = fmeta.get("enabled_by_default", fmeta.get("used_by_default"))
-                feature_present, feature_missing = _evidence_present(fmeta)
-                if str(feature_status).strip().lower() in {"complete", "implemented_production"} and feature_missing:
-                    mismatches.append(f"{fid}: missing {', '.join(feature_missing)}")
-
-                feature_row = {
-                    "feature": feature_title,
-                    "feature_id": fid,
-                    "phase": "",
-                    "status": feature_status,
-                    "jobs": _format_jobs(feature_jobs),
-                    "autorun": _format_yes_no(feature_autorun),
-                    "enabled_by_default": _format_yes_no(feature_enabled),
-                    "evidence_present": feature_present,
-                    "how_to_enable": _format_how_to_enable(fmeta.get("how_to_enable")),
-                }
-                feature_bucket = classify_feature_status_bucket(
-                    feature_status,
-                    integrated_in_jobs=feature_jobs,
-                    integrated_in_autorun=feature_autorun,
-                )
-                if feature_bucket == "complete":
-                    complete_rows.append(feature_row)
-                elif feature_bucket == "todo":
-                    todo_rows.append(feature_row)
-                else:
-                    in_progress_rows.append(feature_row)
+                feature_created = fmeta.get("created") or ""
+                feature_updated = fmeta.get("last_updated") or ""
 
                 phases = fmeta.get("phases") or {}
-                if isinstance(phases, dict) and phases:
-                    for phase_id, phase_info in phases.items():
-                        if isinstance(phase_info, dict):
-                            phase_status = phase_info.get("status") or "unknown"
-                            phase_jobs = phase_info.get("integrated_in_jobs", feature_jobs)
-                            phase_autorun = phase_info.get("integrated_in_autorun", feature_autorun)
-                            phase_enabled = phase_info.get("enabled_by_default", feature_enabled)
-                            phase_present, phase_missing = _evidence_present(phase_info)
-                            if str(phase_status).strip().lower() in {"complete", "implemented_production"} and phase_missing:
-                                mismatches.append(f"{fid}.{phase_id}: missing {', '.join(phase_missing)}")
-                        else:
-                            phase_status = str(phase_info) or "unknown"
-                            phase_jobs = feature_jobs
-                            phase_autorun = feature_autorun
-                            phase_enabled = feature_enabled
-                            phase_present = feature_present
-                        row = {
+                if not isinstance(phases, dict):
+                    phases = {}
+
+                # Count phases and find current phase
+                total_phases = len(phases)
+                complete_count = 0
+                current_phase = ""
+                first_incomplete_phase = ""
+
+                for phase_id, phase_info in phases.items():
+                    if isinstance(phase_info, dict):
+                        phase_status = str(phase_info.get("status") or "").strip().lower()
+                        phase_jobs = phase_info.get("integrated_in_jobs", feature_jobs)
+                    else:
+                        phase_status = str(phase_info).strip().lower()
+                        phase_jobs = feature_jobs
+
+                    # Check if phase is complete
+                    phase_bucket = classify_feature_status_bucket(
+                        phase_status,
+                        integrated_in_jobs=phase_jobs if isinstance(phase_info, dict) else feature_jobs,
+                        integrated_in_autorun=phase_info.get("integrated_in_autorun", False) if isinstance(phase_info, dict) else False,
+                    )
+                    if phase_bucket == "complete":
+                        complete_count += 1
+                    else:
+                        # Track first incomplete phase as current
+                        if not first_incomplete_phase:
+                            first_incomplete_phase = phase_id
+
+                        # Add to IN PROGRESS section (remaining phases)
+                        phase_in_progress_rows.append({
                             "feature": feature_title,
-                            "feature_id": fid,
                             "phase": phase_id,
-                            "status": phase_status,
-                            "jobs": _format_jobs(phase_jobs),
-                            "autorun": _format_yes_no(phase_autorun),
-                            "enabled_by_default": _format_yes_no(phase_enabled),
-                            "evidence_present": phase_present,
-                            "how_to_enable": _format_how_to_enable(phase_info.get("how_to_enable") if isinstance(phase_info, dict) else None)
-                            or _format_how_to_enable(fmeta.get("how_to_enable")),
-                        }
-                        bucket = classify_feature_status_bucket(
-                            phase_status,
-                            integrated_in_jobs=phase_jobs,
-                            integrated_in_autorun=phase_autorun,
-                        )
-                        if bucket == "complete":
-                            complete_rows.append(row)
-                        elif bucket == "todo":
-                            todo_rows.append(row)
-                        else:
-                            in_progress_rows.append(row)
+                            "status": phase_status or "unknown",
+                            "jobs": _format_jobs(phase_jobs) if phase_jobs else "—",
+                            "created": feature_created,
+                            "updated": feature_updated,
+                        })
+
+                current_phase = first_incomplete_phase or "all complete"
+                progress = f"{complete_count}/{total_phases}" if total_phases > 0 else "—"
+
+                # Add feature-level row to TODO table
+                feature_todo_rows.append({
+                    "feature": feature_title,
+                    "current_phase": current_phase,
+                    "progress": progress,
+                    "jobs": _format_jobs(feature_jobs) if feature_jobs else "—",
+                    "created": feature_created,
+                    "updated": feature_updated,
+                })
 
             st.markdown("### Feature Status (Registry)")
             if mismatches:
                 st.warning("Status mismatch (registry says complete but code missing): " + "; ".join(mismatches))
-            if complete_rows:
-                st.markdown("**COMPLETE**")
-                st.dataframe(complete_rows, use_container_width=True, hide_index=True)
-            if in_progress_rows:
-                st.markdown("**IN PROGRESS**")
-                st.dataframe(in_progress_rows, use_container_width=True, hide_index=True)
-            if todo_rows:
-                st.markdown("**TODO**")
-                st.dataframe(todo_rows, use_container_width=True, hide_index=True)
+
+            if feature_todo_rows:
+                st.markdown("**TODO** (Features)")
+                st.dataframe(feature_todo_rows, use_container_width=True, hide_index=True)
+
+            if phase_in_progress_rows:
+                st.markdown("**IN PROGRESS** (Remaining Phases)")
+                st.dataframe(phase_in_progress_rows, use_container_width=True, hide_index=True)
 
         if not todo_docs and not complete_docs:
             st.info("No docs found in catalog.")
