@@ -5,44 +5,66 @@
     "face_alignment": {
       "title": "Face Alignment",
       "status": "partial",
-      "paths_expected": ["FEATURES/face_alignment/"],
+      "paths_expected": [
+        "FEATURES/face_alignment/"
+      ],
       "phases": {
         "A_FAN_2D": "complete",
         "B_LUVLi_quality_gate": "heuristic_stub",
         "C_3DDFA_V2": "not_started"
       },
-      "pending": ["main pipeline integration", "model-based quality"]
+      "pending": [
+        "main pipeline integration",
+        "model-based quality"
+      ]
     },
     "body_tracking": {
       "title": "Body Tracking",
       "status": "in_progress",
-      "paths_expected": ["FEATURES/body_tracking/"],
+      "paths_expected": [
+        "FEATURES/body_tracking/"
+      ],
       "phases": {
         "sandbox_runner": "implemented_sandbox",
         "pipeline_integration": "future"
       },
-      "pending": ["dependency hardening", "main pipeline integration", "QA acceptance validation"]
+      "pending": [
+        "dependency hardening",
+        "main pipeline integration",
+        "QA acceptance validation"
+      ]
     },
     "arcface_tensorrt": {
       "title": "ArcFace TensorRT",
       "status": "scaffold_only",
-      "paths_expected": ["FEATURES/arcface_tensorrt/"],
+      "paths_expected": [
+        "FEATURES/arcface_tensorrt/"
+      ],
       "phases": {
         "A_engine_building": "scaffold",
         "B_inference_wrapper": "scaffold",
         "C_comparison": "scaffold",
         "D_integration": "future"
       },
-      "pending": ["real GPU test", "full comparison/eval"]
+      "pending": [
+        "real GPU test",
+        "full comparison/eval"
+      ]
     },
     "vision_analytics": {
       "title": "Vision Analytics",
       "status": "not_started",
-      "paths_expected": ["FEATURES/vision_analytics/"],
+      "paths_expected": [
+        "FEATURES/vision_analytics/"
+      ],
       "phases": {
         "all": "not_started"
       },
-      "pending": ["create src/", "wire visibility labeling", "UI surfacing"]
+      "pending": [
+        "create src/",
+        "wire visibility labeling",
+        "UI surfacing"
+      ]
     }
   },
   "docs": [
@@ -53,11 +75,16 @@
       "status": "complete",
       "last_updated": "2025-12-15",
       "type": "canonical",
-      "tags": ["index"],
+      "tags": [
+        "index"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-13"
     },
     {
       "id": "docs-status-taxonomy",
@@ -66,11 +93,17 @@
       "status": "complete",
       "last_updated": "2025-12-15",
       "type": "reference",
-      "tags": ["meta", "status"],
+      "tags": [
+        "meta",
+        "status"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-14"
     },
     {
       "id": "docs-triage-report",
@@ -79,375 +112,597 @@
       "status": "complete",
       "last_updated": "2025-12-15",
       "type": "reference",
-      "tags": ["meta", "triage"],
-      "features": ["face_alignment", "arcface_tensorrt", "vision_analytics"],
+      "tags": [
+        "meta",
+        "triage"
+      ],
+      "features": [
+        "face_alignment",
+        "arcface_tensorrt",
+        "vision_analytics"
+      ],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-14"
     },
     {
       "id": "arch-solution",
       "title": "Solution Architecture",
       "path": "docs/architecture/solution_architecture.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "architecture",
-      "tags": ["architecture"],
+      "tags": [
+        "architecture"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "arch-directory-structure",
       "title": "Directory Structure",
       "path": "docs/architecture/directory_structure.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-16",
       "type": "architecture",
-      "tags": ["architecture"],
+      "tags": [
+        "architecture"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "pipeline-overview",
       "title": "Pipeline Overview",
       "path": "docs/pipeline/overview.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-13",
       "type": "pipeline",
-      "tags": ["pipeline"],
+      "tags": [
+        "pipeline"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["detect_track", "faces_embed", "cluster", "screentime"],
-      "ui_surfaces_expected": ["workspace-ui:2_Episode_Detail"]
+      "jobs": [
+        "detect_track",
+        "faces_embed",
+        "cluster",
+        "screentime"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:2_Episode_Detail"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "pipeline-detect-track-faces",
       "title": "Detect + Track Faces",
       "path": "docs/pipeline/detect_track_faces.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-29",
       "type": "pipeline",
-      "tags": ["pipeline", "detect", "track"],
+      "tags": [
+        "pipeline",
+        "detect",
+        "track"
+      ],
       "features": [],
-      "models": ["RetinaFace", "ByteTrack"],
-      "jobs": ["detect_track"],
-      "ui_surfaces_expected": ["workspace-ui:2_Episode_Detail"]
+      "models": [
+        "RetinaFace",
+        "ByteTrack"
+      ],
+      "jobs": [
+        "detect_track"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:2_Episode_Detail"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "pipeline-faces-harvest",
       "title": "Faces Harvest",
       "path": "docs/pipeline/faces_harvest.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-24",
       "type": "pipeline",
-      "tags": ["pipeline", "faces"],
-      "features": ["face_alignment"],
-      "models": ["ArcFace"],
-      "jobs": ["faces_embed"],
-      "ui_surfaces_expected": ["workspace-ui:2_Episode_Detail"]
+      "tags": [
+        "pipeline",
+        "faces"
+      ],
+      "features": [
+        "face_alignment"
+      ],
+      "models": [
+        "ArcFace"
+      ],
+      "jobs": [
+        "faces_embed"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:2_Episode_Detail"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "pipeline-cluster-identities",
       "title": "Cluster Identities",
       "path": "docs/pipeline/cluster_identities.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-24",
       "type": "pipeline",
-      "tags": ["pipeline", "cluster"],
+      "tags": [
+        "pipeline",
+        "cluster"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["cluster"],
-      "ui_surfaces_expected": ["workspace-ui:2_Episode_Detail"]
+      "jobs": [
+        "cluster"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:2_Episode_Detail"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "pipeline-episode-cleanup",
       "title": "Episode Cleanup",
       "path": "docs/pipeline/episode_cleanup.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-29",
       "type": "pipeline",
-      "tags": ["pipeline", "cleanup"],
+      "tags": [
+        "pipeline",
+        "cleanup"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:2_Episode_Detail"]
+      "ui_surfaces_expected": [
+        "workspace-ui:2_Episode_Detail"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "pipeline-audio",
       "title": "Audio Pipeline",
       "path": "docs/pipeline/audio_pipeline.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "pipeline",
-      "tags": ["pipeline", "audio"],
+      "tags": [
+        "pipeline",
+        "audio"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["audio"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "audio"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-29"
     },
     {
       "id": "pipeline-audio-overview",
       "title": "Audio Pipeline Overview",
       "path": "docs/pipeline/audio/overview.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "pipeline",
-      "tags": ["pipeline", "audio"],
+      "tags": [
+        "pipeline",
+        "audio"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["audio"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "audio"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "pipeline-audio-diarization-manifest",
       "title": "Diarization Manifest",
       "path": "docs/pipeline/audio/diarization_manifest.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "pipeline",
-      "tags": ["pipeline", "audio"],
+      "tags": [
+        "pipeline",
+        "audio"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["audio"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "audio"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "pipeline-screentime-optimization",
       "title": "Screentime Analytics Optimization",
       "path": "docs/pipeline/screentime_analytics_optimization.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-13",
       "type": "pipeline",
-      "tags": ["pipeline", "screentime"],
-      "features": ["vision_analytics"],
+      "tags": [
+        "pipeline",
+        "screentime"
+      ],
+      "features": [
+        "vision_analytics"
+      ],
       "models": [],
-      "jobs": ["screentime"],
-      "ui_surfaces_expected": ["workspace-ui:4_Screentime"]
+      "jobs": [
+        "screentime"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:4_Screentime"
+      ],
+      "created": "2025-12-13"
     },
     {
       "id": "pipeline-tracking-accuracy-tuning",
       "title": "Tracking Accuracy Tuning",
       "path": "docs/pipeline/tracking/tracking-accuracy-tuning.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "pipeline",
-      "tags": ["pipeline", "tracking"],
+      "tags": [
+        "pipeline",
+        "tracking"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["detect_track"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "detect_track"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-18"
     },
     {
       "id": "pipeline-tracking-strict-config",
       "title": "Tracking Strict Config",
       "path": "docs/pipeline/tracking/tracking-strict-config.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "pipeline",
-      "tags": ["pipeline", "tracking"],
+      "tags": [
+        "pipeline",
+        "tracking"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["detect_track"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "detect_track"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-18"
     },
     {
       "id": "ops-faces-review-guide",
       "title": "Faces Review Guide",
       "path": "docs/ops/faces_review_guide.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "ops",
-      "tags": ["ops", "ui"],
+      "tags": [
+        "ops",
+        "ui"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:3_Faces_Review"]
+      "ui_surfaces_expected": [
+        "workspace-ui:3_Faces_Review"
+      ],
+      "created": "2025-11-29"
     },
     {
       "id": "ops-troubleshooting-faces-pipeline",
       "title": "Troubleshooting Faces Pipeline",
       "path": "docs/ops/troubleshooting_faces_pipeline.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-29",
       "type": "ops",
-      "tags": ["ops", "troubleshooting"],
+      "tags": [
+        "ops",
+        "troubleshooting"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "ops-performance-tuning-faces-pipeline",
       "title": "Performance Tuning (Faces Pipeline)",
       "path": "docs/ops/performance_tuning_faces_pipeline.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-29",
       "type": "ops",
-      "tags": ["ops", "performance"],
+      "tags": [
+        "ops",
+        "performance"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "ops-deployment-render",
       "title": "Deployment (Render)",
       "path": "docs/ops/deployment/DEPLOYMENT_RENDER.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "ops",
-      "tags": ["ops", "deployment"],
+      "tags": [
+        "ops",
+        "deployment"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-25"
     },
     {
       "id": "ref-api",
       "title": "API Reference",
       "path": "docs/reference/api.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-13",
       "type": "reference",
-      "tags": ["reference", "api"],
+      "tags": [
+        "reference",
+        "api"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-13"
     },
     {
       "id": "ref-pipeline-configs",
       "title": "Pipeline Configs",
       "path": "docs/reference/config/pipeline_configs.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-13",
       "type": "reference",
-      "tags": ["reference", "config"],
+      "tags": [
+        "reference",
+        "config"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "ref-artifacts-faces-tracks-identities",
       "title": "Artifacts: Faces / Tracks / Identities",
       "path": "docs/reference/artifacts_faces_tracks_identities.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-24",
       "type": "reference",
-      "tags": ["reference", "schema"],
+      "tags": [
+        "reference",
+        "schema"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "ref-facebank",
       "title": "Facebank",
       "path": "docs/reference/facebank.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-11-24",
       "type": "reference",
-      "tags": ["reference"],
+      "tags": [
+        "reference"
+      ],
       "features": [],
-      "models": ["ArcFace"],
+      "models": [
+        "ArcFace"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:3_Faces_Review"]
+      "ui_surfaces_expected": [
+        "workspace-ui:3_Faces_Review"
+      ],
+      "created": "2025-11-24"
     },
     {
       "id": "ref-dev-detect-track-call-chain",
       "title": "Detect/Track Call Chain",
       "path": "docs/reference/dev/detect_track_call_chain.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "reference",
-      "tags": ["dev", "reference"],
+      "tags": [
+        "dev",
+        "reference"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["detect_track"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "detect_track"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-28"
     },
     {
       "id": "ref-dev-detect-track-regression",
       "title": "Detect/Track Regression",
       "path": "docs/reference/dev/detect_track_regression.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "reference",
-      "tags": ["dev", "reference"],
+      "tags": [
+        "dev",
+        "reference"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["detect_track"],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "jobs": [
+        "detect_track"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-28"
     },
     {
       "id": "ref-dev-episode-detail-detect-faces-cluster-audit",
       "title": "Episode Detail Detect/Faces/Cluster Audit",
       "path": "docs/reference/dev/episode_detail_detect_faces_cluster_audit.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "reference",
-      "tags": ["dev", "reference"],
+      "tags": [
+        "dev",
+        "reference"
+      ],
       "features": [],
       "models": [],
-      "jobs": ["detect_track", "faces_embed", "cluster"],
-      "ui_surfaces_expected": ["workspace-ui:2_Episode_Detail"]
+      "jobs": [
+        "detect_track",
+        "faces_embed",
+        "cluster"
+      ],
+      "ui_surfaces_expected": [
+        "workspace-ui:2_Episode_Detail"
+      ],
+      "created": "2025-11-29"
     },
     {
       "id": "ref-branching-strategy",
       "title": "Branching Strategy",
       "path": "docs/reference/branching/BRANCHING_STRATEGY.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-15",
       "type": "reference",
-      "tags": ["reference", "branching"],
+      "tags": [
+        "reference",
+        "branching"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-04"
     },
     {
       "id": "ref-golden-episodes",
       "title": "Golden Episodes",
       "path": "docs/reference/golden-episodes.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "reference",
-      "tags": ["reference", "testing"],
+      "tags": [
+        "reference",
+        "testing"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-04"
     },
     {
       "id": "ref-similarity-scores-guide",
       "title": "Similarity Scores Guide",
       "path": "docs/reference/similarity-scores-guide.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "reference",
-      "tags": ["reference", "faces"],
+      "tags": [
+        "reference",
+        "faces"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:3_Faces_Review", "workspace-ui:3_Smart_Suggestions"]
+      "ui_surfaces_expected": [
+        "workspace-ui:3_Faces_Review",
+        "workspace-ui:3_Smart_Suggestions"
+      ],
+      "created": "2025-11-18"
     },
     {
       "id": "features-sandboxes",
       "title": "Feature Sandboxes",
       "path": "docs/features/feature_sandboxes.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "features",
-      "tags": ["features", "sandbox"],
-      "features": ["face_alignment", "arcface_tensorrt", "vision_analytics"],
+      "tags": [
+        "features",
+        "sandbox"
+      ],
+      "features": [
+        "face_alignment",
+        "arcface_tensorrt",
+        "vision_analytics"
+      ],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-07"
     },
     {
       "id": "features-vision-alignment-body-tracking",
@@ -456,167 +711,280 @@
       "status": "complete",
       "last_updated": "2025-12-15",
       "type": "features",
-      "tags": ["features"],
-      "features": ["face_alignment", "arcface_tensorrt", "vision_analytics", "body_tracking"],
-      "models": ["FAN", "ArcFace", "YOLOv8", "OSNet"],
+      "tags": [
+        "features"
+      ],
+      "features": [
+        "face_alignment",
+        "arcface_tensorrt",
+        "vision_analytics",
+        "body_tracking"
+      ],
+      "models": [
+        "FAN",
+        "ArcFace",
+        "YOLOv8",
+        "OSNet"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "plan-face-alignment-roadmap",
       "title": "Feature: Face Alignment (FAN / LUVLi / 3DDFA)",
       "path": "docs/plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "in_progress"],
-      "features": ["face_alignment"],
-      "models": ["FAN"],
+      "tags": [
+        "plan",
+        "in_progress"
+      ],
+      "features": [
+        "face_alignment"
+      ],
+      "models": [
+        "FAN"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "plan-arcface-tensorrt-onnxruntime-roadmap",
       "title": "Feature: ArcFace TensorRT + ONNXRuntime",
       "path": "docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "in_progress"],
-      "features": ["arcface_tensorrt"],
-      "models": ["ArcFace"],
+      "tags": [
+        "plan",
+        "in_progress"
+      ],
+      "features": [
+        "arcface_tensorrt"
+      ],
+      "models": [
+        "ArcFace"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "plan-body-tracking-reid-fusion-roadmap",
       "title": "Feature: Body Tracking (Re-ID + Fusion)",
       "path": "docs/plans/in_progress/feature_body_tracking_reid_fusion.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "in_progress"],
-      "features": ["body_tracking"],
-      "models": ["YOLOv8", "OSNet"],
+      "tags": [
+        "plan",
+        "in_progress"
+      ],
+      "features": [
+        "body_tracking"
+      ],
+      "models": [
+        "YOLOv8",
+        "OSNet"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "plan-mesh-advanced-visibility-roadmap",
       "title": "Feature: Mesh and Advanced Visibility",
       "path": "docs/plans/in_progress/feature_mesh_and_advanced_visibility.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "in_progress"],
-      "features": ["vision_analytics"],
-      "models": ["MediaPipe"],
+      "tags": [
+        "plan",
+        "in_progress"
+      ],
+      "features": [
+        "vision_analytics"
+      ],
+      "models": [
+        "MediaPipe"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-11"
     },
     {
       "id": "plan-web-app-migration",
       "title": "Web App Migration Plan",
       "path": "docs/plans/in_progress/WEB_APP_MIGRATION_PLAN.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-15",
       "type": "plan",
-      "tags": ["plan", "in_progress"],
+      "tags": [
+        "plan",
+        "in_progress"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-03"
     },
     {
       "id": "plan-infra-deploy-plan",
       "title": "Screenalytics Deploy Plan",
       "path": "docs/plans/in_progress/infra/screenalytics_deploy_plan.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "infra"],
+      "tags": [
+        "plan",
+        "infra"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-03"
     },
     {
       "id": "plan-product-prd",
       "title": "Product Requirements Document (PRD)",
       "path": "docs/plans/in_progress/product/prd.md",
       "status": "in_progress",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "product"],
+      "tags": [
+        "plan",
+        "product"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-07"
     },
     {
       "id": "draft-face-review-suggestions",
       "title": "Face Review Suggestions",
       "path": "docs/plans/draft/ideas/FACE_REVIEW_SUGGESTIONS.md",
       "status": "draft",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "draft"],
+      "tags": [
+        "plan",
+        "draft"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-04"
     },
     {
       "id": "draft-singletons-plan",
       "title": "Singletons Plan",
       "path": "docs/plans/draft/ideas/SINGLETONS_PLAN.md",
       "status": "draft",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "draft"],
+      "tags": [
+        "plan",
+        "draft"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-04"
     },
     {
       "id": "outdated-detect-harvest-findings",
       "title": "Detect/Track & Harvest Faces review",
       "path": "docs/plans/outdated/detect_harvest_findings.md",
       "status": "outdated",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "outdated"],
+      "tags": [
+        "plan",
+        "outdated"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-11-17"
     },
     {
       "id": "audit-vision-alignment-body-tracking-status",
-      "title": "Audit: Vision Alignment / Body Tracking / Embedding Engines — Status",
+      "title": "Audit: Vision Alignment / Body Tracking / Embedding Engines \u2014 Status",
       "path": "docs/plans/complete/audit/vision_alignment_body_tracking_status.md",
       "status": "complete",
       "last_updated": "2025-12-15",
       "type": "audit",
-      "tags": ["audit"],
-      "features": ["face_alignment", "arcface_tensorrt", "vision_analytics", "body_tracking"],
-      "models": ["FAN", "ArcFace", "YOLOv8", "OSNet"],
+      "tags": [
+        "audit"
+      ],
+      "features": [
+        "face_alignment",
+        "arcface_tensorrt",
+        "vision_analytics",
+        "body_tracking"
+      ],
+      "models": [
+        "FAN",
+        "ArcFace",
+        "YOLOv8",
+        "OSNet"
+      ],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-13"
     },
     {
       "id": "plan-main-promotion-plan-2025-12",
       "title": "Main Promotion Plan (2025-12)",
       "path": "docs/plans/complete/branching/2025-12-main-promotion-plan.md",
       "status": "complete",
-      "last_updated": "unknown",
+      "last_updated": "2025-12-14",
       "type": "plan",
-      "tags": ["plan", "branching"],
+      "tags": [
+        "plan",
+        "branching"
+      ],
       "features": [],
       "models": [],
       "jobs": [],
-      "ui_surfaces_expected": ["workspace-ui:docs_dashboard"]
+      "ui_surfaces_expected": [
+        "workspace-ui:docs_dashboard"
+      ],
+      "created": "2025-12-04"
     }
   ]
 }

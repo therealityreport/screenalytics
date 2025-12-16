@@ -2900,11 +2900,14 @@ def render_page_header(page_id: str, page_title: str) -> None:
                 if str(feature_status).strip().lower() in {"complete", "implemented_production"} and feature_missing:
                     mismatches.append(f"{fid}: missing {', '.join(feature_missing)}")
 
+                feature_created = fmeta.get("created") or ""
+                feature_last_updated = fmeta.get("last_updated") or ""
                 feature_row = {
                     "feature": feature_title,
-                    "feature_id": fid,
                     "phase": "",
                     "status": feature_status,
+                    "created": feature_created,
+                    "updated": feature_last_updated,
                     "jobs": _format_jobs(feature_jobs),
                     "autorun": _format_yes_no(feature_autorun),
                     "enabled_by_default": _format_yes_no(feature_enabled),
@@ -2942,9 +2945,10 @@ def render_page_header(page_id: str, page_title: str) -> None:
                             phase_present = feature_present
                         row = {
                             "feature": feature_title,
-                            "feature_id": fid,
                             "phase": phase_id,
                             "status": phase_status,
+                            "created": feature_created,
+                            "updated": feature_last_updated,
                             "jobs": _format_jobs(phase_jobs),
                             "autorun": _format_yes_no(phase_autorun),
                             "enabled_by_default": _format_yes_no(phase_enabled),

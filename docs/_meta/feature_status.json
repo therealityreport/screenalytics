@@ -33,7 +33,7 @@
             "FEATURES/face_alignment/src/run_fan_alignment.py",
             "FEATURES/face_alignment/src/face_alignment_runner.py"
           ],
-          "notes": "FAN 68-point alignment exists as a FEATURE sandbox. Harvest can read alignment_quality from aligned_faces.jsonl if present, but FAN is NOT executed as part of any job—it must be run separately via CLI."
+          "notes": "FAN 68-point alignment exists as a FEATURE sandbox. Harvest can read alignment_quality from aligned_faces.jsonl if present, but FAN is NOT executed as part of any job\u2014it must be run separately via CLI."
         },
         "B_LUVLi_quality_gate": {
           "status": "heuristic_stub",
@@ -67,7 +67,9 @@
       "docs": [
         "docs/plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md",
         "docs/features/vision_alignment_and_body_tracking.md"
-      ]
+      ],
+      "last_updated": "2025-12-13",
+      "created": "2025-12-11"
     },
     "body_tracking": {
       "title": "Body Tracking",
@@ -118,7 +120,9 @@
       "docs": [
         "docs/plans/in_progress/feature_body_tracking_reid_fusion.md",
         "docs/features/vision_alignment_and_body_tracking.md"
-      ]
+      ],
+      "last_updated": "2025-12-13",
+      "created": "2025-12-11"
     },
     "arcface_tensorrt": {
       "title": "ArcFace TensorRT",
@@ -195,7 +199,9 @@
       "docs": [
         "docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md",
         "docs/features/vision_alignment_and_body_tracking.md"
-      ]
+      ],
+      "last_updated": "2025-12-13",
+      "created": "2025-12-11"
     },
     "vision_analytics": {
       "title": "Vision Analytics",
@@ -226,7 +232,11 @@
           "notes": "Docs/config only."
         }
       },
-      "docs": ["docs/features/vision_alignment_and_body_tracking.md"]
+      "docs": [
+        "docs/features/vision_alignment_and_body_tracking.md"
+      ],
+      "last_updated": "2025-12-13",
+      "created": "2025-12-11"
     }
   }
 }
