@@ -28,6 +28,7 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+from py_screenalytics import run_layout  # noqa: E402
 from similarity_badges import (  # noqa: E402
     SimilarityType,
     render_similarity_badge,
@@ -38,6 +39,9 @@ from similarity_badges import (  # noqa: E402
 LOGGER = logging.getLogger(__name__)
 
 cfg = helpers.init_page("Smart Suggestions")
+
+# Current run_id scope for this page (required for run-scoped mutations + artifact reads).
+_CURRENT_RUN_ID: str | None = None
 
 # Handle navigation from dialog (must be before page renders)
 if "_navigate_to_cluster" in st.session_state:
@@ -149,6 +153,74 @@ if not ep_id:
 if not ep_id:
     st.warning("Select an episode from the sidebar to continue.")
     st.stop()
+
+# Resolve run_id scope (required for run-scoped mutations + artifact reads).
+resolved_run_id: str | None = None
+qp_candidate = None
+try:
+    qp_value = st.query_params.get("run_id")
+except Exception:
+    qp_value = None
+if isinstance(qp_value, str):
+    qp_candidate = qp_value.strip()
+elif isinstance(qp_value, list) and qp_value:
+    qp_candidate = str(qp_value[0]).strip()
+if qp_candidate:
+    try:
+        normalized_qp_run_id = run_layout.normalize_run_id(qp_candidate)
+    except ValueError:
+        normalized_qp_run_id = None
+    if normalized_qp_run_id:
+        try:
+            known_run_ids = run_layout.list_run_ids(ep_id)
+        except Exception:
+            known_run_ids = []
+        try:
+            active_run_id = run_layout.read_active_run_id(ep_id)
+        except Exception:
+            active_run_id = None
+        if not known_run_ids or normalized_qp_run_id in known_run_ids or normalized_qp_run_id == active_run_id:
+            resolved_run_id = normalized_qp_run_id
+
+if not resolved_run_id:
+    try:
+        resolved_run_id = run_layout.read_active_run_id(ep_id)
+    except Exception:
+        resolved_run_id = None
+
+if not resolved_run_id:
+    # Fall back to the most recently modified run directory.
+    try:
+        candidate_run_ids = run_layout.list_run_ids(ep_id)
+    except Exception:
+        candidate_run_ids = []
+    latest_run_id: str | None = None
+    latest_mtime = -1.0
+    for candidate in candidate_run_ids:
+        try:
+            mtime = run_layout.run_root(ep_id, candidate).stat().st_mtime
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_run_id = candidate
+    resolved_run_id = latest_run_id
+
+if not resolved_run_id:
+    st.warning("Smart Suggestions requires a run-scoped attempt (run_id). Open Episode Detail to select an attempt.")
+    if st.button("Open Episode Detail", key=f"{ep_id}::smart_suggestions_missing_run_id"):
+        try:
+            st.query_params["ep_id"] = ep_id
+        except Exception:
+            pass
+        helpers.try_switch_page("pages/2_Episode_Detail.py")
+    st.stop()
+
+_CURRENT_RUN_ID = resolved_run_id
+try:
+    st.query_params["run_id"] = resolved_run_id
+except Exception:
+    pass
 
 # API helpers
 _api_base = st.session_state.get("api_base", "http://localhost:8000")
@@ -273,16 +345,19 @@ def _invalidate_suggestions_cache(ep_id: str) -> None:
     Call this after any mutation (assign, dismiss, skip, rescue, etc.)
     to ensure fresh data is fetched on next render.
     """
+    scope = _CURRENT_RUN_ID or "legacy"
     keys_to_clear = [
-        f"cast_suggestions:{ep_id}",
-        f"cast_suggestions_attempted:{ep_id}",  # Critical: allow auto-refresh after invalidation
-        f"rescued_clusters:{ep_id}",
-        f"temporal_only_clusters:{ep_id}",
-        f"embedding_mismatches:{ep_id}",
-        f"quality_only_clusters:{ep_id}",
-        f"people_cache:{ep_id}",
-        f"config_thresholds:{ep_id}",  # Episode-namespaced thresholds
-        f"dismissed_loaded:{ep_id}",  # Force re-fetch of dismissed suggestions
+        f"cast_suggestions:{ep_id}:{scope}",
+        f"smart_suggestions_id_map:{ep_id}:{scope}",
+        f"smart_suggestions_batch_id:{ep_id}:{scope}",
+        f"smart_suggestions_batches:{ep_id}:{scope}",
+        f"cast_suggestions_attempted:{ep_id}:{scope}",  # allow auto-refresh after invalidation
+        f"rescued_clusters:{ep_id}:{scope}",
+        f"temporal_only_clusters:{ep_id}:{scope}",
+        f"embedding_mismatches:{ep_id}:{scope}",
+        f"quality_only_clusters:{ep_id}:{scope}",
+        f"dismissed_suggestions:{ep_id}:{scope}",
+        f"config_thresholds:{ep_id}",  # thresholds are episode-scoped, not run-scoped
     ]
     for key in keys_to_clear:
         st.session_state.pop(key, None)
@@ -576,6 +651,13 @@ def _get_confidence_level(
     return "rest"
 
 
+def _merge_run_params(path: str, params: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    merged: Dict[str, Any] = dict(params or {})
+    if _CURRENT_RUN_ID and path.startswith("/episodes/"):
+        merged.setdefault("run_id", _CURRENT_RUN_ID)
+    return merged or None
+
+
 def _safe_api_get(path: str, params: Dict[str, Any] | None = None, timeout: int | None = None) -> ApiResult:
     """Fetch from API with structured error handling and automatic retry.
 
@@ -587,7 +669,7 @@ def _safe_api_get(path: str, params: Dict[str, Any] | None = None, timeout: int 
     url = f"{_api_base}{path}"
     session = _get_session()
     try:
-        resp = session.get(url, params=params, timeout=timeout)
+        resp = session.get(url, params=_merge_run_params(path, params), timeout=timeout)
         if resp.status_code == 200:
             return ApiResult(data=resp.json())
         # Non-200 status - extract error detail
@@ -608,7 +690,12 @@ def _safe_api_get(path: str, params: Dict[str, Any] | None = None, timeout: int 
         return ApiResult(error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
-def _api_post(path: str, payload: Dict[str, Any] | None = None, timeout: int | None = None) -> ApiResult:
+def _api_post(
+    path: str,
+    payload: Dict[str, Any] | None = None,
+    timeout: int | None = None,
+    params: Dict[str, Any] | None = None,
+) -> ApiResult:
     """POST to API with structured error handling and automatic retry.
 
     Returns ApiResult with data on success, or error details on failure.
@@ -619,7 +706,7 @@ def _api_post(path: str, payload: Dict[str, Any] | None = None, timeout: int | N
     url = f"{_api_base}{path}"
     session = _get_session()
     try:
-        resp = session.post(url, json=payload or {}, timeout=timeout)
+        resp = session.post(url, params=_merge_run_params(path, params), json=payload or {}, timeout=timeout)
         if resp.status_code in (200, 201):
             return ApiResult(data=resp.json())
         # Non-success status - extract error detail
@@ -640,7 +727,12 @@ def _api_post(path: str, payload: Dict[str, Any] | None = None, timeout: int | N
         return ApiResult(error=f"Unexpected error: {type(e).__name__}: {e}")
 
 
-def _api_patch(path: str, payload: Dict[str, Any] | None = None, timeout: int | None = None) -> ApiResult:
+def _api_patch(
+    path: str,
+    payload: Dict[str, Any] | None = None,
+    timeout: int | None = None,
+    params: Dict[str, Any] | None = None,
+) -> ApiResult:
     """PATCH to API with structured error handling and automatic retry.
 
     Returns ApiResult with data on success, or error details on failure.
@@ -651,7 +743,7 @@ def _api_patch(path: str, payload: Dict[str, Any] | None = None, timeout: int | 
     url = f"{_api_base}{path}"
     session = _get_session()
     try:
-        resp = session.patch(url, json=payload or {}, timeout=timeout)
+        resp = session.patch(url, params=_merge_run_params(path, params), json=payload or {}, timeout=timeout)
         if resp.status_code in (200, 201):
             return ApiResult(data=resp.json())
         # Non-success status - extract error detail
@@ -718,17 +810,14 @@ def _recompute_cast_suggestions(ep_id: str, show_slug: str | None) -> RecomputeR
         # Non-fatal: log warning but continue with suggestion fetch
         LOGGER.warning(f"[{ep_id}] Failed to save assignments before recompute: {save_result.error}")
 
-    # Fetch new suggestions into local variables (NOT directly into session_state)
-    # Pass min_similarity=0.01 to get ALL clusters including weak matches
-    # The UI will group them by confidence tier (auto/high/medium/low/rest)
-    cache_buster = int(time.time() * 1000)
-    suggestions_result = _safe_api_get(
-        f"/episodes/{ep_id}/cast_suggestions",
-        params={"_t": cache_buster, "min_similarity": 0.01},
+    generate_payload = {"min_similarity": 0.01, "top_k": 3, "generator_version": "cast_suggestions_v1"}
+    suggestions_result = _api_post(
+        f"/episodes/{ep_id}/smart_suggestions/generate",
+        payload=generate_payload,
+        timeout=_HEAVY_TIMEOUT,
     )
 
     if not suggestions_result.ok:
-        # API failed - return error, keep existing state intact
         return RecomputeResult(
             suggestions={},
             mismatched_embeddings=[],
@@ -736,39 +825,53 @@ def _recompute_cast_suggestions(ep_id: str, show_slug: str | None) -> RecomputeR
         )
 
     suggestions_data = suggestions_result.data or {}
+    batch_id = suggestions_data.get("batch_id")
+    suggestion_rows = suggestions_data.get("suggestions", []) or []
+
     suggestions_map: Dict[str, List[Dict[str, Any]]] = {}
-    rescued_clusters: set[str] = set()  # Track clusters with rescued/force-embedded faces
-    temporal_only_clusters: set[str] = set()  # Track clusters with temporal-based suggestions (no embeddings)
-    for entry in suggestions_data.get("suggestions", []):
-        cid = entry.get("cluster_id")
+    suggestion_id_map: Dict[str, str] = {}
+    rescued_clusters: set[str] = set()
+    temporal_only_clusters: set[str] = set()
+    dismissed_clusters: set[str] = set()
+
+    for row in suggestion_rows:
+        if not isinstance(row, dict):
+            continue
+        evidence = row.get("evidence_json") or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        cid = evidence.get("cluster_id") or row.get("target_identity_id")
         if not cid:
             continue
-        suggestions_map[cid] = entry.get("cast_suggestions", []) or []
-        # Track if this cluster was rescued (force-embedded after quality gate)
-        if entry.get("rescued"):
-            rescued_clusters.add(cid)
-        # Track if this cluster has temporal-only suggestions (based on nearby frames, no embeddings)
-        if entry.get("temporal_only"):
-            temporal_only_clusters.add(cid)
+        cid_str = str(cid)
+        cast_suggestions = evidence.get("cast_suggestions") or []
+        if isinstance(cast_suggestions, list):
+            suggestions_map[cid_str] = cast_suggestions
+        sid = row.get("suggestion_id")
+        if sid:
+            suggestion_id_map[cid_str] = str(sid)
+        if row.get("dismissed"):
+            dismissed_clusters.add(cid_str)
+        meta = evidence.get("meta") or {}
+        if isinstance(meta, dict):
+            if meta.get("rescued"):
+                rescued_clusters.add(cid_str)
+            if meta.get("temporal_only"):
+                temporal_only_clusters.add(cid_str)
 
-    # Extract dimension mismatch warnings from API response
-    mismatched_embeddings = suggestions_data.get("mismatched_embeddings", [])
+    mismatched_embeddings = suggestions_data.get("mismatched_embeddings", []) or []
+    quality_only_clusters = suggestions_data.get("quality_only_clusters", []) or []
 
-    # Extract quality-only clusters (no embeddings, all faces skipped)
-    quality_only_clusters = suggestions_data.get("quality_only_clusters", [])
-
-    # SUCCESS: Now atomically update session state
-    # Clear old state and replace with new data in one consistent operation
-    st.session_state[f"cast_suggestions:{ep_id}"] = suggestions_map
-    st.session_state[f"rescued_clusters:{ep_id}"] = rescued_clusters
-    st.session_state[f"temporal_only_clusters:{ep_id}"] = temporal_only_clusters
-    st.session_state[f"embedding_mismatches:{ep_id}"] = mismatched_embeddings
-    st.session_state[f"quality_only_clusters:{ep_id}"] = quality_only_clusters
-    st.session_state.pop(f"dismissed_suggestions:{ep_id}", None)
-    if show_slug:
-        st.session_state.pop(f"people_cache:{show_slug}", None)
-    st.session_state.pop(f"cluster_tracks:{ep_id}", None)
-    st.session_state.pop(f"identities:{ep_id}", None)
+    scope = _CURRENT_RUN_ID or "legacy"
+    st.session_state[f"cast_suggestions:{ep_id}:{scope}"] = suggestions_map
+    st.session_state[f"smart_suggestions_id_map:{ep_id}:{scope}"] = suggestion_id_map
+    if batch_id:
+        st.session_state[f"smart_suggestions_batch_id:{ep_id}:{scope}"] = str(batch_id)
+    st.session_state[f"dismissed_suggestions:{ep_id}:{scope}"] = dismissed_clusters
+    st.session_state[f"rescued_clusters:{ep_id}:{scope}"] = rescued_clusters
+    st.session_state[f"temporal_only_clusters:{ep_id}:{scope}"] = temporal_only_clusters
+    st.session_state[f"embedding_mismatches:{ep_id}:{scope}"] = mismatched_embeddings
+    st.session_state[f"quality_only_clusters:{ep_id}:{scope}"] = quality_only_clusters
 
     return RecomputeResult(
         suggestions=suggestions_map,
@@ -776,6 +879,60 @@ def _recompute_cast_suggestions(ep_id: str, show_slug: str | None) -> RecomputeR
         quality_only_clusters=quality_only_clusters,
         temporal_only_clusters=temporal_only_clusters,
     )
+
+
+def _load_suggestions_from_db(ep_id: str, batch_id: str) -> str | None:
+    """Hydrate run-scoped suggestion state for a persisted batch (DB-backed)."""
+    if not batch_id:
+        return "Missing batch_id"
+    result = _safe_api_get(
+        f"/episodes/{ep_id}/smart_suggestions",
+        params={"batch_id": batch_id, "include_dismissed": True},
+        timeout=10,
+    )
+    if not result.ok:
+        return result.error_message
+    data = result.data or {}
+    rows = data.get("suggestions", []) or []
+    suggestions_map: Dict[str, List[Dict[str, Any]]] = {}
+    suggestion_id_map: Dict[str, str] = {}
+    rescued_clusters: set[str] = set()
+    temporal_only_clusters: set[str] = set()
+    dismissed_clusters: set[str] = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        evidence = row.get("evidence_json") or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        cid = evidence.get("cluster_id") or row.get("target_identity_id")
+        if not cid:
+            continue
+        cid_str = str(cid)
+        cast_suggestions = evidence.get("cast_suggestions") or []
+        if isinstance(cast_suggestions, list):
+            suggestions_map[cid_str] = cast_suggestions
+        sid = row.get("suggestion_id")
+        if sid:
+            suggestion_id_map[cid_str] = str(sid)
+        if row.get("dismissed"):
+            dismissed_clusters.add(cid_str)
+        meta = evidence.get("meta") or {}
+        if isinstance(meta, dict):
+            if meta.get("rescued"):
+                rescued_clusters.add(cid_str)
+            if meta.get("temporal_only"):
+                temporal_only_clusters.add(cid_str)
+
+    scope = _CURRENT_RUN_ID or "legacy"
+    st.session_state[f"cast_suggestions:{ep_id}:{scope}"] = suggestions_map
+    st.session_state[f"smart_suggestions_id_map:{ep_id}:{scope}"] = suggestion_id_map
+    st.session_state[f"smart_suggestions_batch_id:{ep_id}:{scope}"] = str(batch_id)
+    st.session_state[f"dismissed_suggestions:{ep_id}:{scope}"] = dismissed_clusters
+    st.session_state[f"rescued_clusters:{ep_id}:{scope}"] = rescued_clusters
+    st.session_state[f"temporal_only_clusters:{ep_id}:{scope}"] = temporal_only_clusters
+    return None
 
 
 def _fetch_people_cached(show_id: str) -> Dict[str, Any] | None:
@@ -1097,7 +1254,24 @@ for entity in unlinked_entities:
 col1, col2 = st.columns([1, 4])
 with col1:
     if st.button("← Faces Review"):
+        try:
+            st.query_params["ep_id"] = ep_id
+            if _CURRENT_RUN_ID:
+                st.query_params["run_id"] = _CURRENT_RUN_ID
+        except Exception:
+            pass
         helpers.try_switch_page("pages/3_Faces_Review.py")
+with col2:
+    if _CURRENT_RUN_ID:
+        st.caption(f"Run: `{_CURRENT_RUN_ID}`")
+    if st.button("Change run", key=f"{ep_id}::smart_suggestions_change_run"):
+        try:
+            st.query_params["ep_id"] = ep_id
+            if _CURRENT_RUN_ID:
+                st.query_params["run_id"] = _CURRENT_RUN_ID
+        except Exception:
+            pass
+        helpers.try_switch_page("pages/2_Episode_Detail.py")
 
 # Sync to S3 option for missing thumbnails
 # Check storage backend to show appropriate UI
@@ -1111,7 +1285,12 @@ if _storage_backend == "s3":
         if st.button("📤 Sync Thumbnails to S3", key=f"{ep_id}::sync_thumbs_s3_smart", use_container_width=True):
             with st.spinner("Syncing thumbnails and crops to S3..."):
                 try:
-                    resp = requests.post(f"{_api_base}/episodes/{ep_id}/sync_thumbnails_to_s3", timeout=120)
+                    params = {"run_id": _CURRENT_RUN_ID} if _CURRENT_RUN_ID else None
+                    resp = requests.post(
+                        f"{_api_base}/episodes/{ep_id}/sync_thumbnails_to_s3",
+                        params=params,
+                        timeout=120,
+                    )
                     if resp.status_code == 200:
                         data = resp.json()
                         uploaded = data.get("uploaded_thumbs", 0) + data.get("uploaded_crops", 0)
@@ -1128,16 +1307,19 @@ if _storage_backend == "s3":
 st.markdown("---")
 
 # --- State Management Keys ---
-suggestions_key = f"cast_suggestions:{ep_id}"
-dismissed_key = f"dismissed_suggestions:{ep_id}"
-mismatches_key = f"embedding_mismatches:{ep_id}"
-status_key = f"smart_suggestions_status:{ep_id}"
-error_key = f"smart_suggestions_error:{ep_id}"
-auto_attempt_key = f"cast_suggestions_attempted:{ep_id}"
-dismissed_loaded_key = f"dismissed_loaded:{ep_id}"
-quality_only_key = f"quality_only_clusters:{ep_id}"
-rescued_clusters_key = f"rescued_clusters:{ep_id}"
-temporal_only_key = f"temporal_only_clusters:{ep_id}"
+_run_scope = _CURRENT_RUN_ID or "legacy"
+suggestions_key = f"cast_suggestions:{ep_id}:{_run_scope}"
+suggestion_id_map_key = f"smart_suggestions_id_map:{ep_id}:{_run_scope}"
+batch_key = f"smart_suggestions_batch_id:{ep_id}:{_run_scope}"
+dismissed_key = f"dismissed_suggestions:{ep_id}:{_run_scope}"
+mismatches_key = f"embedding_mismatches:{ep_id}:{_run_scope}"
+status_key = f"smart_suggestions_status:{ep_id}:{_run_scope}"
+error_key = f"smart_suggestions_error:{ep_id}:{_run_scope}"
+auto_attempt_key = f"cast_suggestions_attempted:{ep_id}:{_run_scope}"
+quality_only_key = f"quality_only_clusters:{ep_id}:{_run_scope}"
+rescued_clusters_key = f"rescued_clusters:{ep_id}:{_run_scope}"
+temporal_only_key = f"temporal_only_clusters:{ep_id}:{_run_scope}"
+batches_cache_key = f"smart_suggestions_batches:{ep_id}:{_run_scope}"
 
 # Get or fetch cast suggestions with proper status tracking
 cast_suggestions = st.session_state.get(suggestions_key, {})
@@ -1146,35 +1328,72 @@ quality_only_clusters = st.session_state.get(quality_only_key, [])
 rescued_clusters: set[str] = st.session_state.get(rescued_clusters_key, set())
 temporal_only_clusters: set[str] = st.session_state.get(temporal_only_key, set())
 
+smart_suggestion_id_map: Dict[str, str] = st.session_state.get(suggestion_id_map_key, {}) or {}
+current_batch_id: str | None = st.session_state.get(batch_key)
 
-def _load_dismissed_from_api() -> set:
-    """Load dismissed suggestions from API (persisted to disk)."""
-    try:
-        result = _safe_api_get(f"/episodes/{ep_id}/dismissed_suggestions", timeout=5)
-        if result.ok and result.data:
-            return set(result.data.get("dismissed", []))
-    except Exception as e:
-        LOGGER.debug(f"[Smart Suggestions] Failed to load dismissed from API: {e}")
-    return set()
+def _apply_smart_suggestion(cluster_id: str, cast_id_override: str | None = None) -> ApiResult:
+    """Apply a single persisted suggestion (run-scoped; batch-scoped)."""
+    batch_id = st.session_state.get(batch_key)
+    id_map: Dict[str, str] = st.session_state.get(suggestion_id_map_key, {}) or {}
+    suggestion_id = id_map.get(str(cluster_id))
+    if not batch_id or not suggestion_id:
+        return ApiResult(error="Missing batch_id or suggestion_id (generate suggestions first)")
+    payload: Dict[str, Any] = {"batch_id": str(batch_id), "suggestion_id": str(suggestion_id)}
+    if cast_id_override:
+        payload["cast_id_override"] = cast_id_override
+    return _api_post(f"/episodes/{ep_id}/smart_suggestions/apply", payload, timeout=10)
 
 
-def _save_dismissed_to_api(suggestion_ids: List[str]) -> bool:
-    """Save dismissed suggestions to API."""
-    try:
-        result = _api_post(f"/episodes/{ep_id}/dismissed_suggestions", {"suggestion_ids": suggestion_ids}, timeout=5)
-        return result.ok
-    except Exception:
+def _apply_all_suggestions_in_batch() -> ApiResult:
+    """Apply all suggestions in the current batch (run-scoped; requires batch_id)."""
+    batch_id = st.session_state.get(batch_key)
+    if not batch_id:
+        return ApiResult(error="Missing batch_id (generate suggestions first)")
+    return _api_post(
+        f"/episodes/{ep_id}/smart_suggestions/apply_all",
+        payload={"batch_id": str(batch_id)},
+        timeout=_HEAVY_TIMEOUT,
+    )
+
+
+def _save_dismissed_to_api(target_ids: List[str]) -> bool:
+    """Dismiss suggestions in the current batch (DB-backed)."""
+    batch_id = st.session_state.get(batch_key)
+    if not batch_id:
         return False
+    id_map: Dict[str, str] = st.session_state.get(suggestion_id_map_key, {}) or {}
+    id_values = set(id_map.values())
+    suggestion_ids: List[str] = []
+    for raw in target_ids:
+        if raw is None:
+            continue
+        value = str(raw)
+        if value in id_values:
+            suggestion_ids.append(value)
+            continue
+        sid = id_map.get(value)
+        if sid:
+            suggestion_ids.append(str(sid))
+    if not suggestion_ids:
+        return False
+    payload = {"batch_id": str(batch_id), "suggestion_ids": suggestion_ids, "dismissed": True}
+    result = _api_post(f"/episodes/{ep_id}/smart_suggestions/dismiss", payload, timeout=10)
+    return result.ok
 
 
 def _clear_dismissed_via_api() -> bool:
-    """Clear all dismissed suggestions via API."""
-    try:
-        url = f"{_api_base}/episodes/{ep_id}/dismissed_suggestions"
-        resp = requests.delete(url, timeout=5)
-        return resp.status_code == 200
-    except Exception:
+    """Restore all dismissed suggestions in the current batch (DB-backed)."""
+    batch_id = st.session_state.get(batch_key)
+    if not batch_id:
         return False
+    id_map: Dict[str, str] = st.session_state.get(suggestion_id_map_key, {}) or {}
+    dismissed_clusters: set = st.session_state.get(dismissed_key, set()) or set()
+    suggestion_ids = [id_map.get(str(cid)) for cid in dismissed_clusters if id_map.get(str(cid))]
+    if not suggestion_ids:
+        return True
+    payload = {"batch_id": str(batch_id), "suggestion_ids": suggestion_ids, "dismissed": False}
+    result = _api_post(f"/episodes/{ep_id}/smart_suggestions/dismiss", payload, timeout=10)
+    return result.ok
 
 
 def _archive_cluster(cluster_id: str, cluster_data: Dict[str, Any], reason: str = "user_skipped") -> bool:
@@ -1220,11 +1439,33 @@ def _archive_cluster(cluster_id: str, cluster_data: Dict[str, Any], reason: str 
         return False
 
 
-# Dismissed suggestions tracking - load from API once per session
-if dismissed_loaded_key not in st.session_state:
-    api_dismissed = _load_dismissed_from_api()
-    st.session_state[dismissed_key] = api_dismissed
-    st.session_state[dismissed_loaded_key] = True
+# Persisted batch + dismissed state (DB-backed, run-scoped).
+batches = st.session_state.get(batches_cache_key)
+if batches is None:
+    batches_result = _safe_api_get(f"/episodes/{ep_id}/smart_suggestions/batches", timeout=10)
+    batches = batches_result.data.get("batches", []) if batches_result.ok and batches_result.data else []
+    st.session_state[batches_cache_key] = batches
+
+current_batch_id = st.session_state.get(batch_key)
+if not current_batch_id and batches:
+    latest = batches[0] if isinstance(batches[0], dict) else {}
+    candidate = latest.get("batch_id")
+    if candidate:
+        current_batch_id = str(candidate)
+        st.session_state[batch_key] = current_batch_id
+
+# Hydrate state for the selected batch (without generating a new one).
+if current_batch_id and (not cast_suggestions or not st.session_state.get(suggestion_id_map_key)):
+    load_error = _load_suggestions_from_db(ep_id, current_batch_id)
+    if load_error:
+        st.session_state[status_key] = "error"
+        st.session_state[error_key] = load_error
+    else:
+        cast_suggestions = st.session_state.get(suggestions_key, {}) or {}
+        embedding_mismatches = st.session_state.get(mismatches_key, []) or []
+        quality_only_clusters = st.session_state.get(quality_only_key, []) or []
+        rescued_clusters = st.session_state.get(rescued_clusters_key, set()) or set()
+        temporal_only_clusters = st.session_state.get(temporal_only_key, set()) or set()
 
 dismissed = st.session_state.setdefault(dismissed_key, set())
 
@@ -1232,10 +1473,43 @@ dismissed = st.session_state.setdefault(dismissed_key, set())
 suggestions_status = st.session_state.get(status_key, "idle")
 suggestions_error = st.session_state.get(error_key)
 
-# Auto-refresh suggestions once when none are cached
-if not cast_suggestions and not st.session_state.get(auto_attempt_key, False):
+# Batch selector (run-scoped; DB-backed)
+if batches:
+    batch_ids: List[str] = [str(b.get("batch_id")) for b in batches if isinstance(b, dict) and b.get("batch_id")]
+    if batch_ids:
+        try:
+            selected_idx = batch_ids.index(str(current_batch_id)) if current_batch_id in batch_ids else 0
+        except Exception:
+            selected_idx = 0
+
+        def _format_batch_id(batch_id: str) -> str:
+            batch = next((b for b in batches if isinstance(b, dict) and str(b.get("batch_id")) == batch_id), {}) or {}
+            created_at = batch.get("created_at") or batch.get("created") or ""
+            version = batch.get("generator_version") or ""
+            label_parts = [batch_id]
+            if created_at:
+                label_parts.append(str(created_at))
+            if version:
+                label_parts.append(str(version))
+            return " · ".join(label_parts)
+
+        selected_batch = st.selectbox(
+            "Smart Suggestions batch",
+            options=batch_ids,
+            index=selected_idx,
+            format_func=_format_batch_id,
+            key=f"{ep_id}::{_run_scope}::smart_suggestions_batch_select",
+            help="Persisted, run-scoped suggestion batches. Generate a new batch to refresh suggestions.",
+        )
+        if selected_batch and selected_batch != current_batch_id:
+            st.session_state[batch_key] = selected_batch
+            _invalidate_suggestions_cache(ep_id)
+            st.rerun()
+
+# Auto-refresh suggestions once when none are cached and no batch exists yet.
+if not current_batch_id and not cast_suggestions and not st.session_state.get(auto_attempt_key, False):
     st.session_state[status_key] = "loading"
-    with st.spinner("Analyzing cast vs unassigned clusters..."):
+    with st.spinner("Generating run-scoped Smart Suggestions batch..."):
         result = _recompute_cast_suggestions(ep_id, show_slug)
         st.session_state[auto_attempt_key] = True
         if result.ok:
@@ -1243,8 +1517,8 @@ if not cast_suggestions and not st.session_state.get(auto_attempt_key, False):
             embedding_mismatches = result.mismatched_embeddings
             st.session_state[status_key] = "loaded"
             st.session_state.pop(error_key, None)
+            st.session_state.pop(batches_cache_key, None)
         else:
-            # Error state - keep existing suggestions (if any), show error banner
             st.session_state[status_key] = "error"
             st.session_state[error_key] = result.error
             suggestions_error = result.error
@@ -2247,38 +2521,28 @@ def render_suggestion_row(entry: Dict[str, Any], idx: int) -> None:
             # Only show Accept button if there are suggestions
             if has_suggestions and cast_id:
                 if st.button("✓ Accept", key=f"{ep_id}::sp_accept::{cluster_id}", use_container_width=True):
-                    # Find or create person for this cast member
-                    people_resp = _fetch_people_cached(show_slug)
-                    people = people_resp.get("people", []) if people_resp else []
-                    target_person = next(
-                        (p for p in people if p.get("cast_id") == cast_id),
-                        None,
-                    )
-                    target_person_id = target_person.get("person_id") if target_person else None
-
-                    payload = {
-                        "strategy": "manual",
-                        "cluster_ids": [cluster_id],
-                        "target_person_id": target_person_id,
-                        "cast_id": cast_id,
-                    }
-                    # ATOMIC: Call API first, only remove suggestion if successful
-                    result = _api_post(f"/episodes/{ep_id}/clusters/group", payload)
-                    if result.ok and result.data and result.data.get("status") == "success":
-                        # SUCCESS: Track for undo, then remove from suggestions
-                        _push_undo_action(ep_id, UndoAction(
-                            action_type="assign",
-                            ep_id=ep_id,
-                            cluster_id=cluster_id,
-                            cast_id=cast_id,
-                            cast_name=cast_name,
-                        ))
-                        st.toast(f"Assigned to {cast_name}")
-                        if cluster_id in cast_suggestions:
-                            del cast_suggestions[cluster_id]
-                        st.rerun()
+                    result = _apply_smart_suggestion(cluster_id)
+                    if result.ok and result.data:
+                        if result.data.get("status") == "success":
+                            _push_undo_action(
+                                ep_id,
+                                UndoAction(
+                                    action_type="assign",
+                                    ep_id=ep_id,
+                                    cluster_id=cluster_id,
+                                    cast_id=cast_id,
+                                    cast_name=cast_name,
+                                ),
+                            )
+                            st.toast(f"Assigned to {cast_name}")
+                            _invalidate_suggestions_cache(ep_id)
+                            st.rerun()
+                        elif result.data.get("status") == "skipped":
+                            reason = result.data.get("reason") or "skipped"
+                            st.warning(f"Skipped: {reason}")
+                        else:
+                            st.warning(f"Unexpected response: {result.data}")
                     else:
-                        # FAILURE: Keep suggestion visible, show detailed error
                         error_detail = result.error_message if result.error else "Unknown error"
                         st.error(f"⚠️ Assignment failed: {error_detail}")
                         LOGGER.error(f"[{ep_id}] Failed to accept suggestion for cluster {cluster_id}: {error_detail}")
