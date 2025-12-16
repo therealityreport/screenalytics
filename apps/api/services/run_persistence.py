@@ -219,6 +219,44 @@ class RunPersistenceService:
                 (_json(stage_state_json), run_id),
             )
 
+    def get_run(self, *, ep_id: str, run_id: str) -> dict[str, Any] | None:
+        if self._use_fake():
+            with self._fake_lock:
+                row = self._fake_runs.get(run_id)
+                if not row or row.get("ep_id") != ep_id:
+                    return None
+                return dict(row)
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    run_id,
+                    ep_id,
+                    created_at,
+                    label,
+                    stage_state_json,
+                    config_json
+                FROM runs
+                WHERE ep_id = %s AND run_id = %s
+                LIMIT 1;
+                """,
+                (ep_id, run_id),
+            )
+            row = cur.fetchone()
+        if not isinstance(row, Mapping):
+            return None
+        created_at = row.get("created_at")
+        created_at_iso = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+        return {
+            "run_id": str(row.get("run_id")),
+            "ep_id": str(row.get("ep_id")),
+            "created_at": created_at_iso,
+            "label": row.get("label"),
+            "stage_state_json": row.get("stage_state_json"),
+            "config_json": row.get("config_json"),
+        }
+
     # ------------------------------------------------------------------
     # Job runs
     # ------------------------------------------------------------------

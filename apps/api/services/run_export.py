@@ -175,13 +175,46 @@ def build_run_debug_bundle_zip(
     identities_payload = _read_json(run_root / "identities.json")
     identities_payload = identities_payload if isinstance(identities_payload, dict) else None
 
+    db_error: str | None = None
+    run_row: dict[str, Any] | None = None
+    job_runs: list[dict[str, Any]] = []
+    identity_locks: list[dict[str, Any]] = []
+    suggestion_batches: list[dict[str, Any]] = []
+    suggestions_rows: list[dict[str, Any]] = []
+    suggestion_applies: list[dict[str, Any]] = []
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_row = run_persistence_service.get_run(ep_id=ep_id, run_id=run_id_norm)
+        job_runs = run_persistence_service.list_job_runs(ep_id=ep_id, run_id=run_id_norm)
+        identity_locks = run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
+        suggestion_batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=250)
+        for batch in suggestion_batches:
+            batch_id = batch.get("batch_id") if isinstance(batch, dict) else None
+            if batch_id:
+                suggestions_rows.extend(
+                    run_persistence_service.list_suggestions(
+                        ep_id=ep_id,
+                        run_id=run_id_norm,
+                        batch_id=str(batch_id),
+                        include_dismissed=True,
+                    )
+                )
+        suggestion_applies = run_persistence_service.list_suggestion_applies(ep_id=ep_id, run_id=run_id_norm)
+    except Exception as exc:
+        db_error = str(exc)
+
     run_summary: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "ep_id": ep_id,
         "run_id": run_id_norm,
         "generated_at": _now_iso(),
         "paths": {
             "run_root": str(run_root),
+        },
+        "db": {
+            "run_record": run_row,
+            "error": db_error,
         },
         "toggles": {
             "include_artifacts": bool(include_artifacts),
@@ -205,38 +238,60 @@ def build_run_debug_bundle_zip(
         "cluster_stats": (identities_payload or {}).get("stats") if identities_payload else None,
     }
 
-    jobs_payload = {"schema_version": 1, "ep_id": ep_id, "run_id": run_id_norm, "jobs": _jobs_snapshot(run_root)}
+    jobs_payload = {
+        "schema_version": 2,
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "source": "job_runs" if not db_error else "job_runs_failed_fallback_to_disk",
+        "jobs": job_runs,
+        "supplemental_marker_jobs": _jobs_snapshot(run_root),
+        "db_error": db_error,
+    }
 
     assignments_payload = _identity_assignments_snapshot(identities_payload)
     assignments_payload["ep_id"] = ep_id
     assignments_payload["run_id"] = run_id_norm
     assignments_payload["generated_at"] = run_summary["generated_at"]
 
-    # Placeholder for lock semantics until a dedicated lock model exists.
     locks_payload = {
         "schema_version": 1,
         "ep_id": ep_id,
         "run_id": run_id_norm,
         "generated_at": run_summary["generated_at"],
-        "locks": [],
-        "note": "Identity lock semantics not yet implemented; see identities.json/manual_assignments for user-touched clusters.",
+        "locks": identity_locks,
+        "source": "identity_locks",
+        "db_error": db_error,
     }
 
-    # Attempt to include suggestion traces if present.
+    batches_payload = {
+        "schema_version": 1,
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "generated_at": run_summary["generated_at"],
+        "batches": suggestion_batches,
+        "source": "suggestion_batches",
+        "db_error": db_error,
+    }
+
     suggestions_payload = {
         "schema_version": 1,
         "ep_id": ep_id,
         "run_id": run_id_norm,
         "generated_at": run_summary["generated_at"],
-        "suggestions": [],
-        "note": "Smart suggestions are computed on-demand; persisted suggestion batches not yet implemented.",
+        "suggestions": suggestions_rows,
+        "source": "suggestions",
+        "db_error": db_error,
     }
 
-    applied_payload = _read_json(run_root / "group_log.json")
-    applied_payload = applied_payload if isinstance(applied_payload, dict) else {"entries": []}
-    applied_payload.setdefault("ep_id", ep_id)
-    applied_payload.setdefault("run_id", run_id_norm)
-    applied_payload.setdefault("generated_at", run_summary["generated_at"])
+    applied_payload = {
+        "schema_version": 1,
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "generated_at": run_summary["generated_at"],
+        "applies": suggestion_applies,
+        "source": "suggestion_applies",
+        "db_error": db_error,
+    }
 
     tmp = tempfile.NamedTemporaryFile(prefix="screenalytics_run_debug_", suffix=".zip", delete=False)
     zip_path = tmp.name
@@ -248,6 +303,10 @@ def build_run_debug_bundle_zip(
             zip_handle.writestr("jobs.json", json.dumps(jobs_payload, indent=2, ensure_ascii=False))
             zip_handle.writestr("identity_assignments.json", json.dumps(assignments_payload, indent=2, ensure_ascii=False))
             zip_handle.writestr("identity_locks.json", json.dumps(locks_payload, indent=2, ensure_ascii=False))
+            zip_handle.writestr(
+                "smart_suggestion_batches.json",
+                json.dumps(batches_payload, indent=2, ensure_ascii=False),
+            )
             zip_handle.writestr("smart_suggestions.json", json.dumps(suggestions_payload, indent=2, ensure_ascii=False))
             zip_handle.writestr(
                 "smart_suggestions_applied.json",
@@ -317,4 +376,3 @@ def build_run_debug_bundle_zip(
 
     download_name = f"screenalytics_{ep_id}_{run_id_norm}_run_debug_bundle.zip"
     return zip_path, download_name
-
