@@ -6466,6 +6466,133 @@ def _maybe_run_body_tracking(
         return payload
 
 
+def _maybe_run_body_tracking_fusion(
+    *,
+    ep_id: str,
+    run_id: str | None,
+    effective_run_id: str | None,
+) -> Dict[str, Any] | None:
+    """Run body tracking fusion and screen-time comparison.
+
+    This should be called AFTER cluster stage completes, since fusion requires:
+    - body_tracks.jsonl (from detect_track body_tracking)
+    - faces.jsonl (from faces_embed)
+    - identities.json (from cluster)
+
+    Returns payload dict on success/error, None if skipped (disabled or missing prereqs).
+    """
+    config = _load_body_tracking_config()
+    enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
+    if not enabled:
+        LOGGER.debug("[body_tracking_fusion] Body tracking disabled, skipping fusion")
+        return None
+
+    # Check prerequisites
+    manifests_dir = _manifests_dir_for_run(ep_id, run_id)
+    body_tracks_path = manifests_dir / "body_tracking" / "body_tracks.jsonl"
+    faces_path = manifests_dir / "faces.jsonl"
+    identities_path = manifests_dir / "identities.json"
+
+    if not body_tracks_path.exists():
+        LOGGER.debug("[body_tracking_fusion] body_tracks.jsonl not found, skipping fusion")
+        return None
+    if not faces_path.exists():
+        LOGGER.debug("[body_tracking_fusion] faces.jsonl not found, skipping fusion")
+        return None
+
+    output_dir = _body_tracking_dir_for_run(ep_id, run_id)
+    config_path = REPO_ROOT / "config" / "pipeline" / "body_detection.yaml"
+    fusion_config_path = REPO_ROOT / "config" / "pipeline" / "track_fusion.yaml"
+
+    started_at = _utcnow_iso()
+    try:
+        from FEATURES.body_tracking.src.body_tracking_runner import BodyTrackingRunner
+    except Exception as exc:
+        LOGGER.warning(
+            "[body_tracking_fusion] Disabled due to import error: %s",
+            exc,
+        )
+        payload = {
+            "phase": "body_tracking_fusion",
+            "status": "error",
+            "version": APP_VERSION,
+            "run_id": effective_run_id,
+            "started_at": started_at,
+            "finished_at": _utcnow_iso(),
+            "error": f"import_error: {exc}",
+        }
+        _write_run_marker(ep_id, "body_tracking_fusion", payload, run_id=run_id)
+        return payload
+
+    try:
+        # Video path not needed for fusion (only uses existing artifacts)
+        runner = BodyTrackingRunner(
+            episode_id=ep_id,
+            config_path=config_path if config_path.exists() else None,
+            fusion_config_path=fusion_config_path if fusion_config_path.exists() else None,
+            video_path=None,  # Not needed for fusion
+            output_dir=output_dir,
+            skip_existing=True,
+        )
+
+        # Run fusion (associates face tracks with body tracks)
+        fusion_path = runner.run_fusion()
+        LOGGER.info("[body_tracking_fusion] Fusion complete: %s", fusion_path)
+
+        # Run comparison (calculates face-only vs face+body screen time)
+        comparison_path: Path | None = None
+        if identities_path.exists():
+            try:
+                comparison_path = runner.run_comparison()
+                LOGGER.info("[body_tracking_fusion] Comparison complete: %s", comparison_path)
+            except Exception as exc:
+                LOGGER.warning("[body_tracking_fusion] Comparison failed: %s", exc)
+        else:
+            LOGGER.debug("[body_tracking_fusion] identities.json not found, skipping comparison")
+
+        # Promote artifacts to root manifests dir
+        if run_id:
+            promote = []
+            if fusion_path and fusion_path.exists():
+                promote.append("body_tracking/track_fusion.json")
+            if comparison_path and comparison_path.exists():
+                promote.append("body_tracking/screentime_comparison.json")
+            if runner.metrics_path.exists():
+                promote.append("body_tracking/body_metrics.json")
+            if promote:
+                _promote_run_manifests_to_root(ep_id, run_id, promote)
+
+        payload: Dict[str, Any] = {
+            "phase": "body_tracking_fusion",
+            "status": "success",
+            "version": APP_VERSION,
+            "run_id": effective_run_id,
+            "started_at": started_at,
+            "finished_at": _utcnow_iso(),
+            "artifacts": {
+                "local": {
+                    "track_fusion": str(fusion_path) if fusion_path and fusion_path.exists() else None,
+                    "screentime_comparison": str(comparison_path) if comparison_path and comparison_path.exists() else None,
+                }
+            },
+        }
+        _write_run_marker(ep_id, "body_tracking_fusion", payload, run_id=run_id)
+        return payload
+    except Exception as exc:
+        LOGGER.exception("[body_tracking_fusion] Failed for ep_id=%s run_id=%s", ep_id, effective_run_id)
+        payload = {
+            "phase": "body_tracking_fusion",
+            "status": "error",
+            "version": APP_VERSION,
+            "run_id": effective_run_id,
+            "started_at": started_at,
+            "finished_at": _utcnow_iso(),
+            "error": str(exc),
+        }
+        _write_run_marker(ep_id, "body_tracking_fusion", payload, run_id=run_id)
+        return payload
+
+
 def _run_detect_track_stage(
     args: argparse.Namespace,
     storage: StorageService | None,
@@ -8667,6 +8794,18 @@ def _run_cluster_stage(
                 run_id,
                 extra={"phase": "cluster", "status": "success", "finished_at": finished_at},
             )
+
+        # Run body tracking fusion (best-effort, requires body_tracks + faces to exist)
+        try:
+            fusion_result = _maybe_run_body_tracking_fusion(
+                ep_id=args.ep_id,
+                run_id=run_id,
+                effective_run_id=run_id or progress.run_id,
+            )
+            if fusion_result and fusion_result.get("status") == "success":
+                summary["body_tracking_fusion"] = fusion_result
+        except Exception as exc:
+            LOGGER.warning("[cluster] Body tracking fusion failed (non-fatal): %s", exc)
 
         # Now do S3 sync after completion is signaled
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
