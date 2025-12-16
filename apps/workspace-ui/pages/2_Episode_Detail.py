@@ -897,6 +897,20 @@ def _resolve_session_run_id(ep_id: str) -> str | None:
             return run_layout.normalize_run_id(candidate)
         except ValueError:
             continue
+    try:
+        qp_value = st.query_params.get("run_id")
+    except Exception:
+        qp_value = None
+    candidate = None
+    if isinstance(qp_value, str):
+        candidate = qp_value.strip()
+    elif isinstance(qp_value, list) and qp_value:
+        candidate = str(qp_value[0]).strip()
+    if candidate:
+        try:
+            return run_layout.normalize_run_id(candidate)
+        except ValueError:
+            pass
     return None
 
 
@@ -1141,58 +1155,86 @@ def _estimate_runtime_seconds(frames: int, device_value: str) -> float:
 # Improve Faces Modal (Episode Detail version)
 # =============================================================================
 
+def _improve_faces_state_key(ep_id: str, run_id: str | None, suffix: str) -> str:
+    scope = run_id or "legacy"
+    return f"{ep_id}::{scope}::improve_faces::{suffix}"
+
+
+def _session_improve_faces_state_key(ep_id: str, suffix: str) -> str:
+    return _improve_faces_state_key(ep_id, _resolve_session_run_id(ep_id), suffix)
+
+
 def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
     """Fetch initial suggestions and activate the Improve Faces modal on Episode Detail."""
+    run_id = _resolve_session_run_id(ep_id)
     # Ensure any one-shot trigger only fires once (prevents re-opening on each rerender).
-    st.session_state.pop(f"{ep_id}::trigger_improve_faces", None)
+    st.session_state.pop(_improve_faces_state_key(ep_id, run_id, "trigger"), None)
+    if not run_id:
+        st.warning("Improve Faces requires a run-scoped attempt (run_id). Select an attempt above and retry.")
+        return False
     try:
-        resp = helpers.api_get(f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions")
+        resp = helpers.api_get(
+            f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions",
+            params={"run_id": run_id},
+        )
     except Exception as exc:
         st.error(f"Failed to load Improve Faces suggestions: {exc}")
         return False
 
     suggestions = resp.get("suggestions", []) if isinstance(resp, dict) else []
     initial_done = bool(resp.get("initial_pass_done")) if isinstance(resp, dict) else False
+    active_key = _improve_faces_state_key(ep_id, run_id, "active")
+    suggestions_key = _improve_faces_state_key(ep_id, run_id, "suggestions")
+    index_key = _improve_faces_state_key(ep_id, run_id, "index")
+    empty_reason_key = _improve_faces_state_key(ep_id, run_id, "empty_reason")
+    complete_key = _improve_faces_state_key(ep_id, run_id, "complete")
 
     if not suggestions or initial_done:
         reason = "initial_done" if initial_done else "no_suggestions"
         if force:
-            st.session_state[f"{ep_id}::improve_faces_active"] = True
-            st.session_state[f"{ep_id}::improve_faces_suggestions"] = []
-            st.session_state[f"{ep_id}::improve_faces_index"] = 0
-            st.session_state[f"{ep_id}::improve_faces_empty_reason"] = reason
-            st.session_state[f"{ep_id}::improve_faces_complete"] = True
+            st.session_state[active_key] = True
+            st.session_state[suggestions_key] = []
+            st.session_state[index_key] = 0
+            st.session_state[empty_reason_key] = reason
+            st.session_state[complete_key] = True
             st.rerun()
             return True
 
-        st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-        st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-        st.session_state.pop(f"{ep_id}::improve_faces_index", None)
-        st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
-        st.session_state[f"{ep_id}::improve_faces_complete"] = True
+        st.session_state.pop(active_key, None)
+        st.session_state.pop(suggestions_key, None)
+        st.session_state.pop(index_key, None)
+        st.session_state.pop(empty_reason_key, None)
+        st.session_state[complete_key] = True
         return False
 
-    st.session_state[f"{ep_id}::improve_faces_active"] = True
-    st.session_state[f"{ep_id}::improve_faces_suggestions"] = suggestions
-    st.session_state[f"{ep_id}::improve_faces_index"] = 0
-    st.session_state.pop(f"{ep_id}::improve_faces_complete", None)
-    st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
+    st.session_state[active_key] = True
+    st.session_state[suggestions_key] = suggestions
+    st.session_state[index_key] = 0
+    st.session_state.pop(complete_key, None)
+    st.session_state.pop(empty_reason_key, None)
     st.rerun()
     return True
 
 
 def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
     """Render Improve Faces dialog on Episode Detail page if active."""
-    if not st.session_state.get(f"{ep_id}::improve_faces_active"):
+    run_id = _resolve_session_run_id(ep_id)
+    active_key = _improve_faces_state_key(ep_id, run_id, "active")
+    if not st.session_state.get(active_key):
         return
 
-    suggestions = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
-    idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+    suggestions_key = _improve_faces_state_key(ep_id, run_id, "suggestions")
+    index_key = _improve_faces_state_key(ep_id, run_id, "index")
+    empty_reason_key = _improve_faces_state_key(ep_id, run_id, "empty_reason")
+    complete_key = _improve_faces_state_key(ep_id, run_id, "complete")
+
+    suggestions = st.session_state.get(suggestions_key, []) or []
+    idx = st.session_state.get(index_key, 0) or 0
 
     @st.dialog("Improve Face Clustering", width="large")
     def _dialog():
-        suggestions_local = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
-        current_idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+        suggestions_local = st.session_state.get(suggestions_key, []) or []
+        current_idx = st.session_state.get(index_key, 0) or 0
 
         def _render_thumb(url: str | None) -> None:
             """Render face crop filling the column width."""
@@ -1202,7 +1244,7 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
             st.image(url, use_container_width=True)
 
         if not suggestions_local or current_idx >= len(suggestions_local):
-            empty_reason = st.session_state.get(f"{ep_id}::improve_faces_empty_reason")
+            empty_reason = st.session_state.get(empty_reason_key)
             if empty_reason == "initial_done":
                 st.info("Improve Faces initial pass already completed for this episode.")
             elif empty_reason == "no_suggestions":
@@ -1212,19 +1254,32 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Faces Review", type="primary", use_container_width=True, key="improve_go_faces_review"):
-                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
-                    st.session_state[f"{ep_id}::improve_faces_complete"] = True
+                    st.session_state.pop(active_key, None)
+                    st.session_state.pop(suggestions_key, None)
+                    st.session_state.pop(index_key, None)
+                    st.session_state.pop(empty_reason_key, None)
+                    st.session_state[complete_key] = True
+                    try:
+                        qp = st.query_params
+                        qp["ep_id"] = ep_id
+                        if run_id:
+                            qp["run_id"] = run_id
+                        else:
+                            try:
+                                del qp["run_id"]
+                            except Exception:
+                                pass
+                        st.query_params = qp
+                    except Exception:
+                        pass
                     st.switch_page("pages/3_Faces_Review.py")
             with col2:
                 if st.button("Close", use_container_width=True, key="improve_close"):
-                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
-                    st.session_state[f"{ep_id}::improve_faces_complete"] = True
+                    st.session_state.pop(active_key, None)
+                    st.session_state.pop(suggestions_key, None)
+                    st.session_state.pop(index_key, None)
+                    st.session_state.pop(empty_reason_key, None)
+                    st.session_state[complete_key] = True
                     st.rerun()
             return
 
@@ -1256,7 +1311,7 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
         btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 1])
 
         def _advance():
-            st.session_state[f"{ep_id}::improve_faces_index"] = current_idx + 1
+            st.session_state[index_key] = current_idx + 1
 
         with btn_col1:
             if st.button("Yes", type="primary", use_container_width=True, key=f"ep_improve_yes_{current_idx}"):
@@ -1269,7 +1324,11 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
                     "execution_mode": "redis" if exec_mode != "local" else "local",
                 }
                 try:
-                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
+                    helpers.api_post(
+                        f"/episodes/{ep_id}/face_review/decision/start",
+                        json=payload,
+                        params={"run_id": run_id},
+                    )
                     _advance()
                 except Exception as exc:
                     st.error(f"Failed to save merge decision: {exc}")
@@ -1286,7 +1345,11 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
                     "execution_mode": "redis" if exec_mode != "local" else "local",
                 }
                 try:
-                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
+                    helpers.api_post(
+                        f"/episodes/{ep_id}/face_review/decision/start",
+                        json=payload,
+                        params={"run_id": run_id},
+                    )
                     _advance()
                 except Exception as exc:
                     st.error(f"Failed to save reject decision: {exc}")
@@ -1294,10 +1357,10 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
 
         with btn_col3:
             if st.button("Skip All", use_container_width=True, key=f"ep_improve_skip_{current_idx}"):
-                st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-                st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-                st.session_state.pop(f"{ep_id}::improve_faces_index", None)
-                st.session_state[f"{ep_id}::improve_faces_complete"] = True
+                st.session_state.pop(active_key, None)
+                st.session_state.pop(suggestions_key, None)
+                st.session_state.pop(index_key, None)
+                st.session_state[complete_key] = True
                 st.rerun()
 
     _dialog()
@@ -1784,14 +1847,14 @@ _autorun_navigate_key = f"{ep_id}::autorun_navigate_to_suggestions"
 st.session_state.pop(_autorun_navigate_key, None)
 
 # Trigger Improve Faces modal if flag is set (after cluster completion)
-if st.session_state.get(f"{ep_id}::trigger_improve_faces"):
+if st.session_state.get(_session_improve_faces_state_key(ep_id, "trigger")):
     LOGGER.info("[IMPROVE_FACES] Trigger flag detected, starting Improve Faces modal")
     _start_improve_faces_ep_detail(ep_id, force=True)
 
 # Render Improve Faces modal if active
 _render_improve_faces_modal_ep_detail(ep_id)
 # Skip heavy page rendering while modal is open to speed up YES/NO flows
-if st.session_state.get(f"{ep_id}::improve_faces_active"):
+if st.session_state.get(_session_improve_faces_state_key(ep_id, "active")):
     st.stop()
 
 running_job_key = f"{ep_id}::pipeline_job_running"
@@ -1842,6 +1905,7 @@ if _active_run_id_key not in st.session_state:
     st.session_state[_active_run_id_key] = ""
 selected_attempt_raw = st.session_state.get(_active_run_id_key)
 selected_attempt = selected_attempt_raw.strip() if isinstance(selected_attempt_raw, str) else ""
+attempt_locked = False
 
 # Streamlit doesn't allow mutating the session_state for an instantiated widget key.
 # When other UI actions (e.g., Auto-Run) need to programmatically change the selected
@@ -1852,12 +1916,35 @@ if isinstance(_pending_attempt, str) and _pending_attempt.strip():
     st.session_state[_active_run_id_key] = selected_attempt
     st.session_state[_status_force_refresh_key(ep_id)] = True
     st.session_state[_attempt_init_key] = True
+    attempt_locked = True
 
 if st.session_state.pop(_new_attempt_requested_key, False):
     selected_attempt = uuid.uuid4().hex
     st.session_state[_active_run_id_key] = selected_attempt
     st.session_state[_status_force_refresh_key(ep_id)] = True
     st.session_state[_attempt_init_key] = True
+    attempt_locked = True
+
+if not attempt_locked:
+    try:
+        qp_run_id_value = st.query_params.get("run_id")
+    except Exception:
+        qp_run_id_value = None
+    qp_candidate = None
+    if isinstance(qp_run_id_value, str):
+        qp_candidate = qp_run_id_value.strip()
+    elif isinstance(qp_run_id_value, list) and qp_run_id_value:
+        qp_candidate = str(qp_run_id_value[0]).strip()
+    if qp_candidate:
+        try:
+            normalized_qp_run_id = run_layout.normalize_run_id(qp_candidate)
+        except ValueError:
+            normalized_qp_run_id = None
+        if normalized_qp_run_id and normalized_qp_run_id != selected_attempt:
+            selected_attempt = normalized_qp_run_id
+            st.session_state[_active_run_id_key] = selected_attempt
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            st.session_state[_attempt_init_key] = True
 
 if not st.session_state.get(_attempt_init_key) and not selected_attempt:
     try:
@@ -1868,6 +1955,26 @@ if not st.session_state.get(_attempt_init_key) and not selected_attempt:
         selected_attempt = persisted_run_id.strip()
         st.session_state[_active_run_id_key] = selected_attempt
         st.session_state[_attempt_init_key] = True
+    else:
+        # If no active_run.json exists yet, fall back to the most recently modified run directory.
+        try:
+            candidate_run_ids = run_layout.list_run_ids(ep_id)
+        except Exception:
+            candidate_run_ids = []
+        latest_run_id: str | None = None
+        latest_mtime = -1.0
+        for candidate in candidate_run_ids:
+            try:
+                mtime = run_layout.run_root(ep_id, candidate).stat().st_mtime
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest_run_id = candidate
+        if latest_run_id:
+            selected_attempt = latest_run_id
+            st.session_state[_active_run_id_key] = selected_attempt
+            st.session_state[_attempt_init_key] = True
 
 # Normalize/validate selected attempt (invalid values fall back to legacy).
 selected_attempt_run_id: str | None = None
@@ -1877,6 +1984,24 @@ if selected_attempt:
     except ValueError:
         st.session_state[_active_run_id_key] = ""
         selected_attempt_run_id = None
+
+# Keep run_id in the URL so cross-page navigation stays run-scoped.
+try:
+    current_run_qp = st.query_params.get("run_id", "") or ""
+    desired_run_qp = selected_attempt_run_id or ""
+    if current_run_qp != desired_run_qp:
+        qp = st.query_params
+        if desired_run_qp:
+            qp["run_id"] = desired_run_qp
+        else:
+            try:
+                del qp["run_id"]
+            except Exception:
+                pass
+        st.query_params = qp
+except Exception:
+    # Query param sync is best-effort; do not block page rendering.
+    pass
 
 _manifests_root = get_path(ep_id, "detections").parent
 _runs_root = _manifests_root / "runs"
@@ -2398,6 +2523,54 @@ with st.expander("Pipeline Status", expanded=False):
     if isinstance(api_active_run_id, str) and api_active_run_id.strip():
         if api_active_run_id.strip() != selected_attempt_label:
             st.caption(f"API active_run_id: `{api_active_run_id.strip()}`")
+
+    nav_disabled = not bool(selected_attempt_run_id)
+    nav_help = "Select a run-scoped attempt (run_id) above." if nav_disabled else None
+    nav_col1, nav_col2 = st.columns(2)
+    with nav_col1:
+        if st.button(
+            "Faces Review",
+            key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::nav_faces_review",
+            use_container_width=True,
+            disabled=nav_disabled,
+            help=nav_help,
+        ):
+            try:
+                qp = st.query_params
+                qp["ep_id"] = ep_id
+                if selected_attempt_run_id:
+                    qp["run_id"] = selected_attempt_run_id
+                else:
+                    try:
+                        del qp["run_id"]
+                    except Exception:
+                        pass
+                st.query_params = qp
+            except Exception:
+                pass
+            st.switch_page("pages/3_Faces_Review.py")
+    with nav_col2:
+        if st.button(
+            "Smart Suggestions",
+            key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::nav_smart_suggestions",
+            use_container_width=True,
+            disabled=nav_disabled,
+            help=nav_help,
+        ):
+            try:
+                qp = st.query_params
+                qp["ep_id"] = ep_id
+                if selected_attempt_run_id:
+                    qp["run_id"] = selected_attempt_run_id
+                else:
+                    try:
+                        del qp["run_id"]
+                    except Exception:
+                        pass
+                st.query_params = qp
+            except Exception:
+                pass
+            st.switch_page("pages/3_Smart_Suggestions.py")
     coreml_available = status_payload.get("coreml_available") if status_payload else None
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
@@ -2937,32 +3110,39 @@ with st.container():
                     st.error("Auto-run is disabled (missing video or another job is running).")
                     st.stop()
 
+                new_run_id = uuid.uuid4().hex
+
                 # Always reset review state when starting auto-run (best-effort; don't block pipeline start).
                 with st.spinner("Resetting review state..."):
                     try:
                         helpers.api_post(
                             f"/episodes/{ep_id}/dismissed_suggestions/reset_state",
                             json={"archive_existing": True},
+                            params={"run_id": new_run_id},
                             timeout=15,
                         )
                         helpers.api_post(
                             f"/episodes/{ep_id}/face_review/reset_state",
                             json={"archive_existing": True},
+                            params={"run_id": new_run_id},
                             timeout=15,
                         )
                     except Exception as exc:
                         LOGGER.warning("[AUTORUN] Reset review state failed (continuing anyway): %s", exc)
 
                 # Clear local UI session state so the next cluster run can re-open Improve Faces cleanly.
+                for suffix in ("complete", "active", "suggestions", "index", "empty_reason", "trigger"):
+                    st.session_state.pop(_improve_faces_state_key(ep_id, new_run_id, suffix), None)
                 for key in (
                     f"{ep_id}::improve_faces_complete",
                     f"{ep_id}::improve_faces_active",
                     f"{ep_id}::improve_faces_suggestions",
                     f"{ep_id}::improve_faces_index",
+                    f"{ep_id}::improve_faces_empty_reason",
+                    f"{ep_id}::trigger_improve_faces",
                 ):
                     st.session_state.pop(key, None)
 
-                new_run_id = uuid.uuid4().hex
                 st.session_state[_autorun_run_id_key] = new_run_id
                 # Do not modify the attempt selector widget key after it is created.
                 # Instead, set a pending value that is applied at the top of the script
@@ -4437,8 +4617,9 @@ with col_cluster:
             st.session_state[cluster_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            # Trigger Improve Faces when cluster finishes
-            st.session_state[f"{ep_id}::trigger_improve_faces"] = True
+            # Trigger Improve Faces when cluster finishes (run-scoped).
+            if selected_attempt_run_id:
+                st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
 
             # Check if auto-run is active - this is the final phase, mark complete
             if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
@@ -4446,7 +4627,10 @@ with col_cluster:
                 st.session_state[_autorun_key] = False
                 st.session_state[_autorun_phase_key] = None
             # Trigger Improve Faces modal on this page (not redirect)
-            st.caption("Opening Improve Faces...")
+            if selected_attempt_run_id:
+                st.caption("Opening Improve Faces...")
+            else:
+                st.caption("Cluster complete (legacy run). Select a run-scoped attempt (run_id) to use Improve Faces.")
             time.sleep(0.3)
             st.rerun()
 
@@ -4601,6 +4785,9 @@ with col_cluster:
         st.warning(f"⚠️ A cluster job is already running ({running_cluster_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
 
     def _auto_group_clusters(ep_id: str) -> Tuple[Dict[str, Any] | None, str | None]:
+        run_id = selected_attempt_run_id or _resolve_session_run_id(ep_id)
+        if not run_id:
+            return None, "Select a non-legacy attempt (run_id) before grouping clusters."
         payload = {
             "strategy": "auto",
             "protect_manual": True,
@@ -4608,7 +4795,12 @@ with col_cluster:
             "skip_cast_assignment": False,  # Auto-assign clusters to cast members
         }
         try:
-            resp = helpers.api_post(f"/episodes/{ep_id}/clusters/group", json=payload, timeout=300)
+            resp = helpers.api_post(
+                f"/episodes/{ep_id}/clusters/group",
+                json=payload,
+                params={"run_id": run_id},
+                timeout=300,
+            )
         except requests.RequestException as exc:
             return None, helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}/clusters/group", exc)
         if not resp:
@@ -4849,10 +5041,16 @@ with col_cluster:
                 st.session_state["episode_detail_flash"] = flash_msg
 
                 # Trigger Improve Faces modal on this page (not redirect)
-                st.session_state[f"{ep_id}::trigger_improve_faces"] = True
-                LOGGER.info("[CLUSTER_COMPLETE] Set trigger flag for Improve Faces modal, ep_id=%s", ep_id)
-
-                st.toast("🎯 Cluster complete! Opening Improve Faces...")
+                if selected_attempt_run_id:
+                    st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
+                    LOGGER.info(
+                        "[CLUSTER_COMPLETE] Set trigger flag for Improve Faces modal, ep_id=%s run_id=%s",
+                        ep_id,
+                        selected_attempt_run_id,
+                    )
+                    st.toast("🎯 Cluster complete! Opening Improve Faces...")
+                else:
+                    st.toast("🎯 Cluster complete! Select a run-scoped attempt (run_id) to use Improve Faces.")
                 st.rerun()
 
     # Keep latest cluster log handy for copy/paste
@@ -4861,16 +5059,121 @@ with col_cluster:
     # Show appropriate button based on state
     if cluster_status_value == "success":
         # If Improve Faces was completed, show "FACES REVIEW" button
-        if st.session_state.get(f"{ep_id}::improve_faces_complete"):
-            if st.button("📋 FACES REVIEW", key=f"faces_review_cta_{ep_id}", use_container_width=True, type="primary"):
+        improve_faces_complete = bool(
+            st.session_state.get(_improve_faces_state_key(ep_id, selected_attempt_run_id, "complete"))
+        )
+        if improve_faces_complete:
+            faces_review_disabled = not bool(selected_attempt_run_id)
+            if st.button(
+                "📋 FACES REVIEW",
+                key=f"faces_review_cta_{ep_id}",
+                use_container_width=True,
+                type="primary",
+                disabled=faces_review_disabled,
+                help="Select a run-scoped attempt (run_id) to review this run." if faces_review_disabled else None,
+            ):
+                try:
+                    qp = st.query_params
+                    qp["ep_id"] = ep_id
+                    if selected_attempt_run_id:
+                        qp["run_id"] = selected_attempt_run_id
+                    else:
+                        try:
+                            del qp["run_id"]
+                        except Exception:
+                            pass
+                    st.query_params = qp
+                except Exception:
+                    pass
                 st.switch_page("pages/3_Faces_Review.py")
         else:
             # Manual Improve Faces launcher
-            if st.button("🎯 Improve Faces", key=f"improve_faces_cta_{ep_id}", use_container_width=True):
-                st.session_state[f"{ep_id}::trigger_improve_faces"] = True
+            improve_faces_disabled = not bool(selected_attempt_run_id)
+            if st.button(
+                "🎯 Improve Faces",
+                key=f"improve_faces_cta_{ep_id}",
+                use_container_width=True,
+                disabled=improve_faces_disabled,
+                help="Select a run-scoped attempt (run_id) to enable Improve Faces." if improve_faces_disabled else None,
+            ):
+                st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
                 st.rerun()
 
     st.divider()
+
+st.subheader("Debug / Export")
+if not selected_attempt_run_id:
+    st.info("Select a non-legacy attempt (run_id) to export a run-scoped debug bundle.")
+else:
+    st.caption(f"Exporting run_id: `{selected_attempt_run_id}`")
+    opt_key_prefix = f"{ep_id}::{selected_attempt_run_id}::export_bundle"
+    include_artifacts = st.checkbox(
+        "Include raw artifacts (tracks/faces/identities)",
+        value=True,
+        key=f"{opt_key_prefix}::include_artifacts",
+    )
+    include_images = st.checkbox(
+        "Include thumbnails/crops/frames (very large)",
+        value=False,
+        key=f"{opt_key_prefix}::include_images",
+    )
+    include_logs = st.checkbox(
+        "Include logs (recommended)",
+        value=True,
+        key=f"{opt_key_prefix}::include_logs",
+    )
+
+    export_state_key = f"{opt_key_prefix}::payload"
+    export_clicked = st.button(
+        "Export Run Debug Bundle",
+        key=f"{opt_key_prefix}::export",
+        type="primary",
+        use_container_width=False,
+    )
+    if export_clicked:
+        with st.spinner("Building run debug bundle…"):
+            url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{selected_attempt_run_id}/export"
+            params = {
+                "include_artifacts": "1" if include_artifacts else "0",
+                "include_images": "1" if include_images else "0",
+                "include_logs": "1" if include_logs else "0",
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=300)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error(url, exc))
+            else:
+                content_disp = resp.headers.get("Content-Disposition", "") or ""
+                filename = None
+                if "filename=" in content_disp:
+                    filename = content_disp.split("filename=", 1)[1].strip().strip('"')
+                if not filename:
+                    filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+                st.session_state[export_state_key] = {
+                    "filename": filename,
+                    "bytes": resp.content,
+                }
+
+    bundle = st.session_state.get(export_state_key)
+    if isinstance(bundle, dict) and bundle.get("bytes"):
+        file_bytes = bundle.get("bytes") or b""
+        filename = bundle.get("filename") or f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+        try:
+            st.caption(f"Bundle ready: {len(file_bytes) / 1_048_576:.1f} MiB")
+        except Exception:
+            pass
+        st.download_button(
+            "Download .zip",
+            data=file_bytes,
+            file_name=filename,
+            mime="application/zip",
+            key=f"{opt_key_prefix}::download",
+            use_container_width=False,
+        )
+        if st.button("Clear bundle", key=f"{opt_key_prefix}::clear_bundle"):
+            st.session_state.pop(export_state_key, None)
+            st.rerun()
 
 st.subheader("Artifacts")
 
@@ -5013,7 +5316,7 @@ if _execution_mode == "local" and not _any_job_running:
 
 if _local_job_just_completed:
     # Local mode job just completed - refresh once to show updated status
-    if st.session_state.get(f"{ep_id}::trigger_improve_faces"):
+    if st.session_state.get(_session_improve_faces_state_key(ep_id, "trigger")):
         st.caption("✅ Cluster completed! Opening Improve Faces...")
         import time as _time
         _time.sleep(0.5)

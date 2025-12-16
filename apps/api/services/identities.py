@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Sequence
 
 from py_screenalytics.artifacts import get_path
+from py_screenalytics import run_layout
 
 from apps.api.services import roster as roster_service
 from apps.api.services.storage import (
@@ -43,19 +44,45 @@ def _episode_lock(ep_id: str) -> Generator[None, None, None]:
             lock_file.close()
 
 
-def _manifests_dir(ep_id: str) -> Path:
+def _normalize_run_id(run_id: str | None) -> str | None:
+    if run_id is None:
+        return None
+    candidate = str(run_id).strip()
+    if not candidate:
+        return None
+    try:
+        return run_layout.normalize_run_id(candidate)
+    except ValueError:
+        return None
+
+
+def _qualified_cluster_ref(ep_id: str, cluster_id: str, *, run_id: str | None = None) -> str:
+    """Stable cluster reference for PeopleService (avoids cross-run collisions)."""
+    run_id_norm = _normalize_run_id(run_id)
+    if run_id_norm:
+        return f"{ep_id}:{run_id_norm}:{cluster_id}"
+    return f"{ep_id}:{cluster_id}"
+
+
+def _manifests_dir(ep_id: str, *, run_id: str | None = None) -> Path:
+    run_id_norm = _normalize_run_id(run_id)
+    if run_id_norm:
+        return run_layout.run_root(ep_id, run_id_norm)
     return get_path(ep_id, "detections").parent
 
 
-def _faces_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "faces.jsonl"
+def _faces_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    return _manifests_dir(ep_id, run_id=run_id) / "faces.jsonl"
 
 
-def _identities_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "identities.json"
+def _identities_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    return _manifests_dir(ep_id, run_id=run_id) / "identities.json"
 
 
-def _tracks_path(ep_id: str) -> Path:
+def _tracks_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    run_id_norm = _normalize_run_id(run_id)
+    if run_id_norm:
+        return _manifests_dir(ep_id, run_id=run_id_norm) / "tracks.jsonl"
     return get_path(ep_id, "tracks")
 
 
@@ -168,24 +195,24 @@ def _write_json_lines(path: Path, rows: List[Dict[str, Any]]) -> Path:
     return path
 
 
-def load_faces(ep_id: str) -> List[Dict[str, Any]]:
-    return _read_json_lines(_faces_path(ep_id))
+def load_faces(ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
+    return _read_json_lines(_faces_path(ep_id, run_id=run_id))
 
 
-def write_faces(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
-    return _write_json_lines(_faces_path(ep_id), rows)
+def write_faces(ep_id: str, rows: List[Dict[str, Any]], *, run_id: str | None = None) -> Path:
+    return _write_json_lines(_faces_path(ep_id, run_id=run_id), rows)
 
 
-def load_tracks(ep_id: str) -> List[Dict[str, Any]]:
-    return _read_json_lines(_tracks_path(ep_id))
+def load_tracks(ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
+    return _read_json_lines(_tracks_path(ep_id, run_id=run_id))
 
 
-def write_tracks(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
-    return _write_json_lines(_tracks_path(ep_id), rows)
+def write_tracks(ep_id: str, rows: List[Dict[str, Any]], *, run_id: str | None = None) -> Path:
+    return _write_json_lines(_tracks_path(ep_id, run_id=run_id), rows)
 
 
-def load_identities(ep_id: str) -> Dict[str, Any]:
-    path = _identities_path(ep_id)
+def load_identities(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
+    path = _identities_path(ep_id, run_id=run_id)
     if not path.exists():
         return {"ep_id": ep_id, "identities": [], "stats": {}}
     try:
@@ -194,8 +221,8 @@ def load_identities(ep_id: str) -> Dict[str, Any]:
         return {"ep_id": ep_id, "identities": [], "stats": {}}
 
 
-def write_identities(ep_id: str, payload: Dict[str, Any]) -> Path:
-    path = _identities_path(ep_id)
+def write_identities(ep_id: str, payload: Dict[str, Any], *, run_id: str | None = None) -> Path:
+    path = _identities_path(ep_id, run_id=run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -216,9 +243,9 @@ def _fast_line_count(path: Path) -> int:
     return count
 
 
-def update_identity_stats(ep_id: str, payload: Dict[str, Any]) -> None:
+def update_identity_stats(ep_id: str, payload: Dict[str, Any], *, run_id: str | None = None) -> None:
     # Fast line count instead of loading entire faces.jsonl
-    faces_count = _fast_line_count(_faces_path(ep_id))
+    faces_count = _fast_line_count(_faces_path(ep_id, run_id=run_id))
     payload.setdefault("stats", {})
     payload["stats"]["faces"] = faces_count
     payload["stats"]["clusters"] = len(payload.get("identities", []))
@@ -237,11 +264,19 @@ def sync_manifests(ep_id: str, *paths: Path, async_upload: bool = False) -> None
     except ValueError:
         return
 
+    manifests_root = get_path(ep_id, "detections").parent
+
+    def _key_rel(path: Path) -> str:
+        try:
+            return path.relative_to(manifests_root).as_posix()
+        except ValueError:
+            return path.name
+
     def _do_sync():
         for path in paths:
             if path and path.exists():
                 try:
-                    STORAGE.put_artifact(ctx, "manifests", path, path.name)
+                    STORAGE.put_artifact(ctx, "manifests", path, _key_rel(path))
                 except Exception:
                     continue
 
@@ -388,11 +423,12 @@ def cluster_track_summary(
     *,
     include: Iterable[str] | None = None,
     limit_per_cluster: int | None = None,
+    run_id: str | None = None,
 ) -> Dict[str, Any]:
     include_set = {identity.lower() for identity in include} if include else None
-    identities_payload = load_identities(ep_id)
-    tracks = load_tracks(ep_id)
-    faces = load_faces(ep_id)
+    identities_payload = load_identities(ep_id, run_id=run_id)
+    tracks = load_tracks(ep_id, run_id=run_id)
+    faces = load_faces(ep_id, run_id=run_id)
     track_lookup = _track_lookup(tracks)
 
     # Load cluster centroids for cohesion data and track similarity computation
@@ -403,7 +439,7 @@ def cluster_track_summary(
         from apps.api.services.track_reps import load_cluster_centroids, load_track_reps
         import numpy as np
 
-        centroids = load_cluster_centroids(ep_id)
+        centroids = load_cluster_centroids(ep_id, run_id=run_id)
         for cluster_id, cluster_data in centroids.items():
             if isinstance(cluster_data, dict):
                 if cluster_data.get("cohesion") is not None:
@@ -412,7 +448,7 @@ def cluster_track_summary(
                     cluster_centroids_data[cluster_id] = cluster_data
 
         # Load track reps for similarity computation
-        track_reps_data = load_track_reps(ep_id)
+        track_reps_data = load_track_reps(ep_id, run_id=run_id)
     except Exception:
         pass  # Cohesion/similarity data not available
     face_counts: Dict[int, int] = {}
@@ -631,8 +667,8 @@ def _write_track_index(ep_id: str, track_id: int, face_rows: Sequence[Dict[str, 
         pass
 
 
-def rename_identity(ep_id: str, identity_id: str, label: str | None) -> Dict[str, Any]:
-    payload = load_identities(ep_id)
+def rename_identity(ep_id: str, identity_id: str, label: str | None, *, run_id: str | None = None) -> Dict[str, Any]:
+    payload = load_identities(ep_id, run_id=run_id)
     identity = next(
         (item for item in payload.get("identities", []) if item.get("identity_id") == identity_id),
         None,
@@ -641,14 +677,14 @@ def rename_identity(ep_id: str, identity_id: str, label: str | None) -> Dict[str
         raise ValueError("identity_not_found")
     normalized = (label or "").strip()
     identity["label"] = normalized or None
-    update_identity_stats(ep_id, payload)
-    identities_path = write_identities(ep_id, payload)
+    update_identity_stats(ep_id, payload, run_id=run_id)
+    identities_path = write_identities(ep_id, payload, run_id=run_id)
     sync_manifests(ep_id, identities_path)
     return identity
 
 
-def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, Any]:
-    payload = load_identities(ep_id)
+def merge_identities(ep_id: str, source_id: str, target_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
+    payload = load_identities(ep_id, run_id=run_id)
     identities = payload.get("identities", [])
     source = next((item for item in identities if item.get("identity_id") == source_id), None)
     target = next((item for item in identities if item.get("identity_id") == target_id), None)
@@ -660,15 +696,17 @@ def merge_identities(ep_id: str, source_id: str, target_id: str) -> Dict[str, An
     merged = target_tids | source_tids
     target["track_ids"] = sorted(merged)
     payload["identities"] = [item for item in identities if item.get("identity_id") != source_id]
-    update_identity_stats(ep_id, payload)
-    identities_path = write_identities(ep_id, payload)
+    update_identity_stats(ep_id, payload, run_id=run_id)
+    identities_path = write_identities(ep_id, payload, run_id=run_id)
     # Async S3 upload for snappy UI response
     sync_manifests(ep_id, identities_path, async_upload=True)
     return target
 
 
-def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dict[str, Any]:
-    payload = load_identities(ep_id)
+def move_track(
+    ep_id: str, track_id: int, target_identity_id: str | None, *, run_id: str | None = None
+) -> Dict[str, Any]:
+    payload = load_identities(ep_id, run_id=run_id)
     identities = payload.get("identities", [])
     source_identity = None
     target_identity = None
@@ -691,12 +729,12 @@ def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dic
         target_track_ids = {int(tid) for tid in target_identity["track_ids"]}
         target_track_ids.add(track_id)
         target_identity["track_ids"] = sorted(target_track_ids)
-    update_identity_stats(ep_id, payload)
-    identities_path = write_identities(ep_id, payload)
+    update_identity_stats(ep_id, payload, run_id=run_id)
+    identities_path = write_identities(ep_id, payload, run_id=run_id)
     sync_manifests(ep_id, identities_path)
 
     # Automatically clean up any empty clusters (source may now be empty)
-    cleanup_result = cleanup_empty_clusters(ep_id)
+    cleanup_result = cleanup_empty_clusters(ep_id, run_id=run_id)
 
     return {
         "identity_id": target_identity_id,
@@ -705,24 +743,24 @@ def move_track(ep_id: str, track_id: int, target_identity_id: str | None) -> Dic
     }
 
 
-def drop_track(ep_id: str, track_id: int) -> Dict[str, Any]:
-    tracks = load_tracks(ep_id)
+def drop_track(ep_id: str, track_id: int, *, run_id: str | None = None) -> Dict[str, Any]:
+    tracks = load_tracks(ep_id, run_id=run_id)
     kept_tracks = [row for row in tracks if int(row.get("track_id", -1)) != track_id]
     if len(kept_tracks) == len(tracks):
         raise ValueError("track_not_found")
-    tracks_path = write_tracks(ep_id, kept_tracks)
-    identities = load_identities(ep_id)
+    tracks_path = write_tracks(ep_id, kept_tracks, run_id=run_id)
+    identities = load_identities(ep_id, run_id=run_id)
     for identity in identities.get("identities", []):
         # Coerce to int for consistent comparison
         identity["track_ids"] = sorted(
             int(tid) for tid in identity.get("track_ids", []) if int(tid) != track_id
         )
-    update_identity_stats(ep_id, identities)
-    identities_path = write_identities(ep_id, identities)
+    update_identity_stats(ep_id, identities, run_id=run_id)
+    identities_path = write_identities(ep_id, identities, run_id=run_id)
     sync_manifests(ep_id, tracks_path, identities_path)
 
     # Automatically clean up any empty clusters
-    cleanup_result = cleanup_empty_clusters(ep_id)
+    cleanup_result = cleanup_empty_clusters(ep_id, run_id=run_id)
     return {
         "track_id": track_id,
         "remaining_tracks": len(kept_tracks),
@@ -730,15 +768,17 @@ def drop_track(ep_id: str, track_id: int) -> Dict[str, Any]:
     }
 
 
-def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = False) -> Dict[str, Any]:
-    faces = load_faces(ep_id)
+def drop_frame(
+    ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = False, *, run_id: str | None = None
+) -> Dict[str, Any]:
+    faces = load_faces(ep_id, run_id=run_id)
     removed = [
         row for row in faces if int(row.get("track_id", -1)) == track_id and int(row.get("frame_idx", -1)) == frame_idx
     ]
     if not removed:
         raise ValueError("frame_not_found")
     faces = [row for row in faces if row not in removed]
-    faces_path = write_faces(ep_id, faces)
+    faces_path = write_faces(ep_id, faces, run_id=run_id)
     thumbs_root = get_path(ep_id, "frames_root") / "thumbs"
     crops_root = get_path(ep_id, "frames_root")
     if delete_assets:
@@ -759,14 +799,14 @@ def drop_frame(ep_id: str, track_id: int, frame_idx: int, delete_assets: bool = 
                 except FileNotFoundError:
                     # Crops may already be removed by previous delete requests.
                     pass
-    identities = load_identities(ep_id)
-    update_identity_stats(ep_id, identities)
-    identities_path = write_identities(ep_id, identities)
+    identities = load_identities(ep_id, run_id=run_id)
+    update_identity_stats(ep_id, identities, run_id=run_id)
+    identities_path = write_identities(ep_id, identities, run_id=run_id)
     sync_manifests(ep_id, faces_path, identities_path)
     return {"track_id": track_id, "frame_idx": frame_idx, "removed": len(removed)}
 
 
-def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, Any]:
+def cleanup_empty_clusters(ep_id: str, show_id: str | None = None, *, run_id: str | None = None) -> Dict[str, Any]:
     """Remove clusters with no tracks and update people.json accordingly.
 
     This should be called after any operation that might leave clusters empty:
@@ -791,23 +831,22 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
     """
     from apps.api.services.people import PeopleService
 
-    identities = load_identities(ep_id)
+    run_id_norm = _normalize_run_id(run_id)
+
+    identities = load_identities(ep_id, run_id=run_id_norm)
     all_identities = identities.get("identities", [])
     identities_before = len(all_identities)
 
     # Load tracks.jsonl to check for orphaned track references
-    tracks_path = get_path(ep_id, "tracks")
-    existing_track_ids: set = set()
-    if tracks_path.exists():
+    existing_track_ids: set[int] = set()
+    for row in load_tracks(ep_id, run_id=run_id_norm):
+        tid = row.get("track_id")
+        if tid is None:
+            continue
         try:
-            import jsonlines
-            with jsonlines.open(tracks_path, mode="r") as reader:
-                for track in reader:
-                    tid = track.get("track_id")
-                    if tid is not None:
-                        existing_track_ids.add(int(tid))
-        except Exception as e:
-            LOGGER.warning(f"[{ep_id}] Could not load tracks.jsonl for cleanup: {e}")
+            existing_track_ids.add(int(tid))
+        except (TypeError, ValueError):
+            continue
 
     # Find empty clusters (no track_ids OR all track_ids are orphaned)
     empty_cluster_ids = []
@@ -823,7 +862,14 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
             )
         elif existing_track_ids:
             # Check if any track_ids actually exist in tracks.jsonl
-            valid_tracks = [tid for tid in track_ids if int(tid) in existing_track_ids]
+            valid_tracks = []
+            for tid in track_ids:
+                try:
+                    tid_int = int(tid)
+                except (TypeError, ValueError):
+                    continue
+                if tid_int in existing_track_ids:
+                    valid_tracks.append(tid_int)
             if not valid_tracks:
                 empty_cluster_ids.append(identity.get("identity_id"))
                 LOGGER.info(
@@ -856,8 +902,8 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
 
     # Update identities.json
     identities["identities"] = kept_identities
-    update_identity_stats(ep_id, identities)
-    identities_path = write_identities(ep_id, identities)
+    update_identity_stats(ep_id, identities, run_id=run_id_norm)
+    identities_path = write_identities(ep_id, identities, run_id=run_id_norm)
     sync_manifests(ep_id, identities_path)
 
     # Remove from people.json
@@ -872,8 +918,7 @@ def cleanup_empty_clusters(ep_id: str, show_id: str | None = None) -> Dict[str, 
     if show_id:
         people_service = PeopleService()
         for cluster_id in empty_cluster_ids:
-            # Full cluster ID format: ep_id:identity_id
-            full_cluster_id = f"{ep_id}:{cluster_id}"
+            full_cluster_id = _qualified_cluster_ref(ep_id, str(cluster_id), run_id=run_id_norm)
             modified = people_service.remove_cluster_from_all_people(show_id, full_cluster_id)
             people_updated.extend(modified)
 
@@ -899,11 +944,15 @@ def _persist_identity_name(
     trimmed_name: str,
     show: str | None,
     cast_id: str | None = None,
+    *,
+    run_id: str | None = None,
 ) -> Dict[str, Any]:
-    update_identity_stats(ep_id, payload)
-    identities_path = write_identities(ep_id, payload)
+    run_id_norm = _normalize_run_id(run_id)
+
+    update_identity_stats(ep_id, payload, run_id=run_id_norm)
+    identities_path = write_identities(ep_id, payload, run_id=run_id_norm)
     sync_manifests(ep_id, identities_path)
-    if use_s3():
+    if use_s3() and not run_id_norm:
         try:
             s3_write_json(f"artifacts/manifests/{ep_id}/identities.json", payload)
         except Exception as exc:  # pragma: no cover - best effort sync
@@ -928,7 +977,7 @@ def _persist_identity_name(
             people_service = PeopleService()
 
             # Build cluster_id with episode prefix
-            cluster_id_with_prefix = f"{ep_id}:{identity_id}"
+            cluster_id_with_prefix = _qualified_cluster_ref(ep_id, identity_id, run_id=run_id_norm)
 
             existing_person = None
 
@@ -1013,8 +1062,8 @@ def _persist_identity_name(
                             entry["person_id"] = new_person_id
                             LOGGER.info(f"Updated identity {identity_id} person_id: {old_person_id} -> {new_person_id}")
                             # Re-write identities to persist the person_id change
-                            update_identity_stats(ep_id, payload)
-                            identities_path = write_identities(ep_id, payload)
+                            update_identity_stats(ep_id, payload, run_id=run_id_norm)
+                            identities_path = write_identities(ep_id, payload, run_id=run_id_norm)
                             sync_manifests(ep_id, identities_path)
                         break
 
@@ -1026,7 +1075,7 @@ def _persist_identity_name(
         try:
             from apps.api.services.grouping import GroupingService
 
-            grouping_service = GroupingService()
+            grouping_service = GroupingService(run_id=run_id_norm)
             grouping_service.mark_assignment_manual(ep_id, identity_id, cast_id=cast_id)
             LOGGER.info(f"Marked cluster {identity_id} as manually assigned (cast_id={cast_id})")
         except Exception as exc:
@@ -1036,12 +1085,22 @@ def _persist_identity_name(
     return {"ep_id": ep_id, "identity_id": identity_id, "name": trimmed_name}
 
 
-def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
+def assign_identity_name(
+    ep_id: str,
+    identity_id: str,
+    name: str,
+    show: str | None = None,
+    cast_id: str | None = None,
+    *,
+    run_id: str | None = None,
+) -> Dict[str, Any]:
     """Assign a name to a cluster/identity.
 
     After assignment, cleans up any orphaned unnamed persons and empty unnamed clusters.
     """
-    payload = load_identities(ep_id)
+    run_id_norm = _normalize_run_id(run_id)
+
+    payload = load_identities(ep_id, run_id=run_id_norm)
     entries = _identity_rows(payload)
     target = next(
         (entry for entry in entries if (entry.get("identity_id") or entry.get("id")) == identity_id),
@@ -1058,7 +1117,7 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
     source_was_unnamed = not target.get("name")
 
     target["name"] = trimmed
-    result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
+    result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id, run_id=run_id_norm)
 
     # If source was an unnamed cluster with a person_id, check if that person
     # is now orphaned (has no more clusters) and clean it up
@@ -1076,7 +1135,7 @@ def assign_identity_name(ep_id: str, identity_id: str, name: str, show: str | No
         show_id = show
 
     if show_id:
-        cleanup_result = cleanup_empty_unnamed_identities(ep_id, show_id)
+        cleanup_result = cleanup_empty_unnamed_identities(ep_id, show_id, run_id=run_id_norm)
         if cleanup_result.get("removed_clusters"):
             result["cleaned_up"] = cleanup_result
 
@@ -1136,7 +1195,9 @@ def _cleanup_orphaned_unnamed_person(ep_id: str, person_id: str, show: str | Non
         return {"deleted": False, "person_id": person_id, "reason": f"delete_failed: {exc}"}
 
 
-def cleanup_empty_unnamed_identities(ep_id: str, show_id: str | None = None) -> Dict[str, Any]:
+def cleanup_empty_unnamed_identities(
+    ep_id: str, show_id: str | None = None, *, run_id: str | None = None
+) -> Dict[str, Any]:
     """Remove identities (clusters) that have no tracks AND no name.
 
     This is a stricter version of cleanup_empty_clusters that only removes
@@ -1157,7 +1218,8 @@ def cleanup_empty_unnamed_identities(ep_id: str, show_id: str | None = None) -> 
     """
     from apps.api.services.people import PeopleService
 
-    identities = load_identities(ep_id)
+    run_id_norm = _normalize_run_id(run_id)
+    identities = load_identities(ep_id, run_id=run_id_norm)
     all_identities = identities.get("identities", [])
     identities_before = len(all_identities)
 
@@ -1189,8 +1251,8 @@ def cleanup_empty_unnamed_identities(ep_id: str, show_id: str | None = None) -> 
 
     # Update identities.json
     identities["identities"] = kept_identities
-    update_identity_stats(ep_id, identities)
-    identities_path = write_identities(ep_id, identities)
+    update_identity_stats(ep_id, identities, run_id=run_id_norm)
+    identities_path = write_identities(ep_id, identities, run_id=run_id_norm)
     sync_manifests(ep_id, identities_path)
 
     # Remove from people.json
@@ -1205,7 +1267,7 @@ def cleanup_empty_unnamed_identities(ep_id: str, show_id: str | None = None) -> 
     if show_id:
         people_service = PeopleService()
         for cluster_id in empty_unnamed_ids:
-            full_cluster_id = f"{ep_id}:{cluster_id}"
+            full_cluster_id = _qualified_cluster_ref(ep_id, str(cluster_id), run_id=run_id_norm)
             try:
                 result = people_service.remove_cluster_from_all_people(show_id, full_cluster_id)
                 people_updated.extend(result.get("updated_people", []))
@@ -1228,7 +1290,15 @@ def cleanup_empty_unnamed_identities(ep_id: str, show_id: str | None = None) -> 
     }
 
 
-def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = None, cast_id: str | None = None) -> Dict[str, Any]:
+def assign_track_name(
+    ep_id: str,
+    track_id: int,
+    name: str,
+    show: str | None = None,
+    cast_id: str | None = None,
+    *,
+    run_id: str | None = None,
+) -> Dict[str, Any]:
     """Assign a name to a track, with smart cluster handling.
 
     Behavior:
@@ -1241,6 +1311,8 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
     - Any empty unnamed identities are automatically removed
     - Orphaned unnamed persons are cleaned up
     """
+    run_id_norm = _normalize_run_id(run_id)
+
     trimmed = (name or "").strip()
     if not trimmed:
         raise ValueError("name_required")
@@ -1249,7 +1321,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid_track_id") from exc
 
-    payload = load_identities(ep_id)
+    payload = load_identities(ep_id, run_id=run_id_norm)
     entries = _identity_rows(payload)
     target_identity = None
     track_ids_for_identity: List[int] = []
@@ -1278,7 +1350,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
         payload.setdefault("identities", []).append(target_identity)
         entries = _identity_rows(payload)  # Refresh entries list
 
-        result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
+        result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id, run_id=run_id_norm)
         result["track_id"] = track_id_int
         result["split"] = False
         result["created_identity"] = True
@@ -1296,7 +1368,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
     # CASE 1: Only one track in cluster - assign entire cluster (prevents empty clusters)
     if len(track_ids_for_identity) <= 1:
         target_identity["name"] = trimmed
-        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id)
+        result = _persist_identity_name(ep_id, payload, identity_id, trimmed, show, cast_id, run_id=run_id_norm)
         result["track_id"] = track_id_int
         result["split"] = False
     else:
@@ -1313,7 +1385,7 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
         }
         payload.setdefault("identities", []).append(new_identity)
 
-        result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id)
+        result = _persist_identity_name(ep_id, payload, new_identity_id, trimmed, show, cast_id, run_id=run_id_norm)
         result["track_id"] = track_id_int
         result["split"] = True
         result["source_identity_id"] = identity_id
@@ -1335,9 +1407,9 @@ def assign_track_name(ep_id: str, track_id: int, name: str, show: str | None = N
         show_id = show
 
     if show_id:
-        cleanup_result = cleanup_empty_unnamed_identities(ep_id, show_id)
-        if cleanup_result.get("removed_clusters"):
-            result["cleaned_up"] = cleanup_result
+            cleanup_result = cleanup_empty_unnamed_identities(ep_id, show_id, run_id=run_id_norm)
+            if cleanup_result.get("removed_clusters"):
+                result["cleaned_up"] = cleanup_result
 
     return result
 

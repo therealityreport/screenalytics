@@ -35,6 +35,7 @@ def test_manual_assign_sets_cast_id(tmp_path, isolated_services):
     client = TestClient(app)
     show_id = "rhoslc"
     ep_id = "rhoslc-s06e02"
+    run_id = "attempt-1"
 
     # Create a person without cast_id
     resp = client.post(f"/shows/{show_id}/people", json={"name": "Heather"})
@@ -47,10 +48,10 @@ def test_manual_assign_sets_cast_id(tmp_path, isolated_services):
         "target_person_id": person_id,
         "cast_id": "cast_heather",
     }
-    resp = client.post(f"/episodes/{ep_id}/clusters/group", json=payload)
+    resp = client.post(f"/episodes/{ep_id}/clusters/group", params={"run_id": run_id}, json=payload)
     assert resp.status_code == 200
 
     people = client.get(f"/shows/{show_id}/people").json().get("people", [])
     target = next(p for p in people if p.get("person_id") == person_id)
     assert target.get("cast_id") == "cast_heather"
-    assert f"{ep_id}:id_0001" in target.get("cluster_ids", [])
+    assert f"{ep_id}:{run_id}:id_0001" in target.get("cluster_ids", [])

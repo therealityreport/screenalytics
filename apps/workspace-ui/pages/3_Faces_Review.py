@@ -28,6 +28,7 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+from py_screenalytics import run_layout  # noqa: E402
 from similarity_badges import (  # noqa: E402
     SimilarityType,
     render_similarity_badge,
@@ -151,6 +152,9 @@ if MOCKED_STREAMLIT:
 
 cfg = helpers.init_page("Faces & Tracks")
 helpers.render_page_header("workspace-ui:3_Faces_Review", "Faces & Tracks Review")
+
+# Current run_id scope for this page (required for run-scoped mutations + artifact reads).
+_CURRENT_RUN_ID: str | None = None
 help_cols = st.columns([3, 1])
 with help_cols[0]:
     st.caption("Need the playbook? Open the full Faces Review guide for flow, job settings, and safety tips.")
@@ -507,7 +511,12 @@ def _render_sync_to_s3_button(ep_id: str) -> None:
                 with st.spinner("Syncing thumbnails and crops to S3..."):
                     try:
                         api_base = st.session_state.get("api_base", "http://localhost:8000")
-                        resp = requests.post(f"{api_base}/episodes/{ep_id}/sync_thumbnails_to_s3", timeout=120)
+                        params = {"run_id": _CURRENT_RUN_ID} if _CURRENT_RUN_ID else None
+                        resp = requests.post(
+                            f"{api_base}/episodes/{ep_id}/sync_thumbnails_to_s3",
+                            params=params,
+                            timeout=120,
+                        )
                         if resp.status_code == 200:
                             data = resp.json()
                             uploaded = data.get("uploaded_thumbs", 0) + data.get("uploaded_crops", 0)
@@ -578,8 +587,11 @@ def _extract_s3_key_from_url(url: str) -> str:
 
 
 def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    merged_params: Dict[str, Any] = dict(params or {})
+    if _CURRENT_RUN_ID:
+        merged_params.setdefault("run_id", _CURRENT_RUN_ID)
     try:
-        return helpers.api_get(path, params=params)
+        return helpers.api_get(path, params=(merged_params or None))
     except requests.RequestException as exc:
         base = (cfg or {}).get("api_base") if isinstance(cfg, dict) else ""
         try:
@@ -588,6 +600,22 @@ def _safe_api_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, 
             # Fallback if error display fails
             st.error(f"API error: {path} - {exc}")
         return None
+
+
+def _run_scope_token() -> str:
+    return _CURRENT_RUN_ID or "legacy"
+
+
+def _cast_suggestions_cache_key(ep_id: str) -> str:
+    return f"cast_suggestions:{ep_id}:{_run_scope_token()}"
+
+
+def _dismissed_suggestions_cache_key(ep_id: str) -> str:
+    return f"dismissed_suggestions:{ep_id}:{_run_scope_token()}"
+
+
+def _improve_faces_state_key(ep_id: str, suffix: str) -> str:
+    return f"{ep_id}::{_run_scope_token()}::improve_faces::{suffix}"
 
 
 @st.cache_data(ttl=15)  # Reduced from 60s - frequently mutated by assignments
@@ -690,10 +718,9 @@ def _coerce_track_int(val: Any) -> int | None:
 
 def _start_improve_faces(ep_id: str, *, force: bool = False) -> bool:
     """Fetch initial suggestions and activate the Improve Faces modal."""
-    try:
-        resp = helpers.api_get(f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions")
-    except Exception as exc:
-        st.error(f"Failed to load Improve Faces suggestions: {exc}")
+    resp = _safe_api_get(f"/episodes/{ep_id}/face_review/initial_unassigned_suggestions")
+    if not resp:
+        st.error("Failed to load Improve Faces suggestions.")
         return False
 
     suggestions = resp.get("suggestions", []) if isinstance(resp, dict) else []
@@ -702,31 +729,31 @@ def _start_improve_faces(ep_id: str, *, force: bool = False) -> bool:
     if not suggestions or initial_done:
         if force:
             st.info("No Improve Faces suggestions right now.")
-        st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-        st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-        st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+        st.session_state.pop(_improve_faces_state_key(ep_id, "active"), None)
+        st.session_state.pop(_improve_faces_state_key(ep_id, "suggestions"), None)
+        st.session_state.pop(_improve_faces_state_key(ep_id, "index"), None)
         return False
 
-    st.session_state[f"{ep_id}::improve_faces_active"] = True
-    st.session_state[f"{ep_id}::improve_faces_suggestions"] = suggestions
-    st.session_state[f"{ep_id}::improve_faces_index"] = 0
-    st.session_state.pop(f"{ep_id}::trigger_improve_faces", None)
+    st.session_state[_improve_faces_state_key(ep_id, "active")] = True
+    st.session_state[_improve_faces_state_key(ep_id, "suggestions")] = suggestions
+    st.session_state[_improve_faces_state_key(ep_id, "index")] = 0
+    st.session_state.pop(_improve_faces_state_key(ep_id, "trigger"), None)
     st.rerun()
     return True
 
 
 def _render_improve_faces_modal(ep_id: str) -> None:
     """Render Improve Faces dialog if active."""
-    if not st.session_state.get(f"{ep_id}::improve_faces_active"):
+    if not st.session_state.get(_improve_faces_state_key(ep_id, "active")):
         return
 
-    suggestions = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
-    idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+    suggestions = st.session_state.get(_improve_faces_state_key(ep_id, "suggestions"), []) or []
+    idx = st.session_state.get(_improve_faces_state_key(ep_id, "index"), 0) or 0
 
     @st.dialog("Improve Face Clustering", width="large")
     def _dialog():
-        suggestions_local = st.session_state.get(f"{ep_id}::improve_faces_suggestions", []) or []
-        current_idx = st.session_state.get(f"{ep_id}::improve_faces_index", 0) or 0
+        suggestions_local = st.session_state.get(_improve_faces_state_key(ep_id, "suggestions"), []) or []
+        current_idx = st.session_state.get(_improve_faces_state_key(ep_id, "index"), 0) or 0
 
         def _render_thumb(url: str | None) -> None:
             """Render face crop filling the column width."""
@@ -741,15 +768,15 @@ def _render_improve_faces_modal(ep_id: str) -> None:
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Go to Faces Review", type="primary", use_container_width=True):
-                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.session_state.pop(_improve_faces_state_key(ep_id, "active"), None)
+                    st.session_state.pop(_improve_faces_state_key(ep_id, "suggestions"), None)
+                    st.session_state.pop(_improve_faces_state_key(ep_id, "index"), None)
                     st.rerun()
             with col2:
                 if st.button("Close", use_container_width=True):
-                    st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-                    st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.session_state.pop(_improve_faces_state_key(ep_id, "active"), None)
+                    st.session_state.pop(_improve_faces_state_key(ep_id, "suggestions"), None)
+                    st.session_state.pop(_improve_faces_state_key(ep_id, "index"), None)
                     st.rerun()
             return
 
@@ -781,7 +808,7 @@ def _render_improve_faces_modal(ep_id: str) -> None:
         btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 1])
 
         def _advance():
-            st.session_state[f"{ep_id}::improve_faces_index"] = current_idx + 1
+            st.session_state[_improve_faces_state_key(ep_id, "index")] = current_idx + 1
 
         with btn_col1:
             if st.button("Yes", type="primary", use_container_width=True, key=f"improve_yes_{current_idx}"):
@@ -793,10 +820,8 @@ def _render_improve_faces_modal(ep_id: str) -> None:
                     "decision": "merge",
                     "execution_mode": "redis" if exec_mode != "local" else "local",
                 }
-                try:
-                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
-                except Exception as exc:
-                    st.error(f"Failed to save merge decision: {exc}")
+                if not _api_post(f"/episodes/{ep_id}/face_review/decision/start", payload, timeout=60):
+                    st.error("Failed to save merge decision.")
                 _advance()
 
         with btn_col2:
@@ -809,17 +834,15 @@ def _render_improve_faces_modal(ep_id: str) -> None:
                     "decision": "reject",
                     "execution_mode": "redis" if exec_mode != "local" else "local",
                 }
-                try:
-                    helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
-                except Exception as exc:
-                    st.error(f"Failed to save reject decision: {exc}")
+                if not _api_post(f"/episodes/{ep_id}/face_review/decision/start", payload, timeout=60):
+                    st.error("Failed to save reject decision.")
                 _advance()
 
         with btn_col3:
             if st.button("Skip All", use_container_width=True, key=f"improve_skip_{current_idx}"):
-                st.session_state.pop(f"{ep_id}::improve_faces_active", None)
-                st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
-                st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                st.session_state.pop(_improve_faces_state_key(ep_id, "active"), None)
+                st.session_state.pop(_improve_faces_state_key(ep_id, "suggestions"), None)
+                st.session_state.pop(_improve_faces_state_key(ep_id, "index"), None)
                 st.rerun()
 
     _dialog()
@@ -915,8 +938,8 @@ def _persist_and_refresh_cast_suggestions(
 ) -> tuple[Dict[str, List[Dict[str, Any]]], Optional[int]]:
     """Persist assignments and recompute cast suggestions from latest embeddings."""
     _invalidate_assignment_caches()
-    st.session_state.pop(f"cast_suggestions:{ep_id}", None)
-    st.session_state.pop(f"dismissed_suggestions:{ep_id}", None)
+    st.session_state.pop(_cast_suggestions_cache_key(ep_id), None)
+    st.session_state.pop(_dismissed_suggestions_cache_key(ep_id), None)
 
     saved_count: Optional[int] = None
     save_resp = _api_post(f"/episodes/{ep_id}/save_assignments", {})
@@ -936,7 +959,7 @@ def _persist_and_refresh_cast_suggestions(
             suggestions_map[cid] = entry.get("cast_suggestions", []) or []
 
     if suggestions_map:
-        st.session_state[f"cast_suggestions:{ep_id}"] = suggestions_map
+        st.session_state[_cast_suggestions_cache_key(ep_id)] = suggestions_map
 
     return suggestions_map, saved_count
 
@@ -952,9 +975,12 @@ def _fetch_tracks_meta(ep_id: str, track_ids: List[int]) -> Dict[int, Dict[str, 
     try:
         api_base = st.session_state.get("api_base") or os.environ.get("API_BASE", "http://127.0.0.1:8000")
         ids_param = ",".join(str(tid) for tid in unique_ids)
+        params = {"ids": ids_param, "fields": "id,track_id,faces_count,frames"}
+        if _CURRENT_RUN_ID:
+            params["run_id"] = _CURRENT_RUN_ID
         resp = requests.get(
             f"{api_base}/episodes/{ep_id}/tracks",
-            params={"ids": ids_param, "fields": "id,track_id,faces_count,frames"},
+            params=params,
             timeout=30,
         )
         if resp.status_code == 200:
@@ -1037,7 +1063,8 @@ def _prefetch_adjacent_clusters(
 
 def _api_post(path: str, payload: Dict[str, Any] | None = None, *, timeout: float = 60.0) -> Dict[str, Any] | None:
     try:
-        return helpers.api_post(path, payload or {}, timeout=timeout)
+        params = {"run_id": _CURRENT_RUN_ID} if _CURRENT_RUN_ID else None
+        return helpers.api_post(path, payload or {}, timeout=timeout, params=params)
     except requests.RequestException as exc:
         base = (cfg or {}).get("api_base") if isinstance(cfg, dict) else ""
         try:
@@ -1053,7 +1080,8 @@ def _api_delete(path: str, payload: Dict[str, Any] | None = None) -> Dict[str, A
         st.error("API base URL missing; re-run init_page().")
         return None
     try:
-        resp = requests.delete(f"{base}{path}", json=payload or {}, timeout=60)
+        params = {"run_id": _CURRENT_RUN_ID} if _CURRENT_RUN_ID else None
+        resp = requests.delete(f"{base}{path}", params=params, json=payload or {}, timeout=60)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
     except requests.RequestException as exc:
@@ -1195,9 +1223,12 @@ def _bulk_assign_tracks(
         return
     _invalidate_assignment_caches()
     assigned = resp.get("assigned", 0)
+    skipped_locked = resp.get("skipped_locked", 0) or resp.get("skipped_locked_count", 0) or 0
     failed = resp.get("failed", 0)
     if assigned > 0:
         st.toast(f"Assigned {assigned} track(s) to '{cleaned}'")
+    if skipped_locked > 0:
+        st.warning(f"Skipped {skipped_locked} track(s) because their identities are locked.")
     if failed > 0:
         st.warning(f"{failed} track(s) failed to assign. Check logs.")
     # Clear bulk selection state for all identity keys
@@ -1318,9 +1349,12 @@ def _identity_name_controls(
 
 
 def _initialize_state(ep_id: str) -> None:
-    if st.session_state.get("facebank_ep") != ep_id:
+    current_scope = _run_scope_token()
+    if st.session_state.get("facebank_ep") != ep_id or st.session_state.get("facebank_run_scope") != current_scope:
         old_ep_id = st.session_state.get("facebank_ep")
+        old_scope = st.session_state.get("facebank_run_scope") or "legacy"
         st.session_state["facebank_ep"] = ep_id
+        st.session_state["facebank_run_scope"] = current_scope
         st.session_state["facebank_view"] = "people"
         st.session_state["selected_person"] = None
         st.session_state["selected_identity"] = None
@@ -1329,7 +1363,8 @@ def _initialize_state(ep_id: str) -> None:
 
         # Clear stale cast suggestions from previous episode
         if old_ep_id:
-            st.session_state.pop(f"cast_suggestions:{old_ep_id}", None)
+            st.session_state.pop(f"cast_suggestions:{old_ep_id}:{old_scope}", None)
+            st.session_state.pop(f"dismissed_suggestions:{old_ep_id}:{old_scope}", None)
 
         # Clear pagination keys from previous episode (track_page_{old_ep_id}_* keys)
         if old_ep_id:
@@ -1338,10 +1373,31 @@ def _initialize_state(ep_id: str) -> None:
             for k in keys_to_remove:
                 st.session_state.pop(k, None)
 
+        # Clear run-scoped UI selections (bulk selection, etc.) when the scope changes.
+        for key in list(st.session_state.keys()):
+            if key.startswith("bulk_track_sel::"):
+                st.session_state.pop(key, None)
+
+        # Switching run_id scopes should not reuse cached API data.
+        for cached in (
+            _fetch_identities_cached,
+            _fetch_unlinked_entities,
+            _fetch_track_detail_cached,
+            _fetch_cluster_track_reps_cached,
+            _fetch_cluster_metrics_cached,
+            _fetch_track_metrics_cached,
+        ):
+            try:
+                cached.clear()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
 
 def _hydrate_view_from_query(ep_id: str) -> None:
     """Allow deep links to jump directly into person/cluster/track views."""
-    if st.session_state.get("facebank_query_applied") == ep_id:
+    applied_token = st.session_state.get("facebank_query_applied")
+    desired_token = f"{ep_id}::{_run_scope_token()}"
+    if applied_token == desired_token:
         return
 
     raw_params = getattr(st, "query_params", {}) or {}
@@ -1399,7 +1455,7 @@ def _hydrate_view_from_query(ep_id: str) -> None:
             track_id=track_id,
             low_quality=low_quality,
         )
-        st.session_state["facebank_query_applied"] = ep_id
+        st.session_state["facebank_query_applied"] = desired_token
 
 
 def _set_view(
@@ -1431,6 +1487,8 @@ def _set_view(
     # Update URL with view name for easy reference
     _, view_slug = VIEW_NAMES.get(view, ("Unknown", "unknown"))
     try:
+        if _CURRENT_RUN_ID:
+            st.query_params["run_id"] = _CURRENT_RUN_ID
         st.query_params["view"] = view_slug
         if person_id:
             st.query_params["person"] = person_id
@@ -1458,6 +1516,8 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
             f"**Episode:** `{ep_id}` · Show `{detail['show_slug']}` · S{detail['season_number']:02d}E{detail['episode_number']:02d}"
         )
         st.caption(f"Detector: {helpers.tracks_detector_label(ep_id)}")
+        if _CURRENT_RUN_ID:
+            st.caption(f"Run: `{_CURRENT_RUN_ID}`")
     with cols[1]:
         st.caption(f"S3 v2: `{detail['s3']['v2_key']}`")
     with cols[2]:
@@ -1468,10 +1528,20 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                 st.success("Mirror complete.")
                 st.rerun()
     action_cols = st.columns([1, 2, 2])
+
+    def _open_episode_detail() -> None:
+        try:
+            st.query_params["ep_id"] = ep_id
+            if _CURRENT_RUN_ID:
+                st.query_params["run_id"] = _CURRENT_RUN_ID
+        except Exception:
+            pass
+        helpers.try_switch_page("pages/2_Episode_Detail.py")
+
     action_cols[0].button(
         "Open Episode Detail",
         key="facebank_open_detail",
-        on_click=lambda: helpers.try_switch_page("pages/2_Episode_Detail.py"),
+        on_click=_open_episode_detail,
     )
     with action_cols[1]:
         # Row of action buttons: REFRESH and AUTO-ASSIGN
@@ -1989,7 +2059,7 @@ def _episode_header(ep_id: str) -> Dict[str, Any] | None:
                     cast_suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions")
                     if cast_suggestions_resp and cast_suggestions_resp.get("suggestions"):
                         # Store in session state for display
-                        st.session_state[f"cast_suggestions:{ep_id}"] = {
+                        st.session_state[_cast_suggestions_cache_key(ep_id)] = {
                             sugg["cluster_id"]: sugg.get("cast_suggestions", [])
                             for sugg in cast_suggestions_resp.get("suggestions", [])
                         }
@@ -3062,10 +3132,10 @@ def _render_unassigned_cluster_card(
                     suggest_resp = _safe_api_get(f"/episodes/{ep_id}/clusters/{cluster_id}/suggest_cast")
                     if suggest_resp and suggest_resp.get("suggestions"):
                         # Store suggestions in session state
-                        st.session_state[f"cast_suggestions:{ep_id}"] = st.session_state.get(
-                            f"cast_suggestions:{ep_id}", {}
+                        st.session_state[_cast_suggestions_cache_key(ep_id)] = st.session_state.get(
+                            _cast_suggestions_cache_key(ep_id), {}
                         )
-                        st.session_state[f"cast_suggestions:{ep_id}"][cluster_id] = suggest_resp["suggestions"]
+                        st.session_state[_cast_suggestions_cache_key(ep_id)][cluster_id] = suggest_resp["suggestions"]
                         st.toast(f"Found {len(suggest_resp['suggestions'])} suggestion(s)!")
                         st.rerun()
                     else:
@@ -4419,7 +4489,7 @@ def _render_people_view(
     }
 
     # Suggestions: facebank (cached) and assigned-cluster similarity
-    cast_suggestions_by_cluster = st.session_state.get(f"cast_suggestions:{ep_id}", {})
+    cast_suggestions_by_cluster = st.session_state.get(_cast_suggestions_cache_key(ep_id), {})
     assigned_suggestions_by_cluster: Dict[str, Dict[str, Any]] = {}
     assigned_suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cluster_suggestions_from_assigned")
     if assigned_suggestions_resp:
@@ -5331,7 +5401,7 @@ def _render_cluster_tracks(
     # Fetch cast suggestions once to show cast similarity + ambiguity margin
     cast_suggestion = None
     cast_margin_pct: int | None = None
-    suggestions_cache_key = f"cast_suggestions:{ep_id}"
+    suggestions_cache_key = _cast_suggestions_cache_key(ep_id)
     suggestions_map = st.session_state.get(suggestions_cache_key)
     if suggestions_map is None:
         suggestions_resp = _safe_api_get(f"/episodes/{ep_id}/cast_suggestions")
@@ -6596,6 +6666,74 @@ if not ep_id:
     st.warning("Select an episode from the sidebar to continue.")
     st.stop()
 
+# Resolve run_id scope (required for run-scoped mutations + artifact reads).
+resolved_run_id: str | None = None
+qp_candidate = None
+try:
+    qp_value = st.query_params.get("run_id")
+except Exception:
+    qp_value = None
+if isinstance(qp_value, str):
+    qp_candidate = qp_value.strip()
+elif isinstance(qp_value, list) and qp_value:
+    qp_candidate = str(qp_value[0]).strip()
+if qp_candidate:
+    try:
+        normalized_qp_run_id = run_layout.normalize_run_id(qp_candidate)
+    except ValueError:
+        normalized_qp_run_id = None
+    if normalized_qp_run_id:
+        try:
+            known_run_ids = run_layout.list_run_ids(ep_id)
+        except Exception:
+            known_run_ids = []
+        try:
+            active_run_id = run_layout.read_active_run_id(ep_id)
+        except Exception:
+            active_run_id = None
+        if not known_run_ids or normalized_qp_run_id in known_run_ids or normalized_qp_run_id == active_run_id:
+            resolved_run_id = normalized_qp_run_id
+
+if not resolved_run_id:
+    try:
+        resolved_run_id = run_layout.read_active_run_id(ep_id)
+    except Exception:
+        resolved_run_id = None
+
+if not resolved_run_id:
+    # Fall back to the most recently modified run directory.
+    try:
+        candidate_run_ids = run_layout.list_run_ids(ep_id)
+    except Exception:
+        candidate_run_ids = []
+    latest_run_id: str | None = None
+    latest_mtime = -1.0
+    for candidate in candidate_run_ids:
+        try:
+            mtime = run_layout.run_root(ep_id, candidate).stat().st_mtime
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_run_id = candidate
+    resolved_run_id = latest_run_id
+
+if not resolved_run_id:
+    st.warning("Faces Review requires a run-scoped attempt (run_id). Open Episode Detail to select an attempt.")
+    if st.button("Open Episode Detail", key=f"{ep_id}::faces_review_missing_run_id"):
+        try:
+            st.query_params["ep_id"] = ep_id
+        except Exception:
+            pass
+        helpers.try_switch_page("pages/2_Episode_Detail.py")
+    st.stop()
+
+_CURRENT_RUN_ID = resolved_run_id
+try:
+    st.query_params["run_id"] = resolved_run_id
+except Exception:
+    pass
+
 _initialize_state(ep_id)
 
 # Check for active Celery jobs and render status (Phase 2 - non-blocking jobs)
@@ -6731,8 +6869,8 @@ cluster_payload = _filter_cluster_payload(cluster_payload, archived_clusters, ar
 st.session_state[f"{ep_id}::archived_clusters"] = archived_clusters
 st.session_state[f"{ep_id}::archived_tracks"] = archived_tracks
 
-# Consume Improve Faces trigger set by Episode Detail
-if st.session_state.pop(f"{ep_id}::trigger_improve_faces", False):
+# Consume Improve Faces trigger set by Episode Detail (run-scoped)
+if st.session_state.pop(_improve_faces_state_key(ep_id, "trigger"), False):
     _start_improve_faces(ep_id)
 
 # Manual Improve Faces launcher (always available)
@@ -6758,7 +6896,7 @@ with action_btn_col2:
 
 # If Improve Faces modal is open, render it and skip the heavy page to keep YES/NO snappy
 _render_improve_faces_modal(ep_id)
-if st.session_state.get(f"{ep_id}::improve_faces_active"):
+if st.session_state.get(_improve_faces_state_key(ep_id, "active")):
     st.stop()
 
 cluster_lookup = _clusters_by_identity(cluster_payload)

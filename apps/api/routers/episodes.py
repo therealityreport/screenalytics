@@ -16,6 +16,7 @@ import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -31,6 +32,7 @@ from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
+from apps.api.services.run_export import build_run_debug_bundle_zip
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -871,8 +873,13 @@ FRAME_IDX_RE = re.compile(r"frame_(\d+)\.jpg$", re.IGNORECASE)
 TRACK_LIST_MAX_LIMIT = 500
 
 
-def _load_faces(ep_id: str, *, include_skipped: bool = True) -> List[Dict[str, Any]]:
-    path = _faces_path(ep_id)
+def _load_faces(
+    ep_id: str,
+    *,
+    include_skipped: bool = True,
+    run_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    path = _faces_path_for_run(ep_id, run_id)
     if not path.exists():
         return []
     rows: List[Dict[str, Any]] = []
@@ -901,8 +908,8 @@ def _write_faces(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
     return path
 
 
-def _load_tracks(ep_id: str) -> List[Dict[str, Any]]:
-    path = _tracks_path(ep_id)
+def _load_tracks(ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
+    path = _tracks_path_for_run(ep_id, run_id)
     if not path.exists():
         return []
     rows: List[Dict[str, Any]] = []
@@ -929,8 +936,8 @@ def _write_tracks(ep_id: str, rows: List[Dict[str, Any]]) -> Path:
     return path
 
 
-def _load_identities(ep_id: str) -> Dict[str, Any]:
-    path = _identities_path(ep_id)
+def _load_identities(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
+    path = _identities_path_for_run(ep_id, run_id)
     if not path.exists():
         return {"ep_id": ep_id, "identities": [], "stats": {}}
     try:
@@ -951,10 +958,18 @@ def _sync_manifests(ep_id: str, *paths: Path) -> None:
         ep_ctx = episode_context_from_id(ep_id)
     except ValueError:
         return
+    manifests_root = _manifests_dir(ep_id)
+
+    def _key_rel(path: Path) -> str:
+        try:
+            return path.relative_to(manifests_root).as_posix()
+        except ValueError:
+            return path.name
+
     for path in paths:
         if path and path.exists():
             try:
-                STORAGE.put_artifact(ep_ctx, "manifests", path, path.name)
+                STORAGE.put_artifact(ep_ctx, "manifests", path, _key_rel(path))
             except Exception:
                 continue
 
@@ -978,8 +993,10 @@ def _refresh_similarity_indexes(
     *,
     track_ids: Iterable[int] | None = None,
     identity_ids: Iterable[str] | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Regenerate track reps/centroids and refresh people prototypes if impacted."""
+    run_id_norm = _normalize_run_id(run_id)
     track_set: Set[int] = set()
     for raw in track_ids or []:
         try:
@@ -993,7 +1010,7 @@ def _refresh_similarity_indexes(
             continue
         identity_set.add(str(raw))
 
-    identities_payload = _load_identities(ep_id)
+    identities_payload = _load_identities(ep_id, run_id=run_id_norm)
     if track_set:
         track_lookup = _identity_lookup(identities_payload)
         for tid in track_set:
@@ -1011,7 +1028,7 @@ def _refresh_similarity_indexes(
         return
 
     try:
-        result = generate_track_reps_and_centroids(ep_id)
+        result = generate_track_reps_and_centroids(ep_id, run_id=run_id_norm)
     except Exception as exc:  # pragma: no cover - surface but don't fail request
         LOGGER.error("Track rep regeneration failed for %s: %s", ep_id, exc)
         return
@@ -1049,7 +1066,11 @@ def _refresh_similarity_indexes(
     if not people:
         return
 
-    cluster_refs = {f"{ep_id}:{identity_id}" for identity_id in identity_set}
+    cluster_refs = (
+        {f"{ep_id}:{run_id_norm}:{identity_id}" for identity_id in identity_set}
+        if run_id_norm
+        else {f"{ep_id}:{identity_id}" for identity_id in identity_set}
+    )
 
     touched_person_ids: Set[str] = set()
     for identity in identities_payload.get("identities", []):
@@ -1073,16 +1094,17 @@ def _refresh_similarity_indexes(
 
     centroid_cache: Dict[str, Dict[str, Any]] = {}
 
-    def _centroid_vec(ep_slug: str, cluster_id: str):
-        if ep_slug not in centroid_cache:
+    def _centroid_vec(ep_slug: str, cluster_run_id: str | None, cluster_id: str):
+        cache_key = f"{ep_slug}::{cluster_run_id or 'legacy'}"
+        if cache_key not in centroid_cache:
             try:
-                centroids = load_cluster_centroids(ep_slug)
+                centroids = load_cluster_centroids(ep_slug, run_id=cluster_run_id)
             except Exception as exc:  # pragma: no cover - best effort
                 LOGGER.warning("Failed to load centroids for %s: %s", ep_slug, exc)
-                centroid_cache[ep_slug] = {}
+                centroid_cache[cache_key] = {}
             else:
-                centroid_cache[ep_slug] = centroids if isinstance(centroids, dict) else {}
-        centroids = centroid_cache.get(ep_slug, {})
+                centroid_cache[cache_key] = centroids if isinstance(centroids, dict) else {}
+        centroids = centroid_cache.get(cache_key, {})
         record = centroids.get(cluster_id) if isinstance(centroids, dict) else None
         if not isinstance(record, dict):
             return None
@@ -1102,8 +1124,11 @@ def _refresh_similarity_indexes(
             if not isinstance(cluster_ref, str) or ":" not in cluster_ref:
                 updated_clusters.append(cluster_ref)
                 continue
-            ep_slug, cluster_id = cluster_ref.split(":", 1)
-            vec = _centroid_vec(ep_slug, cluster_id)
+            parts = cluster_ref.split(":")
+            ep_slug = parts[0] if parts else ""
+            cluster_id = parts[-1] if len(parts) >= 2 else ""
+            cluster_run_id = parts[1] if len(parts) >= 3 else None
+            vec = _centroid_vec(ep_slug, cluster_run_id, cluster_id)
             if vec is None:
                 if cluster_ref not in cluster_refs:
                     updated_clusters.append(cluster_ref)
@@ -1172,8 +1197,8 @@ def _recount_track_faces(ep_id: str) -> None:
     _sync_manifests(ep_id, path)
 
 
-def _update_identity_stats(ep_id: str, payload: Dict[str, Any]) -> None:
-    faces_count = len(_load_faces(ep_id, include_skipped=False))
+def _update_identity_stats(ep_id: str, payload: Dict[str, Any], *, run_id: str | None = None) -> None:
+    faces_count = len(_load_faces(ep_id, include_skipped=False, run_id=run_id))
     payload.setdefault("stats", {})
     payload["stats"]["faces"] = faces_count
     payload["stats"]["clusters"] = len(payload.get("identities", []))
@@ -1189,8 +1214,8 @@ def _frame_idx_from_name(name: str) -> int | None:
         return None
 
 
-def _track_face_rows(ep_id: str, track_id: int) -> Dict[int, Dict[str, Any]]:
-    faces = _load_faces(ep_id, include_skipped=False)
+def _track_face_rows(ep_id: str, track_id: int, *, run_id: str | None = None) -> Dict[int, Dict[str, Any]]:
+    faces = _load_faces(ep_id, include_skipped=False, run_id=run_id)
     rows: Dict[int, Dict[str, Any]] = {}
     for row in faces:
         try:
@@ -1204,13 +1229,13 @@ def _track_face_rows(ep_id: str, track_id: int) -> Dict[int, Dict[str, Any]]:
     return rows
 
 
-def _first_face_lookup(ep_id: str) -> Dict[int, Dict[str, Any]]:
+def _first_face_lookup(ep_id: str, *, run_id: str | None = None) -> Dict[int, Dict[str, Any]]:
     """Return the best candidate face row for each track.
 
     We prefer non-skipped faces when available, but fall back to skipped rows so
     that every track can expose a preview thumbnail in the UI."""
 
-    faces = _load_faces(ep_id, include_skipped=True)
+    faces = _load_faces(ep_id, include_skipped=True, run_id=run_id)
     lookup: Dict[int, Dict[str, Any]] = {}
     scores: Dict[int, tuple[int, int, float, int]] = {}
     for row in faces:
@@ -1649,6 +1674,7 @@ class IdentityRenameRequest(BaseModel):
 class IdentityNameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     show: str | None = Field(None, description="Optional show slug override")
+    cast_id: str | None = Field(None, description="Optional cast_id to link assignment")
 
 
 class BulkTrackAssignRequest(BaseModel):
@@ -2220,6 +2246,168 @@ def episode_run_status(ep_id: str, run_id: str | None = Query(None)) -> EpisodeS
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.get("/episodes/{ep_id}/runs", tags=["episodes"])
+def list_episode_runs(
+    ep_id: str,
+    limit: int = Query(100, ge=1, le=500, description="Max DB runs to return"),
+) -> dict:
+    """List run records for an episode (DB-backed, with disk fallback metadata)."""
+    ep_id_norm = normalize_ep_id(ep_id)
+    db_error: str | None = None
+    runs: list[dict[str, Any]] = []
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        runs = run_persistence_service.list_runs(ep_id=ep_id_norm, limit=limit)
+    except Exception as exc:
+        db_error = str(exc)
+
+    run_ids_on_disk = run_layout.list_run_ids(ep_id_norm)
+    active_run_id = _resolve_active_run_id(ep_id_norm)
+
+    payload: dict[str, Any] = {
+        "ep_id": ep_id_norm,
+        "active_run_id": active_run_id,
+        "runs": runs,
+        "run_ids_on_disk": run_ids_on_disk,
+    }
+    if db_error:
+        payload["db_error"] = db_error
+    return payload
+
+
+class IdentityLockRequest(BaseModel):
+    locked_by: str | None = Field(None, description="Optional actor identifier (email/username)")
+    reason: str | None = Field(None, description="Optional reason for the lock")
+
+
+@router.get("/episodes/{ep_id}/identity_locks", tags=["episodes"])
+def list_identity_locks(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        locks = run_persistence_service.list_identity_locks(ep_id=ep_id_norm, run_id=run_id_norm)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load identity locks: {exc}") from exc
+
+    return {"ep_id": ep_id_norm, "run_id": run_id_norm, "locks": locks}
+
+
+@router.post("/episodes/{ep_id}/identities/{identity_id}/lock", tags=["episodes"])
+def lock_identity(
+    ep_id: str,
+    identity_id: str,
+    body: IdentityLockRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_persistence_service.ensure_run(ep_id=ep_id_norm, run_id=run_id_norm)
+        lock_row = run_persistence_service.set_identity_lock(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            identity_id=str(identity_id),
+            locked=True,
+            locked_by=(body.locked_by or None),
+            reason=(body.reason or None),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to lock identity: {exc}") from exc
+
+    return {"status": "success", "ep_id": ep_id_norm, "run_id": run_id_norm, "lock": lock_row}
+
+
+@router.post("/episodes/{ep_id}/identities/{identity_id}/unlock", tags=["episodes"])
+def unlock_identity(
+    ep_id: str,
+    identity_id: str,
+    body: IdentityLockRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_persistence_service.ensure_run(ep_id=ep_id_norm, run_id=run_id_norm)
+        lock_row = run_persistence_service.set_identity_lock(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            identity_id=str(identity_id),
+            locked=False,
+            locked_by=(body.locked_by or None),
+            reason=(body.reason or None),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to unlock identity: {exc}") from exc
+
+    return {"status": "success", "ep_id": ep_id_norm, "run_id": run_id_norm, "lock": lock_row}
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/export", tags=["episodes"])
+def export_run_debug_bundle(
+    ep_id: str,
+    run_id: str,
+    include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities)"),
+    include_images: bool = Query(False, description="Include thumbnails/crops/frames (very large)"),
+    include_logs: bool = Query(True, description="Include persisted logs (recommended)"),
+) -> StreamingResponse:
+    """Export a single zip containing the end-to-end state for one run."""
+    ep_id_norm = normalize_ep_id(ep_id)
+
+    try:
+        zip_path, download_name = build_run_debug_bundle_zip(
+            ep_id=ep_id_norm,
+            run_id=run_id,
+            include_artifacts=include_artifacts,
+            include_images=include_images,
+            include_logs=include_logs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    file_handle = open(zip_path, "rb")
+
+    def _cleanup() -> None:
+        try:
+            file_handle.close()
+        finally:
+            try:
+                os.unlink(zip_path)
+            except OSError:
+                pass
+
+    headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+    return StreamingResponse(
+        file_handle,
+        media_type="application/zip",
+        headers=headers,
+        background=BackgroundTask(_cleanup),
+    )
+
+
 @router.get(
     "/episodes/{ep_id}/events",
     tags=["episodes"],
@@ -2503,7 +2691,10 @@ def mirror_episode_artifacts(ep_id: str, payload: MirrorArtifactsRequest | None 
 
 
 @router.post("/episodes/{ep_id}/refresh_similarity", tags=["episodes"])
-def refresh_similarity_values(ep_id: str) -> dict:
+def refresh_similarity_values(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> dict:
     """Recompute all similarity scores for the episode.
 
     This regenerates track representatives, cluster centroids, updates
@@ -2517,9 +2708,14 @@ def refresh_similarity_values(ep_id: str) -> dict:
     start_time = time.time()
 
     try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
         # Step 1: Load identities to count tracks and clusters (0-10%)
         step_start = time.time()
-        identities_payload = _load_identities(ep_id)
+        identities_payload = _load_identities(ep_id, run_id=run_id_norm)
         identities = identities_payload.get("identities", [])
         track_count = sum(len(i.get("track_ids", [])) for i in identities)
         cluster_count = len(identities)
@@ -2551,7 +2747,7 @@ def refresh_similarity_values(ep_id: str) -> dict:
             from apps.api.services.track_reps import (
                 generate_track_reps_and_centroids,
             )
-            result = generate_track_reps_and_centroids(ep_id)
+            result = generate_track_reps_and_centroids(ep_id, run_id=run_id_norm)
             track_reps_count = result.get("tracks_processed", 0)
             centroids_count = result.get("centroids_computed", 0)
             tracks_with_reps = result.get("tracks_with_reps", 0)
@@ -2610,7 +2806,7 @@ def refresh_similarity_values(ep_id: str) -> dict:
                 # Update prototypes
                 people_by_id = {p.get("person_id"): p for p in people if p.get("person_id")}
                 try:
-                    centroids_data = load_cluster_centroids(ep_id)
+                    centroids_data = load_cluster_centroids(ep_id, run_id=run_id_norm)
                 except Exception:
                     centroids_data = {}
 
@@ -2625,12 +2821,21 @@ def refresh_similarity_values(ep_id: str) -> dict:
                     for cluster_ref in cluster_refs:
                         if not isinstance(cluster_ref, str) or ":" not in cluster_ref:
                             continue
-                        ep_slug, cluster_id = cluster_ref.split(":", 1)
-                        if ep_slug == ep_id:
-                            ep_clusters += 1
-                            centroid_data = centroids_data.get(cluster_id, {})
-                            if centroid_data and centroid_data.get("centroid"):
-                                vectors.append(np.array(centroid_data["centroid"], dtype=np.float32))
+                        parts = cluster_ref.split(":")
+                        ep_slug = parts[0] if parts else ""
+                        cluster_id = parts[-1] if len(parts) >= 2 else ""
+                        cluster_run_id = parts[1] if len(parts) >= 3 else None
+                        if ep_slug != ep_id:
+                            continue
+                        if run_id_norm:
+                            if cluster_run_id != run_id_norm:
+                                continue
+                        elif cluster_run_id is not None:
+                            continue
+                        ep_clusters += 1
+                        centroid_data = centroids_data.get(cluster_id, {})
+                        if centroid_data and centroid_data.get("centroid"):
+                            vectors.append(np.array(centroid_data["centroid"], dtype=np.float32))
                     if vectors:
                         stacked = np.stack(vectors, axis=0)
                         proto = l2_normalize(np.mean(stacked, axis=0)).tolist()
@@ -2671,7 +2876,7 @@ def refresh_similarity_values(ep_id: str) -> dict:
         suggestions_list = []
         try:
             from apps.api.services.grouping import GroupingService
-            grouping_service = GroupingService()
+            grouping_service = GroupingService(run_id=run_id_norm)
             suggestions_result = grouping_service.suggest_from_assigned_clusters(ep_id)
             suggestions_list = suggestions_result.get("suggestions", [])
             suggestions_count = len(suggestions_list)
@@ -2738,7 +2943,11 @@ def refresh_similarity_values(ep_id: str) -> dict:
         return {
             "status": "success",
             "ep_id": ep_id,
+            "run_id": run_id_norm,
             "message": "Similarity values refreshed successfully",
+            # Compatibility keys for workspace-ui (Faces Review expects these at top-level).
+            "tracks_processed": track_reps_count,
+            "centroids_computed": centroids_count,
             "log": {
                 "steps": log_steps,
                 "total_duration_ms": total_duration,
@@ -3035,10 +3244,15 @@ def episode_video_meta(ep_id: str) -> EpisodeVideoMeta:
 
 
 @router.get("/episodes/{ep_id}/identities")
-def list_identities(ep_id: str) -> dict:
-    payload = _load_identities(ep_id)
-    track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id)}
-    first_faces = _first_face_lookup(ep_id)
+def list_identities(ep_id: str, run_id: str | None = Query(None)) -> dict:
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    payload = _load_identities(ep_id, run_id=run_id_norm)
+    track_lookup = {int(row.get("track_id", -1)): row for row in _load_tracks(ep_id, run_id=run_id_norm)}
+    first_faces = _first_face_lookup(ep_id, run_id=run_id_norm)
     identities = []
     for identity in payload.get("identities", []):
         track_ids = []
@@ -3085,19 +3299,24 @@ def list_identities(ep_id: str) -> dict:
                 except ValueError:
                     # Ignore duplicates when multiple workers enqueue roster seeds.
                     pass
-    return {"identities": identities, "stats": payload.get("stats", {})}
+    return {"identities": identities, "stats": payload.get("stats", {}), "run_id": run_id_norm or "legacy"}
 
 
 @router.get("/episodes/{ep_id}/cluster_tracks")
 def list_cluster_tracks(
     ep_id: str,
     limit_per_cluster: int | None = Query(None, ge=1, description="Optional max tracks per cluster"),
+    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
 ) -> dict:
     try:
-        payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster)
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        payload = identity_service.cluster_track_summary(ep_id, limit_per_cluster=limit_per_cluster, run_id=run_id_norm)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    first_faces = _first_face_lookup(ep_id)
+    first_faces = _first_face_lookup(ep_id, run_id=run_id_norm)
     for cluster in payload.get("clusters", []):
         for track in cluster.get("tracks", []) or []:
             tid = track.get("track_id")
@@ -3109,6 +3328,7 @@ def list_cluster_tracks(
             if media_url:
                 track["rep_media_url"] = media_url
                 track["rep_thumb_url"] = media_url
+    payload.setdefault("run_id", run_id_norm or "legacy")
     return payload
 
 
@@ -3117,11 +3337,17 @@ def get_cluster_track_reps(
     ep_id: str,
     cluster_id: str,
     frames_per_track: int = Query(0, ge=0, le=20, description="Number of sample frames to include per track (0=none)"),
+    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
 ) -> dict:
     """Get representative frames with similarity scores for all tracks in a cluster.
 
     If frames_per_track > 0, includes sample frames for each track for inline display.
     """
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     try:
         from apps.api.services.track_reps import (
             build_cluster_track_reps,
@@ -3129,15 +3355,21 @@ def get_cluster_track_reps(
             load_cluster_centroids,
         )
 
-        track_reps = load_track_reps(ep_id)
-        cluster_centroids = load_cluster_centroids(ep_id)
+        track_reps = load_track_reps(ep_id, run_id=run_id_norm)
+        cluster_centroids = load_cluster_centroids(ep_id, run_id=run_id_norm)
 
-        result = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+        result = build_cluster_track_reps(
+            ep_id,
+            cluster_id,
+            track_reps,
+            cluster_centroids,
+            run_id=run_id_norm,
+        )
 
         # Load faces for sample frames if requested
         all_faces = None
         if frames_per_track > 0:
-            all_faces = _load_faces(ep_id, include_skipped=False)
+            all_faces = _load_faces(ep_id, include_skipped=False, run_id=run_id_norm)
 
         # Resolve crop URLs and add sample frames
         for track in result.get("tracks", []):
@@ -3197,7 +3429,11 @@ def get_cluster_track_reps(
 
 
 @router.get("/episodes/{ep_id}/people/{person_id}/clusters_summary")
-def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
+def get_person_clusters_summary(
+    ep_id: str,
+    person_id: str,
+    run_id: str | None = Query(None, description="Optional run_id scope for artifacts/state"),
+) -> dict:
     """Get clusters summary with track representatives for a person in an episode."""
     try:
         from apps.api.services.track_reps import (
@@ -3206,12 +3442,17 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             load_cluster_centroids,
         )
 
+        try:
+            run_id_norm = _normalize_run_id(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
         # Parse episode to get show
         ep_ctx = episode_context_from_id(ep_id)
         show_slug = ep_ctx.show_slug.upper()
 
         # Load identities first - we need this regardless of person lookup
-        identities_data = _load_identities(ep_id)
+        identities_data = _load_identities(ep_id, run_id=run_id_norm)
         identities_list = identities_data.get("identities", []) if isinstance(identities_data, dict) else []
 
         # Try to find clusters via person registry first
@@ -3228,11 +3469,25 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
                 LOGGER.warning(f"cluster_ids is not a list: {type(cluster_ids)}, value: {cluster_ids}")
                 cluster_ids = []
 
-            episode_clusters = [
-                cid.split(":", 1)[1] if ":" in cid else cid
-                for cid in cluster_ids
-                if isinstance(cid, str) and cid.startswith(f"{ep_id}:")
-            ]
+            episode_clusters = []
+            for cid in cluster_ids:
+                if not isinstance(cid, str):
+                    continue
+                if run_id_norm:
+                    prefix = f"{ep_id}:{run_id_norm}:"
+                    if not cid.startswith(prefix):
+                        continue
+                    parts = cid.split(":")
+                    if len(parts) >= 3:
+                        episode_clusters.append(parts[-1])
+                    continue
+
+                # Legacy cluster ref format: "{ep_id}:{cluster_id}"
+                if not cid.startswith(f"{ep_id}:"):
+                    continue
+                parts = cid.split(":")
+                if len(parts) == 2:
+                    episode_clusters.append(parts[1])
         else:
             # Person not in registry - find identities assigned to this person_id
             # This handles auto-clustered people that don't have person records yet
@@ -3255,8 +3510,8 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
             }
 
         # Load track reps and centroids once
-        track_reps = load_track_reps(ep_id)
-        cluster_centroids = load_cluster_centroids(ep_id)
+        track_reps = load_track_reps(ep_id, run_id=run_id_norm)
+        cluster_centroids = load_cluster_centroids(ep_id, run_id=run_id_norm)
 
         # Build identity index for face counts (identities_list already loaded above)
         identity_index = {}
@@ -3271,7 +3526,13 @@ def get_person_clusters_summary(ep_id: str, person_id: str) -> dict:
 
         for cluster_id in episode_clusters:
             LOGGER.info(f"Processing cluster {cluster_id}")
-            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, cluster_centroids)
+            cluster_data = build_cluster_track_reps(
+                ep_id,
+                cluster_id,
+                track_reps,
+                cluster_centroids,
+                run_id=run_id_norm,
+            )
             LOGGER.info(
                 f"cluster_data type: {type(cluster_data)}, keys: {list(cluster_data.keys()) if isinstance(cluster_data, dict) else 'not a dict'}"
             )
@@ -4167,8 +4428,17 @@ def generate_singleton_suggestions(
 
 
 @router.get("/episodes/{ep_id}/tracks/{track_id}")
-def track_detail(ep_id: str, track_id: int) -> dict:
-    faces = [row for row in _load_faces(ep_id, include_skipped=False) if int(row.get("track_id", -1)) == track_id]
+def track_detail(ep_id: str, track_id: int, run_id: str | None = Query(None)) -> dict:
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    faces = [
+        row
+        for row in _load_faces(ep_id, include_skipped=False, run_id=run_id_norm)
+        if int(row.get("track_id", -1)) == track_id
+    ]
     frames = []
     for row in faces:
         media_url = _resolve_face_media_url(ep_id, row)
@@ -4186,7 +4456,7 @@ def track_detail(ep_id: str, track_id: int) -> dict:
             }
         )
     track_row = next(
-        (row for row in _load_tracks(ep_id) if int(row.get("track_id", -1)) == track_id),
+        (row for row in _load_tracks(ep_id, run_id=run_id_norm) if int(row.get("track_id", -1)) == track_id),
         None,
     )
     preview_url = _resolve_face_media_url(ep_id, faces[0] if faces else None)
@@ -4739,8 +5009,13 @@ def delete_track_frames(ep_id: str, track_id: int, body: TrackFrameDeleteRequest
 
 
 @router.post("/episodes/{ep_id}/identities/{identity_id}/rename")
-def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -> dict:
-    payload = _load_identities(ep_id)
+def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest, run_id: str = Query(...)) -> dict:
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    payload = _load_identities(ep_id, run_id=run_id_norm)
     identity = next(
         (item for item in payload.get("identities", []) if item.get("identity_id") == identity_id),
         None,
@@ -4749,43 +5024,122 @@ def rename_identity(ep_id: str, identity_id: str, body: IdentityRenameRequest) -
         raise HTTPException(status_code=404, detail="Identity not found")
     label = (body.label or "").strip()
     identity["label"] = label or None
-    _update_identity_stats(ep_id, payload)
-    path = _write_identities(ep_id, payload)
+    _update_identity_stats(ep_id, payload, run_id=run_id_norm)
+    path = _identities_path_for_run(ep_id, run_id_norm)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _sync_manifests(ep_id, path)
     return {"identity_id": identity_id, "label": identity["label"]}
 
 
 @router.post("/episodes/{ep_id}/identities/{identity_id}/name")
-def assign_identity_name(ep_id: str, identity_id: str, body: IdentityNameRequest) -> dict:
+def assign_identity_name(
+    ep_id: str,
+    identity_id: str,
+    body: IdentityNameRequest,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> dict:
     try:
-        return identity_service.assign_identity_name(ep_id, identity_id, body.name, body.show)
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        return identity_service.assign_identity_name(
+            ep_id,
+            identity_id,
+            body.name,
+            body.show,
+            body.cast_id,
+            run_id=run_id_norm,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/episodes/{ep_id}/tracks/{track_id}/name")
-def assign_track_name(ep_id: str, track_id: int, body: IdentityNameRequest) -> dict:
+def assign_track_name(
+    ep_id: str,
+    track_id: int,
+    body: IdentityNameRequest,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> dict:
     try:
-        return identity_service.assign_track_name(ep_id, track_id, body.name, body.show)
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        return identity_service.assign_track_name(
+            ep_id,
+            track_id,
+            body.name,
+            body.show,
+            body.cast_id,
+            run_id=run_id_norm,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/episodes/{ep_id}/tracks/bulk_assign")
-def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
+def bulk_assign_tracks(
+    ep_id: str,
+    body: BulkTrackAssignRequest,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> dict:
     """Bulk assign multiple tracks to a cast member by name.
 
     This creates or updates identity assignments for each track, similar to
     calling assign_track_name for each track individually but more efficient.
     """
+    ep_id_norm = normalize_ep_id(ep_id)
+
     assigned = 0
+    skipped_locked = 0
     failed = 0
     errors: list[str] = []
 
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    locked_identities: set[str] = set()
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        for row in run_persistence_service.list_identity_locks(ep_id=ep_id_norm, run_id=run_id_norm):
+            if isinstance(row, dict) and row.get("locked") and row.get("identity_id"):
+                locked_identities.add(str(row["identity_id"]))
+    except Exception:
+        locked_identities = set()
+
+    # Precompute track -> identity mapping so we can skip locked identities deterministically.
+    try:
+        identities_payload = identity_service.load_identities(ep_id_norm, run_id=run_id_norm)
+        track_identity_map = _identity_lookup(identities_payload)
+    except Exception:
+        track_identity_map = {}
+
     for track_id in body.track_ids:
         try:
+            identity_id = None
+            try:
+                identity_id = track_identity_map.get(int(track_id))
+            except (TypeError, ValueError):
+                identity_id = None
+            if identity_id and identity_id in locked_identities:
+                skipped_locked += 1
+                continue
+
             identity_service.assign_track_name(
-                ep_id, track_id, body.name, body.show, body.cast_id
+                ep_id_norm,
+                track_id,
+                body.name,
+                body.show,
+                body.cast_id,
+                run_id=run_id_norm,
             )
             assigned += 1
         except ValueError as exc:
@@ -4797,14 +5151,24 @@ def bulk_assign_tracks(ep_id: str, body: BulkTrackAssignRequest) -> dict:
 
     return {
         "assigned": assigned,
+        "skipped_locked": skipped_locked,
         "failed": failed,
         "errors": errors if errors else None,
     }
 
 
 @router.post("/episodes/{ep_id}/identities/merge")
-def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
-    payload = _load_identities(ep_id)
+def merge_identities(
+    ep_id: str,
+    body: IdentityMergeRequest,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> dict:
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    payload = _load_identities(ep_id, run_id=run_id_norm)
     identities = payload.get("identities", [])
     source = next((item for item in identities if item.get("identity_id") == body.source_id), None)
     target = next((item for item in identities if item.get("identity_id") == body.target_id), None)
@@ -4815,10 +5179,12 @@ def merge_identities(ep_id: str, body: IdentityMergeRequest) -> dict:
         merged_track_ids.add(tid)
     target["track_ids"] = sorted({int(x) for x in merged_track_ids})
     payload["identities"] = [item for item in identities if item.get("identity_id") != body.source_id]
-    _update_identity_stats(ep_id, payload)
-    path = _write_identities(ep_id, payload)
+    _update_identity_stats(ep_id, payload, run_id=run_id_norm)
+    path = _identities_path_for_run(ep_id, run_id_norm)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _sync_manifests(ep_id, path)
-    _refresh_similarity_indexes(ep_id, identity_ids=[body.source_id, body.target_id])
+    _refresh_similarity_indexes(ep_id, identity_ids=[body.source_id, body.target_id], run_id=run_id_norm)
     return {"target_id": body.target_id, "track_ids": target["track_ids"]}
 
 
@@ -6126,13 +6492,20 @@ def export_timeline_data(
 
 
 @router.delete("/episodes/{ep_id}/identities/{identity_id}")
-def delete_identity(ep_id: str, identity_id: str) -> dict:
+def delete_identity(
+    ep_id: str, identity_id: str, run_id: str = Query(..., description="Run id scope (required for mutations)")
+) -> dict:
     """Delete (archive) an identity/cluster.
 
     The cluster is moved to the archive where its centroid is stored.
     This allows matching faces in future episodes to be auto-archived.
     """
-    payload = _load_identities(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    payload = _load_identities(ep_id, run_id=run_id_norm)
     identities = payload.get("identities", [])
 
     # Find the identity to archive before deleting
@@ -6172,8 +6545,10 @@ def delete_identity(ep_id: str, identity_id: str) -> dict:
 
     # Remove the identity
     payload["identities"] = [item for item in identities if item.get("identity_id") != identity_id]
-    _update_identity_stats(ep_id, payload)
-    path = _write_identities(ep_id, payload)
+    _update_identity_stats(ep_id, payload, run_id=run_id_norm)
+    path = _identities_path_for_run(ep_id, run_id_norm)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _sync_manifests(ep_id, path)
 
     return {"deleted": identity_id, "archived": True, "remaining": len(payload["identities"])}
@@ -6257,7 +6632,11 @@ def delete_frame(ep_id: str, payload: FrameDeleteRequest) -> dict:
 
 
 @router.post("/episodes/{ep_id}/identities/{identity_id}/export_seeds", tags=["episodes"])
-def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
+def export_facebank_seeds(
+    ep_id: str,
+    identity_id: str,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> Dict[str, Any]:
     """
     Select and export high-quality seed frames to permanent facebank.
     Only exports user-confirmed identities with person_id mappings.
@@ -6270,14 +6649,19 @@ def export_facebank_seeds(ep_id: str, identity_id: str) -> Dict[str, Any]:
     _require_episode_context(ep_id)
 
     # Load all faces for this identity
-    all_faces = _load_faces(ep_id, include_skipped=False)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    all_faces = _load_faces(ep_id, include_skipped=False, run_id=run_id_norm)
     identity_faces = [f for f in all_faces if f.get("identity_id") == identity_id]
 
     if not identity_faces:
         raise HTTPException(status_code=404, detail=f"No faces found for identity {identity_id} in episode {ep_id}")
 
     # Check if identity has a person_id mapping (cast member)
-    identities = _load_identities(ep_id)
+    identities = _load_identities(ep_id, run_id=run_id_norm)
     if not isinstance(identities, dict):
         raise HTTPException(status_code=500, detail="Invalid identities data structure")
 

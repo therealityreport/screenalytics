@@ -9,13 +9,15 @@ from apps.api.main import app
 from py_screenalytics.artifacts import ensure_dirs, get_path
 
 
-def _bootstrap_facebank(ep_id: str, data_root: Path) -> None:
+def _bootstrap_facebank(ep_id: str, data_root: Path, *, run_id: str | None = None) -> None:
     ensure_dirs(ep_id)
     manifests_dir = get_path(ep_id, "detections").parent
     manifests_dir.mkdir(parents=True, exist_ok=True)
-    faces_path = manifests_dir / "faces.jsonl"
-    track_path = manifests_dir / "tracks.jsonl"
-    identities_path = manifests_dir / "identities.json"
+    target_dir = manifests_dir / "runs" / run_id if run_id else manifests_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    faces_path = target_dir / "faces.jsonl"
+    track_path = target_dir / "tracks.jsonl"
+    identities_path = target_dir / "identities.json"
 
     faces_rows = [
         {
@@ -86,21 +88,24 @@ def test_identity_rename_and_merge(monkeypatch, tmp_path) -> None:
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
     ep_id = "test-s01e01"
-    _bootstrap_facebank(ep_id, data_root)
+    run_id = "attempt-1"
+    _bootstrap_facebank(ep_id, data_root, run_id=run_id)
     client = TestClient(app)
 
     rename_resp = client.post(
         f"/episodes/{ep_id}/identities/id_0001/rename",
+        params={"run_id": run_id},
         json={"label": "Lead"},
     )
     assert rename_resp.status_code == 200
     merge_resp = client.post(
         f"/episodes/{ep_id}/identities/merge",
+        params={"run_id": run_id},
         json={"source_id": "id_0002", "target_id": "id_0001"},
     )
     assert merge_resp.status_code == 200
 
-    identities_path = get_path(ep_id, "detections").parent / "identities.json"
+    identities_path = get_path(ep_id, "detections").parent / "runs" / run_id / "identities.json"
     identities_doc = json.loads(identities_path.read_text(encoding="utf-8"))
     assert len(identities_doc["identities"]) == 1
     identity = identities_doc["identities"][0]

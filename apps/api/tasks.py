@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -875,6 +876,9 @@ class PipelineTask(Task):
         operation: str,
         progress_file: str | None = None,
         env: Optional[Dict[str, str]] = None,
+        *,
+        run_id: str | None = None,
+        request_json: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Run a subprocess command and track progress with real-time updates.
 
@@ -896,6 +900,38 @@ class PipelineTask(Task):
 
         job_id = self.request.id
         proc = None  # Track subprocess for cleanup (Bug 9 fix)
+        job_run_id: str | None = None
+        job_started_at = time.time()
+        final_status_value: str | None = None
+        final_error_text: str | None = None
+        final_return_code: int | None = None
+
+        # DB-backed job tracing is best-effort (pipeline should still run if DB is unavailable).
+        if run_id:
+            try:
+                from apps.api.services.run_persistence import run_persistence_service
+
+                run_persistence_service.ensure_run(
+                    ep_id=episode_id,
+                    run_id=run_id,
+                    config_json=(request_json or {}).get("options") if isinstance(request_json, dict) else None,
+                )
+                job_run_id = run_persistence_service.create_job_run(
+                    ep_id=episode_id,
+                    run_id=run_id,
+                    job_name=operation,
+                    request_json=request_json or {"celery_task_id": job_id, "command": command},
+                    status="running",
+                    started_at=datetime.now(timezone.utc),
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "[%s] Failed to persist job start for %s (run_id=%s): %s",
+                    episode_id,
+                    operation,
+                    run_id,
+                    exc,
+                )
 
         LOGGER.info(f"[{job_id}] Starting {operation} for {episode_id}")
         LOGGER.info(f"[{job_id}] Command: {' '.join(command)}")
@@ -1002,7 +1038,10 @@ class PipelineTask(Task):
             if proc.returncode != 0:
                 error_msg = stderr.strip() if stderr else f"Exit code {proc.returncode}"
                 LOGGER.error(f"[{job_id}] {operation} failed: {error_msg}")
-                return {
+                final_status_value = "failed"
+                final_error_text = error_msg
+                final_return_code = proc.returncode
+                result = {
                     "status": "error",
                     "episode_id": episode_id,
                     "operation": operation,
@@ -1010,9 +1049,13 @@ class PipelineTask(Task):
                     "return_code": proc.returncode,
                     "progress": progress_data,
                 }
+                return result
 
             LOGGER.info(f"[{job_id}] {operation} completed successfully")
-            return {
+            final_status_value = "succeeded"
+            final_error_text = None
+            final_return_code = 0
+            result = {
                 "status": "success",
                 "episode_id": episode_id,
                 "operation": operation,
@@ -1020,6 +1063,7 @@ class PipelineTask(Task):
                 "progress": progress_data,
                 "stdout": stdout[:2000] if stdout else None,
             }
+            return result
 
         except Exception as e:
             # Bug 9 fix: Clean up subprocess on exception
@@ -1035,12 +1079,106 @@ class PipelineTask(Task):
                     pass  # Best effort cleanup
 
             LOGGER.exception(f"[{job_id}] {operation} raised exception: {e}")
+            final_status_value = "failed"
+            final_error_text = str(e)
             return {
                 "status": "error",
                 "episode_id": episode_id,
                 "operation": operation,
                 "error": str(e),
             }
+        finally:
+            if run_id and job_run_id:
+                status_value = final_status_value or "failed"
+                error_text = final_error_text
+                elapsed_s = max(0.0, time.time() - job_started_at)
+                finished_at = datetime.now(timezone.utc)
+                try:
+                    from py_screenalytics import run_layout
+
+                    run_root = run_layout.run_root(episode_id, run_id)
+                    artifact_index = {
+                        "run_root": str(run_root),
+                        "key_artifacts": [],
+                    }
+                    for rel in (
+                        "progress.json",
+                        "detections.jsonl",
+                        "tracks.jsonl",
+                        "faces.jsonl",
+                        "identities.json",
+                        "track_metrics.json",
+                        "cluster_centroids.json",
+                        "track_reps.jsonl",
+                        "group_log.json",
+                        "face_review_state.json",
+                    ):
+                        path = run_root / rel
+                        if not path.exists():
+                            continue
+                        try:
+                            stat = path.stat()
+                            artifact_index["key_artifacts"].append(
+                                {"path": rel, "bytes": int(stat.st_size), "mtime": float(stat.st_mtime)}
+                            )
+                        except OSError:
+                            artifact_index["key_artifacts"].append({"path": rel})
+
+                    # Also include faces.npy embed artifact when present.
+                    embeds_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser() / "embeds" / episode_id / "runs" / run_id
+                    faces_npy = embeds_root / "faces.npy"
+                    if faces_npy.exists():
+                        try:
+                            stat = faces_npy.stat()
+                            artifact_index["key_artifacts"].append(
+                                {"path": "faces.npy", "bytes": int(stat.st_size), "mtime": float(stat.st_mtime)}
+                            )
+                        except OSError:
+                            artifact_index["key_artifacts"].append({"path": "faces.npy"})
+                except Exception:
+                    artifact_index = None
+
+                metrics = {
+                    "celery_task_id": job_id,
+                    "elapsed_seconds": elapsed_s,
+                    "return_code": final_return_code,
+                }
+
+                try:
+                    from apps.api.services.run_persistence import run_persistence_service
+
+                    run_persistence_service.update_job_run(
+                        job_run_id=job_run_id,
+                        status=status_value,
+                        finished_at=finished_at,
+                        error_text=error_text,
+                        artifact_index_json=artifact_index,
+                        metrics_json=metrics,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "[%s] Failed to persist job completion for %s (run_id=%s): %s",
+                        episode_id,
+                        operation,
+                        run_id,
+                        exc,
+                    )
+
+                # Update stage_state_json snapshot for the run.
+                try:
+                    from apps.api.routers.episodes import _episode_run_status
+                    from apps.api.services.run_persistence import run_persistence_service
+
+                    snapshot = _episode_run_status(episode_id, run_id).model_dump()
+                    snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    run_persistence_service.update_run_stage_state(run_id=run_id, stage_state_json=snapshot)
+                except Exception as exc:
+                    LOGGER.debug(
+                        "[%s] Stage snapshot update skipped for run_id=%s: %s",
+                        episode_id,
+                        run_id,
+                        exc,
+                    )
 
 
 @celery_app.task(bind=True, base=PipelineTask, name="tasks.run_detect_track")
@@ -1200,8 +1338,20 @@ def run_detect_track_task(
             },
         )
 
+        request_payload = {
+            "celery_task_id": job_id,
+            "operation": "detect_track",
+            "options": options,
+            "command": command,
+        }
         result = self._run_subprocess(
-            command, episode_id, "detect_track", str(progress_file), env
+            command,
+            episode_id,
+            "detect_track",
+            str(progress_file),
+            env,
+            run_id=run_id,
+            request_json=request_payload,
         )
 
         return result
@@ -1327,8 +1477,20 @@ def run_faces_embed_task(
             },
         )
 
+        request_payload = {
+            "celery_task_id": job_id,
+            "operation": "faces_embed",
+            "options": options,
+            "command": command,
+        }
         result = self._run_subprocess(
-            command, episode_id, "faces_embed", str(progress_file), env
+            command,
+            episode_id,
+            "faces_embed",
+            str(progress_file),
+            env,
+            run_id=run_id,
+            request_json=request_payload,
         )
 
         return result
@@ -1448,8 +1610,20 @@ def run_cluster_task(
             },
         )
 
+        request_payload = {
+            "celery_task_id": job_id,
+            "operation": "cluster",
+            "options": options,
+            "command": command,
+        }
         result = self._run_subprocess(
-            command, episode_id, "cluster", str(progress_file), env
+            command,
+            episode_id,
+            "cluster",
+            str(progress_file),
+            env,
+            run_id=run_id,
+            request_json=request_payload,
         )
 
         return result

@@ -28,11 +28,13 @@ def test_identity_endpoints(tmp_path, monkeypatch):
     monkeypatch.setenv("STORAGE_BACKEND", "local")
 
     ep_id = "demo-s01e01"
+    run_id = "attempt-1"
     ensure_dirs(ep_id)
     manifests_dir = get_path(ep_id, "detections").parent
-    tracks_path = get_path(ep_id, "tracks")
-    faces_path = manifests_dir / "faces.jsonl"
-    identities_path = manifests_dir / "identities.json"
+    run_dir = manifests_dir / "runs" / run_id
+    tracks_path = run_dir / "tracks.jsonl"
+    faces_path = run_dir / "faces.jsonl"
+    identities_path = run_dir / "identities.json"
 
     _write_jsonl(
         tracks_path,
@@ -64,6 +66,7 @@ def test_identity_endpoints(tmp_path, monkeypatch):
 
     resp = client.post(
         f"/identities/{ep_id}/rename",
+        params={"run_id": run_id},
         json={"identity_id": "id_0001", "new_label": "Lead"},
     )
     assert resp.status_code == 200
@@ -71,6 +74,7 @@ def test_identity_endpoints(tmp_path, monkeypatch):
 
     resp = client.post(
         f"/identities/{ep_id}/merge",
+        params={"run_id": run_id},
         json={"source_id": "id_0002", "target_id": "id_0001"},
     )
     assert resp.status_code == 200
@@ -78,16 +82,18 @@ def test_identity_endpoints(tmp_path, monkeypatch):
 
     resp = client.post(
         f"/identities/{ep_id}/move_track",
+        params={"run_id": run_id},
         json={"track_id": 2, "target_identity_id": None},
     )
     assert resp.status_code == 200
 
-    resp = client.post(f"/identities/{ep_id}/drop_track", json={"track_id": 2})
+    resp = client.post(f"/identities/{ep_id}/drop_track", params={"run_id": run_id}, json={"track_id": 2})
     assert resp.status_code == 200
     assert resp.json()["track_id"] == 2
 
     resp = client.post(
         f"/identities/{ep_id}/drop_frame",
+        params={"run_id": run_id},
         json={"track_id": 1, "frame_idx": 0, "delete_assets": False},
     )
     assert resp.status_code == 200
