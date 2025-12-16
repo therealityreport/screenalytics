@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from py_screenalytics.artifacts import get_path
+from py_screenalytics import run_layout
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,7 +69,13 @@ def _crops_root(ep_id: str) -> Path:
     return get_path(ep_id, "frames_root") / "crops"
 
 
-def _discover_crop_path(ep_id: str, track_id: int, frame_idx: int) -> Optional[str]:
+def _discover_crop_path(
+    ep_id: str,
+    track_id: int,
+    frame_idx: int,
+    *,
+    run_id: str | None = None,
+) -> Optional[str]:
     """Find the crop file for a specific track and frame.
 
     Primary: data/frames/<ep_id>/crops/track_<ID>/frame_<frame_idx>.jpg
@@ -76,26 +83,37 @@ def _discover_crop_path(ep_id: str, track_id: int, frame_idx: int) -> Optional[s
     Fallback 2: artifacts/crops/<show>/<season>/<episode>/tracks/track_<ID>/frame_<frame_idx>.jpg
     """
     track_component = f"track_{track_id:04d}"
-    frame_filename = f"frame_{frame_idx:06d}.jpg"
+    frame_filename_jpg = f"frame_{frame_idx:06d}.jpg"
+    frame_filename_png = f"frame_{frame_idx:06d}.png"
 
-    # Primary location
     frames_root = get_path(ep_id, "frames_root")
-    primary = frames_root / "crops" / track_component / frame_filename
-    if primary.exists():
-        # Return relative path from crops root
-        return f"crops/{track_component}/{frame_filename}"
+    candidate_crops_roots: list[Path] = []
+    run_candidates: list[str] = []
+    if run_id:
+        try:
+            run_candidates.append(run_layout.normalize_run_id(run_id))
+        except ValueError:
+            pass
+    active_run = run_layout.read_active_run_id(ep_id)
+    if active_run and active_run not in run_candidates:
+        run_candidates.append(active_run)
+    for rid in run_candidates:
+        candidate_crops_roots.append(frames_root / "runs" / rid / "crops")
+    candidate_crops_roots.append(frames_root / "crops")
+
+    for crops_root in candidate_crops_roots:
+        jpg_path = crops_root / track_component / frame_filename_jpg
+        if jpg_path.exists():
+            return f"crops/{track_component}/{frame_filename_jpg}"
+        png_path = crops_root / track_component / frame_filename_png
+        if png_path.exists():
+            return f"crops/{track_component}/{frame_filename_png}"
 
     # Fallback locations
     fallback_root = Path(os.environ.get("SCREENALYTICS_CROPS_FALLBACK_ROOT", "data/crops")).expanduser()
-    legacy1 = fallback_root / ep_id / "tracks" / track_component / frame_filename
+    legacy1 = fallback_root / ep_id / "tracks" / track_component / frame_filename_jpg
     if legacy1.exists():
-        return f"crops/{track_component}/{frame_filename}"
-
-    # Try .png extension
-    frame_filename_png = f"frame_{frame_idx:06d}.png"
-    primary_png = frames_root / "crops" / track_component / frame_filename_png
-    if primary_png.exists():
-        return f"crops/{track_component}/{frame_filename_png}"
+        return f"crops/{track_component}/{frame_filename_jpg}"
 
     legacy1_png = fallback_root / ep_id / "tracks" / track_component / frame_filename_png
     if legacy1_png.exists():
@@ -213,7 +231,12 @@ def _passes_quality_gates(face: Dict[str, Any], crop_path: Optional[str]) -> boo
     return True
 
 
-def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str, Any]]:
+def compute_track_representative(
+    ep_id: str,
+    track_id: int,
+    *,
+    run_id: str | None = None,
+) -> Optional[Dict[str, Any]]:
     """Compute representative frame and centroid for a track.
 
     Selects the HIGHEST-QUALITY frame that passes similarity and quality thresholds,
@@ -249,7 +272,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         if frame_idx is None:
             continue
 
-        crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
+        crop_path = _discover_crop_path(ep_id, track_id, frame_idx, run_id=run_id)
         if _passes_quality_gates(face, crop_path):
             embeddings.append(np.array(embedding, dtype=np.float32))
 
@@ -279,7 +302,7 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
         if frame_idx is None:
             continue
 
-        crop_path = _discover_crop_path(ep_id, track_id, frame_idx)
+        crop_path = _discover_crop_path(ep_id, track_id, frame_idx, run_id=run_id)
         if not crop_path:
             continue
 
@@ -419,7 +442,12 @@ def compute_track_representative(ep_id: str, track_id: int) -> Optional[Dict[str
     return result
 
 
-def compute_all_track_reps(ep_id: str, return_stats: bool = False) -> List[Dict[str, Any]] | Dict[str, Any]:
+def compute_all_track_reps(
+    ep_id: str,
+    *,
+    run_id: str | None = None,
+    return_stats: bool = False,
+) -> List[Dict[str, Any]] | Dict[str, Any]:
     """Compute track representatives for all tracks in an episode.
 
     Args:
@@ -456,7 +484,7 @@ def compute_all_track_reps(ep_id: str, return_stats: bool = False) -> List[Dict[
                 continue
 
             tracks_processed += 1
-            rep = compute_track_representative(ep_id, track_id)
+            rep = compute_track_representative(ep_id, track_id, run_id=run_id)
             if rep:
                 track_reps.append(rep)
             else:
@@ -854,7 +882,7 @@ def build_cluster_track_reps(
     }
 
 
-def generate_track_reps_and_centroids(ep_id: str) -> Dict[str, Any]:
+def generate_track_reps_and_centroids(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
     """Complete pipeline: compute track reps and cluster centroids.
 
     Returns: Summary with paths and counts matching expected keys:
@@ -864,7 +892,7 @@ def generate_track_reps_and_centroids(ep_id: str) -> Dict[str, Any]:
         - centroids_computed: Number of cluster centroids computed
     """
     LOGGER.info(f"Generating track representatives for {ep_id}")
-    track_reps_result = compute_all_track_reps(ep_id, return_stats=True)
+    track_reps_result = compute_all_track_reps(ep_id, run_id=run_id, return_stats=True)
     track_reps_list = track_reps_result["reps"]
     track_reps_map = {rep["track_id"]: rep for rep in track_reps_list}
 
