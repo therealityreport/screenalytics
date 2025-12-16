@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from enum import Enum
 
 from py_screenalytics.artifacts import get_path
+from py_screenalytics import run_layout
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,16 +64,19 @@ class ScreenTimeAnalyzer:
     def __init__(self, config: Optional[ScreenTimeConfig] = None):
         self.config = config or ScreenTimeConfig()
 
-    def analyze_episode(self, ep_id: str) -> Dict[str, Any]:
+    def analyze_episode(self, ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
         """Analyze screen time for an episode.
 
         Args:
             ep_id: Episode identifier (e.g., 'rhobh-s05e17')
+            run_id: Optional pipeline run identifier. When provided, artifacts
+                are read only from `data/manifests/{ep_id}/runs/{run_id}/`.
 
         Returns:
             Dictionary with episode_id, generated_at, metrics list, and diagnostics
         """
-        LOGGER.info(f"[screentime] Starting analysis for {ep_id}")
+        run_id_norm = run_layout.normalize_run_id(run_id) if run_id else None
+        LOGGER.info("[screentime] Starting analysis for %s (run_id=%s)", ep_id, run_id_norm or "legacy")
 
         # Initialize diagnostic counts
         diagnostics = {
@@ -95,9 +99,9 @@ class ScreenTimeAnalyzer:
         }
 
         # Load artifacts
-        faces = self._load_faces(ep_id)
-        tracks = self._load_tracks(ep_id)
-        identities = self._load_identities(ep_id)
+        faces = self._load_faces(ep_id, run_id=run_id_norm)
+        tracks = self._load_tracks(ep_id, run_id=run_id_norm)
+        identities = self._load_identities(ep_id, run_id=run_id_norm)
         people, show_id = self._load_people(ep_id)
         cast_members = self._load_cast_members(show_id)
 
@@ -409,6 +413,7 @@ class ScreenTimeAnalyzer:
 
         return {
             "episode_id": ep_id,
+            "run_id": run_id_norm,
             "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "diagnostics": diagnostics,
             "metadata": {
@@ -419,9 +424,15 @@ class ScreenTimeAnalyzer:
             "timeline": timeline_data,
         }
 
-    def _load_faces(self, ep_id: str) -> List[Dict[str, Any]]:
+    def _manifests_dir(self, ep_id: str, run_id: str | None) -> Path:
+        if run_id:
+            return run_layout.run_root(ep_id, run_id)
+        return get_path(ep_id, "detections").parent
+
+    def _load_faces(self, ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
         """Load faces.jsonl for an episode."""
-        faces_path = get_path(ep_id, "detections").parent / "faces.jsonl"
+        manifests_dir = self._manifests_dir(ep_id, run_id)
+        faces_path = manifests_dir / "faces.jsonl"
         if not faces_path.exists():
             raise FileNotFoundError(f"faces.jsonl not found: {faces_path}")
 
@@ -438,9 +449,10 @@ class ScreenTimeAnalyzer:
                     continue
         return faces
 
-    def _load_tracks(self, ep_id: str) -> List[Dict[str, Any]]:
+    def _load_tracks(self, ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
         """Load tracks.jsonl for an episode."""
-        tracks_path = get_path(ep_id, "tracks")
+        manifests_dir = self._manifests_dir(ep_id, run_id)
+        tracks_path = manifests_dir / "tracks.jsonl"
         if not tracks_path.exists():
             raise FileNotFoundError(f"tracks.jsonl not found: {tracks_path}")
 
@@ -457,9 +469,10 @@ class ScreenTimeAnalyzer:
                     continue
         return tracks
 
-    def _load_identities(self, ep_id: str) -> List[Dict[str, Any]]:
+    def _load_identities(self, ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
         """Load identities.json for an episode."""
-        identities_path = get_path(ep_id, "detections").parent / "identities.json"
+        manifests_dir = self._manifests_dir(ep_id, run_id)
+        identities_path = manifests_dir / "identities.json"
         if not identities_path.exists():
             raise FileNotFoundError(f"identities.json not found: {identities_path}")
 
@@ -902,8 +915,12 @@ class ScreenTimeAnalyzer:
         if track_meta:
             frame_count = track_meta.get("frame_count")
             faces_count = track_meta.get("faces_count")
-            start_frame = track_meta.get("first_frame_idx") or track_meta.get("start_frame")
-            end_frame = track_meta.get("last_frame_idx") or track_meta.get("end_frame")
+            start_frame = track_meta.get("first_frame_idx")
+            if start_frame is None:
+                start_frame = track_meta.get("start_frame")
+            end_frame = track_meta.get("last_frame_idx")
+            if end_frame is None:
+                end_frame = track_meta.get("end_frame")
             if isinstance(frame_count, (int, float)) and frame_count > 0:
                 total_frames = float(frame_count)
             elif isinstance(faces_count, (int, float)) and faces_count > 0:
@@ -992,12 +1009,20 @@ class ScreenTimeAnalyzer:
         end_ts: Optional[float] = None
 
         if self.config.use_video_decode:
-            start_ts = track_meta.get("first_ts") or track_meta.get("start_ts")
-            end_ts = track_meta.get("last_ts") or track_meta.get("end_ts")
+            start_ts = track_meta.get("first_ts")
+            if start_ts is None:
+                start_ts = track_meta.get("start_ts")
+            end_ts = track_meta.get("last_ts")
+            if end_ts is None:
+                end_ts = track_meta.get("end_ts")
 
         fps = self._estimate_fps(track_meta, faces)
-        start_frame = track_meta.get("first_frame_idx") or track_meta.get("start_frame")
-        end_frame = track_meta.get("last_frame_idx") or track_meta.get("end_frame")
+        start_frame = track_meta.get("first_frame_idx")
+        if start_frame is None:
+            start_frame = track_meta.get("start_frame")
+        end_frame = track_meta.get("last_frame_idx")
+        if end_frame is None:
+            end_frame = track_meta.get("end_frame")
 
         if fps and start_frame is not None and end_frame is not None:
             if start_ts is None:
@@ -1114,26 +1139,32 @@ class ScreenTimeAnalyzer:
             return self.config.min_interval_duration_s
         return raw_duration
 
-    def write_outputs(self, ep_id: str, metrics_data: Dict[str, Any]) -> Tuple[Path, Path]:
+    def write_outputs(
+        self, ep_id: str, metrics_data: Dict[str, Any], *, run_id: str | None = None
+    ) -> Tuple[Path, Path]:
         """Write screen time outputs to JSON and CSV.
 
         Returns:
             (json_path, csv_path)
         """
         data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-        analytics_dir = data_root / "analytics" / ep_id
-        analytics_dir.mkdir(parents=True, exist_ok=True)
+        active_dir = data_root / "analytics" / ep_id
+        active_dir.mkdir(parents=True, exist_ok=True)
 
-        json_path = analytics_dir / "screentime.json"
-        csv_path = analytics_dir / "screentime.csv"
+        run_id_norm = run_layout.normalize_run_id(run_id) if run_id else None
+        metrics_payload = dict(metrics_data)
+        if run_id_norm and not metrics_payload.get("run_id"):
+            metrics_payload["run_id"] = run_id_norm
 
-        # Write JSON
-        with json_path.open("w", encoding="utf-8") as f:
-            json.dump(metrics_data, f, indent=2)
+        def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(path)
 
-        # Write CSV
-        metrics = metrics_data.get("metrics", [])
-        if metrics:
+        def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
             fieldnames = [
                 "name",
                 "cast_id",
@@ -1149,13 +1180,33 @@ class ScreenTimeAnalyzer:
                 "tracks_count",
                 "faces_count",
             ]
-            with csv_path.open("w", encoding="utf-8", newline="") as f:
+            with tmp.open("w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
-                writer.writerows(metrics)
+                writer.writerows(rows)
+            tmp.replace(path)
 
-        LOGGER.info(f"[screentime] Wrote outputs to {json_path} and {csv_path}")
+        # Primary outputs
+        if run_id_norm:
+            run_analytics_dir = run_layout.run_root(ep_id, run_id_norm) / "analytics"
+            json_path = run_analytics_dir / "screentime.json"
+            csv_path = run_analytics_dir / "screentime.csv"
+        else:
+            json_path = active_dir / "screentime.json"
+            csv_path = active_dir / "screentime.csv"
 
+        _write_json(json_path, metrics_payload)
+        metrics = metrics_payload.get("metrics", [])
+        if metrics:
+            _write_csv(csv_path, metrics)
+
+        # Active mirror outputs (legacy UI/tools)
+        if run_id_norm:
+            _write_json(active_dir / "screentime.json", metrics_payload)
+            if metrics:
+                _write_csv(active_dir / "screentime.csv", metrics)
+
+        LOGGER.info("[screentime] Wrote outputs (run_id=%s): %s, %s", run_id_norm or "legacy", json_path, csv_path)
         return json_path, csv_path
 
 

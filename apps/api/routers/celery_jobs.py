@@ -837,6 +837,7 @@ SCENE_DETECTOR_LITERAL = Literal["pyscenedetect", "internal", "off"]
 class DetectTrackCeleryRequest(BaseModel):
     """Request model for Celery-based detect/track job."""
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: Optional[str] = Field(None, description="Optional pipeline run identifier (run-scoped artifacts)")
     stride: int = Field(6, description="Frame stride for detection sampling")
     fps: Optional[float] = Field(None, description="Optional target FPS for sampling")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
@@ -871,6 +872,7 @@ class DetectTrackCeleryRequest(BaseModel):
 class FacesEmbedCeleryRequest(BaseModel):
     """Request model for Celery-based faces embed (harvest) job."""
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: Optional[str] = Field(None, description="Optional pipeline run identifier (run-scoped artifacts)")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
     save_frames: bool = Field(False, description="Save sampled frames")
     save_crops: bool = Field(False, description="Save face crops (enable explicitly to avoid storage bloat)")
@@ -892,6 +894,7 @@ class FacesEmbedCeleryRequest(BaseModel):
 class ClusterCeleryRequest(BaseModel):
     """Request model for Celery-based cluster job."""
     ep_id: str = Field(..., description="Episode identifier")
+    run_id: Optional[str] = Field(None, description="Optional pipeline run identifier (run-scoped artifacts)")
     device: DEVICE_LITERAL = Field("auto", description="Execution device")
     cluster_thresh: float = Field(0.7, ge=0.2, le=0.99, description="Clustering threshold")
     min_cluster_size: int = Field(2, ge=1, description="Minimum cluster size")
@@ -911,6 +914,20 @@ class ClusterCeleryRequest(BaseModel):
         description="Clear all existing cluster-to-person assignments before clustering. "
         "When True (default), all old assignments are removed and clusters start fresh."
     )
+
+
+def _normalize_optional_run_id(value: Any) -> str | None:
+    """Normalize run_id for run-scoped artifacts; returns None when absent."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("run_id must be a string")
+    candidate = value.strip()
+    if not candidate:
+        return None
+    from py_screenalytics import run_layout
+
+    return run_layout.normalize_run_id(candidate)
 
 
 def _map_celery_state(state: str) -> str:
@@ -1998,16 +2015,24 @@ def _build_detect_track_command(
 ) -> list[str]:
     """Build command for detect_track pipeline."""
     from py_screenalytics.artifacts import get_path
+    from py_screenalytics import run_layout
 
     video_path = get_path(episode_id, "video")
-    manifests_dir = get_path(episode_id, "detections").parent
-    progress_file = manifests_dir / "progress.json"
+    manifests_root = get_path(episode_id, "detections").parent
+    run_id = options.get("run_id")
+    manifests_dir = run_layout.run_root(episode_id, run_id) if run_id else manifests_root
     manifests_dir.mkdir(parents=True, exist_ok=True)
+    progress_file = manifests_dir / "progress.json"
 
     command = [
         sys.executable,
         str(project_root / "tools" / "episode_run.py"),
         "--ep-id", episode_id,
+        *(
+            ["--run-id", str(run_id)]
+            if run_id
+            else []
+        ),
         "--video", str(video_path),
         "--stride", str(options.get("stride", 6)),
         "--device", options.get("device", "auto"),
@@ -2064,15 +2089,23 @@ def _build_faces_embed_command(
 ) -> list[str]:
     """Build command for faces_embed pipeline."""
     from py_screenalytics.artifacts import get_path
+    from py_screenalytics import run_layout
 
-    manifests_dir = get_path(episode_id, "detections").parent
-    progress_file = manifests_dir / "progress.json"
+    manifests_root = get_path(episode_id, "detections").parent
+    run_id = options.get("run_id")
+    manifests_dir = run_layout.run_root(episode_id, run_id) if run_id else manifests_root
     manifests_dir.mkdir(parents=True, exist_ok=True)
+    progress_file = manifests_dir / "progress.json"
 
     command = [
         sys.executable,
         str(project_root / "tools" / "episode_run.py"),
         "--ep-id", episode_id,
+        *(
+            ["--run-id", str(run_id)]
+            if run_id
+            else []
+        ),
         "--faces-embed",
         "--device", options.get("device", "auto"),
         "--progress-file", str(progress_file),
@@ -2106,15 +2139,23 @@ def _build_cluster_command(
 ) -> list[str]:
     """Build command for cluster pipeline."""
     from py_screenalytics.artifacts import get_path
+    from py_screenalytics import run_layout
 
-    manifests_dir = get_path(episode_id, "detections").parent
-    progress_file = manifests_dir / "progress.json"
+    manifests_root = get_path(episode_id, "detections").parent
+    run_id = options.get("run_id")
+    manifests_dir = run_layout.run_root(episode_id, run_id) if run_id else manifests_root
     manifests_dir.mkdir(parents=True, exist_ok=True)
+    progress_file = manifests_dir / "progress.json"
 
     command = [
         sys.executable,
         str(project_root / "tools" / "episode_run.py"),
         "--ep-id", episode_id,
+        *(
+            ["--run-id", str(run_id)]
+            if run_id
+            else []
+        ),
         "--cluster",
         "--device", options.get("device", "auto"),
         "--progress-file", str(progress_file),
@@ -2424,6 +2465,7 @@ def _stream_local_subprocess(
                             # Standard progress for detect_track, faces_embed, cluster
                             yield json.dumps({
                                 "type": "progress",
+                                "run_id": progress_data.get("run_id"),
                                 "frames_done": progress_data.get("frames_done", 0),
                                 "frames_total": progress_data.get("frames_total", 0),
                                 "phase": progress_data.get("phase", ""),
@@ -2483,9 +2525,18 @@ def _stream_local_subprocess(
         # Read counts from manifest files for auto-run progression
         # These counts are CRITICAL for the UI to detect job completion and trigger next phase
         summary_counts: Dict[str, Any] = {}
+        run_id: str | None = None
         try:
             from py_screenalytics.artifacts import get_path
-            manifests_dir = get_path(episode_id, "detections").parent
+            from py_screenalytics import run_layout
+
+            try:
+                run_id = _normalize_optional_run_id(options.get("run_id")) if isinstance(options, dict) else None
+            except ValueError:
+                run_id = None
+
+            manifests_root = get_path(episode_id, "detections").parent
+            manifests_dir = run_layout.run_root(episode_id, run_id) if run_id else manifests_root
 
             if operation == "detect_track":
                 det_path = manifests_dir / "detections.jsonl"
@@ -2516,6 +2567,7 @@ def _stream_local_subprocess(
 
         yield json.dumps({
             "type": "summary",
+            "run_id": run_id,
             "status": "completed",
             "elapsed_seconds": elapsed,
             "return_code": 0,
@@ -2607,6 +2659,7 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         "device": req.device,
         "detector": req.detector,
         "tracker": req.tracker,
+        "run_id": req.run_id,
         "save_frames": req.save_frames,
         "save_crops": req.save_crops,
         "jpeg_quality": req.jpeg_quality,
@@ -2626,6 +2679,11 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
 
     # Apply profile-based defaults (CPU thread limits, fps, etc.)
     options, config_warnings = _apply_profile_defaults(options, resolved_profile, req.device)
+
+    try:
+        options["run_id"] = _normalize_optional_run_id(options.get("run_id"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid run_id: {exc}") from exc
 
     # Collect all warnings
     all_warnings = []
@@ -2667,6 +2725,7 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         "ep_id": req.ep_id,
         "state": "queued",
         "operation": "detect_track",
+        "run_id": options.get("run_id"),
         "execution_mode": "redis",
         "profile": resolved_profile,
         "cpu_threads": options.get("cpu_threads"),
@@ -2713,6 +2772,7 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
     # Build options dict (profile not passed - episode_run.py doesn't accept it)
     options = {
         "device": req.device,
+        "run_id": req.run_id,
         "save_frames": req.save_frames,
         "save_crops": req.save_crops,
         "jpeg_quality": req.jpeg_quality,
@@ -2724,6 +2784,11 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
 
     # Apply profile-based CPU thread defaults
     options, config_warnings = _apply_profile_defaults(options, resolved_profile, req.device)
+
+    try:
+        options["run_id"] = _normalize_optional_run_id(options.get("run_id"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid run_id: {exc}") from exc
 
     LOGGER.info(
         f"[{req.ep_id}] faces_embed options: cpu_threads={options.get('cpu_threads')}, "
@@ -2764,6 +2829,7 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
         "ep_id": req.ep_id,
         "state": "queued",
         "operation": "faces_embed",
+        "run_id": options.get("run_id"),
         "execution_mode": "redis",
         "profile": resolved_profile,
         "cpu_threads": options.get("cpu_threads"),
@@ -2832,6 +2898,7 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
     # Build options dict (profile not passed - episode_run.py doesn't accept it)
     options = {
         "device": req.device,
+        "run_id": req.run_id,
         "cluster_thresh": req.cluster_thresh,
         "min_cluster_size": req.min_cluster_size,
         "min_identity_sim": req.min_identity_sim,
@@ -2841,6 +2908,11 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
 
     # Apply profile-based CPU thread defaults
     options, config_warnings = _apply_profile_defaults(options, resolved_profile, req.device)
+
+    try:
+        options["run_id"] = _normalize_optional_run_id(options.get("run_id"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid run_id: {exc}") from exc
 
     LOGGER.info(
         f"[{req.ep_id}] cluster options: cpu_threads={options.get('cpu_threads')}, "
@@ -2881,6 +2953,7 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
         "ep_id": req.ep_id,
         "state": "queued",
         "operation": "cluster",
+        "run_id": options.get("run_id"),
         "execution_mode": "redis",
         "profile": resolved_profile,
         "cpu_threads": options.get("cpu_threads"),

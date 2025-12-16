@@ -343,7 +343,7 @@ See [docs/reference/config/pipeline_configs.md](../reference/config/pipeline_con
 - **Updates:**
   - `docs/architecture/solution_architecture.md` — Adjust affected components/paths
   - `docs/architecture/directory_structure.md` — Update tree and descriptions
-  - `docs/product/prd.md` — Mark feature addition/removal
+  - `docs/plans/in_progress/product/prd.md` — Mark feature addition/removal
   - `README.md` — Reflect new/removed directories
 
 ### 11.3 MCP Integration

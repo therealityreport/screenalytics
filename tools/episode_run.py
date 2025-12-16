@@ -44,6 +44,7 @@ from apps.api.services.storage import (
     episode_context_from_id,
 )
 from py_screenalytics.artifacts import ensure_dirs, get_path
+from py_screenalytics import run_layout
 from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
 from tools.debug_thumbs import (
     init_debug_logger,
@@ -2751,13 +2752,14 @@ class ThumbWriter:
         storage_backend=None,
         use_png: bool = True,  # Default to PNG for maximum quality
         png_compression: int = 3,
+        run_id: str | None = None,
     ) -> None:
         self.ep_id = ep_id
         self.size = size
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.use_png = use_png
         self.png_compression = max(0, min(int(png_compression), 9))
-        self.root_dir = get_path(ep_id, "frames_root") / "thumbs"
+        self.root_dir = _frames_root_for_run(ep_id, run_id) / "thumbs"
         self._storage_backend = storage_backend
         # Determine if we should use backend for writes (only for pure S3 mode)
         self._use_backend_writes = (
@@ -2908,8 +2910,10 @@ class ThumbWriter:
         return canvas
 
 
-def _faces_embed_path(ep_id: str) -> Path:
+def _faces_embed_path(ep_id: str, run_id: str | None = None) -> Path:
     embed_dir = DATA_ROOT / "embeds" / ep_id
+    if run_id:
+        embed_dir = embed_dir / "runs" / run_layout.normalize_run_id(run_id)
     embed_dir.mkdir(parents=True, exist_ok=True)
     return embed_dir / "faces.npy"
 
@@ -3248,12 +3252,98 @@ def _utcnow_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _write_run_marker(ep_id: str, phase: str, payload: Dict[str, Any]) -> None:
-    manifests_dir = get_path(ep_id, "detections").parent
-    run_dir = manifests_dir / RUN_MARKERS_SUBDIR
-    run_dir.mkdir(parents=True, exist_ok=True)
-    marker_path = run_dir / f"{phase}.json"
-    marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+def _manifests_dir_for_run(ep_id: str, run_id: str | None) -> Path:
+    """Return the manifests dir for a run.
+
+    Legacy layout (run_id is None):
+        data/manifests/{ep_id}/
+
+    Run-scoped layout:
+        data/manifests/{ep_id}/runs/{run_id}/
+    """
+    root = get_path(ep_id, "detections").parent
+    if not run_id:
+        return root
+    return run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
+
+
+def _tracks_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    if not run_id:
+        return get_path(ep_id, "tracks")
+    return _manifests_dir_for_run(ep_id, run_id) / "tracks.jsonl"
+
+
+def _detections_path_for_run(ep_id: str, run_id: str | None) -> Path:
+    if not run_id:
+        return get_path(ep_id, "detections")
+    return _manifests_dir_for_run(ep_id, run_id) / "detections.jsonl"
+
+
+def _frames_root_for_run(ep_id: str, run_id: str | None) -> Path:
+    """Return the frames root for a run (optional run-scoped layout).
+
+    Legacy layout (run_id is None):
+        data/frames/{ep_id}/
+
+    Run-scoped layout:
+        data/frames/{ep_id}/runs/{run_id}/
+    """
+    root = get_path(ep_id, "frames_root")
+    if not run_id:
+        return root
+    return root / "runs" / run_layout.normalize_run_id(run_id)
+
+
+def _promote_run_manifests_to_root(ep_id: str, run_id: str, filenames: Iterable[str]) -> None:
+    """Copy run-scoped manifests into the legacy root manifests dir.
+
+    This keeps backwards compatibility for tools/UI that still read from:
+        data/manifests/{ep_id}/
+    """
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    src_dir = _manifests_dir_for_run(ep_id, run_id_norm)
+    dest_dir = get_path(ep_id, "detections").parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in filenames:
+        cleaned = str(name).strip().lstrip("/\\")
+        if not cleaned:
+            continue
+        src = src_dir / cleaned
+        if not src.exists():
+            continue
+        dest = dest_dir / cleaned
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, tmp)
+        tmp.replace(dest)
+
+
+def _write_run_marker(
+    ep_id: str,
+    phase: str,
+    payload: Dict[str, Any],
+    *,
+    run_id: str | None = None,
+) -> None:
+    manifests_root = get_path(ep_id, "detections").parent
+    runs_root = manifests_root / RUN_MARKERS_SUBDIR
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    marker_payload = dict(payload)
+    if run_id:
+        marker_payload["run_id"] = run_layout.normalize_run_id(run_id)
+
+    # Legacy marker path (kept for UI compatibility)
+    marker_path = runs_root / f"{phase}.json"
+    marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+
+    # Run-scoped marker path (for history/debugging)
+    if run_id:
+        run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
+        run_root.mkdir(parents=True, exist_ok=True)
+        run_marker_path = run_root / f"{phase}.json"
+        run_marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
 
 
 class CropQualityThresholdExceeded(RuntimeError):
@@ -3275,6 +3365,7 @@ class FrameExporter:
         self,
         ep_id: str,
         *,
+        run_id: str | None = None,
         save_frames: bool,
         save_crops: bool,
         jpeg_quality: int,
@@ -3289,7 +3380,7 @@ class FrameExporter:
         self.jpeg_quality = max(1, min(int(jpeg_quality or 85), 100))
         self.use_png = use_png
         self.png_compression = max(0, min(int(png_compression), 9))
-        self.root_dir = get_path(ep_id, "frames_root")
+        self.root_dir = _frames_root_for_run(ep_id, run_id)
         self.frames_dir = self.root_dir / "frames"
         self.crops_dir = self.root_dir / "crops"
         self._storage_backend = storage_backend
@@ -4419,8 +4510,21 @@ def _sync_artifacts_to_s3(
 
     # Upload manifests (always required)
     manifests_dir = get_path(ep_id, "detections").parent
+    skip_manifests_subdirs: list[str] = []
+    runs_dir = manifests_dir / RUN_MARKERS_SUBDIR
+    if runs_dir.exists():
+        try:
+            for entry in runs_dir.iterdir():
+                if entry.is_dir():
+                    skip_manifests_subdirs.append(f"{RUN_MARKERS_SUBDIR}/{entry.name}")
+        except OSError:
+            pass
     count, err = _upload_with_retry(
-        storage.upload_dir, manifests_dir, prefixes["manifests"], "manifests"
+        storage.upload_dir,
+        manifests_dir,
+        prefixes["manifests"],
+        "manifests",
+        skip_subdirs=skip_manifests_subdirs or None,
     )
     stats["manifests"] = count
     if err:
@@ -4538,6 +4642,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Performance profile (fast_cpu/low_power/balanced/high_accuracy) to apply default stride/FPS/save options.",
     )
     parser.add_argument("--ep-id", required=True, help="Episode identifier")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Optional pipeline run identifier. When provided, phase outputs are also written under "
+            "data/manifests/{ep_id}/runs/{run_id}/ and then promoted to the legacy root manifests dir."
+        ),
+    )
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
     parser.add_argument(
         "--stride",
@@ -4818,6 +4930,12 @@ def _configure_logging(quiet: bool, verbose: bool) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     raw_argv: List[str] = getattr(args, "_raw_argv", [])
+
+    # Normalize optional run_id (used for run-scoped artifact storage)
+    raw_run_id = getattr(args, "run_id", None)
+    if raw_run_id is not None:
+        run_id_str = str(raw_run_id).strip()
+        args.run_id = run_layout.normalize_run_id(run_id_str) if run_id_str else None
 
     # Apply performance profile defaults when provided (explicit CLI flags win)
     profile_cfg = _load_performance_profile(args.profile or os.environ.get("SCREENALYTICS_PERF_PROFILE"))
@@ -5341,9 +5459,10 @@ def _run_full_pipeline(
             analyzed_fps or 0.0,
         )
     recorder = TrackRecorder(max_gap=max_gap_frames, remap_ids=True)
-    det_path = get_path(args.ep_id, "detections")
+    run_id = getattr(args, "run_id", None)
+    det_path = _detections_path_for_run(args.ep_id, run_id)
     det_path.parent.mkdir(parents=True, exist_ok=True)
-    track_path = get_path(args.ep_id, "tracks")
+    track_path = _tracks_path_for_run(args.ep_id, run_id)
     det_count = 0
     frames_sampled = 0
     frame_idx = 0
@@ -6209,6 +6328,7 @@ def _run_detect_track_stage(
         stride=args.stride,
         fps_detected=source_fps,
         fps_requested=target_fps,
+        run_id=getattr(args, "run_id", None),
     )
 
     # Emit initial progress before model initialization to ensure progress.json
@@ -6227,6 +6347,7 @@ def _run_detect_track_stage(
     frame_exporter = (
         FrameExporter(
             args.ep_id,
+            run_id=getattr(args, "run_id", None),
             save_frames=save_frames,
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
@@ -6261,7 +6382,9 @@ def _run_detect_track_stage(
             video_fps=source_fps,
         )
 
-        manifests_dir = get_path(args.ep_id, "detections").parent
+        run_id = getattr(args, "run_id", None)
+        effective_run_id = run_id or progress.run_id
+        manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
 
         if det_count == 0:
             LOGGER.warning(
@@ -6275,6 +6398,28 @@ def _run_detect_track_stage(
                 "Review thresholds and rerun detect/track.",
                 args.ep_id,
                 det_count,
+            )
+
+        # Write track_metrics.json alongside the run's manifests (then promote to legacy root).
+        scene_summary = scene_summary or {"count": 0}
+        metrics_path = manifests_dir / "track_metrics.json"
+        metrics_payload = {
+            "ep_id": args.ep_id,
+            "generated_at": _utcnow_iso(),
+            "metrics": track_metrics,
+            "scene_cuts": scene_summary,
+        }
+        try:
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - best effort diagnostics
+            LOGGER.warning("Failed to write track metrics for %s: %s", args.ep_id, exc)
+
+        if run_id:
+            _promote_run_manifests_to_root(
+                args.ep_id,
+                run_id,
+                ("detections.jsonl", "tracks.jsonl", "track_metrics.json"),
             )
 
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
@@ -6292,6 +6437,7 @@ def _run_detect_track_stage(
         summary: Dict[str, Any] = {
             "stage": "detect_track",
             "ep_id": args.ep_id,
+            "run_id": effective_run_id,
             "detections": det_count,
             "tracks": track_count,
             "detections_total": det_count,
@@ -6313,15 +6459,17 @@ def _run_detect_track_stage(
             "metrics": track_metrics,
             "artifacts": {
                 "local": {
-                    "detections": str(get_path(args.ep_id, "detections")),
-                    "tracks": str(get_path(args.ep_id, "tracks")),
+                    "detections": str(_detections_path_for_run(args.ep_id, run_id)),
+                    "tracks": str(_tracks_path_for_run(args.ep_id, run_id)),
                     "manifests_dir": str(manifests_dir),
+                    "active_mirror_dir": str(get_path(args.ep_id, "detections").parent),
                     "frames_dir": (
                         str(frame_exporter.frames_dir) if frame_exporter and frame_exporter.save_frames else None
                     ),
                     "crops_dir": (
                         str(frame_exporter.crops_dir) if frame_exporter and frame_exporter.save_crops else None
                     ),
+                    "track_metrics": str(metrics_path),
                 },
                 "s3_prefixes": s3_prefixes,
             },
@@ -6330,19 +6478,6 @@ def _run_detect_track_stage(
             summary["detect_track_stats"] = detect_track_stats
         if tracker_config_summary:
             summary["tracker_config"] = tracker_config_summary
-        scene_summary = scene_summary or {"count": 0}
-        metrics_path = manifests_dir / "track_metrics.json"
-        metrics_payload = {
-            "ep_id": args.ep_id,
-            "generated_at": _utcnow_iso(),
-            "metrics": track_metrics,
-            "scene_cuts": scene_summary,
-        }
-        try:
-            metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
-            summary["artifacts"]["local"]["track_metrics"] = str(metrics_path)
-        except OSError as exc:  # pragma: no cover - best effort diagnostics
-            LOGGER.warning("Failed to write track metrics for %s: %s", args.ep_id, exc)
         scene_count = scene_summary.get("count")
         scene_cuts_payload: Dict[str, Any] = {"count": int(scene_count) if isinstance(scene_count, int) else 0}
         indices = scene_summary.get("indices")
@@ -6384,6 +6519,7 @@ def _run_detect_track_stage(
                 "phase": "detect_track",
                 "status": "success",
                 "version": APP_VERSION,
+                "run_id": effective_run_id,
                 "detections": det_count,
                 "tracks": track_count,
                 "detector": detector_choice,
@@ -6409,6 +6545,7 @@ def _run_detect_track_stage(
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
+            run_id=run_id,
         )
         return summary
     except Exception as exc:
@@ -6465,7 +6602,8 @@ def _run_faces_embed_stage(
         print(f"[LOCAL MODE] faces_embed starting for {args.ep_id}", flush=True)
         print(f"  device={device}", flush=True)
 
-    track_path = get_path(args.ep_id, "tracks")
+    run_id = getattr(args, "run_id", None)
+    track_path = _tracks_path_for_run(args.ep_id, run_id)
     # Validate tracks.jsonl exists and has usable data
     require_manifest(
         track_path,
@@ -6495,7 +6633,7 @@ def _run_faces_embed_stage(
         )
 
     # Load alignment quality gating config and data
-    manifests_dir = get_path(args.ep_id, "detections").parent
+    manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     alignment_config = _load_alignment_config()
     alignment_gating_enabled = (
         alignment_config.get("quality", {}).get("enabled", False)
@@ -6530,19 +6668,21 @@ def _run_faces_embed_stage(
         stride=1,
         fps_detected=None,
         fps_requested=None,
+        run_id=run_id,
     )
     requested_embed_device = getattr(args, "embed_device", None) or args.device
     device = pick_device(requested_embed_device)
     save_frames = bool(args.save_frames)
     save_crops = bool(args.save_crops)
     jpeg_quality = max(1, min(int(args.jpeg_quality or 85), 100))
-    frames_root = get_path(args.ep_id, "frames_root")
+    frames_root = _frames_root_for_run(args.ep_id, run_id)
     debug_logger_obj: JsonlLogger | NullLogger | None = None
     if save_crops and debug_thumbs_enabled():
         debug_logger_obj = init_debug_logger(args.ep_id, frames_root)
     exporter = (
         FrameExporter(
             args.ep_id,
+            run_id=run_id,
             save_frames=save_frames,
             save_crops=save_crops,
             jpeg_quality=jpeg_quality,
@@ -6555,7 +6695,11 @@ def _run_faces_embed_stage(
     def _phase_meta(step: str | None = None) -> Dict[str, Any]:
         return _non_video_phase_meta(step, crop_diag_source=exporter)
 
-    thumb_writer = ThumbWriter(args.ep_id, size=int(getattr(args, "thumb_size", 256)))
+    thumb_writer = ThumbWriter(
+        args.ep_id,
+        size=int(getattr(args, "thumb_size", 256)),
+        run_id=run_id,
+    )
     detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
     tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
     # Determine CPU fallback policy from CLI flags
@@ -6581,7 +6725,7 @@ def _run_faces_embed_stage(
     embedding_model_name = ARC_FACE_MODEL_NAME
     print(f"[INIT] Embedding backend ready (type={embedding_backend_type}, resolved_device={embed_device})", flush=True)
 
-    manifests_dir = get_path(args.ep_id, "detections").parent
+    manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
     video_path = get_path(args.ep_id, "video")
     frame_decoder: FrameDecoder | None = None
@@ -6993,7 +7137,7 @@ def _run_faces_embed_stage(
                 cache_stats["size"],
             )
 
-        embed_path = _faces_embed_path(args.ep_id)
+        embed_path = _faces_embed_path(args.ep_id, run_id=run_id)
         if embeddings_array:
             np.save(embed_path, np.vstack(embeddings_array))
         else:
@@ -7003,11 +7147,15 @@ def _run_faces_embed_stage(
         if exporter:
             exporter.write_indexes()
 
+        if run_id:
+            _promote_run_manifests_to_root(args.ep_id, run_id, ("faces.jsonl", "tracks.jsonl"))
+
         # Build preliminary summary for completion events (before S3 sync)
         finished_at = _utcnow_iso()
         summary: Dict[str, Any] = {
             "stage": "faces_embed",
             "ep_id": args.ep_id,
+            "run_id": run_id or progress.run_id,
             "faces": len(rows),
             "device": device,
             "requested_device": requested_embed_device,
@@ -7022,6 +7170,7 @@ def _run_faces_embed_stage(
                     "faces": str(faces_path),
                     "tracks": str(track_path),
                     "manifests_dir": str(manifests_dir),
+                    "active_mirror_dir": str(get_path(args.ep_id, "detections").parent),
                     "frames_dir": (str(exporter.frames_dir) if exporter and exporter.save_frames else None),
                     "crops_dir": (str(exporter.crops_dir) if exporter and exporter.save_crops else None),
                     "thumbs_dir": str(thumb_writer.root_dir),
@@ -7074,6 +7223,7 @@ def _run_faces_embed_stage(
                 "phase": "faces_embed",
                 "status": "success",
                 "version": APP_VERSION,
+                "run_id": run_id or progress.run_id,
                 "faces": len(rows),
                 "save_frames": save_frames,
                 "save_crops": save_crops,
@@ -7085,6 +7235,7 @@ def _run_faces_embed_stage(
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
+            run_id=run_id,
         )
 
         # Log completion for local mode streaming
@@ -7294,7 +7445,8 @@ def _run_cluster_stage(
         print(f"[LOCAL MODE] cluster starting for {args.ep_id}", flush=True)
         print(f"  device={device}, cluster_thresh={cluster_thresh}", flush=True)
 
-    manifests_dir = get_path(args.ep_id, "detections").parent
+    run_id = getattr(args, "run_id", None)
+    manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
     # Validate faces.jsonl exists, is non-empty, and has required fields
     faces_row_count = require_manifest(
@@ -7324,7 +7476,7 @@ def _run_cluster_stage(
         except (TypeError, ValueError):
             continue
         faces_per_track[track_key] += 1
-    track_path = get_path(args.ep_id, "tracks")
+    track_path = _tracks_path_for_run(args.ep_id, run_id)
     # Validate tracks.jsonl for cross-reference
     require_manifest(
         track_path,
@@ -7370,7 +7522,9 @@ def _run_cluster_stage(
     preservation_error: str | None = None
 
     identities_path = manifests_dir / "identities.json"
-    if identities_path.exists():
+    # Default to True to preserve cast-assigned clusters (original behavior)
+    preserve_assigned = bool(getattr(args, "preserve_assigned", True))
+    if preserve_assigned and identities_path.exists():
         try:
             existing_data = json.loads(identities_path.read_text(encoding="utf-8"))
             existing_identities = existing_data.get("identities", [])
@@ -7462,7 +7616,7 @@ def _run_cluster_stage(
             )
 
     # Handle preservation errors - fail hard unless explicitly ignored
-    if preservation_error:
+    if preserve_assigned and preservation_error:
         if ignore_preservation_errors:
             LOGGER.warning(
                 "CLUSTER PRESERVATION WARNING: %s (proceeding due to --ignore-preservation-errors)",
@@ -7482,6 +7636,7 @@ def _run_cluster_stage(
         stride=1,
         fps_detected=None,
         fps_requested=None,
+        run_id=run_id,
     )
     phase_meta = _non_video_phase_meta()
     device = pick_device(args.device)
@@ -7605,7 +7760,7 @@ def _run_cluster_stage(
 
         min_cluster = max(1, int(args.min_cluster_size))
         identity_payload: List[dict] = []
-        thumb_root = get_path(args.ep_id, "frames_root") / "thumbs"
+        thumb_root = _frames_root_for_run(args.ep_id, run_id) / "thumbs"
         faces_done = 0
         # Start identity counter after max preserved ID to avoid collisions
         identity_counter = max_preserved_id + 1
@@ -7737,6 +7892,13 @@ def _run_cluster_stage(
         }
         identities_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+        if run_id:
+            _promote_run_manifests_to_root(
+                args.ep_id,
+                run_id,
+                ("tracks.jsonl", "faces.jsonl", "identities.json"),
+            )
+
         if preserved_identities:
             LOGGER.info(
                 "Cluster stage complete: %d preserved clusters, %d new clusters",
@@ -7766,6 +7928,7 @@ def _run_cluster_stage(
         summary: Dict[str, Any] = {
             "stage": "cluster",
             "ep_id": args.ep_id,
+            "run_id": run_id or progress.run_id,
             "identities_count": len(identity_payload),
             "faces_count": faces_total,
             "device": device,
@@ -7778,6 +7941,8 @@ def _run_cluster_stage(
                     "faces": str(faces_path),
                     "identities": str(identities_path),
                     "tracks": str(track_path),
+                    "manifests_dir": str(manifests_dir),
+                    "active_mirror_dir": str(get_path(args.ep_id, "detections").parent),
                 },
                 "s3_prefixes": s3_prefixes,
             },
@@ -7822,6 +7987,7 @@ def _run_cluster_stage(
                 "phase": "cluster",
                 "status": "success",
                 "version": APP_VERSION,
+                "run_id": run_id or progress.run_id,
                 "faces": faces_total,
                 "identities": len(identity_payload),
                 "cluster_thresh": args.cluster_thresh,
@@ -7833,7 +7999,15 @@ def _run_cluster_stage(
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
+            run_id=run_id,
         )
+
+        if run_id:
+            run_layout.write_active_run_id(
+                args.ep_id,
+                run_id,
+                extra={"phase": "cluster", "status": "success", "finished_at": finished_at},
+            )
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:

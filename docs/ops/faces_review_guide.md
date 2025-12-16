@@ -8,7 +8,7 @@ Complete walkthrough of the Faces & Tracks Review page (`apps/workspace-ui/pages
 - Use face-first detectors (RetinaFace or YOLOv8-face) for best similarity numbers.
 
 ## Page Map (top row)
-- **Similarity Scores Guide** expander: in-page legend; full doc at `docs/similarity-scores-guide.md`.
+- **Similarity Scores Guide** expander: in-page legend; full doc at `docs/reference/similarity-scores-guide.md`.
 - **Help** link: opens this guide.
 - **Episode header**: detector/tracker, S3 keys, Mirror from S3, Episode Detail shortcut.
 - **Cluster Cleanup** popover: pick actions, presets, preview/dry-run, backup/undo, protect recent edits.

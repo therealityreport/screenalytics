@@ -340,7 +340,7 @@ pytest FEATURES/body_tracking/tests/ -v
 **Docs:**
 - [FEATURES/body_tracking/docs/README.md](../../FEATURES/body_tracking/docs/README.md)
 - [FEATURES/body_tracking/TODO.md](../../FEATURES/body_tracking/TODO.md)
-- [docs/todo/feature_body_tracking_reid_fusion.md](../todo/feature_body_tracking_reid_fusion.md)
+- [docs/plans/in_progress/feature_body_tracking_reid_fusion.md](../plans/in_progress/feature_body_tracking_reid_fusion.md)
 
 **Acceptance Matrix:** Sections 3.10-3.12
 
