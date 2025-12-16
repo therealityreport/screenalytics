@@ -3,7 +3,7 @@
 
 # Master switch
 face_alignment:
-  enabled: true
+  enabled: false
 
   # Model configuration
   model:
