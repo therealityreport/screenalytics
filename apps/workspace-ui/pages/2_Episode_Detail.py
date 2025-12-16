@@ -58,7 +58,28 @@ CLUSTER_MIN_IDENTITY_SIM_DEFAULT = 0.45  # clustering.yaml: min_identity_sim
 
 # Faces harvest defaults
 FACES_THUMB_SIZE_DEFAULT = 256
-FACES_MIN_FRAMES_BETWEEN_CROPS_DEFAULT = 32
+
+
+def _default_faces_min_frames_between_crops(video_meta: Dict[str, Any] | None) -> int:
+    """Default crop sampling interval for Faces Harvest.
+
+    Target: ~1/2 the detected FPS, rounded to an even integer.
+    Examples:
+      - 23.98 fps → 12
+      - 29.97/30 fps → 14
+    """
+    meta = video_meta or {}
+    fps = helpers.coerce_float(meta.get("fps_detected")) or helpers.coerce_float(meta.get("fps"))
+    if fps is None or fps <= 0:
+        return max(1, int(MIN_FRAMES_BETWEEN_CROPS_DEFAULT))
+
+    interval = int(round(fps / 2.0))
+    if interval < 1:
+        interval = 1
+    # Prefer even intervals (e.g., 30fps -> 14 instead of 15).
+    if interval % 2 == 1 and interval > 1:
+        interval -= 1
+    return max(1, min(interval, 600))
 
 
 def _get_pipeline_settings_key(ep_id: str, category: str, field: str) -> str:
@@ -380,7 +401,7 @@ def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | No
                 # Min frames between crops
                 min_frames_key = _get_pipeline_settings_key(ep_id, "harvest", "min_frames_between_crops")
                 if min_frames_key not in st.session_state:
-                    st.session_state[min_frames_key] = FACES_MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+                    st.session_state[min_frames_key] = _default_faces_min_frames_between_crops(video_meta)
                 st.number_input(
                     "Min frames between crops",
                     min_value=1,
@@ -565,7 +586,7 @@ def _get_detect_settings(ep_id: str) -> Dict[str, Any]:
     }
 
 
-def _get_harvest_settings(ep_id: str) -> Dict[str, Any]:
+def _get_harvest_settings(ep_id: str, video_meta: Dict[str, Any] | None) -> Dict[str, Any]:
     """Get current faces harvest settings from session state with defaults."""
     def _get(field: str, default: Any) -> Any:
         key = _get_pipeline_settings_key(ep_id, "harvest", field)
@@ -578,7 +599,7 @@ def _get_harvest_settings(ep_id: str) -> Dict[str, Any]:
         "device_label": device_label,
         "save_frames": bool(_get("save_frames", False)),
         "save_crops": bool(_get("save_crops", True)),
-        "min_frames_between_crops": int(_get("min_frames_between_crops", FACES_MIN_FRAMES_BETWEEN_CROPS_DEFAULT)),
+        "min_frames_between_crops": int(_get("min_frames_between_crops", _default_faces_min_frames_between_crops(video_meta))),
         "thumb_size": int(_get("thumb_size", FACES_THUMB_SIZE_DEFAULT)),
         "jpeg_quality": int(_get("jpeg_quality", JPEG_DEFAULT)),
     }
@@ -845,12 +866,38 @@ def _job_active(ep_id: str) -> bool:
 JOB_STALE_TIMEOUT_SECONDS = 300  # 5 minutes without progress update = stale
 
 
+def _resolve_session_run_id(ep_id: str) -> str | None:
+    """Best-effort run_id for run-scoped artifacts in this UI session."""
+    # Prefer the auto-run run_id when present, otherwise use the attempt selector value.
+    for key in (f"{ep_id}::autorun_run_id", f"{ep_id}::active_run_id"):
+        value = st.session_state.get(key)
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if not candidate:
+            continue
+        try:
+            return run_layout.normalize_run_id(candidate)
+        except ValueError:
+            continue
+    return None
+
+
 def _get_progress_file_age(ep_id: str) -> float | None:
     """Get the age of the progress file in seconds, or None if not found."""
-    progress_path = helpers.DATA_ROOT / "manifests" / ep_id / "progress.json"
+    run_id = _resolve_session_run_id(ep_id)
+    legacy_dir = get_path(ep_id, "detections").parent
+    candidates: list[Path] = []
+    if run_id:
+        try:
+            candidates.append(run_layout.run_root(ep_id, run_id) / "progress.json")
+        except ValueError:
+            pass
+    candidates.append(legacy_dir / "progress.json")
     try:
-        if progress_path.exists():
-            return time.time() - progress_path.stat().st_mtime
+        for progress_path in candidates:
+            if progress_path.exists():
+                return time.time() - progress_path.stat().st_mtime
     except OSError:
         pass
     return None
@@ -862,22 +909,30 @@ def _get_most_recent_run_marker_age(ep_id: str) -> float | None:
     Checks all phase markers (detect_track, faces_embed, cluster) and returns
     the age of whichever was most recently modified. Returns None if no markers found.
     """
-    runs_dir = helpers.DATA_ROOT / "manifests" / ep_id / "runs"
-    if not runs_dir.exists():
-        return None
+    run_id = _resolve_session_run_id(ep_id)
+    legacy_runs_dir = get_path(ep_id, "detections").parent / "runs"
+    scoped_runs_dir: Path | None = None
+    if run_id:
+        try:
+            scoped_runs_dir = run_layout.run_root(ep_id, run_id)
+        except ValueError:
+            scoped_runs_dir = None
 
     phases = ["detect_track.json", "faces_embed.json", "cluster.json"]
     most_recent_mtime = None
 
     for phase_file in phases:
-        marker_path = runs_dir / phase_file
-        try:
-            if marker_path.exists():
-                mtime = marker_path.stat().st_mtime
-                if most_recent_mtime is None or mtime > most_recent_mtime:
-                    most_recent_mtime = mtime
-        except OSError:
-            continue
+        for runs_dir in (scoped_runs_dir, legacy_runs_dir):
+            if runs_dir is None:
+                continue
+            marker_path = runs_dir / phase_file
+            try:
+                if marker_path.exists():
+                    mtime = marker_path.stat().st_mtime
+                    if most_recent_mtime is None or mtime > most_recent_mtime:
+                        most_recent_mtime = mtime
+            except OSError:
+                continue
 
     if most_recent_mtime is not None:
         return time.time() - most_recent_mtime
@@ -899,10 +954,19 @@ def _get_manifest_mtime(ep_id: str, phase: str) -> float | None:
     filename = manifest_map.get(phase)
     if not filename:
         return None
-    manifest_path = helpers.DATA_ROOT / "manifests" / ep_id / filename
+    run_id = _resolve_session_run_id(ep_id)
+    legacy_dir = get_path(ep_id, "detections").parent
+    candidates: list[Path] = []
+    if run_id:
+        try:
+            candidates.append(run_layout.run_root(ep_id, run_id) / filename)
+        except ValueError:
+            pass
+    candidates.append(legacy_dir / filename)
     try:
-        if manifest_path.exists():
-            return manifest_path.stat().st_mtime
+        for manifest_path in candidates:
+            if manifest_path.exists():
+                return manifest_path.stat().st_mtime
     except OSError:
         pass
     return None
@@ -2673,7 +2737,7 @@ if faces_min_frames_between_crops_default is None:
         faces_phase_status.get("min_frames_between_crops")
     )
 if faces_min_frames_between_crops_default is None:
-    faces_min_frames_between_crops_default = MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+    faces_min_frames_between_crops_default = _default_faces_min_frames_between_crops(video_meta)
 
 cluster_device_default_value = _choose_value(
     cluster_phase_status.get("requested_device"),
@@ -3058,7 +3122,7 @@ if autorun_active:
 
     # Helper: Get run marker mtime for a phase
     def _get_run_marker_mtime(phase: str) -> float | None:
-        marker_path = helpers.DATA_ROOT / "manifests" / ep_id / "runs" / f"{phase}.json"
+        marker_path = _scoped_markers_dir / f"{phase}.json"
         try:
             if marker_path.exists():
                 return marker_path.stat().st_mtime
@@ -3070,7 +3134,7 @@ if autorun_active:
     # NOTE: Avoid shadowing the global `_get_manifest_mtime(ep_id, phase)` helper used by
     # `_should_retry_phase_trigger()` later in this file (auto-run retry path).
     def _get_manifest_file_mtime(filename: str) -> float:
-        manifest_path = helpers.DATA_ROOT / "manifests" / ep_id / filename
+        manifest_path = manifests_dir / filename
         try:
             if manifest_path.exists():
                 return manifest_path.stat().st_mtime
@@ -3084,13 +3148,23 @@ if autorun_active:
         return mtime > 0 and (time.time() - mtime) < max_age_sec
 
     def _get_progress_mtime() -> float:
-        progress_path = helpers.DATA_ROOT / "manifests" / ep_id / "progress.json"
+        progress_path = manifests_dir / "progress.json"
         try:
             if progress_path.exists():
                 return progress_path.stat().st_mtime
         except OSError:
             pass
         return 0.0
+
+    def _read_progress_payload() -> Dict[str, Any]:
+        progress_path = manifests_dir / "progress.json"
+        if not progress_path.exists():
+            return {}
+        try:
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     # Fallback 1: detect → faces
     # If auto-run is stuck on "detect" but API says detect is success and no job running
@@ -3124,7 +3198,7 @@ if autorun_active:
         # Also allow a fresh progress.json “done” as a completion signal
         progress_mtime = _get_progress_mtime()
         progress_from_current_run = progress_mtime > detect_baseline
-        progress_payload = helpers.get_episode_progress(ep_id) or {}
+        progress_payload = _read_progress_payload()
         progress_done = str(progress_payload.get("step") or "").lower() == "done" or str(progress_payload.get("phase") or "").lower() == "done"
         if progress_done:
             progress_from_current_run = True
@@ -3150,8 +3224,8 @@ if autorun_active:
         # This handles cases where autorun_started_at is stale/future compared to artifact mtimes
         # But we require manifests to be reasonably fresh (within 10 min) to avoid using stale data
         if detect_api_status == "success" and not detect_job_running and not detect_from_current_run:
-            det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
-            trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+            det_path = detections_path
+            trk_path = tracks_path
             if det_path.exists() and trk_path.exists():
                 # Check freshness - manifests must be modified within last 10 minutes
                 manifest_freshness_window = 600  # 10 minutes in seconds
@@ -3188,8 +3262,8 @@ if autorun_active:
                 # Read counts from manifest for the completed stage log
                 det_count = 0
                 trk_count = 0
-                det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
-                trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+                det_path = detections_path
+                trk_path = tracks_path
                 try:
                     if det_path.exists():
                         with det_path.open("r", encoding="utf-8") as fh:
@@ -3201,7 +3275,7 @@ if autorun_active:
                     pass
 
                 # Best-effort: write a run marker if missing
-                marker_path = helpers.DATA_ROOT / "manifests" / ep_id / "runs" / "detect_track.json"
+                marker_path = _scoped_markers_dir / "detect_track.json"
                 if not marker_path.exists():
                     try:
                         marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3213,6 +3287,8 @@ if autorun_active:
                             "tracks": trk_count,
                             "finished_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
                         }
+                        if selected_attempt_run_id:
+                            marker_payload["run_id"] = selected_attempt_run_id
                         marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
                     except OSError:
                         pass
@@ -3307,10 +3383,10 @@ if autorun_active:
             if effective_mtime > 0 and (last_promoted_mtime is None or effective_mtime > last_promoted_mtime):
                 # Read faces count from manifest
                 faces_count = 0
-                faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
+                faces_manifest_path = faces_path
                 try:
-                    if faces_path.exists():
-                        with faces_path.open("r", encoding="utf-8") as fh:
+                    if faces_manifest_path.exists():
+                        with faces_manifest_path.open("r", encoding="utf-8") as fh:
                             faces_count = sum(1 for line in fh if line.strip())
                 except OSError:
                     pass
@@ -3531,8 +3607,8 @@ with col_detect:
         # This handles cases where streaming succeeded but didn't return a proper summary
         if not summary and not error_message:
             LOGGER.warning("[AUTORUN] No summary received, attempting to synthesize from manifests")
-            det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
-            trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+            det_path = detections_path
+            trk_path = tracks_path
             if det_path.exists() and trk_path.exists():
                 LOGGER.info("[AUTORUN] Manifests exist, synthesizing summary")
                 summary = {"status": "completed", "fallback": True}
@@ -3566,7 +3642,7 @@ with col_detect:
                 # FALLBACK: If normalize_summary didn't get counts, read directly from manifest
                 # This is critical for local mode where streaming response may not include counts
                 if det_count is None or det_count == 0:
-                    det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
+                    det_path = detections_path
                     if det_path.exists():
                         try:
                             with det_path.open("r", encoding="utf-8") as fh:
@@ -3575,7 +3651,7 @@ with col_detect:
                         except OSError:
                             pass
                 if trk_count is None or trk_count == 0:
-                    trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
+                    trk_path = tracks_path
                     if trk_path.exists():
                         try:
                             with trk_path.open("r", encoding="utf-8") as fh:
@@ -3810,13 +3886,11 @@ with col_faces:
                 det_count, track_count = None, None
             # Fallback to manifest counts
             if det_count is None or track_count is None:
-                det_path = helpers.DATA_ROOT / "manifests" / ep_id / "detections.jsonl"
-                trk_path = helpers.DATA_ROOT / "manifests" / ep_id / "tracks.jsonl"
                 try:
-                    if det_path.exists():
-                        det_count = sum(1 for line in det_path.open("r", encoding="utf-8") if line.strip())
-                    if trk_path.exists():
-                        track_count = sum(1 for line in trk_path.open("r", encoding="utf-8") if line.strip())
+                    if detections_path.exists():
+                        det_count = sum(1 for line in detections_path.open("r", encoding="utf-8") if line.strip())
+                    if tracks_path.exists():
+                        track_count = sum(1 for line in tracks_path.open("r", encoding="utf-8") if line.strip())
                 except OSError:
                     pass
             # Log completed stage
@@ -3892,7 +3966,7 @@ with col_faces:
 
     # ─── GET SETTINGS FROM PIPELINE SETTINGS DIALOG ──────────────────────────
     # All settings are now managed in the unified Pipeline Settings dialog (gear icon)
-    harvest_settings = _get_harvest_settings(ep_id)
+    harvest_settings = _get_harvest_settings(ep_id, video_meta)
 
     faces_device_value = harvest_settings["device"]
     faces_device_label = harvest_settings["device_label"]
@@ -4144,10 +4218,10 @@ with col_faces:
 
                     # FALLBACK: If normalize_summary didn't get faces count, read directly from manifest
                     if faces_count is None or faces_count == 0:
-                        faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
-                        if faces_path.exists():
+                        faces_manifest_path = faces_path
+                        if faces_manifest_path.exists():
                             try:
-                                with faces_path.open("r", encoding="utf-8") as fh:
+                                with faces_manifest_path.open("r", encoding="utf-8") as fh:
                                     faces_count = sum(1 for line in fh if line.strip())
                                 LOGGER.info("[AUTORUN] Fallback faces_count from manifest: %s", faces_count)
                             except OSError:
@@ -4245,7 +4319,6 @@ with col_cluster:
                 faces_count = None
             # Fallback to manifest count
             if faces_count is None:
-                faces_path = helpers.DATA_ROOT / "manifests" / ep_id / "faces.jsonl"
                 try:
                     if faces_path.exists():
                         faces_count = sum(1 for line in faces_path.open("r", encoding="utf-8") if line.strip())
@@ -4285,7 +4358,6 @@ with col_cluster:
                 identities_count = None
             # Fallback to manifest count
             if identities_count is None:
-                identities_path = helpers.DATA_ROOT / "manifests" / ep_id / "identities.json"
                 try:
                     if identities_path.exists():
                         import json
