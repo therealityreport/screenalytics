@@ -1,34 +1,69 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "last_updated": "2025-12-16",
   "features": {
     "face_alignment": {
       "title": "Face Alignment",
       "status": "partial",
-      "used_by_default": false,
-      "how_to_enable": "Run `python -m FEATURES.face_alignment` to generate alignment artifacts; the main pipeline can consume `face_alignment/aligned_faces.jsonl` when present.",
-      "paths_required": [
-        "FEATURES/face_alignment",
+      "integrated_in_jobs": [],
+      "integrated_in_autorun": false,
+      "enabled_by_default": false,
+      "how_to_enable": {
+        "config_key": "config/pipeline/face_alignment.yaml:face_alignment.enabled",
+        "ui_path": null,
+        "cli_flag": "python -m FEATURES.face_alignment"
+      },
+      "evidence_paths": [
+        "tools/episode_run.py",
         "config/pipeline/face_alignment.yaml",
-        "tools/episode_run.py"
+        "config/pipeline/embedding.yaml"
       ],
       "phases": {
         "A_FAN_2D": {
           "status": "implemented_sandbox",
-          "used_by_default": false,
-          "paths_required": ["FEATURES/face_alignment/src"],
-          "notes": "Sandbox runner exists; not promoted into a first-class main-pipeline stage yet."
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": "config/pipeline/face_alignment.yaml:face_alignment.enabled",
+            "ui_path": null,
+            "cli_flag": "python -m FEATURES.face_alignment"
+          },
+          "evidence_paths": [
+            "FEATURES/face_alignment/src/run_fan_alignment.py",
+            "FEATURES/face_alignment/src/face_alignment_runner.py",
+            "tools/episode_run.py"
+          ],
+          "notes": "FAN 68-point alignment exists as a FEATURE sandbox; production jobs can consume `alignment_quality` from `face_alignment/aligned_faces.jsonl` when present, but do not run FAN inside the job pipeline yet."
         },
         "B_LUVLi_quality_gate": {
           "status": "heuristic_stub",
-          "used_by_default": false,
-          "paths_required": ["FEATURES/face_alignment/src"],
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [
+            "FEATURES/face_alignment/src/run_luvli_quality.py"
+          ],
           "notes": "Heuristic placeholder only; not a model-based LUVLi port."
         },
         "C_3DDFA_V2": {
           "status": "not_started",
-          "used_by_default": false,
-          "paths_required": [],
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [],
           "notes": "Planned only."
         }
       },
@@ -40,9 +75,15 @@
     "body_tracking": {
       "title": "Body Tracking",
       "status": "in_progress",
-      "used_by_default": false,
-      "how_to_enable": "Run `python -m FEATURES.body_tracking` to generate body-tracking artifacts; screentime can consume the comparison artifact when present.",
-      "paths_required": [
+      "integrated_in_jobs": [],
+      "integrated_in_autorun": false,
+      "enabled_by_default": false,
+      "how_to_enable": {
+        "config_key": "config/pipeline/body_detection.yaml:body_tracking.enabled",
+        "ui_path": null,
+        "cli_flag": "python -m FEATURES.body_tracking"
+      },
+      "evidence_paths": [
         "FEATURES/body_tracking",
         "config/pipeline/body_detection.yaml",
         "config/pipeline/track_fusion.yaml"
@@ -50,15 +91,31 @@
       "phases": {
         "sandbox_runner": {
           "status": "implemented_sandbox",
-          "used_by_default": false,
-          "paths_required": ["FEATURES/body_tracking/src"],
-          "notes": "Sandbox pipeline exists; not enabled in main auto-run."
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": "python -m FEATURES.body_tracking"
+          },
+          "evidence_paths": [
+            "FEATURES/body_tracking/src"
+          ],
+          "notes": "Sandbox pipeline exists; not enabled in production jobs or auto-run."
         },
         "pipeline_integration": {
           "status": "future",
-          "used_by_default": false,
-          "paths_required": [],
-          "notes": "Not integrated into `tools/episode_run.py` yet."
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [],
+          "notes": "Not integrated into production jobs or auto-run yet."
         }
       },
       "docs": [
@@ -69,33 +126,73 @@
     "arcface_tensorrt": {
       "title": "ArcFace TensorRT",
       "status": "scaffold_only",
-      "used_by_default": false,
-      "how_to_enable": "Not enabled in production; requires GPU parity testing and integration work.",
-      "paths_required": ["FEATURES/arcface_tensorrt"],
+      "integrated_in_jobs": [],
+      "integrated_in_autorun": false,
+      "enabled_by_default": false,
+      "how_to_enable": {
+        "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt (not production-ready)",
+        "ui_path": null,
+        "cli_flag": null
+      },
+      "evidence_paths": [
+        "FEATURES/arcface_tensorrt"
+      ],
       "phases": {
         "A_engine_building": {
           "status": "scaffold_only",
-          "used_by_default": false,
-          "paths_required": ["FEATURES/arcface_tensorrt/src"],
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [
+            "FEATURES/arcface_tensorrt/src"
+          ],
           "notes": "Scaffold only; not validated."
         },
         "B_inference_wrapper": {
           "status": "scaffold_only",
-          "used_by_default": false,
-          "paths_required": ["FEATURES/arcface_tensorrt/src"],
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [
+            "FEATURES/arcface_tensorrt/src"
+          ],
           "notes": "Scaffold only; not validated."
         },
         "C_comparison": {
           "status": "scaffold_only",
-          "used_by_default": false,
-          "paths_required": [],
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [],
           "notes": "Planned evaluation."
         },
         "D_integration": {
           "status": "future",
-          "used_by_default": false,
-          "paths_required": [],
-          "notes": "Not integrated into production pipeline."
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [],
+          "notes": "Not integrated into production jobs or auto-run yet."
         }
       },
       "docs": [
@@ -106,14 +203,29 @@
     "vision_analytics": {
       "title": "Vision Analytics",
       "status": "not_started",
-      "used_by_default": false,
-      "how_to_enable": "Not started.",
-      "paths_required": ["FEATURES/vision_analytics"],
+      "integrated_in_jobs": [],
+      "integrated_in_autorun": false,
+      "enabled_by_default": false,
+      "how_to_enable": {
+        "config_key": null,
+        "ui_path": null,
+        "cli_flag": null
+      },
+      "evidence_paths": [
+        "FEATURES/vision_analytics"
+      ],
       "phases": {
         "all": {
           "status": "not_started",
-          "used_by_default": false,
-          "paths_required": [],
+          "integrated_in_jobs": [],
+          "integrated_in_autorun": false,
+          "enabled_by_default": false,
+          "how_to_enable": {
+            "config_key": null,
+            "ui_path": null,
+            "cli_flag": null
+          },
+          "evidence_paths": [],
           "notes": "Docs/config only."
         }
       },
