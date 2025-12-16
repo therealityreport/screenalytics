@@ -3333,6 +3333,10 @@ def _write_run_marker(
     marker_payload = dict(payload)
     if run_id:
         marker_payload["run_id"] = run_layout.normalize_run_id(run_id)
+    else:
+        # Avoid leaking ProgressEmitter.run_id into legacy markers when the job
+        # was run without an explicit run_id (legacy/unscoped mode).
+        marker_payload.pop("run_id", None)
 
     # Legacy marker path (kept for UI compatibility)
     marker_path = runs_root / f"{phase}.json"
@@ -7207,14 +7211,8 @@ def _run_faces_embed_stage(
             extra=_phase_meta(),
         )
 
-        # Now do S3 sync after completion is signaled
-        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
-        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
-        if s3_sync_result.errors:
-            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
-        if not s3_sync_result.success:
-            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
-        # Brief delay to ensure final progress event is written and readable
+        # Persist phase marker promptly after completion; S3 sync may take a while.
+        # Brief delay to ensure final progress event is written and readable.
         time.sleep(0.2)
         _write_run_marker(
             args.ep_id,
@@ -7237,6 +7235,14 @@ def _run_faces_embed_stage(
             },
             run_id=run_id,
         )
+
+        # Now do S3 sync after completion is signaled
+        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
+        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
+        if s3_sync_result.errors:
+            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:
@@ -7971,14 +7977,8 @@ def _run_cluster_stage(
             extra=phase_meta,
         )
 
-        # Now do S3 sync after completion is signaled
-        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
-        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
-        if s3_sync_result.errors:
-            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
-        if not s3_sync_result.success:
-            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
-        # Brief delay to ensure final progress event is written and readable
+        # Persist phase marker promptly after completion; S3 sync may take a while.
+        # Brief delay to ensure final progress event is written and readable.
         time.sleep(0.2)
         _write_run_marker(
             args.ep_id,
@@ -8008,6 +8008,14 @@ def _run_cluster_stage(
                 run_id,
                 extra={"phase": "cluster", "status": "success", "finished_at": finished_at},
             )
+
+        # Now do S3 sync after completion is signaled
+        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
+        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
+        if s3_sync_result.errors:
+            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:
