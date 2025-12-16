@@ -9,7 +9,7 @@
         "harvest"
       ],
       "integrated_in_autorun": true,
-      "enabled_by_default": false,
+      "enabled_by_default": true,
       "how_to_enable": {
         "config_key": "config/pipeline/face_alignment.yaml:face_alignment.enabled",
         "ui_path": null,
@@ -28,7 +28,7 @@
             "harvest"
           ],
           "integrated_in_autorun": true,
-          "enabled_by_default": false,
+          "enabled_by_default": true,
           "how_to_enable": {
             "config_key": "config/pipeline/face_alignment.yaml:face_alignment.enabled",
             "ui_path": null,
@@ -47,7 +47,7 @@
             "harvest"
           ],
           "integrated_in_autorun": true,
-          "enabled_by_default": false,
+          "enabled_by_default": true,
           "how_to_enable": {
             "config_key": "config/pipeline/face_alignment.yaml:face_alignment.quality_gate.enabled",
             "ui_path": null,
