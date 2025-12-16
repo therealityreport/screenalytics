@@ -15,6 +15,9 @@ export default function ScreenalyticsLayout({ children }: { children: ReactNode 
         <aside className={styles.sidebar}>
           <div className={styles.brand}>Screenalytics</div>
           <div className={styles.nav}>
+            <Link className={styles.navLink} href="/screenalytics">
+              Dashboard
+            </Link>
             <Link className={styles.navLink} href="/screenalytics/upload">
               Upload
             </Link>

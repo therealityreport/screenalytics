@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { startMockWorker } from "@/mocks/browser";
 import { ToastProvider } from "@/components/toast";
+import { DocsProvider } from "@/components/screenalytics/docs-provider";
 
 export function ScreenalyticsProviders({ children }: { children: ReactNode }) {
   const [client] = useState(
@@ -31,7 +32,9 @@ export function ScreenalyticsProviders({ children }: { children: ReactNode }) {
   return (
     <ToastProvider>
       <QueryClientProvider client={client}>
-        {children}
+        <DocsProvider>
+          {children}
+        </DocsProvider>
         <ReactQueryDevtools initialIsOpen={false} />
       </QueryClientProvider>
     </ToastProvider>
