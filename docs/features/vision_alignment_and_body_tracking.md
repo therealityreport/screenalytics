@@ -1,8 +1,9 @@
 # Vision Alignment & Body Tracking
 
-Version: 1.0
+Version: 1.1
 Status: In Development
-Last Updated: 2025-12-15
+Last Updated: 2025-12-16
+Tags: face_alignment, arcface_tensorrt, vision_analytics, body_tracking
 
 ---
 
@@ -19,22 +20,21 @@ This document describes the extension of Screenalytics from face-only tracking t
 
 ## Implementation Status Snapshot (current)
 
-These are the current known states we rely on elsewhere in docs/UI:
+This is the blunt “what exists right now” snapshot (scaffold ≠ production-ready):
 
-- **Face Alignment (`FEATURES/face_alignment/`)** — `partial`
-  - Phase A: FAN 2D integration — complete
-  - Phase B: LUVLi quality gate — heuristic stub only
-  - Phase C: 3DDFA_V2 — not started
-  - Pending: main pipeline integration, model-based quality
-- **ArcFace TensorRT (`FEATURES/arcface_tensorrt/`)** — `scaffold_only`
-  - Phase A: engine building — scaffold (pending real ONNX test)
-  - Phase B: inference wrapper — scaffold (pending GPU test)
-  - Phase C: comparison — scaffold (pending eval)
-  - Phase D: integration — future
-  - Pending: real GPU testing, full comparison/eval
-- **Vision Analytics (`FEATURES/vision_analytics/`)** — `not_started`
-  - All phases: not started (docs-only)
-  - Pending: create `src/`, wire visibility labeling, UI surfacing
+- **Face Alignment (`face_alignment`)** — `partial`
+  - FAN 68-point landmarks: implemented and wired in the embedding (faces_embed / “harvest”) stage.
+  - “LUVLi quality”: heuristic gate only (not a real LUVLi model).
+  - “3D alignment / 3DDFA”: not started; current “pose” is a solvePnP placeholder from FAN landmarks.
+- **Body Tracking + Re-ID (`body_tracking`)** — `partial`
+  - YOLO person detection + ByteTrack tracking: implemented behind an opt-in config flag.
+  - OSNet Re-ID + face↔body fusion + screentime comparison: implemented, but optional/best-effort (heavy deps).
+  - Default behavior remains face-only unless body artifacts exist.
+- **ArcFace TensorRT (`arcface_tensorrt`)** — `scaffold_only`
+  - Code is wired and can be selected as an embedding backend, but treat it as experimental until GPU parity/eval is proven.
+  - When TensorRT/PyCUDA/engine is missing, the pipeline falls back to the PyTorch baseline.
+- **Vision Analytics (`vision_analytics`)** — `not_started`
+  - Docs/config only; no runnable implementation or artifacts yet.
 
 ---
 
@@ -54,68 +54,32 @@ These are the current known states we rely on elsewhere in docs/UI:
 Note: the diagram below shows a **target** architecture; several components are partial/scaffold/planned-only today (see status snapshot above).
 
 ```
-Video Frames
+episode.mp4 / decoded frames
     │
-    ├─────────────────────────────────────────────────────────────┐
-    │                                                             │
-    ▼                                                             ▼
-┌─────────────────────────┐                         ┌─────────────────────────┐
-│   Face Detection        │                         │   Person Detection      │
-│   (RetinaFace)          │                         │   (YOLOv8)              │
-└───────────┬─────────────┘                         └───────────┬─────────────┘
-            │                                                   │
-            ▼                                                   ▼
-┌─────────────────────────┐                         ┌─────────────────────────┐
-│   Face Alignment        │                         │   Person Tracking       │
-│   (FAN 2D/3D)           │                         │   (ByteTrack)           │
-│   68/98-point landmarks │                         └───────────┬─────────────┘
-└───────────┬─────────────┘                                     │
-            │                                                   ▼
-            ▼                                       ┌─────────────────────────┐
-┌─────────────────────────┐                         │   Person Re-ID          │
-│   Alignment Quality     │                         │   (OSNet 256-d)         │
-│   Gate (LUVLi)          │                         └───────────┬─────────────┘
-│   min_quality: 0.60     │                                     │
-└───────────┬─────────────┘                                     │
-            │                                                   │
-    ┌───────┴───────┐                                           │
-    │               │                                           │
-    ▼               ▼                                           │
- [PASS]          [SKIP]                                         │
-    │                                                           │
-    ▼                                                           │
-┌─────────────────────────┐                                     │
-│   Face Embedding        │                                     │
-│   (ArcFace TensorRT)    │                                     │
-│   512-d, FP16           │                                     │
-└───────────┬─────────────┘                                     │
-            │                                                   │
-            ▼                                                   │
-┌─────────────────────────┐                                     │
-│   Face Tracking         │                                     │
-│   (ByteTrack)           │                                     │
-└───────────┬─────────────┘                                     │
-            │                                                   │
-            └───────────────────┬───────────────────────────────┘
-                                │
-                                ▼
-                  ┌─────────────────────────┐
-                  │   Face↔Body Association │
-                  │   (IoU + Re-ID handoff) │
-                  └───────────┬─────────────┘
-                              │
-                              ▼
-                  ┌─────────────────────────┐
-                  │   Identity Clustering   │
-                  │   (HAC + Centroid)      │
-                  └───────────┬─────────────┘
-                              │
-                              ▼
-                  ┌─────────────────────────┐
-                  │   Unified Timeline      │
-                  │   ├─ face_visible_time  │
-                  │   └─ body_only_time     │
-                  └─────────────────────────┘
+    ├─► [1] Face Detect (RetinaFace) ─► detections.jsonl
+    │        │
+    │        └─► [2] Face Track (ByteTrack) ─► tracks.jsonl
+    │                 │
+    │                 └─► [3] Face Embed (“harvest”)
+    │                       ├─ (optional) Face Alignment (FAN 68) ─► face_alignment/aligned_faces.jsonl
+    │                       ├─ (optional) Quality Gate (heuristic “LUVLi”) ─► drop/downweight
+    │                       └─ Embedding Engine (PyTorch baseline / TensorRT experimental) ─► faces.jsonl + faces.npy
+    │
+    ├─► [4] Cluster Identities ─► identities.json
+    │
+    ├─► (optional) Body Tracking + Re-ID (FEATURE sandbox; heavy deps)
+    │        ├─ Person Detect (YOLO) ─► body_tracking/body_detections.jsonl
+    │        ├─ Person Track (ByteTrack) ─► body_tracking/body_tracks.jsonl
+    │        ├─ Person Re-ID (OSNet) ─► body_tracking/body_embeddings.*
+    │        └─ Face↔Body Fusion ─► body_tracking/track_fusion.json + screentime_comparison.json
+    │
+    ├─► (planned) Vision Analytics (mesh/gaze/visibility) ─► vision_analytics/* (planned)
+    │
+    └─► [5] Screentime Analyze
+           ├─ identities + tracks + faces
+           ├─ + body_tracking/screentime_comparison.json (if present)
+           └─ + vision_analytics/* (planned)
+             └─► screentime.json / screentime.csv
 ```
 
 ---
@@ -123,12 +87,28 @@ Video Frames
 ## Feature Modules
 
 **Current reality (as of this doc update):**
-- Face alignment + body tracking are **FEATURE sandbox modules** you run explicitly (`python -m FEATURES.face_alignment`, `python -m FEATURES.body_tracking`).
-- The “main” detect→embed pipeline consumes their outputs **only if artifacts exist** (e.g., embedding gating reads `face_alignment/aligned_faces.jsonl`; screentime reads `body_tracking/screentime_comparison.json`).
-- ArcFace TensorRT work is **scaffold-only** today; keep PyTorch/ONNXRuntime as the operational baseline until GPU parity tests/eval are complete.
-- Vision analytics (mesh/visibility/gaze/centerface) is **planned-only** (configs + TODOs exist; no runnable `FEATURES/vision_analytics/src/` yet).
+- These modules are still treated as **FEATURE / best-effort** capabilities (optional deps, safe fallbacks).
+- The main pipeline stays operational in face-only mode and **consumes extra outputs only when the artifacts exist**:
+  - Embedding can use `face_alignment/aligned_faces.jsonl` when present (otherwise skips alignment gating).
+  - Screentime can use `body_tracking/screentime_comparison.json` when present (otherwise face-only metrics).
+- ArcFace TensorRT is wired as an embedding backend, but should be considered experimental until parity is demonstrated on target GPUs.
+- Vision analytics (mesh/visibility/gaze) is planned-only today (docs/config placeholders; no runnable implementation).
 
-See: [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../plans/complete/audit/vision_alignment_body_tracking_status.md)
+See also:
+- Machine-readable snapshot: [docs/_meta/feature_status.json](../_meta/feature_status.json)
+- Historical audit (may be stale): [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../plans/complete/audit/vision_alignment_body_tracking_status.md)
+
+### Truth Table (artifact-gated consumption)
+
+The “umbrella” rule is simple: **if an artifact exists, downstream stages may consume it; if it doesn’t, the pipeline falls back**.
+
+| Output artifact | Produced by | Consumed by | If missing |
+|---|---|---|---|
+| `face_alignment/aligned_faces.jsonl` | faces_embed (or legacy `python -m FEATURES.face_alignment`) | faces_embed gating + export/debug | Skip alignment gating; embed proceeds normally |
+| `body_tracking/body_tracks.jsonl` | body_tracking (opt-in) | body_tracking_fusion | Skip fusion/comparison |
+| `body_tracking/track_fusion.json` | body_tracking_fusion | export/debug + UI (optional) | No fused face↔body association |
+| `body_tracking/screentime_comparison.json` | body_tracking_fusion | screentime analytics/UI | Face-only screentime metrics |
+| `vision_analytics/*` | (planned-only) | (none yet) | No visibility analytics inputs |
 
 ### 1. Face Alignment (Priority 1)
 
@@ -139,8 +119,10 @@ See: [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../pla
 | 3DDFA_V2 | planned | 3D head pose (selective) |
 
 **Integration Points:**
-- Run alignment (sandbox): `FEATURES/face_alignment/src/face_alignment_runner.py` (`python -m FEATURES.face_alignment`)
-- Consume quality for embedding gating: `_load_alignment_quality_index()` in `tools/episode_run.py`
+- Default path: runs inside the embedding (faces_embed) stage when `config/pipeline/face_alignment.yaml` enables it.
+- Requires optional dependency: `face-alignment` (`pip install face-alignment`)
+- Legacy sandbox runner: `python -m FEATURES.face_alignment`
+- Pipeline consumption: `_load_alignment_quality_index()` in `tools/episode_run.py`
 
 **Config:** `config/pipeline/face_alignment.yaml` (canonical)
 
@@ -160,7 +142,8 @@ See: [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../pla
 | Track Fusion | custom | Face↔body association |
 
 **Integration Points:**
-- Run pipeline (sandbox): `FEATURES/body_tracking/src/body_tracking_runner.py` (`python -m FEATURES.body_tracking`)
+- Pipeline (opt-in): `tools/episode_run.py` runs best-effort body tracking + fusion when `config/pipeline/body_detection.yaml` enables it.
+- Standalone sandbox runner: `FEATURES/body_tracking/src/body_tracking_runner.py` (`python -m FEATURES.body_tracking`)
 - Screentime reads comparison artifact (if present): `apps/api/services/screentime.py`
 
 **Config:** `config/pipeline/body_detection.yaml`, `config/pipeline/track_fusion.yaml`
@@ -214,7 +197,7 @@ See: [docs/plans/complete/audit/vision_alignment_body_tracking_status.md](../pla
 
 The schemas below describe a **target** model, not a production guarantee today.
 Current implementations write dedicated artifacts under `data/manifests/{ep_id}/face_alignment/` and
-`data/manifests/{ep_id}/body_tracking/` (see the audit doc linked above).
+`data/manifests/{ep_id}/body_tracking/` (see the status snapshot / `docs/_meta/feature_status.json`).
 
 ### Proposed Track Schema (`tracks.jsonl`)
 
