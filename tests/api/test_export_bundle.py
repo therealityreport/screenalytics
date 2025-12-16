@@ -79,10 +79,10 @@ def test_export_bundle_contains_expected_files(tmp_path, monkeypatch):
 
     client = TestClient(app)
 
-    # Call export endpoint
+    # Call export endpoint (explicitly request ZIP format)
     resp = client.get(
         f"/episodes/{ep_id}/runs/{run_id}/export",
-        params={"include_artifacts": True, "include_images": False, "include_logs": False},
+        params={"format": "zip", "include_artifacts": True, "include_images": False, "include_logs": False},
     )
     assert resp.status_code == 200, f"Export failed: {resp.text}"
     assert resp.headers.get("content-type") == "application/zip"
@@ -177,10 +177,10 @@ def test_export_bundle_excludes_artifacts_when_disabled(tmp_path, monkeypatch):
 
     client = TestClient(app)
 
-    # Call export with include_artifacts=False
+    # Call export with include_artifacts=False (explicitly request ZIP format)
     resp = client.get(
         f"/episodes/{ep_id}/runs/{run_id}/export",
-        params={"include_artifacts": False, "include_images": False, "include_logs": False},
+        params={"format": "zip", "include_artifacts": False, "include_images": False, "include_logs": False},
     )
     assert resp.status_code == 200
 

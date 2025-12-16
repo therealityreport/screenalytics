@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.run_export import build_run_debug_bundle_zip
+from apps.api.services.run_export import build_run_debug_bundle_zip, build_screentime_run_debug_pdf
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -2368,44 +2369,65 @@ def unlock_identity(
 def export_run_debug_bundle(
     ep_id: str,
     run_id: str,
-    include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities)"),
-    include_images: bool = Query(False, description="Include thumbnails/crops/frames (very large)"),
-    include_logs: bool = Query(True, description="Include persisted logs (recommended)"),
+    format: str = Query("pdf", description="Export format: 'pdf' for debug report, 'zip' for raw bundle"),
+    include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities) - only for zip format"),
+    include_images: bool = Query(False, description="Include thumbnails/crops/frames (very large) - only for zip format"),
+    include_logs: bool = Query(True, description="Include persisted logs (recommended) - only for zip format"),
 ) -> StreamingResponse:
-    """Export a single zip containing the end-to-end state for one run."""
+    """Export a run debug report (PDF) or raw bundle (ZIP)."""
     ep_id_norm = normalize_ep_id(ep_id)
 
-    try:
-        zip_path, download_name = build_run_debug_bundle_zip(
-            ep_id=ep_id_norm,
-            run_id=run_id,
-            include_artifacts=include_artifacts,
-            include_images=include_images,
-            include_logs=include_logs,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    file_handle = open(zip_path, "rb")
-
-    def _cleanup() -> None:
+    if format == "zip":
+        # ZIP export
         try:
-            file_handle.close()
-        finally:
-            try:
-                os.unlink(zip_path)
-            except OSError:
-                pass
+            zip_path, download_name = build_run_debug_bundle_zip(
+                ep_id=ep_id_norm,
+                run_id=run_id,
+                include_artifacts=include_artifacts,
+                include_images=include_images,
+                include_logs=include_logs,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
-    return StreamingResponse(
-        file_handle,
-        media_type="application/zip",
-        headers=headers,
-        background=BackgroundTask(_cleanup),
-    )
+        file_handle = open(zip_path, "rb")
+
+        def _cleanup() -> None:
+            try:
+                file_handle.close()
+            finally:
+                try:
+                    os.unlink(zip_path)
+                except OSError:
+                    pass
+
+        headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+        return StreamingResponse(
+            file_handle,
+            media_type="application/zip",
+            headers=headers,
+            background=BackgroundTask(_cleanup),
+        )
+    else:
+        # PDF export (default)
+        try:
+            pdf_bytes, download_name = build_screentime_run_debug_pdf(
+                ep_id=ep_id_norm,
+                run_id=run_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers=headers,
+        )
 
 
 @router.get(
