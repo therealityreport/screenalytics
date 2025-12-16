@@ -2461,6 +2461,7 @@ def render_workspace_nav() -> None:
 # =============================================================================
 
 _DOCS_CATALOG_DEFAULT_RELATIVE_PATH = Path("docs") / "_meta" / "docs_catalog.json"
+_FEATURE_STATUS_DEFAULT_RELATIVE_PATH = Path("docs") / "_meta" / "feature_status.json"
 
 
 def _repo_root() -> Path:
@@ -2496,6 +2497,48 @@ def load_docs_catalog(catalog_path: str | Path | None = None) -> tuple[dict[str,
     return data, None
 
 
+def load_feature_status_registry(
+    registry_path: str | Path | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Load feature-status registry JSON used by header popovers.
+
+    Returns: (registry, error). If error is not None, registry is None.
+    """
+    repo_root = _repo_root()
+    relative_path = Path(registry_path) if registry_path is not None else _FEATURE_STATUS_DEFAULT_RELATIVE_PATH
+    registry_file = (repo_root / relative_path).resolve()
+
+    if not registry_file.exists():
+        return None, f"Feature status registry not found at `{relative_path}` (expected in repo root)."
+
+    try:
+        raw = registry_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"Failed to read feature status registry `{relative_path}`: {exc}"
+
+    if not isinstance(data, dict):
+        return None, "Feature status registry must be a JSON object."
+    if not isinstance(data.get("features"), dict):
+        return None, 'Feature status registry missing required key: "features" (object).'
+
+    return data, None
+
+
+def _paths_present(paths_expected: Any) -> tuple[bool, list[str]]:
+    repo_root = _repo_root()
+    missing: list[str] = []
+    if not isinstance(paths_expected, list):
+        return False, ["<invalid paths list>"]
+    for expected in paths_expected:
+        if not isinstance(expected, str) or not expected.strip():
+            continue
+        resolved = repo_root / expected
+        if not resolved.exists():
+            missing.append(expected)
+    return len(missing) == 0, missing
+
+
 def _feature_present_in_ui(feature_id: str, catalog: dict[str, Any]) -> bool:
     docs = catalog.get("docs") or []
     if not isinstance(docs, list):
@@ -2512,18 +2555,7 @@ def _feature_present_in_ui(feature_id: str, catalog: dict[str, Any]) -> bool:
 
 
 def _feature_present_in_code(feature: dict[str, Any]) -> tuple[bool, list[str]]:
-    repo_root = _repo_root()
-    paths_expected = feature.get("paths_expected") or []
-    missing: list[str] = []
-    if not isinstance(paths_expected, list):
-        return False, ["<invalid paths_expected>"]
-    for expected in paths_expected:
-        if not isinstance(expected, str) or not expected.strip():
-            continue
-        resolved = repo_root / expected
-        if not resolved.exists():
-            missing.append(expected)
-    return len(missing) == 0, missing
+    return _paths_present(feature.get("paths_expected") or [])
 
 
 def render_page_header(page_id: str, page_title: str) -> None:
@@ -2541,6 +2573,15 @@ def render_page_header(page_id: str, page_title: str) -> None:
             st.warning(error)
             st.caption("Merge the docs catalog PR, or add `docs/_meta/docs_catalog.json`.")
             return
+
+        registry, registry_error = load_feature_status_registry()
+        registry_features: dict[str, Any] = {}
+        if registry_error:
+            st.caption(registry_error)
+        elif registry is not None:
+            registry_features = registry.get("features") or {}
+            if not isinstance(registry_features, dict):
+                registry_features = {}
 
         assert catalog is not None
         docs = [d for d in catalog.get("docs", []) if isinstance(d, dict)]
@@ -2584,6 +2625,31 @@ def render_page_header(page_id: str, page_title: str) -> None:
             )
             if missing_paths:
                 st.warning("Missing paths: " + ", ".join(f"`{p}`" for p in missing_paths))
+
+            reg_feature = registry_features.get(feature_id) if isinstance(registry_features, dict) else None
+            if isinstance(reg_feature, dict):
+                reg_status = reg_feature.get("status") or "unknown"
+                reg_used = reg_feature.get("used_by_default")
+                reg_paths = reg_feature.get("paths_required") or []
+                reg_present, reg_missing = _paths_present(reg_paths)
+                st.caption(
+                    f"registry: status `{reg_status}` | used_by_default `{bool(reg_used)}` | present in code `{reg_present}`"
+                )
+                if reg_missing and reg_status == "complete":
+                    st.warning("Registry says complete but paths missing: " + ", ".join(f"`{p}`" for p in reg_missing))
+                how_to_enable = reg_feature.get("how_to_enable")
+                if isinstance(how_to_enable, str) and how_to_enable.strip():
+                    st.caption(how_to_enable.strip())
+
+                reg_phases = reg_feature.get("phases") or {}
+                if isinstance(reg_phases, dict) and reg_phases:
+                    st.markdown("**Registry Phases**")
+                    for phase_id, phase_info in reg_phases.items():
+                        if isinstance(phase_info, dict):
+                            phase_status = phase_info.get("status") or "unknown"
+                        else:
+                            phase_status = str(phase_info)
+                        st.markdown(f"- `{phase_id}`: `{phase_status}`")
 
             phases = feature.get("phases") or {}
             if isinstance(phases, dict) and phases:
@@ -2663,6 +2729,15 @@ def render_page_header(page_id: str, page_title: str) -> None:
             st.warning(error)
             return
 
+        registry, registry_error = load_feature_status_registry()
+        registry_features: dict[str, Any] = {}
+        if registry_error:
+            st.caption(registry_error)
+        elif registry is not None:
+            registry_features = registry.get("features") or {}
+            if not isinstance(registry_features, dict):
+                registry_features = {}
+
         assert catalog is not None
         docs = [d for d in catalog.get("docs", []) if isinstance(d, dict)]
         todo_statuses = {"in_progress", "draft", "outdated"}
@@ -2670,6 +2745,73 @@ def render_page_header(page_id: str, page_title: str) -> None:
             d for d in docs if d.get("status") in todo_statuses
         ]
         todo_docs.sort(key=lambda d: (str(d.get("status")), str(d.get("title"))))
+
+        if registry_features:
+            todo_rows: list[dict[str, Any]] = []
+            complete_rows: list[dict[str, Any]] = []
+            mismatches: list[str] = []
+
+            def _is_complete_status(value: str) -> bool:
+                return value in {"complete", "implemented_sandbox"}
+
+            for fid, fmeta in sorted(registry_features.items()):
+                if not isinstance(fmeta, dict):
+                    continue
+                feature_title = fmeta.get("title") or fid
+                feature_used = bool(fmeta.get("used_by_default"))
+                feature_paths = fmeta.get("paths_required") or []
+                feature_present, feature_missing = _paths_present(feature_paths)
+                feature_status = fmeta.get("status") or "unknown"
+                if feature_status == "complete" and feature_missing:
+                    mismatches.append(f"{fid}: missing {', '.join(feature_missing)}")
+                phases = fmeta.get("phases") or {}
+                if isinstance(phases, dict) and phases:
+                    for phase_id, phase_info in phases.items():
+                        if isinstance(phase_info, dict):
+                            phase_status = phase_info.get("status") or "unknown"
+                            phase_used = bool(phase_info.get("used_by_default", feature_used))
+                            phase_paths = phase_info.get("paths_required") or []
+                            _, phase_missing = _paths_present(phase_paths)
+                            if phase_status == "complete" and phase_missing:
+                                mismatches.append(f"{fid}.{phase_id}: missing {', '.join(phase_missing)}")
+                        else:
+                            phase_status = str(phase_info) or "unknown"
+                            phase_used = feature_used
+                        row = {
+                            "feature": feature_title,
+                            "feature_id": fid,
+                            "phase": phase_id,
+                            "status": phase_status,
+                            "used_by_default": phase_used,
+                            "present_in_code": feature_present,
+                        }
+                        if _is_complete_status(phase_status):
+                            complete_rows.append(row)
+                        else:
+                            todo_rows.append(row)
+                else:
+                    row = {
+                        "feature": feature_title,
+                        "feature_id": fid,
+                        "phase": "",
+                        "status": feature_status,
+                        "used_by_default": feature_used,
+                        "present_in_code": feature_present,
+                    }
+                    if _is_complete_status(feature_status):
+                        complete_rows.append(row)
+                    else:
+                        todo_rows.append(row)
+
+            st.markdown("### Feature Status (Registry)")
+            if mismatches:
+                st.warning("Status mismatch (registry says complete but code missing): " + "; ".join(mismatches))
+            if todo_rows:
+                st.markdown("**TO-DO** (not complete)")
+                st.dataframe(todo_rows, use_container_width=True, hide_index=True)
+            if complete_rows:
+                st.markdown("**COMPLETE**")
+                st.dataframe(complete_rows, use_container_width=True, hide_index=True)
 
         if not todo_docs:
             st.info("No in-progress/draft/outdated docs found in catalog.")
