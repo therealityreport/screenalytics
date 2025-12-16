@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "last_updated": "2025-12-16",
+  "features": {
+    "face_alignment": {
+      "title": "Face Alignment",
+      "status": "partial",
+      "used_by_default": false,
+      "how_to_enable": "Run `python -m FEATURES.face_alignment` to generate alignment artifacts; the main pipeline can consume `face_alignment/aligned_faces.jsonl` when present.",
+      "paths_required": [
+        "FEATURES/face_alignment",
+        "config/pipeline/face_alignment.yaml",
+        "tools/episode_run.py"
+      ],
+      "phases": {
+        "A_FAN_2D": {
+          "status": "implemented_sandbox",
+          "used_by_default": false,
+          "paths_required": ["FEATURES/face_alignment/src"],
+          "notes": "Sandbox runner exists; not promoted into a first-class main-pipeline stage yet."
+        },
+        "B_LUVLi_quality_gate": {
+          "status": "heuristic_stub",
+          "used_by_default": false,
+          "paths_required": ["FEATURES/face_alignment/src"],
+          "notes": "Heuristic placeholder only; not a model-based LUVLi port."
+        },
+        "C_3DDFA_V2": {
+          "status": "not_started",
+          "used_by_default": false,
+          "paths_required": [],
+          "notes": "Planned only."
+        }
+      },
+      "docs": [
+        "docs/plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md",
+        "docs/features/vision_alignment_and_body_tracking.md"
+      ]
+    },
+    "body_tracking": {
+      "title": "Body Tracking",
+      "status": "in_progress",
+      "used_by_default": false,
+      "how_to_enable": "Run `python -m FEATURES.body_tracking` to generate body-tracking artifacts; screentime can consume the comparison artifact when present.",
+      "paths_required": [
+        "FEATURES/body_tracking",
+        "config/pipeline/body_detection.yaml",
+        "config/pipeline/track_fusion.yaml"
+      ],
+      "phases": {
+        "sandbox_runner": {
+          "status": "implemented_sandbox",
+          "used_by_default": false,
+          "paths_required": ["FEATURES/body_tracking/src"],
+          "notes": "Sandbox pipeline exists; not enabled in main auto-run."
+        },
+        "pipeline_integration": {
+          "status": "future",
+          "used_by_default": false,
+          "paths_required": [],
+          "notes": "Not integrated into `tools/episode_run.py` yet."
+        }
+      },
+      "docs": [
+        "docs/plans/in_progress/feature_body_tracking_reid_fusion.md",
+        "docs/features/vision_alignment_and_body_tracking.md"
+      ]
+    },
+    "arcface_tensorrt": {
+      "title": "ArcFace TensorRT",
+      "status": "scaffold_only",
+      "used_by_default": false,
+      "how_to_enable": "Not enabled in production; requires GPU parity testing and integration work.",
+      "paths_required": ["FEATURES/arcface_tensorrt"],
+      "phases": {
+        "A_engine_building": {
+          "status": "scaffold_only",
+          "used_by_default": false,
+          "paths_required": ["FEATURES/arcface_tensorrt/src"],
+          "notes": "Scaffold only; not validated."
+        },
+        "B_inference_wrapper": {
+          "status": "scaffold_only",
+          "used_by_default": false,
+          "paths_required": ["FEATURES/arcface_tensorrt/src"],
+          "notes": "Scaffold only; not validated."
+        },
+        "C_comparison": {
+          "status": "scaffold_only",
+          "used_by_default": false,
+          "paths_required": [],
+          "notes": "Planned evaluation."
+        },
+        "D_integration": {
+          "status": "future",
+          "used_by_default": false,
+          "paths_required": [],
+          "notes": "Not integrated into production pipeline."
+        }
+      },
+      "docs": [
+        "docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md",
+        "docs/features/vision_alignment_and_body_tracking.md"
+      ]
+    },
+    "vision_analytics": {
+      "title": "Vision Analytics",
+      "status": "not_started",
+      "used_by_default": false,
+      "how_to_enable": "Not started.",
+      "paths_required": ["FEATURES/vision_analytics"],
+      "phases": {
+        "all": {
+          "status": "not_started",
+          "used_by_default": false,
+          "paths_required": [],
+          "notes": "Docs/config only."
+        }
+      },
+      "docs": ["docs/features/vision_alignment_and_body_tracking.md"]
+    }
+  }
+}
