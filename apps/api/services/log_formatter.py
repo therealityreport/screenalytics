@@ -31,6 +31,7 @@ class LogFormatterState:
     # ONNX warning tracking
     onnx_warning_count: int = 0
     onnx_warning_shown: bool = False
+    onnx_warning_first_line: str | None = None
 
     # Debug frame tracking
     debug_frame_count: int = 0
@@ -70,9 +71,10 @@ class LogFormatter:
     """
 
     # Patterns for classification
+    ONNX_PROVIDERS_LINE_PATTERN = re.compile(r"^\[LOCAL MODE\]\s*ONNX providers:", re.IGNORECASE)
     ONNX_WARNING_PATTERN = re.compile(
         r'(ONNXRuntime|onnxruntime|ORT|CoreML.*fallback|'
-        r'CPUExecutionProvider|coreml.*not.*available|'
+        r'coreml.*not.*available|'
         r'EP Error|Execution provider|InferenceSession)',
         re.IGNORECASE
     )
@@ -186,6 +188,13 @@ class LogFormatter:
         # Check for JSON progress blob
         if self._looks_like_json(line):
             formatted = self._format_json_progress(line)
+            if formatted:
+                self._formatted_lines.append(formatted)
+            return formatted
+
+        # Keep local-mode ONNX provider selection visible (and don't misclassify as warning).
+        if self.ONNX_PROVIDERS_LINE_PATTERN.match(line):
+            formatted = self._format_onnx_providers_line(line)
             if formatted:
                 self._formatted_lines.append(formatted)
             return formatted
@@ -418,11 +427,21 @@ class LogFormatter:
     def _handle_onnx_warning(self, line: str) -> str | None:
         """Handle ONNX runtime warnings - show single friendly message."""
         self.state.onnx_warning_count += 1
+        if self.state.onnx_warning_first_line is None:
+            collapsed = " ".join(str(line).strip().split())
+            self.state.onnx_warning_first_line = collapsed[:220]
 
         if not self.state.onnx_warning_shown:
             self.state.onnx_warning_shown = True
             # Single user-friendly message instead of raw ONNX output
-            formatted = "[WARN] Some ops are falling back to CPU; this may be slower on your Mac."
+            details = self.state.onnx_warning_first_line or ""
+            if details:
+                formatted = (
+                    "[WARN] Some ops are falling back to CPU; this may be slower on your Mac. "
+                    f"(details: {details})"
+                )
+            else:
+                formatted = "[WARN] Some ops are falling back to CPU; this may be slower on your Mac."
             self._formatted_lines.append(formatted)
             return formatted
 
@@ -465,6 +484,13 @@ class LogFormatter:
             line = line.replace("[PhaseTracker]", "[SUMMARY]")
 
         return line
+
+    def _format_onnx_providers_line(self, line: str) -> str:
+        """Format local-mode provider selection into a compact, readable line."""
+        collapsed = " ".join(str(line).strip().split())
+        # Drop the often-long available=[...] portion to keep UI logs readable.
+        collapsed = re.sub(r",\\s*available=\\[.*\\]\\)$", ")", collapsed)
+        return collapsed
 
     def finalize(self) -> str | None:
         """Generate final summary if needed.
