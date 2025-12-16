@@ -7920,11 +7920,11 @@ def _run_cluster_stage(
                 "Generating track representatives and cluster centroids for %s",
                 args.ep_id,
             )
-            track_reps_summary = generate_track_reps_and_centroids(args.ep_id)
+            track_reps_summary = generate_track_reps_and_centroids(args.ep_id, run_id=run_id)
             LOGGER.info(
                 "Generated %d track reps and %d cluster centroids",
-                track_reps_summary.get("track_reps_count", 0),
-                track_reps_summary.get("cluster_centroids_count", 0),
+                track_reps_summary.get("tracks_with_reps", 0),
+                track_reps_summary.get("centroids_computed", 0),
             )
         except Exception as exc:
             LOGGER.warning("Failed to generate track representatives: %s", exc)

@@ -1138,12 +1138,20 @@ def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
     initial_done = bool(resp.get("initial_pass_done")) if isinstance(resp, dict) else False
 
     if not suggestions or initial_done:
+        reason = "initial_done" if initial_done else "no_suggestions"
         if force:
-            st.info("No Improve Faces suggestions right now.")
+            st.session_state[f"{ep_id}::improve_faces_active"] = True
+            st.session_state[f"{ep_id}::improve_faces_suggestions"] = []
+            st.session_state[f"{ep_id}::improve_faces_index"] = 0
+            st.session_state[f"{ep_id}::improve_faces_empty_reason"] = reason
+            st.session_state[f"{ep_id}::improve_faces_complete"] = True
+            st.rerun()
+            return True
+
         st.session_state.pop(f"{ep_id}::improve_faces_active", None)
         st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
         st.session_state.pop(f"{ep_id}::improve_faces_index", None)
-        # Mark that review is complete so we show the Faces Review button
+        st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
         st.session_state[f"{ep_id}::improve_faces_complete"] = True
         return False
 
@@ -1151,6 +1159,7 @@ def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
     st.session_state[f"{ep_id}::improve_faces_suggestions"] = suggestions
     st.session_state[f"{ep_id}::improve_faces_index"] = 0
     st.session_state.pop(f"{ep_id}::improve_faces_complete", None)
+    st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
     st.rerun()
     return True
 
@@ -1176,6 +1185,11 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
             st.image(url, use_container_width=True)
 
         if not suggestions_local or current_idx >= len(suggestions_local):
+            empty_reason = st.session_state.get(f"{ep_id}::improve_faces_empty_reason")
+            if empty_reason == "initial_done":
+                st.info("Improve Faces initial pass already completed for this episode.")
+            elif empty_reason == "no_suggestions":
+                st.info("No Improve Faces suggestions right now.")
             st.success("All suggestions reviewed!")
             st.markdown("Click **Faces Review** to continue assigning faces to cast members.")
             col1, col2 = st.columns(2)
@@ -1184,6 +1198,7 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
                     st.session_state.pop(f"{ep_id}::improve_faces_active", None)
                     st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
                     st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
                     st.session_state[f"{ep_id}::improve_faces_complete"] = True
                     st.switch_page("pages/3_Faces_Review.py")
             with col2:
@@ -1191,6 +1206,7 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
                     st.session_state.pop(f"{ep_id}::improve_faces_active", None)
                     st.session_state.pop(f"{ep_id}::improve_faces_suggestions", None)
                     st.session_state.pop(f"{ep_id}::improve_faces_index", None)
+                    st.session_state.pop(f"{ep_id}::improve_faces_empty_reason", None)
                     st.session_state[f"{ep_id}::improve_faces_complete"] = True
                     st.rerun()
             return
@@ -1749,7 +1765,7 @@ st.session_state.pop(_autorun_navigate_key, None)
 # Trigger Improve Faces modal if flag is set (after cluster completion)
 if st.session_state.get(f"{ep_id}::trigger_improve_faces"):
     LOGGER.info("[IMPROVE_FACES] Trigger flag detected, starting Improve Faces modal")
-    _start_improve_faces_ep_detail(ep_id)
+    _start_improve_faces_ep_detail(ep_id, force=True)
 
 # Render Improve Faces modal if active
 _render_improve_faces_modal_ep_detail(ep_id)

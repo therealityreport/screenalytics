@@ -453,7 +453,7 @@
       "id": "features-vision-alignment-body-tracking",
       "title": "Vision Alignment & Body Tracking",
       "path": "docs/features/vision_alignment_and_body_tracking.md",
-      "status": "in_progress",
+      "status": "complete",
       "last_updated": "2025-12-15",
       "type": "features",
       "tags": ["features"],
