@@ -16,6 +16,7 @@ import cv2  # type: ignore
 from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -31,6 +32,7 @@ from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
+from apps.api.services.run_export import build_run_debug_bundle_zip
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -2218,6 +2220,50 @@ def episode_run_status(ep_id: str, run_id: str | None = Query(None)) -> EpisodeS
     except ValueError as exc:
         # FastAPI will coerce query params to str; validate run_id explicitly.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/episodes/{ep_id}/runs/{run_id}/export", tags=["episodes"])
+def export_run_debug_bundle(
+    ep_id: str,
+    run_id: str,
+    include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities)"),
+    include_images: bool = Query(False, description="Include thumbnails/crops/frames (very large)"),
+    include_logs: bool = Query(True, description="Include persisted logs (recommended)"),
+) -> StreamingResponse:
+    """Export a single zip containing the end-to-end state for one run."""
+    ep_id_norm = normalize_ep_id(ep_id)
+
+    try:
+        zip_path, download_name = build_run_debug_bundle_zip(
+            ep_id=ep_id_norm,
+            run_id=run_id,
+            include_artifacts=include_artifacts,
+            include_images=include_images,
+            include_logs=include_logs,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    file_handle = open(zip_path, "rb")
+
+    def _cleanup() -> None:
+        try:
+            file_handle.close()
+        finally:
+            try:
+                os.unlink(zip_path)
+            except OSError:
+                pass
+
+    headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+    return StreamingResponse(
+        file_handle,
+        media_type="application/zip",
+        headers=headers,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @router.get(
