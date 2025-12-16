@@ -63,7 +63,7 @@ screenalytics/
 │   └── ...                      # Other experimental features
 │
 ├── agents/                      # Codex/Claude profiles, playbooks, prompts (CONTROLLED)
-│   ├── AGENTS.md                # Agent behavior documentation
+│   ├── AGENTS.md                # Agent catalog (feature agents, automation bots, policies)
 │   ├── playbooks/               # Automation playbooks
 │   │   └── update-docs-on-change.yaml
 │   ├── profiles/                # Agent profiles (relabel, doc-sync, etc.)

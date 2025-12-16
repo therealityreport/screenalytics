@@ -206,64 +206,11 @@ PR: <link if created, otherwise "not yet">
 
 ---
 
-## 11. Feature-Specific Agents
+## 11. Related Documentation
 
-### BodyTrackingAgent
-
-**Scope:** Person detection, tracking, Re-ID, and face↔body fusion.
-
-**Owns:**
-- `FEATURES/body_tracking/src/` - Body tracking implementation
-- `config/pipeline/body_detection.yaml` - Detection and Re-ID config
-- `config/pipeline/track_fusion.yaml` - Fusion rules
-
-**Key Tasks:**
-- YOLO person detection (class 0 = person)
-- ByteTrack temporal tracking with ID offset (100000+)
-- OSNet Re-ID embedding computation (256-d)
-- Face↔body IoU association
-- Re-ID handoff when face disappears
-- Screen-time comparison (face-only vs face+body)
-
-**Artifacts:**
-- `data/manifests/{ep_id}/body_tracking/body_detections.jsonl`
-- `data/manifests/{ep_id}/body_tracking/body_tracks.jsonl`
-- `data/manifests/{ep_id}/body_tracking/body_embeddings.npy`
-- `data/manifests/{ep_id}/body_tracking/track_fusion.json`
-- `data/manifests/{ep_id}/body_tracking/screentime_comparison.json`
-
-**Config Flags (rollback levers):**
-- `body_tracking.enabled: false` - Disable entire feature
-- `person_reid.enabled: false` - Disable Re-ID embeddings
-- `track_fusion.enabled: false` - Disable face↔body fusion
-
-**Acceptance Matrix:** Sections 3.10-3.12
-
----
-
-### FaceAlignmentAgent
-
-**Scope:** Face alignment, landmark extraction, and quality gating.
-
-**Owns:**
-- `FEATURES/face_alignment/src/` - Alignment implementation
-- `config/pipeline/face_alignment.yaml` - Alignment config
-
-**Key Tasks:**
-- FAN 68-point 2D landmark extraction
-- Aligned face crop generation (ArcFace normalization)
-- Quality scoring (future: LUVLi uncertainty)
-- 3D head pose estimation (future: 3DDFA_V2)
-
-**Artifacts:**
-- `data/manifests/{ep_id}/face_alignment/aligned_faces.jsonl`
-- `data/manifests/{ep_id}/face_alignment/aligned_crops/` (optional)
-
-**Config Flags (rollback levers):**
-- `face_alignment.enabled: false` - Disable alignment
-- Disable embedding gating: `config/pipeline/embedding.yaml` → `face_alignment.enabled: false` (or set `min_alignment_quality: 0.0`)
-
-**Acceptance Matrix:** Sections 3.7-3.9
+- **[Agent Catalog](agents/AGENTS.md)** — Feature agent ownership map and automation bots
+- **[Branching Strategy](docs/reference/branching/BRANCHING_STRATEGY.md)** — Full git workflow details
+- **[Acceptance Matrix](ACCEPTANCE_MATRIX.md)** — Quality gates and acceptance criteria
 
 ---
 
