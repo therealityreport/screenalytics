@@ -65,6 +65,8 @@ class TensorRTConfig:
             engine_s3_key_prefix=trt_config.get("engine_s3_key_prefix", cls.engine_s3_key_prefix),
             precision=trt_config.get("precision", cls.precision),
             max_batch_size=trt_config.get("max_batch_size", cls.max_batch_size),
+            min_batch_size=trt_config.get("min_batch_size", cls.min_batch_size),
+            opt_batch_size=trt_config.get("opt_batch_size", cls.opt_batch_size),
             workspace_size_mb=trt_config.get("workspace_size_mb", cls.workspace_size_mb),
         )
 

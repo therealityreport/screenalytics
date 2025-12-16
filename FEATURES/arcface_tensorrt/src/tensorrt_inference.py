@@ -56,6 +56,7 @@ class TensorRTArcFace:
         self._d_input = None
         self._d_output = None
         self._h_output = None
+        self._allocated_batch_size: int | None = None
 
     def _load_engine(self):
         """Load TensorRT engine."""
@@ -112,6 +113,9 @@ class TensorRTArcFace:
         """Allocate device buffers for inference."""
         import pycuda.driver as cuda
 
+        if self._input_shape is None or self._output_shape is None:
+            raise RuntimeError("Engine shapes not initialized")
+
         # Calculate sizes
         input_size = batch_size * int(np.prod(self._input_shape[1:]))
         output_size = batch_size * int(np.prod(self._output_shape[1:]))
@@ -121,10 +125,8 @@ class TensorRTArcFace:
         self._d_output = cuda.mem_alloc(output_size * np.float32().nbytes)
 
         # Allocate host output buffer
-        self._h_output = np.empty(
-            (batch_size, int(np.prod(self._output_shape[1:]))),
-            dtype=np.float32,
-        )
+        self._h_output = np.empty(output_size, dtype=np.float32)
+        self._allocated_batch_size = int(batch_size)
 
     def preprocess(self, images: np.ndarray) -> np.ndarray:
         """
@@ -170,14 +172,21 @@ class TensorRTArcFace:
         input_tensor = self.preprocess(images)
         batch_size = input_tensor.shape[0]
 
+        if self._input_binding_idx is None or self._output_binding_idx is None:
+            raise RuntimeError("Engine bindings not initialized")
+        if self._input_shape is None or self._output_shape is None:
+            raise RuntimeError("Engine shapes not initialized")
+
         # Set dynamic batch size
         self._context.set_binding_shape(
             self._input_binding_idx,
             (batch_size,) + tuple(self._input_shape[1:]),
         )
 
-        # Allocate buffers if needed
-        if self._d_input is None:
+        # Allocate buffers if needed (or if batch grows beyond current capacity)
+        if self._d_input is None or self._d_output is None or self._allocated_batch_size is None:
+            self._allocate_buffers(batch_size)
+        elif batch_size > self._allocated_batch_size:
             self._allocate_buffers(batch_size)
 
         # Copy input to device
@@ -188,21 +197,27 @@ class TensorRTArcFace:
         )
 
         # Run inference
+        bindings = [0] * int(self._engine.num_bindings)
+        bindings[int(self._input_binding_idx)] = int(self._d_input)
+        bindings[int(self._output_binding_idx)] = int(self._d_output)
         self._context.execute_async_v2(
-            bindings=[int(self._d_input), int(self._d_output)],
+            bindings=bindings,
             stream_handle=self._stream.handle,
         )
 
         # Copy output to host
-        output_size = batch_size * int(np.prod(self._output_shape[1:]))
-        h_output = np.empty(output_size, dtype=np.float32)
+        output_shape = tuple(self._context.get_binding_shape(self._output_binding_idx))
+        embedding_dim = int(np.prod(output_shape[1:]))
+        output_size = batch_size * embedding_dim
+        if self._h_output is None or int(self._h_output.size) < output_size:
+            self._h_output = np.empty(output_size, dtype=np.float32)
+            self._allocated_batch_size = batch_size
 
-        cuda.memcpy_dtoh_async(h_output, self._d_output, self._stream)
+        cuda.memcpy_dtoh_async(self._h_output[:output_size], self._d_output, self._stream)
         self._stream.synchronize()
 
         # Reshape and normalize
-        embedding_dim = int(np.prod(self._output_shape[1:]))
-        embeddings = h_output.reshape(batch_size, embedding_dim)
+        embeddings = self._h_output[:output_size].reshape(batch_size, embedding_dim)
 
         # L2 normalize
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)

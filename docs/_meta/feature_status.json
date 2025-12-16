@@ -132,74 +132,92 @@
     },
     "arcface_tensorrt": {
       "title": "ArcFace TensorRT",
-      "status": "scaffold_only",
-      "integrated_in_jobs": [],
-      "integrated_in_autorun": false,
+      "status": "implemented_production",
+      "integrated_in_jobs": [
+        "harvest"
+      ],
+      "integrated_in_autorun": true,
       "enabled_by_default": false,
       "how_to_enable": {
-        "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt (not production-ready)",
+        "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt",
         "ui_path": null,
         "cli_flag": null
       },
       "evidence_paths": [
-        "FEATURES/arcface_tensorrt"
+        "tools/episode_run.py",
+        "FEATURES/arcface_tensorrt",
+        "config/pipeline/arcface_tensorrt.yaml",
+        "config/pipeline/embedding.yaml"
       ],
       "phases": {
         "A_engine_building": {
-          "status": "scaffold_only",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
-            "config_key": null,
+            "config_key": "config/pipeline/arcface_tensorrt.yaml",
             "ui_path": null,
-            "cli_flag": null
+            "cli_flag": "python -m FEATURES.arcface_tensorrt --mode build"
           },
           "evidence_paths": [
-            "FEATURES/arcface_tensorrt/src"
+            "FEATURES/arcface_tensorrt/src/tensorrt_builder.py",
+            "config/pipeline/arcface_tensorrt.yaml"
           ],
-          "notes": "Scaffold only; not validated."
+          "notes": "Engine build/load + local/S3 caching via build_or_load_engine(); invoked when embedding.backend=tensorrt."
         },
         "B_inference_wrapper": {
-          "status": "scaffold_only",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
-            "config_key": null,
+            "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt",
             "ui_path": null,
             "cli_flag": null
           },
           "evidence_paths": [
-            "FEATURES/arcface_tensorrt/src"
+            "tools/episode_run.py",
+            "FEATURES/arcface_tensorrt/src/tensorrt_inference.py"
           ],
-          "notes": "Scaffold only; not validated."
+          "notes": "Batched inference wrapper used by faces_embed when enabled; falls back to PyTorch when TensorRT/PyCUDA/engine is unavailable."
         },
         "C_comparison": {
-          "status": "scaffold_only",
+          "status": "implemented_production",
           "integrated_in_jobs": [],
           "integrated_in_autorun": false,
           "enabled_by_default": false,
           "how_to_enable": {
             "config_key": null,
             "ui_path": null,
-            "cli_flag": null
+            "cli_flag": "python -m FEATURES.arcface_tensorrt --mode compare"
           },
-          "evidence_paths": [],
-          "notes": "Planned evaluation."
+          "evidence_paths": [
+            "FEATURES/arcface_tensorrt/src/embedding_compare.py"
+          ],
+          "notes": "Parity harness: compares TensorRT vs PyTorch reference embeddings on a deterministic synthetic eval set."
         },
         "D_integration": {
-          "status": "future",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
-            "config_key": null,
+            "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt",
             "ui_path": null,
             "cli_flag": null
           },
-          "evidence_paths": [],
-          "notes": "Not integrated into production jobs or auto-run yet."
+          "evidence_paths": [
+            "tools/episode_run.py",
+            "FEATURES/arcface_tensorrt"
+          ],
+          "notes": "Integrated into faces_embed (Harvest) and auto-run through embedding.backend selection; safe fallback to PyTorch on failure."
         }
       },
       "docs": [
