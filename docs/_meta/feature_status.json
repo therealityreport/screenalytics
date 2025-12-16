@@ -111,9 +111,9 @@
       ],
       "phases": {
         "sandbox_runner": {
-          "status": "implemented_sandbox",
+          "status": "complete",
           "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
             "config_key": null,
@@ -123,7 +123,7 @@
           "evidence_paths": [
             "FEATURES/body_tracking/src"
           ],
-          "notes": "Sandbox pipeline exists; not enabled in production jobs or auto-run."
+          "notes": "Standalone CLI tool for testing body tracking outside the pipeline. Complete as designed; production code is in pipeline_integration phase."
         },
         "pipeline_integration": {
           "status": "implemented_production",
@@ -165,17 +165,19 @@
           "notes": "Face↔body track fusion and screen-time comparison. Runs as best-effort post-processing after cluster stage completes. Generates track_fusion.json and screentime_comparison.json."
         },
         "E_unified_screentime": {
-          "status": "not_started",
+          "status": "implemented_production",
           "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
-          "enabled_by_default": false,
+          "integrated_in_autorun": true,
+          "enabled_by_default": true,
           "how_to_enable": {
             "config_key": null,
-            "ui_path": null,
+            "ui_path": "Screentime page → Body Tracking tab",
             "cli_flag": null
           },
-          "evidence_paths": [],
-          "notes": "Planned: Unified timeline fusion (face + body), UI visibility breakdown, schema finalization."
+          "evidence_paths": [
+            "apps/workspace-ui/pages/4_Screentime.py"
+          ],
+          "notes": "UI visibility breakdown showing face vs body screen time. Includes stacked bar chart, per-cast breakdown with body contribution %, and progress bars. Auto-displays when body_metrics_available=true."
         }
       },
       "docs": [
@@ -242,9 +244,9 @@
           "notes": "Batched inference wrapper used by faces_embed when enabled; falls back to PyTorch when TensorRT/PyCUDA/engine is unavailable."
         },
         "C_comparison": {
-          "status": "implemented_production",
+          "status": "complete",
           "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
             "config_key": null,
@@ -254,7 +256,7 @@
           "evidence_paths": [
             "FEATURES/arcface_tensorrt/src/embedding_compare.py"
           ],
-          "notes": "Parity harness: compares TensorRT vs PyTorch reference embeddings on a deterministic synthetic eval set."
+          "notes": "Standalone CLI parity harness. Compares TensorRT vs PyTorch reference embeddings on a deterministic synthetic eval set. Complete as designed; not meant to run in pipeline."
         },
         "D_integration": {
           "status": "implemented_production",
