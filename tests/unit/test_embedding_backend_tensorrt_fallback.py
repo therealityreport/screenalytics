@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -38,6 +40,15 @@ class _FailingTensorRTBackend:
         raise ImportError("TensorRT not installed")
 
 
+def test_embedding_config_defaults_to_tensorrt_backend() -> None:
+    import yaml
+
+    cfg_path = Path("config/pipeline/embedding.yaml")
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    embedding = data.get("embedding") or {}
+    assert embedding.get("backend") == "tensorrt"
+
+
 def test_get_embedding_backend_falls_back_to_pytorch_when_tensorrt_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(episode_run, "TensorRTEmbeddingBackend", _FailingTensorRTBackend)
     monkeypatch.setattr(episode_run, "ArcFaceEmbedder", _DummyPytorchBackend)
@@ -67,4 +78,3 @@ def test_get_embedding_backend_raises_when_fallback_disabled(monkeypatch: pytest
 
     with pytest.raises(ImportError):
         embedder.ensure_ready()
-

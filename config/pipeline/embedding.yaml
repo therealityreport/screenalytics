@@ -3,7 +3,7 @@
 
 # Backend selection
 embedding:
-  backend: pytorch                 # tensorrt | pytorch (default: pytorch)
+  backend: tensorrt                # tensorrt | pytorch (default: tensorrt; falls back to pytorch when unavailable)
   tensorrt_config: config/pipeline/arcface_tensorrt.yaml
 
 # Face alignment quality gating

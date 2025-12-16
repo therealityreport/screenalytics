@@ -45,10 +45,10 @@ quality_gating:
 
 # 3D head pose (future: 3DDFA_V2 integration)
 head_pose_3d:
-  enabled: false                   # Enable when 3DDFA_V2 is implemented
+  enabled: true                    # Default-on: selective head pose extraction
   run_every_n_frames: 10           # Run 3D on every Nth frame
   run_on_uncertain: true           # Also run on low-quality faces
-  uncertainty_threshold: 0.7       # Faces below this get 3D pose
+  uncertainty_threshold: 0.5       # Faces below this get 3D pose
 
 # Performance
 performance:

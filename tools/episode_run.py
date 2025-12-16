@@ -6950,6 +6950,33 @@ def _load_alignment_landmarks_index(aligned_faces_path: Path) -> Dict[Tuple[int,
                 alignment_quality_source = data.get("alignment_quality_source")
                 if isinstance(alignment_quality_source, str) and alignment_quality_source.strip():
                     entry["alignment_quality_source"] = alignment_quality_source.strip()
+                pose_yaw = data.get("pose_yaw")
+                if pose_yaw is not None:
+                    try:
+                        entry["pose_yaw"] = float(pose_yaw)
+                    except (TypeError, ValueError):
+                        pass
+                pose_pitch = data.get("pose_pitch")
+                if pose_pitch is not None:
+                    try:
+                        entry["pose_pitch"] = float(pose_pitch)
+                    except (TypeError, ValueError):
+                        pass
+                pose_roll = data.get("pose_roll")
+                if pose_roll is not None:
+                    try:
+                        entry["pose_roll"] = float(pose_roll)
+                    except (TypeError, ValueError):
+                        pass
+                pose_err = data.get("pose_reprojection_error_px")
+                if pose_err is not None:
+                    try:
+                        entry["pose_reprojection_error_px"] = float(pose_err)
+                    except (TypeError, ValueError):
+                        pass
+                pose_source = data.get("pose_source")
+                if isinstance(pose_source, str) and pose_source.strip():
+                    entry["pose_source"] = pose_source.strip()
                 if entry:
                     index[key] = entry
     except Exception as exc:
@@ -7037,6 +7064,28 @@ def _run_faces_embed_stage(
     except (TypeError, ValueError):
         quality_gate_threshold = 0.3
     quality_gate_threshold = max(0.0, min(quality_gate_threshold, 1.0))
+
+    head_pose_cfg = (
+        alignment_config.get("head_pose_3d", {})
+        if isinstance(alignment_config.get("head_pose_3d"), dict)
+        else {}
+    )
+    head_pose_enabled = alignment_run_enabled and bool(head_pose_cfg.get("enabled", False))
+    head_pose_every_n_frames_raw = head_pose_cfg.get("run_every_n_frames", 10)
+    try:
+        head_pose_every_n_frames = int(head_pose_every_n_frames_raw)
+    except (TypeError, ValueError):
+        head_pose_every_n_frames = 10
+    head_pose_every_n_frames = max(head_pose_every_n_frames, 1)
+    head_pose_run_on_uncertain = bool(head_pose_cfg.get("run_on_uncertain", True))
+    head_pose_uncertainty_threshold_raw = head_pose_cfg.get("uncertainty_threshold", quality_gate_threshold)
+    try:
+        head_pose_uncertainty_threshold = float(head_pose_uncertainty_threshold_raw)
+    except (TypeError, ValueError):
+        head_pose_uncertainty_threshold = float(quality_gate_threshold)
+    head_pose_uncertainty_threshold = max(0.0, min(head_pose_uncertainty_threshold, 1.0))
+    head_pose_computed = 0
+    head_pose_failed = 0
 
     quality_gate_mode = str(quality_gate_cfg.get("mode", "drop") or "drop").strip().lower()
     if quality_gate_mode not in {"drop", "downweight"}:
@@ -7350,6 +7399,11 @@ def _run_faces_embed_stage(
                 alignment_quality_source: str | None = None
                 alignment_source: str | None = None
                 alignment_quality_weight: float | None = None
+                pose_yaw: float | None = None
+                pose_pitch: float | None = None
+                pose_roll: float | None = None
+                pose_reprojection_error_px: float | None = None
+                pose_source: str | None = None
                 if alignment_run_enabled:
                     face_alignment_cfg = alignment_config.get("face_alignment", {}) if isinstance(
                         alignment_config.get("face_alignment"), dict
@@ -7386,6 +7440,33 @@ def _run_faces_embed_stage(
                                     alignment_quality_score = float(aq_cached)
                                 except (TypeError, ValueError):
                                     alignment_quality_score = None
+                            pose_yaw_cached = cached.get("pose_yaw")
+                            if pose_yaw_cached is not None:
+                                try:
+                                    pose_yaw = float(pose_yaw_cached)
+                                except (TypeError, ValueError):
+                                    pose_yaw = None
+                            pose_pitch_cached = cached.get("pose_pitch")
+                            if pose_pitch_cached is not None:
+                                try:
+                                    pose_pitch = float(pose_pitch_cached)
+                                except (TypeError, ValueError):
+                                    pose_pitch = None
+                            pose_roll_cached = cached.get("pose_roll")
+                            if pose_roll_cached is not None:
+                                try:
+                                    pose_roll = float(pose_roll_cached)
+                                except (TypeError, ValueError):
+                                    pose_roll = None
+                            pose_err_cached = cached.get("pose_reprojection_error_px")
+                            if pose_err_cached is not None:
+                                try:
+                                    pose_reprojection_error_px = float(pose_err_cached)
+                                except (TypeError, ValueError):
+                                    pose_reprojection_error_px = None
+                            pose_source_cached = cached.get("pose_source")
+                            if isinstance(pose_source_cached, str) and pose_source_cached.strip():
+                                pose_source = pose_source_cached.strip()
                     if landmarks_68 is None:
                         if fan2d_mod is None:
                             try:
@@ -7426,6 +7507,47 @@ def _run_faces_embed_stage(
                                     "alignment_quality_source": alignment_quality_source,
                                 }
                     if landmarks_68 is not None:
+                        if head_pose_enabled and pose_yaw is None:
+                            should_run_pose = (int(frame_idx) % head_pose_every_n_frames) == 0
+                            if (
+                                not should_run_pose
+                                and head_pose_run_on_uncertain
+                                and alignment_quality_score is not None
+                            ):
+                                should_run_pose = alignment_quality_score < head_pose_uncertainty_threshold
+                            if should_run_pose:
+                                try:
+                                    from py_screenalytics.face_alignment import head_pose as _head_pose  # type: ignore
+
+                                    estimate = _head_pose.estimate_head_pose_pnp(
+                                        landmarks_68,
+                                        image_shape=image.shape,
+                                    )
+                                    if estimate is not None:
+                                        pose_yaw = estimate.yaw
+                                        pose_pitch = estimate.pitch
+                                        pose_roll = estimate.roll
+                                        pose_reprojection_error_px = estimate.reprojection_error_px
+                                        pose_source = estimate.source
+                                        head_pose_computed += 1
+                                        cached_entry = alignment_landmarks_index.get(key)
+                                        if isinstance(cached_entry, dict):
+                                            cached_entry["pose_yaw"] = pose_yaw
+                                            cached_entry["pose_pitch"] = pose_pitch
+                                            cached_entry["pose_roll"] = pose_roll
+                                            cached_entry["pose_reprojection_error_px"] = pose_reprojection_error_px
+                                            cached_entry["pose_source"] = pose_source
+                                            alignment_landmarks_index[key] = cached_entry
+                                except Exception as exc:
+                                    head_pose_failed += 1
+                                    if head_pose_failed <= 3:
+                                        LOGGER.warning(
+                                            "Head pose estimation failed for track=%s frame=%s: %s",
+                                            track_id,
+                                            frame_idx,
+                                            exc,
+                                        )
+
                         if aligned_faces_handle and key not in alignment_written_keys:
                             try:
                                 aligned_faces_handle.write(
@@ -7438,6 +7560,11 @@ def _run_faces_embed_stage(
                                             landmarks_68=landmarks_68,
                                             alignment_quality=alignment_quality_score,
                                             alignment_quality_source=alignment_quality_source or "heuristic",
+                                            pose_yaw=pose_yaw,
+                                            pose_pitch=pose_pitch,
+                                            pose_roll=pose_roll,
+                                            pose_reprojection_error_px=pose_reprojection_error_px,
+                                            pose_source=pose_source,
                                         )
                                     )
                                     + "\n"
@@ -7568,6 +7695,11 @@ def _run_faces_embed_stage(
                     "alignment_source": alignment_source,
                     "alignment_quality": alignment_quality_score,
                     "alignment_quality_weight": alignment_quality_weight,
+                    "pose_yaw": pose_yaw,
+                    "pose_pitch": pose_pitch,
+                    "pose_roll": pose_roll,
+                    "pose_reprojection_error_px": pose_reprojection_error_px,
+                    "pose_source": pose_source,
                     "crop_rel_path": crop_rel_path,
                     "crop_s3_key": crop_s3_key,
                     "thumb_rel_path": thumb_rel_path,
@@ -7660,6 +7792,33 @@ def _run_faces_embed_stage(
                         face_row["thumb_s3_key"] = meta["thumb_s3_key"]
                     if meta["landmarks"]:
                         face_row["landmarks"] = [round(float(val), 4) for val in meta["landmarks"]]
+                    pose_yaw_val = meta.get("pose_yaw")
+                    if pose_yaw_val is not None:
+                        try:
+                            face_row["pose_yaw"] = round(float(pose_yaw_val), 3)
+                        except (TypeError, ValueError):
+                            pass
+                    pose_pitch_val = meta.get("pose_pitch")
+                    if pose_pitch_val is not None:
+                        try:
+                            face_row["pose_pitch"] = round(float(pose_pitch_val), 3)
+                        except (TypeError, ValueError):
+                            pass
+                    pose_roll_val = meta.get("pose_roll")
+                    if pose_roll_val is not None:
+                        try:
+                            face_row["pose_roll"] = round(float(pose_roll_val), 3)
+                        except (TypeError, ValueError):
+                            pass
+                    pose_err_val = meta.get("pose_reprojection_error_px")
+                    if pose_err_val is not None:
+                        try:
+                            face_row["pose_reprojection_error_px"] = round(float(pose_err_val), 3)
+                        except (TypeError, ValueError):
+                            pass
+                    pose_source_val = meta.get("pose_source")
+                    if isinstance(pose_source_val, str) and pose_source_val.strip():
+                        face_row["pose_source"] = pose_source_val.strip()
                     if meta.get("alignment_used"):
                         face_row["alignment_used"] = True
                         if meta.get("alignment_source"):
@@ -7783,6 +7942,15 @@ def _run_faces_embed_stage(
             },
             "coherence": coherence_result.get("coherence_stats", {}),
         }
+        if head_pose_enabled:
+            summary["head_pose_3d"] = {
+                "enabled": True,
+                "run_every_n_frames": head_pose_every_n_frames,
+                "run_on_uncertain": head_pose_run_on_uncertain,
+                "uncertainty_threshold": head_pose_uncertainty_threshold,
+                "computed": head_pose_computed,
+                "failed": head_pose_failed,
+            }
         # Add mixed tracks if any were found
         if coherence_result.get("mixed_tracks"):
             summary["mixed_tracks"] = coherence_result["mixed_tracks"]

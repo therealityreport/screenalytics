@@ -242,6 +242,7 @@ def _compute_iou(box1: List[float], box2: List[float]) -> float:
 @pytest.fixture
 def synthetic_body_detections() -> List[Dict]:
     """Fixture providing synthetic body detections."""
+    np.random.seed(0)
     return create_synthetic_detections(num_frames=50, num_persons=3)
 
 
@@ -254,6 +255,7 @@ def synthetic_body_tracks(synthetic_body_detections) -> List[Dict]:
 @pytest.fixture
 def synthetic_face_detections(synthetic_body_detections) -> List[Dict]:
     """Fixture providing synthetic face detections."""
+    np.random.seed(0)
     return create_synthetic_face_detections(synthetic_body_detections, face_visibility_prob=0.6)
 
 
@@ -352,4 +354,5 @@ def create_mock_embeddings(num_embeddings: int, dim: int = 256) -> Tuple[np.ndar
 @pytest.fixture
 def mock_body_embeddings() -> Tuple[np.ndarray, List[Dict]]:
     """Fixture providing mock body embeddings."""
+    np.random.seed(0)
     return create_mock_embeddings(15, dim=256)

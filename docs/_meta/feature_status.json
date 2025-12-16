@@ -6,7 +6,7 @@
       "title": "Face Alignment",
       "status": "partial",
       "created": "2025-12-11",
-      "last_updated": "2025-12-13",
+      "last_updated": "2025-12-16",
       "integrated_in_jobs": [
         "harvest"
       ],
@@ -63,17 +63,23 @@
           "notes": "MVP alignment-quality gate implemented in faces_embed using deterministic heuristics from FAN landmarks (NOT a LUVLi model). Supports drop/downweight via face_alignment.quality_gate.*."
         },
         "C_3DDFA_V2": {
-          "status": "not_started",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
-          "enabled_by_default": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": true,
+          "enabled_by_default": true,
           "how_to_enable": {
-            "config_key": null,
+            "config_key": "config/pipeline/face_alignment.yaml:head_pose_3d.enabled",
             "ui_path": null,
             "cli_flag": null
           },
-          "evidence_paths": [],
-          "notes": "Planned only."
+          "evidence_paths": [
+            "tools/episode_run.py",
+            "py_screenalytics/face_alignment/head_pose.py",
+            "config/pipeline/face_alignment.yaml"
+          ],
+          "notes": "Selective head pose extraction runs inside faces_embed when enabled (every N frames and/or low-quality faces). MVP uses OpenCV solvePnP from FAN landmarks (NOT a 3DDFA model) and writes pose_yaw/pitch/roll into aligned_faces.jsonl and faces.jsonl."
         }
       },
       "docs": [
@@ -188,7 +194,7 @@
         "harvest"
       ],
       "integrated_in_autorun": true,
-      "enabled_by_default": false,
+      "enabled_by_default": true,
       "how_to_enable": {
         "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt",
         "ui_path": null,
@@ -207,7 +213,7 @@
             "harvest"
           ],
           "integrated_in_autorun": true,
-          "enabled_by_default": false,
+          "enabled_by_default": true,
           "how_to_enable": {
             "config_key": "config/pipeline/arcface_tensorrt.yaml",
             "ui_path": null,
@@ -225,7 +231,7 @@
             "harvest"
           ],
           "integrated_in_autorun": true,
-          "enabled_by_default": false,
+          "enabled_by_default": true,
           "how_to_enable": {
             "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt",
             "ui_path": null,
@@ -258,7 +264,7 @@
             "harvest"
           ],
           "integrated_in_autorun": true,
-          "enabled_by_default": false,
+          "enabled_by_default": true,
           "how_to_enable": {
             "config_key": "config/pipeline/embedding.yaml:embedding.backend=tensorrt",
             "ui_path": null,
