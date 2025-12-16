@@ -18,11 +18,11 @@ gate_enabled: true      # Enable appearance-based track splitting
 
 # T7: Softer appearance thresholds (prevent splits on temporary pose changes)
 # Appearance gate thresholds set via environment variables in episode_run.py:
-# - TRACK_GATE_APPEAR_HARD: default 0.65 (was 0.75) - hard split if similarity < 65%
-# - TRACK_GATE_APPEAR_SOFT: default 0.75 (was 0.82) - soft split if similarity < 75%
-# - TRACK_GATE_APPEAR_STREAK: default 3 (was 2) - consecutive low-sim frames before split
-# - TRACK_GATE_IOU: default 0.50 (was 0.40) - split if spatial jump (IoU < 50%)
-# - TRACK_GATE_EMB_EVERY: default 24 - extract embeddings every 24 frames (reduced from 10 for thermal performance)
+# - TRACK_GATE_APPEAR_HARD: default 0.70 - hard split if similarity < 70%
+# - TRACK_GATE_APPEAR_SOFT: default 0.78 - soft split if similarity < 78%
+# - TRACK_GATE_APPEAR_STREAK: default 2 - consecutive low-sim frames before split
+# - TRACK_GATE_IOU: default 0.55 - split if spatial jump (IoU < 55%)
+# - TRACK_GATE_EMB_EVERY: default 3 - extract embeddings every 3 frames for responsive appearance gating
 
 # T5: Global Motion Compensation (GMC) for camera pans/zooms
 # Set via SCREENALYTICS_GMC_METHOD environment variable (default: "sparseOptFlow")
