@@ -25,7 +25,7 @@ When navigating to Faces Review or Smart Suggestions:
 
 ## Export Run Debug Report
 
-The Debug/Export section generates a PDF report capturing the run's pipeline statistics, artifact status, and review state.
+The Debug/Export section generates a comprehensive PDF report capturing the run's pipeline configuration, statistics, artifact status, and actionable tuning suggestions.
 
 ### Endpoint
 
@@ -37,33 +37,73 @@ Returns: `application/pdf` - Screen Time Run Debug Report
 
 ### Report Sections
 
-The PDF report includes:
+The PDF report includes 12 sections plus an appendix:
 
-1. **Cover / Executive Summary**
-   - Episode ID, Run ID, Generated timestamp
-   - Total face/body tracks, clusters, fused identities, screen time gain
+**0. Run Inputs & Lineage**
+- Episode ID, Run ID, Git SHA, Generated timestamp
+- Video metadata (duration, frame rate, resolution if available)
+- Model versions (Face Detector, Tracker, Embedding, Body Detector, Re-ID)
 
-2. **Face Detect** - Detection counts, artifact size
+**1. Face Detect**
+- Detection counts
+- Configuration from `detection.yaml` (model_id, confidence_th, min_size, wide_shot_mode)
+- Artifacts with sizes and record counts
 
-3. **Face Track** - Track metrics (born, lost, ID switches, scene cuts)
+**2. Face Track**
+- Track metrics (born, lost, ID switches, forced splits, scene cuts)
+- **Diagnostic warnings** for alarming metrics (high forced splits, high ID switches)
+- Configuration from `tracking.yaml` (track_thresh, match_thresh, track_buffer)
+- Artifacts with sizes
 
-4. **Face Harvest / Embed** - Harvested faces, aligned faces, embedding file status
+**3. Face Harvest / Embed**
+- Harvested and aligned face counts
+- **Diagnostic warning** for low alignment rate
+- Configuration from `embedding.yaml` (backend, min_alignment_quality)
+- Artifacts with sizes and record counts
 
-5. **Body Detect** - Body detection counts
+**4. Body Detect**
+- Body detection counts
+- Configuration from `body_detection.yaml` (model, confidence_threshold, detect_every_n_frames)
+- Artifacts with sizes
 
-6. **Body Track** - Body track counts
+**5. Body Track**
+- Body track counts
+- Configuration from `body_detection.yaml → person_tracking` (tracker, thresholds, id_offset)
+- Artifacts with sizes
 
-7. **Track Fusion** - Face/body track counts, fused identity count
+**6. Track Fusion**
+- **Clarified metrics**: Face Tracks, Body Tracks, Total Tracked IDs (union), Actual Fused Pairs
+- Configuration from `track_fusion.yaml` (iou_threshold, reid_handoff settings)
+- Artifacts with sizes
 
-8. **Cluster** - Cluster statistics (count, faces, mixed tracks, low cohesion)
+**7. Cluster**
+- Cluster statistics (count, singleton fraction, mixed tracks, outlier tracks, low cohesion)
+- **Diagnostic warnings** for high singleton fraction or mixed tracks
+- Configuration from `clustering.yaml` (algorithm, distance metric, cluster_thresh, singleton_merge)
+- Artifacts with sizes and identity counts
 
-9. **Faces Review** - Assigned/locked identity counts (from DB)
+**8. Faces Review (DB State)**
+- Assigned identities, locked identities, unassigned counts
+- **DB error context** with impact explanation if DB unavailable
+- Data sources
 
-10. **Smart Suggestions** - Batch/suggestion counts, dismissed/applied counts (from DB)
+**9. Smart Suggestions**
+- Batch counts, suggestion counts, dismissed/applied/pending
+- Data sources
 
-11. **Screen Time Analyze** - Duration gains, face-only vs combined time
+**10. Screen Time Analyze**
+- **Screen Time Breakdown Table**: Face-only, Body-only, Combined Total, Gain from Body Tracking
+- Percentages and explanatory notes
+- Configuration from `screen_time_v2.yaml` (active preset, quality_min, gap_tolerance_s)
+- Artifacts with sizes
 
-12. **Appendix: Artifact Manifest** - Complete listing of all artifacts with status and size
+**11. What Likely Needs Tuning**
+- Heuristic-based suggestions derived from the metrics
+- Stage, Issue, Suggested Action format
+- Covers: Detection, Tracking, Embedding, Clustering, Body Tracking, Track Fusion, Screen Time
+
+**Appendix: Artifact Manifest**
+- Complete listing with: Filename, Status, Size, Record Count, Pipeline Stage
 
 ## Pipeline Jobs
 
