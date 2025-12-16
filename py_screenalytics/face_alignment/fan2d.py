@@ -185,6 +185,11 @@ def aligned_face_row(
     landmarks_68: Sequence[Sequence[float]] | None,
     alignment_quality: float | None,
     alignment_quality_source: str = "heuristic",
+    pose_yaw: float | None = None,
+    pose_pitch: float | None = None,
+    pose_roll: float | None = None,
+    pose_reprojection_error_px: float | None = None,
+    pose_source: str | None = None,
 ) -> dict[str, Any]:
     """Build a JSON-serializable aligned face row for `aligned_faces.jsonl`."""
     row: dict[str, Any] = {
@@ -199,6 +204,16 @@ def aligned_face_row(
     if alignment_quality is not None:
         row["alignment_quality"] = round(float(alignment_quality), 4)
         row["alignment_quality_source"] = alignment_quality_source
+    if pose_yaw is not None:
+        row["pose_yaw"] = round(float(pose_yaw), 3)
+    if pose_pitch is not None:
+        row["pose_pitch"] = round(float(pose_pitch), 3)
+    if pose_roll is not None:
+        row["pose_roll"] = round(float(pose_roll), 3)
+    if pose_reprojection_error_px is not None:
+        row["pose_reprojection_error_px"] = round(float(pose_reprojection_error_px), 3)
+    if pose_source is not None:
+        row["pose_source"] = str(pose_source)
     return row
 
 
