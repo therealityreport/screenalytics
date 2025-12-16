@@ -83,8 +83,8 @@ else:
                 [
                     str(doc.get("title") or ""),
                     str(doc.get("path") or ""),
-                    " ".join(doc.get("tags") or []),
-                    " ".join(doc.get("features") or []),
+                    " ".join(t for t in (doc.get("tags") or []) if isinstance(t, str)),
+                    " ".join(f for f in (doc.get("features") or []) if isinstance(f, str)),
                 ]
             ).lower()
             if query_norm not in haystack:
@@ -105,8 +105,8 @@ else:
             "type": d.get("type", ""),
             "last_updated": d.get("last_updated", ""),
             "path": d.get("path", ""),
-            "features": ", ".join(d.get("features") or []),
-            "ui_surfaces_expected": ", ".join(d.get("ui_surfaces_expected") or []),
+            "features": ", ".join(f for f in (d.get("features") or []) if isinstance(f, str)),
+            "ui_surfaces_expected": ", ".join(s for s in (d.get("ui_surfaces_expected") or []) if isinstance(s, str)),
         }
         for d in filtered_docs
     ]

@@ -385,5 +385,83 @@ Selected workflows (see `.github/workflows/` for the full list):
 
 ---
 
+## 12. Root Directory Contract
+
+### Canonical Root Items
+
+The repository root should contain ONLY these items:
+
+#### Required Files
+| File | Purpose |
+|------|---------|
+| `README.md` | Project overview and quickstart |
+| `SETUP.md` | Environment setup guide |
+| `CLAUDE.md` | Claude Code integration rules |
+| `AGENTS.md` | Agent behavior policy |
+| `ACCEPTANCE_MATRIX.md` | Quality gates reference |
+| `CONTRIBUTING.md` | Contribution guidelines |
+| `LICENSE` | Project license |
+| `CODEOWNERS` | GitHub code ownership |
+| `Makefile` | Build shortcuts (minimal) |
+| `.env.example` | Environment template |
+| `requirements.txt` | Python dependencies |
+| `pyproject.toml` | Python project config |
+
+#### Required Directories
+| Directory | Purpose |
+|-----------|---------|
+| `apps/` | Production applications (API, UI) |
+| `web/` | Next.js web application |
+| `config/` | All YAML/TOML configurations |
+| `docs/` | All documentation |
+| `tests/` | All test files |
+| `tools/` | CLI utilities and scripts |
+| `FEATURES/` | Experimental sandboxes |
+| `agents/` | Agent profiles and playbooks |
+| `data/` | Local data/manifests (gitignored) |
+| `db/` | Database migrations |
+| `infra/` | Docker and IaC |
+
+#### Hidden/System (OK at root)
+| Item | Purpose |
+|------|---------|
+| `.git/` | Git repository |
+| `.github/` | GitHub workflows |
+| `.claude/` | Claude Code config |
+| `.venv/` | Python virtualenv |
+| `.vscode/` | Editor settings |
+| `.gitignore` | Git ignore rules |
+| `.editorconfig` | Editor config |
+| `.python-version` | Python version |
+| `.pre-commit-config.yaml` | Pre-commit hooks |
+| `.streamlit/` | Streamlit config |
+
+### Prohibited at Root
+
+**Do NOT add to root:**
+- New markdown files (put in `docs/`)
+- Log files (gitignore or put in `data/`)
+- One-off scripts (put in `tools/`)
+- Experiment code (put in `FEATURES/`)
+- Config files (put in `config/`)
+- Random directories without clear purpose
+
+### Cleanup Candidates (Follow-up)
+
+Items currently at root that may need relocation:
+
+| Item | Issue | Suggested Action |
+|------|-------|------------------|
+| `*.log` files | Should not be committed | Add to `.gitignore` |
+| `configs/` | Duplicates `config/`? | Investigate and merge or remove |
+| `archive/` | Unclear purpose | Move to `docs/_archive/` or delete |
+| `artifacts/` | Unclear purpose | Move to `data/` or delete |
+| `packages/` | Listed in docs but may not exist | Verify status |
+| `mcps/` | Listed in docs but may not exist | Verify status |
+
+**Note:** These cleanups should be done carefully in a separate PR to avoid breaking references.
+
+---
+
 **Maintained by:** Screenalytics Engineering
 **Next Review:** Quarterly

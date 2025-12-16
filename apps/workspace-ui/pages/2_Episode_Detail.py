@@ -1267,7 +1267,7 @@ def _cached_episode_status(
     ep_id: str,
     cache_key: float,
     marker_mtimes: tuple,
-    run_id: str | None,
+    run_id: str | None = None,
 ) -> Dict[str, Any] | None:
     """Cache episode status API response with 10s TTL.
 
@@ -1275,6 +1275,7 @@ def _cached_episode_status(
         ep_id: Episode ID
         cache_key: Fetch token for manual cache busting
         marker_mtimes: Tuple of artifact mtimes to auto-invalidate cache (runs + manifests)
+        run_id: Optional attempt/run_id to scope status.
     """
     return helpers.get_episode_status(ep_id, run_id=run_id)
 
@@ -1720,9 +1721,19 @@ except requests.RequestException as exc:
     st.error(helpers.describe_error(f"{cfg['api_base']}/episodes/{ep_id}", exc))
     st.stop()
 
+status_cache_key = _status_cache_key(ep_id)
+status_ts_key = _status_timestamp_key(ep_id)
+fetch_token_key = _status_fetch_token_key(ep_id)
+mtimes_key = _status_mtimes_key(ep_id)
+force_refresh_key = _status_force_refresh_key(ep_id)
+force_refresh = bool(st.session_state.pop(force_refresh_key, False))
+fetch_token = st.session_state.get(fetch_token_key, 0)
+status_payload = st.session_state.get(status_cache_key)
+
 # Attempt selection (run_id-scoped pipeline artifacts).
 # Store selected attempt in session state; empty string means legacy/unscoped.
 _active_run_id_key = f"{ep_id}::active_run_id"
+_active_run_id_pending_key = f"{ep_id}::active_run_id_pending"
 _autorun_run_id_key = f"{ep_id}::autorun_run_id"
 _new_attempt_requested_key = f"{ep_id}::new_attempt_requested"
 _attempt_init_key = f"{ep_id}::attempt_selector_initialized"
@@ -1730,6 +1741,23 @@ if _active_run_id_key not in st.session_state:
     st.session_state[_active_run_id_key] = ""
 selected_attempt_raw = st.session_state.get(_active_run_id_key)
 selected_attempt = selected_attempt_raw.strip() if isinstance(selected_attempt_raw, str) else ""
+
+# Streamlit doesn't allow mutating the session_state for an instantiated widget key.
+# When other UI actions (e.g., Auto-Run) need to programmatically change the selected
+# attempt, they write the desired run_id to this pending key and trigger a rerun.
+_pending_attempt = st.session_state.pop(_active_run_id_pending_key, None)
+if isinstance(_pending_attempt, str) and _pending_attempt.strip():
+    selected_attempt = _pending_attempt.strip()
+    st.session_state[_active_run_id_key] = selected_attempt
+    st.session_state[_status_force_refresh_key(ep_id)] = True
+    st.session_state[_attempt_init_key] = True
+
+if st.session_state.pop(_new_attempt_requested_key, False):
+    selected_attempt = uuid.uuid4().hex
+    st.session_state[_active_run_id_key] = selected_attempt
+    st.session_state[_status_force_refresh_key(ep_id)] = True
+    st.session_state[_attempt_init_key] = True
+
 if not st.session_state.get(_attempt_init_key) and not selected_attempt:
     try:
         persisted_run_id = run_layout.read_active_run_id(ep_id)
@@ -1738,11 +1766,7 @@ if not st.session_state.get(_attempt_init_key) and not selected_attempt:
     if isinstance(persisted_run_id, str) and persisted_run_id.strip():
         selected_attempt = persisted_run_id.strip()
         st.session_state[_active_run_id_key] = selected_attempt
-    st.session_state[_attempt_init_key] = True
-if st.session_state.pop(_new_attempt_requested_key, False):
-    selected_attempt = uuid.uuid4().hex
-    st.session_state[_active_run_id_key] = selected_attempt
-    st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.session_state[_attempt_init_key] = True
 
 # Normalize/validate selected attempt (invalid values fall back to legacy).
 selected_attempt_run_id: str | None = None
@@ -1753,14 +1777,6 @@ if selected_attempt:
         st.session_state[_active_run_id_key] = ""
         selected_attempt_run_id = None
 
-status_cache_key = _status_cache_key(ep_id)
-status_ts_key = _status_timestamp_key(ep_id)
-fetch_token_key = _status_fetch_token_key(ep_id)
-mtimes_key = _status_mtimes_key(ep_id)
-force_refresh_key = _status_force_refresh_key(ep_id)
-force_refresh = bool(st.session_state.pop(force_refresh_key, False))
-fetch_token = st.session_state.get(fetch_token_key, 0)
-status_payload = st.session_state.get(status_cache_key)
 _manifests_root = get_path(ep_id, "detections").parent
 _runs_root = _manifests_root / "runs"
 _scoped_manifests_dir = (
@@ -1813,6 +1829,13 @@ else:
     cluster_phase_status = status_payload.get("cluster") or {}
 
 api_active_run_id = (status_payload or {}).get("active_run_id")
+if not st.session_state.get(_attempt_init_key) and not selected_attempt:
+    if isinstance(api_active_run_id, str) and api_active_run_id.strip():
+        st.session_state[_active_run_id_key] = api_active_run_id.strip()
+        st.session_state[_attempt_init_key] = True
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.rerun()
+    st.session_state[_attempt_init_key] = True
 
 prefixes = helpers.episode_artifact_prefixes(ep_id)
 bucket_name = cfg.get("bucket")
@@ -1822,7 +1845,7 @@ detections_path = manifests_dir / "detections.jsonl"
 faces_path = manifests_dir / "faces.jsonl"
 identities_path = manifests_dir / "identities.json"
 analytics_dir = (
-    run_layout.run_root(ep_id, selected_attempt_run_id) / "analytics"
+    manifests_dir / "analytics"
     if selected_attempt_run_id
     else helpers.DATA_ROOT / "analytics" / ep_id
 )
@@ -2253,9 +2276,15 @@ with st.expander("Pipeline Status", expanded=False):
             key=_active_run_id_key,
             format_func=_format_attempt,
             help="Scopes status/artifacts and any new Detect/Faces/Cluster runs to this attempt.",
+            disabled=job_running,
         )
     with attempt_col2:
-        if st.button("New attempt", key=f"{ep_id}::new_attempt_btn", use_container_width=True):
+        if st.button(
+            "New attempt",
+            key=f"{ep_id}::new_attempt_btn",
+            use_container_width=True,
+            disabled=job_running,
+        ):
             st.session_state[_new_attempt_requested_key] = True
             st.rerun()
 
@@ -2268,7 +2297,6 @@ with st.expander("Pipeline Status", expanded=False):
     if isinstance(api_active_run_id, str) and api_active_run_id.strip():
         if api_active_run_id.strip() != selected_attempt_label:
             st.caption(f"API active_run_id: `{api_active_run_id.strip()}`")
-
     coreml_available = status_payload.get("coreml_available") if status_payload else None
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
@@ -2874,11 +2902,52 @@ with st.container():
 
                 new_run_id = uuid.uuid4().hex
                 st.session_state[_autorun_run_id_key] = new_run_id
-                st.session_state[_active_run_id_key] = new_run_id
+                # Do not modify the attempt selector widget key after it is created.
+                # Instead, set a pending value that is applied at the top of the script
+                # on the next rerun.
+                st.session_state[_active_run_id_pending_key] = new_run_id
                 LOGGER.info("[AUTORUN] Starting new pipeline run_id=%s", new_run_id)
 
+                # Clear old manifest data to prevent stale data confusion
+                # Archive old run markers and clear status cache
                 _manifests_dir = helpers.DATA_ROOT / "manifests" / ep_id
                 _runs_dir = _manifests_dir / "runs"
+                archived_count = 0
+                manifest_archived = 0
+                if _runs_dir.exists():
+                    archive_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    for marker_file in ["detect_track.json", "faces_embed.json", "cluster.json"]:
+                        marker_path = _runs_dir / marker_file
+                        if marker_path.exists():
+                            try:
+                                archive_path = _runs_dir / f"{marker_file}.{archive_time}.bak"
+                                marker_path.rename(archive_path)
+                                archived_count += 1
+                                LOGGER.info("[AUTORUN] Archived old marker: %s -> %s", marker_file, archive_path.name)
+                            except OSError as e:
+                                LOGGER.warning("[AUTORUN] Failed to archive %s: %s", marker_file, e)
+                    # Archive manifest files as well to force a clean pipeline run
+                    manifest_files = [
+                        "detections.jsonl",
+                        "tracks.jsonl",
+                        "faces.jsonl",
+                        "identities.json",
+                        "track_metrics.json",
+                    ]
+                    for manifest_file in manifest_files:
+                        manifest_path = _manifests_dir / manifest_file
+                        if manifest_path.exists():
+                            try:
+                                archive_path = _manifests_dir / f"{manifest_file}.{archive_time}.bak"
+                                manifest_path.rename(archive_path)
+                                manifest_archived += 1
+                                LOGGER.info("[AUTORUN] Archived old manifest: %s -> %s", manifest_file, archive_path.name)
+                            except OSError as e:
+                                LOGGER.warning("[AUTORUN] Failed to archive manifest %s: %s", manifest_file, e)
+                if archived_count > 0:
+                    LOGGER.info("[AUTORUN] Archived %d old run markers", archived_count)
+                if manifest_archived > 0:
+                    LOGGER.info("[AUTORUN] Archived %d manifest files for clean auto-run start", manifest_archived)
 
                 # Record baseline mtimes to avoid promoting stale artifacts from prior runs
                 def _safe_mtime(path: Path) -> float:
@@ -3434,7 +3503,9 @@ with col_detect:
         job_payload["fps"] = fps_value
     mode_label = f"{detect_detector_label} + {detect_tracker_label}"
 
-    if autorun_active:
+    if selected_attempt_run_id:
+        job_payload["run_id"] = selected_attempt_run_id
+    elif autorun_active:
         autorun_run_id = st.session_state.get(_autorun_run_id_key)
         if isinstance(autorun_run_id, str) and autorun_run_id.strip():
             job_payload["run_id"] = autorun_run_id.strip()
@@ -4006,7 +4077,9 @@ with col_faces:
                 "jpeg_quality": int(faces_jpeg_quality),
                 "thumb_size": int(faces_thumb_size),
             }
-            if autorun_active:
+            if selected_attempt_run_id:
+                payload["run_id"] = selected_attempt_run_id
+            elif autorun_active:
                 autorun_run_id = st.session_state.get(_autorun_run_id_key)
                 if isinstance(autorun_run_id, str) and autorun_run_id.strip():
                     payload["run_id"] = autorun_run_id.strip()
@@ -4556,7 +4629,9 @@ with col_cluster:
                 "min_cluster_size": int(min_cluster_size_value),
                 "profile": profile_value,
             }
-            if autorun_active:
+            if selected_attempt_run_id:
+                payload["run_id"] = selected_attempt_run_id
+            elif autorun_active:
                 autorun_run_id = st.session_state.get(_autorun_run_id_key)
                 if isinstance(autorun_run_id, str) and autorun_run_id.strip():
                     payload["run_id"] = autorun_run_id.strip()
@@ -4717,11 +4792,10 @@ detections_key = f"{manifests_prefix}detections.jsonl" if manifests_prefix else 
 tracks_key = f"{manifests_prefix}tracks.jsonl" if manifests_prefix else None
 faces_key = f"{manifests_prefix}faces.jsonl" if manifests_prefix else None
 identities_key = f"{manifests_prefix}identities.json" if manifests_prefix else None
-_render_artifact_entry("Detections", get_path(ep_id, "detections"), "detections", detections_key)
-_render_artifact_entry("Tracks", get_path(ep_id, "tracks"), "tracks", tracks_key)
+_render_artifact_entry("Detections", detections_path, "detections", detections_key)
+_render_artifact_entry("Tracks", tracks_path, "tracks", tracks_key)
 _render_artifact_entry("Faces", faces_path, "faces", faces_key)
 _render_artifact_entry("Identities", identities_path, "identities", identities_key)
-analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
 _render_artifact_entry("Screentime (json)", analytics_dir / "screentime.json", "screentime_json")
 _render_artifact_entry("Screentime (csv)", analytics_dir / "screentime.csv", "screentime_csv")
 
@@ -4753,13 +4827,13 @@ def _read_json_artifact(path: Path, max_lines: int = 2000) -> tuple[str | None, 
 st.subheader("Debug: Raw JSON artifacts")
 artifact_groups = {
     "Detect / Faces / Tracks": [
-        get_path(ep_id, "detections"),
-        get_path(ep_id, "tracks"),
+        detections_path,
+        tracks_path,
         faces_path,
     ],
     "Cluster": [
         identities_path,
-        manifests_dir / "track_metrics.json",
+        _track_metrics_path,
     ],
     "Screentime": [
         analytics_dir / "screentime.json",
