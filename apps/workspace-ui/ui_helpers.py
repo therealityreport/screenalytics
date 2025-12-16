@@ -1835,10 +1835,12 @@ def fetch_trr_metadata(show_slug: str) -> Dict[str, Any]:
     }
 
 
-def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
+def _episode_status_payload(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any] | None:
     url = f"{_api_base()}/episodes/{ep_id}/status"
     try:
-        resp = requests.get(url, timeout=15)
+        run_id_value = run_id.strip() if isinstance(run_id, str) else ""
+        params = {"run_id": run_id_value} if run_id_value else None
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
     except requests.RequestException:
         return None
@@ -1849,8 +1851,8 @@ def _episode_status_payload(ep_id: str) -> Dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def get_episode_status(ep_id: str) -> Dict[str, Any] | None:
-    return _episode_status_payload(ep_id)
+def get_episode_status(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any] | None:
+    return _episode_status_payload(ep_id, run_id=run_id)
 
 
 def link_local(path: Path | str) -> str:
@@ -2974,17 +2976,31 @@ def _fetch_async_job_error(ep_id: str, phase: str) -> str | None:
     return None
 
 
-def _summary_from_status(ep_id: str, phase: str) -> Dict[str, Any] | None:
-    payload = _episode_status_payload(ep_id)
+def _summary_from_status(ep_id: str, phase: str, *, run_id: str | None = None) -> Dict[str, Any] | None:
+    payload = _episode_status_payload(ep_id, run_id=run_id)
     if not payload:
         return None
 
     # For detect_track, count files directly since status API doesn't include it
     if phase == "detect_track":
         from py_screenalytics.artifacts import get_path
+        from py_screenalytics import run_layout
 
-        det_path = get_path(ep_id, "detections")
-        track_path = get_path(ep_id, "tracks")
+        run_id_value = run_id.strip() if isinstance(run_id, str) else ""
+        run_id_norm: str | None = None
+        if run_id_value:
+            try:
+                run_id_norm = run_layout.normalize_run_id(run_id_value)
+            except ValueError:
+                run_id_norm = None
+
+        if run_id_norm:
+            manifests_dir = run_layout.run_root(ep_id, run_id_norm)
+            det_path = manifests_dir / "detections.jsonl"
+            track_path = manifests_dir / "tracks.jsonl"
+        else:
+            det_path = get_path(ep_id, "detections")
+            track_path = get_path(ep_id, "tracks")
         if det_path.exists() and track_path.exists():
             det_count = sum(1 for line in det_path.open("r", encoding="utf-8") if line.strip())
             track_count = sum(1 for line in track_path.open("r", encoding="utf-8") if line.strip())
