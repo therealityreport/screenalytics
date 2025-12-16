@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,28 +42,46 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(l2_normalize(a), l2_normalize(b)))
 
 
-def _manifests_dir(ep_id: str) -> Path:
+def _normalize_run_id(run_id: str | None) -> str | None:
+    if run_id is None:
+        return None
+    candidate = str(run_id).strip()
+    if not candidate:
+        return None
+    try:
+        return run_layout.normalize_run_id(candidate)
+    except ValueError:
+        return None
+
+
+def _manifests_dir(ep_id: str, *, run_id: str | None = None) -> Path:
+    run_id_norm = _normalize_run_id(run_id)
+    if run_id_norm:
+        return run_layout.run_root(ep_id, run_id_norm)
     return get_path(ep_id, "detections").parent
 
 
-def _faces_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "faces.jsonl"
+def _faces_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    return _manifests_dir(ep_id, run_id=run_id) / "faces.jsonl"
 
 
-def _tracks_path(ep_id: str) -> Path:
+def _tracks_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    run_id_norm = _normalize_run_id(run_id)
+    if run_id_norm:
+        return _manifests_dir(ep_id, run_id=run_id_norm) / "tracks.jsonl"
     return get_path(ep_id, "tracks")
 
 
-def _track_reps_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "track_reps.jsonl"
+def _track_reps_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    return _manifests_dir(ep_id, run_id=run_id) / "track_reps.jsonl"
 
 
-def _cluster_centroids_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "cluster_centroids.json"
+def _cluster_centroids_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    return _manifests_dir(ep_id, run_id=run_id) / "cluster_centroids.json"
 
 
-def _identities_path(ep_id: str) -> Path:
-    return _manifests_dir(ep_id) / "identities.json"
+def _identities_path(ep_id: str, *, run_id: str | None = None) -> Path:
+    return _manifests_dir(ep_id, run_id=run_id) / "identities.json"
 
 
 def _crops_root(ep_id: str) -> Path:
@@ -122,9 +141,9 @@ def _discover_crop_path(
     return None
 
 
-def _load_faces_for_track(ep_id: str, track_id: int) -> List[Dict[str, Any]]:
+def _load_faces_for_track(ep_id: str, track_id: int, *, run_id: str | None = None) -> List[Dict[str, Any]]:
     """Load all faces for a specific track."""
-    faces_path = _faces_path(ep_id)
+    faces_path = _faces_path(ep_id, run_id=run_id)
     if not faces_path.exists():
         return []
 
@@ -254,7 +273,7 @@ def compute_track_representative(
             "rep_low_quality": false  # true when had to fall back to low-quality frames
         }
     """
-    faces = _load_faces_for_track(ep_id, track_id)
+    faces = _load_faces_for_track(ep_id, track_id, run_id=run_id)
     if not faces:
         return None
 
@@ -458,7 +477,7 @@ def compute_all_track_reps(
         If return_stats is False: List of track rep dicts
         If return_stats is True: Dict with 'reps', 'tracks_processed', 'tracks_with_reps', 'tracks_skipped'
     """
-    tracks_path = _tracks_path(ep_id)
+    tracks_path = _tracks_path(ep_id, run_id=run_id)
     if not tracks_path.exists():
         LOGGER.warning(f"No tracks file found for {ep_id}")
         if return_stats:
@@ -500,9 +519,10 @@ def compute_all_track_reps(
     return track_reps
 
 
-def write_track_reps(ep_id: str, track_reps: List[Dict[str, Any]]) -> Path:
+def write_track_reps(ep_id: str, track_reps: List[Dict[str, Any]], *, run_id: str | None = None) -> Path:
     """Write track representatives to track_reps.jsonl."""
-    path = _track_reps_path(ep_id)
+    run_id_norm = _normalize_run_id(run_id)
+    path = _track_reps_path(ep_id, run_id=run_id_norm)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8") as f:
@@ -510,15 +530,27 @@ def write_track_reps(ep_id: str, track_reps: List[Dict[str, Any]]) -> Path:
             f.write(json.dumps(rep) + "\n")
 
     LOGGER.info(f"Wrote {len(track_reps)} track representatives to {path}")
+
+    # Backwards compatibility: keep legacy root copy in sync for UI/features that
+    # still read from data/manifests/{ep_id}/track_reps.jsonl.
+    if run_id_norm:
+        legacy_path = _track_reps_path(ep_id, run_id=None)
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
+        try:
+            shutil.copy2(path, tmp)
+            tmp.replace(legacy_path)
+        except OSError as exc:
+            LOGGER.warning("Failed to promote track reps to legacy path %s: %s", legacy_path, exc)
     return path
 
 
-def load_track_reps(ep_id: str) -> Dict[str, Dict[str, Any]]:
+def load_track_reps(ep_id: str, *, run_id: str | None = None) -> Dict[str, Dict[str, Any]]:
     """Load track representatives from track_reps.jsonl.
 
     Returns: Dict mapping track_id -> rep data
     """
-    path = _track_reps_path(ep_id)
+    path = _track_reps_path(ep_id, run_id=run_id)
     if not path.exists():
         return {}
 
@@ -540,7 +572,12 @@ def load_track_reps(ep_id: str) -> Dict[str, Dict[str, Any]]:
     return reps
 
 
-def compute_cluster_centroids(ep_id: str, track_reps: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+def compute_cluster_centroids(
+    ep_id: str,
+    track_reps: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    run_id: str | None = None,
+) -> Dict[str, Any]:
     """Compute cluster centroids from track representatives.
 
     Args:
@@ -558,14 +595,14 @@ def compute_cluster_centroids(ep_id: str, track_reps: Optional[Dict[str, Dict[st
         }
     """
     if track_reps is None:
-        track_reps = load_track_reps(ep_id)
+        track_reps = load_track_reps(ep_id, run_id=run_id)
 
     if not track_reps:
         LOGGER.warning(f"No track representatives found for {ep_id}")
         return {}
 
     # Load identities to get cluster assignments
-    identities_path = _identities_path(ep_id)
+    identities_path = _identities_path(ep_id, run_id=run_id)
     if not identities_path.exists():
         LOGGER.warning(f"No identities file found for {ep_id}")
         return {}
@@ -636,9 +673,10 @@ def compute_cluster_centroids(ep_id: str, track_reps: Optional[Dict[str, Dict[st
     return centroids
 
 
-def write_cluster_centroids(ep_id: str, centroids: Dict[str, Any]) -> Path:
+def write_cluster_centroids(ep_id: str, centroids: Dict[str, Any], *, run_id: str | None = None) -> Path:
     """Write cluster centroids to cluster_centroids.json."""
-    path = _cluster_centroids_path(ep_id)
+    run_id_norm = _normalize_run_id(run_id)
+    path = _cluster_centroids_path(ep_id, run_id=run_id_norm)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     output = {
@@ -649,15 +687,27 @@ def write_cluster_centroids(ep_id: str, centroids: Dict[str, Any]) -> Path:
 
     path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     LOGGER.info(f"Wrote {len(centroids)} cluster centroids to {path}")
+
+    # Backwards compatibility: keep legacy root copy in sync for UI/features that
+    # still read from data/manifests/{ep_id}/cluster_centroids.json.
+    if run_id_norm:
+        legacy_path = _cluster_centroids_path(ep_id, run_id=None)
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
+        try:
+            shutil.copy2(path, tmp)
+            tmp.replace(legacy_path)
+        except OSError as exc:
+            LOGGER.warning("Failed to promote cluster centroids to legacy path %s: %s", legacy_path, exc)
     return path
 
 
-def load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
+def load_cluster_centroids(ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
     """Load cluster centroids from cluster_centroids.json.
 
     For legacy formats, derives track lists from identities.json.
     """
-    path = _cluster_centroids_path(ep_id)
+    path = _cluster_centroids_path(ep_id, run_id=run_id)
     if not path.exists():
         LOGGER.warning(f"cluster_centroids.json does not exist for {ep_id}")
         return {}
@@ -673,7 +723,7 @@ def load_cluster_centroids(ep_id: str) -> Dict[str, Any]:
             # Load identities to get track_ids for each cluster
             from apps.api.services.identities import load_identities
 
-            identities_data = load_identities(ep_id)
+            identities_data = load_identities(ep_id, run_id=run_id)
             identity_tracks_map = {}
             for identity in identities_data.get("identities", []):
                 identity_id = identity.get("identity_id")
@@ -714,6 +764,8 @@ def build_cluster_track_reps(
     cluster_id: str,
     track_reps: Optional[Dict[str, Dict[str, Any]]] = None,
     cluster_centroids: Optional[Dict[str, Any]] = None,
+    *,
+    run_id: str | None = None,
 ) -> Dict[str, Any]:
     """Build track representatives with similarity scores for a cluster.
 
@@ -736,10 +788,10 @@ def build_cluster_track_reps(
         }
     """
     if track_reps is None:
-        track_reps = load_track_reps(ep_id)
+        track_reps = load_track_reps(ep_id, run_id=run_id)
 
     if cluster_centroids is None:
-        cluster_centroids = load_cluster_centroids(ep_id)
+        cluster_centroids = load_cluster_centroids(ep_id, run_id=run_id)
 
     cluster_data = cluster_centroids.get(cluster_id)
 
@@ -896,12 +948,12 @@ def generate_track_reps_and_centroids(ep_id: str, *, run_id: str | None = None) 
     track_reps_list = track_reps_result["reps"]
     track_reps_map = {rep["track_id"]: rep for rep in track_reps_list}
 
-    track_reps_path = write_track_reps(ep_id, track_reps_list)
+    track_reps_path = write_track_reps(ep_id, track_reps_list, run_id=run_id)
 
     LOGGER.info(f"Generating cluster centroids for {ep_id}")
-    centroids = compute_cluster_centroids(ep_id, track_reps_map)
+    centroids = compute_cluster_centroids(ep_id, track_reps_map, run_id=run_id)
 
-    centroids_path = write_cluster_centroids(ep_id, centroids)
+    centroids_path = write_cluster_centroids(ep_id, centroids, run_id=run_id)
 
     return {
         # Keys expected by run_refresh_similarity_task

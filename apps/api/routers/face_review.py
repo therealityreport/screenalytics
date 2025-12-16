@@ -75,6 +75,7 @@ def get_initial_unassigned_suggestions(
     ep_id: str,
     show_id: Optional[str] = Query(None, description="Show ID for people lookup"),
     limit: int = Query(20, description="Max suggestions to return"),
+    run_id: Optional[str] = Query(None, description="Optional run_id scope for artifacts/state"),
 ):
     """Get unassigned↔unassigned cluster pairs for initial post-cluster pass.
 
@@ -86,15 +87,22 @@ def get_initial_unassigned_suggestions(
             ep_id=ep_id,
             show_id=show_id,
             limit=limit,
+            run_id=run_id,
         )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to get initial suggestions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{ep_id}/face_review/decision/start")
-def process_decision(ep_id: str, request: DecisionRequest):
+def process_decision(
+    ep_id: str,
+    request: DecisionRequest,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+):
     """Process a user decision (merge/reject) for a face review comparison.
 
     Accepts decisions from the Improve Faces modal:
@@ -124,8 +132,11 @@ def process_decision(ep_id: str, request: DecisionRequest):
             person_id=request.person_id,
             cast_id=request.cast_id,
             show_id=show_id,
+            run_id=run_id,
         )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to process decision: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -136,6 +147,7 @@ def get_improve_faces_queue(
     ep_id: str,
     show_id: Optional[str] = Query(None, description="Show ID"),
     limit: int = Query(30, description="Max suggestions"),
+    run_id: Optional[str] = Query(None, description="Optional run_id scope for artifacts/state"),
 ):
     """Get mixed queue of suggestions for Improve Faces feature.
 
@@ -150,51 +162,68 @@ def get_improve_faces_queue(
             ep_id=ep_id,
             show_id=show_id,
             limit=limit,
+            run_id=run_id,
         )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to get improve faces queue: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{ep_id}/face_review/mark_initial_pass_done")
-def mark_initial_pass_done(ep_id: str):
+def mark_initial_pass_done(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+):
     """Mark the initial unassigned pass as complete.
 
     This prevents the initial suggestions from being shown again
     on subsequent visits to the Faces Review page.
     """
     try:
-        face_review_service.mark_initial_pass_done(ep_id)
+        face_review_service.mark_initial_pass_done(ep_id, run_id=run_id)
         return {"status": "success", "ep_id": ep_id}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to mark initial pass done: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{ep_id}/face_review/reset_initial_pass")
-def reset_initial_pass(ep_id: str):
+def reset_initial_pass(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+):
     """Reset the initial pass flag to allow re-running suggestions.
 
     Useful if the user wants to review initial suggestions again
     after previously completing them.
     """
     try:
-        face_review_service.reset_initial_pass(ep_id)
+        face_review_service.reset_initial_pass(ep_id, run_id=run_id)
         return {"status": "success", "ep_id": ep_id}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to reset initial pass: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{ep_id}/face_review/reset_state")
-def reset_face_review_state(ep_id: str, request: ResetFaceReviewStateRequest) -> dict:
+def reset_face_review_state(
+    ep_id: str,
+    request: ResetFaceReviewStateRequest,
+    run_id: str = Query(..., description="Run id scope (required for mutations)"),
+) -> dict:
     """Reset Improve Faces decisions and initial-pass state (explicit, user-controlled).
 
     By default, archives the prior state file so user intent is preserved and can be restored if needed.
     """
     try:
-        result = face_review_service.reset_state(ep_id, archive_existing=request.archive_existing)
+        result = face_review_service.reset_state(ep_id, run_id=run_id, archive_existing=request.archive_existing)
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error") or "Failed to reset face review state")
 
@@ -205,6 +234,8 @@ def reset_face_review_state(ep_id: str, request: ResetFaceReviewStateRequest) ->
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         LOGGER.error(f"[{ep_id}] Failed to reset face review state: {e}")
         raise HTTPException(status_code=500, detail=str(e))

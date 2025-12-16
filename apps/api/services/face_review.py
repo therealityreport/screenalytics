@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from py_screenalytics.artifacts import get_path
+from py_screenalytics import run_layout
 
 from apps.api.services.identities import (
     load_identities,
@@ -58,32 +59,40 @@ class FaceReviewService:
 
     def __init__(self):
         """Initialize the face review service."""
+        # Cache keyed by "ep_id::run_id" where run_id may be "legacy".
         self._cache: Dict[str, Dict[str, Any]] = {}
 
-    def _get_state_file_path(self, ep_id: str) -> Path:
-        """Get the path to the face review state file for an episode."""
+    @staticmethod
+    def _cache_key(ep_id: str, run_id: str | None) -> str:
+        return f"{ep_id}::{run_id or 'legacy'}"
+
+    def _get_state_file_path(self, ep_id: str, *, run_id: str | None = None) -> Path:
+        """Get the path to the face review state file for an episode/run."""
+        if run_id:
+            return run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id)) / "face_review_state.json"
         manifests_dir = get_path(ep_id, "detections").parent
         return manifests_dir / "face_review_state.json"
 
-    def _load_state(self, ep_id: str) -> Dict[str, Any]:
+    def _load_state(self, ep_id: str, *, run_id: str | None = None) -> Dict[str, Any]:
         """Load face review state from disk."""
-        if ep_id in self._cache:
-            return self._cache[ep_id]
+        key = self._cache_key(ep_id, run_id)
+        if key in self._cache:
+            return self._cache[key]
 
-        state_file = self._get_state_file_path(ep_id)
+        state_file = self._get_state_file_path(ep_id, run_id=run_id)
         if not state_file.exists():
             default_state = {
                 "initial_unassigned_pass_done": False,
                 "decisions": [],  # List of {pair_type, cluster_a, cluster_b, person_id, decision, timestamp}
                 "updated_at": None,
             }
-            self._cache[ep_id] = default_state
+            self._cache[key] = default_state
             return default_state
 
         try:
             with open(state_file, "r") as f:
                 data = json.load(f)
-                self._cache[ep_id] = data
+                self._cache[key] = data
                 return data
         except Exception as e:
             LOGGER.warning(f"[{ep_id}] Failed to load face review state: {e}")
@@ -92,51 +101,65 @@ class FaceReviewService:
                 "decisions": [],
                 "updated_at": None,
             }
-            self._cache[ep_id] = default_state
+            self._cache[key] = default_state
             return default_state
 
-    def _save_state(self, ep_id: str, state: Dict[str, Any]) -> bool:
+    def _save_state(self, ep_id: str, state: Dict[str, Any], *, run_id: str | None = None) -> bool:
         """Save face review state to disk."""
-        state_file = self._get_state_file_path(ep_id)
+        state_file = self._get_state_file_path(ep_id, run_id=run_id)
         try:
             state["updated_at"] = datetime.utcnow().isoformat()
+            if run_id:
+                state.setdefault("run_id", run_layout.normalize_run_id(run_id))
+            state_file.parent.mkdir(parents=True, exist_ok=True)
             with open(state_file, "w") as f:
                 json.dump(state, f, indent=2)
-            self._cache[ep_id] = state
+            self._cache[self._cache_key(ep_id, run_id)] = state
             return True
         except Exception as e:
             LOGGER.error(f"[{ep_id}] Failed to save face review state: {e}")
             return False
 
-    def _invalidate_cache(self, ep_id: str) -> None:
-        """Invalidate the cache for an episode."""
-        if ep_id in self._cache:
-            del self._cache[ep_id]
+    def _invalidate_cache(self, ep_id: str, *, run_id: str | None = None) -> None:
+        """Invalidate the cache for an episode/run."""
+        if run_id is None:
+            prefix = f"{ep_id}::"
+            for key in list(self._cache.keys()):
+                if key.startswith(prefix):
+                    self._cache.pop(key, None)
+            return
+        self._cache.pop(self._cache_key(ep_id, run_id), None)
 
-    def is_initial_pass_done(self, ep_id: str) -> bool:
+    def is_initial_pass_done(self, ep_id: str, *, run_id: str | None = None) -> bool:
         """Check if the initial unassigned↔unassigned pass has been completed."""
-        state = self._load_state(ep_id)
+        state = self._load_state(ep_id, run_id=run_id)
         return state.get("initial_unassigned_pass_done", False)
 
-    def mark_initial_pass_done(self, ep_id: str) -> bool:
+    def mark_initial_pass_done(self, ep_id: str, *, run_id: str | None = None) -> bool:
         """Mark the initial unassigned↔unassigned pass as completed."""
-        state = self._load_state(ep_id)
+        state = self._load_state(ep_id, run_id=run_id)
         state["initial_unassigned_pass_done"] = True
-        return self._save_state(ep_id, state)
+        return self._save_state(ep_id, state, run_id=run_id)
 
-    def reset_initial_pass(self, ep_id: str) -> bool:
+    def reset_initial_pass(self, ep_id: str, *, run_id: str | None = None) -> bool:
         """Reset the initial pass flag (allows re-running)."""
-        state = self._load_state(ep_id)
+        state = self._load_state(ep_id, run_id=run_id)
         state["initial_unassigned_pass_done"] = False
-        return self._save_state(ep_id, state)
+        return self._save_state(ep_id, state, run_id=run_id)
 
-    def reset_state(self, ep_id: str, *, archive_existing: bool = True) -> Dict[str, Any]:
-        """Reset face review state (decisions + initial pass) for an episode.
+    def reset_state(
+        self,
+        ep_id: str,
+        *,
+        run_id: str | None = None,
+        archive_existing: bool = True,
+    ) -> Dict[str, Any]:
+        """Reset face review state (decisions + initial pass) for an episode/run.
 
         The default behavior preserves user intent by archiving the existing state file
         before writing a fresh empty state.
         """
-        state_file = self._get_state_file_path(ep_id)
+        state_file = self._get_state_file_path(ep_id, run_id=run_id)
         archived_name: str | None = None
 
         if archive_existing and state_file.exists():
@@ -150,14 +173,14 @@ class FaceReviewService:
                 LOGGER.error("[%s] Failed to archive face review state: %s", ep_id, exc)
                 return {"ok": False, "error": f"Failed to archive existing face review state: {exc}"}
 
-        self._invalidate_cache(ep_id)
+        self._invalidate_cache(ep_id, run_id=run_id)
         default_state = {
             "initial_unassigned_pass_done": False,
             "decisions": [],
             "updated_at": None,
         }
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        if not self._save_state(ep_id, default_state):
+        if not self._save_state(ep_id, default_state, run_id=run_id):
             return {"ok": False, "error": "Failed to write face review state"}
 
         return {"ok": True, "archived": archived_name}
@@ -168,6 +191,7 @@ class FaceReviewService:
         cluster_a: str,
         cluster_b: Optional[str] = None,
         person_id: Optional[str] = None,
+        run_id: str | None = None,
     ) -> Optional[str]:
         """Get a previous decision for a pair.
 
@@ -180,7 +204,7 @@ class FaceReviewService:
         Returns:
             "yes", "no", or None if no decision exists
         """
-        state = self._load_state(ep_id)
+        state = self._load_state(ep_id, run_id=run_id)
         decisions = state.get("decisions", [])
 
         for decision in decisions:
@@ -210,6 +234,7 @@ class FaceReviewService:
         cluster_b: Optional[str] = None,
         person_id: Optional[str] = None,
         cast_id: Optional[str] = None,
+        run_id: str | None = None,
     ) -> bool:
         """Record a user decision for a face review comparison.
 
@@ -225,7 +250,7 @@ class FaceReviewService:
         Returns:
             True if successful
         """
-        state = self._load_state(ep_id)
+        state = self._load_state(ep_id, run_id=run_id)
         decisions = state.get("decisions", [])
 
         # Remove any existing decision for this pair (safely handles None values)
@@ -263,11 +288,11 @@ class FaceReviewService:
         decisions.append(new_decision)
         state["decisions"] = decisions
 
-        return self._save_state(ep_id, state)
+        return self._save_state(ep_id, state, run_id=run_id)
 
-    def get_all_decisions(self, ep_id: str) -> List[Dict[str, Any]]:
-        """Get all recorded decisions for an episode."""
-        state = self._load_state(ep_id)
+    def get_all_decisions(self, ep_id: str, *, run_id: str | None = None) -> List[Dict[str, Any]]:
+        """Get all recorded decisions for an episode/run."""
+        state = self._load_state(ep_id, run_id=run_id)
         return state.get("decisions", [])
 
     def _get_cluster_size(self, identity: Dict[str, Any]) -> Tuple[int, int]:
@@ -284,10 +309,11 @@ class FaceReviewService:
         cluster_a_id: str,
         cluster_b_id: str,
         centroids: Optional[Dict[str, Any]] = None,
+        run_id: str | None = None,
     ) -> float:
         """Compute cosine similarity between two cluster centroids."""
         if centroids is None:
-            centroids = load_cluster_centroids(ep_id)
+            centroids = load_cluster_centroids(ep_id, run_id=run_id)
 
         centroid_a = centroids.get(cluster_a_id, {}).get("centroid")
         centroid_b = centroids.get(cluster_b_id, {}).get("centroid")
@@ -321,6 +347,7 @@ class FaceReviewService:
         cluster_id: str,
         track_reps: Optional[Dict[str, Dict[str, Any]]] = None,
         centroids: Optional[Dict[str, Any]] = None,
+        run_id: str | None = None,
     ) -> Optional[str]:
         """Get the representative crop URL for a cluster (face closest to centroid).
 
@@ -328,7 +355,13 @@ class FaceReviewService:
         then returns the crop URL for that track's representative frame.
         """
         try:
-            cluster_data = build_cluster_track_reps(ep_id, cluster_id, track_reps, centroids)
+            cluster_data = build_cluster_track_reps(
+                ep_id,
+                cluster_id,
+                track_reps,
+                centroids,
+                run_id=run_id,
+            )
             tracks = cluster_data.get("tracks", [])
 
             if not tracks:
@@ -367,6 +400,8 @@ class FaceReviewService:
         ep_id: str,
         show_id: Optional[str] = None,
         limit: int = 20,
+        *,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         """Get cluster pairs for the initial post-cluster pass to reduce duplicates.
 
@@ -397,7 +432,7 @@ class FaceReviewService:
                 "total_candidates": N
             }
         """
-        state = self._load_state(ep_id)
+        state = self._load_state(ep_id, run_id=run_id)
 
         if state.get("initial_unassigned_pass_done"):
             return {
@@ -407,14 +442,13 @@ class FaceReviewService:
                 "total_candidates": 0,
             }
 
-        identities_data = load_identities(ep_id)
+        identities_data = load_identities(ep_id, run_id=run_id)
         identities = identities_data.get("identities", [])
 
         # Bug 12 fix: Handle missing centroid/track_reps files
-        try:
-            centroids = load_cluster_centroids(ep_id)
-        except FileNotFoundError:
-            LOGGER.warning(f"[{ep_id}] Centroids not computed yet, cannot generate suggestions")
+        centroids = load_cluster_centroids(ep_id, run_id=run_id)
+        if not centroids:
+            LOGGER.warning("[%s] Centroids not computed yet, cannot generate suggestions (run_id=%s)", ep_id, run_id or "legacy")
             return {
                 "ep_id": ep_id,
                 "initial_pass_done": False,
@@ -423,11 +457,7 @@ class FaceReviewService:
                 "error": "Centroids not computed yet. Run clustering first.",
             }
 
-        try:
-            track_reps = load_track_reps(ep_id)
-        except FileNotFoundError:
-            LOGGER.warning(f"[{ep_id}] Track reps not computed, using empty dict")
-            track_reps = {}
+        track_reps = load_track_reps(ep_id, run_id=run_id) or {}
 
         # Get ALL clusters with track_ids (both assigned and unassigned)
         # to find potential duplicates that should be merged
@@ -462,11 +492,11 @@ class FaceReviewService:
                     continue
 
                 # Skip if we already have a decision
-                if self.get_decision(ep_id, id_a, cluster_b=id_b):
+                if self.get_decision(ep_id, id_a, cluster_b=id_b, run_id=run_id):
                     continue
 
                 # Compute similarity
-                sim = self._compute_cluster_similarity(ep_id, id_a, id_b, centroids)
+                sim = self._compute_cluster_similarity(ep_id, id_a, id_b, centroids, run_id=run_id)
 
                 # Only suggest borderline pairs (between thresholds)
                 if MERGE_SIMILARITY_THRESHOLD <= sim < MERGE_SIMILARITY_UPPER:
@@ -500,13 +530,13 @@ class FaceReviewService:
                 "type": "merge",
                 "cluster_a": {
                     "id": id_a,
-                    "crop_url": self._get_representative_crop_url(ep_id, id_a, track_reps, centroids),
+                    "crop_url": self._get_representative_crop_url(ep_id, id_a, track_reps, centroids, run_id=run_id),
                     "tracks": size_a[0],
                     "faces": size_a[1],
                 },
                 "cluster_b": {
                     "id": id_b,
-                    "crop_url": self._get_representative_crop_url(ep_id, id_b, track_reps, centroids),
+                    "crop_url": self._get_representative_crop_url(ep_id, id_b, track_reps, centroids, run_id=run_id),
                     "tracks": size_b[0],
                     "faces": size_b[1],
                 },
@@ -527,6 +557,8 @@ class FaceReviewService:
         show_id: Optional[str] = None,
         limit: int = 30,
         progress_callback: Optional[callable] = None,
+        *,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         """Get mixed queue of suggestions for the Faces Review "Improve Faces" feature.
 
@@ -568,14 +600,13 @@ class FaceReviewService:
 
         _report_progress("loading", 0.05, "Loading identities and embeddings...")
 
-        identities_data = load_identities(ep_id)
+        identities_data = load_identities(ep_id, run_id=run_id)
         identities = identities_data.get("identities", [])
 
         # Bug 12 fix: Handle missing centroid/track_reps files
-        try:
-            centroids = load_cluster_centroids(ep_id)
-        except FileNotFoundError:
-            LOGGER.warning(f"[{ep_id}] Centroids not computed yet, cannot generate suggestions")
+        centroids = load_cluster_centroids(ep_id, run_id=run_id)
+        if not centroids:
+            LOGGER.warning("[%s] Centroids not computed yet, cannot generate suggestions (run_id=%s)", ep_id, run_id or "legacy")
             return {
                 "ep_id": ep_id,
                 "suggestions": [],
@@ -584,11 +615,7 @@ class FaceReviewService:
                 "error": "Centroids not computed yet. Run clustering first.",
             }
 
-        try:
-            track_reps = load_track_reps(ep_id)
-        except FileNotFoundError:
-            LOGGER.warning(f"[{ep_id}] Track reps not computed, using empty dict")
-            track_reps = {}
+        track_reps = load_track_reps(ep_id, run_id=run_id) or {}
 
         _report_progress("loading", 0.10, "Building cluster lookups...")
 
@@ -607,7 +634,7 @@ class FaceReviewService:
 
         # OPTIMIZATION 1: Pre-load ALL decisions once into a set for O(1) lookups
         _report_progress("loading", 0.15, "Loading previous decisions...")
-        all_decisions = self.get_all_decisions(ep_id)
+        all_decisions = self.get_all_decisions(ep_id, run_id=run_id)
         decided_cluster_pairs = set()  # (sorted tuple of cluster_a, cluster_b)
         decided_person_pairs = set()   # (cluster_a, person_id)
 
@@ -627,7 +654,7 @@ class FaceReviewService:
         def _get_cached_crop_url(cluster_id: str) -> Optional[str]:
             if cluster_id not in _crop_url_cache:
                 _crop_url_cache[cluster_id] = self._get_representative_crop_url(
-                    ep_id, cluster_id, track_reps, centroids
+                    ep_id, cluster_id, track_reps, centroids, run_id=run_id
                 )
             return _crop_url_cache[cluster_id]
 
@@ -667,7 +694,7 @@ class FaceReviewService:
                 if pair_key in decided_cluster_pairs:
                     continue
 
-                sim = self._compute_cluster_similarity(ep_id, id_a, id_b, centroids)
+                sim = self._compute_cluster_similarity(ep_id, id_a, id_b, centroids, run_id=run_id)
 
                 if sim >= MERGE_SIMILARITY_THRESHOLD:
                     unassigned_pair_count += 1
@@ -755,7 +782,7 @@ class FaceReviewService:
                 if (unassigned_id, person_id) in decided_person_pairs:
                     continue
 
-                sim = self._compute_cluster_similarity(ep_id, unassigned_id, assigned_id, centroids)
+                sim = self._compute_cluster_similarity(ep_id, unassigned_id, assigned_id, centroids, run_id=run_id)
 
                 if sim >= CAST_SUGGESTION_THRESHOLD and sim > best_sim:
                     person = people_by_id.get(person_id, {})
@@ -818,6 +845,8 @@ class FaceReviewService:
         suggestion_id: str,
         decision: str,
         show_id: Optional[str] = None,
+        *,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         """Process a decision using the suggestion ID format.
 
@@ -881,6 +910,7 @@ class FaceReviewService:
                 decision=internal_decision,
                 cluster_b_id=id_b,
                 show_id=show_id,
+                run_id=run_id,
             )
         elif suggestion_type == "assign":
             return self.process_decision(
@@ -890,6 +920,7 @@ class FaceReviewService:
                 decision=internal_decision,
                 person_id=id_b,
                 show_id=show_id,
+                run_id=run_id,
             )
         else:
             return {
@@ -908,6 +939,8 @@ class FaceReviewService:
         person_id: Optional[str] = None,
         cast_id: Optional[str] = None,
         show_id: Optional[str] = None,
+        *,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         """Process a user decision (yes/no) for a face review comparison.
 
@@ -944,6 +977,7 @@ class FaceReviewService:
             cluster_b=cluster_b_id,
             person_id=person_id,
             cast_id=cast_id,
+            run_id=run_id,
         )
 
         if decision == "no":
@@ -959,9 +993,9 @@ class FaceReviewService:
 
         # decision == "yes"
         if pair_type == "unassigned_unassigned" and cluster_b_id:
-            return self._merge_clusters(ep_id, cluster_a_id, cluster_b_id)
+            return self._merge_clusters(ep_id, cluster_a_id, cluster_b_id, run_id=run_id)
         elif pair_type == "unassigned_assigned" and person_id:
-            return self._assign_to_cast(ep_id, cluster_a_id, person_id, cast_id, show_id)
+            return self._assign_to_cast(ep_id, cluster_a_id, person_id, cast_id, show_id, run_id=run_id)
         else:
             return {
                 "status": "error",
@@ -974,6 +1008,8 @@ class FaceReviewService:
         ep_id: str,
         cluster_a_id: str,
         cluster_b_id: str,
+        *,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         """Merge two unassigned clusters (smaller into larger).
 
@@ -982,7 +1018,7 @@ class FaceReviewService:
         import time
         t0 = time.time()
         try:
-            identities_data = load_identities(ep_id)
+            identities_data = load_identities(ep_id, run_id=run_id)
             t1 = time.time()
             LOGGER.info(f"[{ep_id}] _merge_clusters: load_identities took {t1-t0:.3f}s")
             identities = identities_data.get("identities", [])
@@ -1008,7 +1044,7 @@ class FaceReviewService:
 
             # Perform merge
             t2 = time.time()
-            merged = merge_identities(ep_id, source_id=source_id, target_id=target_id)
+            merged = merge_identities(ep_id, source_id=source_id, target_id=target_id, run_id=run_id)
             t3 = time.time()
             LOGGER.info(f"[{ep_id}] _merge_clusters: merge_identities took {t3-t2:.3f}s, total {t3-t0:.3f}s")
             LOGGER.info(f"[{ep_id}] Merged cluster {source_id} into {target_id}")
@@ -1037,6 +1073,8 @@ class FaceReviewService:
         person_id: str,
         cast_id: Optional[str],
         show_id: Optional[str],
+        *,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         """Assign an unassigned cluster to a cast member.
 
@@ -1057,7 +1095,7 @@ class FaceReviewService:
                     LOGGER.warning(f"[{ep_id}] Could not validate person {person_id}: {e}")
                     # Continue anyway - the add_cluster_to_person call will fail if person doesn't exist
 
-            identities_data = load_identities(ep_id)
+            identities_data = load_identities(ep_id, run_id=run_id)
             identities = identities_data.get("identities", [])
 
             cluster = next((i for i in identities if i.get("identity_id") == cluster_id), None)
@@ -1081,13 +1119,13 @@ class FaceReviewService:
             }
 
             # Skip heavy stats update for quick operations - cluster count unchanged
-            identities_path = write_identities(ep_id, identities_data)
+            identities_path = write_identities(ep_id, identities_data, run_id=run_id)
 
             # Update the person's cluster_ids list BEFORE syncing to S3
             # This avoids a race condition where async upload could overwrite rollback data
             if show_id and person_id:
                 try:
-                    qualified_cluster_id = f"{ep_id}:{cluster_id}"
+                    qualified_cluster_id = f"{ep_id}:{run_layout.normalize_run_id(run_id)}:{cluster_id}" if run_id else f"{ep_id}:{cluster_id}"
                     PEOPLE_SERVICE.add_cluster_to_person(show_id, person_id, qualified_cluster_id)
                 except Exception as e:
                     # Rollback the identity assignment to maintain consistency
@@ -1095,7 +1133,7 @@ class FaceReviewService:
                     cluster["person_id"] = None
                     cluster.pop("cast_id", None)
                     manual_assignments.pop(cluster_id, None)
-                    write_identities(ep_id, identities_data)
+                    write_identities(ep_id, identities_data, run_id=run_id)
                     sync_manifests(ep_id, identities_path)
                     return {
                         "status": "error",
@@ -1111,7 +1149,7 @@ class FaceReviewService:
             # Auto-seed facebank with cluster centroid for future matching
             if cast_id and show_id:
                 try:
-                    self._auto_seed_facebank(ep_id, cluster_id, cast_id, show_id, cluster)
+                    self._auto_seed_facebank(ep_id, cluster_id, cast_id, show_id, cluster, run_id=run_id)
                 except Exception as seed_err:
                     # Don't fail the assignment if seeding fails - just log
                     LOGGER.warning(f"[{ep_id}] Auto-seed facebank failed for cluster {cluster_id}: {seed_err}")
@@ -1140,6 +1178,8 @@ class FaceReviewService:
         cast_id: str,
         show_id: str,
         cluster: Dict[str, Any],
+        *,
+        run_id: str | None = None,
     ) -> None:
         """Auto-seed facebank with cluster centroid when assigned to cast.
 
@@ -1154,10 +1194,9 @@ class FaceReviewService:
             cluster: Cluster identity data dict
         """
         # Load centroid embedding for this cluster
-        try:
-            centroids = load_cluster_centroids(ep_id)
-        except FileNotFoundError:
-            LOGGER.warning(f"[{ep_id}] No centroids file, skipping auto-seed for {cluster_id}")
+        centroids = load_cluster_centroids(ep_id, run_id=run_id)
+        if not centroids:
+            LOGGER.warning("[%s] No centroids file, skipping auto-seed for %s (run_id=%s)", ep_id, cluster_id, run_id or "legacy")
             return
 
         centroid_data = centroids.get(cluster_id)
@@ -1173,12 +1212,9 @@ class FaceReviewService:
         embedding = np.array(centroid_embedding, dtype=np.float32)
 
         # Get representative crop URL for this cluster
-        try:
-            track_reps = load_track_reps(ep_id)
-        except FileNotFoundError:
-            track_reps = {}
+        track_reps = load_track_reps(ep_id, run_id=run_id) or {}
 
-        crop_url = self._get_representative_crop_url(ep_id, cluster_id, track_reps, centroids)
+        crop_url = self._get_representative_crop_url(ep_id, cluster_id, track_reps, centroids, run_id=run_id)
 
         # Build quality info from cluster data
         quality = {

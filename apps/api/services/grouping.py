@@ -19,6 +19,7 @@ except ImportError:
     HAS_SKLEARN = False
 
 from py_screenalytics.artifacts import get_path
+from py_screenalytics import run_layout
 
 from apps.api.services.facebank import FacebankService, SEED_ATTACH_SIM
 from apps.api.services.cast import CastService
@@ -304,11 +305,24 @@ def _compute_group_centroid(
 class GroupingService:
     """Handle cluster centroid computation and grouping."""
 
-    def __init__(self, data_root: Path | str | None = None):
+    def __init__(self, data_root: Path | str | None = None, *, run_id: str | None = None):
         self.data_root = Path(data_root) if data_root else DEFAULT_DATA_ROOT
+        self.run_id = run_layout.normalize_run_id(run_id) if run_id else None
         self.people_service = PeopleService(data_root)
         self.facebank_service = FacebankService(data_root)
         self.cast_service = CastService(data_root)
+
+    def _qualified_cluster_id(self, ep_id: str, cluster_id: str) -> str:
+        """Stable cluster reference for PeopleService (avoids cross-run collisions)."""
+        if self.run_id:
+            return f"{ep_id}:{self.run_id}:{cluster_id}"
+        return f"{ep_id}:{cluster_id}"
+
+    def _manifests_dir(self, ep_id: str) -> Path:
+        """Resolve manifests directory for this service instance's run scope."""
+        if self.run_id:
+            return run_layout.run_root(ep_id, self.run_id)
+        return get_path(ep_id, "detections").parent
 
     def _get_best_skipped_face(
         self,
@@ -402,10 +416,18 @@ class GroupingService:
 
         # Try to load crop and generate embedding
         try:
-            from py_screenalytics.artifacts import get_path
+            frames_root = get_path(ep_id, "frames_root")
+            crop_path = None
+            candidate_roots: list[Path] = []
+            if self.run_id:
+                candidate_roots.append(frames_root / "runs" / self.run_id)
+            candidate_roots.append(frames_root)
 
-            crops_root = get_path(ep_id, "crops")
-            crop_path = crops_root.parent / crop_rel_path if crops_root else None
+            for root in candidate_roots:
+                candidate = root / crop_rel_path
+                if candidate.exists():
+                    crop_path = candidate
+                    break
 
             if crop_path and crop_path.exists():
                 import cv2
@@ -659,33 +681,27 @@ class GroupingService:
 
     def _cluster_centroids_path(self, ep_id: str) -> Path:
         """Get path to cluster_centroids.json for an episode."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "cluster_centroids.json"
+        return self._manifests_dir(ep_id) / "cluster_centroids.json"
 
     def _identities_path(self, ep_id: str) -> Path:
         """Get path to identities.json for an episode."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "identities.json"
+        return self._manifests_dir(ep_id) / "identities.json"
 
     def _faces_path(self, ep_id: str) -> Path:
         """Get path to faces.jsonl for an episode."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "faces.jsonl"
+        return self._manifests_dir(ep_id) / "faces.jsonl"
 
     def _tracks_path(self, ep_id: str) -> Path:
         """Get path to tracks.jsonl for an episode."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "tracks.jsonl"
+        return self._manifests_dir(ep_id) / "tracks.jsonl"
 
     def _group_log_path(self, ep_id: str) -> Path:
         """Get path to group_log.json for an episode."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "group_log.json"
+        return self._manifests_dir(ep_id) / "group_log.json"
 
     def _group_progress_path(self, ep_id: str) -> Path:
         """Get path to group_progress.json for in-flight progress."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "group_progress.json"
+        return self._manifests_dir(ep_id) / "group_progress.json"
 
     def _write_progress(
         self,
@@ -704,6 +720,8 @@ class GroupingService:
             "finished": finished,
             "entries": entries,
         }
+        if self.run_id:
+            payload["run_id"] = self.run_id
         if error:
             payload["error"] = error
         path = self._group_progress_path(ep_id)
@@ -1434,7 +1452,7 @@ class GroupingService:
 
                     if auto_assign:
                         # Assign to existing person
-                        full_cluster_id = f"{ep_id}:{cluster_id}"
+                        full_cluster_id = self._qualified_cluster_id(ep_id, cluster_id)
                         self.people_service.add_cluster_to_person(
                             show_id,
                             person_id,
@@ -1468,7 +1486,7 @@ class GroupingService:
                 else:
                     if auto_assign:
                         # Create new person with the cluster's seed_cast_id if available
-                        full_cluster_id = f"{ep_id}:{cluster_id}"
+                        full_cluster_id = self._qualified_cluster_id(ep_id, cluster_id)
                         person = self.people_service.create_person(
                             show_id,
                             prototype=centroid.tolist(),
@@ -2201,7 +2219,7 @@ class GroupingService:
                 self.people_service.add_cluster_to_person(
                     show_id,
                     base_person,
-                    f"{ep_id}:{cid}",
+                    self._qualified_cluster_id(ep_id, cid),
                     update_prototype=False,  # Don't use momentum - we set prototype directly
                     cluster_centroid=None,
                 )
@@ -2281,6 +2299,8 @@ class GroupingService:
 
     def _save_group_log(self, ep_id: str, log: Dict[str, Any]) -> None:
         """Save grouping audit log."""
+        if self.run_id:
+            log.setdefault("run_id", self.run_id)
         log_path = self._group_log_path(ep_id)
         log_path.write_text(json.dumps(log, indent=2), encoding="utf-8")
 
@@ -2337,7 +2357,7 @@ class GroupingService:
             person = self.people_service.create_person(
                 show_id,
                 prototype=proto.tolist(),
-                cluster_ids=[f"{ep_id}:{cid}" for cid in cluster_ids],
+                cluster_ids=[self._qualified_cluster_id(ep_id, cid) for cid in cluster_ids],
                 cast_id=cast_id,
                 name=name,
             )
@@ -2356,7 +2376,7 @@ class GroupingService:
                     },
                 )
             for cluster_id in cluster_ids:
-                full_cluster_id = f"{ep_id}:{cluster_id}"
+                full_cluster_id = self._qualified_cluster_id(ep_id, cluster_id)
                 centroid = centroids_map.get(cluster_id)
                 self.people_service.add_cluster_to_person(
                     show_id,
@@ -2469,7 +2489,7 @@ class GroupingService:
                     target_person = self.people_service.create_person(
                         show_id,
                         prototype=proto.tolist(),
-                        cluster_ids=[f"{ep_id}:{cid}" for cid in cluster_ids],
+                        cluster_ids=[self._qualified_cluster_id(ep_id, cid) for cid in cluster_ids],
                         cast_id=cast_id,
                         name=cast_member.get("name"),
                     )
@@ -2477,7 +2497,7 @@ class GroupingService:
                 else:
                     # Add clusters to existing person
                     for cluster_id in cluster_ids:
-                        full_cluster_id = f"{ep_id}:{cluster_id}"
+                        full_cluster_id = self._qualified_cluster_id(ep_id, cluster_id)
                         centroid = centroids_map.get(cluster_id)
                         self.people_service.add_cluster_to_person(
                             show_id,
@@ -2574,7 +2594,7 @@ class GroupingService:
                 cast_person_map[cast_id] = person
 
             person_id = person["person_id"]
-            full_cluster_id = f"{ep_id}:{cluster_id}"
+            full_cluster_id = self._qualified_cluster_id(ep_id, cluster_id)
             updated = self.people_service.add_cluster_to_person(
                 show_id,
                 person_id,
@@ -3805,7 +3825,7 @@ class GroupingService:
 
         # Load track data for face count fallback (track_id -> faces_count)
         tracks_by_id: Dict[int, int] = {}
-        tracks_path = get_path(ep_id, "tracks")
+        tracks_path = self._tracks_path(ep_id)
         if tracks_path.exists():
             try:
                 with tracks_path.open("r", encoding="utf-8") as f:
@@ -3921,7 +3941,7 @@ class GroupingService:
                 continue
 
             # Ensure this cluster is in the person's cluster list
-            full_cluster_id = f"{ep_id}:{cluster_id}"
+            full_cluster_id = self._qualified_cluster_id(ep_id, cluster_id)
             centroid = centroids_map.get(cluster_id)
 
             # Add to person (this is idempotent - won't duplicate if already there)
@@ -3943,8 +3963,7 @@ class GroupingService:
 
     def _undo_stack_path(self, ep_id: str) -> Path:
         """Get path to undo stack file for an episode."""
-        manifests_dir = get_path(ep_id, "detections").parent
-        return manifests_dir / "undo_stack.json"
+        return self._manifests_dir(ep_id) / "undo_stack.json"
 
     def _load_undo_stack(self, ep_id: str) -> List[Dict[str, Any]]:
         """Load the undo stack for an episode."""
@@ -4621,7 +4640,7 @@ class GroupingService:
             person = self.people_service.create_person(
                 show_id,
                 prototype=merged_centroid.tolist(),
-                cluster_ids=[f"{ep_id}:{cid}" for cid in cluster_ids],
+                cluster_ids=[self._qualified_cluster_id(ep_id, cid) for cid in cluster_ids],
             )
             target_person_id = person["person_id"]
 
@@ -4649,7 +4668,7 @@ class GroupingService:
 
         # Add all clusters to person
         for cid in cluster_ids:
-            full_cid = f"{ep_id}:{cid}"
+            full_cid = self._qualified_cluster_id(ep_id, cid)
             centroid = centroids_map.get(cid, {}).get("centroid")
             self.people_service.add_cluster_to_person(
                 show_id,

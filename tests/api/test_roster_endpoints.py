@@ -40,9 +40,10 @@ def test_roster_add_and_get(monkeypatch):
 def test_identity_name_assign_adds_to_roster(tmp_path, monkeypatch):
     client = TestClient(app)
     ep_id = "demo-s01e01"
+    run_id = "attempt-1"
     ensure_dirs(ep_id)
     manifests_dir = get_path(ep_id, "detections").parent
-    identities_path = manifests_dir / "identities.json"
+    identities_path = manifests_dir / "runs" / run_id / "identities.json"
     identities_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "ep_id": ep_id,
@@ -53,6 +54,7 @@ def test_identity_name_assign_adds_to_roster(tmp_path, monkeypatch):
 
     resp = client.post(
         f"/episodes/{ep_id}/identities/id_0001/name",
+        params={"run_id": run_id},
         json={"name": "Lisa Vanderpump", "show": "demo"},
     )
     assert resp.status_code == 200

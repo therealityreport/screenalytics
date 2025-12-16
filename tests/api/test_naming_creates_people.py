@@ -26,7 +26,7 @@ def test_persist_identity_name_creates_people_record():
     assert ".lower()" in content, "Should do case-insensitive name matching"
 
     # Check that cluster_id includes episode prefix
-    assert 'cluster_id_with_prefix = f"{ep_id}:{identity_id}"' in content, "Should prefix cluster_id with episode"
+    assert "_qualified_cluster_ref(ep_id, identity_id" in content, "Should prefix cluster_id with episode (and run_id when provided)"
 
     print("✓ _persist_identity_name creates/updates People records")
 
