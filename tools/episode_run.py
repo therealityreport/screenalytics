@@ -6594,6 +6594,47 @@ def _load_alignment_quality_index(manifest_dir: Path) -> Dict[Tuple[int, int], f
     return index
 
 
+def _load_alignment_landmarks_index(aligned_faces_path: Path) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Load 68-point landmarks + quality from aligned_faces.jsonl for reuse in faces_embed."""
+    if not aligned_faces_path.exists():
+        return {}
+
+    index: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    try:
+        with open(aligned_faces_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                track_id = data.get("track_id")
+                frame_idx = data.get("frame_idx")
+                if track_id is None or frame_idx is None:
+                    continue
+                key = (int(track_id), int(frame_idx))
+                entry: Dict[str, Any] = {}
+                landmarks_68 = data.get("landmarks_68")
+                if isinstance(landmarks_68, list) and landmarks_68:
+                    entry["landmarks_68"] = landmarks_68
+                alignment_quality = data.get("alignment_quality")
+                if alignment_quality is not None:
+                    try:
+                        entry["alignment_quality"] = float(alignment_quality)
+                    except (TypeError, ValueError):
+                        pass
+                alignment_quality_source = data.get("alignment_quality_source")
+                if isinstance(alignment_quality_source, str) and alignment_quality_source.strip():
+                    entry["alignment_quality_source"] = alignment_quality_source.strip()
+                if entry:
+                    index[key] = entry
+    except Exception as exc:
+        LOGGER.warning("Failed to load aligned_faces.jsonl: %s", exc)
+        return {}
+
+    if index:
+        LOGGER.info("Loaded %d aligned face rows from %s", len(index), aligned_faces_path)
+    return index
+
+
 def _run_faces_embed_stage(
     args: argparse.Namespace,
     storage: StorageService | None,
@@ -6639,6 +6680,12 @@ def _run_faces_embed_stage(
     # Load alignment quality gating config and data
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     alignment_config = _load_alignment_config()
+    alignment_run_enabled = bool(alignment_config.get("face_alignment", {}).get("enabled", False))
+    alignment_output_cfg = alignment_config.get("face_alignment", {}).get("output", {}) if isinstance(
+        alignment_config.get("face_alignment"), dict
+    ) else {}
+    alignment_crop_size = int(alignment_output_cfg.get("crop_size") or 112)
+    alignment_crop_margin = float(alignment_output_cfg.get("crop_margin") or 0.0)
     alignment_gating_enabled = (
         alignment_config.get("quality", {}).get("enabled", False)
         or embedding_config.get("face_alignment", {}).get("use_for_embedding", False)
@@ -6731,6 +6778,24 @@ def _run_faces_embed_stage(
 
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
+    aligned_faces_dir = manifests_dir / "face_alignment"
+    aligned_faces_path = aligned_faces_dir / "aligned_faces.jsonl"
+    aligned_faces_tmp_path = aligned_faces_dir / "aligned_faces.jsonl.tmp"
+    aligned_faces_handle = None
+    alignment_landmarks_index: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    alignment_written_keys: set[Tuple[int, int]] = set()
+    alignment_used_count = 0
+    alignment_failed_count = 0
+    fan2d_mod = None
+    fan_aligner = None
+    if alignment_run_enabled:
+        aligned_faces_dir.mkdir(parents=True, exist_ok=True)
+        alignment_landmarks_index = _load_alignment_landmarks_index(aligned_faces_path)
+        try:
+            aligned_faces_handle = open(aligned_faces_tmp_path, "w", encoding="utf-8")
+        except OSError as exc:
+            LOGGER.warning("Unable to write aligned_faces.jsonl (%s); continuing without artifact output", exc)
+            aligned_faces_handle = None
     video_path = get_path(args.ep_id, "video")
     frame_decoder: FrameDecoder | None = None
     track_embeddings: Dict[int, List[TrackEmbeddingSample]] = defaultdict(list)
@@ -6749,6 +6814,7 @@ def _run_faces_embed_stage(
 
     faces_done = 0
     started_at = _utcnow_iso()
+    faces_embed_succeeded = False
     try:
         progress.emit(
             0,
@@ -6925,6 +6991,147 @@ def _run_faces_embed_stage(
                     faces_done = min(faces_total, faces_done + 1)
                     continue
 
+                alignment_used = False
+                alignment_quality_score: float | None = None
+                alignment_quality_source: str | None = None
+                alignment_source: str | None = None
+                if alignment_run_enabled:
+                    face_alignment_cfg = alignment_config.get("face_alignment", {}) if isinstance(
+                        alignment_config.get("face_alignment"), dict
+                    ) else {}
+                    processing_cfg = face_alignment_cfg.get("processing", {}) if isinstance(
+                        face_alignment_cfg.get("processing"), dict
+                    ) else {}
+                    model_cfg = face_alignment_cfg.get("model", {}) if isinstance(
+                        face_alignment_cfg.get("model"), dict
+                    ) else {}
+                    quality_cfg = face_alignment_cfg.get("quality", {}) if isinstance(
+                        face_alignment_cfg.get("quality"), dict
+                    ) else {}
+                    key = (int(track_id), int(frame_idx))
+                    cached = alignment_landmarks_index.get(key)
+                    landmarks_68 = None
+                    if isinstance(cached, dict) and cached.get("landmarks_68") is not None:
+                        if fan2d_mod is None:
+                            try:
+                                from py_screenalytics.face_alignment import fan2d as _fan2d  # type: ignore
+
+                                fan2d_mod = _fan2d
+                            except Exception as exc:
+                                LOGGER.warning("Face alignment enabled but fan2d module unavailable: %s", exc)
+                                fan2d_mod = False
+                        if fan2d_mod:
+                            landmarks_68 = fan2d_mod.coerce_landmarks_68(cached.get("landmarks_68"))
+                        if landmarks_68 is not None:
+                            alignment_source = "aligned_faces"
+                            alignment_quality_source = str(cached.get("alignment_quality_source") or "heuristic")
+                            aq_cached = cached.get("alignment_quality")
+                            if aq_cached is not None:
+                                try:
+                                    alignment_quality_score = float(aq_cached)
+                                except (TypeError, ValueError):
+                                    alignment_quality_score = None
+                    if landmarks_68 is None:
+                        if fan2d_mod is None:
+                            try:
+                                from py_screenalytics.face_alignment import fan2d as _fan2d  # type: ignore
+
+                                fan2d_mod = _fan2d
+                            except Exception as exc:
+                                LOGGER.warning("Face alignment enabled but fan2d module unavailable: %s", exc)
+                                fan2d_mod = False
+                        if fan2d_mod:
+                            if fan_aligner is None:
+                                fan_aligner = fan2d_mod.Fan2dAligner(
+                                    landmarks_type=str(model_cfg.get("landmarks_type", "2D")),
+                                    device=str(processing_cfg.get("device", "auto")),
+                                    flip_input=bool(model_cfg.get("flip_input", False)),
+                                )
+                            try:
+                                landmarks_68 = fan_aligner.align_face(image, validated_bbox)
+                            except Exception as exc:
+                                alignment_failed_count += 1
+                                landmarks_68 = None
+                                if alignment_failed_count <= 3:
+                                    LOGGER.warning("FAN alignment failed for track=%s frame=%s: %s", track_id, frame_idx, exc)
+                            if landmarks_68 is not None:
+                                alignment_source = "fan2d"
+                                alignment_quality_source = "heuristic"
+                                try:
+                                    alignment_quality_score = fan2d_mod.compute_alignment_quality(
+                                        validated_bbox,
+                                        landmarks_68,
+                                        min_face_size=int(quality_cfg.get("min_face_size", 20)),
+                                    )
+                                except Exception:
+                                    alignment_quality_score = None
+                                alignment_landmarks_index[key] = {
+                                    "landmarks_68": landmarks_68,
+                                    "alignment_quality": alignment_quality_score,
+                                    "alignment_quality_source": alignment_quality_source,
+                                }
+                    if landmarks_68 is not None:
+                        if aligned_faces_handle and key not in alignment_written_keys:
+                            try:
+                                aligned_faces_handle.write(
+                                    json.dumps(
+                                        fan2d_mod.aligned_face_row(
+                                            track_id=track_id,
+                                            frame_idx=frame_idx,
+                                            bbox_xyxy=validated_bbox,
+                                            confidence=conf,
+                                            landmarks_68=landmarks_68,
+                                            alignment_quality=alignment_quality_score,
+                                            alignment_quality_source=alignment_quality_source or "heuristic",
+                                        )
+                                    )
+                                    + "\n"
+                                )
+                                alignment_written_keys.add(key)
+                            except Exception:
+                                pass
+
+                        if alignment_gating_enabled and alignment_quality_score is not None and alignment_quality_score < min_alignment_quality:
+                            rows.append(
+                                _make_skip_face_row(
+                                    args.ep_id,
+                                    track_id,
+                                    frame_idx,
+                                    ts_val,
+                                    bbox,
+                                    detector_choice,
+                                    f"low_alignment_quality:{alignment_quality_score:.3f}",
+                                    crop_rel_path=crop_rel_path,
+                                    crop_s3_key=crop_s3_key,
+                                    thumb_rel_path=None,
+                                    thumb_s3_key=None,
+                                )
+                            )
+                            skipped_alignment_quality += 1
+                            faces_done = min(faces_total, faces_done + 1)
+                            continue
+
+                        if fan2d_mod and alignment_source in {"fan2d", "aligned_faces"}:
+                            try:
+                                crop = fan2d_mod.align_face_crop(
+                                    image,
+                                    landmarks_68,
+                                    crop_size=alignment_crop_size,
+                                    margin=alignment_crop_margin,
+                                )
+                                alignment_used = True
+                                alignment_used_count += 1
+                            except Exception as exc:
+                                alignment_failed_count += 1
+                                if alignment_failed_count <= 3:
+                                    LOGGER.warning(
+                                        "Aligned crop failed for track=%s frame=%s (source=%s): %s",
+                                        track_id,
+                                        frame_idx,
+                                        alignment_source,
+                                        exc,
+                                    )
+
                 crop_std = float(np.std(crop))
                 blur_score = _estimate_blur_score(crop)
                 skip_reason: str | None = None
@@ -6991,6 +7198,9 @@ def _run_faces_embed_stage(
                     "bbox": bbox,
                     "validated_bbox": validated_bbox,
                     "landmarks": landmarks,
+                    "alignment_used": alignment_used,
+                    "alignment_source": alignment_source,
+                    "alignment_quality": alignment_quality_score,
                     "crop_rel_path": crop_rel_path,
                     "crop_s3_key": crop_s3_key,
                     "thumb_rel_path": thumb_rel_path,
@@ -7083,6 +7293,16 @@ def _run_faces_embed_stage(
                         face_row["thumb_s3_key"] = meta["thumb_s3_key"]
                     if meta["landmarks"]:
                         face_row["landmarks"] = [round(float(val), 4) for val in meta["landmarks"]]
+                    if meta.get("alignment_used"):
+                        face_row["alignment_used"] = True
+                        if meta.get("alignment_source"):
+                            face_row["alignment_source"] = str(meta["alignment_source"])
+                        aq_val = meta.get("alignment_quality")
+                        if aq_val is not None:
+                            try:
+                                face_row["alignment_quality"] = round(float(aq_val), 4)
+                            except (TypeError, ValueError):
+                                pass
                     if seed_cast_id:
                         face_row["seed_cast_id"] = seed_cast_id
                         face_row["seed_similarity"] = round(float(seed_similarity), 4)
@@ -7179,10 +7399,15 @@ def _run_faces_embed_stage(
                     "crops_dir": (str(exporter.crops_dir) if exporter and exporter.save_crops else None),
                     "thumbs_dir": str(thumb_writer.root_dir),
                     "faces_embeddings": str(embed_path),
+                    "aligned_faces": (str(aligned_faces_path) if alignment_run_enabled else None),
                 },
                 "s3_prefixes": s3_prefixes,
             },
-            "stats": {"faces": len(rows), "embedding_model": embedding_model_name},
+            "stats": {
+                "faces": len(rows),
+                "embedding_model": embedding_model_name,
+                "alignment_used": (alignment_used_count if alignment_run_enabled else 0),
+            },
             "coherence": coherence_result.get("coherence_stats", {}),
         }
         # Add mixed tracks if any were found
@@ -7267,6 +7492,7 @@ def _run_faces_embed_stage(
                 "skip_rate": skipped_alignment_quality / max(faces_total, 1),
             }
 
+        faces_embed_succeeded = True
         return summary
     except Exception as exc:
         progress.fail(str(exc))
@@ -7276,6 +7502,21 @@ def _run_faces_embed_stage(
             frame_decoder.close()
         if debug_logger_obj:
             debug_logger_obj.close()
+        if aligned_faces_handle:
+            try:
+                aligned_faces_handle.close()
+            except Exception:
+                pass
+            if faces_embed_succeeded:
+                try:
+                    aligned_faces_tmp_path.replace(aligned_faces_path)
+                except Exception as exc:
+                    LOGGER.warning("Failed to finalize aligned_faces.jsonl: %s", exc)
+            else:
+                try:
+                    aligned_faces_tmp_path.unlink()
+                except Exception:
+                    pass
         progress.close()
 
 
