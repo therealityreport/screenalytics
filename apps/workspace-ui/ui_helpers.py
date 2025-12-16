@@ -2741,6 +2741,7 @@ def render_page_header(page_id: str, page_title: str) -> None:
                 st.warning("Missing paths: " + ", ".join(f"`{p}`" for p in missing_paths))
 
             reg_feature = registry_features.get(feature_id) if isinstance(registry_features, dict) else None
+            reg_phases_present = False
             if isinstance(reg_feature, dict):
                 reg_status = reg_feature.get("status") or "unknown"
                 reg_jobs = reg_feature.get("integrated_in_jobs") or []
@@ -2766,8 +2767,11 @@ def render_page_header(page_id: str, page_title: str) -> None:
                     st.caption(enable_hint)
 
                 reg_phases = reg_feature.get("phases") or {}
-                if isinstance(reg_phases, dict) and reg_phases:
-                    st.markdown("**Registry Phases**")
+                reg_phases_present = isinstance(reg_phases, dict) and bool(reg_phases)
+                if reg_phases_present:
+                    # Registry is canonical for phase status; avoid mixing with potentially stale docs catalog phases.
+                    st.markdown("**Phases**")
+                    st.caption("source: feature status registry")
                     for phase_id, phase_info in reg_phases.items():
                         if isinstance(phase_info, dict):
                             phase_status = phase_info.get("status") or "unknown"
@@ -2785,8 +2789,9 @@ def render_page_header(page_id: str, page_title: str) -> None:
                             st.markdown(f"- `{phase_id}`: `{phase_status}`")
 
             phases = feature.get("phases") or {}
-            if isinstance(phases, dict) and phases:
+            if not reg_phases_present and isinstance(phases, dict) and phases:
                 st.markdown("**Phases**")
+                st.caption("source: docs catalog (may be stale)")
                 for phase, phase_status in phases.items():
                     st.markdown(f"- `{phase}`: `{phase_status}`")
 

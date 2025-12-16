@@ -579,7 +579,7 @@ def _get_detect_settings(ep_id: str) -> Dict[str, Any]:
         "det_thresh": float(_get("det_thresh", helpers.DEFAULT_DET_THRESH)),
         "save_frames": bool(_get("save_frames", True)),
         "save_crops": bool(_get("save_crops", True)),
-        "cpu_threads": int(_get("cpu_threads", 2)),
+        "cpu_threads": int(_get("cpu_threads", 4)),
         "max_gap": int(_get("max_gap", helpers.DEFAULT_MAX_GAP)),
         "track_high_thresh": float(_get("track_high_thresh", TRACK_THRESH_DEFAULT)),
         "new_track_thresh": float(_get("new_track_thresh", TRACK_NEW_THRESH_DEFAULT)),
@@ -1270,9 +1270,10 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
                 }
                 try:
                     helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
-                except Exception:
-                    pass
-                _advance()
+                    _advance()
+                except Exception as exc:
+                    st.error(f"Failed to save merge decision: {exc}")
+                    LOGGER.error("[FACE_REVIEW] Merge decision failed: %s", exc)
 
         with btn_col2:
             if st.button("No", use_container_width=True, key=f"ep_improve_no_{current_idx}"):
@@ -1286,9 +1287,10 @@ def _render_improve_faces_modal_ep_detail(ep_id: str) -> None:
                 }
                 try:
                     helpers.api_post(f"/episodes/{ep_id}/face_review/decision/start", json=payload)
-                except Exception:
-                    pass
-                _advance()
+                    _advance()
+                except Exception as exc:
+                    st.error(f"Failed to save reject decision: {exc}")
+                    LOGGER.error("[FACE_REVIEW] Reject decision failed: %s", exc)
 
         with btn_col3:
             if st.button("Skip All", use_container_width=True, key=f"ep_improve_skip_{current_idx}"):
@@ -1517,6 +1519,8 @@ if flash_error:
 if flash_message:
     st.success(flash_message)
 
+# Bug #8: Remove legacy unnamespaced keys that may exist from older sessions
+# Current code uses namespaced keys via _get_pipeline_settings_key(ep_id, "detect", "detector")
 if "detector" in st.session_state:
     del st.session_state["detector"]
 if "tracker" in st.session_state:
