@@ -1804,36 +1804,26 @@ class TensorRTEmbeddingBackend:
             return
 
         try:
-            # Import from FEATURES directory (use underscore for Python import)
-            import sys
-            features_path = str(REPO_ROOT / "FEATURES" / "arcface-tensorrt")
-            if features_path not in sys.path:
-                sys.path.insert(0, features_path)
-
-            from src.tensorrt_inference import TensorRTArcFace
-            from src.tensorrt_builder import TensorRTConfig, build_or_load_engine
+            import tensorrt  # noqa: F401  # type: ignore
+            import pycuda.driver  # noqa: F401  # type: ignore
 
             # Load config and build/load engine
             if self.engine_path:
                 engine_path = Path(self.engine_path)
             else:
-                import yaml
-                with open(self.config_path) as f:
-                    config_dict = yaml.safe_load(f)
+                from FEATURES.arcface_tensorrt.src.tensorrt_builder import TensorRTConfig, build_or_load_engine
 
-                config = TensorRTConfig(
-                    model_name=config_dict.get("tensorrt", {}).get("model_name", "arcface_r100"),
-                    precision=config_dict.get("tensorrt", {}).get("precision", "fp16"),
-                    max_batch_size=config_dict.get("tensorrt", {}).get("max_batch_size", 32),
-                    engine_local_dir=config_dict.get("tensorrt", {}).get("engine_local_dir", "data/engines"),
-                    onnx_path=config_dict.get("tensorrt", {}).get("onnx_path"),
-                )
+                config = TensorRTConfig.from_yaml(Path(self.config_path))
                 engine_path, _ = build_or_load_engine(config)
 
             if engine_path is None:
                 raise RuntimeError("Failed to build or load TensorRT engine")
 
+            from FEATURES.arcface_tensorrt.src.tensorrt_inference import TensorRTArcFace
+
             self._engine = TensorRTArcFace(engine_path=engine_path)
+            # Warm engine once so fallback happens before embedding loop.
+            self._engine._load_engine()
             LOGGER.info("TensorRT embedding backend ready: %s", engine_path)
 
         except ImportError as e:
@@ -1893,6 +1883,70 @@ class TensorRTEmbeddingBackend:
         return np.vstack(embeddings)
 
 
+class _FallbackEmbeddingBackend:
+    def __init__(
+        self,
+        primary: EmbeddingBackend,
+        fallback: EmbeddingBackend,
+        *,
+        primary_label: str,
+        fallback_label: str,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_label = primary_label
+        self._fallback_label = fallback_label
+        self._active: EmbeddingBackend | None = None
+
+    def _activate_primary(self) -> None:
+        if self._active is not None:
+            return
+        try:
+            self._primary.ensure_ready()
+            self._active = self._primary
+        except Exception as exc:
+            LOGGER.warning(
+                "[EMBED] Falling back from %s to %s: %s",
+                self._primary_label,
+                self._fallback_label,
+                exc,
+            )
+            self._fallback.ensure_ready()
+            self._active = self._fallback
+
+    def ensure_ready(self) -> None:
+        self._activate_primary()
+        if self._active is not None:
+            self._active.ensure_ready()
+
+    @property
+    def resolved_device(self) -> str:
+        if self._active is None:
+            try:
+                return getattr(self._primary, "resolved_device")
+            except Exception:
+                return getattr(self._fallback, "resolved_device", "cpu")
+        return getattr(self._active, "resolved_device", "cpu")
+
+    def encode(self, crops: list[np.ndarray]) -> np.ndarray:
+        self._activate_primary()
+        if self._active is None:
+            return np.zeros((len(crops), 512), dtype=np.float32)
+        try:
+            return self._active.encode(crops)
+        except Exception as exc:
+            if self._active is self._primary:
+                LOGGER.warning(
+                    "[EMBED] TensorRT encode failed; falling back to %s: %s",
+                    self._fallback_label,
+                    exc,
+                )
+                self._fallback.ensure_ready()
+                self._active = self._fallback
+                return self._active.encode(crops)
+            raise
+
+
 def get_embedding_backend(
     backend_type: str = "pytorch",
     device: str = "auto",
@@ -1912,7 +1966,15 @@ def get_embedding_backend(
         Embedding backend instance
     """
     if backend_type == "tensorrt":
-        return TensorRTEmbeddingBackend(config_path=tensorrt_config)
+        tensorrt_backend = TensorRTEmbeddingBackend(config_path=tensorrt_config)
+        if allow_cpu_fallback:
+            return _FallbackEmbeddingBackend(
+                tensorrt_backend,
+                ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback),
+                primary_label="tensorrt",
+                fallback_label="pytorch",
+            )
+        return tensorrt_backend
     else:
         # Default to PyTorch/ONNX Runtime backend
         return ArcFaceEmbedder(device, allow_cpu_fallback=allow_cpu_fallback)
@@ -6787,6 +6849,9 @@ def _run_faces_embed_stage(
     tensorrt_config_path = embedding_config.get("embedding", {}).get(
         "tensorrt_config", "config/pipeline/arcface_tensorrt.yaml"
     )
+    fallback_cfg = embedding_config.get("fallback", {}) if isinstance(embedding_config.get("fallback"), dict) else {}
+    fallback_to_pytorch = bool(fallback_cfg.get("fallback_to_pytorch", True))
+    allow_embedding_fallback = allow_cpu_fallback or (embedding_backend_type == "tensorrt" and fallback_to_pytorch)
 
     # Emit progress during model loading (can take time for CoreML compilation)
     print(f"[INIT] Loading embedding backend (type={embedding_backend_type}, device={device})...", flush=True)
@@ -6794,7 +6859,7 @@ def _run_faces_embed_stage(
         backend_type=embedding_backend_type,
         device=device,
         tensorrt_config=tensorrt_config_path,
-        allow_cpu_fallback=allow_cpu_fallback,
+        allow_cpu_fallback=allow_embedding_fallback,
     )
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
