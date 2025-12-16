@@ -42,19 +42,23 @@
           "notes": "FAN 68-point alignment runs inside faces_embed when face_alignment.enabled=true. It writes runs/{run_id}/face_alignment/aligned_faces.jsonl and uses aligned crops for ArcFace embeddings. Requires optional dependency: face-alignment (pip install face-alignment)."
         },
         "B_LUVLi_quality_gate": {
-          "status": "heuristic_stub",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
-            "config_key": null,
+            "config_key": "config/pipeline/face_alignment.yaml:face_alignment.quality_gate.enabled",
             "ui_path": null,
             "cli_flag": null
           },
           "evidence_paths": [
-            "FEATURES/face_alignment/src/run_luvli_quality.py"
+            "tools/episode_run.py",
+            "py_screenalytics/face_alignment/fan2d.py",
+            "config/pipeline/face_alignment.yaml"
           ],
-          "notes": "Heuristic placeholder only; not a model-based LUVLi port."
+          "notes": "MVP alignment-quality gate implemented in faces_embed using deterministic heuristics from FAN landmarks (NOT a LUVLi model). Supports drop/downweight via face_alignment.quality_gate.*."
         },
         "C_3DDFA_V2": {
           "status": "not_started",

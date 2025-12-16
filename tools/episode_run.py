@@ -6677,36 +6677,61 @@ def _run_faces_embed_stage(
             track_path,
         )
 
-    # Load alignment quality gating config and data
+    # Load face-alignment + alignment-quality gate config
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     alignment_config = _load_alignment_config()
-    alignment_run_enabled = bool(alignment_config.get("face_alignment", {}).get("enabled", False))
-    alignment_output_cfg = alignment_config.get("face_alignment", {}).get("output", {}) if isinstance(
-        alignment_config.get("face_alignment"), dict
-    ) else {}
+    face_alignment_cfg = alignment_config.get("face_alignment", {}) if isinstance(alignment_config.get("face_alignment"), dict) else {}
+    alignment_run_enabled = bool(face_alignment_cfg.get("enabled", False))
+    alignment_output_cfg = face_alignment_cfg.get("output", {}) if isinstance(face_alignment_cfg.get("output"), dict) else {}
     alignment_crop_size = int(alignment_output_cfg.get("crop_size") or 112)
     alignment_crop_margin = float(alignment_output_cfg.get("crop_margin") or 0.0)
-    alignment_gating_enabled = (
-        alignment_config.get("quality", {}).get("enabled", False)
-        or embedding_config.get("face_alignment", {}).get("use_for_embedding", False)
-    )
-    min_alignment_quality = (
-        alignment_config.get("quality", {}).get("threshold", 0.3)
-        or embedding_config.get("face_alignment", {}).get("min_alignment_quality", 0.3)
+    quality_gate_cfg = face_alignment_cfg.get("quality_gate", {}) if isinstance(face_alignment_cfg.get("quality_gate"), dict) else {}
+    legacy_quality_gate_cfg = alignment_config.get("quality_gating", {}) if isinstance(alignment_config.get("quality_gating"), dict) else {}
+    legacy_embed_face_alignment_cfg = (
+        embedding_config.get("face_alignment", {}) if isinstance(embedding_config.get("face_alignment"), dict) else {}
     )
 
+    quality_gate_enabled = bool(quality_gate_cfg.get("enabled", False))
+    if not quality_gate_cfg and legacy_quality_gate_cfg:
+        quality_gate_enabled = bool(legacy_quality_gate_cfg.get("enabled", quality_gate_enabled))
+    if not quality_gate_cfg and not legacy_quality_gate_cfg:
+        quality_gate_enabled = bool(
+            quality_gate_enabled
+            or legacy_embed_face_alignment_cfg.get("enabled", False)
+            or legacy_embed_face_alignment_cfg.get("use_for_embedding", False)
+        )
+
+    quality_gate_threshold_raw = (
+        quality_gate_cfg.get("threshold")
+        if quality_gate_cfg
+        else legacy_quality_gate_cfg.get("threshold", legacy_embed_face_alignment_cfg.get("min_alignment_quality", 0.3))
+    )
+    try:
+        quality_gate_threshold = float(quality_gate_threshold_raw)
+    except (TypeError, ValueError):
+        quality_gate_threshold = 0.3
+    quality_gate_threshold = max(0.0, min(quality_gate_threshold, 1.0))
+
+    quality_gate_mode = str(quality_gate_cfg.get("mode", "drop") or "drop").strip().lower()
+    if quality_gate_mode not in {"drop", "downweight"}:
+        LOGGER.warning("Unknown face_alignment.quality_gate.mode=%r; falling back to 'drop'", quality_gate_mode)
+        quality_gate_mode = "drop"
+
     alignment_quality_index: Dict[Tuple[int, int], float] = {}
-    if alignment_gating_enabled:
+    if quality_gate_enabled:
         alignment_quality_index = _load_alignment_quality_index(manifests_dir)
         if alignment_quality_index:
             LOGGER.info(
-                "Alignment quality gating enabled: min_quality=%.2f, faces_with_quality=%d",
-                min_alignment_quality, len(alignment_quality_index)
+                "Alignment quality gate enabled: threshold=%.2f, mode=%s, faces_with_quality=%d",
+                quality_gate_threshold,
+                quality_gate_mode,
+                len(alignment_quality_index),
             )
         else:
-            LOGGER.info("Alignment quality gating enabled but no aligned_faces.jsonl found")
+            LOGGER.info("Alignment quality gate enabled but no aligned_faces.jsonl found")
 
-    skipped_alignment_quality = 0  # Counter for gated faces
+    skipped_alignment_quality = 0  # Counter for dropped faces
+    downweighted_alignment_quality = 0  # Counter for downweighted faces
 
     faces_total = len(samples)
     if LOCAL_MODE_INSTRUMENTATION:
@@ -6922,11 +6947,11 @@ def _run_faces_embed_stage(
                 ts_val = round(float(sample["ts"]), 4)
                 landmarks = sample.get("landmarks")
 
-                # Check alignment quality gate (if enabled)
-                if alignment_quality_index:
+                # Alignment quality gate (cached; drop-only)
+                if quality_gate_enabled and quality_gate_mode == "drop" and alignment_quality_index:
                     aq_key = (int(track_id), int(frame_idx))
                     aq_score = alignment_quality_index.get(aq_key)
-                    if aq_score is not None and aq_score < min_alignment_quality:
+                    if aq_score is not None and aq_score < quality_gate_threshold:
                         rows.append(
                             _make_skip_face_row(
                                 args.ep_id,
@@ -6995,6 +7020,7 @@ def _run_faces_embed_stage(
                 alignment_quality_score: float | None = None
                 alignment_quality_source: str | None = None
                 alignment_source: str | None = None
+                alignment_quality_weight: float | None = None
                 if alignment_run_enabled:
                     face_alignment_cfg = alignment_config.get("face_alignment", {}) if isinstance(
                         alignment_config.get("face_alignment"), dict
@@ -7091,25 +7117,36 @@ def _run_faces_embed_stage(
                             except Exception:
                                 pass
 
-                        if alignment_gating_enabled and alignment_quality_score is not None and alignment_quality_score < min_alignment_quality:
-                            rows.append(
-                                _make_skip_face_row(
-                                    args.ep_id,
-                                    track_id,
-                                    frame_idx,
-                                    ts_val,
-                                    bbox,
-                                    detector_choice,
-                                    f"low_alignment_quality:{alignment_quality_score:.3f}",
-                                    crop_rel_path=crop_rel_path,
-                                    crop_s3_key=crop_s3_key,
-                                    thumb_rel_path=None,
-                                    thumb_s3_key=None,
+                        if (
+                            quality_gate_enabled
+                            and alignment_quality_score is not None
+                            and alignment_quality_score < quality_gate_threshold
+                        ):
+                            if quality_gate_mode == "drop":
+                                rows.append(
+                                    _make_skip_face_row(
+                                        args.ep_id,
+                                        track_id,
+                                        frame_idx,
+                                        ts_val,
+                                        bbox,
+                                        detector_choice,
+                                        f"low_alignment_quality:{alignment_quality_score:.3f}",
+                                        crop_rel_path=crop_rel_path,
+                                        crop_s3_key=crop_s3_key,
+                                        thumb_rel_path=None,
+                                        thumb_s3_key=None,
+                                    )
                                 )
-                            )
-                            skipped_alignment_quality += 1
-                            faces_done = min(faces_total, faces_done + 1)
-                            continue
+                                skipped_alignment_quality += 1
+                                faces_done = min(faces_total, faces_done + 1)
+                                continue
+                            if quality_gate_mode == "downweight":
+                                denom = max(quality_gate_threshold, 1e-6)
+                                factor = max(0.0, min(float(alignment_quality_score) / denom, 1.0))
+                                alignment_quality_weight = factor
+                                quality = max(min(quality * factor, 1.0), 0.0)
+                                downweighted_alignment_quality += 1
 
                         if fan2d_mod and alignment_source in {"fan2d", "aligned_faces"}:
                             try:
@@ -7201,6 +7238,7 @@ def _run_faces_embed_stage(
                     "alignment_used": alignment_used,
                     "alignment_source": alignment_source,
                     "alignment_quality": alignment_quality_score,
+                    "alignment_quality_weight": alignment_quality_weight,
                     "crop_rel_path": crop_rel_path,
                     "crop_s3_key": crop_s3_key,
                     "thumb_rel_path": thumb_rel_path,
@@ -7301,6 +7339,12 @@ def _run_faces_embed_stage(
                         if aq_val is not None:
                             try:
                                 face_row["alignment_quality"] = round(float(aq_val), 4)
+                            except (TypeError, ValueError):
+                                pass
+                        aq_weight = meta.get("alignment_quality_weight")
+                        if aq_weight is not None:
+                            try:
+                                face_row["alignment_quality_weight"] = round(float(aq_weight), 4)
                             except (TypeError, ValueError):
                                 pass
                     if seed_cast_id:
@@ -7475,21 +7519,25 @@ def _run_faces_embed_stage(
             print(f"[LOCAL MODE] faces_embed completed for {args.ep_id}", flush=True)
             print(f"  faces={len(rows)}, runtime={runtime_sec:.1f}s", flush=True)
 
-        # Log alignment quality gating stats
-        if skipped_alignment_quality > 0:
+        # Log alignment quality gate stats
+        if quality_gate_enabled and (skipped_alignment_quality > 0 or downweighted_alignment_quality > 0):
             LOGGER.info(
-                "Alignment quality gating: skipped %d/%d faces (%.1f%%) below threshold %.2f",
+                "Alignment quality gate: mode=%s, threshold=%.2f, skipped=%d, downweighted=%d (total=%d)",
+                quality_gate_mode,
+                quality_gate_threshold,
                 skipped_alignment_quality,
+                downweighted_alignment_quality,
                 faces_total,
-                100 * skipped_alignment_quality / max(faces_total, 1),
-                min_alignment_quality,
             )
             summary["alignment_quality_gating"] = {
                 "enabled": True,
-                "threshold": min_alignment_quality,
+                "mode": quality_gate_mode,
+                "threshold": quality_gate_threshold,
                 "skipped": skipped_alignment_quality,
+                "downweighted": downweighted_alignment_quality,
                 "total": faces_total,
                 "skip_rate": skipped_alignment_quality / max(faces_total, 1),
+                "downweight_rate": downweighted_alignment_quality / max(faces_total, 1),
             }
 
         faces_embed_succeeded = True

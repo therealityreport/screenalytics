@@ -22,6 +22,13 @@ face_alignment:
     min_face_size: 20              # Minimum face box size in pixels
     min_confidence: 0.5            # Minimum detection confidence
 
+  # Alignment-quality gate (MVP heuristic; NOT LUVLi)
+  # Produces `alignment_quality` in aligned_faces.jsonl and can drop/downweight embeddings.
+  quality_gate:
+    enabled: true                  # Enable gating when face_alignment.enabled=true
+    threshold: 0.30                # Minimum alignment_quality to pass (0.0–1.0)
+    mode: drop                     # drop | downweight
+
   # Output
   output:
     export_crops: false            # Save aligned crop images
@@ -30,6 +37,7 @@ face_alignment:
     jpeg_quality: 95               # Quality for JPEG crops
 
 # Quality gating (future: LUVLi integration)
+# NOTE: Deprecated; prefer `face_alignment.quality_gate.*` above.
 quality_gating:
   enabled: false                   # Enable when LUVLi is implemented
   threshold: 0.60                  # Minimum alignment_quality to pass
