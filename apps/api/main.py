@@ -34,7 +34,6 @@ from apps.api.routers import (
     people,
     roster,
 )
-from tools import episode_run
 
 app = FastAPI(title="Screenalytics API", version="0.1.0")
 install_error_handlers(app)
@@ -286,6 +285,9 @@ async def _warmup_retinaface() -> None:
 
     async def warmup():
         """Run the blocking warmup in a thread pool to avoid blocking event loop."""
+        # Lazy import to avoid pulling in heavy ML deps at API startup
+        from tools import episode_run
+
         loop = asyncio.get_running_loop()
         ready, detail, _ = await loop.run_in_executor(
             None, episode_run.ensure_retinaface_ready, "auto"

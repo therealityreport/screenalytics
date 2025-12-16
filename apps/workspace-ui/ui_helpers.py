@@ -2525,6 +2525,120 @@ def load_feature_status_registry(
     return data, None
 
 
+_FEATURE_STATUS_JOB_LABELS = {
+    "detect_track": "Detect/Track",
+    "harvest": "Harvest",
+    "cluster": "Cluster",
+}
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "y", "1"}:
+            return True
+        if normalized in {"false", "no", "n", "0", ""}:
+            return False
+    return False
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for it in value:
+        if not isinstance(it, str):
+            continue
+        stripped = it.strip()
+        if stripped:
+            items.append(stripped)
+    deduped: list[str] = []
+    for item in items:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def _format_jobs(value: Any) -> str:
+    jobs = _as_str_list(value)
+    labels: list[str] = []
+    for job in jobs:
+        labels.append(_FEATURE_STATUS_JOB_LABELS.get(job, job))
+    return ", ".join(labels)
+
+
+def _format_yes_no(value: Any) -> str:
+    return "Yes" if _as_bool(value) else "No"
+
+
+def _format_how_to_enable(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, dict):
+        return ""
+    parts: list[str] = []
+    config_key = value.get("config_key")
+    ui_path = value.get("ui_path")
+    cli_flag = value.get("cli_flag")
+    if isinstance(config_key, str) and config_key.strip():
+        parts.append(f"config: {config_key.strip()}")
+    if isinstance(ui_path, str) and ui_path.strip():
+        parts.append(f"ui: {ui_path.strip()}")
+    if isinstance(cli_flag, str) and cli_flag.strip():
+        parts.append(f"cli: {cli_flag.strip()}")
+    return " | ".join(parts)
+
+
+def classify_feature_status_bucket(
+    status: Any,
+    *,
+    integrated_in_jobs: Any = None,
+    integrated_in_autorun: Any = None,
+) -> str:
+    """Classify a registry feature/phase into COMPLETE / IN PROGRESS / TODO.
+
+    Rules (per docs):
+    - COMPLETE only if status is "complete" or "implemented_production" AND the phase is integrated into jobs/autorun.
+    - implemented_sandbox can never be COMPLETE.
+    """
+    status_value = str(status or "").strip().lower()
+    jobs = _as_str_list(integrated_in_jobs)
+    autorun = _as_bool(integrated_in_autorun)
+
+    if status_value in {"complete", "implemented_production"} and (jobs or autorun):
+        return "complete"
+    if status_value in {"future", "not_started", "draft", "outdated"}:
+        return "todo"
+    if status_value in {
+        "partial",
+        "in_progress",
+        "implemented_sandbox",
+        "heuristic_stub",
+        "scaffold_only",
+        "implemented_production",
+    }:
+        return "in_progress"
+    return "in_progress"
+
+
+def _evidence_paths(meta: dict[str, Any]) -> list[str]:
+    value = meta.get("evidence_paths")
+    if value is None:
+        value = meta.get("paths_required")
+    return _as_str_list(value)
+
+
+def _evidence_present(meta: dict[str, Any]) -> tuple[bool, list[str]]:
+    paths = _evidence_paths(meta)
+    if not paths:
+        return False, ["<missing evidence_paths>"]
+    return _paths_present(paths)
+
+
 def _paths_present(paths_expected: Any) -> tuple[bool, list[str]]:
     repo_root = _repo_root()
     missing: list[str] = []
@@ -2629,17 +2743,27 @@ def render_page_header(page_id: str, page_title: str) -> None:
             reg_feature = registry_features.get(feature_id) if isinstance(registry_features, dict) else None
             if isinstance(reg_feature, dict):
                 reg_status = reg_feature.get("status") or "unknown"
-                reg_used = reg_feature.get("used_by_default")
-                reg_paths = reg_feature.get("paths_required") or []
-                reg_present, reg_missing = _paths_present(reg_paths)
+                reg_jobs = reg_feature.get("integrated_in_jobs") or []
+                reg_autorun = reg_feature.get("integrated_in_autorun")
+                reg_enabled = reg_feature.get("enabled_by_default", reg_feature.get("used_by_default"))
+                reg_present, reg_missing = _evidence_present(reg_feature)
                 st.caption(
-                    f"registry: status `{reg_status}` | used_by_default `{bool(reg_used)}` | present in code `{reg_present}`"
+                    "registry: "
+                    f"status `{reg_status}` | "
+                    f"jobs `{_format_jobs(reg_jobs) or '—'}` | "
+                    f"autorun `{_format_yes_no(reg_autorun)}` | "
+                    f"enabled_by_default `{_format_yes_no(reg_enabled)}` | "
+                    f"evidence_present `{reg_present}`"
                 )
-                if reg_missing and reg_status == "complete":
-                    st.warning("Registry says complete but paths missing: " + ", ".join(f"`{p}`" for p in reg_missing))
+                if reg_missing and str(reg_status).strip().lower() in {"complete", "implemented_production"}:
+                    st.warning(
+                        "Registry says implemented/complete but evidence paths missing: "
+                        + ", ".join(f"`{p}`" for p in reg_missing)
+                    )
                 how_to_enable = reg_feature.get("how_to_enable")
-                if isinstance(how_to_enable, str) and how_to_enable.strip():
-                    st.caption(how_to_enable.strip())
+                enable_hint = _format_how_to_enable(how_to_enable)
+                if enable_hint:
+                    st.caption(enable_hint)
 
                 reg_phases = reg_feature.get("phases") or {}
                 if isinstance(reg_phases, dict) and reg_phases:
@@ -2647,9 +2771,18 @@ def render_page_header(page_id: str, page_title: str) -> None:
                     for phase_id, phase_info in reg_phases.items():
                         if isinstance(phase_info, dict):
                             phase_status = phase_info.get("status") or "unknown"
+                            phase_jobs = phase_info.get("integrated_in_jobs", reg_jobs)
+                            phase_autorun = phase_info.get("integrated_in_autorun", reg_autorun)
+                            phase_enabled = phase_info.get("enabled_by_default", reg_enabled)
+                            st.markdown(
+                                f"- `{phase_id}`: `{phase_status}` "
+                                f"(jobs: `{_format_jobs(phase_jobs) or '—'}`, "
+                                f"autorun: `{_format_yes_no(phase_autorun)}`, "
+                                f"enabled_by_default: `{_format_yes_no(phase_enabled)}`)"
+                            )
                         else:
                             phase_status = str(phase_info)
-                        st.markdown(f"- `{phase_id}`: `{phase_status}`")
+                            st.markdown(f"- `{phase_id}`: `{phase_status}`")
 
             phases = feature.get("phases") or {}
             if isinstance(phases, dict) and phases:
@@ -2741,80 +2874,111 @@ def render_page_header(page_id: str, page_title: str) -> None:
         assert catalog is not None
         docs = [d for d in catalog.get("docs", []) if isinstance(d, dict)]
         todo_statuses = {"in_progress", "draft", "outdated"}
-        todo_docs = [
-            d for d in docs if d.get("status") in todo_statuses
-        ]
+        todo_docs = [d for d in docs if d.get("status") in todo_statuses]
         todo_docs.sort(key=lambda d: (str(d.get("status")), str(d.get("title"))))
+        complete_docs = [d for d in docs if d.get("status") == "complete"]
+        complete_docs.sort(
+            key=lambda d: (str(d.get("last_updated") or ""), str(d.get("title") or "")),
+            reverse=True,
+        )
 
         if registry_features:
             todo_rows: list[dict[str, Any]] = []
+            in_progress_rows: list[dict[str, Any]] = []
             complete_rows: list[dict[str, Any]] = []
             mismatches: list[str] = []
-
-            def _is_complete_status(value: str) -> bool:
-                return value in {"complete", "implemented_sandbox"}
 
             for fid, fmeta in sorted(registry_features.items()):
                 if not isinstance(fmeta, dict):
                     continue
                 feature_title = fmeta.get("title") or fid
-                feature_used = bool(fmeta.get("used_by_default"))
-                feature_paths = fmeta.get("paths_required") or []
-                feature_present, feature_missing = _paths_present(feature_paths)
                 feature_status = fmeta.get("status") or "unknown"
-                if feature_status == "complete" and feature_missing:
+                feature_jobs = fmeta.get("integrated_in_jobs") or []
+                feature_autorun = fmeta.get("integrated_in_autorun")
+                feature_enabled = fmeta.get("enabled_by_default", fmeta.get("used_by_default"))
+                feature_present, feature_missing = _evidence_present(fmeta)
+                if str(feature_status).strip().lower() in {"complete", "implemented_production"} and feature_missing:
                     mismatches.append(f"{fid}: missing {', '.join(feature_missing)}")
+
+                feature_row = {
+                    "feature": feature_title,
+                    "feature_id": fid,
+                    "phase": "",
+                    "status": feature_status,
+                    "jobs": _format_jobs(feature_jobs),
+                    "autorun": _format_yes_no(feature_autorun),
+                    "enabled_by_default": _format_yes_no(feature_enabled),
+                    "evidence_present": feature_present,
+                    "how_to_enable": _format_how_to_enable(fmeta.get("how_to_enable")),
+                }
+                feature_bucket = classify_feature_status_bucket(
+                    feature_status,
+                    integrated_in_jobs=feature_jobs,
+                    integrated_in_autorun=feature_autorun,
+                )
+                if feature_bucket == "complete":
+                    complete_rows.append(feature_row)
+                elif feature_bucket == "todo":
+                    todo_rows.append(feature_row)
+                else:
+                    in_progress_rows.append(feature_row)
+
                 phases = fmeta.get("phases") or {}
                 if isinstance(phases, dict) and phases:
                     for phase_id, phase_info in phases.items():
                         if isinstance(phase_info, dict):
                             phase_status = phase_info.get("status") or "unknown"
-                            phase_used = bool(phase_info.get("used_by_default", feature_used))
-                            phase_paths = phase_info.get("paths_required") or []
-                            _, phase_missing = _paths_present(phase_paths)
-                            if phase_status == "complete" and phase_missing:
+                            phase_jobs = phase_info.get("integrated_in_jobs", feature_jobs)
+                            phase_autorun = phase_info.get("integrated_in_autorun", feature_autorun)
+                            phase_enabled = phase_info.get("enabled_by_default", feature_enabled)
+                            phase_present, phase_missing = _evidence_present(phase_info)
+                            if str(phase_status).strip().lower() in {"complete", "implemented_production"} and phase_missing:
                                 mismatches.append(f"{fid}.{phase_id}: missing {', '.join(phase_missing)}")
                         else:
                             phase_status = str(phase_info) or "unknown"
-                            phase_used = feature_used
+                            phase_jobs = feature_jobs
+                            phase_autorun = feature_autorun
+                            phase_enabled = feature_enabled
+                            phase_present = feature_present
                         row = {
                             "feature": feature_title,
                             "feature_id": fid,
                             "phase": phase_id,
                             "status": phase_status,
-                            "used_by_default": phase_used,
-                            "present_in_code": feature_present,
+                            "jobs": _format_jobs(phase_jobs),
+                            "autorun": _format_yes_no(phase_autorun),
+                            "enabled_by_default": _format_yes_no(phase_enabled),
+                            "evidence_present": phase_present,
+                            "how_to_enable": _format_how_to_enable(phase_info.get("how_to_enable") if isinstance(phase_info, dict) else None)
+                            or _format_how_to_enable(fmeta.get("how_to_enable")),
                         }
-                        if _is_complete_status(phase_status):
+                        bucket = classify_feature_status_bucket(
+                            phase_status,
+                            integrated_in_jobs=phase_jobs,
+                            integrated_in_autorun=phase_autorun,
+                        )
+                        if bucket == "complete":
                             complete_rows.append(row)
-                        else:
+                        elif bucket == "todo":
                             todo_rows.append(row)
-                else:
-                    row = {
-                        "feature": feature_title,
-                        "feature_id": fid,
-                        "phase": "",
-                        "status": feature_status,
-                        "used_by_default": feature_used,
-                        "present_in_code": feature_present,
-                    }
-                    if _is_complete_status(feature_status):
-                        complete_rows.append(row)
-                    else:
-                        todo_rows.append(row)
+                        else:
+                            in_progress_rows.append(row)
 
             st.markdown("### Feature Status (Registry)")
             if mismatches:
                 st.warning("Status mismatch (registry says complete but code missing): " + "; ".join(mismatches))
-            if todo_rows:
-                st.markdown("**TO-DO** (not complete)")
-                st.dataframe(todo_rows, use_container_width=True, hide_index=True)
             if complete_rows:
                 st.markdown("**COMPLETE**")
                 st.dataframe(complete_rows, use_container_width=True, hide_index=True)
+            if in_progress_rows:
+                st.markdown("**IN PROGRESS**")
+                st.dataframe(in_progress_rows, use_container_width=True, hide_index=True)
+            if todo_rows:
+                st.markdown("**TODO**")
+                st.dataframe(todo_rows, use_container_width=True, hide_index=True)
 
-        if not todo_docs:
-            st.info("No in-progress/draft/outdated docs found in catalog.")
+        if not todo_docs and not complete_docs:
+            st.info("No docs found in catalog.")
             return
 
         feature_catalog = catalog.get("features") or {}
@@ -2855,32 +3019,53 @@ def render_page_header(page_id: str, page_title: str) -> None:
                     deduped.append(item)
             return ", ".join(deduped)
 
-        rows: list[dict[str, Any]] = []
-        for d in todo_docs:
-            features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
-            models_list = [m for m in (d.get("models") or []) if isinstance(m, str)]
-            jobs_list = [j for j in (d.get("jobs") or []) if isinstance(j, str)]
-            surfaces_list = [s for s in (d.get("ui_surfaces_expected") or []) if isinstance(s, str)]
-            path_value = d.get("path", "")
-            rows.append(
-                {
-                    "status": d.get("status", ""),
-                    "type": d.get("type", ""),
-                    "title": d.get("title", ""),
-                    "last_updated": d.get("last_updated", ""),
-                    "features": ", ".join(features_list),
-                    "feature_status": _feature_statuses_for(features_list),
-                    "expected_code_paths": _paths_expected_for(features_list),
-                    "implementation_hint": _extract_doc_implementation_hint(path_value),
-                    "pending": _feature_pending_for(features_list),
-                    "models": ", ".join(models_list),
-                    "jobs": ", ".join(jobs_list),
-                    "ui_surfaces_expected": ", ".join(surfaces_list),
-                    "path": path_value,
-                }
-            )
+        st.markdown("### Docs")
+        st.caption(f"to-do: {len(todo_docs)} • complete: {len(complete_docs)}")
 
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        if todo_docs:
+            st.markdown("**TO-DO DOCS**")
+            todo_doc_rows: list[dict[str, Any]] = []
+            for d in todo_docs:
+                features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
+                models_list = [m for m in (d.get("models") or []) if isinstance(m, str)]
+                jobs_list = [j for j in (d.get("jobs") or []) if isinstance(j, str)]
+                surfaces_list = [s for s in (d.get("ui_surfaces_expected") or []) if isinstance(s, str)]
+                path_value = d.get("path", "")
+                todo_doc_rows.append(
+                    {
+                        "status": d.get("status", ""),
+                        "type": d.get("type", ""),
+                        "title": d.get("title", ""),
+                        "last_updated": d.get("last_updated", ""),
+                        "features": ", ".join(features_list),
+                        "feature_status": _feature_statuses_for(features_list),
+                        "expected_code_paths": _paths_expected_for(features_list),
+                        "implementation_hint": _extract_doc_implementation_hint(path_value),
+                        "pending": _feature_pending_for(features_list),
+                        "models": ", ".join(models_list),
+                        "jobs": ", ".join(jobs_list),
+                        "ui_surfaces_expected": ", ".join(surfaces_list),
+                        "path": path_value,
+                    }
+                )
+
+            st.dataframe(todo_doc_rows, use_container_width=True, hide_index=True)
+
+        if complete_docs:
+            st.markdown("**COMPLETED DOCS**")
+            complete_doc_rows: list[dict[str, Any]] = []
+            for d in complete_docs:
+                features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
+                complete_doc_rows.append(
+                    {
+                        "title": d.get("title", ""),
+                        "last_updated": d.get("last_updated", ""),
+                        "features": ", ".join(features_list),
+                        "feature_status": _feature_statuses_for(features_list),
+                        "path": d.get("path", ""),
+                    }
+                )
+            st.dataframe(complete_doc_rows, use_container_width=True, hide_index=True)
 
     dialog = getattr(st, "dialog", None)
     if callable(dialog):
