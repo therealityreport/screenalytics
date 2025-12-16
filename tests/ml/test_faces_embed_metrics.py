@@ -352,10 +352,8 @@ def test_faces_embed_respects_min_frames_between_crops(tmp_path: Path, monkeypat
             "cpu",
             "--out-root",
             str(data_root),
-            "--min-frames-between-crops",
-            str(spacing),
             "--sample-every-n-frames",
-            "1",
+            str(spacing),
         ]
 
         env = os.environ.copy()

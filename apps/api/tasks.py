@@ -1293,7 +1293,7 @@ def run_faces_embed_task(
         if options.get("jpeg_quality"):
             command += ["--jpeg-quality", str(options["jpeg_quality"])]
         if options.get("min_frames_between_crops"):
-            command += ["--min-frames-between-crops", str(options["min_frames_between_crops"])]
+            command += ["--sample-every-n-frames", str(options["min_frames_between_crops"])]
         if options.get("thumb_size"):
             command += ["--thumb-size", str(options["thumb_size"])]
         # Note: --profile is not a valid argument for episode_run.py
