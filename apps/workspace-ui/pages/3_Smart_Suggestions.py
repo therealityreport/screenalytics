@@ -2119,6 +2119,56 @@ config_thresholds = _fetch_config_thresholds()
 high_label = config_thresholds.get("cast_high_label", "≥68%")
 
 with bulk_col:
+    # --- Apply All Suggestions (run-scoped, respects locks) ---
+    total_suggestions = len(suggestion_entries)
+    apply_all_key = f"{ep_id}::apply_all_suggestions"
+
+    # Check for pending confirmation
+    if _confirm_action(
+        apply_all_key,
+        "Apply All Suggestions",
+        total_suggestions,
+        warning_message="This will apply all suggestions in the current batch. Locked identities and already-assigned clusters will be skipped.",
+    ):
+        with st.spinner(f"Applying all {total_suggestions} suggestions..."):
+            result = _apply_all_suggestions_in_batch()
+            if result.ok and result.data:
+                data = result.data
+                applied = data.get("applied_count", 0)
+                skipped_locked = data.get("skipped_locked_count", 0)
+                skipped_dismissed = data.get("skipped_dismissed_count", 0)
+                skipped_assigned = data.get("skipped_already_assigned_count", 0)
+                summary_parts = [f"Applied {applied}"]
+                if skipped_locked:
+                    summary_parts.append(f"skipped {skipped_locked} locked")
+                if skipped_dismissed:
+                    summary_parts.append(f"skipped {skipped_dismissed} dismissed")
+                if skipped_assigned:
+                    summary_parts.append(f"skipped {skipped_assigned} already assigned")
+                st.success(", ".join(summary_parts))
+                _invalidate_suggestions_cache(ep_id)
+                st.rerun()
+            else:
+                error_msg = result.error_message if result.error else "Unknown error"
+                st.error(f"Apply All failed: {error_msg}")
+
+    if st.button(
+        f"✓ Apply All Suggestions ({total_suggestions})",
+        key=apply_all_key,
+        disabled=total_suggestions == 0,
+        use_container_width=True,
+        type="primary",
+        help="Apply all suggestions in the current batch (respects identity locks)",
+    ):
+        if total_suggestions > 3:
+            _request_confirmation(apply_all_key)
+            st.rerun()
+        else:
+            st.session_state[f"confirmed:{apply_all_key}"] = True
+            st.rerun()
+
+    st.markdown("---")
+
     # Bulk action buttons with confirmation dialogs
     bulk_c1, bulk_c2, bulk_c3 = st.columns(3)
     with bulk_c1:
