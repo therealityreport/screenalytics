@@ -226,14 +226,18 @@ class ScreenTimeComparator:
         combined_frames = face_set | body_set
         body_only_frames = body_set - face_set
 
-        # Create combined segments with type annotation
-        face_segments = self._frames_to_segments(list(face_set), "face")
-        body_only_segs = self._frames_to_segments(list(body_only_frames), "body")
-        combined_segments = self._merge_segments(face_segments + body_only_segs)
+        # Combined visibility segments (union), merged with the same gap policy.
+        # Note: We intentionally compute combined_duration from the union frames rather than
+        # summing per-type segments, since alternating face/body segments can undercount
+        # (single-frame segments have zero duration under our frame→time convention).
+        combined_segments = self._frames_to_segments(list(combined_frames), "both")
+        combined_segments = self._merge_segments(combined_segments)
         combined_duration = sum(s.duration for s in combined_segments)
 
         # Body-only duration
-        body_only_duration = sum(s.duration for s in body_only_segs)
+        body_only_segments = self._frames_to_segments(list(body_only_frames), "body")
+        body_only_segments = self._merge_segments(body_only_segments)
+        body_only_duration = sum(s.duration for s in body_only_segments)
 
         # Calculate gain
         duration_gain = combined_duration - face_only_duration
