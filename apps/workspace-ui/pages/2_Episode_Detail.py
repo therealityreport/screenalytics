@@ -3864,10 +3864,8 @@ with col_faces:
     _detect_just_completed_key = f"{ep_id}::detect_track_just_completed"
     if st.session_state.get(_detect_just_completed_key):
         LOGGER.info("[AUTORUN] Detected detect_track_just_completed flag, advancing to faces phase")
-        # Clear the flag to prevent re-processing
-        st.session_state.pop(_detect_just_completed_key, None)
-        # Get the summary that was stored
-        stored_summary = st.session_state.pop(f"{ep_id}::detect_track_summary", None)
+        # Get the stored completion context (do not clear until we successfully handle it).
+        stored_summary = st.session_state.get(f"{ep_id}::detect_track_summary")
         completed_at = st.session_state.get(f"{ep_id}::detect_track_completed_at")
 
         # Set tracks_completed_at if not already set
@@ -3875,16 +3873,19 @@ with col_faces:
             st.session_state[f"{ep_id}::tracks_completed_at"] = completed_at or time.time()
             LOGGER.info("[AUTORUN] Set tracks_completed_at from detect_track completion flag")
 
-        # Check if auto-run is active and waiting on detect phase
-        if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "detect":
-            # Build completed stage entry
-            if stored_summary:
+        # If auto-run is active, ALWAYS ensure the faces trigger is set after detect completes.
+        autorun_active_now = bool(st.session_state.get(_autorun_key))
+        phase_now = st.session_state.get(_autorun_phase_key)
+        faces_trigger_key = f"{ep_id}::autorun_faces_trigger"
+        faces_trigger_now = bool(st.session_state.get(faces_trigger_key))
+
+        if autorun_active_now and not faces_trigger_now and phase_now in (None, "detect", "faces"):
+            det_count: int | None = None
+            track_count: int | None = None
+            if isinstance(stored_summary, dict) and stored_summary:
                 normalized = helpers.normalize_summary(ep_id, stored_summary)
                 det_count = helpers.coerce_int(normalized.get("detections"))
                 track_count = helpers.coerce_int(normalized.get("tracks"))
-            else:
-                det_count, track_count = None, None
-            # Fallback to manifest counts
             if det_count is None or track_count is None:
                 try:
                     if detections_path.exists():
@@ -3893,19 +3894,34 @@ with col_faces:
                         track_count = sum(1 for line in tracks_path.open("r", encoding="utf-8") if line.strip())
                 except OSError:
                     pass
-            # Log completed stage
+
             completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
-            stage_label = f"Detect/Track ({det_count or '?':,} detections, {track_count or '?':,} tracks)"
-            if stage_label not in completed:
-                completed.append(stage_label)
+            if not any("Detect/Track" in s for s in completed):
+                det_display = f"{det_count:,}" if isinstance(det_count, int) else "?"
+                track_display = f"{track_count:,}" if isinstance(track_count, int) else "?"
+                completed.append(f"Detect/Track ({det_display} detections, {track_display} tracks)")
                 st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
-            # Advance to faces phase
+
             st.session_state[_autorun_phase_key] = "faces"
-            st.session_state[f"{ep_id}::autorun_faces_trigger"] = True
+            st.session_state[faces_trigger_key] = True
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            LOGGER.info("[AUTORUN] Advanced from detect to faces via completion flag")
+            LOGGER.info(
+                "[AUTORUN] Promoted detect completion -> faces trigger (phase was %s, det=%s, tracks=%s)",
+                phase_now,
+                det_count,
+                track_count,
+            )
+
+            # Clear completion signal now that we've promoted it.
+            st.session_state.pop(_detect_just_completed_key, None)
+            st.session_state.pop(f"{ep_id}::detect_track_summary", None)
+
             st.toast("✅ Detect/Track complete - starting Faces Harvest...")
             st.rerun()
+
+        # No promotion needed (manual run, or faces already queued); clear the completion signal.
+        st.session_state.pop(_detect_just_completed_key, None)
+        st.session_state.pop(f"{ep_id}::detect_track_summary", None)
 
     st.markdown("### Faces Harvest")
     st.caption(_format_phase_status("Faces Harvest", faces_phase_status, "faces"))
@@ -4298,10 +4314,8 @@ with col_cluster:
     _faces_just_completed_key = f"{ep_id}::faces_embed_just_completed"
     if st.session_state.get(_faces_just_completed_key):
         LOGGER.info("[AUTORUN] Detected faces_embed_just_completed flag, advancing to cluster phase")
-        # Clear the flag to prevent re-processing
-        st.session_state.pop(_faces_just_completed_key, None)
-        # Get the summary that was stored
-        stored_summary = st.session_state.pop(f"{ep_id}::faces_embed_summary", None)
+        # Get the stored completion context (do not clear until we successfully handle it).
+        stored_summary = st.session_state.get(f"{ep_id}::faces_embed_summary")
         completed_at = st.session_state.get(f"{ep_id}::faces_embed_completed_at")
 
         # Set faces_completed_at if not already set
@@ -4309,34 +4323,54 @@ with col_cluster:
             st.session_state[f"{ep_id}::faces_completed_at"] = completed_at or time.time()
             LOGGER.info("[AUTORUN] Set faces_completed_at from faces_embed completion flag")
 
-        # Check if auto-run is active and waiting on faces phase
-        if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "faces":
-            # Build completed stage entry
-            if stored_summary:
+        # If auto-run is active, ALWAYS ensure the cluster trigger is set after faces complete.
+        # This is intentionally tolerant of phase desync (e.g., phase already moved to "cluster"
+        # but the trigger was missed, or the script was restarted mid-stream).
+        autorun_active_now = bool(st.session_state.get(_autorun_key))
+        phase_now = st.session_state.get(_autorun_phase_key)
+        cluster_trigger_key = f"{ep_id}::autorun_cluster_trigger"
+        cluster_trigger_now = bool(st.session_state.get(cluster_trigger_key))
+
+        if autorun_active_now and not cluster_trigger_now:
+            faces_count: int | None = None
+            if isinstance(stored_summary, dict) and stored_summary:
                 normalized = helpers.normalize_summary(ep_id, stored_summary)
                 faces_count = helpers.coerce_int(normalized.get("faces"))
-            else:
-                faces_count = None
-            # Fallback to manifest count
             if faces_count is None:
                 try:
                     if faces_path.exists():
                         faces_count = sum(1 for line in faces_path.open("r", encoding="utf-8") if line.strip())
                 except OSError:
-                    pass
-            # Log completed stage
+                    faces_count = None
+
             completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
-            stage_label = f"Faces Harvest ({faces_count or '?':,} faces)"
-            if stage_label not in completed:
-                completed.append(stage_label)
+            if not any("Faces Harvest" in s for s in completed):
+                faces_count_display = f"{faces_count:,}" if isinstance(faces_count, int) else "?"
+                completed.append(f"Faces Harvest ({faces_count_display} faces)")
                 st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
-            # Advance to cluster phase
+
+            # Advance to cluster phase and trigger the next stage.
             st.session_state[_autorun_phase_key] = "cluster"
-            st.session_state[f"{ep_id}::autorun_cluster_trigger"] = True
+            st.session_state[cluster_trigger_key] = True
+            # Prevent faces from being repeatedly re-triggered after completion.
+            st.session_state.pop(f"{ep_id}::autorun_faces_trigger", None)
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            LOGGER.info("[AUTORUN] Advanced from faces to cluster via completion flag")
+            LOGGER.info(
+                "[AUTORUN] Promoted faces completion -> cluster trigger (phase was %s, faces=%s)",
+                phase_now,
+                faces_count,
+            )
+
+            # Clear completion signal now that we've promoted it.
+            st.session_state.pop(_faces_just_completed_key, None)
+            st.session_state.pop(f"{ep_id}::faces_embed_summary", None)
+
             st.toast("✅ Faces Harvest complete - starting Clustering...")
             st.rerun()
+
+        # No promotion needed (manual run, or cluster already queued); clear the completion signal.
+        st.session_state.pop(_faces_just_completed_key, None)
+        st.session_state.pop(f"{ep_id}::faces_embed_summary", None)
 
     # CRITICAL: Check for cluster completion flag set by ui_helpers
     # This handles the final phase where cluster completes and marks auto-run done
@@ -4532,10 +4566,14 @@ with col_cluster:
         effective_faces_ready = True
         effective_faces_stale = False
 
+    # Cluster relies on tracks.jsonl; use the run-scoped manifest as the most direct readiness signal.
+    tracks_manifest_ready = _manifest_has_rows(tracks_path)
+    effective_tracks_ready_for_cluster = tracks_ready or tracks_manifest_ready
+
     cluster_disabled = (
         (not effective_faces_ready)
         or (not detector_face_only)
-        or (not tracks_ready)
+        or (not effective_tracks_ready_for_cluster)
         or job_running
         or zero_faces_success
         or (not combo_supported_cluster)
@@ -4548,10 +4586,11 @@ with col_cluster:
     if autorun_active:
         LOGGER.info(
             "[AUTORUN CLUSTER] cluster_disabled=%s: effective_faces_ready=%s, detector_face_only=%s, "
-            "tracks_ready=%s, job_running=%s, zero_faces_success=%s, combo_supported=%s, "
+            "tracks_ready=%s (manifest=%s, effective=%s), job_running=%s, zero_faces_success=%s, combo_supported=%s, "
             "effective_faces_stale=%s, cluster_status=%s, running_cluster_job=%s, trigger_active=%s",
-            cluster_disabled, effective_faces_ready, detector_face_only, tracks_ready, job_running,
-            zero_faces_success, combo_supported_cluster, effective_faces_stale, cluster_status_value,
+            cluster_disabled, effective_faces_ready, detector_face_only, tracks_ready, tracks_manifest_ready,
+            effective_tracks_ready_for_cluster, job_running, zero_faces_success, combo_supported_cluster,
+            effective_faces_stale, cluster_status_value,
             running_cluster_job is not None, cluster_trigger_active
         )
 
@@ -4624,8 +4663,10 @@ with col_cluster:
                     reasons.append(f"- faces not ready (faces_ready={faces_ready}, faces_just_completed={faces_just_completed})")
                 if not detector_face_only:
                     reasons.append(f"- detector not face-only ({detector_face_only=})")
-                if not tracks_ready:
-                    reasons.append(f"- tracks not ready ({tracks_ready=})")
+                if not effective_tracks_ready_for_cluster:
+                    reasons.append(
+                        f"- tracks not ready (tracks_ready={tracks_ready}, tracks_manifest_ready={tracks_manifest_ready})"
+                    )
                 if job_running:
                     reasons.append(f"- job already running ({job_running=})")
                 if zero_faces_success:
