@@ -95,6 +95,15 @@ def test_face_alignment_config_is_default_on() -> None:
     assert bool(face_alignment.get("enabled", False)) is True
 
 
+def test_head_pose_config_is_default_on() -> None:
+    import yaml
+
+    cfg_path = Path("config/pipeline/face_alignment.yaml")
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    head_pose = data.get("head_pose_3d") or {}
+    assert bool(head_pose.get("enabled", False)) is True
+
+
 def test_faces_embed_writes_alignment_artifacts_by_default(tmp_path, monkeypatch) -> None:
     data_root = tmp_path / "data"
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
@@ -186,4 +195,3 @@ def test_faces_embed_does_not_write_alignment_artifacts_when_disabled(tmp_path, 
 
     aligned_faces_path = manifests_dir / "face_alignment" / "aligned_faces.jsonl"
     assert not aligned_faces_path.exists()
-

@@ -70,11 +70,28 @@ def _patch_face_alignment_enabled(monkeypatch, *, quality_gate: dict | None = No
     }
     if quality_gate is not None:
         face_alignment_cfg["quality_gate"] = quality_gate
+    config: dict = {"face_alignment": face_alignment_cfg}
+    monkeypatch.setattr(
+        episode_run,
+        "_load_alignment_config",
+        lambda: config,
+    )
+
+
+def _patch_face_alignment_with_head_pose(monkeypatch, *, head_pose_3d: dict) -> None:
+    face_alignment_cfg = {
+        "enabled": True,
+        "model": {"landmarks_type": "2D", "flip_input": False},
+        "processing": {"device": "cpu"},
+        "quality": {"min_face_size": 20},
+        "output": {"crop_size": 112, "crop_margin": 0.0},
+    }
     monkeypatch.setattr(
         episode_run,
         "_load_alignment_config",
         lambda: {
-            "face_alignment": face_alignment_cfg
+            "face_alignment": face_alignment_cfg,
+            "head_pose_3d": head_pose_3d,
         },
     )
 
@@ -373,3 +390,88 @@ def test_faces_embed_quality_gate_downweight_keeps_faces(tmp_path, monkeypatch) 
     assert len(faces) == 2
     weights = [f.get("alignment_quality_weight") for f in faces if f.get("alignment_quality_weight") is not None]
     assert weights and min(weights) < 1.0
+
+
+def test_faces_embed_writes_head_pose_fields_when_enabled(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "test-face-align-head-pose"
+    run_id = "runPose"
+    ensure_dirs(ep_id)
+
+    video_path = get_path(ep_id, "video")
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.touch()
+
+    _write_single_track(ep_id, run_id=run_id)
+
+    fake_embedder = _FakeEmbedder()
+    _patch_face_alignment_with_head_pose(
+        monkeypatch,
+        head_pose_3d={
+            "enabled": True,
+            "run_every_n_frames": 1,
+            "run_on_uncertain": False,
+            "uncertainty_threshold": 0.5,
+        },
+    )
+    _patch_embedding_config(monkeypatch, enable_legacy_alignment_gate=False)
+    _patch_fake_embedding_runtime(monkeypatch, fake_embedder)
+
+    from py_screenalytics.face_alignment import head_pose as head_pose_mod
+
+    monkeypatch.setattr(
+        head_pose_mod,
+        "estimate_head_pose_pnp",
+        lambda _lm, *, image_shape: head_pose_mod.HeadPoseEstimate(
+            yaw=10.0,
+            pitch=20.0,
+            roll=30.0,
+            reprojection_error_px=0.5,
+            source="unit_test",
+        ),
+    )
+
+    manifests_dir = episode_run._manifests_dir_for_run(ep_id, run_id=run_id)
+    progress_path = manifests_dir / "progress.json"
+
+    args = SimpleNamespace(
+        ep_id=ep_id,
+        run_id=run_id,
+        device="cpu",
+        save_frames=False,
+        save_crops=False,
+        jpeg_quality=85,
+        thumb_size=64,
+        progress_file=str(progress_path),
+        max_samples_per_track=1,
+        min_samples_per_track=1,
+        sample_every_n_frames=1,
+    )
+
+    summary = episode_run._run_faces_embed_stage(args, storage=None, ep_ctx=None, s3_prefixes=None)
+    assert summary.get("head_pose_3d", {}).get("computed") == 1
+
+    aligned_faces_path = manifests_dir / "face_alignment" / "aligned_faces.jsonl"
+    aligned_rows = [
+        json.loads(line)
+        for line in aligned_faces_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert aligned_rows and aligned_rows[0].get("pose_yaw") == 10.0
+    assert aligned_rows[0].get("pose_pitch") == 20.0
+    assert aligned_rows[0].get("pose_roll") == 30.0
+    assert aligned_rows[0].get("pose_reprojection_error_px") == 0.5
+    assert aligned_rows[0].get("pose_source") == "unit_test"
+
+    faces = [
+        json.loads(line)
+        for line in (manifests_dir / "faces.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert faces and faces[0].get("pose_yaw") == 10.0
+    assert faces[0].get("pose_pitch") == 20.0
+    assert faces[0].get("pose_roll") == 30.0
+    assert faces[0].get("pose_reprojection_error_px") == 0.5
+    assert faces[0].get("pose_source") == "unit_test"
