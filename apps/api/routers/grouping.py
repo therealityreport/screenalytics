@@ -793,6 +793,464 @@ def get_cast_suggestions(
         )
 
 
+# =============================================================================
+# Smart Suggestions Persistence (DB-backed, run-scoped)
+# =============================================================================
+
+
+class SmartSuggestionsGenerateRequest(BaseModel):
+    min_similarity: float = Field(0.01, ge=0.0, le=1.0, description="Minimum similarity threshold")
+    top_k: int = Field(3, ge=1, le=10, description="Top-k cast candidates per cluster")
+    generator_version: str = Field("cast_suggestions_v1", description="Generator version identifier")
+
+
+class SmartSuggestionsDismissRequest(BaseModel):
+    batch_id: str = Field(..., description="Suggestion batch id (required)")
+    suggestion_ids: List[str] = Field(..., description="Suggestion ids to dismiss/restore")
+    dismissed: bool = Field(True, description="True=dismiss, False=restore")
+
+
+class SmartSuggestionsApplyRequest(BaseModel):
+    batch_id: str = Field(..., description="Suggestion batch id (required)")
+    suggestion_id: str = Field(..., description="Suggestion id to apply")
+    applied_by: str | None = Field(None, description="Optional actor identifier (email/username)")
+    cast_id_override: str | None = Field(
+        None,
+        description="Optional cast_id override (when user selects a non-top suggestion)",
+    )
+
+
+class SmartSuggestionsApplyAllRequest(BaseModel):
+    batch_id: str = Field(..., description="Suggestion batch id (required)")
+    applied_by: str | None = Field(None, description="Optional actor identifier (email/username)")
+
+
+def _identity_person_map(ep_id: str, *, run_id: str | None) -> dict[str, str | None]:
+    from apps.api.services.identities import load_identities
+
+    payload = load_identities(ep_id, run_id=run_id)
+    identities = payload.get("identities", []) if isinstance(payload, dict) else []
+    mapping: dict[str, str | None] = {}
+    for identity in identities:
+        if not isinstance(identity, dict):
+            continue
+        cid = identity.get("identity_id") or identity.get("id")
+        if not cid:
+            continue
+        mapping[str(cid)] = identity.get("person_id")
+    return mapping
+
+
+def _people_by_id(ep_id: str) -> dict[str, dict[str, Any]]:
+    parsed = _parse_ep_id(ep_id)
+    show_id = parsed["show"] if parsed else None
+    if not show_id:
+        return {}
+    people = people_service.list_people(show_id)
+    return {p.get("person_id"): p for p in people if isinstance(p, dict) and p.get("person_id")}
+
+
+@router.post("/episodes/{ep_id}/smart_suggestions/generate")
+def generate_smart_suggestions(
+    ep_id: str,
+    body: SmartSuggestionsGenerateRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    """Generate a new persisted Smart Suggestions batch (run-scoped)."""
+    try:
+        scoped_service = _scoped_grouping_service(run_id)
+        result = scoped_service.suggest_cast_for_unassigned_clusters(
+            ep_id,
+            min_similarity=body.min_similarity,
+            top_k=body.top_k,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate suggestions: {exc}") from exc
+
+    suggestions_entries = result.get("suggestions", []) if isinstance(result, dict) else []
+    rows: list[dict[str, Any]] = []
+    for entry in suggestions_entries:
+        if not isinstance(entry, dict):
+            continue
+        cluster_id = entry.get("cluster_id")
+        cast_suggestions = entry.get("cast_suggestions") or []
+        if not cluster_id or not isinstance(cast_suggestions, list) or not cast_suggestions:
+            continue
+        best = cast_suggestions[0] if isinstance(cast_suggestions[0], dict) else None
+        if not best:
+            continue
+        best_cast_id = best.get("cast_id")
+        similarity = best.get("similarity")
+        try:
+            similarity_value = float(similarity) if similarity is not None else 0.0
+        except (TypeError, ValueError):
+            similarity_value = 0.0
+
+        rows.append(
+            {
+                "type": "cluster_cast_assignment",
+                "target_identity_id": str(cluster_id),
+                "suggested_person_id": str(best_cast_id) if best_cast_id else "",
+                "confidence": similarity_value,
+                "evidence_json": {
+                    "cluster_id": cluster_id,
+                    "best": best,
+                    "cast_suggestions": cast_suggestions,
+                    "meta": {k: v for k, v in entry.items() if k not in {"cast_suggestions"}},
+                },
+            }
+        )
+
+    try:
+        from py_screenalytics import run_layout
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        run_persistence_service.ensure_run(ep_id=ep_id, run_id=run_id_norm)
+        batch_id = run_persistence_service.create_suggestion_batch(
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            generator_version=body.generator_version,
+            generator_config_json={
+                "min_similarity": body.min_similarity,
+                "top_k": body.top_k,
+                "source": "GroupingService.suggest_cast_for_unassigned_clusters",
+            },
+            summary_json={
+                "clusters_with_suggestions": len(rows),
+                "mismatched_embeddings": len(result.get("mismatched_embeddings", []) if isinstance(result, dict) else []),
+                "quality_only_clusters": len(result.get("quality_only_clusters", []) if isinstance(result, dict) else []),
+            },
+        )
+
+        inserted = run_persistence_service.insert_suggestions(batch_id=batch_id, ep_id=ep_id, run_id=run_id_norm, rows=rows)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to persist suggestions: {exc}") from exc
+
+    return {
+        "status": "success",
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "batch_id": batch_id,
+        "counts": {
+            "suggestions_persisted": len(inserted),
+            "clusters_with_suggestions": len(rows),
+        },
+        "suggestions": inserted,
+        "mismatched_embeddings": result.get("mismatched_embeddings", []) if isinstance(result, dict) else [],
+        "quality_only_clusters": result.get("quality_only_clusters", []) if isinstance(result, dict) else [],
+    }
+
+
+@router.get("/episodes/{ep_id}/smart_suggestions/batches")
+def list_smart_suggestion_batches(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required)"),
+    limit: int = Query(25, ge=1, le=250),
+) -> dict:
+    try:
+        from py_screenalytics import run_layout
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list suggestion batches: {exc}") from exc
+    return {"status": "success", "ep_id": ep_id, "run_id": run_id_norm, "batches": batches}
+
+
+@router.get("/episodes/{ep_id}/smart_suggestions")
+def list_smart_suggestions(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required)"),
+    batch_id: str | None = Query(None, description="Optional batch_id (defaults to latest)"),
+    include_dismissed: bool = Query(False, description="Include dismissed suggestions"),
+) -> dict:
+    try:
+        from py_screenalytics import run_layout
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        effective_batch_id = batch_id
+        if not effective_batch_id:
+            batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=1)
+            effective_batch_id = (batches[0].get("batch_id") if batches else None)
+        if not effective_batch_id:
+            return {"status": "success", "ep_id": ep_id, "run_id": run_id_norm, "batch_id": None, "suggestions": []}
+
+        suggestions = run_persistence_service.list_suggestions(
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            batch_id=str(effective_batch_id),
+            include_dismissed=include_dismissed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list suggestions: {exc}") from exc
+    return {
+        "status": "success",
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "batch_id": str(effective_batch_id),
+        "suggestions": suggestions,
+    }
+
+
+@router.post("/episodes/{ep_id}/smart_suggestions/dismiss")
+def dismiss_smart_suggestions(
+    ep_id: str,
+    body: SmartSuggestionsDismissRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    try:
+        from py_screenalytics import run_layout
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        updated = 0
+        for sid in body.suggestion_ids:
+            if run_persistence_service.set_suggestion_dismissed(
+                ep_id=ep_id,
+                run_id=run_id_norm,
+                batch_id=body.batch_id,
+                suggestion_id=sid,
+                dismissed=bool(body.dismissed),
+            ):
+                updated += 1
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update dismissed state: {exc}") from exc
+    return {
+        "status": "success",
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "batch_id": body.batch_id,
+        "dismissed": bool(body.dismissed),
+        "updated": updated,
+        "requested": len(body.suggestion_ids),
+    }
+
+
+@router.post("/episodes/{ep_id}/smart_suggestions/apply")
+def apply_smart_suggestion(
+    ep_id: str,
+    body: SmartSuggestionsApplyRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    """Apply a single suggestion (run-scoped; enforces identity locks)."""
+    try:
+        from py_screenalytics import run_layout
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        suggestions = run_persistence_service.list_suggestions(
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            batch_id=body.batch_id,
+            include_dismissed=True,
+        )
+        suggestion = next((s for s in suggestions if s.get("suggestion_id") == body.suggestion_id), None)
+        if not suggestion:
+            raise HTTPException(status_code=404, detail="suggestion_not_found")
+        if suggestion.get("dismissed"):
+            return {"status": "skipped", "reason": "dismissed", "ep_id": ep_id, "run_id": run_id_norm}
+
+        target_identity_id = suggestion.get("target_identity_id")
+        if not target_identity_id:
+            raise HTTPException(status_code=400, detail="suggestion_missing_target_identity_id")
+
+        if run_persistence_service.is_identity_locked(ep_id=ep_id, run_id=run_id_norm, identity_id=str(target_identity_id)):
+            return {"status": "skipped", "reason": "locked", "ep_id": ep_id, "run_id": run_id_norm}
+
+        people_by_id = _people_by_id(ep_id)
+        before_map = _identity_person_map(ep_id, run_id=run_id_norm)
+        before_person_id = before_map.get(str(target_identity_id))
+        before_cast_id = (people_by_id.get(before_person_id or "", {}) or {}).get("cast_id") if before_person_id else None
+
+        cast_id = body.cast_id_override or suggestion.get("suggested_person_id")
+        if not cast_id:
+            raise HTTPException(status_code=400, detail="suggestion_missing_cast_id")
+
+        # Skip if already assigned to a cast member.
+        if before_cast_id:
+            return {
+                "status": "skipped",
+                "reason": "already_assigned",
+                "ep_id": ep_id,
+                "run_id": run_id_norm,
+            }
+
+        class _Assign:
+            def __init__(self, cluster_id: str, target_cast_id: str) -> None:
+                self.cluster_id = cluster_id
+                self.target_cast_id = target_cast_id
+
+        scoped_service = _scoped_grouping_service(run_id_norm)
+        scoped_service.batch_assign_clusters(ep_id, [_Assign(str(target_identity_id), str(cast_id))])
+
+        after_map = _identity_person_map(ep_id, run_id=run_id_norm)
+        after_person_id = after_map.get(str(target_identity_id))
+        people_after = _people_by_id(ep_id)
+        after_cast_id = (people_after.get(after_person_id or "", {}) or {}).get("cast_id") if after_person_id else None
+
+        apply_id = run_persistence_service.record_suggestion_apply(
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            batch_id=body.batch_id,
+            suggestion_id=body.suggestion_id,
+            applied_by=body.applied_by,
+            changes_json={
+                "target_identity_id": str(target_identity_id),
+                "suggestion_cast_id": suggestion.get("suggested_person_id"),
+                "applied_cast_id": str(cast_id),
+                "before_person_id": before_person_id,
+                "after_person_id": after_person_id,
+                "before_cast_id": before_cast_id,
+                "after_cast_id": after_cast_id,
+            },
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to apply suggestion: {exc}") from exc
+
+    return {
+        "status": "success",
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "batch_id": body.batch_id,
+        "suggestion_id": body.suggestion_id,
+        "apply_id": apply_id,
+    }
+
+
+@router.post("/episodes/{ep_id}/smart_suggestions/apply_all")
+def apply_all_smart_suggestions(
+    ep_id: str,
+    body: SmartSuggestionsApplyAllRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    """Apply all suggestions in a batch (run-scoped; requires batch_id)."""
+    try:
+        from py_screenalytics import run_layout
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        suggestions = run_persistence_service.list_suggestions(
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            batch_id=body.batch_id,
+            include_dismissed=False,
+        )
+
+        locked_set = {
+            row.get("identity_id")
+            for row in run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
+            if isinstance(row, dict) and row.get("locked") and row.get("identity_id")
+        }
+
+        # Deduplicate by target_identity_id (keep highest confidence per cluster).
+        best_by_cluster: dict[str, dict[str, Any]] = {}
+        for s in suggestions:
+            cid = s.get("target_identity_id")
+            if not cid:
+                continue
+            if cid not in best_by_cluster or float(s.get("confidence") or 0.0) > float(best_by_cluster[cid].get("confidence") or 0.0):
+                best_by_cluster[cid] = s
+
+        people_before = _people_by_id(ep_id)
+        before_map = _identity_person_map(ep_id, run_id=run_id_norm)
+
+        to_apply: list[tuple[str, str, str]] = []  # (cluster_id, cast_id, suggestion_id)
+        skipped_locked = 0
+        skipped_already_assigned = 0
+
+        for cid, s in best_by_cluster.items():
+            if cid in locked_set:
+                skipped_locked += 1
+                continue
+            before_person_id = before_map.get(cid)
+            before_cast_id = (people_before.get(before_person_id or "", {}) or {}).get("cast_id") if before_person_id else None
+            if before_cast_id:
+                skipped_already_assigned += 1
+                continue
+            cast_id = s.get("suggested_person_id")
+            if not cast_id:
+                continue
+            to_apply.append((cid, str(cast_id), str(s.get("suggestion_id"))))
+
+        class _Assign:
+            def __init__(self, cluster_id: str, target_cast_id: str) -> None:
+                self.cluster_id = cluster_id
+                self.target_cast_id = target_cast_id
+
+        scoped_service = _scoped_grouping_service(run_id_norm)
+        assignments = [_Assign(cid, cast_id) for (cid, cast_id, _sid) in to_apply]
+        batch_result = scoped_service.batch_assign_clusters(ep_id, assignments) if assignments else {"succeeded": 0, "failed": 0, "results": []}
+
+        after_map = _identity_person_map(ep_id, run_id=run_id_norm)
+        people_after = _people_by_id(ep_id)
+
+        applied = 0
+        apply_ids: list[str] = []
+        for cid, cast_id, sid in to_apply:
+            before_person_id = before_map.get(cid)
+            after_person_id = after_map.get(cid)
+            after_cast_id = (people_after.get(after_person_id or "", {}) or {}).get("cast_id") if after_person_id else None
+            if after_cast_id:
+                applied += 1
+            apply_ids.append(
+                run_persistence_service.record_suggestion_apply(
+                    ep_id=ep_id,
+                    run_id=run_id_norm,
+                    batch_id=body.batch_id,
+                    suggestion_id=sid,
+                    applied_by=body.applied_by,
+                    changes_json={
+                        "target_identity_id": cid,
+                        "applied_cast_id": cast_id,
+                        "before_person_id": before_person_id,
+                        "after_person_id": after_person_id,
+                        "before_cast_id": (people_before.get(before_person_id or "", {}) or {}).get("cast_id") if before_person_id else None,
+                        "after_cast_id": after_cast_id,
+                        "mode": "apply_all",
+                    },
+                )
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to apply all: {exc}") from exc
+
+    return {
+        "status": "success",
+        "ep_id": ep_id,
+        "run_id": run_id_norm,
+        "batch_id": body.batch_id,
+        "counts": {
+            "applied": applied,
+            "skipped_locked": skipped_locked,
+            "skipped_dismissed": 0,
+            "skipped_already_assigned": skipped_already_assigned,
+            "requested": len(best_by_cluster),
+        },
+        "job": batch_result,
+        "apply_ids": apply_ids,
+    }
+
+
 @router.get("/episodes/{ep_id}/unlinked_entities")
 def list_unlinked_entities(
     ep_id: str,

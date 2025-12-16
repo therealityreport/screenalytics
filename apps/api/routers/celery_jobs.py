@@ -2208,6 +2208,13 @@ def _stream_local_subprocess(
     Yields:
         Newline-delimited JSON strings
     """
+    run_id_norm: str | None = None
+    try:
+        run_id_norm = _normalize_optional_run_id(options.get("run_id")) if isinstance(options, dict) else None
+    except ValueError:
+        run_id_norm = None
+
+    job_run_id: str | None = None
     # Check for existing running job (in-memory registry)
     existing_job = _get_running_local_job(episode_id, operation)
     if existing_job:
@@ -2382,6 +2389,34 @@ def _stream_local_subprocess(
         return text
 
     try:
+        # Best-effort DB persistence for local-mode runs (do not block pipeline execution).
+        if run_id_norm:
+            try:
+                from apps.api.services.run_persistence import run_persistence_service
+
+                run_persistence_service.ensure_run(ep_id=episode_id, run_id=run_id_norm, config_json=options)
+                job_run_id = run_persistence_service.create_job_run(
+                    ep_id=episode_id,
+                    run_id=run_id_norm,
+                    job_name=operation,
+                    request_json={
+                        "execution_mode": "local",
+                        "operation": operation,
+                        "options": options,
+                        "command": command,
+                    },
+                    status="running",
+                    started_at=datetime.now(timezone.utc),
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "[%s] Failed to persist local job start for %s (run_id=%s): %s",
+                    episode_id,
+                    operation,
+                    run_id_norm,
+                    exc,
+                )
+
         # Start subprocess with line-buffered output for streaming
         process = subprocess.Popen(
             effective_command,
@@ -2428,6 +2463,20 @@ def _stream_local_subprocess(
                     "elapsed_seconds": elapsed,
                     "error": f"Job timed out after {timeout} seconds",
                 }) + "\n"
+
+                if run_id_norm and job_run_id:
+                    try:
+                        from apps.api.services.run_persistence import run_persistence_service
+
+                        run_persistence_service.update_job_run(
+                            job_run_id=job_run_id,
+                            status="failed",
+                            finished_at=datetime.now(timezone.utc),
+                            error_text=f"timeout after {timeout}s",
+                            metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "timeout_s": timeout},
+                        )
+                    except Exception:
+                        pass
                 return
 
             stripped = raw_line.rstrip()
@@ -2513,6 +2562,51 @@ def _stream_local_subprocess(
                 "return_code": process.returncode,
                 "error": error_msg,
             }) + "\n"
+
+            if run_id_norm and job_run_id:
+                try:
+                    from py_screenalytics import run_layout
+                    from apps.api.services.run_persistence import run_persistence_service
+
+                    run_root = run_layout.run_root(episode_id, run_id_norm)
+                    artifact_index = {"run_root": str(run_root), "key_artifacts": []}
+                    for rel in (
+                        "progress.json",
+                        "detections.jsonl",
+                        "tracks.jsonl",
+                        "faces.jsonl",
+                        "identities.json",
+                        "track_metrics.json",
+                        "cluster_centroids.json",
+                        "track_reps.jsonl",
+                        "group_log.json",
+                        "face_review_state.json",
+                    ):
+                        path = run_root / rel
+                        if not path.exists():
+                            continue
+                        try:
+                            stat = path.stat()
+                            artifact_index["key_artifacts"].append(
+                                {"path": rel, "bytes": int(stat.st_size), "mtime": float(stat.st_mtime)}
+                            )
+                        except OSError:
+                            artifact_index["key_artifacts"].append({"path": rel})
+
+                    run_persistence_service.update_job_run(
+                        job_run_id=job_run_id,
+                        status="failed",
+                        finished_at=datetime.now(timezone.utc),
+                        error_text=error_msg,
+                        artifact_index_json=artifact_index,
+                        metrics_json={
+                            "execution_mode": "local",
+                            "elapsed_seconds": elapsed,
+                            "return_code": process.returncode,
+                        },
+                    )
+                except Exception:
+                    pass
             return
 
         # Success - emit completion summary
@@ -2523,21 +2617,55 @@ def _stream_local_subprocess(
         # Save logs
         _save_logs_always("completed", elapsed)
 
+        if run_id_norm and job_run_id:
+            try:
+                from py_screenalytics import run_layout
+                from apps.api.services.run_persistence import run_persistence_service
+
+                run_root = run_layout.run_root(episode_id, run_id_norm)
+                artifact_index = {"run_root": str(run_root), "key_artifacts": []}
+                for rel in (
+                    "progress.json",
+                    "detections.jsonl",
+                    "tracks.jsonl",
+                    "faces.jsonl",
+                    "identities.json",
+                    "track_metrics.json",
+                    "cluster_centroids.json",
+                    "track_reps.jsonl",
+                    "group_log.json",
+                    "face_review_state.json",
+                ):
+                    path = run_root / rel
+                    if not path.exists():
+                        continue
+                    try:
+                        stat = path.stat()
+                        artifact_index["key_artifacts"].append(
+                            {"path": rel, "bytes": int(stat.st_size), "mtime": float(stat.st_mtime)}
+                        )
+                    except OSError:
+                        artifact_index["key_artifacts"].append({"path": rel})
+
+                run_persistence_service.update_job_run(
+                    job_run_id=job_run_id,
+                    status="succeeded",
+                    finished_at=datetime.now(timezone.utc),
+                    artifact_index_json=artifact_index,
+                    metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "return_code": 0},
+                )
+            except Exception:
+                pass
+
         # Read counts from manifest files for auto-run progression
         # These counts are CRITICAL for the UI to detect job completion and trigger next phase
         summary_counts: Dict[str, Any] = {}
-        run_id: str | None = None
         try:
             from py_screenalytics.artifacts import get_path
             from py_screenalytics import run_layout
 
-            try:
-                run_id = _normalize_optional_run_id(options.get("run_id")) if isinstance(options, dict) else None
-            except ValueError:
-                run_id = None
-
             manifests_root = get_path(episode_id, "detections").parent
-            manifests_dir = run_layout.run_root(episode_id, run_id) if run_id else manifests_root
+            manifests_dir = run_layout.run_root(episode_id, run_id_norm) if run_id_norm else manifests_root
 
             if operation == "detect_track":
                 det_path = manifests_dir / "detections.jsonl"
@@ -2568,12 +2696,24 @@ def _stream_local_subprocess(
 
         yield json.dumps({
             "type": "summary",
-            "run_id": run_id,
+            "run_id": run_id_norm,
             "status": "completed",
             "elapsed_seconds": elapsed,
             "return_code": 0,
             **summary_counts,
         }) + "\n"
+
+        # Persist a post-job stage snapshot for the run (best-effort).
+        if run_id_norm:
+            try:
+                from apps.api.routers.episodes import _episode_run_status
+                from apps.api.services.run_persistence import run_persistence_service
+
+                snapshot = _episode_run_status(episode_id, run_id_norm).model_dump()
+                snapshot["computed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                run_persistence_service.update_run_stage_state(run_id=run_id_norm, stage_state_json=snapshot)
+            except Exception:
+                pass
 
     except GeneratorExit:
         # Client disconnected (page refresh, navigation, etc.) - kill the subprocess
@@ -2588,6 +2728,20 @@ def _stream_local_subprocess(
 
         # ALWAYS save logs, even on cancel
         _save_logs_always("cancelled", elapsed)
+
+        if run_id_norm and job_run_id:
+            try:
+                from apps.api.services.run_persistence import run_persistence_service
+
+                run_persistence_service.update_job_run(
+                    job_run_id=job_run_id,
+                    status="failed",
+                    finished_at=datetime.now(timezone.utc),
+                    error_text="cancelled: client disconnected",
+                    metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed, "cancelled": True},
+                )
+            except Exception:
+                pass
         raise
 
     except Exception as e:
@@ -2605,6 +2759,20 @@ def _stream_local_subprocess(
 
         # ALWAYS save logs, even on exception
         _save_logs_always("error", elapsed, {"exception": error_msg})
+
+        if run_id_norm and job_run_id:
+            try:
+                from apps.api.services.run_persistence import run_persistence_service
+
+                run_persistence_service.update_job_run(
+                    job_run_id=job_run_id,
+                    status="failed",
+                    finished_at=datetime.now(timezone.utc),
+                    error_text=error_msg,
+                    metrics_json={"execution_mode": "local", "elapsed_seconds": elapsed},
+                )
+            except Exception:
+                pass
 
         yield json.dumps({
             "type": "summary",

@@ -2246,6 +2246,124 @@ def episode_run_status(ep_id: str, run_id: str | None = Query(None)) -> EpisodeS
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.get("/episodes/{ep_id}/runs", tags=["episodes"])
+def list_episode_runs(
+    ep_id: str,
+    limit: int = Query(100, ge=1, le=500, description="Max DB runs to return"),
+) -> dict:
+    """List run records for an episode (DB-backed, with disk fallback metadata)."""
+    ep_id_norm = normalize_ep_id(ep_id)
+    db_error: str | None = None
+    runs: list[dict[str, Any]] = []
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        runs = run_persistence_service.list_runs(ep_id=ep_id_norm, limit=limit)
+    except Exception as exc:
+        db_error = str(exc)
+
+    run_ids_on_disk = run_layout.list_run_ids(ep_id_norm)
+    active_run_id = _resolve_active_run_id(ep_id_norm)
+
+    payload: dict[str, Any] = {
+        "ep_id": ep_id_norm,
+        "active_run_id": active_run_id,
+        "runs": runs,
+        "run_ids_on_disk": run_ids_on_disk,
+    }
+    if db_error:
+        payload["db_error"] = db_error
+    return payload
+
+
+class IdentityLockRequest(BaseModel):
+    locked_by: str | None = Field(None, description="Optional actor identifier (email/username)")
+    reason: str | None = Field(None, description="Optional reason for the lock")
+
+
+@router.get("/episodes/{ep_id}/identity_locks", tags=["episodes"])
+def list_identity_locks(
+    ep_id: str,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        locks = run_persistence_service.list_identity_locks(ep_id=ep_id_norm, run_id=run_id_norm)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load identity locks: {exc}") from exc
+
+    return {"ep_id": ep_id_norm, "run_id": run_id_norm, "locks": locks}
+
+
+@router.post("/episodes/{ep_id}/identities/{identity_id}/lock", tags=["episodes"])
+def lock_identity(
+    ep_id: str,
+    identity_id: str,
+    body: IdentityLockRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_persistence_service.ensure_run(ep_id=ep_id_norm, run_id=run_id_norm)
+        lock_row = run_persistence_service.set_identity_lock(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            identity_id=str(identity_id),
+            locked=True,
+            locked_by=(body.locked_by or None),
+            reason=(body.reason or None),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to lock identity: {exc}") from exc
+
+    return {"status": "success", "ep_id": ep_id_norm, "run_id": run_id_norm, "lock": lock_row}
+
+
+@router.post("/episodes/{ep_id}/identities/{identity_id}/unlock", tags=["episodes"])
+def unlock_identity(
+    ep_id: str,
+    identity_id: str,
+    body: IdentityLockRequest,
+    run_id: str = Query(..., description="Run id scope (required)"),
+) -> dict:
+    ep_id_norm = normalize_ep_id(ep_id)
+    try:
+        run_id_norm = _normalize_run_id(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        run_persistence_service.ensure_run(ep_id=ep_id_norm, run_id=run_id_norm)
+        lock_row = run_persistence_service.set_identity_lock(
+            ep_id=ep_id_norm,
+            run_id=run_id_norm,
+            identity_id=str(identity_id),
+            locked=False,
+            locked_by=(body.locked_by or None),
+            reason=(body.reason or None),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to unlock identity: {exc}") from exc
+
+    return {"status": "success", "ep_id": ep_id_norm, "run_id": run_id_norm, "lock": lock_row}
+
+
 @router.get("/episodes/{ep_id}/runs/{run_id}/export", tags=["episodes"])
 def export_run_debug_bundle(
     ep_id: str,
@@ -4975,7 +5093,10 @@ def bulk_assign_tracks(
     This creates or updates identity assignments for each track, similar to
     calling assign_track_name for each track individually but more efficient.
     """
+    ep_id_norm = normalize_ep_id(ep_id)
+
     assigned = 0
+    skipped_locked = 0
     failed = 0
     errors: list[str] = []
 
@@ -4984,10 +5105,36 @@ def bulk_assign_tracks(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    locked_identities: set[str] = set()
+    try:
+        from apps.api.services.run_persistence import run_persistence_service
+
+        for row in run_persistence_service.list_identity_locks(ep_id=ep_id_norm, run_id=run_id_norm):
+            if isinstance(row, dict) and row.get("locked") and row.get("identity_id"):
+                locked_identities.add(str(row["identity_id"]))
+    except Exception:
+        locked_identities = set()
+
+    # Precompute track -> identity mapping so we can skip locked identities deterministically.
+    try:
+        identities_payload = identity_service.load_identities(ep_id_norm, run_id=run_id_norm)
+        track_identity_map = _identity_lookup(identities_payload)
+    except Exception:
+        track_identity_map = {}
+
     for track_id in body.track_ids:
         try:
+            identity_id = None
+            try:
+                identity_id = track_identity_map.get(int(track_id))
+            except (TypeError, ValueError):
+                identity_id = None
+            if identity_id and identity_id in locked_identities:
+                skipped_locked += 1
+                continue
+
             identity_service.assign_track_name(
-                ep_id,
+                ep_id_norm,
                 track_id,
                 body.name,
                 body.show,
@@ -5004,6 +5151,7 @@ def bulk_assign_tracks(
 
     return {
         "assigned": assigned,
+        "skipped_locked": skipped_locked,
         "failed": failed,
         "errors": errors if errors else None,
     }
