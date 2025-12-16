@@ -5,35 +5,41 @@
     "face_alignment": {
       "title": "Face Alignment",
       "status": "partial",
-      "integrated_in_jobs": [],
-      "integrated_in_autorun": false,
+      "integrated_in_jobs": [
+        "harvest"
+      ],
+      "integrated_in_autorun": true,
       "enabled_by_default": false,
       "how_to_enable": {
         "config_key": "config/pipeline/face_alignment.yaml:face_alignment.enabled",
         "ui_path": null,
-        "cli_flag": "python -m FEATURES.face_alignment"
+        "cli_flag": "python -m FEATURES.face_alignment (legacy sandbox runner)"
       },
       "evidence_paths": [
         "tools/episode_run.py",
+        "py_screenalytics/face_alignment/fan2d.py",
         "config/pipeline/face_alignment.yaml",
         "config/pipeline/embedding.yaml"
       ],
       "phases": {
         "A_FAN_2D": {
-          "status": "implemented_sandbox",
-          "integrated_in_jobs": [],
-          "integrated_in_autorun": false,
+          "status": "implemented_production",
+          "integrated_in_jobs": [
+            "harvest"
+          ],
+          "integrated_in_autorun": true,
           "enabled_by_default": false,
           "how_to_enable": {
             "config_key": "config/pipeline/face_alignment.yaml:face_alignment.enabled",
             "ui_path": null,
-            "cli_flag": "python -m FEATURES.face_alignment"
+            "cli_flag": "python -m FEATURES.face_alignment (legacy sandbox runner)"
           },
           "evidence_paths": [
-            "FEATURES/face_alignment/src/run_fan_alignment.py",
-            "FEATURES/face_alignment/src/face_alignment_runner.py"
+            "py_screenalytics/face_alignment/fan2d.py",
+            "tools/episode_run.py",
+            "FEATURES/face_alignment/src/run_fan_alignment.py"
           ],
-          "notes": "FAN 68-point alignment exists as a FEATURE sandbox. Harvest can read alignment_quality from aligned_faces.jsonl if present, but FAN is NOT executed as part of any job—it must be run separately via CLI."
+          "notes": "FAN 68-point alignment runs inside faces_embed when face_alignment.enabled=true. It writes runs/{run_id}/face_alignment/aligned_faces.jsonl and uses aligned crops for ArcFace embeddings. Requires optional dependency: face-alignment (pip install face-alignment)."
         },
         "B_LUVLi_quality_gate": {
           "status": "heuristic_stub",
