@@ -19,7 +19,7 @@ is_truthy() {
 }
 
 # ============================================================================
-# Kill-only mode: DEV_KILL_ONLY=1 or --kill flag
+# Kill all services helper
 # ============================================================================
 kill_all_services() {
     echo "[dev_auto] Killing all services..."
@@ -56,9 +56,17 @@ EOF
     echo "[dev_auto] All services stopped."
 }
 
-if is_truthy "${DEV_KILL_ONLY:-}" || [[ "${1:-}" == "--kill" ]]; then
+# --kill flag: kill only, don't start
+if [[ "${1:-}" == "--kill" ]]; then
     kill_all_services
     exit 0
+fi
+
+# DEV_AUTO_YES: kill services first, then start fresh (no prompt)
+if is_truthy "${DEV_AUTO_YES:-}"; then
+    kill_all_services
+    echo ""
+    echo "[dev_auto] Starting fresh..."
 fi
 
 if [[ "${TERM_PROGRAM:-}" == "vscode" ]]; then
