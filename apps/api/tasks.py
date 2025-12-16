@@ -1172,23 +1172,22 @@ def run_detect_track_task(
 
         env = os.environ.copy()
         cpu_threads = options.get("cpu_threads")
-        if cpu_threads:
-            # Cap threads between 1 and available CPU count to prevent overheating
-            max_allowed = os.cpu_count() or 8
-            threads = max(1, min(int(cpu_threads), max_allowed))
-            # Apply CPU thread caps to downstream ML libraries for laptop-friendly runs
-            env.update(
-                {
-                    "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
-                    "OMP_NUM_THREADS": str(threads),
-                    "MKL_NUM_THREADS": str(threads),
-                    "OPENBLAS_NUM_THREADS": str(threads),
-                    "VECLIB_MAXIMUM_THREADS": str(threads),
-                    "NUMEXPR_NUM_THREADS": str(threads),
-                    "ORT_INTRA_OP_NUM_THREADS": str(threads),
-                    "ORT_INTER_OP_NUM_THREADS": "1",
-                }
-            )
+        # Default to 4 threads (balanced profile) if not specified to prevent overheating
+        max_allowed = os.cpu_count() or 8
+        threads = max(1, min(int(cpu_threads) if cpu_threads else 4, max_allowed))
+        # Apply CPU thread caps to downstream ML libraries for laptop-friendly runs
+        env.update(
+            {
+                "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+                "OMP_NUM_THREADS": str(threads),
+                "MKL_NUM_THREADS": str(threads),
+                "OPENBLAS_NUM_THREADS": str(threads),
+                "VECLIB_MAXIMUM_THREADS": str(threads),
+                "NUMEXPR_NUM_THREADS": str(threads),
+                "ORT_INTRA_OP_NUM_THREADS": str(threads),
+                "ORT_INTER_OP_NUM_THREADS": "1",
+            }
+        )
 
         # Update progress
         self.update_state(
@@ -1301,21 +1300,21 @@ def run_faces_embed_task(
         # Apply CPU thread limits for laptop-friendly runs
         env = os.environ.copy()
         cpu_threads = options.get("cpu_threads")
-        if cpu_threads:
-            max_allowed = os.cpu_count() or 8
-            threads = max(1, min(int(cpu_threads), max_allowed))
-            env.update(
-                {
-                    "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
-                    "OMP_NUM_THREADS": str(threads),
-                    "MKL_NUM_THREADS": str(threads),
-                    "OPENBLAS_NUM_THREADS": str(threads),
-                    "VECLIB_MAXIMUM_THREADS": str(threads),
-                    "NUMEXPR_NUM_THREADS": str(threads),
-                    "ORT_INTRA_OP_NUM_THREADS": str(threads),
-                    "ORT_INTER_OP_NUM_THREADS": "1",
-                }
-            )
+        # Default to 4 threads (balanced profile) if not specified to prevent overheating
+        max_allowed = os.cpu_count() or 8
+        threads = max(1, min(int(cpu_threads) if cpu_threads else 4, max_allowed))
+        env.update(
+            {
+                "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+                "OMP_NUM_THREADS": str(threads),
+                "MKL_NUM_THREADS": str(threads),
+                "OPENBLAS_NUM_THREADS": str(threads),
+                "VECLIB_MAXIMUM_THREADS": str(threads),
+                "NUMEXPR_NUM_THREADS": str(threads),
+                "ORT_INTRA_OP_NUM_THREADS": str(threads),
+                "ORT_INTER_OP_NUM_THREADS": "1",
+            }
+        )
 
         # Update progress
         self.update_state(
@@ -1422,21 +1421,21 @@ def run_cluster_task(
         # Apply CPU thread limits for laptop-friendly runs
         env = os.environ.copy()
         cpu_threads = options.get("cpu_threads")
-        if cpu_threads:
-            max_allowed = os.cpu_count() or 8
-            threads = max(1, min(int(cpu_threads), max_allowed))
-            env.update(
-                {
-                    "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
-                    "OMP_NUM_THREADS": str(threads),
-                    "MKL_NUM_THREADS": str(threads),
-                    "OPENBLAS_NUM_THREADS": str(threads),
-                    "VECLIB_MAXIMUM_THREADS": str(threads),
-                    "NUMEXPR_NUM_THREADS": str(threads),
-                    "ORT_INTRA_OP_NUM_THREADS": str(threads),
-                    "ORT_INTER_OP_NUM_THREADS": "1",
-                }
-            )
+        # Default to 4 threads (balanced profile) if not specified to prevent overheating
+        max_allowed = os.cpu_count() or 8
+        threads = max(1, min(int(cpu_threads) if cpu_threads else 4, max_allowed))
+        env.update(
+            {
+                "SCREENALYTICS_MAX_CPU_THREADS": str(threads),
+                "OMP_NUM_THREADS": str(threads),
+                "MKL_NUM_THREADS": str(threads),
+                "OPENBLAS_NUM_THREADS": str(threads),
+                "VECLIB_MAXIMUM_THREADS": str(threads),
+                "NUMEXPR_NUM_THREADS": str(threads),
+                "ORT_INTRA_OP_NUM_THREADS": str(threads),
+                "ORT_INTER_OP_NUM_THREADS": "1",
+            }
+        )
 
         # Update progress
         self.update_state(

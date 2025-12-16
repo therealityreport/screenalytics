@@ -7167,9 +7167,17 @@ def _run_faces_embed_stage(
 
     # Get backend selection from embedding config (already loaded earlier)
     embedding_backend_type = embedding_config.get("embedding", {}).get("backend", "pytorch")
-    tensorrt_config_path = embedding_config.get("embedding", {}).get(
-        "tensorrt_config", "config/pipeline/arcface_tensorrt.yaml"
+    tensorrt_config_rel = embedding_config.get("embedding", {}).get(
+        "tensorrt_config",
+        "config/pipeline/arcface_tensorrt.yaml",
     )
+    # Resolve relative config paths against REPO_ROOT so subprocess CWD doesn't matter.
+    if isinstance(tensorrt_config_rel, str) and tensorrt_config_rel.strip():
+        tensorrt_config_path = tensorrt_config_rel.strip()
+    else:
+        tensorrt_config_path = "config/pipeline/arcface_tensorrt.yaml"
+    if not Path(tensorrt_config_path).is_absolute():
+        tensorrt_config_path = str(REPO_ROOT / tensorrt_config_path)
     fallback_cfg = embedding_config.get("fallback", {}) if isinstance(embedding_config.get("fallback"), dict) else {}
     fallback_to_pytorch = bool(fallback_cfg.get("fallback_to_pytorch", True))
     allow_embedding_fallback = allow_cpu_fallback or (embedding_backend_type == "tensorrt" and fallback_to_pytorch)

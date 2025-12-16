@@ -2653,6 +2653,28 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
     resolved_profile, profile_warning = _resolve_profile(req.device, req.profile)
     LOGGER.info(f"[{req.ep_id}] Profile: {req.profile} -> {resolved_profile} (device={req.device})")
 
+    # Bug #10 fix: Validate device before queuing to catch issues early
+    device_warning = None
+    try:
+        from apps.api.services.validation import normalize_device, DeviceUnavailableError
+
+        device_result = normalize_device(req.device, allow_fallback=True)
+        if device_result.was_fallback:
+            device_warning = device_result.warning or f"Device '{req.device}' unavailable, using {device_result.resolved}"
+            LOGGER.warning(f"[{req.ep_id}] Device fallback: {device_warning}")
+    except DeviceUnavailableError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ep_id": req.ep_id,
+                "state": "error",
+                "error": "device_unavailable",
+                "message": str(exc),
+            },
+        )
+    except ImportError:
+        LOGGER.debug("[detect_track] Device validation module not available, skipping pre-check")
+
     # Build options dict (profile not passed - episode_run.py doesn't accept it)
     options = {
         "stride": req.stride,
@@ -2690,6 +2712,8 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
     all_warnings = []
     if profile_warning:
         all_warnings.append(profile_warning)
+    if device_warning:
+        all_warnings.append(device_warning)
     all_warnings.extend(config_warnings)
 
     LOGGER.info(
@@ -2719,6 +2743,8 @@ async def start_detect_track_celery(req: DetectTrackCeleryRequest):
         )
 
     # Redis/Celery mode (default) - enqueues job and returns immediately
+    # Bug #2 fix: Add profile to options for Celery tasks (not just local)
+    options["profile"] = resolved_profile
     result = run_detect_track_task.delay(req.ep_id, options)
 
     response = {
@@ -2823,6 +2849,8 @@ async def start_faces_embed_celery(req: FacesEmbedCeleryRequest):
         )
 
     # Redis/Celery mode (default) - enqueues job and returns immediately
+    # Bug #2 fix: Add profile to options for Celery tasks (not just local)
+    options["profile"] = resolved_profile
     result = run_faces_embed_task.delay(req.ep_id, options)
 
     response = {
@@ -2947,6 +2975,8 @@ async def start_cluster_celery(req: ClusterCeleryRequest):
         )
 
     # Redis/Celery mode (default) - enqueues job and returns immediately
+    # Bug #2 fix: Add profile to options for Celery tasks (not just local)
+    options["profile"] = resolved_profile
     result = run_cluster_task.delay(req.ep_id, options)
 
     response = {
