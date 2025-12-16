@@ -39,6 +39,7 @@ class LogFormatterState:
 
     # Config tracking (to avoid duplicate config lines)
     config_emitted: bool = False
+    onnx_providers_line: str | None = None
 
     # Phase tracking
     current_phase: str = ""
@@ -196,6 +197,7 @@ class LogFormatter:
         if self.ONNX_PROVIDERS_LINE_PATTERN.match(line):
             formatted = self._format_onnx_providers_line(line)
             if formatted:
+                self.state.onnx_providers_line = formatted
                 self._formatted_lines.append(formatted)
             return formatted
 
@@ -435,6 +437,7 @@ class LogFormatter:
             self.state.onnx_warning_shown = True
             # Single user-friendly message instead of raw ONNX output
             details = self.state.onnx_warning_first_line or ""
+            providers_line = self.state.onnx_providers_line or ""
             if details:
                 formatted = (
                     "[WARN] Some ops are falling back to CPU; this may be slower on your Mac. "
@@ -442,6 +445,8 @@ class LogFormatter:
                 )
             else:
                 formatted = "[WARN] Some ops are falling back to CPU; this may be slower on your Mac."
+            if providers_line:
+                formatted += f" (providers: {providers_line})"
             self._formatted_lines.append(formatted)
             return formatted
 
@@ -528,6 +533,7 @@ def format_config_block(
     total_frames: int | None = None,
     fps: float | None = None,
     thermal_limit_info: str | None = None,
+    crop_interval_frames: int | None = None,
 ) -> str:
     """Generate a canonical config block for the start of a run.
 
@@ -556,6 +562,12 @@ def format_config_block(
     config_parts.append(f"Profile: {profile.title()}")
     if stride is not None:
         config_parts.append(f"Stride: {stride}")
+    if crop_interval_frames is not None and crop_interval_frames > 0:
+        if fps is not None and fps > 0:
+            seconds = crop_interval_frames / fps
+            config_parts.append(f"Crop interval: {crop_interval_frames}f (~{seconds:.2f}s)")
+        else:
+            config_parts.append(f"Crop interval: {crop_interval_frames}f")
     lines.append("  " + "  •  ".join(config_parts))
 
     # Total frames line

@@ -25,3 +25,20 @@ def test_log_formatter_shows_single_fallback_warning_with_details() -> None:
     assert "details:" in formatted_first
     formatted_second = formatter.format_line(warn_line)
     assert formatted_second is None
+
+
+def test_log_formatter_includes_providers_line_on_fallback_warning() -> None:
+    formatter = LogFormatter(episode_id="ep-test", operation="faces_embed")
+    provider_line = (
+        "[LOCAL MODE] ONNX providers: ['CoreMLExecutionProvider', 'CPUExecutionProvider'] "
+        "(resolved_device=coreml, available=['CoreMLExecutionProvider', 'CPUExecutionProvider'])"
+    )
+    formatted_provider = formatter.format_line(provider_line)
+    assert formatted_provider is not None
+    assert "available=" not in formatted_provider
+
+    warn_line = "WARNING:onnxruntime: Some operators are not supported and will be executed on CPU."
+    formatted_warn = formatter.format_line(warn_line)
+    assert formatted_warn is not None
+    assert "(providers: [LOCAL MODE] ONNX providers:" in formatted_warn
+    assert "available=" not in formatted_warn

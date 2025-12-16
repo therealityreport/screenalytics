@@ -2320,6 +2320,7 @@ def _stream_local_subprocess(
         total_frames=total_frames,
         fps=fps,
         thermal_limit_info=thermal_limit_info,
+        crop_interval_frames=options.get("min_frames_between_crops") if operation == "faces_embed" else None,
     )
     for line in config_block.split("\n"):
         yield _emit_formatted(line, line)
