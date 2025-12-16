@@ -191,6 +191,16 @@ class BodyTrackingRunner:
 
     def _find_video_path(self) -> Path:
         """Find video path from episode manifest."""
+        # Prefer canonical Screenalytics artifact layout when available.
+        try:
+            from py_screenalytics.artifacts import get_path  # type: ignore
+
+            candidate = get_path(self.episode_id, "video")
+            if candidate.exists():
+                return candidate
+        except ImportError:
+            pass
+
         manifest_dir = Path(f"data/manifests/{self.episode_id}")
         manifest_path = manifest_dir / "manifest.json"
 
@@ -206,6 +216,10 @@ class BodyTrackingRunner:
                 video_path = base / f"{self.episode_id}{ext}"
                 if video_path.exists():
                     return video_path
+                # Newer layout: data/videos/{ep_id}/episode.mp4
+                nested = base / self.episode_id / f"episode{ext}"
+                if nested.exists():
+                    return nested
 
         raise FileNotFoundError(
             f"Could not find video for episode {self.episode_id}. "
