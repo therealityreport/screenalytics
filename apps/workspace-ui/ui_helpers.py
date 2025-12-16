@@ -2874,10 +2874,13 @@ def render_page_header(page_id: str, page_title: str) -> None:
         assert catalog is not None
         docs = [d for d in catalog.get("docs", []) if isinstance(d, dict)]
         todo_statuses = {"in_progress", "draft", "outdated"}
-        todo_docs = [
-            d for d in docs if d.get("status") in todo_statuses
-        ]
+        todo_docs = [d for d in docs if d.get("status") in todo_statuses]
         todo_docs.sort(key=lambda d: (str(d.get("status")), str(d.get("title"))))
+        complete_docs = [d for d in docs if d.get("status") == "complete"]
+        complete_docs.sort(
+            key=lambda d: (str(d.get("last_updated") or ""), str(d.get("title") or "")),
+            reverse=True,
+        )
 
         if registry_features:
             todo_rows: list[dict[str, Any]] = []
@@ -2974,8 +2977,8 @@ def render_page_header(page_id: str, page_title: str) -> None:
                 st.markdown("**TODO**")
                 st.dataframe(todo_rows, use_container_width=True, hide_index=True)
 
-        if not todo_docs:
-            st.info("No in-progress/draft/outdated docs found in catalog.")
+        if not todo_docs and not complete_docs:
+            st.info("No docs found in catalog.")
             return
 
         feature_catalog = catalog.get("features") or {}
@@ -3016,32 +3019,53 @@ def render_page_header(page_id: str, page_title: str) -> None:
                     deduped.append(item)
             return ", ".join(deduped)
 
-        rows: list[dict[str, Any]] = []
-        for d in todo_docs:
-            features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
-            models_list = [m for m in (d.get("models") or []) if isinstance(m, str)]
-            jobs_list = [j for j in (d.get("jobs") or []) if isinstance(j, str)]
-            surfaces_list = [s for s in (d.get("ui_surfaces_expected") or []) if isinstance(s, str)]
-            path_value = d.get("path", "")
-            rows.append(
-                {
-                    "status": d.get("status", ""),
-                    "type": d.get("type", ""),
-                    "title": d.get("title", ""),
-                    "last_updated": d.get("last_updated", ""),
-                    "features": ", ".join(features_list),
-                    "feature_status": _feature_statuses_for(features_list),
-                    "expected_code_paths": _paths_expected_for(features_list),
-                    "implementation_hint": _extract_doc_implementation_hint(path_value),
-                    "pending": _feature_pending_for(features_list),
-                    "models": ", ".join(models_list),
-                    "jobs": ", ".join(jobs_list),
-                    "ui_surfaces_expected": ", ".join(surfaces_list),
-                    "path": path_value,
-                }
-            )
+        st.markdown("### Docs")
+        st.caption(f"to-do: {len(todo_docs)} • complete: {len(complete_docs)}")
 
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        if todo_docs:
+            st.markdown("**TO-DO DOCS**")
+            todo_doc_rows: list[dict[str, Any]] = []
+            for d in todo_docs:
+                features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
+                models_list = [m for m in (d.get("models") or []) if isinstance(m, str)]
+                jobs_list = [j for j in (d.get("jobs") or []) if isinstance(j, str)]
+                surfaces_list = [s for s in (d.get("ui_surfaces_expected") or []) if isinstance(s, str)]
+                path_value = d.get("path", "")
+                todo_doc_rows.append(
+                    {
+                        "status": d.get("status", ""),
+                        "type": d.get("type", ""),
+                        "title": d.get("title", ""),
+                        "last_updated": d.get("last_updated", ""),
+                        "features": ", ".join(features_list),
+                        "feature_status": _feature_statuses_for(features_list),
+                        "expected_code_paths": _paths_expected_for(features_list),
+                        "implementation_hint": _extract_doc_implementation_hint(path_value),
+                        "pending": _feature_pending_for(features_list),
+                        "models": ", ".join(models_list),
+                        "jobs": ", ".join(jobs_list),
+                        "ui_surfaces_expected": ", ".join(surfaces_list),
+                        "path": path_value,
+                    }
+                )
+
+            st.dataframe(todo_doc_rows, use_container_width=True, hide_index=True)
+
+        if complete_docs:
+            st.markdown("**COMPLETED DOCS**")
+            complete_doc_rows: list[dict[str, Any]] = []
+            for d in complete_docs:
+                features_list = [f for f in (d.get("features") or []) if isinstance(f, str)]
+                complete_doc_rows.append(
+                    {
+                        "title": d.get("title", ""),
+                        "last_updated": d.get("last_updated", ""),
+                        "features": ", ".join(features_list),
+                        "feature_status": _feature_statuses_for(features_list),
+                        "path": d.get("path", ""),
+                    }
+                )
+            st.dataframe(complete_doc_rows, use_container_width=True, hide_index=True)
 
     dialog = getattr(st, "dialog", None)
     if callable(dialog):
