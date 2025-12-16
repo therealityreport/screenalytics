@@ -60,23 +60,41 @@ def _write_single_track(ep_id: str, *, run_id: str | None = None) -> None:
         handle.write(json.dumps(row) + "\n")
 
 
-def _patch_face_alignment_enabled(monkeypatch) -> None:
+def _patch_face_alignment_enabled(monkeypatch, *, quality_gate: dict | None = None) -> None:
+    face_alignment_cfg = {
+        "enabled": True,
+        "model": {"landmarks_type": "2D", "flip_input": False},
+        "processing": {"device": "cpu"},
+        "quality": {"min_face_size": 20},
+        "output": {"crop_size": 112, "crop_margin": 0.0},
+    }
+    if quality_gate is not None:
+        face_alignment_cfg["quality_gate"] = quality_gate
     monkeypatch.setattr(
         episode_run,
         "_load_alignment_config",
         lambda: {
-            "face_alignment": {
-                "enabled": True,
-                "model": {"landmarks_type": "2D", "flip_input": False},
-                "processing": {"device": "cpu"},
-                "quality": {"min_face_size": 20},
-                "output": {"crop_size": 112, "crop_margin": 0.0},
-            }
+            "face_alignment": face_alignment_cfg
         },
     )
 
 
-def _patch_fake_embedding_runtime(monkeypatch, fake_embedder: _FakeEmbedder) -> None:
+def _patch_embedding_config(monkeypatch, *, enable_legacy_alignment_gate: bool = False) -> None:
+    monkeypatch.setattr(
+        episode_run,
+        "_load_embedding_config",
+        lambda: {
+            "embedding": {"backend": "pytorch", "tensorrt_config": "config/pipeline/arcface_tensorrt.yaml"},
+            "face_alignment": {
+                "enabled": enable_legacy_alignment_gate,
+                "use_for_embedding": enable_legacy_alignment_gate,
+                "min_alignment_quality": 0.3,
+            },
+        },
+    )
+
+
+def _patch_fake_embedding_runtime(monkeypatch, fake_embedder: _FakeEmbedder, *, quality_fn=None) -> None:
     # Avoid cv2 blur scoring in unit tests (and keep thresholds permissive).
     monkeypatch.setattr(episode_run, "_estimate_blur_score", lambda _img: 999.0)
 
@@ -105,7 +123,10 @@ def _patch_fake_embedding_runtime(monkeypatch, fake_embedder: _FakeEmbedder) -> 
 
     monkeypatch.setattr(fan2d_mod, "Fan2dAligner", _DummyAligner)
     monkeypatch.setattr(fan2d_mod, "align_face_crop", _fake_aligned_crop)
-    monkeypatch.setattr(fan2d_mod, "compute_alignment_quality", lambda *_a, **_k: 1.0)
+    if quality_fn is None:
+        monkeypatch.setattr(fan2d_mod, "compute_alignment_quality", lambda *_a, **_k: 1.0)
+    else:
+        monkeypatch.setattr(fan2d_mod, "compute_alignment_quality", quality_fn)
 
 
 def test_faces_embed_uses_aligned_crop_when_face_alignment_enabled(tmp_path, monkeypatch) -> None:
@@ -123,6 +144,7 @@ def test_faces_embed_uses_aligned_crop_when_face_alignment_enabled(tmp_path, mon
 
     fake_embedder = _FakeEmbedder()
     _patch_face_alignment_enabled(monkeypatch)
+    _patch_embedding_config(monkeypatch, enable_legacy_alignment_gate=False)
     _patch_fake_embedding_runtime(monkeypatch, fake_embedder)
 
     manifests_dir = episode_run._manifests_dir_for_run(ep_id, run_id=None)
@@ -181,6 +203,7 @@ def test_faces_embed_writes_run_scoped_alignment_artifacts_when_run_id_set(tmp_p
 
     fake_embedder = _FakeEmbedder()
     _patch_face_alignment_enabled(monkeypatch)
+    _patch_embedding_config(monkeypatch, enable_legacy_alignment_gate=False)
     _patch_fake_embedding_runtime(monkeypatch, fake_embedder)
 
     manifests_dir = episode_run._manifests_dir_for_run(ep_id, run_id=run_id)
@@ -205,3 +228,148 @@ def test_faces_embed_writes_run_scoped_alignment_artifacts_when_run_id_set(tmp_p
 
     aligned_faces_path = manifests_dir / "face_alignment" / "aligned_faces.jsonl"
     assert aligned_faces_path.exists()
+
+
+def test_faces_embed_quality_gate_drop_changes_face_count(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "test-face-align-quality-gate-drop"
+    ensure_dirs(ep_id)
+
+    video_path = get_path(ep_id, "video")
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.touch()
+
+    def _write_two_samples(*, run_id: str) -> None:
+        track_path = episode_run._tracks_path_for_run(ep_id, run_id)
+        track_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "track_id": 1,
+            "class": "face",
+            "bboxes_sampled": [
+                {"frame_idx": 0, "ts": 0.0, "bbox_xyxy": [10, 10, 25, 25]},  # low quality
+                {"frame_idx": 1, "ts": 0.1, "bbox_xyxy": [10, 10, 80, 90]},  # high quality
+            ],
+        }
+        track_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    def _quality_fn(bbox_xyxy, _landmarks_68, *, min_face_size: int = 20, ideal_aspect_ratio: float = 0.85):
+        x1, _y1, x2, _y2 = bbox_xyxy[:4]
+        width = float(x2) - float(x1)
+        return 0.1 if width < 30 else 0.9
+
+    # Run without gate: expect both faces embedded.
+    run_no_gate = "runNoGate"
+    _write_two_samples(run_id=run_no_gate)
+    fake_embedder = _FakeEmbedder()
+    _patch_face_alignment_enabled(monkeypatch, quality_gate={"enabled": False, "threshold": 0.6, "mode": "drop"})
+    _patch_embedding_config(monkeypatch, enable_legacy_alignment_gate=False)
+    _patch_fake_embedding_runtime(monkeypatch, fake_embedder, quality_fn=_quality_fn)
+
+    manifests_dir = episode_run._manifests_dir_for_run(ep_id, run_id=run_no_gate)
+    args = SimpleNamespace(
+        ep_id=ep_id,
+        run_id=run_no_gate,
+        device="cpu",
+        save_frames=False,
+        save_crops=False,
+        jpeg_quality=85,
+        thumb_size=64,
+        progress_file=str(manifests_dir / "progress.json"),
+        max_samples_per_track=2,
+        min_samples_per_track=1,
+        sample_every_n_frames=1,
+    )
+    episode_run._run_faces_embed_stage(args, storage=None, ep_ctx=None, s3_prefixes=None)
+    faces = [
+        json.loads(line)
+        for line in (manifests_dir / "faces.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    embedded = [row for row in faces if row.get("embedding")]
+    assert len(embedded) == 2
+
+    # Run with gate drop: expect low-quality face dropped.
+    run_drop = "runDrop"
+    _write_two_samples(run_id=run_drop)
+    fake_embedder_2 = _FakeEmbedder()
+    _patch_face_alignment_enabled(monkeypatch, quality_gate={"enabled": True, "threshold": 0.6, "mode": "drop"})
+    _patch_embedding_config(monkeypatch, enable_legacy_alignment_gate=False)
+    _patch_fake_embedding_runtime(monkeypatch, fake_embedder_2, quality_fn=_quality_fn)
+
+    manifests_dir_drop = episode_run._manifests_dir_for_run(ep_id, run_id=run_drop)
+    args.run_id = run_drop
+    args.progress_file = str(manifests_dir_drop / "progress.json")
+    episode_run._run_faces_embed_stage(args, storage=None, ep_ctx=None, s3_prefixes=None)
+    faces_drop = [
+        json.loads(line)
+        for line in (manifests_dir_drop / "faces.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    embedded_drop = [row for row in faces_drop if row.get("embedding")]
+    assert len(embedded_drop) == 1
+    assert any(str(row.get("skip", "")).startswith("low_alignment_quality") for row in faces_drop)
+
+
+def test_faces_embed_quality_gate_downweight_keeps_faces(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "test-face-align-quality-gate-downweight"
+    run_id = "runDownweight"
+    ensure_dirs(ep_id)
+
+    video_path = get_path(ep_id, "video")
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.touch()
+
+    track_path = episode_run._tracks_path_for_run(ep_id, run_id)
+    track_path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "track_id": 1,
+        "class": "face",
+        "bboxes_sampled": [
+            {"frame_idx": 0, "ts": 0.0, "bbox_xyxy": [10, 10, 25, 25]},  # low quality
+            {"frame_idx": 1, "ts": 0.1, "bbox_xyxy": [10, 10, 80, 90]},  # high quality
+        ],
+    }
+    track_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    def _quality_fn(bbox_xyxy, _landmarks_68, *, min_face_size: int = 20, ideal_aspect_ratio: float = 0.85):
+        x1, _y1, x2, _y2 = bbox_xyxy[:4]
+        width = float(x2) - float(x1)
+        return 0.1 if width < 30 else 0.9
+
+    fake_embedder = _FakeEmbedder()
+    _patch_face_alignment_enabled(monkeypatch, quality_gate={"enabled": True, "threshold": 0.6, "mode": "downweight"})
+    _patch_embedding_config(monkeypatch, enable_legacy_alignment_gate=False)
+    _patch_fake_embedding_runtime(monkeypatch, fake_embedder, quality_fn=_quality_fn)
+
+    manifests_dir = episode_run._manifests_dir_for_run(ep_id, run_id=run_id)
+    args = SimpleNamespace(
+        ep_id=ep_id,
+        run_id=run_id,
+        device="cpu",
+        save_frames=False,
+        save_crops=False,
+        jpeg_quality=85,
+        thumb_size=64,
+        progress_file=str(manifests_dir / "progress.json"),
+        max_samples_per_track=2,
+        min_samples_per_track=1,
+        sample_every_n_frames=1,
+    )
+
+    summary = episode_run._run_faces_embed_stage(args, storage=None, ep_ctx=None, s3_prefixes=None)
+    assert summary.get("alignment_quality_gating", {}).get("downweighted") == 1
+    assert summary.get("alignment_quality_gating", {}).get("skipped") == 0
+
+    faces = [
+        json.loads(line)
+        for line in (manifests_dir / "faces.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(faces) == 2
+    weights = [f.get("alignment_quality_weight") for f in faces if f.get("alignment_quality_weight") is not None]
+    assert weights and min(weights) < 1.0
