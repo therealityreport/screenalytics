@@ -262,3 +262,58 @@ def test_episode_status_scopes_to_run_id(tmp_path, monkeypatch) -> None:
     assert legacy_payload["detect_track"]["run_id"] == "legacy"
     assert legacy_payload["faces_embed"]["run_id"] == "legacy"
     assert legacy_payload["faces_embed"]["faces"] == 1
+
+
+def test_episode_status_active_run_id_ignores_invalid_marker_run_id(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    ep_id = "active-run-id-fallback"
+
+    client = TestClient(app)
+
+    manifests_dir = get_path(ep_id, "detections").parent
+    runs_dir = manifests_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Legacy marker includes a run_id that does NOT exist as a run directory (regression case).
+    (runs_dir / "faces_embed.json").write_text(
+        json.dumps({"phase": "faces_embed", "status": "success", "run_id": "bogus-run-id", "faces": 1}),
+        encoding="utf-8",
+    )
+
+    # active_run.json points to a missing run directory (also a regression case).
+    (runs_dir / "active_run.json").write_text(
+        json.dumps({"ep_id": ep_id, "run_id": "missing-run-dir", "updated_at": "2025-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    real_run_id = "realrun"
+    run_dir = runs_dir / real_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "progress.json").write_text(json.dumps({"phase": "detect_track"}), encoding="utf-8")
+
+    resp = client.get(f"/episodes/{ep_id}/status")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload.get("active_run_id") == real_run_id
+
+
+def test_episode_status_faces_success_from_run_manifest_without_marker(tmp_path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    ep_id = "faces-output-run-scoped"
+    run_id = "attempt-1"
+
+    client = TestClient(app)
+
+    manifests_dir = get_path(ep_id, "detections").parent
+    run_dir = manifests_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "faces.jsonl").write_text('{"f":1}\n', encoding="utf-8")
+
+    resp = client.get(f"/episodes/{ep_id}/status", params={"run_id": run_id})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["faces_embed"]["status"] == "success"
+    assert payload["faces_embed"]["source"] == "output"
+    assert payload["faces_embed"]["faces"] == 1

@@ -241,7 +241,12 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
         return {}
 
     monkeypatch.setattr(helpers, "api_get", _api_get, raising=False)
-    monkeypatch.setattr(helpers, "get_episode_status", lambda _ep: _api_get(f"/episodes/{_ep}/status"), raising=False)
+    monkeypatch.setattr(
+        helpers,
+        "get_episode_status",
+        lambda _ep, run_id=None: _api_get(f"/episodes/{_ep}/status"),  # noqa: ARG005
+        raising=False,
+    )
 
     original_sys_path = list(sys.path)
     try:
@@ -252,4 +257,3 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
         pass
     finally:
         sys.path[:] = original_sys_path
-
