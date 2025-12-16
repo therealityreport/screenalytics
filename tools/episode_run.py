@@ -134,6 +134,23 @@ def _load_alignment_config() -> dict[str, Any]:
     return {}
 
 
+def _load_body_tracking_config() -> dict[str, Any]:
+    """Load body tracking configuration from YAML file if available."""
+    config_path = REPO_ROOT / "config" / "pipeline" / "body_detection.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+        return config or {}
+    except Exception as exc:
+        LOGGER.warning("Failed to load body tracking config YAML: %s", exc)
+        return {}
+
+
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
 APP_VERSION = os.environ.get("SCREENALYTICS_APP_VERSION", PIPELINE_VERSION)
 TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml")
@@ -3356,6 +3373,10 @@ def _frames_root_for_run(ep_id: str, run_id: str | None) -> Path:
     return root / "runs" / run_layout.normalize_run_id(run_id)
 
 
+def _body_tracking_dir_for_run(ep_id: str, run_id: str | None) -> Path:
+    return _manifests_dir_for_run(ep_id, run_id) / "body_tracking"
+
+
 def _promote_run_manifests_to_root(ep_id: str, run_id: str, filenames: Iterable[str]) -> None:
     """Copy run-scoped manifests into the legacy root manifests dir.
 
@@ -6338,6 +6359,113 @@ def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def _maybe_run_body_tracking(
+    *,
+    ep_id: str,
+    run_id: str | None,
+    effective_run_id: str | None,
+    video_path: Path,
+) -> Dict[str, Any] | None:
+    config = _load_body_tracking_config()
+    enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
+    if not enabled:
+        return None
+
+    output_dir = _body_tracking_dir_for_run(ep_id, run_id)
+    config_path = REPO_ROOT / "config" / "pipeline" / "body_detection.yaml"
+    fusion_config_path = REPO_ROOT / "config" / "pipeline" / "track_fusion.yaml"
+
+    started_at = _utcnow_iso()
+    try:
+        from FEATURES.body_tracking.src.body_tracking_runner import BodyTrackingRunner
+    except Exception as exc:
+        LOGGER.warning(
+            "[body_tracking] Disabled due to import error (install deps to enable): %s",
+            exc,
+        )
+        payload = {
+            "phase": "body_tracking",
+            "status": "error",
+            "version": APP_VERSION,
+            "run_id": effective_run_id,
+            "started_at": started_at,
+            "finished_at": _utcnow_iso(),
+            "error": f"import_error: {exc}",
+        }
+        _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
+        return payload
+
+    try:
+        runner = BodyTrackingRunner(
+            episode_id=ep_id,
+            config_path=config_path if config_path.exists() else None,
+            fusion_config_path=fusion_config_path if fusion_config_path.exists() else None,
+            video_path=video_path,
+            output_dir=output_dir,
+            skip_existing=True,
+        )
+        det_path = runner.run_detection()
+        tracks_path = runner.run_tracking()
+
+        embeddings_path: Path | None = None
+        if getattr(runner.config, "reid_enabled", False):
+            try:
+                embeddings_path = runner.run_embedding()
+            except ImportError as exc:
+                LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", exc)
+            except Exception as exc:
+                LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", exc)
+
+        if run_id:
+            promote = [
+                "body_tracking/body_detections.jsonl",
+                "body_tracking/body_tracks.jsonl",
+            ]
+            if embeddings_path and embeddings_path.exists():
+                promote.append("body_tracking/body_embeddings.npy")
+            if runner.embeddings_meta_path.exists():
+                promote.append("body_tracking/body_embeddings_meta.json")
+            if runner.metrics_path.exists():
+                promote.append("body_tracking/body_metrics.json")
+            _promote_run_manifests_to_root(ep_id, run_id, promote)
+
+        payload: Dict[str, Any] = {
+            "phase": "body_tracking",
+            "status": "success",
+            "version": APP_VERSION,
+            "run_id": effective_run_id,
+            "started_at": started_at,
+            "finished_at": _utcnow_iso(),
+            "reid_enabled": bool(getattr(runner.config, "reid_enabled", False)),
+            "artifacts": {
+                "local": {
+                    "body_tracking_dir": str(output_dir),
+                    "body_detections": str(det_path),
+                    "body_tracks": str(tracks_path),
+                    "body_embeddings": str(embeddings_path) if embeddings_path and embeddings_path.exists() else None,
+                    "body_embeddings_meta": (
+                        str(runner.embeddings_meta_path) if runner.embeddings_meta_path.exists() else None
+                    ),
+                }
+            },
+        }
+        _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
+        return payload
+    except Exception as exc:
+        LOGGER.exception("[body_tracking] Failed for ep_id=%s run_id=%s", ep_id, effective_run_id)
+        payload = {
+            "phase": "body_tracking",
+            "status": "error",
+            "version": APP_VERSION,
+            "run_id": effective_run_id,
+            "started_at": started_at,
+            "finished_at": _utcnow_iso(),
+            "error": str(exc),
+        }
+        _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
+        return payload
+
+
 def _run_detect_track_stage(
     args: argparse.Namespace,
     storage: StorageService | None,
@@ -6488,6 +6616,13 @@ def _run_detect_track_stage(
                 ("detections.jsonl", "tracks.jsonl", "track_metrics.json"),
             )
 
+        body_tracking_summary = _maybe_run_body_tracking(
+            ep_id=args.ep_id,
+            run_id=run_id,
+            effective_run_id=effective_run_id,
+            video_path=video_dest,
+        )
+
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
         _report_s3_upload(
             progress,
@@ -6540,6 +6675,8 @@ def _run_detect_track_stage(
                 "s3_prefixes": s3_prefixes,
             },
         }
+        if body_tracking_summary:
+            summary["body_tracking"] = body_tracking_summary
         if detect_track_stats:
             summary["detect_track_stats"] = detect_track_stats
         if tracker_config_summary:
