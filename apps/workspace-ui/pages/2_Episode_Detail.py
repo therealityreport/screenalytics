@@ -5103,43 +5103,24 @@ with col_cluster:
 
 st.subheader("Debug / Export")
 if not selected_attempt_run_id:
-    st.info("Select a non-legacy attempt (run_id) to export a run-scoped debug bundle.")
+    st.info("Select a non-legacy attempt (run_id) to export a run debug report.")
 else:
     st.caption(f"Exporting run_id: `{selected_attempt_run_id}`")
     opt_key_prefix = f"{ep_id}::{selected_attempt_run_id}::export_bundle"
-    include_artifacts = st.checkbox(
-        "Include raw artifacts (tracks/faces/identities)",
-        value=True,
-        key=f"{opt_key_prefix}::include_artifacts",
-    )
-    include_images = st.checkbox(
-        "Include thumbnails/crops/frames (very large)",
-        value=False,
-        key=f"{opt_key_prefix}::include_images",
-    )
-    include_logs = st.checkbox(
-        "Include logs (recommended)",
-        value=True,
-        key=f"{opt_key_prefix}::include_logs",
-    )
 
     export_state_key = f"{opt_key_prefix}::payload"
     export_clicked = st.button(
-        "Export Run Debug Bundle",
+        "Generate PDF Report",
         key=f"{opt_key_prefix}::export",
         type="primary",
         use_container_width=False,
+        help="Generate a Screen Time Run Debug Report PDF with pipeline stats and artifact manifest",
     )
     if export_clicked:
-        with st.spinner("Building run debug bundle…"):
+        with st.spinner("Generating PDF report…"):
             url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{selected_attempt_run_id}/export"
-            params = {
-                "include_artifacts": "1" if include_artifacts else "0",
-                "include_images": "1" if include_images else "0",
-                "include_logs": "1" if include_logs else "0",
-            }
             try:
-                resp = requests.get(url, params=params, timeout=300)
+                resp = requests.get(url, timeout=300)
                 resp.raise_for_status()
             except requests.RequestException as exc:
                 st.error(helpers.describe_error(url, exc))
@@ -5149,7 +5130,7 @@ else:
                 if "filename=" in content_disp:
                     filename = content_disp.split("filename=", 1)[1].strip().strip('"')
                 if not filename:
-                    filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+                    filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
                 st.session_state[export_state_key] = {
                     "filename": filename,
                     "bytes": resp.content,
@@ -5158,20 +5139,20 @@ else:
     bundle = st.session_state.get(export_state_key)
     if isinstance(bundle, dict) and bundle.get("bytes"):
         file_bytes = bundle.get("bytes") or b""
-        filename = bundle.get("filename") or f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+        filename = bundle.get("filename") or f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
         try:
-            st.caption(f"Bundle ready: {len(file_bytes) / 1_048_576:.1f} MiB")
+            st.caption(f"Report ready: {len(file_bytes) / 1024:.1f} KB")
         except Exception:
             pass
         st.download_button(
-            "Download .zip",
+            "Download PDF",
             data=file_bytes,
             file_name=filename,
-            mime="application/zip",
+            mime="application/pdf",
             key=f"{opt_key_prefix}::download",
             use_container_width=False,
         )
-        if st.button("Clear bundle", key=f"{opt_key_prefix}::clear_bundle"):
+        if st.button("Clear", key=f"{opt_key_prefix}::clear_bundle"):
             st.session_state.pop(export_state_key, None)
             st.rerun()
 
