@@ -64,7 +64,12 @@ export function DocsProvider({ children, initialCatalog }: DocsProviderProps) {
 
     // Fetch catalog if not provided
     fetch("/data/docs_catalog.json")
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error(`Failed to fetch docs catalog: ${res.status}`);
+        }
+        return res.json();
+      })
       .then((data) => {
         setCatalog(data);
         setLoading(false);
