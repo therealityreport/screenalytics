@@ -1,19 +1,38 @@
 # Screenalytics Web App Migration Plan
 
+> **Status:** PARTIALLY OUTDATED - See updated docs below
+> **Last audit:** 2025-12-15
+
+## Updated Documentation
+
+This document contains useful reference material but the percentages and status are outdated.
+
+**For current status and roadmap, see:**
+- [web_app/MIGRATION_INVENTORY_TRIAGE.md](web_app/MIGRATION_INVENTORY_TRIAGE.md) - Document/code inventory and triage
+- [web_app/MIGRATION_ROADMAP.md](web_app/MIGRATION_ROADMAP.md) - Phased implementation plan with acceptance criteria
+
+---
+
 > **Goal:** Migrate the Streamlit UI to a standalone Next.js web application that runs async without requiring VS Code to be open.
 
-## Current State Summary
+## Current State Summary (as of 2025-12-15 audit)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
 | **Next.js App** | Exists at `web/` | React Query, SSE, OpenAPI types |
 | **Layout/Providers** | Complete | Sidebar nav, Toast, QueryClient |
 | **API Client** | Solid foundation | `apiFetch`, error normalization, types |
-| **Upload Page** | 80% complete | Needs S3 browser, audio pipeline trigger |
-| **Episode Detail** | 40% complete | Missing job history, audio, cluster UI |
-| **Faces Review** | Stub only | Full implementation needed |
+| **Upload Page** | **~60% complete** | Missing S3 browser, audio trigger, ETA |
+| **Episode Detail** | **~30% complete** | Missing run_id, job history, screentime panel |
+| **Faces Review** | **Stub only (0%)** | Full implementation needed |
 | **Voices Review** | Not started | New page |
 | **Cast Management** | Not started | New page |
+
+**Key gaps identified:**
+1. Package still named `youth-league-web` (needs rebrand)
+2. No Modal/Dialog component for better UX
+3. OpenAPI types may be stale
+4. No test coverage
 
 ## Migration Priority Order
 
@@ -422,6 +441,6 @@ Located in `web/mocks/handlers.ts` - already mocks:
 
 ## Status
 
-**Current:** On hold - fixing local Streamlit features first
+**Current:** Active - see [MIGRATION_ROADMAP.md](web_app/MIGRATION_ROADMAP.md) for phased plan
 
-**Last updated:** 2024-12-02
+**Last updated:** 2025-12-15
