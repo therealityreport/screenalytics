@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { use, useMemo, useState } from "react";
 import { useEpisodeEvents, useEpisodeStatus, useTriggerPhase } from "@/api/hooks";
 import type { EpisodePhase } from "@/api/types";
 import styles from "../episode.module.css";
@@ -11,8 +11,8 @@ function StatusBadge({ state }: { state?: string }) {
   return <span className={cls}>{text}</span>;
 }
 
-export default function EpisodeDetail({ params }: { params: { id: string } }) {
-  const episodeId = params.id;
+export default function EpisodeDetail({ params }: { params: Promise<{ id: string }> }) {
+  const { id: episodeId } = use(params);
   const [events, setEvents] = useState<string[]>([]);
 
   const statusQuery = useEpisodeStatus(episodeId, { enabled: true, refetchInterval: 1800 });
@@ -88,7 +88,7 @@ export default function EpisodeDetail({ params }: { params: { id: string } }) {
         <div className={styles.statusCard}>
           <div className={styles.statusTitle}>Cluster</div>
           <StatusBadge state={cluster?.status} />
-          {cluster?.singleton_fraction_before !== undefined && cluster?.singleton_fraction_after !== undefined && (
+          {cluster?.singleton_fraction_before != null && cluster?.singleton_fraction_after != null && (
             <div style={{ fontSize: 12, color: "#475569", marginTop: 4 }}>
               singleton: {(cluster.singleton_fraction_before * 100).toFixed(1)}% → {(cluster.singleton_fraction_after * 100).toFixed(1)}%
             </div>
