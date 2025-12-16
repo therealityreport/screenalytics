@@ -20,6 +20,8 @@ This catalog documents:
 
 Feature agents own specific pipeline capabilities and their associated code, configs, and artifacts.
 
+> **Canonical status source:** [`docs/_meta/feature_status.json`](/docs/_meta/feature_status.json) — the registry below summarizes status but the JSON is the single source of truth for job integration and bucket classification.
+
 ### FaceAlignmentAgent
 
 **Status:** `partial` (sandbox implementation exists; not integrated into main pipeline)
@@ -39,7 +41,7 @@ Feature agents own specific pipeline capabilities and their associated code, con
 **Phase Status:**
 | Phase | Status | Notes |
 |-------|--------|-------|
-| A_FAN_2D | `implemented_sandbox` | Sandbox runner exists; not in main auto-run |
+| A_FAN_2D | `implemented_sandbox` | Sandbox runner exists; harvest can consume output if present but does NOT run FAN |
 | B_LUVLi_quality_gate | `heuristic_stub` | Placeholder only; not model-based |
 | C_3DDFA_V2 | `not_started` | Planned |
 

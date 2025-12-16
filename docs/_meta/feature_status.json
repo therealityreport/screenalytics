@@ -21,9 +21,7 @@
       "phases": {
         "A_FAN_2D": {
           "status": "implemented_sandbox",
-          "integrated_in_jobs": [
-            "harvest"
-          ],
+          "integrated_in_jobs": [],
           "integrated_in_autorun": false,
           "enabled_by_default": false,
           "how_to_enable": {
@@ -33,10 +31,9 @@
           },
           "evidence_paths": [
             "FEATURES/face_alignment/src/run_fan_alignment.py",
-            "FEATURES/face_alignment/src/face_alignment_runner.py",
-            "tools/episode_run.py"
+            "FEATURES/face_alignment/src/face_alignment_runner.py"
           ],
-          "notes": "FAN 68-point alignment exists as a FEATURE sandbox; production jobs can consume `alignment_quality` from `face_alignment/aligned_faces.jsonl` when present, but do not run FAN inside the job pipeline yet."
+          "notes": "FAN 68-point alignment exists as a FEATURE sandbox. Harvest can read alignment_quality from aligned_faces.jsonl if present, but FAN is NOT executed as part of any job—it must be run separately via CLI."
         },
         "B_LUVLi_quality_gate": {
           "status": "heuristic_stub",
