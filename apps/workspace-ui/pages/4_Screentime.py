@@ -904,6 +904,15 @@ if json_path.exists():
                 row["Body Visible"] = format_time(body_visible_s) if isinstance(body_visible_s, (int, float)) else "-"
                 row["Body Only"] = format_time(body_only_s) if isinstance(body_only_s, (int, float)) else "-"
                 row["Gap Bridged"] = format_time(gap_bridged_s) if isinstance(gap_bridged_s, (int, float)) else "-"
+                # Calculate body contribution percentage
+                if isinstance(body_only_s, (int, float)) and isinstance(face_s, (int, float)):
+                    total_screen = face_s + body_only_s
+                    body_pct = (body_only_s / total_screen * 100) if total_screen > 0 else 0.0
+                    row["Body %"] = f"{body_pct:.1f}%"
+                    row["_body_pct"] = body_pct  # Hidden for sorting
+                else:
+                    row["Body %"] = "-"
+                    row["_body_pct"] = 0.0
 
             # Add manual comparison columns if manual values exist
             if manual_screentime:
@@ -942,7 +951,7 @@ if json_path.exists():
         if has_speaking:
             sort_options.insert(2, "Speaking")
         if body_metrics_available:
-            sort_options.extend(["Body Visible", "Body Only", "Gap Bridged"])
+            sort_options.extend(["Body Visible", "Body Only", "Gap Bridged", "Body %"])
         if manual_screentime:
             sort_options.extend(["Manual", "Error %"])
 
@@ -972,7 +981,7 @@ if json_path.exists():
         if has_speaking:
             desired_order.append("Speaking")
         if body_metrics_available:
-            desired_order.extend(["Body Visible", "Body Only", "Gap Bridged"])
+            desired_order.extend(["Body Visible", "Body Only", "Gap Bridged", "Body %"])
         desired_order.extend(["Tracks", "Faces", "Confidence"])
         display_cols = [c for c in desired_order if c in df_sorted.columns and c not in hidden_cols]
         display_df = df_sorted[display_cols]
@@ -984,7 +993,12 @@ if json_path.exists():
         st.subheader("Visualizations")
 
         # Tab layout for different chart types
-        tab1, tab2, tab3 = st.tabs(["Bar Chart", "Pie Chart", "Time Distribution"])
+        tab_names = ["Bar Chart", "Pie Chart", "Time Distribution"]
+        if body_metrics_available:
+            tab_names.append("Body Tracking")
+        tabs = st.tabs(tab_names)
+        tab1, tab2, tab3 = tabs[0], tabs[1], tabs[2]
+        tab4 = tabs[3] if body_metrics_available else None
 
         with tab1:
             # Bar chart of screen time - use name for display
@@ -1034,6 +1048,79 @@ if json_path.exists():
                 title="Tracks vs Faces (bubble size = face visible)",
             )
             st.plotly_chart(fig2, use_container_width=True)
+
+        if tab4 is not None:
+            with tab4:
+                # Body Tracking visualization - stacked bar chart of face vs body
+                st.markdown("**Face vs Body Screen Time Breakdown**")
+
+                # Build data for stacked bar chart
+                body_chart_data = []
+                for m in metrics:
+                    name = m.get("name", m.get("person_id", "unknown"))
+                    face_visible = _face_visible_seconds(m)
+                    body_only = m.get("body_only_seconds", 0) or 0
+                    gap_bridged = m.get("gap_bridged_seconds", 0) or 0
+                    total = face_visible + body_only
+
+                    body_chart_data.append({
+                        "Cast Member": name,
+                        "Face Visible": face_visible,
+                        "Body Only": body_only,
+                        "Total": total,
+                        "Body Contribution %": (body_only / total * 100) if total > 0 else 0,
+                    })
+
+                if body_chart_data:
+                    df_body = pd.DataFrame(body_chart_data).sort_values("Total", ascending=False)
+
+                    # Stacked bar chart
+                    fig_body = px.bar(
+                        df_body,
+                        x="Cast Member",
+                        y=["Face Visible", "Body Only"],
+                        title="Screen Time: Face Visible vs Body Only",
+                        labels={"value": "Duration (seconds)", "variable": "Visibility Type"},
+                        color_discrete_map={"Face Visible": "#2ecc71", "Body Only": "#3498db"},
+                        barmode="stack",
+                    )
+                    fig_body.update_layout(
+                        xaxis_tickangle=-45,
+                        legend_title="Visibility Type",
+                        height=450,
+                    )
+                    st.plotly_chart(fig_body, use_container_width=True)
+
+                    # Summary metrics
+                    total_face = sum(d["Face Visible"] for d in body_chart_data)
+                    total_body_only = sum(d["Body Only"] for d in body_chart_data)
+                    total_combined = total_face + total_body_only
+                    avg_body_contrib = (total_body_only / total_combined * 100) if total_combined > 0 else 0
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Face Visible", f"{total_face:.1f}s")
+                    col2.metric("Body Only", f"{total_body_only:.1f}s")
+                    col3.metric("Total Combined", f"{total_combined:.1f}s")
+                    col4.metric("Body Contribution", f"{avg_body_contrib:.1f}%")
+
+                    st.caption(
+                        "Body tracking extends screen time by detecting cast members when their face isn't visible. "
+                        "'Body Only' shows time added by body tracking."
+                    )
+
+                    # Per-cast breakdown with progress bars
+                    st.markdown("**Per-Cast Visibility Breakdown**")
+                    for d in df_body.head(10).to_dict("records"):
+                        name = d["Cast Member"]
+                        face_pct = (d["Face Visible"] / d["Total"] * 100) if d["Total"] > 0 else 100
+                        body_pct = d["Body Contribution %"]
+                        st.markdown(f"**{name}**")
+                        cols = st.columns([3, 1, 1])
+                        cols[0].progress(face_pct / 100, text=f"Face: {face_pct:.0f}%")
+                        cols[1].write(f"Face: {d['Face Visible']:.1f}s")
+                        cols[2].write(f"Body: {d['Body Only']:.1f}s")
+                else:
+                    st.info("No body tracking data available for this analysis.")
 
         st.divider()
 
