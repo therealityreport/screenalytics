@@ -226,16 +226,19 @@ def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | No
                 )
 
             with col4:
-                # CPU threads
+                # CPU threads - default to 4 for balanced profile
                 cpu_threads_key = _get_pipeline_settings_key(ep_id, "detect", "cpu_threads")
+                cpu_thread_options = [2, 4, 6, 8]
                 if cpu_threads_key not in st.session_state:
-                    st.session_state[cpu_threads_key] = 2
+                    st.session_state[cpu_threads_key] = 4
+                if st.session_state[cpu_threads_key] not in cpu_thread_options:
+                    st.session_state[cpu_threads_key] = 4
                 st.selectbox(
                     "CPU threads (cap)",
-                    options=[1, 2, 4],
-                    index=1,  # Default to 2
+                    options=cpu_thread_options,
+                    index=cpu_thread_options.index(st.session_state[cpu_threads_key]),  # Default to 4
                     key=cpu_threads_key,
-                    help="Limit BLAS/ONNX threads for thermal safety",
+                    help="CPU thread limit (low_power=2, balanced=4, performance=8)",
                 )
 
                 # Max gap
@@ -400,8 +403,13 @@ def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | No
 
                 # Min frames between crops
                 min_frames_key = _get_pipeline_settings_key(ep_id, "harvest", "min_frames_between_crops")
-                if min_frames_key not in st.session_state:
-                    st.session_state[min_frames_key] = _default_faces_min_frames_between_crops(video_meta)
+                computed_min_frames = _default_faces_min_frames_between_crops(video_meta)
+                current_min_frames = helpers.coerce_int(st.session_state.get(min_frames_key))
+                if current_min_frames is None or (
+                    current_min_frames == MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+                    and computed_min_frames != MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+                ):
+                    st.session_state[min_frames_key] = computed_min_frames
                 st.number_input(
                     "Min frames between crops",
                     min_value=1,
@@ -593,13 +601,22 @@ def _get_harvest_settings(ep_id: str, video_meta: Dict[str, Any] | None) -> Dict
         return st.session_state.get(key, default)
 
     device_label = _get("device", helpers.DEFAULT_DEVICE_LABEL)
+    # Promote fps-derived default when the session still holds the legacy global default.
+    computed_min_frames = _default_faces_min_frames_between_crops(video_meta)
+    min_frames_key = _get_pipeline_settings_key(ep_id, "harvest", "min_frames_between_crops")
+    current_min_frames = helpers.coerce_int(st.session_state.get(min_frames_key))
+    if current_min_frames is None or (
+        current_min_frames == MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+        and computed_min_frames != MIN_FRAMES_BETWEEN_CROPS_DEFAULT
+    ):
+        st.session_state[min_frames_key] = computed_min_frames
 
     return {
         "device": helpers.DEVICE_VALUE_MAP.get(device_label, "auto"),
         "device_label": device_label,
         "save_frames": bool(_get("save_frames", False)),
         "save_crops": bool(_get("save_crops", True)),
-        "min_frames_between_crops": int(_get("min_frames_between_crops", _default_faces_min_frames_between_crops(video_meta))),
+        "min_frames_between_crops": int(_get("min_frames_between_crops", computed_min_frames)),
         "thumb_size": int(_get("thumb_size", FACES_THUMB_SIZE_DEFAULT)),
         "jpeg_quality": int(_get("jpeg_quality", JPEG_DEFAULT)),
     }
@@ -2898,87 +2915,48 @@ with st.container():
         else:
             # Disable if no video or job already running
             autorun_disabled = not local_video_exists or st.session_state.get(running_job_key, False)
-            autorun_reset_review_state_key = f"{ep_id}::autorun_reset_review_state"
-            autorun_reset_review_state_confirm_key = f"{ep_id}::autorun_confirm_reset_review_state"
             autorun_start_requested_key = f"{ep_id}::autorun_start_requested"
 
-            reset_review_state = st.checkbox(
-                "Reset review state",
-                key=autorun_reset_review_state_key,
+            if st.button(
+                "🚀 Auto-Run Pipeline",
+                key="start_autorun",
+                use_container_width=True,
+                type="primary",
                 disabled=autorun_disabled,
-                help="Clears dismissed Smart Suggestions and Improve Faces decisions (archives first).",
-            )
-
-            if st.session_state.get(autorun_reset_review_state_confirm_key):
-                st.warning(
-                    "⚠️ **Reset review state?** This clears dismissed Smart Suggestions and Improve Faces decisions "
-                    "(existing files are archived first)."
-                )
-                confirm_col1, confirm_col2 = st.columns(2)
-                with confirm_col1:
-                    if st.button(
-                        "✓ Reset + Auto-Run",
-                        key=f"{ep_id}::autorun_confirm_reset_review_state_yes",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        with st.spinner("Resetting review state..."):
-                            try:
-                                helpers.api_post(
-                                    f"/episodes/{ep_id}/dismissed_suggestions/reset_state",
-                                    json={"archive_existing": True},
-                                    timeout=15,
-                                )
-                                helpers.api_post(
-                                    f"/episodes/{ep_id}/face_review/reset_state",
-                                    json={"archive_existing": True},
-                                    timeout=15,
-                                )
-                            except Exception as exc:
-                                st.error(f"Reset failed: {exc}")
-                                st.exception(exc)
-                                st.session_state.pop(autorun_reset_review_state_confirm_key, None)
-                                st.stop()
-
-                        # Clear local UI session state so the next cluster run can re-open Improve Faces cleanly.
-                        for key in (
-                            f"{ep_id}::improve_faces_complete",
-                            f"{ep_id}::improve_faces_active",
-                            f"{ep_id}::improve_faces_suggestions",
-                            f"{ep_id}::improve_faces_index",
-                        ):
-                            st.session_state.pop(key, None)
-
-                        st.session_state.pop(autorun_reset_review_state_confirm_key, None)
-                        st.session_state[autorun_start_requested_key] = True
-                        st.rerun()
-                with confirm_col2:
-                    if st.button(
-                        "Cancel",
-                        key=f"{ep_id}::autorun_confirm_reset_review_state_no",
-                        use_container_width=True,
-                    ):
-                        st.session_state.pop(autorun_reset_review_state_confirm_key, None)
-                        st.rerun()
-            else:
-                if st.button(
-                    "🚀 Auto-Run Pipeline",
-                    key="start_autorun",
-                    use_container_width=True,
-                    type="primary",
-                    disabled=autorun_disabled,
-                    help="Run Detect/Track → Faces Harvest → Cluster automatically with current settings",
-                ):
-                    if reset_review_state:
-                        st.session_state[autorun_reset_review_state_confirm_key] = True
-                        st.rerun()
-                    st.session_state[autorun_start_requested_key] = True
-                    st.rerun()
+                help="Run Detect/Track → Faces Harvest → Cluster automatically (resets review state first)",
+            ):
+                st.session_state[autorun_start_requested_key] = True
+                st.rerun()
 
             if st.session_state.pop(autorun_start_requested_key, False):
                 if autorun_disabled:
                     st.error("Auto-run is disabled (missing video or another job is running).")
                     st.stop()
+
+                # Always reset review state when starting auto-run (best-effort; don't block pipeline start).
+                with st.spinner("Resetting review state..."):
+                    try:
+                        helpers.api_post(
+                            f"/episodes/{ep_id}/dismissed_suggestions/reset_state",
+                            json={"archive_existing": True},
+                            timeout=15,
+                        )
+                        helpers.api_post(
+                            f"/episodes/{ep_id}/face_review/reset_state",
+                            json={"archive_existing": True},
+                            timeout=15,
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("[AUTORUN] Reset review state failed (continuing anyway): %s", exc)
+
+                # Clear local UI session state so the next cluster run can re-open Improve Faces cleanly.
+                for key in (
+                    f"{ep_id}::improve_faces_complete",
+                    f"{ep_id}::improve_faces_active",
+                    f"{ep_id}::improve_faces_suggestions",
+                    f"{ep_id}::improve_faces_index",
+                ):
+                    st.session_state.pop(key, None)
 
                 new_run_id = uuid.uuid4().hex
                 st.session_state[_autorun_run_id_key] = new_run_id
@@ -4015,9 +3993,14 @@ with col_faces:
     if faces_save_crops:
         export_bits.append("crops")
     export_text = "saving " + " & ".join(export_bits) if export_bits else "crops only"
+    interval_note = ""
+    if video_meta:
+        fps_detected = helpers.coerce_float(video_meta.get("fps_detected")) or helpers.coerce_float(video_meta.get("fps"))
+        if fps_detected and fps_detected > 0:
+            interval_note = f" (~{faces_min_frames_between_crops / fps_detected:.2f}s @ {fps_detected:.2f}fps)"
     st.info(
         f"**Faces Harvest** → {faces_device_label} · {export_text}, "
-        f"crop interval {faces_min_frames_between_crops} frames"
+        f"crop interval {faces_min_frames_between_crops} frames{interval_note}"
     )
 
     # Estimate counts

@@ -3,7 +3,7 @@
 
 # Master switch
 body_tracking:
-  enabled: true
+  enabled: false  # Disabled by default for thermals; enable explicitly when needed.
 
 # Person detection (YOLO)
 person_detection:
@@ -17,8 +17,9 @@ person_detection:
   # Class filtering (COCO)
   classes: [0]                     # 0 = person in COCO
 
-  # Frame sampling (optional)
-  detect_every_n_frames: 1         # 1 = every frame
+  # Frame sampling - should match face detection stride for aligned processing
+  # Set to match your UI stride setting (default balanced = 6)
+  detect_every_n_frames: 6         # Match face detection stride
 
 # Person tracking (ByteTrack)
 person_tracking:
