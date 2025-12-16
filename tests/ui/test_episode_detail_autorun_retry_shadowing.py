@@ -171,6 +171,7 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
     # Stub `py_screenalytics.artifacts.get_path` so the page doesn't need real media artifacts.
     py_screenalytics_pkg = types.ModuleType("py_screenalytics")
     artifacts_mod = types.ModuleType("py_screenalytics.artifacts")
+    run_layout_mod = types.ModuleType("py_screenalytics.run_layout")
 
     def _get_path(ep_id_value: str, kind: str) -> Path:
         base = tmp_path / "manifests" / ep_id_value
@@ -184,8 +185,28 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
 
     artifacts_mod.get_path = _get_path  # type: ignore[attr-defined]
     py_screenalytics_pkg.artifacts = artifacts_mod  # type: ignore[attr-defined]
+
+    def _read_active_run_id(_ep_id: str):  # noqa: ANN001
+        return None
+
+    def _normalize_run_id(run_id_value: str) -> str:
+        return run_id_value.strip()
+
+    def _run_root(ep_id_value: str, run_id_value: str) -> Path:
+        return tmp_path / "manifests" / ep_id_value / "runs" / run_id_value
+
+    def _list_run_ids(_ep_id: str):  # noqa: ANN001
+        return []
+
+    run_layout_mod.read_active_run_id = _read_active_run_id  # type: ignore[attr-defined]
+    run_layout_mod.normalize_run_id = _normalize_run_id  # type: ignore[attr-defined]
+    run_layout_mod.run_root = _run_root  # type: ignore[attr-defined]
+    run_layout_mod.list_run_ids = _list_run_ids  # type: ignore[attr-defined]
+    py_screenalytics_pkg.run_layout = run_layout_mod  # type: ignore[attr-defined]
+
     monkeypatch.setitem(sys.modules, "py_screenalytics", py_screenalytics_pkg)
     monkeypatch.setitem(sys.modules, "py_screenalytics.artifacts", artifacts_mod)
+    monkeypatch.setitem(sys.modules, "py_screenalytics.run_layout", run_layout_mod)
 
     monkeypatch.syspath_prepend(str(workspace_dir))
     import ui_helpers as helpers  # noqa: E402
@@ -241,7 +262,12 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
         return {}
 
     monkeypatch.setattr(helpers, "api_get", _api_get, raising=False)
-    monkeypatch.setattr(helpers, "get_episode_status", lambda _ep: _api_get(f"/episodes/{_ep}/status"), raising=False)
+    monkeypatch.setattr(
+        helpers,
+        "get_episode_status",
+        lambda _ep, *, run_id=None: _api_get(f"/episodes/{_ep}/status"),
+        raising=False,
+    )
 
     original_sys_path = list(sys.path)
     try:
@@ -252,4 +278,3 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
         pass
     finally:
         sys.path[:] = original_sys_path
-
