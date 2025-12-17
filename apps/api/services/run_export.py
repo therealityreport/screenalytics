@@ -2576,18 +2576,54 @@ def build_screentime_run_debug_pdf(
     story.append(PageBreak())
     story.append(Paragraph("7. Cluster", section_style))
 
-    # Calculate singleton stats
-    singleton_count = sum(1 for i in identities_list if len(i.get("track_ids", [])) == 1)
-    singleton_frac = singleton_count / len(identities_list) if identities_list else 0
+    # Calculate singleton stats (treat derived metrics as N/A when identities.json is missing/unreadable).
+    singleton_count: int | None
+    singleton_frac: float | None
+    if identities_count_run is None:
+        singleton_count = None
+        singleton_frac = None
+    else:
+        singleton_count = sum(1 for identity in identities_list if len(identity.get("track_ids", [])) == 1)
+        singleton_frac = singleton_count / len(identities_list) if identities_list else 0.0
+
+    faces_in_clusters = cluster_stats.get("faces") if identities_count_run is not None else None
+    mixed_tracks = cluster_stats.get("mixed_tracks") if identities_count_run is not None else None
+    outlier_tracks = cluster_stats.get("outlier_tracks") if identities_count_run is not None else None
+    low_cohesion = cluster_stats.get("low_cohesion_identities") if identities_count_run is not None else None
+    singleton_count_display = _format_optional_count(singleton_count, path=identities_path, label="identities.json")
+    if singleton_frac is None:
+        singleton_frac_display = _na_artifact(identities_path, "identities.json")
+    else:
+        singleton_frac_display = f"{singleton_frac:.1%} of total"
+    faces_in_clusters_display = _format_optional_count(
+        faces_in_clusters if isinstance(faces_in_clusters, int) else None,
+        path=identities_path,
+        label="identities.json",
+    )
+    mixed_tracks_display = _format_optional_count(
+        mixed_tracks if isinstance(mixed_tracks, int) else None,
+        path=identities_path,
+        label="identities.json",
+    )
+    outlier_tracks_display = _format_optional_count(
+        outlier_tracks if isinstance(outlier_tracks, int) else None,
+        path=identities_path,
+        label="identities.json",
+    )
+    low_cohesion_display = _format_optional_count(
+        low_cohesion if isinstance(low_cohesion, int) else None,
+        path=identities_path,
+        label="identities.json",
+    )
 
     cluster_table_data = [
         _wrap_row(["Metric", "Value", "Notes"]),
         _wrap_row(["Clusters (identities)", identities_count_display, "Unique identity groups"]),
-        _wrap_row(["Total Faces in Clusters", str(cluster_stats.get("faces", 0)), "Sum of face samples"]),
-        _wrap_row(["Singleton Clusters", str(singleton_count), f"{singleton_frac:.1%} of total"]),
-        _wrap_row(["Mixed Tracks", str(cluster_stats.get("mixed_tracks", 0)), "Tracks with multiple people (error)"]),
-        _wrap_row(["Outlier Tracks", str(cluster_stats.get("outlier_tracks", 0)), "Rejected from clusters"]),
-        _wrap_row(["Low Cohesion", str(cluster_stats.get("low_cohesion_identities", 0)), "Clusters with poor internal similarity"]),
+        _wrap_row(["Total Faces in Clusters", faces_in_clusters_display, "Sum of face samples"]),
+        _wrap_row(["Singleton Clusters", singleton_count_display, singleton_frac_display]),
+        _wrap_row(["Mixed Tracks", mixed_tracks_display, "Tracks with multiple people (error)"]),
+        _wrap_row(["Outlier Tracks", outlier_tracks_display, "Rejected from clusters"]),
+        _wrap_row(["Low Cohesion", low_cohesion_display, "Clusters with poor internal similarity"]),
     ]
     cluster_table = Table(cluster_table_data, colWidths=[2 * inch, 1 * inch, 2.5 * inch])
     cluster_table.setStyle(
@@ -2602,14 +2638,13 @@ def build_screentime_run_debug_pdf(
     story.append(cluster_table)
 
     # Diagnostic notes
-    if singleton_frac > 0.5:
+    if isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5:
         story.append(Paragraph(
             f"⚠️ High singleton fraction ({singleton_frac:.1%}): Over half of clusters have only 1 track. "
             "Consider lowering cluster_thresh in clustering.yaml (currently "
             f"{clustering_config.get('cluster_thresh', 'N/A')}) to merge more aggressively.",
             warning_style
         ))
-    mixed_tracks = cluster_stats.get("mixed_tracks", 0)
     if isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5:
         story.append(Paragraph(
             f"⚠️ High mixed tracks ({mixed_tracks}): Some clusters contain tracks from different people. "
