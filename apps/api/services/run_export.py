@@ -1759,6 +1759,8 @@ def build_screentime_run_debug_pdf(
     marker_fps = None
     marker_frames_total = None
     marker_stride_requested = None
+    marker_gate_enabled: bool | None = None
+    marker_gate_auto_rerun: dict[str, Any] | None = None
     if isinstance(detect_track_marker, dict):
         marker_duration_s = _parse_ffprobe_fraction(detect_track_marker.get("video_duration_sec"))
         marker_fps = _parse_ffprobe_fraction(detect_track_marker.get("fps"))
@@ -1772,6 +1774,14 @@ def build_screentime_run_debug_pdf(
             marker_stride_requested = stride_raw
         elif isinstance(stride_raw, str) and stride_raw.isdigit():
             marker_stride_requested = int(stride_raw)
+        tracking_gate = detect_track_marker.get("tracking_gate")
+        if isinstance(tracking_gate, dict):
+            enabled_raw = tracking_gate.get("enabled")
+            if isinstance(enabled_raw, bool):
+                marker_gate_enabled = enabled_raw
+            auto_rerun_raw = tracking_gate.get("auto_rerun")
+            if isinstance(auto_rerun_raw, dict):
+                marker_gate_auto_rerun = auto_rerun_raw
 
     def _fmt_duration_s(value: float | None) -> str:
         if value is None:
@@ -1845,6 +1855,21 @@ def build_screentime_run_debug_pdf(
         ])
     if marker_stride_requested is not None:
         lineage_data.append(["Face Detection Stride (requested)", str(marker_stride_requested)])
+    if marker_gate_enabled is not None:
+        lineage_data.append(["Appearance Gate Enabled", "true" if marker_gate_enabled else "false"])
+    if marker_gate_auto_rerun is not None:
+        triggered = marker_gate_auto_rerun.get("triggered")
+        selected = marker_gate_auto_rerun.get("selected")
+        reason = marker_gate_auto_rerun.get("reason")
+        if triggered is True:
+            lineage_data.append(
+                [
+                    "Appearance Gate Auto-Rerun",
+                    f"true (selected={selected or 'unknown'}, reason={reason or 'unknown'})",
+                ]
+            )
+        elif triggered is False:
+            lineage_data.append(["Appearance Gate Auto-Rerun", f"false (reason={reason or 'unknown'})"])
 
     def _rel_diff(a: float, b: float) -> float:
         denom = max(abs(a), abs(b))
@@ -2071,6 +2096,12 @@ def build_screentime_run_debug_pdf(
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (tracking.yaml):", subsection_style))
+    gate_enabled_effective: str = str(tracking_config.get("gate_enabled", "N/A"))
+    tracking_gate_meta = metrics.get("tracking_gate") if isinstance(metrics, dict) else None
+    if isinstance(tracking_gate_meta, dict):
+        enabled_raw = tracking_gate_meta.get("enabled")
+        if isinstance(enabled_raw, bool):
+            gate_enabled_effective = ("true" if enabled_raw else "false") + " (effective)"
     track_config_rows = [
         _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
         _wrap_row([
@@ -2099,7 +2130,7 @@ def build_screentime_run_debug_pdf(
         ], cell_style_small),
         _wrap_row([
             "gate_enabled",
-            str(tracking_config.get("gate_enabled", "N/A")),
+            gate_enabled_effective,
             "Appearance-based track splitting",
             "Enable to split when face changes; disable if too many splits",
         ], cell_style_small),

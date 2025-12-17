@@ -460,6 +460,16 @@ GATE_PROTO_MOMENTUM_DEFAULT = min(max(float(os.environ.get("TRACK_GATE_PROTO_MOM
 GATE_EMB_EVERY_DEFAULT = max(
     int(os.environ.get("TRACK_GATE_EMB_EVERY", "3")), 0
 )  # Was 10, reduced to catch more person switches (critical fix)
+
+# Adaptive rerun: disable appearance gate when it is clearly over-splitting.
+GATE_AUTO_RERUN_ENABLED = str(os.environ.get("TRACK_GATE_AUTO_RERUN", "1")).strip().lower() in {"1", "true", "yes", "on"}
+GATE_AUTO_RERUN_FORCED_SPLITS_THRESHOLD = max(int(os.environ.get("TRACK_GATE_AUTO_RERUN_FORCED_SPLITS", "250")), 0)
+GATE_AUTO_RERUN_MAX_ID_SWITCHES = max(int(os.environ.get("TRACK_GATE_AUTO_RERUN_MAX_ID_SWITCHES", "10")), 0)
+# Require that a meaningful share of forced_splits came from the gate (vs scene cuts) when available.
+GATE_AUTO_RERUN_MIN_GATE_SPLITS_SHARE = max(
+    min(float(os.environ.get("TRACK_GATE_AUTO_RERUN_MIN_GATE_SHARE", "0.5")), 1.0),
+    0.0,
+)
 # ByteTrack spatial matching - strict defaults
 TRACK_BUFFER_BASE_DEFAULT = max(
     _env_int("SCREANALYTICS_TRACK_BUFFER", _env_int("BYTE_TRACK_BUFFER", 15)),
@@ -500,6 +510,21 @@ if _YAML_CONFIG and "BYTE_TRACK_HIGH_THRESH" not in os.environ and "SCREENALYTIC
         TRACK_HIGH_THRESH_DEFAULT = float(_YAML_CONFIG["track_thresh"])
         TRACK_NEW_THRESH_DEFAULT = TRACK_HIGH_THRESH_DEFAULT
         LOGGER.info("Applied track_thresh=%.2f from YAML config", TRACK_HIGH_THRESH_DEFAULT)
+
+# Appearance gate enable/disable (default from tracking.yaml; override via env or CLI)
+GATE_ENABLED_DEFAULT = True
+if "TRACK_GATE_ENABLED" in os.environ:
+    cleaned = str(os.environ.get("TRACK_GATE_ENABLED", "")).strip().lower()
+    if cleaned in {"0", "false", "no", "off"}:
+        GATE_ENABLED_DEFAULT = False
+    elif cleaned in {"1", "true", "yes", "on"}:
+        GATE_ENABLED_DEFAULT = True
+elif _YAML_CONFIG and "gate_enabled" in _YAML_CONFIG:
+    try:
+        GATE_ENABLED_DEFAULT = bool(_YAML_CONFIG.get("gate_enabled"))
+        LOGGER.info("Applied gate_enabled=%s from YAML config", GATE_ENABLED_DEFAULT)
+    except Exception:
+        GATE_ENABLED_DEFAULT = True
 
 # Load detection config for wide shot mode and small face settings
 _DETECTION_CONFIG = _load_detection_config_yaml()
@@ -4980,6 +5005,20 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     gate_group = parser.add_argument_group("Appearance gate")
     gate_group.add_argument(
+        "--gate-enabled",
+        dest="gate_enabled",
+        action="store_true",
+        default=GATE_ENABLED_DEFAULT,
+        help="Enable appearance-based track splitting (default from tracking.yaml)",
+    )
+    gate_group.add_argument(
+        "--no-gate",
+        "--gate-disabled",
+        dest="gate_enabled",
+        action="store_false",
+        help="Disable appearance gate (reduces forced splits on stable tracks)",
+    )
+    gate_group.add_argument(
         "--gate-appear-hard",
         type=float,
         default=GATE_APPEAR_T_HARD_DEFAULT,
@@ -5185,6 +5224,59 @@ def _gate_config_from_args(args: argparse.Namespace, frame_stride: int) -> GateC
         proto_momentum=proto_mom,
         emb_every=emb_stride,
     )
+
+
+def _gate_auto_rerun_decision(metrics: Dict[str, Any]) -> tuple[bool, str, Dict[str, Any]]:
+    """Decide whether to auto-rerun tracking with gate disabled.
+
+    Trigger only when forced_splits are extreme AND id_switches are low,
+    indicating the appearance gate is over-splitting stable tracks.
+    """
+
+    def _safe_int(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
+
+    forced_splits = _safe_int(metrics.get("forced_splits")) or 0
+    id_switches = _safe_int(metrics.get("id_switches")) or 0
+    gate_splits: int | None = None
+    gate_share: float | None = None
+
+    appearance_gate = metrics.get("appearance_gate")
+    if isinstance(appearance_gate, dict):
+        splits = appearance_gate.get("splits")
+        if isinstance(splits, dict):
+            gate_splits = _safe_int(splits.get("total"))
+    if gate_splits is not None and forced_splits > 0:
+        gate_share = gate_splits / forced_splits
+
+    snapshot = {
+        "forced_splits": forced_splits,
+        "id_switches": id_switches,
+        "gate_splits_total": gate_splits,
+        "gate_splits_share": (round(gate_share, 3) if gate_share is not None else None),
+        "thresholds": {
+            "forced_splits": GATE_AUTO_RERUN_FORCED_SPLITS_THRESHOLD,
+            "max_id_switches": GATE_AUTO_RERUN_MAX_ID_SWITCHES,
+            "min_gate_share": GATE_AUTO_RERUN_MIN_GATE_SPLITS_SHARE,
+        },
+        "enabled": GATE_AUTO_RERUN_ENABLED,
+    }
+
+    if not GATE_AUTO_RERUN_ENABLED:
+        return False, "disabled", snapshot
+    if forced_splits < GATE_AUTO_RERUN_FORCED_SPLITS_THRESHOLD:
+        return False, "forced_splits_below_threshold", snapshot
+    if id_switches > GATE_AUTO_RERUN_MAX_ID_SWITCHES:
+        return False, "id_switches_too_high", snapshot
+    if gate_share is not None and gate_share < GATE_AUTO_RERUN_MIN_GATE_SPLITS_SHARE:
+        return False, "gate_share_too_low", snapshot
+    return True, "forced_splits_high_id_switches_low", snapshot
 
 
 def _effective_stride(stride: int, target_fps: float | None, source_fps: float) -> int:
@@ -5508,7 +5600,8 @@ def _run_full_pipeline(
     gate_embedder: ArcFaceEmbedder | None = None
     gate_config: GateConfig | None = None
     gate_embed_stride = frame_stride
-    if tracker_choice == "bytetrack":
+    gate_enabled = bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT))
+    if tracker_choice == "bytetrack" and gate_enabled:
         gate_config = _gate_config_from_args(args, frame_stride)
         appearance_gate = AppearanceGate(gate_config)
         gate_embed_stride = gate_config.emb_every or frame_stride
@@ -5520,6 +5613,8 @@ def _run_full_pipeline(
                 "ArcFace gate embedder is required for ByteTrack gating. "
                 "Install the ArcFace weights via scripts/fetch_models.py or rerun with --tracker strongsort."
             ) from exc
+    elif tracker_choice == "bytetrack":
+        LOGGER.info("[gate] gate_enabled=false; running ByteTrack without appearance-based splits")
     scene_detector_choice = _normalize_scene_detector_choice(getattr(args, "scene_detector", None))
     args.scene_detector = scene_detector_choice
     scene_threshold = max(float(getattr(args, "scene_threshold", SCENE_THRESHOLD_DEFAULT)), 0.0)
@@ -6333,6 +6428,21 @@ def _run_full_pipeline(
         "longest_tracks": recorder.top_long_tracks(),
         "max_gap_frames": recorder.max_gap,
     }
+    metrics["tracking_gate"] = {
+        "enabled": bool(gate_enabled),
+        "config": (
+            {
+                "appear_t_hard": getattr(gate_config, "appear_t_hard", None),
+                "appear_t_soft": getattr(gate_config, "appear_t_soft", None),
+                "appear_streak": getattr(gate_config, "appear_streak", None),
+                "gate_iou": getattr(gate_config, "gate_iou", None),
+                "proto_momentum": getattr(gate_config, "proto_momentum", None),
+                "emb_every": getattr(gate_config, "emb_every", None),
+            }
+            if gate_config is not None
+            else None
+        ),
+    }
     if tracker_config_summary:
         metrics["tracker_config"] = tracker_config_summary
     if final_diag_stats:
@@ -6781,6 +6891,81 @@ def _run_detect_track_stage(
             video_fps=source_fps,
         )
 
+        # Adaptive gate auto-rerun: if the appearance gate is over-splitting, rerun with gate disabled
+        gate_enabled_initial = bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT))
+        gate_auto_rerun: Dict[str, Any] = {"triggered": False, "reason": "not_evaluated"}
+        if tracker_choice == "bytetrack" and gate_enabled_initial:
+            triggered, reason, decision = _gate_auto_rerun_decision(track_metrics)
+            gate_auto_rerun = {
+                "triggered": bool(triggered),
+                "reason": reason,
+                "decision": decision,
+                "selected": "initial",
+                "initial": {
+                    "gate_enabled": True,
+                    "detections": det_count,
+                    "tracks": track_count,
+                    "metrics": track_metrics,
+                },
+            }
+            if triggered:
+                LOGGER.warning(
+                    "[gate] Auto-rerun triggered (forced_splits=%s id_switches=%s); rerunning with gate_enabled=false",
+                    decision.get("forced_splits"),
+                    decision.get("id_switches"),
+                )
+                rerun_args = argparse.Namespace(**vars(args))
+                rerun_args.gate_enabled = False
+                try:
+                    (
+                        det_count_rerun,
+                        track_count_rerun,
+                        frames_sampled_rerun,
+                        pipeline_device_rerun,
+                        detector_device_rerun,
+                        analyzed_fps_rerun,
+                        track_metrics_rerun,
+                        scene_summary_rerun,
+                        detection_conf_hist_rerun,
+                        detect_track_stats_rerun,
+                        tracker_config_summary_rerun,
+                    ) = _run_full_pipeline(
+                        rerun_args,
+                        video_dest,
+                        source_fps=source_fps,
+                        progress=None,  # avoid re-emitting progress for the recovery pass
+                        target_fps=target_fps,
+                        frame_exporter=frame_exporter,
+                        total_frames=frames_total,
+                        video_fps=source_fps,
+                    )
+
+                    det_count = det_count_rerun
+                    track_count = track_count_rerun
+                    frames_sampled = frames_sampled_rerun
+                    pipeline_device = pipeline_device_rerun
+                    detector_device = detector_device_rerun
+                    analyzed_fps = analyzed_fps_rerun
+                    track_metrics = track_metrics_rerun
+                    scene_summary = scene_summary_rerun
+                    detection_conf_hist = detection_conf_hist_rerun
+                    detect_track_stats = detect_track_stats_rerun
+                    tracker_config_summary = tracker_config_summary_rerun
+                    args.gate_enabled = False
+
+                    gate_auto_rerun["selected"] = "rerun"
+                    gate_auto_rerun["rerun"] = {
+                        "gate_enabled": False,
+                        "detections": det_count_rerun,
+                        "tracks": track_count_rerun,
+                        "metrics": track_metrics_rerun,
+                    }
+                except Exception as exc:  # pragma: no cover - best effort recovery
+                    LOGGER.warning("[gate] Auto-rerun failed; keeping initial gated output: %s", exc)
+                    gate_auto_rerun["error"] = str(exc)
+        elif tracker_choice == "bytetrack":
+            gate_auto_rerun = {"triggered": False, "reason": "gate_disabled"}
+
         run_id = getattr(args, "run_id", None)
         effective_run_id = run_id or progress.run_id
         manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
@@ -6807,6 +6992,10 @@ def _run_detect_track_stage(
             "generated_at": _utcnow_iso(),
             "metrics": track_metrics,
             "scene_cuts": scene_summary,
+            "tracking_gate": {
+                "enabled": bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT)),
+                "auto_rerun": gate_auto_rerun,
+            },
         }
         try:
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6950,6 +7139,10 @@ def _run_detect_track_stage(
                 "device": pipeline_device,
                 "requested_device": args.device,
                 "resolved_device": detector_device,
+                "tracking_gate": {
+                    "enabled": bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT)),
+                    "auto_rerun": gate_auto_rerun,
+                },
                 "started_at": started_at,
                 "finished_at": finished_at,
             },
