@@ -2371,7 +2371,6 @@ def export_run_debug_bundle(
     run_id: str,
     format: str = Query("pdf", description="Export format: 'pdf' for debug report, 'zip' for raw bundle"),
     include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities) - only for zip format"),
-    include_images: bool = Query(False, description="Include thumbnails/crops/frames (very large) - only for zip format"),
     include_logs: bool = Query(True, description="Include persisted logs (recommended) - only for zip format"),
 ) -> StreamingResponse:
     """Export a run debug report (PDF) or raw bundle (ZIP)."""
@@ -2384,7 +2383,6 @@ def export_run_debug_bundle(
                 ep_id=ep_id_norm,
                 run_id=run_id,
                 include_artifacts=include_artifacts,
-                include_images=include_images,
                 include_logs=include_logs,
             )
         except ValueError as exc:

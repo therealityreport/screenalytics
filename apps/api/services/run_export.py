@@ -20,18 +20,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
 
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
@@ -174,7 +162,6 @@ def build_run_debug_bundle_zip(
     ep_id: str,
     run_id: str,
     include_artifacts: bool = True,
-    include_images: bool = False,
     include_logs: bool = True,
 ) -> tuple[str, str]:
     """Build a run-scoped debug bundle zip.
@@ -236,7 +223,6 @@ def build_run_debug_bundle_zip(
         },
         "toggles": {
             "include_artifacts": bool(include_artifacts),
-            "include_images": bool(include_images),
             "include_logs": bool(include_logs),
         },
         "artifacts_present": {
@@ -315,6 +301,11 @@ def build_run_debug_bundle_zip(
     zip_path = tmp.name
     tmp.close()
 
+    allowed_suffixes = {".json", ".jsonl", ".log", ".txt"}
+
+    def _allowlisted_bundle_path(path: Path) -> bool:
+        return path.suffix.lower() in allowed_suffixes
+
     try:
         with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_handle:
             zip_handle.writestr("run_summary.json", json.dumps(run_summary, indent=2, ensure_ascii=False))
@@ -352,31 +343,28 @@ def build_run_debug_bundle_zip(
                     "faces_ops.jsonl",
                 ):
                     _safe_add_file(zip_handle, run_root / filename, arcname=filename)
-                _safe_add_dir(zip_handle, run_root / "body_tracking", arc_prefix="body_tracking")
-                _safe_add_dir(zip_handle, run_root / "analytics", arc_prefix="analytics")
-
-                faces_npy = (
-                    Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-                    / "embeds"
-                    / ep_id
-                    / "runs"
-                    / run_id_norm
-                    / "faces.npy"
+                _safe_add_dir(
+                    zip_handle,
+                    run_root / "body_tracking",
+                    arc_prefix="body_tracking",
+                    include_predicate=_allowlisted_bundle_path,
                 )
-                _safe_add_file(zip_handle, faces_npy, arcname="faces.npy")
-
-            # Images (thumbs/crops/frames) can be huge - gated behind include_images.
-            if include_images:
-                frames_root = get_path(ep_id, "frames_root")
-                run_frames = frames_root / "runs" / run_id_norm
-                _safe_add_dir(zip_handle, run_frames / "thumbs", arc_prefix="images/thumbs")
-                _safe_add_dir(zip_handle, run_frames / "crops", arc_prefix="images/crops")
-                _safe_add_dir(zip_handle, run_frames / "frames", arc_prefix="images/frames")
+                _safe_add_dir(
+                    zip_handle,
+                    run_root / "analytics",
+                    arc_prefix="analytics",
+                    include_predicate=_allowlisted_bundle_path,
+                )
 
             # Logs (episode-wide) - stored under manifests/{ep_id}/logs
             if include_logs:
                 logs_dir = manifests_root / "logs"
-                _safe_add_dir(zip_handle, logs_dir, arc_prefix="logs")
+                _safe_add_dir(
+                    zip_handle,
+                    logs_dir,
+                    arc_prefix="logs",
+                    include_predicate=_allowlisted_bundle_path,
+                )
                 _safe_add_file(zip_handle, runs_root / run_layout.ACTIVE_RUN_FILENAME, arcname="active_run.json")
 
                 # Include legacy phase markers for context (single file per phase; may not match this run).
@@ -560,6 +548,205 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_ffprobe_fraction(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            as_float = float(value)
+        except (TypeError, ValueError):
+            return None
+        return as_float if as_float > 0 else None
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if "/" in cleaned:
+        num_str, den_str = cleaned.split("/", 1)
+        try:
+            num = float(num_str)
+            den = float(den_str)
+        except (TypeError, ValueError):
+            return None
+        if den == 0:
+            return None
+        fps = num / den
+        return fps if fps > 0 else None
+    try:
+        fps = float(cleaned)
+    except (TypeError, ValueError):
+        return None
+    return fps if fps > 0 else None
+
+
+def _ffprobe_video_metadata(video_path: Path) -> dict[str, Any]:
+    """Best-effort video metadata via ffprobe (duration_s, avg_fps, nb_frames)."""
+    if not video_path.exists():
+        return {"ok": False, "error": "missing_video", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration,avg_frame_rate,nb_frames",
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "ffprobe_not_found", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "ffprobe_timeout", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "error": "ffprobe_failed",
+            "duration_s": None,
+            "avg_fps": None,
+            "nb_frames": None,
+        }
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "ffprobe_bad_json", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    stream0 = streams[0] if isinstance(streams, list) and streams else None
+    if not isinstance(stream0, dict):
+        return {"ok": False, "error": "ffprobe_no_stream", "duration_s": None, "avg_fps": None, "nb_frames": None}
+
+    duration_s = _parse_ffprobe_fraction(stream0.get("duration"))
+    avg_fps = _parse_ffprobe_fraction(stream0.get("avg_frame_rate"))
+    nb_frames_raw = stream0.get("nb_frames")
+    nb_frames: int | None = None
+    if isinstance(nb_frames_raw, int):
+        nb_frames = nb_frames_raw
+    elif isinstance(nb_frames_raw, str) and nb_frames_raw.isdigit():
+        nb_frames = int(nb_frames_raw)
+    return {"ok": True, "error": None, "duration_s": duration_s, "avg_fps": avg_fps, "nb_frames": nb_frames}
+
+
+def _opencv_video_metadata(video_path: Path) -> dict[str, Any]:
+    """Best-effort video metadata via OpenCV (fps, frame_count, width, height)."""
+    if not video_path.exists():
+        return {
+            "ok": False,
+            "error": "missing_video",
+            "fps": None,
+            "frame_count": None,
+            "width": None,
+            "height": None,
+        }
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        cv2 = None  # type: ignore
+    if cv2 is None:
+        return {
+            "ok": False,
+            "error": "opencv_unavailable",
+            "fps": None,
+            "frame_count": None,
+            "width": None,
+            "height": None,
+        }
+
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return {
+                "ok": False,
+                "error": "opencv_open_failed",
+                "fps": None,
+                "frame_count": None,
+                "width": None,
+                "height": None,
+            }
+        fps_probe = cap.get(cv2.CAP_PROP_FPS)
+        frames_probe = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        width_probe = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height_probe = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = float(fps_probe) if fps_probe else None
+        frame_count = int(frames_probe) if frames_probe else None
+        width = int(width_probe) if width_probe else None
+        height = int(height_probe) if height_probe else None
+        return {
+            "ok": True,
+            "error": None,
+            "fps": fps,
+            "frame_count": frame_count,
+            "width": width,
+            "height": height,
+        }
+    finally:
+        cap.release()
+
+
+def _face_detection_frame_stats(detections_path: Path) -> dict[str, Any]:
+    """Compute observed frame stats from detections.jsonl (unique frames + median stride)."""
+    if not detections_path.exists():
+        return {
+            "ok": False,
+            "error": "missing_detections_jsonl",
+            "frames_observed": None,
+            "stride_median": None,
+        }
+
+    frame_indices: set[int] = set()
+    try:
+        with detections_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                frame_idx = row.get("frame_idx")
+                if isinstance(frame_idx, int):
+                    frame_indices.add(frame_idx)
+    except OSError:
+        return {
+            "ok": False,
+            "error": "read_error_detections_jsonl",
+            "frames_observed": None,
+            "stride_median": None,
+        }
+
+    frames_sorted = sorted(frame_indices)
+    if len(frames_sorted) < 2:
+        return {
+            "ok": True,
+            "error": None,
+            "frames_observed": len(frames_sorted),
+            "stride_median": None,
+        }
+    deltas = [b - a for a, b in zip(frames_sorted, frames_sorted[1:]) if b - a > 0]
+    if not deltas:
+        stride_median = None
+    else:
+        import statistics
+
+        stride_median = int(statistics.median(deltas))
+    return {
+        "ok": True,
+        "error": None,
+        "frames_observed": len(frames_sorted),
+        "stride_median": stride_median,
+    }
 
 
 def _format_mtime(path: Path) -> str:
@@ -854,6 +1041,22 @@ def build_screentime_run_debug_pdf(
     Returns:
         (pdf_bytes, download_filename)
     """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("reportlab is required to build PDF debug reports (pip install reportlab)") from exc
+
     run_id_norm = run_layout.normalize_run_id(run_id)
     run_root = run_layout.run_root(ep_id, run_id_norm)
     if not run_root.exists():
@@ -1180,7 +1383,7 @@ def build_screentime_run_debug_pdf(
             return "✗ No"
         return "—"
 
-    def _status_color(ok: bool | None) -> colors.Color:
+    def _status_color(ok: bool | None):
         if ok is True:
             return colors.green
         if ok is False:
@@ -1372,97 +1575,157 @@ def build_screentime_run_debug_pdf(
         ["Generated At", _now_iso()],
     ]
 
-    # Video metadata (best-effort, prefer run-scoped markers when present)
-    video_meta_path = manifests_root / "video_metadata.json"
-    video_meta = _read_json(video_meta_path) if video_meta_path.exists() else None
+    # Video metadata sources (split, labeled, and validated for mismatches).
+    video_path = get_path(ep_id, "video")
+    ffprobe_meta = _ffprobe_video_metadata(video_path)
+    opencv_meta = _opencv_video_metadata(video_path)
     detect_track_marker = _read_json(run_root / "detect_track.json") if (run_root / "detect_track.json").exists() else None
-    progress_marker = _read_json(run_root / "progress.json") if (run_root / "progress.json").exists() else None
 
-    video_duration_s = None
-    video_fps = None
-    video_frames_total = None
-    width_value = None
-    height_value = None
+    ffprobe_duration_s = ffprobe_meta.get("duration_s") if ffprobe_meta.get("ok") else None
+    ffprobe_fps = ffprobe_meta.get("avg_fps") if ffprobe_meta.get("ok") else None
+    ffprobe_frames = ffprobe_meta.get("nb_frames") if ffprobe_meta.get("ok") else None
 
-    face_stride = None
-    face_frames_processed = None
+    opencv_fps = opencv_meta.get("fps") if opencv_meta.get("ok") else None
+    opencv_frames = opencv_meta.get("frame_count") if opencv_meta.get("ok") else None
+    width_value = opencv_meta.get("width") if opencv_meta.get("ok") else None
+    height_value = opencv_meta.get("height") if opencv_meta.get("ok") else None
 
-    if isinstance(video_meta, dict):
-        video_duration_s = video_meta.get("duration") or video_meta.get("duration_sec")
-        video_fps = video_meta.get("fps")
-        width_value = video_meta.get("width")
-        height_value = video_meta.get("height")
-        video_frames_total = video_meta.get("frame_count") or video_meta.get("frames_total")
-
+    marker_duration_s = None
+    marker_fps = None
+    marker_frames_total = None
+    marker_stride_requested = None
     if isinstance(detect_track_marker, dict):
-        video_duration_s = detect_track_marker.get("video_duration_sec", video_duration_s)
-        video_fps = detect_track_marker.get("fps", video_fps)
-        face_frames_processed = detect_track_marker.get("frames_total", face_frames_processed)
-        face_stride = detect_track_marker.get("stride", face_stride)
+        marker_duration_s = _parse_ffprobe_fraction(detect_track_marker.get("video_duration_sec"))
+        marker_fps = _parse_ffprobe_fraction(detect_track_marker.get("fps"))
+        marker_frames_raw = detect_track_marker.get("frames_total")
+        if isinstance(marker_frames_raw, int):
+            marker_frames_total = marker_frames_raw
+        elif isinstance(marker_frames_raw, str) and marker_frames_raw.isdigit():
+            marker_frames_total = int(marker_frames_raw)
+        stride_raw = detect_track_marker.get("stride")
+        if isinstance(stride_raw, int):
+            marker_stride_requested = stride_raw
+        elif isinstance(stride_raw, str) and stride_raw.isdigit():
+            marker_stride_requested = int(stride_raw)
 
-    if isinstance(progress_marker, dict):
-        if face_frames_processed is None:
-            face_frames_processed = progress_marker.get("frames_total", face_frames_processed)
-        if face_stride is None:
-            face_stride = progress_marker.get("stride", face_stride)
-        video_fps = progress_marker.get("fps_detected", video_fps) or progress_marker.get("fps_infer", video_fps)
+    def _fmt_duration_s(value: float | None) -> str:
+        if value is None:
+            return "unknown"
+        return f"{value:.3f}s"
 
-    # If metadata is missing, probe the video file header when available.
-    if (
-        width_value is None
-        or height_value is None
-        or video_frames_total is None
-        or video_fps is None
-        or video_duration_s is None
-    ):
-        try:
-            video_path = get_path(ep_id, "video")
-            if video_path.exists():
-                try:
-                    import cv2  # type: ignore
-                except Exception:
-                    cv2 = None  # type: ignore
-                if cv2 is not None:
-                    cap = cv2.VideoCapture(str(video_path))
-                    try:
-                        if cap.isOpened():
-                            width_probe = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                            height_probe = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                            frames_probe = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                            fps_probe = cap.get(cv2.CAP_PROP_FPS)
-                            if width_value is None and width_probe:
-                                width_value = int(width_probe)
-                            if height_value is None and height_probe:
-                                height_value = int(height_probe)
-                            if video_frames_total is None and frames_probe:
-                                video_frames_total = int(frames_probe)
-                            if video_fps is None and fps_probe:
-                                video_fps = float(fps_probe)
-                            if video_duration_s is None and video_frames_total and video_fps:
-                                video_duration_s = float(video_frames_total) / float(video_fps)
-                    finally:
-                        cap.release()
-        except Exception:
-            pass
+    def _fmt_fps(value: float | None) -> str:
+        if value is None:
+            return "unknown"
+        return f"{value:.3f} fps"
 
-    if video_duration_s is not None:
-        try:
-            lineage_data.append(["Video Duration", f"{float(video_duration_s):.2f}s"])
-        except (TypeError, ValueError):
-            lineage_data.append(["Video Duration", str(video_duration_s)])
-    if video_fps is not None:
-        try:
-            lineage_data.append(["Video Frame Rate", f"{float(video_fps):.3g} fps"])
-        except (TypeError, ValueError):
-            lineage_data.append(["Video Frame Rate", f"{video_fps} fps"])
+    def _fmt_int(value: int | None) -> str:
+        if value is None:
+            return "unknown"
+        return str(value)
+
+    resolved_duration_s: float | None = ffprobe_duration_s or marker_duration_s
+    resolved_fps: float | None = ffprobe_fps or marker_fps
+    resolved_frames: int | None = ffprobe_frames or marker_frames_total
+    if resolved_duration_s is not None:
+        lineage_data.append(
+            [
+                "Video Duration (resolved)",
+                f"{resolved_duration_s:.2f}s ({'ffprobe' if ffprobe_duration_s else 'detect_track.marker'})",
+            ]
+        )
+    if resolved_fps is not None:
+        lineage_data.append(
+            [
+                "Video Frame Rate (resolved)",
+                f"{resolved_fps:.3f} fps ({'ffprobe' if ffprobe_fps else 'detect_track.marker'})",
+            ]
+        )
+    if resolved_frames is not None:
+        lineage_data.append(
+            [
+                "Total Video Frames (resolved)",
+                f"{resolved_frames} ({'ffprobe' if ffprobe_frames else 'detect_track.marker'})",
+            ]
+        )
     if width_value is not None or height_value is not None:
-        lineage_data.append(["Resolution", f"{width_value or '?'}x{height_value or '?'}"])
-    if video_frames_total is not None:
-        lineage_data.append(["Total Video Frames", str(video_frames_total)])
-    if face_frames_processed is not None:
-        lineage_data.append(["Face Frames Processed", str(face_frames_processed)])
-    if face_stride is not None:
-        lineage_data.append(["Face Pipeline Stride", str(face_stride)])
+        lineage_data.append(["Resolution (OpenCV)", f"{width_value or '?'}x{height_value or '?'}"])
+
+    lineage_data.extend([
+        ["ffprobe.duration_s", _fmt_duration_s(ffprobe_duration_s)],
+        ["ffprobe.avg_fps", _fmt_fps(ffprobe_fps)],
+        ["ffprobe.nb_frames", _fmt_int(ffprobe_frames)],
+        ["opencv.fps", _fmt_fps(opencv_fps)],
+        ["opencv.frame_count", _fmt_int(opencv_frames)],
+    ])
+    if marker_duration_s is not None or marker_fps is not None or marker_frames_total is not None:
+        lineage_data.extend([
+            ["detect_track.marker.video_duration_s", _fmt_duration_s(marker_duration_s)],
+            ["detect_track.marker.fps", _fmt_fps(marker_fps)],
+            ["detect_track.marker.frames_total", _fmt_int(marker_frames_total)],
+        ])
+    if marker_stride_requested is not None:
+        lineage_data.append(["Face Detection Stride (requested)", str(marker_stride_requested)])
+
+    def _rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b))
+        if denom <= 0:
+            return 0.0
+        return abs(a - b) / denom
+
+    mismatches: list[str] = []
+
+    def _check_mismatch(label: str, a_name: str, a_value: float | int | None, b_name: str, b_value: float | int | None) -> None:
+        if a_value is None or b_value is None:
+            return
+        diff = _rel_diff(float(a_value), float(b_value))
+        if diff > 0.10:
+            mismatches.append(f"{label}: {a_name} vs {b_name} ({diff * 100:.1f}% diff)")
+
+    opencv_duration_s: float | None = None
+    if isinstance(opencv_frames, int) and isinstance(opencv_fps, float) and opencv_fps > 0:
+        opencv_duration_s = float(opencv_frames) / opencv_fps
+
+    _check_mismatch("Duration", "ffprobe.duration_s", ffprobe_duration_s, "detect_track.marker.video_duration_s", marker_duration_s)
+    _check_mismatch("Duration", "ffprobe.duration_s", ffprobe_duration_s, "opencv.frame_count/opencv.fps", opencv_duration_s)
+    _check_mismatch("Duration", "detect_track.marker.video_duration_s", marker_duration_s, "opencv.frame_count/opencv.fps", opencv_duration_s)
+    _check_mismatch("FPS", "ffprobe.avg_fps", ffprobe_fps, "detect_track.marker.fps", marker_fps)
+    _check_mismatch("FPS", "ffprobe.avg_fps", ffprobe_fps, "opencv.fps", opencv_fps)
+    _check_mismatch("FPS", "detect_track.marker.fps", marker_fps, "opencv.fps", opencv_fps)
+    _check_mismatch("Frames", "ffprobe.nb_frames", ffprobe_frames, "detect_track.marker.frames_total", marker_frames_total)
+    _check_mismatch("Frames", "ffprobe.nb_frames", ffprobe_frames, "opencv.frame_count", opencv_frames)
+    _check_mismatch("Frames", "detect_track.marker.frames_total", marker_frames_total, "opencv.frame_count", opencv_frames)
+
+    if mismatches:
+        story.append(
+            Paragraph(
+                "<b>⚠️ metadata mismatch</b>: video metadata sources disagree by &gt;10% ("
+                + "; ".join(mismatches)
+                + "). Values in this section may be unreliable.",
+                note_style,
+            )
+        )
+
+    # Face detection observed frame stats (most reliable for stride/frame count).
+    det_stats = _face_detection_frame_stats(detections_path)
+    if det_stats.get("ok"):
+        lineage_data.append(["Face Detection Frames Observed", str(det_stats.get("frames_observed"))])
+        stride_median = det_stats.get("stride_median")
+        lineage_data.append(
+            ["Face Detection Stride (observed)", str(stride_median) if stride_median is not None else "unknown"]
+        )
+    else:
+        lineage_data.append(["Face Detection Frames Observed", "unknown"])
+        lineage_data.append(["Face Detection Stride (observed)", "unknown"])
+
+    detection_stride_cfg = None
+    for key in ("stride", "detect_every_n_frames"):
+        if key in detection_config:
+            detection_stride_cfg = detection_config.get(key)
+            break
+    if detection_stride_cfg is not None:
+        lineage_data.append(["Face Detection Stride (config)", str(detection_stride_cfg)])
+    else:
+        lineage_data.append(["Face Detection Stride (config)", "N/A (not specified in detection.yaml)"])
     body_stride_cfg: int | None = None
     try:
         body_stride_cfg_raw = body_detection_config.get("person_detection", {}).get("detect_every_n_frames")
@@ -1472,8 +1735,8 @@ def build_screentime_run_debug_pdf(
     if body_stride_cfg is not None:
         lineage_data.append(["Body Pipeline Stride (detect_every_n_frames)", str(body_stride_cfg)])
         if bool(body_tracking_ran_effective):
-            if isinstance(video_frames_total, int) and body_stride_cfg > 0:
-                body_frames_expected = (video_frames_total + body_stride_cfg - 1) // body_stride_cfg
+            if isinstance(resolved_frames, int) and body_stride_cfg > 0:
+                body_frames_expected = (resolved_frames + body_stride_cfg - 1) // body_stride_cfg
                 lineage_data.append(["Body Frames Processed (expected)", str(body_frames_expected)])
             else:
                 lineage_data.append(["Body Frames Processed (expected)", "N/A"])

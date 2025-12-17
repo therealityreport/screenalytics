@@ -5109,34 +5109,17 @@ else:
     opt_key_prefix = f"{ep_id}::{selected_attempt_run_id}::export_bundle"
     export_format_label = st.radio(
         "Export format",
-        options=("PDF debug report", "ZIP raw bundle"),
+        options=("PDF debug report", "ZIP debug bundle (advanced)"),
         index=0,
         key=f"{opt_key_prefix}::format",
         horizontal=True,
     )
     export_format = "zip" if export_format_label.startswith("ZIP") else "pdf"
 
-    include_artifacts = True
-    include_images = False
-    include_logs = True
     if export_format == "zip":
-        include_artifacts = st.checkbox(
-            "Include raw artifacts (tracks/faces/identities)",
-            value=True,
-            key=f"{opt_key_prefix}::include_artifacts",
-        )
-        include_images = st.checkbox(
-            "Include thumbnails/crops/frames (very large)",
-            value=False,
-            key=f"{opt_key_prefix}::include_images",
-        )
-        include_logs = st.checkbox(
-            "Include logs (recommended)",
-            value=True,
-            key=f"{opt_key_prefix}::include_logs",
-        )
+        st.caption("ZIP includes `debug_report.pdf` + run-scoped json/jsonl artifacts + logs (no images).")
     else:
-        st.caption("PDF export is a self-contained report (toggles apply to ZIP only).")
+        st.caption("PDF export is a self-contained report.")
 
     export_state_key = f"{opt_key_prefix}::payload::{export_format}"
     export_button_label = "Generate Debug Report (PDF)" if export_format == "pdf" else "Export Run Debug Bundle (ZIP)"
@@ -5150,14 +5133,6 @@ else:
         with st.spinner("Building export…"):
             url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{selected_attempt_run_id}/export"
             params = {"format": export_format}
-            if export_format == "zip":
-                params.update(
-                    {
-                        "include_artifacts": "1" if include_artifacts else "0",
-                        "include_images": "1" if include_images else "0",
-                        "include_logs": "1" if include_logs else "0",
-                    }
-                )
             try:
                 resp = requests.get(url, params=params, timeout=300)
                 resp.raise_for_status()
