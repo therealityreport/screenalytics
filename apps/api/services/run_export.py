@@ -15,6 +15,7 @@ import os
 import subprocess
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -454,6 +455,18 @@ def _artifact_row(path: Path, name: str | None = None) -> tuple[str, str, str]:
     if path.exists():
         return (filename, "Present", _file_size_str(path))
     return (filename, "Missing", "-")
+
+
+def _bundle_status(path: Path, *, in_allowlist: bool) -> str:
+    """Return 'In Bundle' status based on file existence and allowlist membership.
+
+    - "Yes" if file exists AND is in bundle allowlist
+    - "No" if file exists but NOT in bundle allowlist
+    - "N/A" if file is missing (nothing to bundle)
+    """
+    if not path.exists():
+        return "N/A"
+    return "Yes" if in_allowlist else "No"
 
 
 def _load_yaml_config(config_name: str) -> dict[str, Any]:
@@ -1590,12 +1603,43 @@ def build_screentime_run_debug_pdf(
     # =========================================================================
     story.append(Paragraph("0. Run Inputs &amp; Lineage", section_style))
 
+    # Get storage backend configuration for display
+    try:
+        from apps.api.services.validation import validate_storage_backend_config
+        storage_config = validate_storage_backend_config()
+        storage_backend = storage_config.backend
+        storage_bucket = storage_config.bucket or "N/A"
+        storage_endpoint = storage_config.s3_endpoint or "N/A"
+        storage_is_fallback = storage_config.is_fallback
+        storage_fallback_reason = storage_config.fallback_reason or ""
+        storage_has_creds = storage_config.has_credentials
+    except Exception:
+        storage_backend = os.environ.get("STORAGE_BACKEND", "local").lower()
+        storage_bucket = os.environ.get("SCREENALYTICS_S3_BUCKET") or os.environ.get("AWS_S3_BUCKET") or "N/A"
+        storage_endpoint = os.environ.get("SCREENALYTICS_OBJECT_STORE_ENDPOINT") or "N/A"
+        storage_is_fallback = False
+        storage_fallback_reason = ""
+        storage_has_creds = False
+
+    # Format storage backend display string
+    if storage_backend in ("s3", "minio", "hybrid"):
+        storage_display = f"{storage_backend} (bucket={storage_bucket})"
+        if storage_endpoint != "N/A":
+            storage_display = f"{storage_backend} (bucket={storage_bucket}, endpoint={storage_endpoint})"
+    else:
+        storage_display = storage_backend
+
+    if storage_is_fallback:
+        storage_display = f"{storage_display} [FALLBACK: {storage_fallback_reason}]"
+
     lineage_data = [
         ["Input", "Value"],
         ["Episode ID", ep_id],
         ["Run ID", run_id_norm],
         ["Git SHA", _get_git_sha()],
         ["Generated At", _now_iso()],
+        ["Artifact Store", storage_display],
+        ["DB Connected", "Yes" if db_connected else f"No ({db_error[:40]}...)" if db_error and len(db_error) > 40 else f"No ({db_error or 'unknown'})"],
     ]
 
     # Video metadata sources (split, labeled, and validated for mismatches).
@@ -2914,20 +2958,21 @@ def build_screentime_run_debug_pdf(
     # "In Bundle" indicates whether the artifact is included when exporting as ZIP with include_artifacts=True
     # ZIP bundle includes: .json, .jsonl files from run root + body_tracking/ + analytics/
     # Excludes: .npy files, face_alignment/ subdirectory
+    # If a file is missing, "In Bundle" shows "N/A" (nothing to include)
     artifact_data = [
         ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
-        (*_artifact_row(detections_path), str(detect_count), "Face Detect", "Yes"),
-        (*_artifact_row(tracks_path), str(track_count), "Face Track", "Yes"),
-        (*_artifact_row(track_metrics_path), "-", "Face Track", "Yes"),
-        (*_artifact_row(faces_path), str(faces_count), "Face Harvest", "Yes"),
-        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed", "No"),
-        (*_artifact_row(faces_npy), "-", "Face Embed", "No"),
-        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster", "Yes"),
-        (*_artifact_row(cluster_centroids_path), "-", "Cluster", "Yes"),
-        (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect", "Yes"),
-        (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track", "Yes"),
-        (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion", "Yes"),
-        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time", "Yes"),
+        (*_artifact_row(detections_path), str(detect_count), "Face Detect", _bundle_status(detections_path, in_allowlist=True)),
+        (*_artifact_row(tracks_path), str(track_count), "Face Track", _bundle_status(tracks_path, in_allowlist=True)),
+        (*_artifact_row(track_metrics_path), "-", "Face Track", _bundle_status(track_metrics_path, in_allowlist=True)),
+        (*_artifact_row(faces_path), str(faces_count), "Face Harvest", _bundle_status(faces_path, in_allowlist=True)),
+        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed", _bundle_status(face_alignment_path, in_allowlist=False)),
+        (*_artifact_row(faces_npy), "-", "Face Embed", _bundle_status(faces_npy, in_allowlist=False)),
+        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster", _bundle_status(identities_path, in_allowlist=True)),
+        (*_artifact_row(cluster_centroids_path), "-", "Cluster", _bundle_status(cluster_centroids_path, in_allowlist=True)),
+        (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect", _bundle_status(body_detections_path, in_allowlist=True)),
+        (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track", _bundle_status(body_tracks_path, in_allowlist=True)),
+        (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion", _bundle_status(track_fusion_path, in_allowlist=True)),
+        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time", _bundle_status(screentime_comparison_path, in_allowlist=True)),
     ]
     artifact_table = Table(artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
     artifact_table.setStyle(
@@ -2965,10 +3010,10 @@ def build_screentime_run_debug_pdf(
         )
         legacy_artifact_data = [
             ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
-            (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect", "No"),
-            (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track", "No"),
-            (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion", "No"),
-            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time", "No"),
+            (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect", _bundle_status(legacy_body_detections_path, in_allowlist=False)),
+            (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track", _bundle_status(legacy_body_tracks_path, in_allowlist=False)),
+            (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion", _bundle_status(legacy_track_fusion_path, in_allowlist=False)),
+            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time", _bundle_status(legacy_screentime_comparison_path, in_allowlist=False)),
         ]
         legacy_table = Table(legacy_artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
         legacy_table.setStyle(
@@ -2994,3 +3039,326 @@ def build_screentime_run_debug_pdf(
 
     download_name = f"screenalytics_{ep_id}_{run_id_norm}_debug_report.pdf"
     return pdf_bytes, download_name
+
+
+# ---------------------------------------------------------------------------
+# S3 Export Upload
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ExportUploadResult:
+    """Result of exporting and optionally uploading to S3."""
+
+    success: bool
+    s3_key: str | None = None
+    s3_bucket: str | None = None
+    s3_url: str | None = None
+    error: str | None = None
+    bytes_uploaded: int = 0
+    upload_time_ms: float = 0.0
+
+
+def _get_export_s3_key(ep_id: str, run_id: str, filename: str) -> str:
+    """Generate deterministic S3 key for an export file.
+
+    Format: runs/{ep_id}/{run_id}/exports/{filename}
+    """
+    run_id_norm = run_layout.normalize_run_id(run_id)
+    return f"runs/{ep_id}/{run_id_norm}/exports/{filename}"
+
+
+def validate_s3_for_export() -> tuple[bool, str | None, dict[str, Any]]:
+    """Validate that S3 is properly configured for export uploads.
+
+    Returns:
+        (is_valid, error_message, config_details)
+    """
+    try:
+        from apps.api.services.validation import validate_storage_backend_config
+        config = validate_storage_backend_config()
+    except ImportError:
+        # Fallback to manual check
+        backend = os.environ.get("STORAGE_BACKEND", "local").lower()
+        if backend == "local":
+            return True, None, {"backend": backend, "s3_enabled": False}
+        return False, "Validation module not available", {"backend": backend}
+
+    details = {
+        "backend": config.backend,
+        "bucket": config.bucket,
+        "region": config.region,
+        "s3_endpoint": config.s3_endpoint,
+        "has_credentials": config.has_credentials,
+        "is_fallback": config.is_fallback,
+        "s3_enabled": config.backend in ("s3", "minio", "hybrid"),
+    }
+
+    # Local backend is always valid (just won't upload)
+    if config.backend == "local":
+        return True, None, details
+
+    # For S3/MinIO/hybrid, check required configuration
+    if config.is_fallback:
+        return False, config.fallback_reason, details
+
+    if not config.bucket:
+        return False, "S3 bucket not configured (set SCREENALYTICS_S3_BUCKET or AWS_S3_BUCKET)", details
+
+    # Note: credentials may come from instance profiles, so we only warn, not fail
+    if not config.has_credentials and config.backend == "minio":
+        return False, "MinIO requires explicit credentials", details
+
+    return True, None, details
+
+
+def upload_export_to_s3(
+    *,
+    ep_id: str,
+    run_id: str,
+    file_bytes: bytes,
+    filename: str,
+    content_type: str = "application/octet-stream",
+    fail_on_error: bool = True,
+) -> ExportUploadResult:
+    """Upload an export file to S3.
+
+    Args:
+        ep_id: Episode ID
+        run_id: Run ID
+        file_bytes: File content as bytes
+        filename: Filename for the export (e.g., "debug_report.pdf")
+        content_type: MIME type for the upload
+        fail_on_error: If True, raise exception on failure; if False, return error in result
+
+    Returns:
+        ExportUploadResult with upload status and S3 location
+
+    Raises:
+        RuntimeError: If fail_on_error=True and upload fails
+    """
+    import time
+
+    # Validate S3 configuration
+    is_valid, error_msg, config = validate_s3_for_export()
+
+    # If not S3-enabled, return success without upload
+    if not config.get("s3_enabled"):
+        LOGGER.info("[export-s3] S3 not enabled (backend=%s), skipping upload", config.get("backend"))
+        return ExportUploadResult(success=True, error="S3 not enabled, file not uploaded")
+
+    if not is_valid:
+        msg = f"S3 configuration invalid: {error_msg}"
+        LOGGER.error("[export-s3] %s", msg)
+        if fail_on_error:
+            raise RuntimeError(msg)
+        return ExportUploadResult(success=False, error=msg)
+
+    # Get S3 key
+    s3_key = _get_export_s3_key(ep_id, run_id, filename)
+    bucket = config.get("bucket")
+
+    # Try to upload
+    start_time = time.time()
+    try:
+        from apps.api.services.storage import StorageService
+        storage = StorageService()
+
+        LOGGER.info("[export-s3] Uploading %s to s3://%s/%s (%d bytes)", filename, bucket, s3_key, len(file_bytes))
+
+        if not storage.upload_bytes(file_bytes, s3_key, content_type=content_type):
+            msg = f"Upload failed for s3://{bucket}/{s3_key}"
+            LOGGER.error("[export-s3] %s", msg)
+            if fail_on_error:
+                raise RuntimeError(msg)
+            return ExportUploadResult(success=False, error=msg, s3_key=s3_key, s3_bucket=bucket)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        LOGGER.info("[export-s3] Successfully uploaded %s to s3://%s/%s in %.1fms", filename, bucket, s3_key, elapsed_ms)
+
+        # Generate presigned URL for convenience
+        presigned_url = None
+        try:
+            presigned_url = storage.presign_get(s3_key, expiration=3600)
+        except Exception:
+            pass  # URL generation is best-effort
+
+        return ExportUploadResult(
+            success=True,
+            s3_key=s3_key,
+            s3_bucket=bucket,
+            s3_url=presigned_url,
+            bytes_uploaded=len(file_bytes),
+            upload_time_ms=elapsed_ms,
+        )
+
+    except Exception as exc:
+        elapsed_ms = (time.time() - start_time) * 1000
+        msg = f"S3 upload failed for {filename}: {exc}"
+        LOGGER.exception("[export-s3] %s", msg)
+        if fail_on_error:
+            raise RuntimeError(msg) from exc
+        return ExportUploadResult(
+            success=False,
+            error=msg,
+            s3_key=s3_key,
+            s3_bucket=bucket,
+            upload_time_ms=elapsed_ms,
+        )
+
+
+def build_and_upload_debug_pdf(
+    *,
+    ep_id: str,
+    run_id: str,
+    upload_to_s3: bool = True,
+    fail_on_s3_error: bool = False,
+    write_index: bool = True,
+) -> tuple[bytes, str, ExportUploadResult | None]:
+    """Build debug PDF and optionally upload to S3.
+
+    Args:
+        ep_id: Episode ID
+        run_id: Run ID
+        upload_to_s3: Whether to upload to S3 (if configured)
+        fail_on_s3_error: If True, raise on S3 upload failure
+        write_index: If True, write export_index.json marker file
+
+    Returns:
+        (pdf_bytes, download_filename, upload_result or None)
+    """
+    pdf_bytes, download_name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+
+    upload_result = None
+    if upload_to_s3:
+        upload_result = upload_export_to_s3(
+            ep_id=ep_id,
+            run_id=run_id,
+            file_bytes=pdf_bytes,
+            filename="debug_report.pdf",
+            content_type="application/pdf",
+            fail_on_error=fail_on_s3_error,
+        )
+
+    # Write export index marker for later lookup
+    if write_index:
+        try:
+            from apps.api.services.run_artifact_store import write_export_index, ArtifactSyncResult
+
+            # Convert ExportUploadResult to ArtifactSyncResult-like object for write_export_index
+            artifact_result = None
+            if upload_result:
+                artifact_result = ArtifactSyncResult(
+                    success=upload_result.success,
+                    uploaded_count=1 if upload_result.success else 0,
+                    bytes_uploaded=upload_result.bytes_uploaded,
+                    sync_time_ms=upload_result.upload_time_ms,
+                    s3_prefix=f"runs/{ep_id}/{run_id}/exports/",
+                    s3_bucket=upload_result.s3_bucket,
+                    errors=[upload_result.error] if upload_result.error else [],
+                    uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],
+                )
+
+            write_export_index(
+                ep_id=ep_id,
+                run_id=run_id,
+                export_type="pdf",
+                export_key=upload_result.s3_key if upload_result else None,
+                export_bytes=len(pdf_bytes),
+                upload_result=artifact_result,
+            )
+        except Exception as exc:
+            LOGGER.warning("[export] Failed to write export index: %s", exc)
+
+    return pdf_bytes, download_name, upload_result
+
+
+def build_and_upload_debug_bundle(
+    *,
+    ep_id: str,
+    run_id: str,
+    include_artifacts: bool = True,
+    include_logs: bool = True,
+    upload_to_s3: bool = True,
+    fail_on_s3_error: bool = False,
+    write_index: bool = True,
+) -> tuple[str, str, ExportUploadResult | None]:
+    """Build debug bundle ZIP and optionally upload to S3.
+
+    Args:
+        ep_id: Episode ID
+        run_id: Run ID
+        include_artifacts: Include run artifacts in ZIP
+        include_logs: Include logs in ZIP
+        upload_to_s3: Whether to upload to S3 (if configured)
+        fail_on_s3_error: If True, raise on S3 upload failure
+        write_index: If True, write export_index.json marker file
+
+    Returns:
+        (zip_path, download_filename, upload_result or None)
+    """
+    zip_path, download_name = build_run_debug_bundle_zip(
+        ep_id=ep_id,
+        run_id=run_id,
+        include_artifacts=include_artifacts,
+        include_logs=include_logs,
+    )
+
+    upload_result = None
+    zip_bytes_len = 0
+    if upload_to_s3:
+        try:
+            with open(zip_path, "rb") as f:
+                zip_bytes = f.read()
+            zip_bytes_len = len(zip_bytes)
+            upload_result = upload_export_to_s3(
+                ep_id=ep_id,
+                run_id=run_id,
+                file_bytes=zip_bytes,
+                filename="debug_bundle.zip",
+                content_type="application/zip",
+                fail_on_error=fail_on_s3_error,
+            )
+        except Exception as exc:
+            LOGGER.warning("[export-s3] Failed to read ZIP for S3 upload: %s", exc)
+            if fail_on_s3_error:
+                raise
+
+    # Write export index marker for later lookup
+    if write_index:
+        try:
+            from apps.api.services.run_artifact_store import write_export_index, ArtifactSyncResult
+
+            # Get ZIP size if not already known
+            if zip_bytes_len == 0:
+                try:
+                    zip_bytes_len = Path(zip_path).stat().st_size
+                except OSError:
+                    pass
+
+            # Convert ExportUploadResult to ArtifactSyncResult-like object
+            artifact_result = None
+            if upload_result:
+                artifact_result = ArtifactSyncResult(
+                    success=upload_result.success,
+                    uploaded_count=1 if upload_result.success else 0,
+                    bytes_uploaded=upload_result.bytes_uploaded,
+                    sync_time_ms=upload_result.upload_time_ms,
+                    s3_prefix=f"runs/{ep_id}/{run_id}/exports/",
+                    s3_bucket=upload_result.s3_bucket,
+                    errors=[upload_result.error] if upload_result.error else [],
+                    uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],
+                )
+
+            write_export_index(
+                ep_id=ep_id,
+                run_id=run_id,
+                export_type="zip",
+                export_key=upload_result.s3_key if upload_result else None,
+                export_bytes=zip_bytes_len,
+                upload_result=artifact_result,
+            )
+        except Exception as exc:
+            LOGGER.warning("[export] Failed to write export index: %s", exc)
+
+    return zip_path, download_name, upload_result

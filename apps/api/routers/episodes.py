@@ -2372,18 +2372,37 @@ def export_run_debug_bundle(
     format: str = Query("pdf", description="Export format: 'pdf' for debug report, 'zip' for raw bundle"),
     include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities) - only for zip format"),
     include_logs: bool = Query(True, description="Include persisted logs (recommended) - only for zip format"),
+    upload_to_s3: bool = Query(True, description="Upload export to S3 if configured (silent no-op if backend=local)"),
 ) -> StreamingResponse:
-    """Export a run debug report (PDF) or raw bundle (ZIP)."""
+    """Export a run debug report (PDF) or raw bundle (ZIP).
+
+    When S3 storage is configured, exports are automatically uploaded to:
+    - runs/{ep_id}/{run_id}/exports/debug_report.pdf (for PDF)
+    - runs/{ep_id}/{run_id}/exports/debug_bundle.zip (for ZIP)
+
+    S3 upload status is included in response headers:
+    - X-S3-Upload-Attempted: true/false (whether S3 upload was attempted)
+    - X-S3-Upload-Success: true/false (whether upload succeeded)
+    - X-S3-Upload-Key: S3 key (if successful)
+    - X-S3-Upload-Error: Error message (if failed)
+    """
+    from apps.api.services.run_export import (
+        build_and_upload_debug_bundle,
+        build_and_upload_debug_pdf,
+    )
+
     ep_id_norm = normalize_ep_id(ep_id)
 
     if format == "zip":
         # ZIP export
         try:
-            zip_path, download_name = build_run_debug_bundle_zip(
+            zip_path, download_name, upload_result = build_and_upload_debug_bundle(
                 ep_id=ep_id_norm,
                 run_id=run_id,
                 include_artifacts=include_artifacts,
                 include_logs=include_logs,
+                upload_to_s3=upload_to_s3,
+                fail_on_s3_error=False,  # Don't fail the request if S3 upload fails
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2402,6 +2421,15 @@ def export_run_debug_bundle(
                     pass
 
         headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+        # Add S3 upload status to headers for observability
+        headers["X-S3-Upload-Attempted"] = "true" if upload_result is not None else "false"
+        if upload_result is not None:
+            headers["X-S3-Upload-Success"] = "true" if upload_result.success else "false"
+            if upload_result.s3_key:
+                headers["X-S3-Upload-Key"] = upload_result.s3_key
+            if upload_result.error:
+                headers["X-S3-Upload-Error"] = upload_result.error[:200]  # Truncate long errors
+
         return StreamingResponse(
             file_handle,
             media_type="application/zip",
@@ -2411,9 +2439,11 @@ def export_run_debug_bundle(
     else:
         # PDF export (default)
         try:
-            pdf_bytes, download_name = build_screentime_run_debug_pdf(
+            pdf_bytes, download_name, upload_result = build_and_upload_debug_pdf(
                 ep_id=ep_id_norm,
                 run_id=run_id,
+                upload_to_s3=upload_to_s3,
+                fail_on_s3_error=False,  # Don't fail the request if S3 upload fails
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2421,6 +2451,15 @@ def export_run_debug_bundle(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+        # Add S3 upload status to headers for observability
+        headers["X-S3-Upload-Attempted"] = "true" if upload_result is not None else "false"
+        if upload_result is not None:
+            headers["X-S3-Upload-Success"] = "true" if upload_result.success else "false"
+            if upload_result.s3_key:
+                headers["X-S3-Upload-Key"] = upload_result.s3_key
+            if upload_result.error:
+                headers["X-S3-Upload-Error"] = upload_result.error[:200]  # Truncate long errors
+
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
             media_type="application/pdf",

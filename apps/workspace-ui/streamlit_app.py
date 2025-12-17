@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# Load .env file FIRST before any other imports
+# This ensures S3 configuration is available for all modules
+from pathlib import Path
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parents[2] / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # dotenv not installed, rely on system environment
+
 import streamlit as st
 
 # IMPORTANT: st.set_page_config() must be called FIRST, before any other st.* calls

@@ -3,7 +3,7 @@
 
 # Master switch
 body_tracking:
-  enabled: false  # Disabled by default for thermals; enable explicitly when needed.
+  enabled: true  # Enabled by default for run-scoped auto-run pipelines.
 
 # Person detection (YOLO)
 person_detection:

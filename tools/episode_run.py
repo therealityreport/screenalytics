@@ -135,20 +135,39 @@ def _load_alignment_config() -> dict[str, Any]:
 
 
 def _load_body_tracking_config() -> dict[str, Any]:
-    """Load body tracking configuration from YAML file if available."""
+    """Load body tracking configuration from YAML file if available.
+
+    Environment variable overrides:
+        AUTO_RUN_BODY_TRACKING: If set to "0" or "false", disables body tracking
+            regardless of YAML config. If set to "1" or "true", enables body tracking.
+            If unset, uses the YAML config value (default: enabled).
+    """
     config_path = REPO_ROOT / "config" / "pipeline" / "body_detection.yaml"
-    if not config_path.exists():
-        return {}
+    config: dict[str, Any] = {}
 
-    try:
-        import yaml
+    if config_path.exists():
+        try:
+            import yaml
 
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
-        return config or {}
-    except Exception as exc:
-        LOGGER.warning("Failed to load body tracking config YAML: %s", exc)
-        return {}
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config = yaml.safe_load(handle) or {}
+        except Exception as exc:
+            LOGGER.warning("Failed to load body tracking config YAML: %s", exc)
+
+    # Environment variable override for body tracking enabled state
+    env_override = os.environ.get("AUTO_RUN_BODY_TRACKING", "").strip().lower()
+    if env_override in ("0", "false", "no", "off"):
+        if "body_tracking" not in config:
+            config["body_tracking"] = {}
+        config["body_tracking"]["enabled"] = False
+        LOGGER.debug("[body_tracking] Disabled via AUTO_RUN_BODY_TRACKING env var")
+    elif env_override in ("1", "true", "yes", "on"):
+        if "body_tracking" not in config:
+            config["body_tracking"] = {}
+        config["body_tracking"]["enabled"] = True
+        LOGGER.debug("[body_tracking] Enabled via AUTO_RUN_BODY_TRACKING env var")
+
+    return config
 
 
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
@@ -8829,13 +8848,39 @@ def _run_cluster_stage(
         except Exception as exc:
             LOGGER.warning("[cluster] Body tracking fusion failed (non-fatal): %s", exc)
 
-        # Now do S3 sync after completion is signaled
+        # Now do S3 sync after completion is signaled (legacy episode-level artifacts)
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
         summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
         if s3_sync_result.errors:
             summary["artifacts"]["s3_errors"] = s3_sync_result.errors
         if not s3_sync_result.success:
             LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
+
+        # Sync run-scoped artifacts to S3 with deterministic key layout
+        if run_id:
+            try:
+                from apps.api.services.run_artifact_store import sync_run_artifacts_to_s3
+
+                run_sync_result = sync_run_artifacts_to_s3(
+                    ep_id=args.ep_id,
+                    run_id=run_id,
+                    fail_on_error=False,  # Don't fail the job on S3 errors
+                )
+                summary["artifacts"]["run_scoped_s3"] = run_sync_result.to_dict()
+                if run_sync_result.success:
+                    LOGGER.info(
+                        "[cluster] Run-scoped S3 sync: %d artifacts uploaded to %s",
+                        run_sync_result.uploaded_count,
+                        run_sync_result.s3_prefix,
+                    )
+                else:
+                    LOGGER.warning(
+                        "[cluster] Run-scoped S3 sync failed: %s",
+                        run_sync_result.errors,
+                    )
+            except Exception as exc:
+                LOGGER.warning("[cluster] Run-scoped S3 sync skipped: %s", exc)
+                summary["artifacts"]["run_scoped_s3"] = {"error": str(exc)}
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:

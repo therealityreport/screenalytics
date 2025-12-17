@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# Load .env file FIRST before any other imports
+# This ensures S3 configuration is available for all modules
+from pathlib import Path
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parents[2] / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # dotenv not installed, rely on system environment
+
 # Apply global CPU limits BEFORE importing any ML libraries or heavy dependencies
 # Uses centralized configuration from apps.common.cpu_limits (default: 3 threads = ~300% CPU)
 # Override with env var: SCREENALYTICS_MAX_CPU_THREADS=N

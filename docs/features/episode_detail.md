@@ -23,11 +23,9 @@ When navigating to Faces Review or Smart Suggestions:
 - Child pages operate within that run's scope
 - All mutations affect only the selected run
 
-## Debug / Export (PDF report + ZIP bundle)
+## Export Run Debug Report
 
-The Debug/Export section allows exporting either:
-- a **PDF debug report** (default), or
-- a **ZIP debug bundle** (raw artifacts + logs) for debugging/archival.
+The Debug/Export section generates a comprehensive PDF report capturing the run's pipeline configuration, statistics, artifact status, and actionable tuning suggestions.
 
 ### Endpoint
 
@@ -35,53 +33,77 @@ The Debug/Export section allows exporting either:
 GET /episodes/{ep_id}/runs/{run_id}/export
 ```
 
-### Formats
+Returns: `application/pdf` - Screen Time Run Debug Report
 
-| Query param | Value | Output |
-|---|---|---|
-| `format` | `pdf` (default) | `application/pdf` debug report |
-| `format` | `zip` | `application/zip` raw debug bundle |
+### Report Sections
 
-### Export Options
+The PDF report includes 12 sections plus an appendix:
 
-These toggles apply to **ZIP** exports only:
+**0. Run Inputs & Lineage**
+- Episode ID, Run ID, Git SHA, Generated timestamp
+- Video metadata (duration, frame rate, resolution if available)
+- Model versions (Face Detector, Tracker, Embedding, Body Detector, Re-ID)
 
-| Toggle | Description |
-|--------|-------------|
-| Include Artifacts | Raw JSONL files (tracks, faces, identities) |
-| Include Images | Thumbnails, crops, frames (large) |
-| Include Logs | Pipeline logs and job markers |
+**1. Face Detect**
+- Detection counts
+- Configuration from `detection.yaml` (model_id, confidence_th, min_size, wide_shot_mode)
+- Artifacts with sizes and record counts
 
-### Bundle Contents
+**2. Face Track**
+- Track metrics (born, lost, ID switches, forced splits, scene cuts)
+- **Diagnostic warnings** for alarming metrics (high forced splits, high ID switches)
+- Configuration from `tracking.yaml` (track_thresh, match_thresh, track_buffer)
+- Artifacts with sizes
 
-The exported ZIP contains:
+**3. Face Harvest / Embed**
+- Harvested and aligned face counts
+- **Diagnostic warning** for low alignment rate
+- Configuration from `embedding.yaml` (backend, min_alignment_quality)
+- Artifacts with sizes and record counts
 
-**Always included:**
-- `run_summary.json` - Metadata, schema version, artifact paths
-- `jobs.json` - Job execution history from DB
-- `identity_assignments.json` - Current identity/person mappings
-- `identity_locks.json` - Locked identities for this run
-- `smart_suggestion_batches.json` - Suggestion batch metadata
-- `smart_suggestions.json` - Individual suggestions with evidence
-- `smart_suggestions_applied.json` - Audit trail of applied suggestions
-- `debug_report.pdf` - Same PDF debug report (best-effort; included when generation succeeds)
+**4. Body Detect**
+- Body detection counts
+- Configuration from `body_detection.yaml` (model, confidence_threshold, detect_every_n_frames)
+- Artifacts with sizes
 
-**With include_artifacts=True:**
-- `detections.jsonl`
-- `tracks.jsonl`
-- `track_metrics.json`
-- `faces.jsonl`
-- `identities.json`
-- `cluster_centroids.json`
-- `body_tracking/` directory
-- `analytics/` directory
+**5. Body Track**
+- Body track counts
+- Configuration from `body_detection.yaml → person_tracking` (tracker, thresholds, id_offset)
+- Artifacts with sizes
 
-### PDF Report Contents (high level)
+**6. Track Fusion**
+- **Clarified metrics**: Face Tracks, Body Tracks, Total Tracked IDs (union), Actual Fused Pairs
+- Configuration from `track_fusion.yaml` (iou_threshold, reid_handoff settings)
+- Artifacts with sizes
 
-The PDF report is a self-contained summary intended for “what happened and why”:
-- Run lineage + config snapshots
-- A quick **Run Health** section (DB connectivity, body-tracking artifact presence, fusion sanity checks)
-- Phase-by-phase counts and diagnostics (detect/track/embed/cluster/screentime)
+**7. Cluster**
+- Cluster statistics (count, singleton fraction, mixed tracks, outlier tracks, low cohesion)
+- **Diagnostic warnings** for high singleton fraction or mixed tracks
+- Configuration from `clustering.yaml` (algorithm, distance metric, cluster_thresh, singleton_merge)
+- Artifacts with sizes and identity counts
+
+**8. Faces Review (DB State)**
+- Assigned identities, locked identities, unassigned counts
+- **DB error context** with impact explanation if DB unavailable
+- Data sources
+
+**9. Smart Suggestions**
+- Batch counts, suggestion counts, dismissed/applied/pending
+- Data sources
+
+**10. Screen Time Analyze**
+- **Screen Time Breakdown Table**: Face-only, Body-only, Combined Total, Gain from Body Tracking
+- Percentages and explanatory notes
+- Configuration from `screen_time_v2.yaml` (active preset, quality_min, gap_tolerance_s)
+- Artifacts with sizes
+
+**11. What Likely Needs Tuning**
+- Heuristic-based suggestions derived from the metrics
+- Stage, Issue, Suggested Action format
+- Covers: Detection, Tracking, Embedding, Clustering, Body Tracking, Track Fusion, Screen Time
+
+**Appendix: Artifact Manifest**
+- Complete listing with: Filename, Status, Size, Record Count, Pipeline Stage
 
 ## Pipeline Jobs
 

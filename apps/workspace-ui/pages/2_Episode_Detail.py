@@ -5102,86 +5102,95 @@ with col_cluster:
     st.divider()
 
 st.subheader("Debug / Export")
+
+# Display artifact store backend
+try:
+    from apps.api.services.run_artifact_store import get_artifact_store_display, get_artifact_store_status
+    _artifact_store_display = get_artifact_store_display()
+    _artifact_store_status = get_artifact_store_status()
+    _s3_enabled = _artifact_store_status.get("config", {}).get("s3_enabled", False)
+    st.caption(f"**Artifact Store:** {_artifact_store_display}")
+except Exception:
+    _s3_enabled = False
+    st.caption("**Artifact Store:** Local filesystem (status unavailable)")
+
 if not selected_attempt_run_id:
-    st.info("Select a non-legacy attempt (run_id) to export a run-scoped debug bundle.")
+    st.info("Select a non-legacy attempt (run_id) to export a run debug report.")
 else:
     st.caption(f"Exporting run_id: `{selected_attempt_run_id}`")
     opt_key_prefix = f"{ep_id}::{selected_attempt_run_id}::export_bundle"
-    export_format_label = st.radio(
-        "Export format",
-        options=("PDF debug report", "ZIP debug bundle (advanced)"),
-        index=0,
-        key=f"{opt_key_prefix}::format",
-        horizontal=True,
-    )
-    export_format = "zip" if export_format_label.startswith("ZIP") else "pdf"
 
-    if export_format == "zip":
-        st.caption("ZIP includes `debug_report.pdf` + run-scoped json/jsonl artifacts + logs (no images).")
-    else:
-        st.caption("PDF export is a self-contained report.")
-
-    export_state_key = f"{opt_key_prefix}::payload::{export_format}"
-    export_button_label = "Generate Debug Report (PDF)" if export_format == "pdf" else "Export Run Debug Bundle (ZIP)"
+    export_state_key = f"{opt_key_prefix}::payload"
     export_clicked = st.button(
-        export_button_label,
-        key=f"{opt_key_prefix}::export::{export_format}",
+        "Generate PDF Report",
+        key=f"{opt_key_prefix}::export",
         type="primary",
         use_container_width=False,
+        help="Generate a Screen Time Run Debug Report PDF with pipeline stats and artifact manifest",
     )
     if export_clicked:
-        with st.spinner("Building export…"):
+        with st.spinner("Generating PDF report…"):
             url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{selected_attempt_run_id}/export"
-            params = {"format": export_format}
             try:
-                resp = requests.get(url, params=params, timeout=300)
+                resp = requests.get(url, timeout=300)
                 resp.raise_for_status()
             except requests.RequestException as exc:
                 st.error(helpers.describe_error(url, exc))
             else:
-                content_type = resp.headers.get("Content-Type", "") or ""
-                mime = content_type.split(";", 1)[0].strip()
-                if not mime:
-                    mime = "application/pdf" if export_format == "pdf" else "application/zip"
                 content_disp = resp.headers.get("Content-Disposition", "") or ""
                 filename = None
                 if "filename=" in content_disp:
                     filename = content_disp.split("filename=", 1)[1].strip().strip('"')
                 if not filename:
-                    if export_format == "pdf":
-                        filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
-                    else:
-                        filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+                    filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
+
+                # Check S3 upload status from response headers
+                s3_upload_attempted = resp.headers.get("X-S3-Upload-Attempted", "").lower() == "true"
+                s3_upload_success = resp.headers.get("X-S3-Upload-Success", "").lower() == "true"
+                s3_upload_key = resp.headers.get("X-S3-Upload-Key")
+                s3_upload_error = resp.headers.get("X-S3-Upload-Error")
+
                 st.session_state[export_state_key] = {
                     "filename": filename,
                     "bytes": resp.content,
-                    "mime": mime,
+                    "s3_upload_attempted": s3_upload_attempted,
+                    "s3_upload_success": s3_upload_success,
+                    "s3_upload_key": s3_upload_key,
+                    "s3_upload_error": s3_upload_error,
                 }
 
     bundle = st.session_state.get(export_state_key)
     if isinstance(bundle, dict) and bundle.get("bytes"):
         file_bytes = bundle.get("bytes") or b""
-        mime = bundle.get("mime") or ("application/pdf" if export_format == "pdf" else "application/zip")
-        default_name = (
-            f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
-            if export_format == "pdf"
-            else f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
-        )
-        filename = bundle.get("filename") or default_name
-        download_label = "Download .pdf" if export_format == "pdf" else "Download .zip"
+        filename = bundle.get("filename") or f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
         try:
-            st.caption(f"Export ready: {len(file_bytes) / 1_048_576:.1f} MiB")
+            st.caption(f"Report ready: {len(file_bytes) / 1024:.1f} KB")
         except Exception:
             pass
+
+        # Display S3 upload status
+        s3_upload_attempted = bundle.get("s3_upload_attempted", False)
+        s3_upload_success = bundle.get("s3_upload_success", False)
+        s3_upload_key = bundle.get("s3_upload_key")
+        s3_upload_error = bundle.get("s3_upload_error")
+        if s3_upload_attempted:
+            if s3_upload_success and s3_upload_key:
+                st.success(f"✅ Saved to S3: `{s3_upload_key}`")
+            elif s3_upload_error:
+                st.warning(f"⚠️ S3 upload attempted but failed: {s3_upload_error}")
+            else:
+                st.warning("⚠️ S3 upload attempted but status unknown")
+        else:
+            st.info("S3 upload not attempted (local backend or disabled)")
         st.download_button(
-            download_label,
+            "Download PDF",
             data=file_bytes,
             file_name=filename,
-            mime=mime,
-            key=f"{opt_key_prefix}::download::{export_format}",
+            mime="application/pdf",
+            key=f"{opt_key_prefix}::download",
             use_container_width=False,
         )
-        if st.button("Clear export", key=f"{opt_key_prefix}::clear_bundle::{export_format}"):
+        if st.button("Clear", key=f"{opt_key_prefix}::clear_bundle"):
             st.session_state.pop(export_state_key, None)
             st.rerun()
 

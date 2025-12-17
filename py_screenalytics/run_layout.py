@@ -155,3 +155,110 @@ class RunPaths:
 def as_run_paths(ep_id: str, run_id: str) -> RunPaths:
     return RunPaths(ep_id=ep_id, run_id=normalize_run_id(run_id))
 
+
+# =============================================================================
+# S3 Key Generation for Run Artifacts
+# =============================================================================
+
+def _parse_ep_id(ep_id: str) -> tuple[str, int, int]:
+    """Parse ep_id into (show, season, episode) components.
+
+    Examples:
+        'rhoslc-s06e11' -> ('rhoslc', 6, 11)
+        'demo-s01e01' -> ('demo', 1, 1)
+    """
+    import re
+    match = re.match(r"^(.+)-s(\d+)e(\d+)$", ep_id, re.IGNORECASE)
+    if not match:
+        # Fallback: use ep_id as show, season/episode as 0
+        return (ep_id, 0, 0)
+    show, season, episode = match.groups()
+    return (show, int(season), int(episode))
+
+
+def run_s3_prefix(ep_id: str, run_id: str) -> str:
+    """Generate S3 prefix for run-scoped artifacts.
+
+    Format: runs/{show}/s{ss}/e{ee}/{run_id}/
+
+    Examples:
+        run_s3_prefix('rhoslc-s06e11', 'abc123')
+        -> 'runs/rhoslc/s06/e11/abc123/'
+    """
+    show, season, episode = _parse_ep_id(ep_id)
+    run_id_norm = normalize_run_id(run_id)
+    return f"runs/{show}/s{season:02d}/e{episode:02d}/{run_id_norm}/"
+
+
+def run_artifact_s3_key(ep_id: str, run_id: str, filename: str) -> str:
+    """Generate S3 key for a run-scoped artifact.
+
+    Examples:
+        run_artifact_s3_key('rhoslc-s06e11', 'abc123', 'tracks.jsonl')
+        -> 'runs/rhoslc/s06/e11/abc123/tracks.jsonl'
+    """
+    prefix = run_s3_prefix(ep_id, run_id)
+    cleaned = (filename or "").strip().lstrip("/\\")
+    return f"{prefix}{cleaned}"
+
+
+def run_export_s3_key(ep_id: str, run_id: str, filename: str) -> str:
+    """Generate S3 key for a run export (PDF/ZIP).
+
+    Exports go to an 'exports/' subdirectory within the run.
+
+    Examples:
+        run_export_s3_key('rhoslc-s06e11', 'abc123', 'debug_report.pdf')
+        -> 'runs/rhoslc/s06/e11/abc123/exports/debug_report.pdf'
+    """
+    prefix = run_s3_prefix(ep_id, run_id)
+    cleaned = (filename or "").strip().lstrip("/\\")
+    return f"{prefix}exports/{cleaned}"
+
+
+# =============================================================================
+# Run Artifact Manifest (list of expected artifacts per run)
+# =============================================================================
+
+# Artifacts that are part of the run bundle (uploaded to S3)
+RUN_ARTIFACT_ALLOWLIST = frozenset({
+    # Core pipeline artifacts
+    "tracks.jsonl",
+    "faces.jsonl",
+    "detections.jsonl",
+    "identities.json",
+    "cluster_centroids.json",
+    "track_metrics.json",
+    "track_reps.jsonl",
+    "detect_track.json",
+    "embed.json",
+    "cluster.json",
+    # Body tracking artifacts
+    "body_tracking/body_detections.jsonl",
+    "body_tracking/body_tracks.jsonl",
+    "body_tracking/body_embeddings.npy",
+    "body_tracking/body_embeddings_meta.json",
+    "body_tracking/body_metrics.json",
+    "body_tracking/track_fusion.json",
+    "body_tracking/screentime_comparison.json",
+})
+
+
+def list_run_artifacts(ep_id: str, run_id: str) -> list[tuple[Path, str]]:
+    """List run artifacts that exist locally.
+
+    Returns list of (local_path, s3_key) tuples for files that exist.
+    Only includes files in the RUN_ARTIFACT_ALLOWLIST.
+    """
+    root = run_root(ep_id, run_id)
+    if not root.exists():
+        return []
+
+    artifacts: list[tuple[Path, str]] = []
+    for filename in RUN_ARTIFACT_ALLOWLIST:
+        local_path = root / filename
+        if local_path.exists():
+            s3_key = run_artifact_s3_key(ep_id, run_id, filename)
+            artifacts.append((local_path, s3_key))
+    return artifacts
+
