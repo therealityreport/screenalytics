@@ -32,6 +32,20 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 
+def _is_s3_required() -> bool:
+    """Check if S3 is required via environment variable.
+
+    Returns True if STORAGE_REQUIRE_S3 or EXPORT_REQUIRE_S3 is set to a truthy value.
+    In this mode, S3 misconfiguration should fail requests loudly rather than
+    falling back to local storage silently.
+    """
+    for var in ("STORAGE_REQUIRE_S3", "EXPORT_REQUIRE_S3"):
+        val = os.environ.get(var, "").strip().lower()
+        if val in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
 @dataclass
 class ArtifactSyncResult:
     """Result of a run artifact sync operation."""
@@ -212,7 +226,7 @@ def sync_run_artifacts_to_s3(
     ep_id: str,
     run_id: str,
     *,
-    fail_on_error: bool = False,
+    fail_on_error: bool | None = None,
     skip_existing: bool = True,
 ) -> ArtifactSyncResult:
     """Sync run-scoped artifacts to S3.
@@ -224,6 +238,7 @@ def sync_run_artifacts_to_s3(
         ep_id: Episode ID (e.g., 'rhoslc-s06e11').
         run_id: Run ID.
         fail_on_error: If True, raise RuntimeError on S3 errors.
+            If None (default), uses STORAGE_REQUIRE_S3 env var.
         skip_existing: If True, skip files that already exist in S3.
 
     Returns:
@@ -232,6 +247,9 @@ def sync_run_artifacts_to_s3(
     Raises:
         RuntimeError: If fail_on_error=True and sync fails.
     """
+    # Default fail_on_error based on env var if not explicitly set
+    if fail_on_error is None:
+        fail_on_error = _is_s3_required()
     from py_screenalytics import run_layout
 
     start_time = time.perf_counter()
@@ -346,7 +364,7 @@ def upload_export_to_s3(
     file_bytes: bytes,
     filename: str,
     *,
-    fail_on_error: bool = False,
+    fail_on_error: bool | None = None,
 ) -> ArtifactSyncResult:
     """Upload an export file (PDF/ZIP) to S3.
 
@@ -356,10 +374,15 @@ def upload_export_to_s3(
         file_bytes: Export file content.
         filename: Export filename (e.g., 'debug_report.pdf').
         fail_on_error: If True, raise RuntimeError on failure.
+            If None (default), uses EXPORT_REQUIRE_S3 env var.
 
     Returns:
         ArtifactSyncResult with upload details.
     """
+    # Default fail_on_error based on env var if not explicitly set
+    if fail_on_error is None:
+        fail_on_error = _is_s3_required()
+
     from py_screenalytics import run_layout
 
     start_time = time.perf_counter()
@@ -482,3 +505,129 @@ def get_artifact_store_status() -> dict[str, Any]:
         "config": config.to_dict(),
         "display": get_artifact_store_display(),
     }
+
+
+def write_export_index(
+    ep_id: str,
+    run_id: str,
+    *,
+    export_type: str,
+    export_key: str | None = None,
+    export_bytes: int = 0,
+    upload_result: ArtifactSyncResult | None = None,
+    artifact_sync_result: ArtifactSyncResult | None = None,
+) -> Path:
+    """Write export_index.json marker file for later lookup.
+
+    This persists export metadata so users can find S3 keys and sync status
+    without re-running exports.
+
+    Args:
+        ep_id: Episode ID.
+        run_id: Run ID.
+        export_type: Type of export ('pdf' or 'zip').
+        export_key: S3 key for the export (if uploaded).
+        export_bytes: Size of export in bytes.
+        upload_result: Result from upload_export_to_s3 (if uploaded).
+        artifact_sync_result: Result from sync_run_artifacts_to_s3 (if synced).
+
+    Returns:
+        Path to the written export_index.json file.
+    """
+    import json
+    import subprocess
+    from datetime import datetime, timezone
+    from py_screenalytics import run_layout
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    exports_dir = run_root / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get git SHA
+    git_sha: str | None = None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            git_sha = result.stdout.strip()
+    except Exception:
+        pass
+
+    now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    index_data: dict[str, Any] = {
+        "ep_id": ep_id,
+        "run_id": run_id,
+        "generated_at": now_iso,
+        "git_sha": git_sha,
+        "export_type": export_type,
+        "export_bytes": export_bytes,
+    }
+
+    if export_key:
+        index_data["export_s3_key"] = export_key
+
+    if upload_result:
+        index_data["export_upload"] = {
+            "attempted": True,
+            "success": upload_result.success,
+            "s3_key": upload_result.uploaded_files[0] if upload_result.uploaded_files else None,
+            "bytes_uploaded": upload_result.bytes_uploaded,
+            "sync_time_ms": upload_result.sync_time_ms,
+            "errors": upload_result.errors,
+        }
+    else:
+        index_data["export_upload"] = {"attempted": False}
+
+    if artifact_sync_result:
+        index_data["artifact_sync"] = {
+            "attempted": True,
+            "success": artifact_sync_result.success,
+            "s3_prefix": artifact_sync_result.s3_prefix,
+            "s3_bucket": artifact_sync_result.s3_bucket,
+            "total_artifacts": artifact_sync_result.total_artifacts,
+            "uploaded_count": artifact_sync_result.uploaded_count,
+            "skipped_count": artifact_sync_result.skipped_count,
+            "failed_count": artifact_sync_result.failed_count,
+            "bytes_uploaded": artifact_sync_result.bytes_uploaded,
+            "sync_time_ms": artifact_sync_result.sync_time_ms,
+            "errors": artifact_sync_result.errors,
+        }
+    else:
+        index_data["artifact_sync"] = {"attempted": False}
+
+    index_path = exports_dir / "export_index.json"
+    index_path.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
+    LOGGER.info("[artifact-store] Wrote export index to %s", index_path)
+
+    return index_path
+
+
+def read_export_index(ep_id: str, run_id: str) -> dict[str, Any] | None:
+    """Read export_index.json marker file.
+
+    Args:
+        ep_id: Episode ID.
+        run_id: Run ID.
+
+    Returns:
+        Parsed export index data, or None if not found.
+    """
+    import json
+    from py_screenalytics import run_layout
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    index_path = run_root / "exports" / "export_index.json"
+
+    if not index_path.exists():
+        return None
+
+    try:
+        return json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("[artifact-store] Failed to read export index: %s", exc)
+        return None

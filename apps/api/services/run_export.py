@@ -3213,6 +3213,7 @@ def build_and_upload_debug_pdf(
     run_id: str,
     upload_to_s3: bool = True,
     fail_on_s3_error: bool = False,
+    write_index: bool = True,
 ) -> tuple[bytes, str, ExportUploadResult | None]:
     """Build debug PDF and optionally upload to S3.
 
@@ -3221,6 +3222,7 @@ def build_and_upload_debug_pdf(
         run_id: Run ID
         upload_to_s3: Whether to upload to S3 (if configured)
         fail_on_s3_error: If True, raise on S3 upload failure
+        write_index: If True, write export_index.json marker file
 
     Returns:
         (pdf_bytes, download_filename, upload_result or None)
@@ -3238,6 +3240,36 @@ def build_and_upload_debug_pdf(
             fail_on_error=fail_on_s3_error,
         )
 
+    # Write export index marker for later lookup
+    if write_index:
+        try:
+            from apps.api.services.run_artifact_store import write_export_index, ArtifactSyncResult
+
+            # Convert ExportUploadResult to ArtifactSyncResult-like object for write_export_index
+            artifact_result = None
+            if upload_result:
+                artifact_result = ArtifactSyncResult(
+                    success=upload_result.success,
+                    uploaded_count=1 if upload_result.success else 0,
+                    bytes_uploaded=upload_result.bytes_uploaded,
+                    sync_time_ms=upload_result.upload_time_ms,
+                    s3_prefix=f"runs/{ep_id}/{run_id}/exports/",
+                    s3_bucket=upload_result.s3_bucket,
+                    errors=[upload_result.error] if upload_result.error else [],
+                    uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],
+                )
+
+            write_export_index(
+                ep_id=ep_id,
+                run_id=run_id,
+                export_type="pdf",
+                export_key=upload_result.s3_key if upload_result else None,
+                export_bytes=len(pdf_bytes),
+                upload_result=artifact_result,
+            )
+        except Exception as exc:
+            LOGGER.warning("[export] Failed to write export index: %s", exc)
+
     return pdf_bytes, download_name, upload_result
 
 
@@ -3249,6 +3281,7 @@ def build_and_upload_debug_bundle(
     include_logs: bool = True,
     upload_to_s3: bool = True,
     fail_on_s3_error: bool = False,
+    write_index: bool = True,
 ) -> tuple[str, str, ExportUploadResult | None]:
     """Build debug bundle ZIP and optionally upload to S3.
 
@@ -3259,6 +3292,7 @@ def build_and_upload_debug_bundle(
         include_logs: Include logs in ZIP
         upload_to_s3: Whether to upload to S3 (if configured)
         fail_on_s3_error: If True, raise on S3 upload failure
+        write_index: If True, write export_index.json marker file
 
     Returns:
         (zip_path, download_filename, upload_result or None)
@@ -3271,10 +3305,12 @@ def build_and_upload_debug_bundle(
     )
 
     upload_result = None
+    zip_bytes_len = 0
     if upload_to_s3:
         try:
             with open(zip_path, "rb") as f:
                 zip_bytes = f.read()
+            zip_bytes_len = len(zip_bytes)
             upload_result = upload_export_to_s3(
                 ep_id=ep_id,
                 run_id=run_id,
@@ -3287,5 +3323,42 @@ def build_and_upload_debug_bundle(
             LOGGER.warning("[export-s3] Failed to read ZIP for S3 upload: %s", exc)
             if fail_on_s3_error:
                 raise
+
+    # Write export index marker for later lookup
+    if write_index:
+        try:
+            from apps.api.services.run_artifact_store import write_export_index, ArtifactSyncResult
+
+            # Get ZIP size if not already known
+            if zip_bytes_len == 0:
+                try:
+                    zip_bytes_len = Path(zip_path).stat().st_size
+                except OSError:
+                    pass
+
+            # Convert ExportUploadResult to ArtifactSyncResult-like object
+            artifact_result = None
+            if upload_result:
+                artifact_result = ArtifactSyncResult(
+                    success=upload_result.success,
+                    uploaded_count=1 if upload_result.success else 0,
+                    bytes_uploaded=upload_result.bytes_uploaded,
+                    sync_time_ms=upload_result.upload_time_ms,
+                    s3_prefix=f"runs/{ep_id}/{run_id}/exports/",
+                    s3_bucket=upload_result.s3_bucket,
+                    errors=[upload_result.error] if upload_result.error else [],
+                    uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],
+                )
+
+            write_export_index(
+                ep_id=ep_id,
+                run_id=run_id,
+                export_type="zip",
+                export_key=upload_result.s3_key if upload_result else None,
+                export_bytes=zip_bytes_len,
+                upload_result=artifact_result,
+            )
+        except Exception as exc:
+            LOGGER.warning("[export] Failed to write export index: %s", exc)
 
     return zip_path, download_name, upload_result
