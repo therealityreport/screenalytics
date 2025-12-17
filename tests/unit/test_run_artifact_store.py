@@ -141,6 +141,17 @@ class TestRunLayoutS3Keys:
         key = run_export_s3_key("rhoslc-s06e11", "abc123", "debug_report.pdf")
         assert key == "runs/rhoslc/s06/e11/abc123/exports/debug_report.pdf"
 
+    def test_artifact_and_export_share_run_prefix(self) -> None:
+        """Test that artifacts + exports share the same run prefix for parsed ep_ids."""
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import run_s3_prefix, run_artifact_s3_key, run_export_s3_key
+
+        prefix = run_s3_prefix("rhoslc-s06e11", "abc123")
+        assert run_artifact_s3_key("rhoslc-s06e11", "abc123", "tracks.jsonl").startswith(prefix)
+        assert run_export_s3_key("rhoslc-s06e11", "abc123", "debug_report.pdf").startswith(prefix)
+
     def test_parse_ep_id_standard(self) -> None:
         """Test episode ID parsing for standard format."""
         import sys
@@ -163,6 +174,72 @@ class TestRunLayoutS3Keys:
 
         routing = parse_episode_routing("custom-episode-id")
         assert routing is None
+
+    def test_get_run_s3_layout_canonical(self) -> None:
+        """Test canonical layout when ep_id is parseable."""
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import get_run_s3_layout
+
+        layout = get_run_s3_layout("rhoslc-s06e11", "abc123")
+        assert layout.s3_layout == "canonical"
+        assert layout.write_prefix == "runs/rhoslc/s06/e11/abc123/"
+        assert layout.canonical_prefix == "runs/rhoslc/s06/e11/abc123/"
+        assert layout.legacy_prefix == "runs/rhoslc-s06e11/abc123/"
+
+    def test_get_run_s3_layout_legacy(self) -> None:
+        """Test legacy fallback when ep_id is not parseable."""
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import get_run_s3_layout
+
+        layout = get_run_s3_layout("custom-episode-id", "abc123")
+        assert layout.s3_layout == "legacy"
+        assert layout.canonical_prefix is None
+        assert layout.write_prefix == "runs/custom-episode-id/abc123/"
+        assert layout.legacy_prefix == "runs/custom-episode-id/abc123/"
+
+    def test_run_artifact_keys_for_read_prefers_canonical(self) -> None:
+        """Test canonical-first read order for run artifacts."""
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import run_artifact_s3_keys_for_read
+
+        keys = run_artifact_s3_keys_for_read("rhoslc-s06e11", "abc123", "tracks.jsonl")
+        assert keys == [
+            "runs/rhoslc/s06/e11/abc123/tracks.jsonl",
+            "runs/rhoslc-s06e11/abc123/tracks.jsonl",
+        ]
+
+    def test_run_export_keys_for_read_prefers_canonical(self) -> None:
+        """Test canonical-first read order for exports."""
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import run_export_s3_keys_for_read
+
+        keys = run_export_s3_keys_for_read("rhoslc-s06e11", "abc123", "debug_report.pdf")
+        assert keys == [
+            "runs/rhoslc/s06/e11/abc123/exports/debug_report.pdf",
+            "runs/rhoslc-s06e11/abc123/exports/debug_report.pdf",
+        ]
+
+    def test_run_keys_for_read_unparseable_ep_id_is_legacy_only(self) -> None:
+        """Test read key lists for unparseable ep_ids."""
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import run_artifact_s3_keys_for_read, run_export_s3_keys_for_read
+
+        assert run_artifact_s3_keys_for_read("custom-episode-id", "abc123", "tracks.jsonl") == [
+            "runs/custom-episode-id/abc123/tracks.jsonl"
+        ]
+        assert run_export_s3_keys_for_read("custom-episode-id", "abc123", "debug_report.pdf") == [
+            "runs/custom-episode-id/abc123/exports/debug_report.pdf"
+        ]
 
 
 class TestSyncRunArtifactsToS3:
