@@ -1200,6 +1200,29 @@ def build_screentime_run_debug_pdf(
         textColor=colors.HexColor("#4a5568"),
         leftIndent=10,
     )
+    # Table cell style for wrapping text
+    cell_style = ParagraphStyle(
+        "TableCell",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=11,  # Line spacing for wrapped text
+    )
+    cell_style_small = ParagraphStyle(
+        "TableCellSmall",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=10,
+    )
+
+    def _wrap_cell(text: str, style: ParagraphStyle = cell_style) -> Paragraph:
+        """Wrap text in a Paragraph for table cell text wrapping."""
+        # Escape XML special characters for ReportLab
+        safe_text = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return Paragraph(safe_text, style)
+
+    def _wrap_row(row: list, style: ParagraphStyle = cell_style) -> list:
+        """Wrap all cells in a row for text wrapping."""
+        return [_wrap_cell(cell, style) for cell in row]
 
     story: list[Any] = []
 
@@ -1411,35 +1434,35 @@ def build_screentime_run_debug_pdf(
         fused_pairs_detail = f"{actual_fused_pairs} pair(s)"
 
     health_data = [
-        ["Health Check", "Status", "Details"],
-        ["DB Connected", _health_status(db_connected),
-         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")],
-        ["Face Tracks Present", _health_status(face_tracks_present), face_tracks_detail],
-        [
+        _wrap_row(["Health Check", "Status", "Details"]),
+        _wrap_row(["DB Connected", _health_status(db_connected),
+         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")]),
+        _wrap_row(["Face Tracks Present", _health_status(face_tracks_present), face_tracks_detail]),
+        _wrap_row([
             "Body Tracking Ran (run-scoped)",
             _health_status(bool(body_tracking_ran_effective)),
             f"YAML enabled={'true' if body_config_enabled else 'false'} | dets={body_detect_display} tracks={body_track_display}",
-        ],
-        [
+        ]),
+        _wrap_row([
             "Track Fusion Output Present",
             _health_status(track_fusion_available),
             "Present" if track_fusion_available is True else (
                 "Missing body_tracking/track_fusion.json" if track_fusion_available is False else "Unreadable track_fusion.json"
             ),
-        ],
-        ["Face-Body Pairs Fused", _health_status(fused_pairs_ok), fused_pairs_detail],
-        [
+        ]),
+        _wrap_row(["Face-Body Pairs Fused", _health_status(fused_pairs_ok), fused_pairs_detail]),
+        _wrap_row([
             "Screen Time Comparison Present",
             _health_status(screentime_available),
             "Present" if screentime_available is True else (
                 "Missing body_tracking/screentime_comparison.json" if screentime_available is False else "Unreadable screentime_comparison.json"
             ),
-        ],
-        [
+        ]),
+        _wrap_row([
             "Legacy Body Artifacts Present",
             _health_status(legacy_body_artifacts_exist),
             f"legacy_run_id={legacy_body_marker_run_id or 'unknown'} | out_of_scope={'yes' if legacy_body_out_of_scope else 'no'}",
-        ],
+        ]),
     ]
     health_table = Table(health_data, colWidths=[1.8 * inch, 0.8 * inch, 3.9 * inch])
     status_values: list[bool | None] = [
@@ -1791,45 +1814,45 @@ def build_screentime_run_debug_pdf(
     # Configuration used with explanations
     story.append(Paragraph("Configuration (detection.yaml):", subsection_style))
     detect_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "confidence_th",
             str(detection_config.get("confidence_th", "N/A")),
             "Min confidence to accept a detection",
-            "↓ Lower: More faces (+ false positives) | ↑ Higher: Fewer, more confident faces",
-        ],
-        [
+            "Lower: More faces (+ false positives) | Higher: Fewer, more confident",
+        ], cell_style_small),
+        _wrap_row([
             "min_size",
             str(detection_config.get("min_size", "N/A")),
             "Min face size in pixels",
-            "↓ Lower: Detect smaller/distant faces | ↑ Higher: Ignore small faces",
-        ],
-        [
+            "Lower: Detect smaller/distant faces | Higher: Ignore small faces",
+        ], cell_style_small),
+        _wrap_row([
             "iou_th",
             str(detection_config.get("iou_th", "N/A")),
             "NMS IoU threshold for duplicate removal",
-            "↓ Lower: More aggressive duplicate removal | ↑ Higher: Keep overlapping faces",
-        ],
-        [
+            "Lower: More aggressive duplicate removal | Higher: Keep overlapping",
+        ], cell_style_small),
+        _wrap_row([
             "wide_shot_mode",
             str(detection_config.get("wide_shot_mode", "N/A")),
             "Enhanced detection for distant faces",
-            "Enable for wide shots with small faces; disable for close-ups",
-        ],
-        [
+            "Enable for wide shots with small faces",
+        ], cell_style_small),
+        _wrap_row([
             "wide_shot_confidence_th",
             str(detection_config.get("wide_shot_confidence_th", "N/A")),
             "Confidence threshold in wide shot mode",
-            "↓ Lower: More small faces | ↑ Higher: Stricter small face detection",
-        ],
-        [
+            "Lower: More small faces | Higher: Stricter detection",
+        ], cell_style_small),
+        _wrap_row([
             "enable_person_fallback",
             str(detection_config.get("enable_person_fallback", "N/A")),
             "Use body detection when face fails",
             "Enable if missing faces when people turn away",
-        ],
+        ], cell_style_small),
     ]
-    detect_config_table = Table(detect_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    detect_config_table = Table(detect_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     detect_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -1892,39 +1915,39 @@ def build_screentime_run_debug_pdf(
     # Configuration used with explanations
     story.append(Paragraph("Configuration (tracking.yaml):", subsection_style))
     track_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "track_thresh",
             str(tracking_config.get("track_thresh", "N/A")),
             "Min confidence to continue tracking",
-            "↓ Lower: Track low-confidence faces | ↑ Higher: Drop uncertain faces",
-        ],
-        [
+            "Lower: Track low-confidence faces | Higher: Drop uncertain faces",
+        ], cell_style_small),
+        _wrap_row([
             "match_thresh",
             str(tracking_config.get("match_thresh", "N/A")),
             "IoU threshold for bbox matching",
-            "↓ Lower: Match fast-moving faces | ↑ Higher: Reduce ID switches",
-        ],
-        [
+            "Lower: Match fast-moving faces | Higher: Reduce ID switches",
+        ], cell_style_small),
+        _wrap_row([
             "track_buffer",
             str(tracking_config.get("track_buffer", "N/A")),
             "Frames to keep track alive when lost",
-            "↓ Lower: Faster cleanup | ↑ Higher: Bridge brief occlusions",
-        ],
-        [
+            "Lower: Faster cleanup | Higher: Bridge brief occlusions",
+        ], cell_style_small),
+        _wrap_row([
             "new_track_thresh",
             str(tracking_config.get("new_track_thresh", "N/A")),
             "Min confidence to start a new track",
-            "↓ Lower: More new tracks | ↑ Higher: Fewer, more confident tracks",
-        ],
-        [
+            "Lower: More new tracks | Higher: Fewer, more confident tracks",
+        ], cell_style_small),
+        _wrap_row([
             "gate_enabled",
             str(tracking_config.get("gate_enabled", "N/A")),
             "Appearance-based track splitting",
             "Enable to split when face changes; disable if too many splits",
-        ],
+        ], cell_style_small),
     ]
-    track_config_table = Table(track_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    track_config_table = Table(track_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     track_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -1967,23 +1990,23 @@ def build_screentime_run_debug_pdf(
     emb_cfg = embedding_config.get("embedding", {})
     face_align_cfg = embedding_config.get("face_alignment", {})
     embed_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["backend", str(emb_cfg.get("backend", "N/A")), "Embedding computation backend", "tensorrt: Fast GPU | pytorch: Compatible fallback"],
-        ["face_alignment.enabled", str(face_align_cfg.get("enabled", "N/A")), "Apply face alignment before embedding", "Enable for better embeddings; disable for speed"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["backend", str(emb_cfg.get("backend", "N/A")), "Embedding computation backend", "tensorrt: Fast GPU | pytorch: Compatible fallback"], cell_style_small),
+        _wrap_row(["face_alignment.enabled", str(face_align_cfg.get("enabled", "N/A")), "Apply face alignment before embedding", "Enable for better embeddings; disable for speed"], cell_style_small),
+        _wrap_row([
             "min_alignment_quality",
             str(face_align_cfg.get("min_alignment_quality", "N/A")),
             "Min quality score to embed a face",
-            "↓ Lower: Embed more faces (+ noise) | ↑ Higher: Only high-quality faces",
-        ],
-        [
+            "Lower: Embed more faces (+ noise) | Higher: Only high-quality faces",
+        ], cell_style_small),
+        _wrap_row([
             "embedding_dim",
             str(embedding_config.get("output", {}).get("embedding_dim", "512")),
             "Output vector dimensions",
-            "512 standard for ArcFace; don't change unless using different model",
-        ],
+            "512 standard for ArcFace",
+        ], cell_style_small),
     ]
-    embed_config_table = Table(embed_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    embed_config_table = Table(embed_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     embed_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2031,52 +2054,52 @@ def build_screentime_run_debug_pdf(
         override_source_desc = override_source
 
     body_detect_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "body_tracking.enabled (YAML)",
             str(body_config_enabled),
-            "Config value from config/pipeline/body_detection.yaml",
+            "Config from body_detection.yaml",
             "Enable to run body tracking in detect_track",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "body_tracking.ran_effective",
             str(bool(body_tracking_ran_effective)),
-            "Resolved from run-scoped marker/artifacts for this run_id",
-            "If false but legacy artifacts exist, artifacts may be stale",
-        ],
-        [
+            "Resolved from run-scoped marker/artifacts",
+            "If false but legacy artifacts exist, may be stale",
+        ], cell_style_small),
+        _wrap_row([
             "body_tracking.override_source",
             override_source_value,
             override_source_desc,
             "If unknown, verify artifact scope + mtimes",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "model",
             str(person_det_cfg.get("model", "N/A")),
             "YOLO model variant",
-            "yolov8n: Fast | yolov8s/m: More accurate, slower",
-        ],
-        [
+            "yolov8n: Fast | yolov8s/m: Accurate, slower",
+        ], cell_style_small),
+        _wrap_row([
             "confidence_threshold",
             str(person_det_cfg.get("confidence_threshold", "N/A")),
             "Min confidence for person detection",
-            "↓ Lower: More bodies (+ false positives) | ↑ Higher: Fewer, confident bodies",
-        ],
-        [
+            "Lower: More bodies (+ FP) | Higher: Fewer, confident",
+        ], cell_style_small),
+        _wrap_row([
             "min_height_px",
             str(person_det_cfg.get("min_height_px", "N/A")),
             "Min body height in pixels",
-            "↓ Lower: Detect distant people | ↑ Higher: Ignore small figures",
-        ],
-        [
+            "Lower: Detect distant | Higher: Ignore small",
+        ], cell_style_small),
+        _wrap_row([
             "detect_every_n_frames",
             str(person_det_cfg.get("detect_every_n_frames", "N/A")),
             "Frame stride for detection",
-            "↓ Lower: More detections, slower | ↑ Higher: Faster, may miss brief appearances",
-        ],
+            "Lower: More detections | Higher: Faster",
+        ], cell_style_small),
     ]
     body_detect_config_table = Table(
-        body_detect_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch]
+        body_detect_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch]
     )
     body_detect_config_table.setStyle(
         TableStyle([
@@ -2135,40 +2158,40 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Configuration (body_detection.yaml → person_tracking):", subsection_style))
     person_track_cfg = body_detection_config.get("person_tracking", {})
     body_track_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["tracker", str(person_track_cfg.get("tracker", "N/A")), "Tracking algorithm", "bytetrack: Fast, robust | botsort/strongsort: More features"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["tracker", str(person_track_cfg.get("tracker", "N/A")), "Tracking algorithm", "bytetrack: Fast | botsort/strongsort: More features"], cell_style_small),
+        _wrap_row([
             "track_thresh",
             str(person_track_cfg.get("track_thresh", "N/A")),
             "Min confidence to continue body track",
-            "↓ Lower: Track uncertain bodies | ↑ Higher: Drop low-confidence tracks",
-        ],
-        [
+            "Lower: Track uncertain | Higher: Drop low-confidence",
+        ], cell_style_small),
+        _wrap_row([
             "new_track_thresh",
             str(person_track_cfg.get("new_track_thresh", "N/A")),
             "Min confidence to start new body track",
-            "↓ Lower: More new tracks | ↑ Higher: Fewer, confident tracks",
-        ],
-        [
+            "Lower: More new tracks | Higher: Fewer, confident",
+        ], cell_style_small),
+        _wrap_row([
             "match_thresh",
             str(person_track_cfg.get("match_thresh", "N/A")),
             "IoU threshold for body bbox matching",
-            "↓ Lower: Match moving bodies | ↑ Higher: Stricter matching",
-        ],
-        [
+            "Lower: Match moving | Higher: Stricter matching",
+        ], cell_style_small),
+        _wrap_row([
             "track_buffer",
             str(person_track_cfg.get("track_buffer", "N/A")),
             "Frames to keep lost body track alive",
-            "↓ Lower: Faster cleanup | ↑ Higher: Bridge longer occlusions",
-        ],
-        [
+            "Lower: Faster cleanup | Higher: Bridge occlusions",
+        ], cell_style_small),
+        _wrap_row([
             "id_offset",
             str(person_track_cfg.get("id_offset", "N/A")),
             "Starting ID for body tracks",
-            "Prevents ID collision with face tracks; typically 100000",
-        ],
+            "Prevents ID collision with face tracks",
+        ], cell_style_small),
     ]
-    body_track_config_table = Table(body_track_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    body_track_config_table = Table(body_track_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     body_track_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2235,14 +2258,14 @@ def build_screentime_run_debug_pdf(
         fused_pairs_value = _na_artifact(track_fusion_path, "body_tracking/track_fusion.json")
 
     fusion_stats = [
-        ["Metric", "Value", "Notes"],
-        ["Fusion Status", fusion_status, "Run-scoped inputs + outputs"],
-        ["Face Tracks (input)", face_tracks_input, "From run tracks.jsonl"],
-        ["Body Tracks (input)", body_tracks_input, "From run body_tracking/body_tracks.jsonl"],
-        ["Tracked IDs (from fusion output)", tracked_ids_value, "From body_tracking/track_fusion.json"],
-        ["Actual Fused Pairs", fused_pairs_value, "Mappings with both face AND body track IDs"],
+        _wrap_row(["Metric", "Value", "Notes"]),
+        _wrap_row(["Fusion Status", fusion_status, "Run-scoped inputs + outputs"]),
+        _wrap_row(["Face Tracks (input)", face_tracks_input, "From run tracks.jsonl"]),
+        _wrap_row(["Body Tracks (input)", body_tracks_input, "From run body_tracking/body_tracks.jsonl"]),
+        _wrap_row(["Tracked IDs (from fusion output)", tracked_ids_value, "From body_tracking/track_fusion.json"]),
+        _wrap_row(["Actual Fused Pairs", fused_pairs_value, "Mappings with both face AND body track IDs"]),
     ]
-    fusion_table = Table(fusion_stats, colWidths=[2 * inch, 1.2 * inch, 2.3 * inch])
+    fusion_table = Table(fusion_stats, colWidths=[2.0 * inch, 1.5 * inch, 2.0 * inch])
     fusion_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2317,14 +2340,14 @@ def build_screentime_run_debug_pdf(
 
     story.append(Paragraph("Fusion Diagnostics", subsection_style))
     fusion_diag = [
-        ["Step", "Count", "Notes"],
-        ["Candidate overlaps considered", candidates_value, candidates_notes],
-        ["Overlaps passing IoU threshold", passing_value, passing_notes],
-        ["Re-ID comparisons performed", reid_value, reid_notes],
-        ["Matches passing similarity threshold", match_value, match_notes],
-        ["Final fused pairs", fused_pairs_value, "From body_tracking/track_fusion.json"],
+        _wrap_row(["Step", "Count", "Notes"]),
+        _wrap_row(["Candidate overlaps considered", candidates_value, candidates_notes]),
+        _wrap_row(["Overlaps passing IoU threshold", passing_value, passing_notes]),
+        _wrap_row(["Re-ID comparisons performed", reid_value, reid_notes]),
+        _wrap_row(["Matches passing similarity threshold", match_value, match_notes]),
+        _wrap_row(["Final fused pairs", fused_pairs_value, "From body_tracking/track_fusion.json"]),
     ]
-    fusion_diag_table = Table(fusion_diag, colWidths=[2.2 * inch, 1.2 * inch, 2.1 * inch])
+    fusion_diag_table = Table(fusion_diag, colWidths=[2.0 * inch, 1.0 * inch, 2.5 * inch])
     fusion_diag_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2340,39 +2363,39 @@ def build_screentime_run_debug_pdf(
     # Configuration used with explanations
     story.append(Paragraph("Configuration (track_fusion.yaml):", subsection_style))
     fusion_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "track_fusion.enabled",
             str(track_fusion_config.get("track_fusion", {}).get("enabled", "N/A")),
             "Master switch for face-body fusion",
             "Enable to link face and body tracks for screen time",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "iou_threshold",
             str(iou_cfg.get("iou_threshold", "N/A")),
             "Min IoU for face-in-body association",
-            "↓ Lower: More associations | ↑ Higher: Stricter spatial overlap required",
-        ],
-        [
+            "Lower: More associations | Higher: Stricter spatial overlap",
+        ], cell_style_small),
+        _wrap_row([
             "min_overlap_ratio",
             str(iou_cfg.get("min_overlap_ratio", "N/A")),
             "Min face area inside body bbox",
-            "↓ Lower: Associate partial overlaps | ↑ Higher: Require face fully inside body",
-        ],
-        [
+            "Lower: Associate partial overlaps | Higher: Require face fully inside body",
+        ], cell_style_small),
+        _wrap_row([
             "reid_handoff.enabled",
             str(reid_cfg.get("enabled", "N/A")),
             "Use Re-ID when face disappears",
             "Enable to continue tracking via body when face turns away",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "similarity_threshold",
             str(reid_cfg.get("similarity_threshold", "N/A")),
             "Min Re-ID similarity for handoff",
-            "↓ Lower: More handoffs (+ errors) | ↑ Higher: Conservative, fewer handoffs",
-        ],
+            "Lower: More handoffs (+ errors) | Higher: Conservative",
+        ], cell_style_small),
     ]
-    fusion_config_table = Table(fusion_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    fusion_config_table = Table(fusion_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     fusion_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2400,13 +2423,13 @@ def build_screentime_run_debug_pdf(
     singleton_frac = singleton_count / len(identities_list) if identities_list else 0
 
     cluster_table_data = [
-        ["Metric", "Value", "Notes"],
-        ["Clusters (identities)", str(len(identities_list)), "Unique identity groups"],
-        ["Total Faces in Clusters", str(cluster_stats.get("faces", 0)), "Sum of face samples"],
-        ["Singleton Clusters", str(singleton_count), f"{singleton_frac:.1%} of total"],
-        ["Mixed Tracks", str(cluster_stats.get("mixed_tracks", 0)), "Tracks with multiple people (error)"],
-        ["Outlier Tracks", str(cluster_stats.get("outlier_tracks", 0)), "Rejected from clusters"],
-        ["Low Cohesion", str(cluster_stats.get("low_cohesion_identities", 0)), "Clusters with poor internal similarity"],
+        _wrap_row(["Metric", "Value", "Notes"]),
+        _wrap_row(["Clusters (identities)", str(len(identities_list)), "Unique identity groups"]),
+        _wrap_row(["Total Faces in Clusters", str(cluster_stats.get("faces", 0)), "Sum of face samples"]),
+        _wrap_row(["Singleton Clusters", str(singleton_count), f"{singleton_frac:.1%} of total"]),
+        _wrap_row(["Mixed Tracks", str(cluster_stats.get("mixed_tracks", 0)), "Tracks with multiple people (error)"]),
+        _wrap_row(["Outlier Tracks", str(cluster_stats.get("outlier_tracks", 0)), "Rejected from clusters"]),
+        _wrap_row(["Low Cohesion", str(cluster_stats.get("low_cohesion_identities", 0)), "Clusters with poor internal similarity"]),
     ]
     cluster_table = Table(cluster_table_data, colWidths=[2 * inch, 1 * inch, 2.5 * inch])
     cluster_table.setStyle(
@@ -2440,41 +2463,41 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Configuration (clustering.yaml):", subsection_style))
     singleton_merge_cfg = clustering_config.get("singleton_merge", {})
     cluster_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["Algorithm", "Agglomerative", "Hierarchical clustering method", "Groups similar embeddings bottom-up"],
-        ["Similarity Metric", "Cosine similarity", "How similarity is measured", "Distance used internally: 1 - cosine_similarity"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["Algorithm", "Agglomerative", "Hierarchical clustering method", "Groups similar embeddings bottom-up"], cell_style_small),
+        _wrap_row(["Similarity Metric", "Cosine similarity", "How similarity is measured", "Distance: 1 - cosine_similarity"], cell_style_small),
+        _wrap_row([
             "cluster_thresh",
             str(clustering_config.get("cluster_thresh", "N/A")),
-            "Cosine similarity threshold to merge clusters",
-            "↓ Lower: Merge more aggressively (fewer clusters) | ↑ Higher: Stricter merges (more clusters)",
-        ],
-        [
+            "Cosine similarity threshold to merge",
+            "Lower: Merge aggressively | Higher: Stricter",
+        ], cell_style_small),
+        _wrap_row([
             "min_cluster_size",
             str(clustering_config.get("min_cluster_size", "N/A")),
             "Min tracks per cluster",
-            "↑ Higher: Filter out brief appearances",
-        ],
-        [
+            "Higher: Filter brief appearances",
+        ], cell_style_small),
+        _wrap_row([
             "min_identity_sim",
             str(clustering_config.get("min_identity_sim", "N/A")),
             "Min similarity to cluster centroid",
-            "↓ Lower: Accept more outliers | ↑ Higher: Eject dissimilar tracks",
-        ],
-        [
+            "Lower: Accept outliers | Higher: Eject dissimilar",
+        ], cell_style_small),
+        _wrap_row([
             "singleton_merge",
             str(singleton_merge_cfg.get("enabled", "N/A")),
             "Second-pass merge for singletons",
-            "Enable if many single-track clusters; disable if over-merging",
-        ],
-        [
+            "Enable if many singletons; disable if over-merging",
+        ], cell_style_small),
+        _wrap_row([
             "merge.similarity_thresh",
             str(singleton_merge_cfg.get("similarity_thresh", "N/A")),
             "Looser threshold for singleton merge",
-            "↓ Lower: Merge more singletons | ↑ Higher: Conservative merge",
-        ],
+            "Lower: Merge more | Higher: Conservative",
+        ], cell_style_small),
     ]
-    cluster_config_table = Table(cluster_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    cluster_config_table = Table(cluster_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     cluster_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2717,40 +2740,40 @@ def build_screentime_run_debug_pdf(
     presets = screentime_config.get("screen_time_presets", {})
     active_preset = presets.get(preset, {})
     screentime_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"], cell_style_small),
+        _wrap_row([
             "quality_min",
             str(active_preset.get("quality_min", "N/A")),
             "Min detection quality to count",
-            "↓ Lower: Count blurry/profile faces | ↑ Higher: Only clear faces",
-        ],
-        [
+            "Lower: Count blurry faces | Higher: Only clear",
+        ], cell_style_small),
+        _wrap_row([
             "gap_tolerance_s",
             str(active_preset.get("gap_tolerance_s", "N/A")),
             "Max gap to merge into one segment",
-            "↓ Lower: More separate segments | ↑ Higher: Merge through cuts/occlusions",
-        ],
-        [
+            "Lower: More segments | Higher: Merge through cuts",
+        ], cell_style_small),
+        _wrap_row([
             "screen_time_mode",
             str(active_preset.get("screen_time_mode", "N/A")),
             "How to compute screen time",
-            "tracks: Use full track spans | faces: Only count detected frames",
-        ],
-        [
+            "tracks: Full spans | faces: Only detected frames",
+        ], cell_style_small),
+        _wrap_row([
             "edge_padding_s",
             str(active_preset.get("edge_padding_s", "N/A")),
             "Padding added to segment edges",
-            "↓ Lower: Conservative times | ↑ Higher: More generous counting",
-        ],
-        [
+            "Lower: Conservative | Higher: Generous counting",
+        ], cell_style_small),
+        _wrap_row([
             "track_coverage_min",
             str(active_preset.get("track_coverage_min", "N/A")),
             "Min detection coverage per track",
-            "↓ Lower: Count sparse tracks | ↑ Higher: Require consistent detection",
-        ],
+            "Lower: Count sparse | Higher: Require consistent",
+        ], cell_style_small),
     ]
-    screentime_config_table = Table(screentime_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    screentime_config_table = Table(screentime_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     screentime_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2857,9 +2880,10 @@ def build_screentime_run_debug_pdf(
         ))
 
     if tuning_suggestions:
-        tuning_table_data = [["Stage", "Issue", "Suggested Action"]]
-        tuning_table_data.extend(tuning_suggestions)
-        tuning_table = Table(tuning_table_data, colWidths=[1.3 * inch, 1.7 * inch, 3 * inch])
+        tuning_table_data = [_wrap_row(["Stage", "Issue", "Suggested Action"])]
+        for suggestion in tuning_suggestions:
+            tuning_table_data.append(_wrap_row(list(suggestion)))
+        tuning_table = Table(tuning_table_data, colWidths=[1.0 * inch, 1.8 * inch, 2.7 * inch])
         tuning_table.setStyle(
             TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fc8181")),
