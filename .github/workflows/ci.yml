@@ -41,7 +41,7 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          pip install pytest pytest-cov pyyaml numpy opencv-python-headless fastapi httpx requests pillow python-multipart
+          pip install pytest pytest-cov pyyaml numpy opencv-python-headless fastapi httpx requests pillow python-multipart reportlab
 
       - name: Run face_alignment tests
         run: |

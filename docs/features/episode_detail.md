@@ -23,9 +23,11 @@ When navigating to Faces Review or Smart Suggestions:
 - Child pages operate within that run's scope
 - All mutations affect only the selected run
 
-## Export Run Debug Bundle
+## Debug / Export (PDF report + ZIP bundle)
 
-The Debug/Export section allows exporting a complete snapshot of a run's state for debugging or archival.
+The Debug/Export section allows exporting either:
+- a **PDF debug report** (default), or
+- a **ZIP debug bundle** (raw artifacts + logs) for debugging/archival.
 
 ### Endpoint
 
@@ -33,7 +35,16 @@ The Debug/Export section allows exporting a complete snapshot of a run's state f
 GET /episodes/{ep_id}/runs/{run_id}/export
 ```
 
+### Formats
+
+| Query param | Value | Output |
+|---|---|---|
+| `format` | `pdf` (default) | `application/pdf` debug report |
+| `format` | `zip` | `application/zip` raw debug bundle |
+
 ### Export Options
+
+These toggles apply to **ZIP** exports only:
 
 | Toggle | Description |
 |--------|-------------|
@@ -53,6 +64,7 @@ The exported ZIP contains:
 - `smart_suggestion_batches.json` - Suggestion batch metadata
 - `smart_suggestions.json` - Individual suggestions with evidence
 - `smart_suggestions_applied.json` - Audit trail of applied suggestions
+- `debug_report.pdf` - Same PDF debug report (best-effort; included when generation succeeds)
 
 **With include_artifacts=True:**
 - `detections.jsonl`
@@ -63,6 +75,13 @@ The exported ZIP contains:
 - `cluster_centroids.json`
 - `body_tracking/` directory
 - `analytics/` directory
+
+### PDF Report Contents (high level)
+
+The PDF report is a self-contained summary intended for “what happened and why”:
+- Run lineage + config snapshots
+- A quick **Run Health** section (DB connectivity, body-tracking artifact presence, fusion sanity checks)
+- Phase-by-phase counts and diagnostics (detect/track/embed/cluster/screentime)
 
 ## Pipeline Jobs
 
