@@ -1624,27 +1624,42 @@ def build_screentime_run_debug_pdf(
         return str(value)
 
     resolved_duration_s: float | None = ffprobe_duration_s or marker_duration_s
-    resolved_fps: float | None = ffprobe_fps or marker_fps
-    resolved_frames: int | None = ffprobe_frames or marker_frames_total
+    resolved_fps: float | None = ffprobe_fps or marker_fps or opencv_fps
+    # Include opencv_frames as final fallback per Cursor bot feedback
+    resolved_frames: int | None = ffprobe_frames or marker_frames_total or opencv_frames
+
+    def _resolved_source(ffprobe_val: Any, marker_val: Any, opencv_val: Any = None) -> str:
+        """Determine which source provided the resolved value."""
+        if ffprobe_val is not None:
+            return "ffprobe"
+        if marker_val is not None:
+            return "detect_track.marker"
+        if opencv_val is not None:
+            return "opencv"
+        return "unknown"
+
     if resolved_duration_s is not None:
+        dur_source = _resolved_source(ffprobe_duration_s, marker_duration_s)
         lineage_data.append(
             [
                 "Video Duration (resolved)",
-                f"{resolved_duration_s:.2f}s ({'ffprobe' if ffprobe_duration_s else 'detect_track.marker'})",
+                f"{resolved_duration_s:.2f}s ({dur_source})",
             ]
         )
     if resolved_fps is not None:
+        fps_source = _resolved_source(ffprobe_fps, marker_fps, opencv_fps)
         lineage_data.append(
             [
                 "Video Frame Rate (resolved)",
-                f"{resolved_fps:.3f} fps ({'ffprobe' if ffprobe_fps else 'detect_track.marker'})",
+                f"{resolved_fps:.3f} fps ({fps_source})",
             ]
         )
     if resolved_frames is not None:
+        frames_source = _resolved_source(ffprobe_frames, marker_frames_total, opencv_frames)
         lineage_data.append(
             [
                 "Total Video Frames (resolved)",
-                f"{resolved_frames} ({'ffprobe' if ffprobe_frames else 'detect_track.marker'})",
+                f"{resolved_frames} ({frames_source})",
             ]
         )
     if width_value is not None or height_value is not None:
@@ -2872,22 +2887,25 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Complete listing of all referenced artifacts with status, size, and record counts:", body_style))
     story.append(Spacer(1, 8))
 
+    # "In Bundle" indicates whether the artifact is included when exporting as ZIP with include_artifacts=True
+    # ZIP bundle includes: .json, .jsonl files from run root + body_tracking/ + analytics/
+    # Excludes: .npy files, face_alignment/ subdirectory
     artifact_data = [
-        ["Artifact", "Status", "Size", "Records", "Stage"],
-        (*_artifact_row(detections_path), str(detect_count), "Face Detect"),
-        (*_artifact_row(tracks_path), str(track_count), "Face Track"),
-        (*_artifact_row(track_metrics_path), "-", "Face Track"),
-        (*_artifact_row(faces_path), str(faces_count), "Face Harvest"),
-        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed"),
-        (*_artifact_row(faces_npy), "-", "Face Embed"),
-        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster"),
-        (*_artifact_row(cluster_centroids_path), "-", "Cluster"),
-        (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect"),
-        (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track"),
-        (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion"),
-        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time"),
+        ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
+        (*_artifact_row(detections_path), str(detect_count), "Face Detect", "Yes"),
+        (*_artifact_row(tracks_path), str(track_count), "Face Track", "Yes"),
+        (*_artifact_row(track_metrics_path), "-", "Face Track", "Yes"),
+        (*_artifact_row(faces_path), str(faces_count), "Face Harvest", "Yes"),
+        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed", "No"),
+        (*_artifact_row(faces_npy), "-", "Face Embed", "No"),
+        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster", "Yes"),
+        (*_artifact_row(cluster_centroids_path), "-", "Cluster", "Yes"),
+        (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect", "Yes"),
+        (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track", "Yes"),
+        (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion", "Yes"),
+        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time", "Yes"),
     ]
-    artifact_table = Table(artifact_data, colWidths=[2.8 * inch, 0.7 * inch, 0.7 * inch, 0.6 * inch, 1 * inch])
+    artifact_table = Table(artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
     artifact_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
@@ -2922,13 +2940,13 @@ def build_screentime_run_debug_pdf(
             label="legacy/body_tracking/body_tracks.jsonl",
         )
         legacy_artifact_data = [
-            ["Artifact", "Status", "Size", "Records", "Stage"],
-            (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect"),
-            (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track"),
-            (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion"),
-            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time"),
+            ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
+            (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect", "No"),
+            (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track", "No"),
+            (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion", "No"),
+            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time", "No"),
         ]
-        legacy_table = Table(legacy_artifact_data, colWidths=[2.8 * inch, 0.7 * inch, 0.7 * inch, 0.6 * inch, 1 * inch])
+        legacy_table = Table(legacy_artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
         legacy_table.setStyle(
             TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4a5568")),
