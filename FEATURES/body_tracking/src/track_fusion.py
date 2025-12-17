@@ -6,6 +6,7 @@ Associates face tracks with body tracks for continuous identity tracking.
 
 import json
 import logging
+import random
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,15 +27,22 @@ class FaceBodyAssociation:
     confidence: float
     method: str  # "iou" | "reid" | "temporal"
     frame_range: Tuple[int, int]  # (start_frame, end_frame)
+    best_iou: float | None = None
+    best_similarity: float | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload: dict = {
             "face_track_id": self.face_track_id,
             "body_track_id": self.body_track_id,
             "confidence": self.confidence,
             "method": self.method,
             "frame_range": list(self.frame_range),
         }
+        if self.best_iou is not None:
+            payload["best_iou"] = round(float(self.best_iou), 6)
+        if self.best_similarity is not None:
+            payload["best_similarity"] = round(float(self.best_similarity), 6)
+        return payload
 
 
 @dataclass
@@ -52,6 +60,31 @@ class FusedIdentity:
     total_frames: int = 0
 
     def to_dict(self) -> dict:
+        methods = {a.method for a in self.associations}
+        has_iou = "iou" in methods
+        has_reid = "reid" in methods
+        attribution_source: str | None
+        if not (self.face_track_ids and self.body_track_ids):
+            attribution_source = None
+        elif has_iou and has_reid:
+            attribution_source = "hybrid"
+        elif has_reid:
+            attribution_source = "reid"
+        elif has_iou:
+            attribution_source = "iou"
+        else:
+            attribution_source = None
+
+        best_iou: float | None = None
+        best_similarity: float | None = None
+        for assoc in self.associations:
+            if assoc.best_iou is not None:
+                best_iou = assoc.best_iou if best_iou is None else max(best_iou, assoc.best_iou)
+            if assoc.best_similarity is not None:
+                best_similarity = (
+                    assoc.best_similarity if best_similarity is None else max(best_similarity, assoc.best_similarity)
+                )
+
         return {
             "identity_id": self.identity_id,
             "face_track_ids": self.face_track_ids,
@@ -60,6 +93,11 @@ class FusedIdentity:
             "face_visible_frames": self.face_visible_frames,
             "body_only_frames": self.body_only_frames,
             "total_frames": self.total_frames,
+            "attribution": {
+                "source": attribution_source,
+                "best_iou": (round(float(best_iou), 6) if best_iou is not None else None),
+                "best_similarity": (round(float(best_similarity), 6) if best_similarity is not None else None),
+            },
         }
 
 
@@ -68,7 +106,7 @@ class TrackFusion:
 
     def __init__(
         self,
-        iou_threshold: float = 0.50,
+        iou_threshold: float = 0.02,
         min_overlap_ratio: float = 0.7,
         reid_similarity_threshold: float = 0.70,
         max_gap_seconds: float = 30.0,
@@ -81,6 +119,7 @@ class TrackFusion:
         self.max_gap_seconds = max_gap_seconds
         self.face_in_upper_body = face_in_upper_body
         self.upper_body_fraction = upper_body_fraction
+        self.last_diagnostics: dict[str, object] = {}
 
     def compute_iou(self, box1: List[float], box2: List[float]) -> float:
         """Compute IoU between two boxes."""
@@ -124,6 +163,14 @@ class TrackFusion:
         overlap_ratio = inter_area / face_area
 
         if overlap_ratio < self.min_overlap_ratio:
+            return 0.0
+
+        # IoU gating: note that when face is fully inside body, IoU ~= face_area / body_area.
+        # This is expected to be small (e.g. 0.02-0.10), so keep iou_threshold conservative.
+        body_area = (body_box[2] - body_box[0]) * (body_box[3] - body_box[1])
+        union_area = face_area + body_area - inter_area
+        iou = inter_area / union_area if union_area > 0 else 0.0
+        if iou < self.iou_threshold:
             return 0.0
 
         # Check if face is in upper portion of body
@@ -235,23 +282,72 @@ class TrackFusion:
         logger.info(f"Fusing {len(face_tracks)} face tracks with {len(body_tracks)} body tracks")
 
         # Phase 1: IoU-based frame-by-frame association
-        iou_associations = self._build_iou_associations(face_tracks, body_tracks)
+        iou_associations, spatial_diag = self._build_iou_associations(face_tracks, body_tracks)
         logger.info(f"  IoU associations: {len(iou_associations)}")
 
         # Phase 2: Re-ID handoff for gaps
-        reid_associations = []
+        reid_associations: List[FaceBodyAssociation] = []
+        reid_diag: dict[str, object] = {"reid_enabled": False, "reid_comparisons": 0, "reid_pass": 0}
         if body_embeddings is not None and face_embeddings is not None:
+            reid_diag = {
+                "reid_enabled": True,
+                "reid_comparisons": 0,
+                "reid_pass": 0,
+            }
             reid_associations = self._build_reid_associations(
                 face_tracks, body_tracks,
                 face_embeddings, face_embeddings_meta,
                 body_embeddings, body_embeddings_meta,
             )
             logger.info(f"  Re-ID associations: {len(reid_associations)}")
+            reid_diag["reid_pass"] = len(reid_associations)
 
         # Phase 3: Build fused identities
         all_associations = iou_associations + reid_associations
         identities = self._build_fused_identities(face_tracks, body_tracks, all_associations)
         logger.info(f"  Fused identities: {len(identities)}")
+
+        # Diagnostics: reconcile final_pairs with association sources.
+        final_pairs = 0
+        iou_pairs = 0
+        reid_pairs = 0
+        hybrid_pairs = 0
+        for identity in identities.values():
+            if not (identity.face_track_ids and identity.body_track_ids):
+                continue
+            final_pairs += 1
+            methods = {assoc.method for assoc in identity.associations}
+            has_iou = "iou" in methods
+            has_reid = "reid" in methods
+            if has_iou and has_reid:
+                hybrid_pairs += 1
+            elif has_reid:
+                reid_pairs += 1
+            else:
+                iou_pairs += 1
+
+        self.last_diagnostics = {
+            "schema_version": 1,
+            "candidate_overlaps": int(spatial_diag.get("candidate_overlaps", 0) or 0),
+            "iou_pass": int(spatial_diag.get("iou_pass", 0) or 0),
+            "overlap_ratio_pass": int(spatial_diag.get("overlap_ratio_pass", 0) or 0),
+            "iou_distribution": spatial_diag.get("iou_distribution"),
+            "overlap_ratio_distribution": spatial_diag.get("overlap_ratio_distribution"),
+            "reid_comparisons": int(reid_diag.get("reid_comparisons", 0) or 0),
+            "reid_pass": int(reid_diag.get("reid_pass", 0) or 0),
+            "final_pairs": final_pairs,
+            "iou_pairs": iou_pairs,
+            "reid_pairs": reid_pairs,
+            "hybrid_pairs": hybrid_pairs,
+            "config": {
+                "iou_threshold": float(self.iou_threshold),
+                "min_overlap_ratio": float(self.min_overlap_ratio),
+                "face_in_upper_body": bool(self.face_in_upper_body),
+                "upper_body_fraction": float(self.upper_body_fraction),
+                "reid_similarity_threshold": float(self.reid_similarity_threshold),
+                "max_gap_seconds": float(self.max_gap_seconds),
+            },
+        }
 
         return identities
 
@@ -259,7 +355,7 @@ class TrackFusion:
         self,
         face_tracks: Dict[int, dict],
         body_tracks: Dict[int, dict],
-    ) -> List[FaceBodyAssociation]:
+    ) -> tuple[List[FaceBodyAssociation], dict[str, object]]:
         """Build associations using frame-by-frame IoU."""
         # Index body detections by frame
         body_by_frame: Dict[int, List[Tuple[int, dict]]] = defaultdict(list)
@@ -268,11 +364,76 @@ class TrackFusion:
                 frame_idx = det["frame_idx"]
                 body_by_frame[frame_idx].append((track_id, det))
 
+        def _face_in_upper(face_box: list[float], body_box: list[float]) -> bool:
+            if not self.face_in_upper_body:
+                return True
+            try:
+                face_center_y = (float(face_box[1]) + float(face_box[3])) / 2.0
+                body_y1 = float(body_box[1])
+                body_y2 = float(body_box[3])
+            except (TypeError, ValueError, IndexError):
+                return False
+            body_height = body_y2 - body_y1
+            upper_body_y = body_y1 + body_height * float(self.upper_body_fraction)
+            return face_center_y <= upper_body_y
+
+        def _iou_and_overlap_ratio(face_box: list[float], body_box: list[float]) -> tuple[float, float]:
+            try:
+                fx1, fy1, fx2, fy2 = (float(v) for v in face_box)
+                bx1, by1, bx2, by2 = (float(v) for v in body_box)
+            except (TypeError, ValueError):
+                return 0.0, 0.0
+            ix1, iy1 = max(fx1, bx1), max(fy1, by1)
+            ix2, iy2 = min(fx2, bx2), min(fy2, by2)
+            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+            inter = iw * ih
+            if inter <= 0:
+                return 0.0, 0.0
+            face_area = max(0.0, fx2 - fx1) * max(0.0, fy2 - fy1)
+            body_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            union = face_area + body_area - inter
+            iou = inter / union if union > 0 else 0.0
+            overlap_ratio = inter / face_area if face_area > 0 else 0.0
+            return iou, overlap_ratio
+
         # For each face track, find overlapping body tracks
         associations = []
+        candidate_overlaps = 0
+        overlap_ratio_pass = 0
+        iou_pass = 0
+
+        sample_limit = 50_000
+        iou_samples: list[float] = []
+        overlap_samples: list[float] = []
+        iou_seen = 0
+        overlap_seen = 0
+        rng = random.Random(0)
+
+        def _reservoir_push(sample_list: list[float], value: float, *, seen: int) -> int:
+            seen += 1
+            if len(sample_list) < sample_limit:
+                sample_list.append(value)
+                return seen
+            j = rng.randrange(seen)
+            if j < sample_limit:
+                sample_list[j] = value
+            return seen
+
+        def _distribution(sample_list: list[float]) -> dict[str, float] | None:
+            if not sample_list:
+                return None
+            arr = np.asarray(sample_list, dtype=np.float32)
+            return {
+                "min": float(np.min(arr)),
+                "median": float(np.median(arr)),
+                "p95": float(np.percentile(arr, 95)),
+                "max": float(np.max(arr)),
+            }
+
         for face_track_id, face_track in face_tracks.items():
             body_overlap_counts: Dict[int, int] = defaultdict(int)
             body_overlap_scores: Dict[int, List[float]] = defaultdict(list)
+            best_iou_by_body: Dict[int, float] = defaultdict(float)
             frame_ranges: Dict[int, Tuple[int, int]] = {}
 
             for face_det in face_track.get("detections", []):
@@ -281,11 +442,25 @@ class TrackFusion:
 
                 for body_track_id, body_det in body_by_frame.get(frame_idx, []):
                     body_box = body_det["bbox"]
+                    if not _face_in_upper(face_box, body_box):
+                        continue
+
+                    iou, overlap_ratio = _iou_and_overlap_ratio(face_box, body_box)
+                    candidate_overlaps += 1
+                    iou_seen = _reservoir_push(iou_samples, float(iou), seen=iou_seen)
+                    overlap_seen = _reservoir_push(overlap_samples, float(overlap_ratio), seen=overlap_seen)
+
+                    if overlap_ratio >= self.min_overlap_ratio:
+                        overlap_ratio_pass += 1
+                        if iou >= self.iou_threshold:
+                            iou_pass += 1
+
                     score = self.compute_face_in_body_score(face_box, body_box)
 
                     if score >= self.min_overlap_ratio:
                         body_overlap_counts[body_track_id] += 1
                         body_overlap_scores[body_track_id].append(score)
+                        best_iou_by_body[body_track_id] = max(best_iou_by_body[body_track_id], float(iou))
 
                         if body_track_id not in frame_ranges:
                             frame_ranges[body_track_id] = (frame_idx, frame_idx)
@@ -303,9 +478,18 @@ class TrackFusion:
                         confidence=avg_score,
                         method="iou",
                         frame_range=frame_ranges[body_track_id],
+                        best_iou=best_iou_by_body.get(body_track_id),
                     ))
 
-        return associations
+        diagnostics: dict[str, object] = {
+            "candidate_overlaps": candidate_overlaps,
+            "overlap_ratio_pass": overlap_ratio_pass,
+            "iou_pass": iou_pass,
+            "iou_distribution": _distribution(iou_samples),
+            "overlap_ratio_distribution": _distribution(overlap_samples),
+        }
+
+        return associations, diagnostics
 
     def _build_reid_associations(
         self,
@@ -370,6 +554,7 @@ class TrackFusion:
                     confidence=similarity,
                     method="reid",
                     frame_range=(face_end_frame, body_track.get("end_frame", body_start_frame)),
+                    best_similarity=float(similarity),
                 ))
 
         return associations
@@ -582,9 +767,11 @@ def fuse_face_body_tracks(
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         result = {
+            "schema_version": 2,
             "num_face_tracks": len(face_tracks),
             "num_body_tracks": len(body_tracks),
             "num_fused_identities": len(identities),
+            "diagnostics": getattr(fusion, "last_diagnostics", {}) or {},
             "identities": {k: v.to_dict() for k, v in identities.items()},
         }
 

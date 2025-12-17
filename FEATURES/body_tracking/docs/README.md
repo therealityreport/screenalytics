@@ -168,7 +168,7 @@ performance:
 
 ```yaml
 iou_association:
-  iou_threshold: 0.50
+  iou_threshold: 0.02
   min_overlap_ratio: 0.7
   face_in_upper_body: true    # Face should be in upper 50% of body
 

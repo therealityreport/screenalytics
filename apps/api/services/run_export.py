@@ -2479,57 +2479,139 @@ def build_screentime_run_debug_pdf(
     except (TypeError, ValueError):
         upper_body_fraction = 0.5
 
-    overlap_diag = _track_fusion_overlap_diagnostics(
-        face_tracks_path=tracks_path,
-        body_tracks_path=body_tracks_path,
-        iou_threshold=iou_threshold,
-        min_overlap_ratio=min_overlap_ratio,
-        face_in_upper_body=face_in_upper_body,
-        upper_body_fraction=upper_body_fraction,
-    )
+    def _safe_int(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned.isdigit():
+                return int(cleaned)
+        return None
 
-    if overlap_diag.get("ok"):
-        candidates_value = f"{overlap_diag['comparisons_considered']} comparisons"
-        candidates_notes = (
-            f"{overlap_diag['pairs_considered']} pairs across {overlap_diag['frames_with_candidates']} frames"
+    def _format_dist(dist: Any) -> str:
+        if not isinstance(dist, dict):
+            return "N/A"
+        parts: list[str] = []
+        for key in ("min", "median", "p95", "max"):
+            val = dist.get(key)
+            if isinstance(val, (int, float)):
+                parts.append(f"{key}={float(val):.4f}")
+        return " ".join(parts) if parts else "N/A"
+
+    fusion_diag_payload = None
+    if track_fusion_payload is not None:
+        diag_block = track_fusion_payload.get("diagnostics")
+        fusion_diag_payload = diag_block if isinstance(diag_block, dict) else None
+
+    if fusion_diag_payload:
+        candidate_overlaps = _safe_int(fusion_diag_payload.get("candidate_overlaps"))
+        overlap_ratio_pass = _safe_int(fusion_diag_payload.get("overlap_ratio_pass"))
+        iou_pass_count = _safe_int(fusion_diag_payload.get("iou_pass"))
+        iou_pairs_count = _safe_int(fusion_diag_payload.get("iou_pairs"))
+        reid_pairs_count = _safe_int(fusion_diag_payload.get("reid_pairs"))
+        hybrid_pairs_count = _safe_int(fusion_diag_payload.get("hybrid_pairs"))
+        final_pairs_count = _safe_int(fusion_diag_payload.get("final_pairs"))
+        reid_comparisons = _safe_int(fusion_diag_payload.get("reid_comparisons"))
+        reid_pass = _safe_int(fusion_diag_payload.get("reid_pass"))
+
+        candidates_value = f"{candidate_overlaps} comparisons" if candidate_overlaps is not None else "N/A"
+        candidates_notes = "From track_fusion.json diagnostics"
+        overlap_value = f"{overlap_ratio_pass} comparisons" if overlap_ratio_pass is not None else "N/A"
+        overlap_notes = f"threshold=min_overlap_ratio≥{min_overlap_ratio:.2f}"
+        iou_value = f"{iou_pass_count} comparisons" if iou_pass_count is not None else "N/A"
+        iou_notes = f"threshold=iou≥{iou_threshold:.3f} (and overlap_ratio pass)"
+        iou_dist_value = _format_dist(fusion_diag_payload.get("iou_distribution"))
+        overlap_dist_value = _format_dist(fusion_diag_payload.get("overlap_ratio_distribution"))
+
+        reid_value = f"{reid_comparisons} comparisons" if reid_comparisons is not None else "N/A"
+        reid_notes = "From track_fusion.json diagnostics"
+        match_value = f"{reid_pass} matches" if reid_pass is not None else "N/A"
+        match_notes = f"threshold={reid_cfg.get('similarity_threshold', 'N/A')}"
+
+        final_pairs_detail = (
+            f"{final_pairs_count} pairs (iou={iou_pairs_count or 0}, reid={reid_pairs_count or 0}, hybrid={hybrid_pairs_count or 0})"
+            if final_pairs_count is not None
+            else "N/A"
         )
-        passing_value = f"{overlap_diag['comparisons_passing']} comparisons"
-        passing_notes = (
-            f"{overlap_diag['pairs_passing']} pairs; {overlap_diag['pairs_passing_min_frames']} pairs with ≥3 frames"
+        final_pairs_notes = (
+            "final_pairs == iou_pairs + reid_pairs + hybrid_pairs"
+            if (
+                final_pairs_count is not None
+                and iou_pairs_count is not None
+                and reid_pairs_count is not None
+                and hybrid_pairs_count is not None
+                and final_pairs_count == (iou_pairs_count + reid_pairs_count + hybrid_pairs_count)
+            )
+            else "From track_fusion.json diagnostics"
         )
     else:
-        candidates_value = "N/A"
-        candidates_notes = str(overlap_diag.get("error") or "unknown")
-        passing_value = "N/A"
-        passing_notes = str(overlap_diag.get("error") or "unknown")
+        overlap_diag = _track_fusion_overlap_diagnostics(
+            face_tracks_path=tracks_path,
+            body_tracks_path=body_tracks_path,
+            iou_threshold=iou_threshold,
+            min_overlap_ratio=min_overlap_ratio,
+            face_in_upper_body=face_in_upper_body,
+            upper_body_fraction=upper_body_fraction,
+        )
 
-    reid_enabled = bool(reid_cfg.get("enabled", False))
-    reid_similarity = reid_cfg.get("similarity_threshold")
-    body_embeddings_path = body_tracking_dir / "body_embeddings.npy"
-    if not reid_enabled:
-        reid_value = "N/A"
-        reid_notes = "reid_handoff.enabled=false"
-        match_value = "N/A"
-        match_notes = "Re-ID disabled"
-    elif not body_embeddings_path.exists():
-        reid_value = "N/A"
-        reid_notes = "missing body_tracking/body_embeddings.npy"
-        match_value = "N/A"
-        match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
-    else:
-        reid_value = "N/A"
-        reid_notes = "Re-ID comparison counts are not recorded in current artifacts"
-        match_value = "N/A"
-        match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+        if overlap_diag.get("ok"):
+            candidates_value = f"{overlap_diag['comparisons_considered']} comparisons"
+            candidates_notes = (
+                f"{overlap_diag['pairs_considered']} pairs across {overlap_diag['frames_with_candidates']} frames"
+            )
+            overlap_value = "N/A"
+            overlap_notes = "N/A (not recorded in legacy diagnostics)"
+            iou_value = f"{overlap_diag['comparisons_passing']} comparisons"
+            iou_notes = (
+                f"{overlap_diag['pairs_passing']} pairs; {overlap_diag['pairs_passing_min_frames']} pairs with ≥3 frames"
+            )
+            iou_dist_value = "N/A"
+            overlap_dist_value = "N/A"
+        else:
+            candidates_value = "N/A"
+            candidates_notes = str(overlap_diag.get("error") or "unknown")
+            overlap_value = "N/A"
+            overlap_notes = str(overlap_diag.get("error") or "unknown")
+            iou_value = "N/A"
+            iou_notes = str(overlap_diag.get("error") or "unknown")
+            iou_dist_value = "N/A"
+            overlap_dist_value = "N/A"
+
+        reid_enabled = bool(reid_cfg.get("enabled", False))
+        reid_similarity = reid_cfg.get("similarity_threshold")
+        body_embeddings_path = body_tracking_dir / "body_embeddings.npy"
+        if not reid_enabled:
+            reid_value = "N/A"
+            reid_notes = "reid_handoff.enabled=false"
+            match_value = "N/A"
+            match_notes = "Re-ID disabled"
+        elif not body_embeddings_path.exists():
+            reid_value = "N/A"
+            reid_notes = "missing body_tracking/body_embeddings.npy"
+            match_value = "N/A"
+            match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+        else:
+            reid_value = "N/A"
+            reid_notes = "Re-ID comparison counts are not recorded in current artifacts"
+            match_value = "N/A"
+            match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+
+        final_pairs_detail = fused_pairs_value
+        final_pairs_notes = "From body_tracking/track_fusion.json"
 
     story.append(Paragraph("Fusion Diagnostics", subsection_style))
     fusion_diag = [
         _wrap_row(["Step", "Count", "Notes"]),
         _wrap_row(["Candidate overlaps considered", candidates_value, candidates_notes]),
-        _wrap_row(["Overlaps passing IoU threshold", passing_value, passing_notes]),
+        _wrap_row(["Overlaps passing overlap_ratio", overlap_value, overlap_notes]),
+        _wrap_row(["Overlaps passing IoU threshold", iou_value, iou_notes]),
+        _wrap_row(["IoU distribution (min/median/p95/max)", iou_dist_value, "Sampled over candidate overlaps"]),
+        _wrap_row(["Overlap ratio distribution (min/median/p95/max)", overlap_dist_value, "Sampled over candidate overlaps"]),
         _wrap_row(["Re-ID comparisons performed", reid_value, reid_notes]),
         _wrap_row(["Matches passing similarity threshold", match_value, match_notes]),
-        _wrap_row(["Final fused pairs", fused_pairs_value, "From body_tracking/track_fusion.json"]),
+        _wrap_row(["Final fused pairs", final_pairs_detail, final_pairs_notes]),
     ]
     fusion_diag_table = Table(fusion_diag, colWidths=[2.0 * inch, 1.0 * inch, 2.5 * inch])
     fusion_diag_table.setStyle(
