@@ -1149,7 +1149,8 @@ def build_screentime_run_debug_pdf(
     screentime_summary: dict[str, Any] | None = None
     if screentime_payload is not None:
         summary_block = screentime_payload.get("summary")
-        screentime_summary = summary_block if isinstance(summary_block, dict) else {}
+        # Only set screentime_summary if it's a proper dict; otherwise keep None for N/A display
+        screentime_summary = summary_block if isinstance(summary_block, dict) else None
 
     # Face-only fallback for cases where screentime_comparison.json is missing.
     face_tracks_count_run = _count_jsonl_lines_optional(tracks_path)
