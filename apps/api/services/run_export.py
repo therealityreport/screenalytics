@@ -1075,6 +1075,8 @@ def build_screentime_run_debug_pdf(
     if not run_root.exists():
         raise FileNotFoundError(f"Run not found on disk: {run_root}")
 
+    s3_layout = run_layout.get_run_s3_layout(ep_id, run_id_norm)
+
     manifests_root = get_path(ep_id, "detections").parent
     # Run-scoped body_tracking is authoritative for this report; legacy artifacts are diagnostic only.
     body_tracking_dir = run_root / "body_tracking"
@@ -1106,6 +1108,8 @@ def build_screentime_run_debug_pdf(
     # NOTE: download mtimes reflect hydration time, not artifact generation time.
     hydrated_from_s3 = False
     hydrated_paths: dict[str, Path] = {}
+    hydrated_s3_keys: dict[str, str] = {}
+    hydrated_locations: dict[str, str] = {}
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
     try:
         if any(not (run_root / filename).exists() for filename in run_layout.RUN_ARTIFACT_ALLOWLIST):
@@ -1120,9 +1124,22 @@ def build_screentime_run_debug_pdf(
                     local_path = run_root / filename
                     if local_path.exists():
                         continue
-                    s3_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, filename)
-                    payload = storage.download_bytes(s3_key)
-                    if payload is None:
+                    for s3_key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, filename):
+                        try:
+                            if not storage.object_exists(s3_key):
+                                continue
+                        except Exception as exc:
+                            LOGGER.warning("[export] Failed to check S3 object existence for %s: %s", s3_key, exc)
+                            continue
+                        payload = storage.download_bytes(s3_key)
+                        if payload is None:
+                            continue
+                        hydrated_s3_keys[filename] = s3_key
+                        hydrated_locations[filename] = (
+                            "legacy" if s3_key.startswith(s3_layout.legacy_prefix) else "canonical"
+                        )
+                        break
+                    else:
                         continue
                     dest_path = hydrate_root / filename
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1307,6 +1324,8 @@ def build_screentime_run_debug_pdf(
         ["Generated At", _now_iso()],
         ["Git SHA", _get_git_sha()],
         ["Run Root", str(run_root)],
+        ["S3 Layout (write)", s3_layout.s3_layout],
+        ["S3 Run Prefix (write)", s3_layout.write_prefix],
     ]
     summary_table = Table(summary_data, colWidths=[1.5 * inch, 5 * inch])
     summary_table.setStyle(
@@ -1333,12 +1352,13 @@ def build_screentime_run_debug_pdf(
                 note_style,
             )
         )
-        hydrated_keys = sorted(
-            run_layout.run_artifact_s3_key(ep_id, run_id_norm, filename) for filename in hydrated_paths.keys()
+        hydrated_items = sorted(
+            (key, hydrated_locations.get(filename, "unknown"))
+            for filename, key in hydrated_s3_keys.items()
         )
-        story.append(Paragraph(f"Hydrated keys ({len(hydrated_keys)}):", subsection_style))
-        for key in hydrated_keys:
-            story.append(Paragraph(f"&bull; {key}", bullet_style))
+        story.append(Paragraph(f"Hydrated keys ({len(hydrated_items)}):", subsection_style))
+        for key, location in hydrated_items:
+            story.append(Paragraph(f"&bull; {key} (artifact_location={location})", bullet_style))
         story.append(Spacer(1, 8))
 
     # =========================================================================
@@ -3247,10 +3267,12 @@ class ExportUploadResult:
 def _get_export_s3_key(ep_id: str, run_id: str, filename: str) -> str:
     """Generate deterministic S3 key for an export file.
 
-    Format: runs/{ep_id}/{run_id}/exports/{filename}
+    Canonical format: runs/{show}/s{ss}/e{ee}/{run_id}/exports/{filename}
+
+    Falls back to legacy (write) prefix only when ep_id parsing fails:
+        runs/{ep_id}/{run_id}/exports/{filename}
     """
-    run_id_norm = run_layout.normalize_run_id(run_id)
-    return f"runs/{ep_id}/{run_id_norm}/exports/{filename}"
+    return run_layout.run_export_s3_key(ep_id, run_id, filename)
 
 
 def validate_s3_for_export() -> tuple[bool, str | None, dict[str, Any]]:
@@ -3339,9 +3361,21 @@ def upload_export_to_s3(
             raise RuntimeError(msg)
         return ExportUploadResult(success=False, error=msg)
 
-    # Get S3 key
-    s3_key = _get_export_s3_key(ep_id, run_id, filename)
+    # Resolve S3 key layout (canonical preferred; legacy only if ep_id parsing fails).
+    layout = run_layout.get_run_s3_layout(ep_id, run_id)
+    cleaned_filename = (filename or "").strip().lstrip("/\\")
+    s3_key = f"{layout.write_prefix}exports/{cleaned_filename}"
     bucket = config.get("bucket")
+    legacy_key = f"{layout.legacy_prefix}exports/{cleaned_filename}"
+    if layout.s3_layout == "canonical" and legacy_key != s3_key:
+        # Guard: avoid double-writing into both canonical + legacy prefixes.
+        LOGGER.info(
+            "[export-s3] s3_layout=canonical key=%s legacy_suppressed=%s",
+            s3_key,
+            legacy_key,
+        )
+    elif layout.s3_layout == "legacy":
+        LOGGER.warning("[export-s3] s3_layout=legacy key=%s", s3_key)
 
     # Try to upload
     start_time = time.time()
@@ -3349,7 +3383,13 @@ def upload_export_to_s3(
         from apps.api.services.storage import StorageService
         storage = StorageService()
 
-        LOGGER.info("[export-s3] Uploading %s to s3://%s/%s (%d bytes)", filename, bucket, s3_key, len(file_bytes))
+        LOGGER.info(
+            "[export-s3] Uploading %s to s3://%s/%s (%d bytes)",
+            cleaned_filename,
+            bucket,
+            s3_key,
+            len(file_bytes),
+        )
 
         if not storage.upload_bytes(file_bytes, s3_key, content_type=content_type):
             msg = f"Upload failed for s3://{bucket}/{s3_key}"
@@ -3433,12 +3473,13 @@ def build_and_upload_debug_pdf(
             # Convert ExportUploadResult to ArtifactSyncResult-like object for write_export_index
             artifact_result = None
             if upload_result:
+                s3_layout = run_layout.get_run_s3_layout(ep_id, run_id)
                 artifact_result = ArtifactSyncResult(
                     success=upload_result.success,
                     uploaded_count=1 if upload_result.success else 0,
                     bytes_uploaded=upload_result.bytes_uploaded,
                     sync_time_ms=upload_result.upload_time_ms,
-                    s3_prefix=f"runs/{ep_id}/{run_id}/exports/",
+                    s3_prefix=f"{s3_layout.write_prefix}exports/",
                     s3_bucket=upload_result.s3_bucket,
                     errors=[upload_result.error] if upload_result.error else [],
                     uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],
@@ -3524,12 +3565,13 @@ def build_and_upload_debug_bundle(
             # Convert ExportUploadResult to ArtifactSyncResult-like object
             artifact_result = None
             if upload_result:
+                s3_layout = run_layout.get_run_s3_layout(ep_id, run_id)
                 artifact_result = ArtifactSyncResult(
                     success=upload_result.success,
                     uploaded_count=1 if upload_result.success else 0,
                     bytes_uploaded=upload_result.bytes_uploaded,
                     sync_time_ms=upload_result.upload_time_ms,
-                    s3_prefix=f"runs/{ep_id}/{run_id}/exports/",
+                    s3_prefix=f"{s3_layout.write_prefix}exports/",
                     s3_bucket=upload_result.s3_bucket,
                     errors=[upload_result.error] if upload_result.error else [],
                     uploaded_files=[upload_result.s3_key] if upload_result.s3_key else [],

@@ -202,7 +202,7 @@ class TestExportS3Key:
 
         key = _get_export_s3_key("rhoslc-s06e11", "abc123", "debug_report.pdf")
 
-        assert key == "runs/rhoslc-s06e11/abc123/exports/debug_report.pdf"
+        assert key == "runs/rhoslc/s06/e11/abc123/exports/debug_report.pdf"
 
     def test_export_s3_key_normalizes_run_id(self) -> None:
         """Test that S3 key normalizes run_id."""
@@ -216,7 +216,7 @@ class TestExportS3Key:
 
         # Key should contain the normalized run_id
         assert "exports/debug_bundle.zip" in key
-        assert "runs/demo-s01e01/" in key
+        assert "runs/demo/s01/e01/" in key
 
 
 class TestBundleStatus:
