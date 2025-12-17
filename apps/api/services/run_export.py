@@ -1080,7 +1080,7 @@ def build_screentime_run_debug_pdf(
     body_tracking_dir = run_root / "body_tracking"
     legacy_body_tracking_dir = manifests_root / "body_tracking"
 
-    # Load artifact paths
+    # Load artifact paths (local-first; optionally materialized from S3 in delete-local mode).
     detections_path = run_root / "detections.jsonl"
     tracks_path = run_root / "tracks.jsonl"
     faces_path = run_root / "faces.jsonl"
@@ -1101,9 +1101,62 @@ def build_screentime_run_debug_pdf(
         / "faces.npy"
     )
 
+    # If local run artifacts were deleted after S3 sync, hydrate allowlisted artifacts from S3
+    # so the PDF reflects the run-scoped state instead of reporting false "missing" signals.
+    # NOTE: download mtimes reflect hydration time, not artifact generation time.
+    hydrated_from_s3 = False
+    hydrated_paths: dict[str, Path] = {}
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        if any(not (run_root / filename).exists() for filename in run_layout.RUN_ARTIFACT_ALLOWLIST):
+            from apps.api.services.storage import StorageService
+
+            storage = StorageService()
+            if storage.s3_enabled():
+                temp_dir = tempfile.TemporaryDirectory(prefix="screenalytics_run_hydrate_")
+                hydrate_root = Path(temp_dir.name)
+
+                for filename in sorted(run_layout.RUN_ARTIFACT_ALLOWLIST):
+                    local_path = run_root / filename
+                    if local_path.exists():
+                        continue
+                    s3_key = run_layout.run_artifact_s3_key(ep_id, run_id_norm, filename)
+                    payload = storage.download_bytes(s3_key)
+                    if payload is None:
+                        continue
+                    dest_path = hydrate_root / filename
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    dest_path.write_bytes(payload)
+                    hydrated_paths[filename] = dest_path
+                    hydrated_from_s3 = True
+    except Exception as exc:
+        LOGGER.warning("[export] Failed to hydrate run artifacts from S3: %s", exc)
+
+    def _resolved_path(path: Path, rel_name: str) -> Path:
+        resolved = hydrated_paths.get(rel_name)
+        return resolved if resolved is not None else path
+
+    detections_path = _resolved_path(detections_path, "detections.jsonl")
+    tracks_path = _resolved_path(tracks_path, "tracks.jsonl")
+    faces_path = _resolved_path(faces_path, "faces.jsonl")
+    identities_path = _resolved_path(identities_path, "identities.json")
+    track_metrics_path = _resolved_path(track_metrics_path, "track_metrics.json")
+    cluster_centroids_path = _resolved_path(cluster_centroids_path, "cluster_centroids.json")
+    body_detections_path = _resolved_path(body_detections_path, "body_tracking/body_detections.jsonl")
+    body_tracks_path = _resolved_path(body_tracks_path, "body_tracking/body_tracks.jsonl")
+    track_fusion_path = _resolved_path(track_fusion_path, "body_tracking/track_fusion.json")
+    screentime_comparison_path = _resolved_path(
+        screentime_comparison_path,
+        "body_tracking/screentime_comparison.json",
+    )
+    # Keep downstream derived paths pointing at the resolved body_tracking directory.
+    body_tracking_dir = body_tracks_path.parent
+
     # Load JSON artifact data
-    identities_data = _read_json(identities_path) or {}
-    track_metrics_data = _read_json(track_metrics_path) or {}
+    identities_payload = _read_json(identities_path)
+    identities_data = identities_payload if isinstance(identities_payload, dict) else {}
+    track_metrics_payload = _read_json(track_metrics_path)
+    track_metrics_data = track_metrics_payload if isinstance(track_metrics_payload, dict) else {}
     track_fusion_data = _read_json(track_fusion_path) if track_fusion_path.exists() else None
     screentime_data = _read_json(screentime_comparison_path) if screentime_comparison_path.exists() else None
 
@@ -1269,6 +1322,15 @@ def build_screentime_run_debug_pdf(
     )
     story.append(summary_table)
     story.append(Spacer(1, 12))
+    if hydrated_from_s3:
+        story.append(
+            Paragraph(
+                "<b>Note:</b> Some run-scoped artifacts were loaded from S3 because local copies were missing "
+                "(commonly due to STORAGE_DELETE_LOCAL_AFTER_SYNC=1). File mtimes reflect hydration time.",
+                note_style,
+            )
+        )
+        story.append(Spacer(1, 8))
 
     # =========================================================================
     # RUN HEALTH (Quick Sanity Check)
@@ -1278,9 +1340,7 @@ def build_screentime_run_debug_pdf(
     # Run-scoped body artifacts (authoritative for this run_id).
     body_detect_count_run = _count_jsonl_lines_optional(body_detections_path)
     body_track_count_run = _count_jsonl_lines_optional(body_tracks_path)
-    body_detect_count_run_value = body_detect_count_run or 0
-    body_track_count_run_value = body_track_count_run or 0
-    body_artifacts_exist_run = body_detect_count_run_value > 0 or body_track_count_run_value > 0
+    body_artifacts_exist_run = body_detections_path.exists() and body_tracks_path.exists()
 
     # Legacy body artifacts (diagnostic only; promoted from some run_id).
     legacy_body_detections_path = legacy_body_tracking_dir / "body_detections.jsonl"
@@ -1296,25 +1356,26 @@ def build_screentime_run_debug_pdf(
         or legacy_screentime_comparison_path.exists()
     )
 
-    # Determine whether body tracking ran for this run_id from run-scoped markers/artifacts.
+    # Determine whether body tracking ran for this run_id.
+    # IMPORTANT: Do not treat legacy presence as evidence of run-scoped execution.
+    # Require the run-scoped artifacts to exist (even if empty).
     run_body_tracking_marker = _read_json(run_root / "body_tracking.json")
-    body_tracking_ran_effective = (
-        isinstance(run_body_tracking_marker, dict)
-        and run_body_tracking_marker.get("status") == "success"
-        and run_body_tracking_marker.get("run_id") == run_id_norm
-    ) or body_artifacts_exist_run
-    body_tracking_effective_source = "run marker" if isinstance(run_body_tracking_marker, dict) else "artifacts"
+    body_tracking_ran_effective = body_artifacts_exist_run
+    body_tracking_effective_source = "run artifacts" if body_artifacts_exist_run else "missing artifacts"
 
     # Legacy marker run_id (helps detect stale/out-of-scope body artifacts).
     legacy_body_marker = _read_json(manifests_root / "runs" / "body_tracking.json")
     legacy_body_marker_run_id = legacy_body_marker.get("run_id") if isinstance(legacy_body_marker, dict) else None
     legacy_body_same_run = legacy_body_marker_run_id == run_id_norm if legacy_body_marker_run_id else False
-    legacy_body_out_of_scope = legacy_body_artifacts_exist and not legacy_body_same_run and not body_artifacts_exist_run
+    # Legacy artifacts are always episode-level (not run-scoped). Treat as out-of-scope for this run_id,
+    # even when they were promoted from the same run, to avoid conflating legacy with run-scoped execution.
+    legacy_body_out_of_scope = legacy_body_artifacts_exist
+    legacy_body_only_present = legacy_body_artifacts_exist and not body_artifacts_exist_run
 
     override_source: str = "N/A"
     preset_name: str | None = None
     cli_command: str | None = None
-    if body_config_enabled != bool(body_tracking_ran_effective) or legacy_body_out_of_scope:
+    if body_config_enabled != bool(body_tracking_ran_effective) or legacy_body_only_present:
         override_source_hit: tuple[bool, str] | None = None
         for job_run in job_runs:
             if not isinstance(job_run, dict):
@@ -1505,7 +1566,7 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Run Health", subsection_style))
     story.append(health_table)
 
-    if body_config_enabled != bool(body_tracking_ran_effective) or legacy_body_out_of_scope:
+    if body_config_enabled != bool(body_tracking_ran_effective) or legacy_body_only_present:
         story.append(Paragraph(
             "⚠️ <b>Body Tracking Diagnostic:</b> body_tracking.enabled (YAML) does not match the effective run-scoped state "
             "or only legacy artifacts are present.",
@@ -1544,6 +1605,14 @@ def build_screentime_run_debug_pdf(
 
     # Executive summary stats
     identities_list = identities_data.get("identities", [])
+    if not isinstance(identities_list, list):
+        identities_list = []
+    identities_count_run = len(identities_list) if isinstance(identities_payload, dict) else None
+    identities_count_display = _format_optional_count(
+        identities_count_run,
+        path=identities_path,
+        label="identities.json",
+    )
     cluster_stats = identities_data.get("stats", {})
     metrics = track_metrics_data.get("metrics", {})
 
@@ -1570,7 +1639,7 @@ def build_screentime_run_debug_pdf(
         ["Metric", "Value"],
         ["Total Face Tracks", face_tracks_exec],
         ["Total Body Tracks", body_tracks_exec],
-        ["Face Clusters (identities.json)", str(len(identities_list))],
+        ["Face Clusters (identities.json)", identities_count_display],
         ["Tracked IDs (from fusion output)", tracked_ids_exec],
         ["Screen Time Gain (from comparison)", screentime_gain_exec],
     ]
@@ -1852,8 +1921,13 @@ def build_screentime_run_debug_pdf(
     # SECTION 1: FACE DETECT
     # =========================================================================
     story.append(Paragraph("1. Face Detect", section_style))
-    detect_count = _count_jsonl_lines(detections_path)
-    story.append(Paragraph(f"Total face detections: <b>{detect_count}</b>", body_style))
+    detect_count = _count_jsonl_lines_optional(detections_path)
+    detect_count_display = _format_optional_count(
+        detect_count,
+        path=detections_path,
+        label="detections.jsonl",
+    )
+    story.append(Paragraph(f"Total face detections: <b>{detect_count_display}</b>", body_style))
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (detection.yaml):", subsection_style))
@@ -1911,14 +1985,24 @@ def build_screentime_run_debug_pdf(
     story.append(detect_config_table)
 
     story.append(Paragraph("Artifacts:", subsection_style))
-    story.append(Paragraph(f"&bull; detections.jsonl ({_file_size_str(detections_path)}) - {detect_count} records", bullet_style))
+    story.append(
+        Paragraph(
+            f"&bull; detections.jsonl ({_file_size_str(detections_path)}) - {detect_count_display} records",
+            bullet_style,
+        )
+    )
 
     # =========================================================================
     # SECTION 2: FACE TRACK
     # =========================================================================
     story.append(Paragraph("2. Face Track", section_style))
-    track_count = _count_jsonl_lines(tracks_path)
-    story.append(Paragraph(f"Total face tracks: <b>{track_count}</b>", body_style))
+    track_count = _count_jsonl_lines_optional(tracks_path)
+    track_count_display = _format_optional_count(
+        track_count,
+        path=tracks_path,
+        label="tracks.jsonl",
+    )
+    story.append(Paragraph(f"Total face tracks: <b>{track_count_display}</b>", body_style))
 
     track_stats = [
         ["Metric", "Value"],
@@ -2006,28 +2090,45 @@ def build_screentime_run_debug_pdf(
     story.append(track_config_table)
 
     story.append(Paragraph("Artifacts:", subsection_style))
-    story.append(Paragraph(f"&bull; tracks.jsonl ({_file_size_str(tracks_path)}) - {track_count} records", bullet_style))
+    story.append(
+        Paragraph(
+            f"&bull; tracks.jsonl ({_file_size_str(tracks_path)}) - {track_count_display} records",
+            bullet_style,
+        )
+    )
     story.append(Paragraph(f"&bull; track_metrics.json ({_file_size_str(track_metrics_path)})", bullet_style))
 
     # =========================================================================
     # SECTION 3: FACE HARVEST / EMBED
     # =========================================================================
     story.append(Paragraph("3. Face Harvest / Embed", section_style))
-    faces_count = _count_jsonl_lines(faces_path)
-    aligned_count = _count_jsonl_lines(face_alignment_path)
+    faces_count = _count_jsonl_lines_optional(faces_path)
+    aligned_count = _count_jsonl_lines_optional(face_alignment_path)
+    faces_count_display = _format_optional_count(
+        faces_count,
+        path=faces_path,
+        label="faces.jsonl",
+    )
+    aligned_count_display = _format_optional_count(
+        aligned_count,
+        path=face_alignment_path,
+        label="face_alignment/aligned_faces.jsonl",
+    )
 
-    story.append(Paragraph(f"Harvested faces: <b>{faces_count}</b>", body_style))
-    story.append(Paragraph(f"Aligned faces: <b>{aligned_count}</b>", body_style))
+    story.append(Paragraph(f"Harvested faces: <b>{faces_count_display}</b>", body_style))
+    story.append(Paragraph(f"Aligned faces: <b>{aligned_count_display}</b>", body_style))
 
     # Diagnostic for alignment drop
-    if faces_count > 0 and aligned_count > 0:
+    if isinstance(faces_count, int) and isinstance(aligned_count, int) and faces_count > 0 and aligned_count > 0:
         alignment_rate = aligned_count / faces_count * 100
         if alignment_rate < 70:
-            story.append(Paragraph(
-                f"⚠️ Low alignment rate ({alignment_rate:.1f}%): Many faces rejected by quality gating. "
-                "Consider lowering face_alignment.min_alignment_quality in embedding.yaml.",
-                warning_style
-            ))
+            story.append(
+                Paragraph(
+                    f"⚠️ Low alignment rate ({alignment_rate:.1f}%): Many faces rejected by quality gating. "
+                    "Consider lowering face_alignment.min_alignment_quality in embedding.yaml.",
+                    warning_style,
+                )
+            )
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (embedding.yaml):", subsection_style))
@@ -2065,8 +2166,18 @@ def build_screentime_run_debug_pdf(
     story.append(embed_config_table)
 
     story.append(Paragraph("Artifacts:", subsection_style))
-    story.append(Paragraph(f"&bull; faces.jsonl ({_file_size_str(faces_path)}) - {faces_count} records", bullet_style))
-    story.append(Paragraph(f"&bull; face_alignment/aligned_faces.jsonl ({_file_size_str(face_alignment_path)}) - {aligned_count} records", bullet_style))
+    story.append(
+        Paragraph(
+            f"&bull; faces.jsonl ({_file_size_str(faces_path)}) - {faces_count_display} records",
+            bullet_style,
+        )
+    )
+    story.append(
+        Paragraph(
+            f"&bull; face_alignment/aligned_faces.jsonl ({_file_size_str(face_alignment_path)}) - {aligned_count_display} records",
+            bullet_style,
+        )
+    )
     story.append(Paragraph(f"&bull; faces.npy ({_file_size_str(faces_npy)})", bullet_style))
 
     # =========================================================================
@@ -2468,7 +2579,7 @@ def build_screentime_run_debug_pdf(
 
     cluster_table_data = [
         _wrap_row(["Metric", "Value", "Notes"]),
-        _wrap_row(["Clusters (identities)", str(len(identities_list)), "Unique identity groups"]),
+        _wrap_row(["Clusters (identities)", identities_count_display, "Unique identity groups"]),
         _wrap_row(["Total Faces in Clusters", str(cluster_stats.get("faces", 0)), "Sum of face samples"]),
         _wrap_row(["Singleton Clusters", str(singleton_count), f"{singleton_frac:.1%} of total"]),
         _wrap_row(["Mixed Tracks", str(cluster_stats.get("mixed_tracks", 0)), "Tracks with multiple people (error)"]),
@@ -2560,14 +2671,34 @@ def build_screentime_run_debug_pdf(
     ))
 
     story.append(Paragraph("Artifacts:", subsection_style))
-    story.append(Paragraph(f"&bull; identities.json ({_file_size_str(identities_path)}) - {len(identities_list)} identities", bullet_style))
+    story.append(
+        Paragraph(
+            f"&bull; identities.json ({_file_size_str(identities_path)}) - {identities_count_display} identities",
+            bullet_style,
+        )
+    )
     story.append(Paragraph(f"&bull; cluster_centroids.json ({_file_size_str(cluster_centroids_path)})", bullet_style))
 
     # =========================================================================
     # SECTION 8: FACES REVIEW (DB State)
     # =========================================================================
     story.append(Paragraph("8. Faces Review (DB State)", section_style))
-    assigned_count = sum(1 for i in identities_list if i.get("person_id"))
+    assigned_count = sum(1 for identity in identities_list if identity.get("person_id")) if identities_count_run is not None else None
+    assigned_count_display = _format_optional_count(
+        assigned_count,
+        path=identities_path,
+        label="identities.json",
+    )
+    unassigned_count = (
+        (identities_count_run - assigned_count)
+        if identities_count_run is not None and isinstance(assigned_count, int)
+        else None
+    )
+    unassigned_count_display = _format_optional_count(
+        unassigned_count,
+        path=identities_path,
+        label="identities.json",
+    )
 
     # Show "unavailable" for DB-sourced data when DB is not connected
     if db_error:
@@ -2578,10 +2709,10 @@ def build_screentime_run_debug_pdf(
 
     review_stats = [
         ["Metric", "Value"],
-        ["Total Identities", str(len(identities_list))],
-        ["Assigned to Cast", str(assigned_count)],
+        ["Total Identities", identities_count_display],
+        ["Assigned to Cast", assigned_count_display],
         ["Locked Identities", locked_count_str],
-        ["Unassigned", str(len(identities_list) - assigned_count)],
+        ["Unassigned", unassigned_count_display],
     ]
     review_table = Table(review_stats, colWidths=[2 * inch, 2 * inch])
     review_table.setStyle(
@@ -2848,7 +2979,13 @@ def build_screentime_run_debug_pdf(
     tuning_suggestions: list[tuple[str, str, str]] = []
 
     # Detection tuning
-    if detect_count == 0:
+    if detect_count is None:
+        tuning_suggestions.append((
+            "Face Detection",
+            "detections.jsonl missing or unreadable",
+            "Rerun detect/track or verify run-scoped artifacts are present in S3 (runs/.../{run_id}/detections.jsonl)",
+        ))
+    elif detect_count == 0:
         tuning_suggestions.append((
             "Face Detection",
             "No detections found",
@@ -2876,7 +3013,7 @@ def build_screentime_run_debug_pdf(
         ))
 
     # Embedding tuning
-    if faces_count > 0 and aligned_count > 0:
+    if isinstance(faces_count, int) and isinstance(aligned_count, int) and faces_count > 0 and aligned_count > 0:
         alignment_rate = aligned_count / faces_count * 100
         if alignment_rate < 70:
             tuning_suggestions.append((
@@ -2961,13 +3098,13 @@ def build_screentime_run_debug_pdf(
     # If a file is missing, "In Bundle" shows "N/A" (nothing to include)
     artifact_data = [
         ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
-        (*_artifact_row(detections_path), str(detect_count), "Face Detect", _bundle_status(detections_path, in_allowlist=True)),
-        (*_artifact_row(tracks_path), str(track_count), "Face Track", _bundle_status(tracks_path, in_allowlist=True)),
+        (*_artifact_row(detections_path), detect_count_display, "Face Detect", _bundle_status(detections_path, in_allowlist=True)),
+        (*_artifact_row(tracks_path), track_count_display, "Face Track", _bundle_status(tracks_path, in_allowlist=True)),
         (*_artifact_row(track_metrics_path), "-", "Face Track", _bundle_status(track_metrics_path, in_allowlist=True)),
-        (*_artifact_row(faces_path), str(faces_count), "Face Harvest", _bundle_status(faces_path, in_allowlist=True)),
-        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed", _bundle_status(face_alignment_path, in_allowlist=False)),
+        (*_artifact_row(faces_path), faces_count_display, "Face Harvest", _bundle_status(faces_path, in_allowlist=True)),
+        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), aligned_count_display, "Face Embed", _bundle_status(face_alignment_path, in_allowlist=False)),
         (*_artifact_row(faces_npy), "-", "Face Embed", _bundle_status(faces_npy, in_allowlist=False)),
-        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster", _bundle_status(identities_path, in_allowlist=True)),
+        (*_artifact_row(identities_path), identities_count_display, "Cluster", _bundle_status(identities_path, in_allowlist=True)),
         (*_artifact_row(cluster_centroids_path), "-", "Cluster", _bundle_status(cluster_centroids_path, in_allowlist=True)),
         (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect", _bundle_status(body_detections_path, in_allowlist=True)),
         (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track", _bundle_status(body_tracks_path, in_allowlist=True)),
@@ -3033,9 +3170,13 @@ def build_screentime_run_debug_pdf(
         story.append(Paragraph("No legacy body_tracking artifacts found.", note_style))
 
     # Build PDF
-    doc.build(story)
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
+    try:
+        doc.build(story)
+        pdf_bytes = buffer.getvalue()
+    finally:
+        buffer.close()
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
     download_name = f"screenalytics_{ep_id}_{run_id_norm}_debug_report.pdf"
     return pdf_bytes, download_name
