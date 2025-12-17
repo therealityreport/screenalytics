@@ -388,7 +388,7 @@ def sync_run_artifacts_to_s3(
 
             # Clean up empty directories
             run_root = run_layout.run_root(ep_id, run_id)
-            for subdir in ["body_tracking"]:
+            for subdir in ["body_tracking", "face_alignment"]:
                 subdir_path = run_root / subdir
                 if subdir_path.exists() and subdir_path.is_dir():
                     try:
@@ -624,6 +624,20 @@ def write_export_index(
         "export_type": export_type,
         "export_bytes": export_bytes,
     }
+
+    # Record the resolved S3 layout/prefixes so exports can be traced even when local
+    # run artifacts were deleted after sync (S3-first mode).
+    try:
+        layout = run_layout.get_run_s3_layout(ep_id, run_id)
+        index_data["run_s3"] = {
+            "layout": layout.s3_layout,
+            "write_prefix": layout.write_prefix,
+            "canonical_prefix": layout.canonical_prefix,
+            "legacy_prefix": layout.legacy_prefix,
+        }
+        index_data["exports_s3_prefix"] = f"{layout.write_prefix}exports/"
+    except Exception as exc:
+        index_data["run_s3_error"] = str(exc)
 
     if export_key:
         index_data["export_s3_key"] = export_key

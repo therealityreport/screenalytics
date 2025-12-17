@@ -6432,13 +6432,67 @@ def _maybe_run_body_tracking(
         tracks_path = runner.run_tracking()
 
         embeddings_path: Path | None = None
-        if getattr(runner.config, "reid_enabled", False):
+        embeddings_note: str | None = None
+        reid_enabled = bool(getattr(runner.config, "reid_enabled", False))
+        if reid_enabled:
             try:
                 embeddings_path = runner.run_embedding()
             except ImportError as exc:
+                embeddings_note = f"import_error: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", exc)
             except Exception as exc:
+                embeddings_note = f"error: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", exc)
+        else:
+            embeddings_note = "disabled"
+
+        # Always materialize placeholder embedding artifacts so run-scoped bundles are consistent.
+        # Fusion can still proceed without embeddings; empty arrays safely no-op the Re-ID path.
+        if embeddings_path is None:
+            embeddings_path = runner.embeddings_path
+        if not embeddings_path.exists():
+            try:
+                dim_raw = getattr(runner.config, "reid_embedding_dim", 256)
+                dim = max(int(dim_raw) if dim_raw is not None else 256, 1)
+            except (TypeError, ValueError):
+                dim = 256
+            try:
+                np.save(embeddings_path, np.zeros((0, dim), dtype=np.float32))
+            except Exception as exc:
+                LOGGER.warning("[body_tracking] Failed to write placeholder body_embeddings.npy: %s", exc)
+        if not runner.embeddings_meta_path.exists():
+            try:
+                meta = {
+                    "embedding_dim": None,
+                    "model_name": getattr(runner.config, "reid_model", None),
+                    "num_embeddings": 0,
+                    "entries": [],
+                    "reid_enabled": reid_enabled,
+                    "note": embeddings_note,
+                }
+                runner.embeddings_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            except Exception as exc:
+                LOGGER.warning("[body_tracking] Failed to write placeholder body_embeddings_meta.json: %s", exc)
+
+        # Emit a lightweight metrics artifact (allowlisted for run-scoped S3 sync).
+        if not runner.metrics_path.exists():
+            try:
+                metrics_payload = {
+                    "episode_id": ep_id,
+                    "generated_at": _utcnow_iso(),
+                    "output_dir": str(output_dir),
+                    "reid_enabled": reid_enabled,
+                    "reid_note": embeddings_note,
+                    "artifacts": {
+                        "body_detections": str(det_path),
+                        "body_tracks": str(tracks_path),
+                        "body_embeddings": str(embeddings_path),
+                        "body_embeddings_meta": str(runner.embeddings_meta_path),
+                    },
+                }
+                runner.metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+            except Exception as exc:
+                LOGGER.warning("[body_tracking] Failed to write body_metrics.json: %s", exc)
 
         if run_id:
             promote = [
@@ -6460,7 +6514,8 @@ def _maybe_run_body_tracking(
             "run_id": effective_run_id,
             "started_at": started_at,
             "finished_at": _utcnow_iso(),
-            "reid_enabled": bool(getattr(runner.config, "reid_enabled", False)),
+            "reid_enabled": reid_enabled,
+            "reid_note": embeddings_note,
             "artifacts": {
                 "local": {
                     "body_tracking_dir": str(output_dir),
@@ -6470,6 +6525,7 @@ def _maybe_run_body_tracking(
                     "body_embeddings_meta": (
                         str(runner.embeddings_meta_path) if runner.embeddings_meta_path.exists() else None
                     ),
+                    "body_metrics": str(runner.metrics_path) if runner.metrics_path.exists() else None,
                 }
             },
         }
@@ -6558,6 +6614,7 @@ def _maybe_run_body_tracking_fusion(
             # Fusion/comparison do not require the video, but the runner resolves it eagerly.
             video_path=get_path(ep_id, "video"),
             output_dir=output_dir,
+            manifests_dir=manifests_dir,
             skip_existing=True,
         )
 

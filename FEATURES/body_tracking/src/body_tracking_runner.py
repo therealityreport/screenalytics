@@ -143,6 +143,7 @@ class BodyTrackingRunner:
         fusion_config_path: Optional[Path] = None,
         video_path: Optional[Path] = None,
         output_dir: Optional[Path] = None,
+        manifests_dir: Optional[Path] = None,
         device: Optional[str] = None,
         batch_size: Optional[int] = None,
         skip_existing: bool = False,
@@ -169,8 +170,19 @@ class BodyTrackingRunner:
         if batch_size:
             self.config.detection_batch_size = batch_size
 
-        # Set up paths
-        self.output_dir = output_dir or Path(f"data/manifests/{episode_id}/body_tracking")
+        # Resolve canonical manifests directory (respects SCREENALYTICS_DATA_ROOT when available).
+        if manifests_dir is not None:
+            self.manifests_dir = Path(manifests_dir)
+        else:
+            try:
+                from py_screenalytics.artifacts import get_path  # type: ignore
+
+                self.manifests_dir = get_path(episode_id, "detections").parent
+            except Exception:
+                self.manifests_dir = Path(f"data/manifests/{episode_id}")
+
+        # Set up output paths (default to episode manifests/body_tracking).
+        self.output_dir = output_dir or (self.manifests_dir / "body_tracking")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve video path
@@ -337,8 +349,8 @@ class BodyTrackingRunner:
         if not self.tracks_path.exists():
             self.run_tracking()
 
-        # Check for face tracks
-        face_tracks_path = Path(f"data/manifests/{self.episode_id}/faces.jsonl")
+        # Check for face tracks (run-scoped when manifests_dir points at a run root).
+        face_tracks_path = self.manifests_dir / "faces.jsonl"
         if not face_tracks_path.exists():
             logger.warning(f"Face tracks not found at {face_tracks_path}")
             logger.warning("Fusion requires face tracks. Skipping fusion stage.")
@@ -382,8 +394,8 @@ class BodyTrackingRunner:
         if not self.fusion_path.exists():
             self.run_fusion()
 
-        # Check for identities
-        identities_path = Path(f"data/manifests/{self.episode_id}/identities.json")
+        # Check for identities (run-scoped when manifests_dir points at a run root).
+        identities_path = self.manifests_dir / "identities.json"
         if not identities_path.exists():
             logger.warning(f"Identities not found at {identities_path}")
             logger.warning("Comparison requires identities. Skipping comparison stage.")

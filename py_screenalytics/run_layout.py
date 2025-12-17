@@ -15,6 +15,7 @@ existing call sites remain backward compatible.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ RUNS_SUBDIR = "runs"
 ACTIVE_RUN_FILENAME = "active_run.json"
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+LOGGER = logging.getLogger(__name__)
 
 
 def generate_run_id() -> str:
@@ -160,34 +163,121 @@ def as_run_paths(ep_id: str, run_id: str) -> RunPaths:
 # S3 Key Generation for Run Artifacts
 # =============================================================================
 
-def _parse_ep_id(ep_id: str) -> tuple[str, int, int]:
-    """Parse ep_id into (show, season, episode) components.
+@dataclass(frozen=True)
+class EpisodeRouting:
+    """Parsed routing fields derived from an episode id (ep_id)."""
+
+    show: str
+    season: int
+    episode: int
+
+
+def parse_episode_routing(ep_id: str) -> EpisodeRouting | None:
+    """Parse ep_id into routing fields.
 
     Examples:
-        'rhoslc-s06e11' -> ('rhoslc', 6, 11)
-        'demo-s01e01' -> ('demo', 1, 1)
+        'rhoslc-s06e11' -> EpisodeRouting(show='rhoslc', season=6, episode=11)
+        'demo-s01e01' -> EpisodeRouting(show='demo', season=1, episode=1)
     """
-    import re
-    match = re.match(r"^(.+)-s(\d+)e(\d+)$", ep_id, re.IGNORECASE)
+    match = re.match(r"^(.+)-s(\d+)e(\d+)$", (ep_id or "").strip(), re.IGNORECASE)
     if not match:
-        # Fallback: use ep_id as show, season/episode as 0
-        return (ep_id, 0, 0)
-    show, season, episode = match.groups()
-    return (show, int(season), int(episode))
+        return None
+    show, season_raw, episode_raw = match.groups()
+    try:
+        season = int(season_raw)
+        episode = int(episode_raw)
+    except ValueError:
+        return None
+    return EpisodeRouting(show=show, season=season, episode=episode)
+
+
+@dataclass(frozen=True)
+class RunS3Layout:
+    """Resolved S3 layout for a run, with canonical + legacy prefixes."""
+
+    ep_id: str
+    run_id: str
+    s3_layout: str
+    """One of: 'canonical' | 'legacy'."""
+
+    write_prefix: str
+    """Prefix used for NEW writes."""
+
+    canonical_prefix: str | None
+    """Canonical prefix (if ep_id parsed), else None."""
+
+    legacy_prefix: str
+    """Legacy prefix (runs/{ep_id}/{run_id}/) - always available for reads/migration."""
+
+    routing: EpisodeRouting | None = None
+    """Parsed routing fields when canonical layout is available."""
+
+
+def legacy_run_s3_prefix(ep_id: str, run_id: str) -> str:
+    """Legacy run prefix: runs/{ep_id}/{run_id}/."""
+    run_id_norm = normalize_run_id(run_id)
+    cleaned_ep_id = (ep_id or "").strip().lstrip("/\\")
+    return f"runs/{cleaned_ep_id}/{run_id_norm}/"
+
+
+def get_run_s3_layout(ep_id: str, run_id: str) -> RunS3Layout:
+    """Resolve canonical vs legacy S3 layout for a run.
+
+    Canonical layout (preferred for all new writes):
+        runs/{show}/s{ss}/e{ee}/{run_id}/
+
+    Legacy layout (backward-compatible reads / migration only):
+        runs/{ep_id}/{run_id}/
+    """
+    run_id_norm = normalize_run_id(run_id)
+    legacy_prefix = legacy_run_s3_prefix(ep_id, run_id_norm)
+    routing = parse_episode_routing(ep_id)
+    if routing is None:
+        LOGGER.warning(
+            "[run-layout] Unable to parse ep_id=%r; using legacy run prefix for S3 writes (s3_layout=legacy)",
+            ep_id,
+        )
+        return RunS3Layout(
+            ep_id=ep_id,
+            run_id=run_id_norm,
+            s3_layout="legacy",
+            write_prefix=legacy_prefix,
+            canonical_prefix=None,
+            legacy_prefix=legacy_prefix,
+            routing=None,
+        )
+    canonical_prefix = f"runs/{routing.show}/s{routing.season:02d}/e{routing.episode:02d}/{run_id_norm}/"
+    return RunS3Layout(
+        ep_id=ep_id,
+        run_id=run_id_norm,
+        s3_layout="canonical",
+        write_prefix=canonical_prefix,
+        canonical_prefix=canonical_prefix,
+        legacy_prefix=legacy_prefix,
+        routing=routing,
+    )
 
 
 def run_s3_prefix(ep_id: str, run_id: str) -> str:
     """Generate S3 prefix for run-scoped artifacts.
 
-    Format: runs/{show}/s{ss}/e{ee}/{run_id}/
+    Canonical format (preferred for all new writes):
+        runs/{show}/s{ss}/e{ee}/{run_id}/
+
+    If ep_id parsing fails, falls back to the legacy prefix:
+        runs/{ep_id}/{run_id}/
 
     Examples:
         run_s3_prefix('rhoslc-s06e11', 'abc123')
         -> 'runs/rhoslc/s06/e11/abc123/'
     """
-    show, season, episode = _parse_ep_id(ep_id)
-    run_id_norm = normalize_run_id(run_id)
-    return f"runs/{show}/s{season:02d}/e{episode:02d}/{run_id_norm}/"
+    return get_run_s3_layout(ep_id, run_id).write_prefix
+
+
+def canonical_run_s3_prefix(ep_id: str, run_id: str) -> str | None:
+    """Return the canonical run prefix if ep_id parses, else None."""
+    layout = get_run_s3_layout(ep_id, run_id)
+    return layout.canonical_prefix
 
 
 def run_artifact_s3_key(ep_id: str, run_id: str, filename: str) -> str:
@@ -216,6 +306,38 @@ def run_export_s3_key(ep_id: str, run_id: str, filename: str) -> str:
     return f"{prefix}exports/{cleaned}"
 
 
+def run_artifact_s3_keys_for_read(ep_id: str, run_id: str, filename: str) -> list[str]:
+    """Return S3 keys to try when reading a run artifact (canonical first, then legacy)."""
+    layout = get_run_s3_layout(ep_id, run_id)
+    cleaned = (filename or "").strip().lstrip("/\\")
+    if not cleaned:
+        raise ValueError("filename must be non-empty")
+    keys: list[str] = []
+    canonical = layout.canonical_prefix
+    if canonical is not None:
+        keys.append(f"{canonical}{cleaned}")
+    legacy = f"{layout.legacy_prefix}{cleaned}"
+    if not keys or keys[-1] != legacy:
+        keys.append(legacy)
+    return keys
+
+
+def run_export_s3_keys_for_read(ep_id: str, run_id: str, filename: str) -> list[str]:
+    """Return S3 keys to try when reading a run export (canonical first, then legacy)."""
+    layout = get_run_s3_layout(ep_id, run_id)
+    cleaned = (filename or "").strip().lstrip("/\\")
+    if not cleaned:
+        raise ValueError("filename must be non-empty")
+    keys: list[str] = []
+    canonical = layout.canonical_prefix
+    if canonical is not None:
+        keys.append(f"{canonical}exports/{cleaned}")
+    legacy = f"{layout.legacy_prefix}exports/{cleaned}"
+    if not keys or keys[-1] != legacy:
+        keys.append(legacy)
+    return keys
+
+
 # =============================================================================
 # Run Artifact Manifest (list of expected artifacts per run)
 # =============================================================================
@@ -231,8 +353,11 @@ RUN_ARTIFACT_ALLOWLIST = frozenset({
     "track_metrics.json",
     "track_reps.jsonl",
     "detect_track.json",
-    "embed.json",
+    "faces_embed.json",
     "cluster.json",
+    "body_tracking.json",
+    "body_tracking_fusion.json",
+    "face_alignment/aligned_faces.jsonl",
     # Body tracking artifacts
     "body_tracking/body_detections.jsonl",
     "body_tracking/body_tracks.jsonl",
@@ -261,4 +386,3 @@ def list_run_artifacts(ep_id: str, run_id: str) -> list[tuple[Path, str]]:
             s3_key = run_artifact_s3_key(ep_id, run_id, filename)
             artifacts.append((local_path, s3_key))
     return artifacts
-

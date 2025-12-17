@@ -2377,8 +2377,12 @@ def export_run_debug_bundle(
     """Export a run debug report (PDF) or raw bundle (ZIP).
 
     When S3 storage is configured, exports are automatically uploaded to:
-    - runs/{ep_id}/{run_id}/exports/debug_report.pdf (for PDF)
-    - runs/{ep_id}/{run_id}/exports/debug_bundle.zip (for ZIP)
+    - runs/{show}/s{ss}/e{ee}/{run_id}/exports/debug_report.pdf (for PDF, canonical)
+    - runs/{show}/s{ss}/e{ee}/{run_id}/exports/debug_bundle.zip (for ZIP, canonical)
+
+    If the episode id cannot be parsed into {show, season, episode}, exports fall back to the
+    legacy layout:
+    - runs/{ep_id}/{run_id}/exports/...
 
     S3 upload status is included in response headers:
     - X-S3-Upload-Attempted: true/false (whether S3 upload was attempted)
