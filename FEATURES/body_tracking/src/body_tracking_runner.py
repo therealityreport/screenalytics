@@ -394,11 +394,11 @@ class BodyTrackingRunner:
         if not self.fusion_path.exists():
             self.run_fusion()
 
-        # Check for identities (run-scoped when manifests_dir points at a run root).
-        identities_path = self.manifests_dir / "identities.json"
-        if not identities_path.exists():
-            logger.warning(f"Identities not found at {identities_path}")
-            logger.warning("Comparison requires identities. Skipping comparison stage.")
+        # Comparison uses run-scoped face detections (faces.jsonl) + body tracks + fusion output.
+        faces_path = self.manifests_dir / "faces.jsonl"
+        if not faces_path.exists():
+            logger.warning(f"Face detections not found at {faces_path}")
+            logger.warning("Comparison requires faces.jsonl. Skipping comparison stage.")
             return self.comparison_path
 
         logger.info("[STAGE] Screen-time Comparison")
@@ -410,7 +410,7 @@ class BodyTrackingRunner:
 
         compare_screen_time(
             comparator=comparator,
-            identities_path=identities_path,
+            faces_path=faces_path,
             fusion_path=self.fusion_path,
             output_path=self.comparison_path,
         )

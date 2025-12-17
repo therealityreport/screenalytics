@@ -6557,7 +6557,6 @@ def _maybe_run_body_tracking_fusion(
     This should be called AFTER cluster stage completes, since fusion requires:
     - body_tracks.jsonl (from detect_track body_tracking)
     - faces.jsonl (from faces_embed)
-    - identities.json (from cluster)
 
     Returns payload dict on success/error, None if skipped (disabled or missing prereqs).
     """
@@ -6571,7 +6570,6 @@ def _maybe_run_body_tracking_fusion(
     manifests_dir = _manifests_dir_for_run(ep_id, run_id)
     body_tracks_path = manifests_dir / "body_tracking" / "body_tracks.jsonl"
     faces_path = manifests_dir / "faces.jsonl"
-    identities_path = manifests_dir / "identities.json"
 
     if not body_tracks_path.exists():
         LOGGER.debug("[body_tracking_fusion] body_tracks.jsonl not found, skipping fusion")
@@ -6624,14 +6622,11 @@ def _maybe_run_body_tracking_fusion(
 
         # Run comparison (calculates face-only vs face+body screen time)
         comparison_path: Path | None = None
-        if identities_path.exists():
-            try:
-                comparison_path = runner.run_comparison()
-                LOGGER.info("[body_tracking_fusion] Comparison complete: %s", comparison_path)
-            except Exception as exc:
-                LOGGER.warning("[body_tracking_fusion] Comparison failed: %s", exc)
-        else:
-            LOGGER.debug("[body_tracking_fusion] identities.json not found, skipping comparison")
+        try:
+            comparison_path = runner.run_comparison()
+            LOGGER.info("[body_tracking_fusion] Comparison complete: %s", comparison_path)
+        except Exception as exc:
+            LOGGER.warning("[body_tracking_fusion] Comparison failed: %s", exc)
 
         # Promote artifacts to root manifests dir
         if run_id:

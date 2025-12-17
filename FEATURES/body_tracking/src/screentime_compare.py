@@ -63,6 +63,14 @@ class ScreenTimeBreakdown:
     combined_frames: int = 0
     combined_segments: List[TimeSegment] = field(default_factory=list)
 
+    # Absolute body metrics (includes frames where face is visible)
+    body_total_duration: float = 0.0
+    body_total_frames: int = 0
+
+    # Overlap between face and body visibility
+    fused_duration: float = 0.0
+    fused_frames: int = 0
+
     # Breakdown
     face_visible_duration: float = 0.0
     body_only_duration: float = 0.0
@@ -83,6 +91,14 @@ class ScreenTimeBreakdown:
                 "duration": round(self.combined_duration, 3),
                 "frames": self.combined_frames,
                 "segment_count": len(self.combined_segments),
+            },
+            "body_total": {
+                "duration": round(self.body_total_duration, 3),
+                "frames": self.body_total_frames,
+            },
+            "fused": {
+                "duration": round(self.fused_duration, 3),
+                "frames": self.fused_frames,
             },
             "breakdown": {
                 "face_visible_duration": round(self.face_visible_duration, 3),
@@ -106,6 +122,8 @@ class ComparisonSummary:
     total_face_only_duration: float = 0.0
     total_combined_duration: float = 0.0
     total_duration_gain: float = 0.0
+    total_body_duration: float = 0.0
+    total_fused_duration: float = 0.0
     avg_duration_gain_pct: float = 0.0
 
     # Per-identity breakdowns
@@ -117,8 +135,15 @@ class ComparisonSummary:
                 "total_identities": self.total_identities,
                 "identities_with_gain": self.identities_with_gain,
                 "total_face_only_duration": round(self.total_face_only_duration, 3),
+                "face_total_s": round(self.total_face_only_duration, 3),
+                "total_body_duration": round(self.total_body_duration, 3),
+                "body_total_s": round(self.total_body_duration, 3),
+                "total_fused_duration": round(self.total_fused_duration, 3),
+                "fused_total_s": round(self.total_fused_duration, 3),
                 "total_combined_duration": round(self.total_combined_duration, 3),
+                "combined_total_s": round(self.total_combined_duration, 3),
                 "total_duration_gain": round(self.total_duration_gain, 3),
+                "gain_total_s": round(self.total_duration_gain, 3),
                 "avg_duration_gain_pct": round(self.avg_duration_gain_pct, 2),
             },
             "breakdowns": [b.to_dict() for b in self.breakdowns],
@@ -216,11 +241,22 @@ class ScreenTimeComparator:
         """Compute screen time breakdown for a single identity."""
         face_set = set(face_frames)
         body_set = set(body_frames)
+        overlap_frames = face_set & body_set
 
         # Face-only metrics
         face_only_segments = self._frames_to_segments(list(face_set), "face")
         face_only_segments = self._merge_segments(face_only_segments)
         face_only_duration = sum(s.duration for s in face_only_segments)
+
+        # Body absolute metrics
+        body_total_segments = self._frames_to_segments(list(body_set), "body")
+        body_total_segments = self._merge_segments(body_total_segments)
+        body_total_duration = sum(s.duration for s in body_total_segments)
+
+        # Overlap (face ∩ body)
+        fused_segments = self._frames_to_segments(list(overlap_frames), "both")
+        fused_segments = self._merge_segments(fused_segments)
+        fused_duration = sum(s.duration for s in fused_segments)
 
         # Combined metrics
         combined_frames = face_set | body_set
@@ -251,6 +287,10 @@ class ScreenTimeComparator:
             combined_duration=combined_duration,
             combined_frames=len(combined_frames),
             combined_segments=combined_segments,
+            body_total_duration=body_total_duration,
+            body_total_frames=len(body_set),
+            fused_duration=fused_duration,
+            fused_frames=len(overlap_frames),
             face_visible_duration=face_only_duration,
             body_only_duration=body_only_duration,
             duration_gain=duration_gain,
@@ -299,6 +339,8 @@ class ScreenTimeComparator:
             total_identities=len(breakdowns),
             identities_with_gain=sum(1 for b in breakdowns if b.duration_gain > 0),
             total_face_only_duration=sum(b.face_only_duration for b in breakdowns),
+            total_body_duration=sum(b.body_total_duration for b in breakdowns),
+            total_fused_duration=sum(b.fused_duration for b in breakdowns),
             total_combined_duration=sum(b.combined_duration for b in breakdowns),
             total_duration_gain=sum(b.duration_gain for b in breakdowns),
             breakdowns=breakdowns,
@@ -313,7 +355,7 @@ class ScreenTimeComparator:
 
 def compare_screen_time(
     comparator: ScreenTimeComparator,
-    identities_path: Path,
+    faces_path: Path,
     fusion_path: Path,
     output_path: Path,
 ) -> ComparisonSummary:
@@ -322,14 +364,13 @@ def compare_screen_time(
 
     Args:
         comparator: ScreenTimeComparator instance
-        identities_path: Path to episode identities.json
+        faces_path: Path to faces.jsonl (face detections with track_id + frame_idx)
         fusion_path: Path to track_fusion.json
         output_path: Path to output comparison JSON
 
     Returns:
         ComparisonSummary
     """
-    identities_path = Path(identities_path)
     fusion_path = Path(fusion_path)
     output_path = Path(output_path)
 
@@ -341,20 +382,24 @@ def compare_screen_time(
     fused_identities = fusion_data.get("identities", {})
     logger.info(f"Loaded {len(fused_identities)} fused identities")
 
-    # Load original identities for face track mapping
-    logger.info(f"Loading identities from: {identities_path}")
-    with open(identities_path) as f:
-        identities_data = json.load(f)
-
-    # Build face tracks dict from identities
+    faces_path = Path(faces_path)
     face_tracks: Dict[int, dict] = {}
-    for identity in identities_data.get("identities", []):
-        for track in identity.get("tracks", []):
-            track_id = track.get("track_id")
-            if track_id is not None:
-                face_tracks[track_id] = track
-
-    logger.info(f"Loaded {len(face_tracks)} face tracks")
+    logger.info(f"Loading face detections from: {faces_path}")
+    if faces_path.exists():
+        with faces_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                face = json.loads(line)
+                track_id = face.get("track_id")
+                frame_idx = face.get("frame_idx")
+                if track_id is None or frame_idx is None:
+                    continue
+                if track_id not in face_tracks:
+                    face_tracks[track_id] = {"track_id": track_id, "detections": []}
+                face_tracks[track_id]["detections"].append({"frame_idx": int(frame_idx)})
+    logger.info(f"Loaded {len(face_tracks)} face tracks (aggregated from faces.jsonl)")
 
     # Load body tracks from fusion directory
     body_tracks_path = output_path.parent / "body_tracks.jsonl"

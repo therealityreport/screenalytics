@@ -2981,19 +2981,32 @@ def build_screentime_run_debug_pdf(
         story.append(Paragraph(f"Total tracked IDs analyzed: <b>{unavailable}</b>", body_style))
         story.append(Paragraph(f"Tracked IDs with gain: <b>{unavailable}</b>", body_style))
     else:
-        face_only_duration = _safe_float(screentime_summary.get("total_face_only_duration", 0))
-        combined_duration = _safe_float(screentime_summary.get("total_combined_duration", 0))
-        duration_gain = _safe_float(screentime_summary.get("total_duration_gain", 0))
-        body_only_duration = combined_duration - face_only_duration if combined_duration > face_only_duration else 0.0
-        gain_vs_combined_pct = _format_percent(duration_gain, combined_duration, na="N/A")
-        gain_vs_face_only_pct = _format_percent(duration_gain, face_only_duration, na="N/A")
+        face_total_s = _safe_float(
+            screentime_summary.get("face_total_s", screentime_summary.get("total_face_only_duration", 0))
+        )
+        body_total_s = _safe_float(
+            screentime_summary.get("body_total_s", screentime_summary.get("total_body_duration", 0))
+        )
+        fused_total_s = _safe_float(
+            screentime_summary.get("fused_total_s", screentime_summary.get("total_fused_duration", 0))
+        )
+        combined_total_s = _safe_float(
+            screentime_summary.get("combined_total_s", screentime_summary.get("total_combined_duration", 0))
+        )
+        gain_total_s = _safe_float(
+            screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain", 0))
+        )
+        duration_gain = gain_total_s
+        gain_vs_combined_pct = _format_percent(gain_total_s, combined_total_s, na="N/A")
+        gain_vs_face_only_pct = _format_percent(gain_total_s, face_total_s, na="N/A")
 
         screentime_breakdown = [
-            ["Source", "Duration", "% of Combined"],
-            ["Face-only segments", f"{face_only_duration:.2f}s", _format_percent(face_only_duration, combined_duration, na="N/A")],
-            ["Body-only segments", f"{body_only_duration:.2f}s", _format_percent(body_only_duration, combined_duration, na="N/A")],
-            ["Combined Total", f"{combined_duration:.2f}s", "100%"],
-            ["Gain from Body Tracking (vs Combined)", f"+{duration_gain:.2f}s", gain_vs_combined_pct],
+            ["Metric", "Duration", "% of Combined"],
+            ["Face baseline total", f"{face_total_s:.2f}s", _format_percent(face_total_s, combined_total_s, na="N/A")],
+            ["Body total (absolute)", f"{body_total_s:.2f}s", _format_percent(body_total_s, combined_total_s, na="N/A")],
+            ["Face∩Body overlap total", f"{fused_total_s:.2f}s", _format_percent(fused_total_s, combined_total_s, na="N/A")],
+            ["Combined total (Face ∪ Body)", f"{combined_total_s:.2f}s", "100%"],
+            ["Gain vs Face baseline (Combined − Face)", f"+{gain_total_s:.2f}s", gain_vs_combined_pct],
         ]
         screentime_table = Table(screentime_breakdown, colWidths=[2 * inch, 1.5 * inch, 1.5 * inch])
         screentime_table.setStyle(
@@ -3033,8 +3046,8 @@ def build_screentime_run_debug_pdf(
         # Adjust wording based on whether fusion actually occurred
         if actual_fused_pairs is not None and actual_fused_pairs > 0:
             story.append(Paragraph(
-                f"<b>Note:</b> 'Gain from Body Tracking' represents body-only duration gain—additional screen time "
-                f"from {actual_fused_pairs} fused face-body pair(s) where faces turned away but bodies remained visible.",
+                f"<b>Note:</b> 'Gain vs Face baseline' is the incremental time added by body visibility "
+                f"(Combined − Face baseline), from {actual_fused_pairs} fused face-body pair(s).",
                 note_style
             ))
         elif body_tracking_ran_effective and (body_track_count_run or 0) > 0:
