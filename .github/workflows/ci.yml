@@ -63,6 +63,11 @@ jobs:
         run: |
           pytest -q \
             tests/unit/test_profiles_config_resolution.py \
+            tests/unit/test_track_fusion_diagnostics.py \
+            tests/unit/test_run_export_missing_artifacts_na.py \
+            tests/unit/test_run_export_screentime_totals.py \
+            tests/unit/test_gate_auto_rerun_reporting.py \
+            tests/unit/test_run_export_db_optional.py \
             tests/api/test_episode_status.py \
             tests/api/test_screentime.py \
             tests/ml/test_sse_progress.py \
