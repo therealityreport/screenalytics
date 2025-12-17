@@ -222,6 +222,7 @@ def run_export_s3_key(ep_id: str, run_id: str, filename: str) -> str:
 
 # Artifacts that are part of the run bundle (uploaded to S3)
 RUN_ARTIFACT_ALLOWLIST = frozenset({
+    # Core pipeline artifacts
     "tracks.jsonl",
     "faces.jsonl",
     "detections.jsonl",
@@ -232,8 +233,12 @@ RUN_ARTIFACT_ALLOWLIST = frozenset({
     "detect_track.json",
     "embed.json",
     "cluster.json",
+    # Body tracking artifacts
     "body_tracking/body_detections.jsonl",
     "body_tracking/body_tracks.jsonl",
+    "body_tracking/body_embeddings.npy",
+    "body_tracking/body_embeddings_meta.json",
+    "body_tracking/body_metrics.json",
     "body_tracking/track_fusion.json",
     "body_tracking/screentime_comparison.json",
 })

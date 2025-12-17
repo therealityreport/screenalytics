@@ -5145,6 +5145,7 @@ else:
                     filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
 
                 # Check S3 upload status from response headers
+                s3_upload_attempted = resp.headers.get("X-S3-Upload-Attempted", "").lower() == "true"
                 s3_upload_success = resp.headers.get("X-S3-Upload-Success", "").lower() == "true"
                 s3_upload_key = resp.headers.get("X-S3-Upload-Key")
                 s3_upload_error = resp.headers.get("X-S3-Upload-Error")
@@ -5152,6 +5153,7 @@ else:
                 st.session_state[export_state_key] = {
                     "filename": filename,
                     "bytes": resp.content,
+                    "s3_upload_attempted": s3_upload_attempted,
                     "s3_upload_success": s3_upload_success,
                     "s3_upload_key": s3_upload_key,
                     "s3_upload_error": s3_upload_error,
@@ -5167,15 +5169,19 @@ else:
             pass
 
         # Display S3 upload status
-        s3_upload_success = bundle.get("s3_upload_success")
+        s3_upload_attempted = bundle.get("s3_upload_attempted", False)
+        s3_upload_success = bundle.get("s3_upload_success", False)
         s3_upload_key = bundle.get("s3_upload_key")
         s3_upload_error = bundle.get("s3_upload_error")
-        if s3_upload_success and s3_upload_key:
-            st.success(f"✅ Saved to S3: `{s3_upload_key}`")
-        elif s3_upload_error:
-            st.warning(f"⚠️ S3 upload failed: {s3_upload_error}")
-        elif _s3_enabled and s3_upload_key is None:
-            st.info("S3 upload skipped (not enabled or local backend)")
+        if s3_upload_attempted:
+            if s3_upload_success and s3_upload_key:
+                st.success(f"✅ Saved to S3: `{s3_upload_key}`")
+            elif s3_upload_error:
+                st.warning(f"⚠️ S3 upload attempted but failed: {s3_upload_error}")
+            else:
+                st.warning("⚠️ S3 upload attempted but status unknown")
+        else:
+            st.info("S3 upload not attempted (local backend or disabled)")
         st.download_button(
             "Download PDF",
             data=file_bytes,

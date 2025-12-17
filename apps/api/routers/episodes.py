@@ -2381,7 +2381,8 @@ def export_run_debug_bundle(
     - runs/{ep_id}/{run_id}/exports/debug_bundle.zip (for ZIP)
 
     S3 upload status is included in response headers:
-    - X-S3-Upload-Success: true/false
+    - X-S3-Upload-Attempted: true/false (whether S3 upload was attempted)
+    - X-S3-Upload-Success: true/false (whether upload succeeded)
     - X-S3-Upload-Key: S3 key (if successful)
     - X-S3-Upload-Error: Error message (if failed)
     """
@@ -2420,7 +2421,8 @@ def export_run_debug_bundle(
                     pass
 
         headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
-        # Add S3 upload status to headers
+        # Add S3 upload status to headers for observability
+        headers["X-S3-Upload-Attempted"] = "true" if upload_result is not None else "false"
         if upload_result is not None:
             headers["X-S3-Upload-Success"] = "true" if upload_result.success else "false"
             if upload_result.s3_key:
@@ -2449,7 +2451,8 @@ def export_run_debug_bundle(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
-        # Add S3 upload status to headers
+        # Add S3 upload status to headers for observability
+        headers["X-S3-Upload-Attempted"] = "true" if upload_result is not None else "false"
         if upload_result is not None:
             headers["X-S3-Upload-Success"] = "true" if upload_result.success else "false"
             if upload_result.s3_key:

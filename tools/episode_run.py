@@ -135,20 +135,39 @@ def _load_alignment_config() -> dict[str, Any]:
 
 
 def _load_body_tracking_config() -> dict[str, Any]:
-    """Load body tracking configuration from YAML file if available."""
+    """Load body tracking configuration from YAML file if available.
+
+    Environment variable overrides:
+        AUTO_RUN_BODY_TRACKING: If set to "0" or "false", disables body tracking
+            regardless of YAML config. If set to "1" or "true", enables body tracking.
+            If unset, uses the YAML config value (default: enabled).
+    """
     config_path = REPO_ROOT / "config" / "pipeline" / "body_detection.yaml"
-    if not config_path.exists():
-        return {}
+    config: dict[str, Any] = {}
 
-    try:
-        import yaml
+    if config_path.exists():
+        try:
+            import yaml
 
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
-        return config or {}
-    except Exception as exc:
-        LOGGER.warning("Failed to load body tracking config YAML: %s", exc)
-        return {}
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config = yaml.safe_load(handle) or {}
+        except Exception as exc:
+            LOGGER.warning("Failed to load body tracking config YAML: %s", exc)
+
+    # Environment variable override for body tracking enabled state
+    env_override = os.environ.get("AUTO_RUN_BODY_TRACKING", "").strip().lower()
+    if env_override in ("0", "false", "no", "off"):
+        if "body_tracking" not in config:
+            config["body_tracking"] = {}
+        config["body_tracking"]["enabled"] = False
+        LOGGER.debug("[body_tracking] Disabled via AUTO_RUN_BODY_TRACKING env var")
+    elif env_override in ("1", "true", "yes", "on"):
+        if "body_tracking" not in config:
+            config["body_tracking"] = {}
+        config["body_tracking"]["enabled"] = True
+        LOGGER.debug("[body_tracking] Enabled via AUTO_RUN_BODY_TRACKING env var")
+
+    return config
 
 
 PIPELINE_VERSION = os.environ.get("SCREENALYTICS_PIPELINE_VERSION", "2025-11-11")
