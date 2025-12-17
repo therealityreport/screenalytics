@@ -20,18 +20,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
 
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
@@ -174,7 +162,6 @@ def build_run_debug_bundle_zip(
     ep_id: str,
     run_id: str,
     include_artifacts: bool = True,
-    include_images: bool = False,
     include_logs: bool = True,
 ) -> tuple[str, str]:
     """Build a run-scoped debug bundle zip.
@@ -236,7 +223,6 @@ def build_run_debug_bundle_zip(
         },
         "toggles": {
             "include_artifacts": bool(include_artifacts),
-            "include_images": bool(include_images),
             "include_logs": bool(include_logs),
         },
         "artifacts_present": {
@@ -315,6 +301,11 @@ def build_run_debug_bundle_zip(
     zip_path = tmp.name
     tmp.close()
 
+    allowed_suffixes = {".json", ".jsonl", ".log", ".txt"}
+
+    def _allowlisted_bundle_path(path: Path) -> bool:
+        return path.suffix.lower() in allowed_suffixes
+
     try:
         with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_handle:
             zip_handle.writestr("run_summary.json", json.dumps(run_summary, indent=2, ensure_ascii=False))
@@ -352,31 +343,28 @@ def build_run_debug_bundle_zip(
                     "faces_ops.jsonl",
                 ):
                     _safe_add_file(zip_handle, run_root / filename, arcname=filename)
-                _safe_add_dir(zip_handle, run_root / "body_tracking", arc_prefix="body_tracking")
-                _safe_add_dir(zip_handle, run_root / "analytics", arc_prefix="analytics")
-
-                faces_npy = (
-                    Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
-                    / "embeds"
-                    / ep_id
-                    / "runs"
-                    / run_id_norm
-                    / "faces.npy"
+                _safe_add_dir(
+                    zip_handle,
+                    run_root / "body_tracking",
+                    arc_prefix="body_tracking",
+                    include_predicate=_allowlisted_bundle_path,
                 )
-                _safe_add_file(zip_handle, faces_npy, arcname="faces.npy")
-
-            # Images (thumbs/crops/frames) can be huge - gated behind include_images.
-            if include_images:
-                frames_root = get_path(ep_id, "frames_root")
-                run_frames = frames_root / "runs" / run_id_norm
-                _safe_add_dir(zip_handle, run_frames / "thumbs", arc_prefix="images/thumbs")
-                _safe_add_dir(zip_handle, run_frames / "crops", arc_prefix="images/crops")
-                _safe_add_dir(zip_handle, run_frames / "frames", arc_prefix="images/frames")
+                _safe_add_dir(
+                    zip_handle,
+                    run_root / "analytics",
+                    arc_prefix="analytics",
+                    include_predicate=_allowlisted_bundle_path,
+                )
 
             # Logs (episode-wide) - stored under manifests/{ep_id}/logs
             if include_logs:
                 logs_dir = manifests_root / "logs"
-                _safe_add_dir(zip_handle, logs_dir, arc_prefix="logs")
+                _safe_add_dir(
+                    zip_handle,
+                    logs_dir,
+                    arc_prefix="logs",
+                    include_predicate=_allowlisted_bundle_path,
+                )
                 _safe_add_file(zip_handle, runs_root / run_layout.ACTIVE_RUN_FILENAME, arcname="active_run.json")
 
                 # Include legacy phase markers for context (single file per phase; may not match this run).
@@ -560,6 +548,205 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_ffprobe_fraction(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            as_float = float(value)
+        except (TypeError, ValueError):
+            return None
+        return as_float if as_float > 0 else None
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if "/" in cleaned:
+        num_str, den_str = cleaned.split("/", 1)
+        try:
+            num = float(num_str)
+            den = float(den_str)
+        except (TypeError, ValueError):
+            return None
+        if den == 0:
+            return None
+        fps = num / den
+        return fps if fps > 0 else None
+    try:
+        fps = float(cleaned)
+    except (TypeError, ValueError):
+        return None
+    return fps if fps > 0 else None
+
+
+def _ffprobe_video_metadata(video_path: Path) -> dict[str, Any]:
+    """Best-effort video metadata via ffprobe (duration_s, avg_fps, nb_frames)."""
+    if not video_path.exists():
+        return {"ok": False, "error": "missing_video", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration,avg_frame_rate,nb_frames",
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "ffprobe_not_found", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "ffprobe_timeout", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "error": "ffprobe_failed",
+            "duration_s": None,
+            "avg_fps": None,
+            "nb_frames": None,
+        }
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "ffprobe_bad_json", "duration_s": None, "avg_fps": None, "nb_frames": None}
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    stream0 = streams[0] if isinstance(streams, list) and streams else None
+    if not isinstance(stream0, dict):
+        return {"ok": False, "error": "ffprobe_no_stream", "duration_s": None, "avg_fps": None, "nb_frames": None}
+
+    duration_s = _parse_ffprobe_fraction(stream0.get("duration"))
+    avg_fps = _parse_ffprobe_fraction(stream0.get("avg_frame_rate"))
+    nb_frames_raw = stream0.get("nb_frames")
+    nb_frames: int | None = None
+    if isinstance(nb_frames_raw, int):
+        nb_frames = nb_frames_raw
+    elif isinstance(nb_frames_raw, str) and nb_frames_raw.isdigit():
+        nb_frames = int(nb_frames_raw)
+    return {"ok": True, "error": None, "duration_s": duration_s, "avg_fps": avg_fps, "nb_frames": nb_frames}
+
+
+def _opencv_video_metadata(video_path: Path) -> dict[str, Any]:
+    """Best-effort video metadata via OpenCV (fps, frame_count, width, height)."""
+    if not video_path.exists():
+        return {
+            "ok": False,
+            "error": "missing_video",
+            "fps": None,
+            "frame_count": None,
+            "width": None,
+            "height": None,
+        }
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        cv2 = None  # type: ignore
+    if cv2 is None:
+        return {
+            "ok": False,
+            "error": "opencv_unavailable",
+            "fps": None,
+            "frame_count": None,
+            "width": None,
+            "height": None,
+        }
+
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return {
+                "ok": False,
+                "error": "opencv_open_failed",
+                "fps": None,
+                "frame_count": None,
+                "width": None,
+                "height": None,
+            }
+        fps_probe = cap.get(cv2.CAP_PROP_FPS)
+        frames_probe = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        width_probe = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height_probe = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        fps = float(fps_probe) if fps_probe else None
+        frame_count = int(frames_probe) if frames_probe else None
+        width = int(width_probe) if width_probe else None
+        height = int(height_probe) if height_probe else None
+        return {
+            "ok": True,
+            "error": None,
+            "fps": fps,
+            "frame_count": frame_count,
+            "width": width,
+            "height": height,
+        }
+    finally:
+        cap.release()
+
+
+def _face_detection_frame_stats(detections_path: Path) -> dict[str, Any]:
+    """Compute observed frame stats from detections.jsonl (unique frames + median stride)."""
+    if not detections_path.exists():
+        return {
+            "ok": False,
+            "error": "missing_detections_jsonl",
+            "frames_observed": None,
+            "stride_median": None,
+        }
+
+    frame_indices: set[int] = set()
+    try:
+        with detections_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                frame_idx = row.get("frame_idx")
+                if isinstance(frame_idx, int):
+                    frame_indices.add(frame_idx)
+    except OSError:
+        return {
+            "ok": False,
+            "error": "read_error_detections_jsonl",
+            "frames_observed": None,
+            "stride_median": None,
+        }
+
+    frames_sorted = sorted(frame_indices)
+    if len(frames_sorted) < 2:
+        return {
+            "ok": True,
+            "error": None,
+            "frames_observed": len(frames_sorted),
+            "stride_median": None,
+        }
+    deltas = [b - a for a, b in zip(frames_sorted, frames_sorted[1:]) if b - a > 0]
+    if not deltas:
+        stride_median = None
+    else:
+        import statistics
+
+        stride_median = int(statistics.median(deltas))
+    return {
+        "ok": True,
+        "error": None,
+        "frames_observed": len(frames_sorted),
+        "stride_median": stride_median,
+    }
 
 
 def _format_mtime(path: Path) -> str:
@@ -854,6 +1041,22 @@ def build_screentime_run_debug_pdf(
     Returns:
         (pdf_bytes, download_filename)
     """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("reportlab is required to build PDF debug reports (pip install reportlab)") from exc
+
     run_id_norm = run_layout.normalize_run_id(run_id)
     run_root = run_layout.run_root(ep_id, run_id_norm)
     if not run_root.exists():
@@ -997,6 +1200,29 @@ def build_screentime_run_debug_pdf(
         textColor=colors.HexColor("#4a5568"),
         leftIndent=10,
     )
+    # Table cell style for wrapping text
+    cell_style = ParagraphStyle(
+        "TableCell",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=11,  # Line spacing for wrapped text
+    )
+    cell_style_small = ParagraphStyle(
+        "TableCellSmall",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=10,
+    )
+
+    def _wrap_cell(text: str, style: ParagraphStyle = cell_style) -> Paragraph:
+        """Wrap text in a Paragraph for table cell text wrapping."""
+        # Escape XML special characters for ReportLab
+        safe_text = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return Paragraph(safe_text, style)
+
+    def _wrap_row(row: list, style: ParagraphStyle = cell_style) -> list:
+        """Wrap all cells in a row for text wrapping."""
+        return [_wrap_cell(cell, style) for cell in row]
 
     story: list[Any] = []
 
@@ -1180,7 +1406,7 @@ def build_screentime_run_debug_pdf(
             return "✗ No"
         return "—"
 
-    def _status_color(ok: bool | None) -> colors.Color:
+    def _status_color(ok: bool | None):
         if ok is True:
             return colors.green
         if ok is False:
@@ -1208,35 +1434,35 @@ def build_screentime_run_debug_pdf(
         fused_pairs_detail = f"{actual_fused_pairs} pair(s)"
 
     health_data = [
-        ["Health Check", "Status", "Details"],
-        ["DB Connected", _health_status(db_connected),
-         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")],
-        ["Face Tracks Present", _health_status(face_tracks_present), face_tracks_detail],
-        [
+        _wrap_row(["Health Check", "Status", "Details"]),
+        _wrap_row(["DB Connected", _health_status(db_connected),
+         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")]),
+        _wrap_row(["Face Tracks Present", _health_status(face_tracks_present), face_tracks_detail]),
+        _wrap_row([
             "Body Tracking Ran (run-scoped)",
             _health_status(bool(body_tracking_ran_effective)),
             f"YAML enabled={'true' if body_config_enabled else 'false'} | dets={body_detect_display} tracks={body_track_display}",
-        ],
-        [
+        ]),
+        _wrap_row([
             "Track Fusion Output Present",
             _health_status(track_fusion_available),
             "Present" if track_fusion_available is True else (
                 "Missing body_tracking/track_fusion.json" if track_fusion_available is False else "Unreadable track_fusion.json"
             ),
-        ],
-        ["Face-Body Pairs Fused", _health_status(fused_pairs_ok), fused_pairs_detail],
-        [
+        ]),
+        _wrap_row(["Face-Body Pairs Fused", _health_status(fused_pairs_ok), fused_pairs_detail]),
+        _wrap_row([
             "Screen Time Comparison Present",
             _health_status(screentime_available),
             "Present" if screentime_available is True else (
                 "Missing body_tracking/screentime_comparison.json" if screentime_available is False else "Unreadable screentime_comparison.json"
             ),
-        ],
-        [
+        ]),
+        _wrap_row([
             "Legacy Body Artifacts Present",
             _health_status(legacy_body_artifacts_exist),
             f"legacy_run_id={legacy_body_marker_run_id or 'unknown'} | out_of_scope={'yes' if legacy_body_out_of_scope else 'no'}",
-        ],
+        ]),
     ]
     health_table = Table(health_data, colWidths=[1.8 * inch, 0.8 * inch, 3.9 * inch])
     status_values: list[bool | None] = [
@@ -1372,97 +1598,172 @@ def build_screentime_run_debug_pdf(
         ["Generated At", _now_iso()],
     ]
 
-    # Video metadata (best-effort, prefer run-scoped markers when present)
-    video_meta_path = manifests_root / "video_metadata.json"
-    video_meta = _read_json(video_meta_path) if video_meta_path.exists() else None
+    # Video metadata sources (split, labeled, and validated for mismatches).
+    video_path = get_path(ep_id, "video")
+    ffprobe_meta = _ffprobe_video_metadata(video_path)
+    opencv_meta = _opencv_video_metadata(video_path)
     detect_track_marker = _read_json(run_root / "detect_track.json") if (run_root / "detect_track.json").exists() else None
-    progress_marker = _read_json(run_root / "progress.json") if (run_root / "progress.json").exists() else None
 
-    video_duration_s = None
-    video_fps = None
-    video_frames_total = None
-    width_value = None
-    height_value = None
+    ffprobe_duration_s = ffprobe_meta.get("duration_s") if ffprobe_meta.get("ok") else None
+    ffprobe_fps = ffprobe_meta.get("avg_fps") if ffprobe_meta.get("ok") else None
+    ffprobe_frames = ffprobe_meta.get("nb_frames") if ffprobe_meta.get("ok") else None
 
-    face_stride = None
-    face_frames_processed = None
+    opencv_fps = opencv_meta.get("fps") if opencv_meta.get("ok") else None
+    opencv_frames = opencv_meta.get("frame_count") if opencv_meta.get("ok") else None
+    width_value = opencv_meta.get("width") if opencv_meta.get("ok") else None
+    height_value = opencv_meta.get("height") if opencv_meta.get("ok") else None
 
-    if isinstance(video_meta, dict):
-        video_duration_s = video_meta.get("duration") or video_meta.get("duration_sec")
-        video_fps = video_meta.get("fps")
-        width_value = video_meta.get("width")
-        height_value = video_meta.get("height")
-        video_frames_total = video_meta.get("frame_count") or video_meta.get("frames_total")
-
+    marker_duration_s = None
+    marker_fps = None
+    marker_frames_total = None
+    marker_stride_requested = None
     if isinstance(detect_track_marker, dict):
-        video_duration_s = detect_track_marker.get("video_duration_sec", video_duration_s)
-        video_fps = detect_track_marker.get("fps", video_fps)
-        face_frames_processed = detect_track_marker.get("frames_total", face_frames_processed)
-        face_stride = detect_track_marker.get("stride", face_stride)
+        marker_duration_s = _parse_ffprobe_fraction(detect_track_marker.get("video_duration_sec"))
+        marker_fps = _parse_ffprobe_fraction(detect_track_marker.get("fps"))
+        marker_frames_raw = detect_track_marker.get("frames_total")
+        if isinstance(marker_frames_raw, int):
+            marker_frames_total = marker_frames_raw
+        elif isinstance(marker_frames_raw, str) and marker_frames_raw.isdigit():
+            marker_frames_total = int(marker_frames_raw)
+        stride_raw = detect_track_marker.get("stride")
+        if isinstance(stride_raw, int):
+            marker_stride_requested = stride_raw
+        elif isinstance(stride_raw, str) and stride_raw.isdigit():
+            marker_stride_requested = int(stride_raw)
 
-    if isinstance(progress_marker, dict):
-        if face_frames_processed is None:
-            face_frames_processed = progress_marker.get("frames_total", face_frames_processed)
-        if face_stride is None:
-            face_stride = progress_marker.get("stride", face_stride)
-        video_fps = progress_marker.get("fps_detected", video_fps) or progress_marker.get("fps_infer", video_fps)
+    def _fmt_duration_s(value: float | None) -> str:
+        if value is None:
+            return "unknown"
+        return f"{value:.3f}s"
 
-    # If metadata is missing, probe the video file header when available.
-    if (
-        width_value is None
-        or height_value is None
-        or video_frames_total is None
-        or video_fps is None
-        or video_duration_s is None
-    ):
-        try:
-            video_path = get_path(ep_id, "video")
-            if video_path.exists():
-                try:
-                    import cv2  # type: ignore
-                except Exception:
-                    cv2 = None  # type: ignore
-                if cv2 is not None:
-                    cap = cv2.VideoCapture(str(video_path))
-                    try:
-                        if cap.isOpened():
-                            width_probe = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                            height_probe = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                            frames_probe = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                            fps_probe = cap.get(cv2.CAP_PROP_FPS)
-                            if width_value is None and width_probe:
-                                width_value = int(width_probe)
-                            if height_value is None and height_probe:
-                                height_value = int(height_probe)
-                            if video_frames_total is None and frames_probe:
-                                video_frames_total = int(frames_probe)
-                            if video_fps is None and fps_probe:
-                                video_fps = float(fps_probe)
-                            if video_duration_s is None and video_frames_total and video_fps:
-                                video_duration_s = float(video_frames_total) / float(video_fps)
-                    finally:
-                        cap.release()
-        except Exception:
-            pass
+    def _fmt_fps(value: float | None) -> str:
+        if value is None:
+            return "unknown"
+        return f"{value:.3f} fps"
 
-    if video_duration_s is not None:
-        try:
-            lineage_data.append(["Video Duration", f"{float(video_duration_s):.2f}s"])
-        except (TypeError, ValueError):
-            lineage_data.append(["Video Duration", str(video_duration_s)])
-    if video_fps is not None:
-        try:
-            lineage_data.append(["Video Frame Rate", f"{float(video_fps):.3g} fps"])
-        except (TypeError, ValueError):
-            lineage_data.append(["Video Frame Rate", f"{video_fps} fps"])
+    def _fmt_int(value: int | None) -> str:
+        if value is None:
+            return "unknown"
+        return str(value)
+
+    resolved_duration_s: float | None = ffprobe_duration_s or marker_duration_s
+    resolved_fps: float | None = ffprobe_fps or marker_fps or opencv_fps
+    # Include opencv_frames as final fallback per Cursor bot feedback
+    resolved_frames: int | None = ffprobe_frames or marker_frames_total or opencv_frames
+
+    def _resolved_source(ffprobe_val: Any, marker_val: Any, opencv_val: Any = None) -> str:
+        """Determine which source provided the resolved value."""
+        if ffprobe_val is not None:
+            return "ffprobe"
+        if marker_val is not None:
+            return "detect_track.marker"
+        if opencv_val is not None:
+            return "opencv"
+        return "unknown"
+
+    if resolved_duration_s is not None:
+        dur_source = _resolved_source(ffprobe_duration_s, marker_duration_s)
+        lineage_data.append(
+            [
+                "Video Duration (resolved)",
+                f"{resolved_duration_s:.2f}s ({dur_source})",
+            ]
+        )
+    if resolved_fps is not None:
+        fps_source = _resolved_source(ffprobe_fps, marker_fps, opencv_fps)
+        lineage_data.append(
+            [
+                "Video Frame Rate (resolved)",
+                f"{resolved_fps:.3f} fps ({fps_source})",
+            ]
+        )
+    if resolved_frames is not None:
+        frames_source = _resolved_source(ffprobe_frames, marker_frames_total, opencv_frames)
+        lineage_data.append(
+            [
+                "Total Video Frames (resolved)",
+                f"{resolved_frames} ({frames_source})",
+            ]
+        )
     if width_value is not None or height_value is not None:
-        lineage_data.append(["Resolution", f"{width_value or '?'}x{height_value or '?'}"])
-    if video_frames_total is not None:
-        lineage_data.append(["Total Video Frames", str(video_frames_total)])
-    if face_frames_processed is not None:
-        lineage_data.append(["Face Frames Processed", str(face_frames_processed)])
-    if face_stride is not None:
-        lineage_data.append(["Face Pipeline Stride", str(face_stride)])
+        lineage_data.append(["Resolution (OpenCV)", f"{width_value or '?'}x{height_value or '?'}"])
+
+    lineage_data.extend([
+        ["ffprobe.duration_s", _fmt_duration_s(ffprobe_duration_s)],
+        ["ffprobe.avg_fps", _fmt_fps(ffprobe_fps)],
+        ["ffprobe.nb_frames", _fmt_int(ffprobe_frames)],
+        ["opencv.fps", _fmt_fps(opencv_fps)],
+        ["opencv.frame_count", _fmt_int(opencv_frames)],
+    ])
+    if marker_duration_s is not None or marker_fps is not None or marker_frames_total is not None:
+        lineage_data.extend([
+            ["detect_track.marker.video_duration_s", _fmt_duration_s(marker_duration_s)],
+            ["detect_track.marker.fps", _fmt_fps(marker_fps)],
+            ["detect_track.marker.frames_total", _fmt_int(marker_frames_total)],
+        ])
+    if marker_stride_requested is not None:
+        lineage_data.append(["Face Detection Stride (requested)", str(marker_stride_requested)])
+
+    def _rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b))
+        if denom <= 0:
+            return 0.0
+        return abs(a - b) / denom
+
+    mismatches: list[str] = []
+
+    def _check_mismatch(label: str, a_name: str, a_value: float | int | None, b_name: str, b_value: float | int | None) -> None:
+        if a_value is None or b_value is None:
+            return
+        diff = _rel_diff(float(a_value), float(b_value))
+        if diff > 0.10:
+            mismatches.append(f"{label}: {a_name} vs {b_name} ({diff * 100:.1f}% diff)")
+
+    opencv_duration_s: float | None = None
+    if isinstance(opencv_frames, int) and isinstance(opencv_fps, float) and opencv_fps > 0:
+        opencv_duration_s = float(opencv_frames) / opencv_fps
+
+    _check_mismatch("Duration", "ffprobe.duration_s", ffprobe_duration_s, "detect_track.marker.video_duration_s", marker_duration_s)
+    _check_mismatch("Duration", "ffprobe.duration_s", ffprobe_duration_s, "opencv.frame_count/opencv.fps", opencv_duration_s)
+    _check_mismatch("Duration", "detect_track.marker.video_duration_s", marker_duration_s, "opencv.frame_count/opencv.fps", opencv_duration_s)
+    _check_mismatch("FPS", "ffprobe.avg_fps", ffprobe_fps, "detect_track.marker.fps", marker_fps)
+    _check_mismatch("FPS", "ffprobe.avg_fps", ffprobe_fps, "opencv.fps", opencv_fps)
+    _check_mismatch("FPS", "detect_track.marker.fps", marker_fps, "opencv.fps", opencv_fps)
+    _check_mismatch("Frames", "ffprobe.nb_frames", ffprobe_frames, "detect_track.marker.frames_total", marker_frames_total)
+    _check_mismatch("Frames", "ffprobe.nb_frames", ffprobe_frames, "opencv.frame_count", opencv_frames)
+    _check_mismatch("Frames", "detect_track.marker.frames_total", marker_frames_total, "opencv.frame_count", opencv_frames)
+
+    if mismatches:
+        story.append(
+            Paragraph(
+                "<b>⚠️ metadata mismatch</b>: video metadata sources disagree by &gt;10% ("
+                + "; ".join(mismatches)
+                + "). Values in this section may be unreliable.",
+                note_style,
+            )
+        )
+
+    # Face detection observed frame stats (most reliable for stride/frame count).
+    det_stats = _face_detection_frame_stats(detections_path)
+    if det_stats.get("ok"):
+        lineage_data.append(["Face Detection Frames Observed", str(det_stats.get("frames_observed"))])
+        stride_median = det_stats.get("stride_median")
+        lineage_data.append(
+            ["Face Detection Stride (observed)", str(stride_median) if stride_median is not None else "unknown"]
+        )
+    else:
+        lineage_data.append(["Face Detection Frames Observed", "unknown"])
+        lineage_data.append(["Face Detection Stride (observed)", "unknown"])
+
+    detection_stride_cfg = None
+    for key in ("stride", "detect_every_n_frames"):
+        if key in detection_config:
+            detection_stride_cfg = detection_config.get(key)
+            break
+    if detection_stride_cfg is not None:
+        lineage_data.append(["Face Detection Stride (config)", str(detection_stride_cfg)])
+    else:
+        lineage_data.append(["Face Detection Stride (config)", "N/A (not specified in detection.yaml)"])
     body_stride_cfg: int | None = None
     try:
         body_stride_cfg_raw = body_detection_config.get("person_detection", {}).get("detect_every_n_frames")
@@ -1472,8 +1773,8 @@ def build_screentime_run_debug_pdf(
     if body_stride_cfg is not None:
         lineage_data.append(["Body Pipeline Stride (detect_every_n_frames)", str(body_stride_cfg)])
         if bool(body_tracking_ran_effective):
-            if isinstance(video_frames_total, int) and body_stride_cfg > 0:
-                body_frames_expected = (video_frames_total + body_stride_cfg - 1) // body_stride_cfg
+            if isinstance(resolved_frames, int) and body_stride_cfg > 0:
+                body_frames_expected = (resolved_frames + body_stride_cfg - 1) // body_stride_cfg
                 lineage_data.append(["Body Frames Processed (expected)", str(body_frames_expected)])
             else:
                 lineage_data.append(["Body Frames Processed (expected)", "N/A"])
@@ -1513,45 +1814,45 @@ def build_screentime_run_debug_pdf(
     # Configuration used with explanations
     story.append(Paragraph("Configuration (detection.yaml):", subsection_style))
     detect_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "confidence_th",
             str(detection_config.get("confidence_th", "N/A")),
             "Min confidence to accept a detection",
-            "↓ Lower: More faces (+ false positives) | ↑ Higher: Fewer, more confident faces",
-        ],
-        [
+            "Lower: More faces (+ false positives) | Higher: Fewer, more confident",
+        ], cell_style_small),
+        _wrap_row([
             "min_size",
             str(detection_config.get("min_size", "N/A")),
             "Min face size in pixels",
-            "↓ Lower: Detect smaller/distant faces | ↑ Higher: Ignore small faces",
-        ],
-        [
+            "Lower: Detect smaller/distant faces | Higher: Ignore small faces",
+        ], cell_style_small),
+        _wrap_row([
             "iou_th",
             str(detection_config.get("iou_th", "N/A")),
             "NMS IoU threshold for duplicate removal",
-            "↓ Lower: More aggressive duplicate removal | ↑ Higher: Keep overlapping faces",
-        ],
-        [
+            "Lower: More aggressive duplicate removal | Higher: Keep overlapping",
+        ], cell_style_small),
+        _wrap_row([
             "wide_shot_mode",
             str(detection_config.get("wide_shot_mode", "N/A")),
             "Enhanced detection for distant faces",
-            "Enable for wide shots with small faces; disable for close-ups",
-        ],
-        [
+            "Enable for wide shots with small faces",
+        ], cell_style_small),
+        _wrap_row([
             "wide_shot_confidence_th",
             str(detection_config.get("wide_shot_confidence_th", "N/A")),
             "Confidence threshold in wide shot mode",
-            "↓ Lower: More small faces | ↑ Higher: Stricter small face detection",
-        ],
-        [
+            "Lower: More small faces | Higher: Stricter detection",
+        ], cell_style_small),
+        _wrap_row([
             "enable_person_fallback",
             str(detection_config.get("enable_person_fallback", "N/A")),
             "Use body detection when face fails",
             "Enable if missing faces when people turn away",
-        ],
+        ], cell_style_small),
     ]
-    detect_config_table = Table(detect_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    detect_config_table = Table(detect_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     detect_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -1614,39 +1915,39 @@ def build_screentime_run_debug_pdf(
     # Configuration used with explanations
     story.append(Paragraph("Configuration (tracking.yaml):", subsection_style))
     track_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "track_thresh",
             str(tracking_config.get("track_thresh", "N/A")),
             "Min confidence to continue tracking",
-            "↓ Lower: Track low-confidence faces | ↑ Higher: Drop uncertain faces",
-        ],
-        [
+            "Lower: Track low-confidence faces | Higher: Drop uncertain faces",
+        ], cell_style_small),
+        _wrap_row([
             "match_thresh",
             str(tracking_config.get("match_thresh", "N/A")),
             "IoU threshold for bbox matching",
-            "↓ Lower: Match fast-moving faces | ↑ Higher: Reduce ID switches",
-        ],
-        [
+            "Lower: Match fast-moving faces | Higher: Reduce ID switches",
+        ], cell_style_small),
+        _wrap_row([
             "track_buffer",
             str(tracking_config.get("track_buffer", "N/A")),
             "Frames to keep track alive when lost",
-            "↓ Lower: Faster cleanup | ↑ Higher: Bridge brief occlusions",
-        ],
-        [
+            "Lower: Faster cleanup | Higher: Bridge brief occlusions",
+        ], cell_style_small),
+        _wrap_row([
             "new_track_thresh",
             str(tracking_config.get("new_track_thresh", "N/A")),
             "Min confidence to start a new track",
-            "↓ Lower: More new tracks | ↑ Higher: Fewer, more confident tracks",
-        ],
-        [
+            "Lower: More new tracks | Higher: Fewer, more confident tracks",
+        ], cell_style_small),
+        _wrap_row([
             "gate_enabled",
             str(tracking_config.get("gate_enabled", "N/A")),
             "Appearance-based track splitting",
             "Enable to split when face changes; disable if too many splits",
-        ],
+        ], cell_style_small),
     ]
-    track_config_table = Table(track_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    track_config_table = Table(track_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     track_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -1689,23 +1990,23 @@ def build_screentime_run_debug_pdf(
     emb_cfg = embedding_config.get("embedding", {})
     face_align_cfg = embedding_config.get("face_alignment", {})
     embed_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["backend", str(emb_cfg.get("backend", "N/A")), "Embedding computation backend", "tensorrt: Fast GPU | pytorch: Compatible fallback"],
-        ["face_alignment.enabled", str(face_align_cfg.get("enabled", "N/A")), "Apply face alignment before embedding", "Enable for better embeddings; disable for speed"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["backend", str(emb_cfg.get("backend", "N/A")), "Embedding computation backend", "tensorrt: Fast GPU | pytorch: Compatible fallback"], cell_style_small),
+        _wrap_row(["face_alignment.enabled", str(face_align_cfg.get("enabled", "N/A")), "Apply face alignment before embedding", "Enable for better embeddings; disable for speed"], cell_style_small),
+        _wrap_row([
             "min_alignment_quality",
             str(face_align_cfg.get("min_alignment_quality", "N/A")),
             "Min quality score to embed a face",
-            "↓ Lower: Embed more faces (+ noise) | ↑ Higher: Only high-quality faces",
-        ],
-        [
+            "Lower: Embed more faces (+ noise) | Higher: Only high-quality faces",
+        ], cell_style_small),
+        _wrap_row([
             "embedding_dim",
             str(embedding_config.get("output", {}).get("embedding_dim", "512")),
             "Output vector dimensions",
-            "512 standard for ArcFace; don't change unless using different model",
-        ],
+            "512 standard for ArcFace",
+        ], cell_style_small),
     ]
-    embed_config_table = Table(embed_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    embed_config_table = Table(embed_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     embed_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -1753,52 +2054,52 @@ def build_screentime_run_debug_pdf(
         override_source_desc = override_source
 
     body_detect_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "body_tracking.enabled (YAML)",
             str(body_config_enabled),
-            "Config value from config/pipeline/body_detection.yaml",
+            "Config from body_detection.yaml",
             "Enable to run body tracking in detect_track",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "body_tracking.ran_effective",
             str(bool(body_tracking_ran_effective)),
-            "Resolved from run-scoped marker/artifacts for this run_id",
-            "If false but legacy artifacts exist, artifacts may be stale",
-        ],
-        [
+            "Resolved from run-scoped marker/artifacts",
+            "If false but legacy artifacts exist, may be stale",
+        ], cell_style_small),
+        _wrap_row([
             "body_tracking.override_source",
             override_source_value,
             override_source_desc,
             "If unknown, verify artifact scope + mtimes",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "model",
             str(person_det_cfg.get("model", "N/A")),
             "YOLO model variant",
-            "yolov8n: Fast | yolov8s/m: More accurate, slower",
-        ],
-        [
+            "yolov8n: Fast | yolov8s/m: Accurate, slower",
+        ], cell_style_small),
+        _wrap_row([
             "confidence_threshold",
             str(person_det_cfg.get("confidence_threshold", "N/A")),
             "Min confidence for person detection",
-            "↓ Lower: More bodies (+ false positives) | ↑ Higher: Fewer, confident bodies",
-        ],
-        [
+            "Lower: More bodies (+ FP) | Higher: Fewer, confident",
+        ], cell_style_small),
+        _wrap_row([
             "min_height_px",
             str(person_det_cfg.get("min_height_px", "N/A")),
             "Min body height in pixels",
-            "↓ Lower: Detect distant people | ↑ Higher: Ignore small figures",
-        ],
-        [
+            "Lower: Detect distant | Higher: Ignore small",
+        ], cell_style_small),
+        _wrap_row([
             "detect_every_n_frames",
             str(person_det_cfg.get("detect_every_n_frames", "N/A")),
             "Frame stride for detection",
-            "↓ Lower: More detections, slower | ↑ Higher: Faster, may miss brief appearances",
-        ],
+            "Lower: More detections | Higher: Faster",
+        ], cell_style_small),
     ]
     body_detect_config_table = Table(
-        body_detect_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch]
+        body_detect_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch]
     )
     body_detect_config_table.setStyle(
         TableStyle([
@@ -1857,40 +2158,40 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Configuration (body_detection.yaml → person_tracking):", subsection_style))
     person_track_cfg = body_detection_config.get("person_tracking", {})
     body_track_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["tracker", str(person_track_cfg.get("tracker", "N/A")), "Tracking algorithm", "bytetrack: Fast, robust | botsort/strongsort: More features"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["tracker", str(person_track_cfg.get("tracker", "N/A")), "Tracking algorithm", "bytetrack: Fast | botsort/strongsort: More features"], cell_style_small),
+        _wrap_row([
             "track_thresh",
             str(person_track_cfg.get("track_thresh", "N/A")),
             "Min confidence to continue body track",
-            "↓ Lower: Track uncertain bodies | ↑ Higher: Drop low-confidence tracks",
-        ],
-        [
+            "Lower: Track uncertain | Higher: Drop low-confidence",
+        ], cell_style_small),
+        _wrap_row([
             "new_track_thresh",
             str(person_track_cfg.get("new_track_thresh", "N/A")),
             "Min confidence to start new body track",
-            "↓ Lower: More new tracks | ↑ Higher: Fewer, confident tracks",
-        ],
-        [
+            "Lower: More new tracks | Higher: Fewer, confident",
+        ], cell_style_small),
+        _wrap_row([
             "match_thresh",
             str(person_track_cfg.get("match_thresh", "N/A")),
             "IoU threshold for body bbox matching",
-            "↓ Lower: Match moving bodies | ↑ Higher: Stricter matching",
-        ],
-        [
+            "Lower: Match moving | Higher: Stricter matching",
+        ], cell_style_small),
+        _wrap_row([
             "track_buffer",
             str(person_track_cfg.get("track_buffer", "N/A")),
             "Frames to keep lost body track alive",
-            "↓ Lower: Faster cleanup | ↑ Higher: Bridge longer occlusions",
-        ],
-        [
+            "Lower: Faster cleanup | Higher: Bridge occlusions",
+        ], cell_style_small),
+        _wrap_row([
             "id_offset",
             str(person_track_cfg.get("id_offset", "N/A")),
             "Starting ID for body tracks",
-            "Prevents ID collision with face tracks; typically 100000",
-        ],
+            "Prevents ID collision with face tracks",
+        ], cell_style_small),
     ]
-    body_track_config_table = Table(body_track_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    body_track_config_table = Table(body_track_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     body_track_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -1957,14 +2258,14 @@ def build_screentime_run_debug_pdf(
         fused_pairs_value = _na_artifact(track_fusion_path, "body_tracking/track_fusion.json")
 
     fusion_stats = [
-        ["Metric", "Value", "Notes"],
-        ["Fusion Status", fusion_status, "Run-scoped inputs + outputs"],
-        ["Face Tracks (input)", face_tracks_input, "From run tracks.jsonl"],
-        ["Body Tracks (input)", body_tracks_input, "From run body_tracking/body_tracks.jsonl"],
-        ["Tracked IDs (from fusion output)", tracked_ids_value, "From body_tracking/track_fusion.json"],
-        ["Actual Fused Pairs", fused_pairs_value, "Mappings with both face AND body track IDs"],
+        _wrap_row(["Metric", "Value", "Notes"]),
+        _wrap_row(["Fusion Status", fusion_status, "Run-scoped inputs + outputs"]),
+        _wrap_row(["Face Tracks (input)", face_tracks_input, "From run tracks.jsonl"]),
+        _wrap_row(["Body Tracks (input)", body_tracks_input, "From run body_tracking/body_tracks.jsonl"]),
+        _wrap_row(["Tracked IDs (from fusion output)", tracked_ids_value, "From body_tracking/track_fusion.json"]),
+        _wrap_row(["Actual Fused Pairs", fused_pairs_value, "Mappings with both face AND body track IDs"]),
     ]
-    fusion_table = Table(fusion_stats, colWidths=[2 * inch, 1.2 * inch, 2.3 * inch])
+    fusion_table = Table(fusion_stats, colWidths=[2.0 * inch, 1.5 * inch, 2.0 * inch])
     fusion_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2039,14 +2340,14 @@ def build_screentime_run_debug_pdf(
 
     story.append(Paragraph("Fusion Diagnostics", subsection_style))
     fusion_diag = [
-        ["Step", "Count", "Notes"],
-        ["Candidate overlaps considered", candidates_value, candidates_notes],
-        ["Overlaps passing IoU threshold", passing_value, passing_notes],
-        ["Re-ID comparisons performed", reid_value, reid_notes],
-        ["Matches passing similarity threshold", match_value, match_notes],
-        ["Final fused pairs", fused_pairs_value, "From body_tracking/track_fusion.json"],
+        _wrap_row(["Step", "Count", "Notes"]),
+        _wrap_row(["Candidate overlaps considered", candidates_value, candidates_notes]),
+        _wrap_row(["Overlaps passing IoU threshold", passing_value, passing_notes]),
+        _wrap_row(["Re-ID comparisons performed", reid_value, reid_notes]),
+        _wrap_row(["Matches passing similarity threshold", match_value, match_notes]),
+        _wrap_row(["Final fused pairs", fused_pairs_value, "From body_tracking/track_fusion.json"]),
     ]
-    fusion_diag_table = Table(fusion_diag, colWidths=[2.2 * inch, 1.2 * inch, 2.1 * inch])
+    fusion_diag_table = Table(fusion_diag, colWidths=[2.0 * inch, 1.0 * inch, 2.5 * inch])
     fusion_diag_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2062,39 +2363,39 @@ def build_screentime_run_debug_pdf(
     # Configuration used with explanations
     story.append(Paragraph("Configuration (track_fusion.yaml):", subsection_style))
     fusion_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row([
             "track_fusion.enabled",
             str(track_fusion_config.get("track_fusion", {}).get("enabled", "N/A")),
             "Master switch for face-body fusion",
             "Enable to link face and body tracks for screen time",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "iou_threshold",
             str(iou_cfg.get("iou_threshold", "N/A")),
             "Min IoU for face-in-body association",
-            "↓ Lower: More associations | ↑ Higher: Stricter spatial overlap required",
-        ],
-        [
+            "Lower: More associations | Higher: Stricter spatial overlap",
+        ], cell_style_small),
+        _wrap_row([
             "min_overlap_ratio",
             str(iou_cfg.get("min_overlap_ratio", "N/A")),
             "Min face area inside body bbox",
-            "↓ Lower: Associate partial overlaps | ↑ Higher: Require face fully inside body",
-        ],
-        [
+            "Lower: Associate partial overlaps | Higher: Require face fully inside body",
+        ], cell_style_small),
+        _wrap_row([
             "reid_handoff.enabled",
             str(reid_cfg.get("enabled", "N/A")),
             "Use Re-ID when face disappears",
             "Enable to continue tracking via body when face turns away",
-        ],
-        [
+        ], cell_style_small),
+        _wrap_row([
             "similarity_threshold",
             str(reid_cfg.get("similarity_threshold", "N/A")),
             "Min Re-ID similarity for handoff",
-            "↓ Lower: More handoffs (+ errors) | ↑ Higher: Conservative, fewer handoffs",
-        ],
+            "Lower: More handoffs (+ errors) | Higher: Conservative",
+        ], cell_style_small),
     ]
-    fusion_config_table = Table(fusion_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    fusion_config_table = Table(fusion_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     fusion_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2122,13 +2423,13 @@ def build_screentime_run_debug_pdf(
     singleton_frac = singleton_count / len(identities_list) if identities_list else 0
 
     cluster_table_data = [
-        ["Metric", "Value", "Notes"],
-        ["Clusters (identities)", str(len(identities_list)), "Unique identity groups"],
-        ["Total Faces in Clusters", str(cluster_stats.get("faces", 0)), "Sum of face samples"],
-        ["Singleton Clusters", str(singleton_count), f"{singleton_frac:.1%} of total"],
-        ["Mixed Tracks", str(cluster_stats.get("mixed_tracks", 0)), "Tracks with multiple people (error)"],
-        ["Outlier Tracks", str(cluster_stats.get("outlier_tracks", 0)), "Rejected from clusters"],
-        ["Low Cohesion", str(cluster_stats.get("low_cohesion_identities", 0)), "Clusters with poor internal similarity"],
+        _wrap_row(["Metric", "Value", "Notes"]),
+        _wrap_row(["Clusters (identities)", str(len(identities_list)), "Unique identity groups"]),
+        _wrap_row(["Total Faces in Clusters", str(cluster_stats.get("faces", 0)), "Sum of face samples"]),
+        _wrap_row(["Singleton Clusters", str(singleton_count), f"{singleton_frac:.1%} of total"]),
+        _wrap_row(["Mixed Tracks", str(cluster_stats.get("mixed_tracks", 0)), "Tracks with multiple people (error)"]),
+        _wrap_row(["Outlier Tracks", str(cluster_stats.get("outlier_tracks", 0)), "Rejected from clusters"]),
+        _wrap_row(["Low Cohesion", str(cluster_stats.get("low_cohesion_identities", 0)), "Clusters with poor internal similarity"]),
     ]
     cluster_table = Table(cluster_table_data, colWidths=[2 * inch, 1 * inch, 2.5 * inch])
     cluster_table.setStyle(
@@ -2162,41 +2463,41 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Configuration (clustering.yaml):", subsection_style))
     singleton_merge_cfg = clustering_config.get("singleton_merge", {})
     cluster_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["Algorithm", "Agglomerative", "Hierarchical clustering method", "Groups similar embeddings bottom-up"],
-        ["Similarity Metric", "Cosine similarity", "How similarity is measured", "Distance used internally: 1 - cosine_similarity"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["Algorithm", "Agglomerative", "Hierarchical clustering method", "Groups similar embeddings bottom-up"], cell_style_small),
+        _wrap_row(["Similarity Metric", "Cosine similarity", "How similarity is measured", "Distance: 1 - cosine_similarity"], cell_style_small),
+        _wrap_row([
             "cluster_thresh",
             str(clustering_config.get("cluster_thresh", "N/A")),
-            "Cosine similarity threshold to merge clusters",
-            "↓ Lower: Merge more aggressively (fewer clusters) | ↑ Higher: Stricter merges (more clusters)",
-        ],
-        [
+            "Cosine similarity threshold to merge",
+            "Lower: Merge aggressively | Higher: Stricter",
+        ], cell_style_small),
+        _wrap_row([
             "min_cluster_size",
             str(clustering_config.get("min_cluster_size", "N/A")),
             "Min tracks per cluster",
-            "↑ Higher: Filter out brief appearances",
-        ],
-        [
+            "Higher: Filter brief appearances",
+        ], cell_style_small),
+        _wrap_row([
             "min_identity_sim",
             str(clustering_config.get("min_identity_sim", "N/A")),
             "Min similarity to cluster centroid",
-            "↓ Lower: Accept more outliers | ↑ Higher: Eject dissimilar tracks",
-        ],
-        [
+            "Lower: Accept outliers | Higher: Eject dissimilar",
+        ], cell_style_small),
+        _wrap_row([
             "singleton_merge",
             str(singleton_merge_cfg.get("enabled", "N/A")),
             "Second-pass merge for singletons",
-            "Enable if many single-track clusters; disable if over-merging",
-        ],
-        [
+            "Enable if many singletons; disable if over-merging",
+        ], cell_style_small),
+        _wrap_row([
             "merge.similarity_thresh",
             str(singleton_merge_cfg.get("similarity_thresh", "N/A")),
             "Looser threshold for singleton merge",
-            "↓ Lower: Merge more singletons | ↑ Higher: Conservative merge",
-        ],
+            "Lower: Merge more | Higher: Conservative",
+        ], cell_style_small),
     ]
-    cluster_config_table = Table(cluster_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    cluster_config_table = Table(cluster_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     cluster_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2439,40 +2740,40 @@ def build_screentime_run_debug_pdf(
     presets = screentime_config.get("screen_time_presets", {})
     active_preset = presets.get(preset, {})
     screentime_config_rows = [
-        ["Setting", "Value", "Description", "Tuning"],
-        ["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"],
-        [
+        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+        _wrap_row(["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"], cell_style_small),
+        _wrap_row([
             "quality_min",
             str(active_preset.get("quality_min", "N/A")),
             "Min detection quality to count",
-            "↓ Lower: Count blurry/profile faces | ↑ Higher: Only clear faces",
-        ],
-        [
+            "Lower: Count blurry faces | Higher: Only clear",
+        ], cell_style_small),
+        _wrap_row([
             "gap_tolerance_s",
             str(active_preset.get("gap_tolerance_s", "N/A")),
             "Max gap to merge into one segment",
-            "↓ Lower: More separate segments | ↑ Higher: Merge through cuts/occlusions",
-        ],
-        [
+            "Lower: More segments | Higher: Merge through cuts",
+        ], cell_style_small),
+        _wrap_row([
             "screen_time_mode",
             str(active_preset.get("screen_time_mode", "N/A")),
             "How to compute screen time",
-            "tracks: Use full track spans | faces: Only count detected frames",
-        ],
-        [
+            "tracks: Full spans | faces: Only detected frames",
+        ], cell_style_small),
+        _wrap_row([
             "edge_padding_s",
             str(active_preset.get("edge_padding_s", "N/A")),
             "Padding added to segment edges",
-            "↓ Lower: Conservative times | ↑ Higher: More generous counting",
-        ],
-        [
+            "Lower: Conservative | Higher: Generous counting",
+        ], cell_style_small),
+        _wrap_row([
             "track_coverage_min",
             str(active_preset.get("track_coverage_min", "N/A")),
             "Min detection coverage per track",
-            "↓ Lower: Count sparse tracks | ↑ Higher: Require consistent detection",
-        ],
+            "Lower: Count sparse | Higher: Require consistent",
+        ], cell_style_small),
     ]
-    screentime_config_table = Table(screentime_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
+    screentime_config_table = Table(screentime_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
     screentime_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -2579,9 +2880,10 @@ def build_screentime_run_debug_pdf(
         ))
 
     if tuning_suggestions:
-        tuning_table_data = [["Stage", "Issue", "Suggested Action"]]
-        tuning_table_data.extend(tuning_suggestions)
-        tuning_table = Table(tuning_table_data, colWidths=[1.3 * inch, 1.7 * inch, 3 * inch])
+        tuning_table_data = [_wrap_row(["Stage", "Issue", "Suggested Action"])]
+        for suggestion in tuning_suggestions:
+            tuning_table_data.append(_wrap_row(list(suggestion)))
+        tuning_table = Table(tuning_table_data, colWidths=[1.0 * inch, 1.8 * inch, 2.7 * inch])
         tuning_table.setStyle(
             TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fc8181")),
@@ -2609,22 +2911,25 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Complete listing of all referenced artifacts with status, size, and record counts:", body_style))
     story.append(Spacer(1, 8))
 
+    # "In Bundle" indicates whether the artifact is included when exporting as ZIP with include_artifacts=True
+    # ZIP bundle includes: .json, .jsonl files from run root + body_tracking/ + analytics/
+    # Excludes: .npy files, face_alignment/ subdirectory
     artifact_data = [
-        ["Artifact", "Status", "Size", "Records", "Stage"],
-        (*_artifact_row(detections_path), str(detect_count), "Face Detect"),
-        (*_artifact_row(tracks_path), str(track_count), "Face Track"),
-        (*_artifact_row(track_metrics_path), "-", "Face Track"),
-        (*_artifact_row(faces_path), str(faces_count), "Face Harvest"),
-        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed"),
-        (*_artifact_row(faces_npy), "-", "Face Embed"),
-        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster"),
-        (*_artifact_row(cluster_centroids_path), "-", "Cluster"),
-        (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect"),
-        (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track"),
-        (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion"),
-        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time"),
+        ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
+        (*_artifact_row(detections_path), str(detect_count), "Face Detect", "Yes"),
+        (*_artifact_row(tracks_path), str(track_count), "Face Track", "Yes"),
+        (*_artifact_row(track_metrics_path), "-", "Face Track", "Yes"),
+        (*_artifact_row(faces_path), str(faces_count), "Face Harvest", "Yes"),
+        (*_artifact_row(face_alignment_path, "face_alignment/aligned_faces.jsonl"), str(aligned_count), "Face Embed", "No"),
+        (*_artifact_row(faces_npy), "-", "Face Embed", "No"),
+        (*_artifact_row(identities_path), str(len(identities_list)), "Cluster", "Yes"),
+        (*_artifact_row(cluster_centroids_path), "-", "Cluster", "Yes"),
+        (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect", "Yes"),
+        (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track", "Yes"),
+        (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion", "Yes"),
+        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time", "Yes"),
     ]
-    artifact_table = Table(artifact_data, colWidths=[2.8 * inch, 0.7 * inch, 0.7 * inch, 0.6 * inch, 1 * inch])
+    artifact_table = Table(artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
     artifact_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
@@ -2659,13 +2964,13 @@ def build_screentime_run_debug_pdf(
             label="legacy/body_tracking/body_tracks.jsonl",
         )
         legacy_artifact_data = [
-            ["Artifact", "Status", "Size", "Records", "Stage"],
-            (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect"),
-            (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track"),
-            (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion"),
-            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time"),
+            ["Artifact", "Status", "Size", "Records", "Stage", "In Bundle"],
+            (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect", "No"),
+            (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track", "No"),
+            (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion", "No"),
+            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time", "No"),
         ]
-        legacy_table = Table(legacy_artifact_data, colWidths=[2.8 * inch, 0.7 * inch, 0.7 * inch, 0.6 * inch, 1 * inch])
+        legacy_table = Table(legacy_artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
         legacy_table.setStyle(
             TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4a5568")),
