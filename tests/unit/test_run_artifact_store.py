@@ -146,24 +146,23 @@ class TestRunLayoutS3Keys:
         import sys
         sys.path.insert(0, str(PROJECT_ROOT))
 
-        from py_screenalytics.run_layout import _parse_ep_id
+        from py_screenalytics.run_layout import parse_episode_routing
 
-        show, season, episode = _parse_ep_id("rhoslc-s06e11")
-        assert show == "rhoslc"
-        assert season == 6
-        assert episode == 11
+        routing = parse_episode_routing("rhoslc-s06e11")
+        assert routing is not None
+        assert routing.show == "rhoslc"
+        assert routing.season == 6
+        assert routing.episode == 11
 
     def test_parse_ep_id_fallback(self) -> None:
         """Test episode ID parsing fallback for non-standard format."""
         import sys
         sys.path.insert(0, str(PROJECT_ROOT))
 
-        from py_screenalytics.run_layout import _parse_ep_id
+        from py_screenalytics.run_layout import parse_episode_routing
 
-        show, season, episode = _parse_ep_id("custom-episode-id")
-        assert show == "custom-episode-id"
-        assert season == 0
-        assert episode == 0
+        routing = parse_episode_routing("custom-episode-id")
+        assert routing is None
 
 
 class TestSyncRunArtifactsToS3:
