@@ -1328,11 +1328,17 @@ def build_screentime_run_debug_pdf(
     if hydrated_from_s3:
         story.append(
             Paragraph(
-                "<b>Note:</b> Some run-scoped artifacts were loaded from S3 because local copies were missing "
+                "<b>Note:</b> hydrated_from_s3: <b>true</b>. Some run-scoped artifacts were loaded from S3 because local copies were missing "
                 "(commonly due to STORAGE_DELETE_LOCAL_AFTER_SYNC=1). File mtimes reflect hydration time.",
                 note_style,
             )
         )
+        hydrated_keys = sorted(
+            run_layout.run_artifact_s3_key(ep_id, run_id_norm, filename) for filename in hydrated_paths.keys()
+        )
+        story.append(Paragraph(f"Hydrated keys ({len(hydrated_keys)}):", subsection_style))
+        for key in hydrated_keys:
+            story.append(Paragraph(f"&bull; {key}", bullet_style))
         story.append(Spacer(1, 8))
 
     # =========================================================================
