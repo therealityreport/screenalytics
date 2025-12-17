@@ -511,6 +511,259 @@ def _diagnostic_note(condition: bool, message: str) -> str | None:
     return message if condition else None
 
 
+def _format_percent(
+    numerator: float | int | None,
+    denominator: float | int | None,
+    *,
+    na: str = "N/A",
+    signed: bool = False,
+) -> str:
+    """Format a percentage safely, returning `na` when denominator is 0/invalid."""
+    try:
+        numer = float(numerator or 0.0)
+        denom = float(denominator or 0.0)
+    except (TypeError, ValueError):
+        return na
+    if denom <= 0:
+        return na
+    pct = numer / denom * 100.0
+    return f"{pct:+.1f}%" if signed else f"{pct:.1f}%"
+
+
+def _format_mtime(path: Path) -> str:
+    try:
+        ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).replace(microsecond=0)
+    except OSError:
+        return "N/A"
+    return ts.isoformat().replace("+00:00", "Z")
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"true", "1", "yes", "y", "on"}:
+            return True
+        if cleaned in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _find_body_tracking_enabled(payload: Any) -> tuple[bool, str] | None:
+    """Best-effort extraction of body_tracking.enabled from job/request payloads."""
+    if not isinstance(payload, dict):
+        return None
+
+    def _check(root: dict[str, Any], prefix: str) -> tuple[bool, str] | None:
+        body_tracking_block = root.get("body_tracking")
+        if isinstance(body_tracking_block, dict):
+            enabled = _coerce_bool(body_tracking_block.get("enabled"))
+            if enabled is not None:
+                return enabled, f"{prefix}.body_tracking.enabled"
+        enabled = _coerce_bool(root.get("body_tracking_enabled"))
+        if enabled is not None:
+            return enabled, f"{prefix}.body_tracking_enabled"
+        enabled = _coerce_bool(root.get("enable_body_tracking"))
+        if enabled is not None:
+            return enabled, f"{prefix}.enable_body_tracking"
+        return None
+
+    # Common nesting patterns: request_json.options / request_json.requested
+    options = payload.get("options")
+    if isinstance(options, dict):
+        hit = _check(options, "options")
+        if hit is not None:
+            return hit
+    requested = payload.get("requested")
+    if isinstance(requested, dict):
+        hit = _check(requested, "requested")
+        if hit is not None:
+            return hit
+
+    # Direct top-level fallback.
+    return _check(payload, "request_json")
+
+
+def _track_fusion_overlap_diagnostics(
+    *,
+    face_tracks_path: Path,
+    body_tracks_path: Path,
+    iou_threshold: float,
+    min_overlap_ratio: float,
+    face_in_upper_body: bool,
+    upper_body_fraction: float,
+) -> dict[str, Any]:
+    """Compute overlap gating counts for fusion diagnostics.
+
+    This is best-effort and operates on available run artifacts:
+    - face: tracks.jsonl (bboxes_sampled)
+    - body: body_tracks.jsonl (detections list)
+    """
+    if not face_tracks_path.exists() or not body_tracks_path.exists():
+        return {
+            "ok": False,
+            "error": "missing_inputs",
+            "comparisons_total": 0,
+            "comparisons_considered": 0,
+            "pairs_considered": 0,
+            "comparisons_passing": 0,
+            "pairs_passing": 0,
+            "pairs_passing_min_frames": 0,
+            "frames_with_candidates": 0,
+        }
+
+    # Index body detections by frame.
+    body_by_frame: dict[int, list[tuple[int, list[float]]]] = {}
+    try:
+        with body_tracks_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                body_track_id = row.get("track_id")
+                if not isinstance(body_track_id, int):
+                    continue
+                detections = row.get("detections")
+                if not isinstance(detections, list):
+                    continue
+                for det in detections:
+                    if not isinstance(det, dict):
+                        continue
+                    frame_idx = det.get("frame_idx")
+                    bbox = det.get("bbox")
+                    if not isinstance(frame_idx, int) or not isinstance(bbox, list) or len(bbox) != 4:
+                        continue
+                    body_by_frame.setdefault(frame_idx, []).append((body_track_id, bbox))
+    except OSError:
+        return {
+            "ok": False,
+            "error": "read_error_body_tracks",
+            "comparisons_total": 0,
+            "comparisons_considered": 0,
+            "pairs_considered": 0,
+            "comparisons_passing": 0,
+            "pairs_passing": 0,
+            "pairs_passing_min_frames": 0,
+            "frames_with_candidates": 0,
+        }
+
+    def _face_in_upper(face_box: list[float], body_box: list[float]) -> bool:
+        if not face_in_upper_body:
+            return True
+        try:
+            fy = (float(face_box[1]) + float(face_box[3])) / 2.0
+            by1 = float(body_box[1])
+            by2 = float(body_box[3])
+        except (TypeError, ValueError, IndexError):
+            return False
+        upper_y = by1 + max(by2 - by1, 0.0) * float(upper_body_fraction)
+        return fy <= upper_y
+
+    def _iou_and_overlap_ratio(face_box: list[float], body_box: list[float]) -> tuple[float, float]:
+        try:
+            fx1, fy1, fx2, fy2 = (float(v) for v in face_box)
+            bx1, by1, bx2, by2 = (float(v) for v in body_box)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        ix1, iy1 = max(fx1, bx1), max(fy1, by1)
+        ix2, iy2 = min(fx2, bx2), min(fy2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0, 0.0
+        face_area = max(0.0, fx2 - fx1) * max(0.0, fy2 - fy1)
+        body_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = face_area + body_area - inter
+        iou = inter / union if union > 0 else 0.0
+        overlap_ratio = inter / face_area if face_area > 0 else 0.0
+        return iou, overlap_ratio
+
+    comparisons_total = 0
+    comparisons_considered = 0
+    comparisons_passing = 0
+    pairs_considered: set[tuple[int, int]] = set()
+    pairs_passing: set[tuple[int, int]] = set()
+    passing_frames_by_pair: dict[tuple[int, int], int] = {}
+    frames_with_candidates: set[int] = set()
+
+    try:
+        with face_tracks_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                face_track_id = row.get("track_id")
+                if not isinstance(face_track_id, int):
+                    continue
+                samples = row.get("bboxes_sampled")
+                if not isinstance(samples, list):
+                    continue
+                for sample in samples:
+                    if not isinstance(sample, dict):
+                        continue
+                    frame_idx = sample.get("frame_idx")
+                    face_box = sample.get("bbox_xyxy")
+                    if not isinstance(frame_idx, int) or not isinstance(face_box, list) or len(face_box) != 4:
+                        continue
+                    bodies = body_by_frame.get(frame_idx)
+                    if not bodies:
+                        continue
+                    frames_with_candidates.add(frame_idx)
+                    for body_track_id, body_box in bodies:
+                        comparisons_total += 1
+                        if not _face_in_upper(face_box, body_box):
+                            continue
+                        comparisons_considered += 1
+                        pair = (face_track_id, body_track_id)
+                        pairs_considered.add(pair)
+                        iou, overlap_ratio = _iou_and_overlap_ratio(face_box, body_box)
+                        if iou >= float(iou_threshold) and overlap_ratio >= float(min_overlap_ratio):
+                            comparisons_passing += 1
+                            pairs_passing.add(pair)
+                            passing_frames_by_pair[pair] = passing_frames_by_pair.get(pair, 0) + 1
+    except OSError:
+        return {
+            "ok": False,
+            "error": "read_error_face_tracks",
+            "comparisons_total": 0,
+            "comparisons_considered": 0,
+            "pairs_considered": 0,
+            "comparisons_passing": 0,
+            "pairs_passing": 0,
+            "pairs_passing_min_frames": 0,
+            "frames_with_candidates": 0,
+        }
+
+    pairs_passing_min_frames = sum(1 for count in passing_frames_by_pair.values() if count >= 3)
+
+    return {
+        "ok": True,
+        "error": None,
+        "comparisons_total": comparisons_total,
+        "comparisons_considered": comparisons_considered,
+        "pairs_considered": len(pairs_considered),
+        "comparisons_passing": comparisons_passing,
+        "pairs_passing": len(pairs_passing),
+        "pairs_passing_min_frames": pairs_passing_min_frames,
+        "frames_with_candidates": len(frames_with_candidates),
+    }
+
+
 def build_screentime_run_debug_pdf(
     *,
     ep_id: str,
@@ -527,10 +780,9 @@ def build_screentime_run_debug_pdf(
         raise FileNotFoundError(f"Run not found on disk: {run_root}")
 
     manifests_root = get_path(ep_id, "detections").parent
+    # Run-scoped body_tracking is authoritative for this report; legacy artifacts are diagnostic only.
     body_tracking_dir = run_root / "body_tracking"
-    # Fall back to episode-level body_tracking if run-scoped doesn't exist
-    if not body_tracking_dir.exists():
-        body_tracking_dir = manifests_root / "body_tracking"
+    legacy_body_tracking_dir = manifests_root / "body_tracking"
 
     # Load artifact paths
     detections_path = run_root / "detections.jsonl"
@@ -570,6 +822,8 @@ def build_screentime_run_debug_pdf(
 
     # Load DB data
     db_error: str | None = None
+    run_row: dict[str, Any] | None = None
+    job_runs: list[dict[str, Any]] = []
     identity_locks: list[dict[str, Any]] = []
     suggestion_batches: list[dict[str, Any]] = []
     suggestions_rows: list[dict[str, Any]] = []
@@ -577,6 +831,8 @@ def build_screentime_run_debug_pdf(
     try:
         from apps.api.services.run_persistence import run_persistence_service
 
+        run_row = run_persistence_service.get_run(ep_id=ep_id, run_id=run_id_norm)
+        job_runs = run_persistence_service.list_job_runs(ep_id=ep_id, run_id=run_id_norm)
         identity_locks = run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
         suggestion_batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=250)
         for batch in suggestion_batches:
@@ -694,10 +950,87 @@ def build_screentime_run_debug_pdf(
     # =========================================================================
     # RUN HEALTH (Quick Sanity Check)
     # =========================================================================
-    # Compute effective body_tracking status - check if artifacts exist even if config says disabled
-    body_config_enabled = body_detection_config.get("body_tracking", {}).get("enabled", False)
-    body_artifacts_exist = body_detections_path.exists() and _count_jsonl_lines(body_detections_path) > 0
-    body_enabled_effective = body_config_enabled or body_artifacts_exist
+    body_config_enabled = bool(body_detection_config.get("body_tracking", {}).get("enabled", False))
+
+    # Run-scoped body artifacts (authoritative for this run_id).
+    body_detect_count_run = _count_jsonl_lines(body_detections_path)
+    body_track_count_run = _count_jsonl_lines(body_tracks_path)
+    body_artifacts_exist_run = body_detect_count_run > 0 or body_track_count_run > 0
+
+    # Legacy body artifacts (diagnostic only; promoted from some run_id).
+    legacy_body_detections_path = legacy_body_tracking_dir / "body_detections.jsonl"
+    legacy_body_tracks_path = legacy_body_tracking_dir / "body_tracks.jsonl"
+    legacy_track_fusion_path = legacy_body_tracking_dir / "track_fusion.json"
+    legacy_screentime_comparison_path = legacy_body_tracking_dir / "screentime_comparison.json"
+    legacy_body_detect_count = _count_jsonl_lines(legacy_body_detections_path)
+    legacy_body_track_count = _count_jsonl_lines(legacy_body_tracks_path)
+    legacy_body_artifacts_exist = (
+        legacy_body_detect_count > 0
+        or legacy_body_track_count > 0
+        or legacy_track_fusion_path.exists()
+        or legacy_screentime_comparison_path.exists()
+    )
+
+    # Determine whether body tracking ran for this run_id from run-scoped markers/artifacts.
+    run_body_tracking_marker = _read_json(run_root / "body_tracking.json")
+    body_tracking_ran_effective = (
+        isinstance(run_body_tracking_marker, dict)
+        and run_body_tracking_marker.get("status") == "success"
+        and run_body_tracking_marker.get("run_id") == run_id_norm
+    ) or body_artifacts_exist_run
+    body_tracking_effective_source = "run marker" if isinstance(run_body_tracking_marker, dict) else "artifacts"
+
+    # Legacy marker run_id (helps detect stale/out-of-scope body artifacts).
+    legacy_body_marker = _read_json(manifests_root / "runs" / "body_tracking.json")
+    legacy_body_marker_run_id = legacy_body_marker.get("run_id") if isinstance(legacy_body_marker, dict) else None
+    legacy_body_same_run = legacy_body_marker_run_id == run_id_norm if legacy_body_marker_run_id else False
+    legacy_body_out_of_scope = legacy_body_artifacts_exist and not legacy_body_same_run and not body_artifacts_exist_run
+
+    override_source: str = "N/A"
+    preset_name: str | None = None
+    cli_command: str | None = None
+    if body_config_enabled != bool(body_tracking_ran_effective) or legacy_body_out_of_scope:
+        override_source_hit: tuple[bool, str] | None = None
+        for job_run in job_runs:
+            if not isinstance(job_run, dict):
+                continue
+            req = job_run.get("request_json")
+            if cli_command is None and isinstance(req, dict) and isinstance(req.get("command"), list):
+                cli_command = " ".join(str(part) for part in req.get("command") if part is not None)
+            override_source_hit = _find_body_tracking_enabled(job_run.get("request_json"))
+            if override_source_hit is not None:
+                break
+        if override_source_hit is not None:
+            override_source = f"job_runs.request_json ({override_source_hit[1]})"
+        else:
+            run_cfg = run_row.get("config_json") if isinstance(run_row, dict) else None
+            override_source_hit = _find_body_tracking_enabled({"options": run_cfg} if isinstance(run_cfg, dict) else None)
+            if override_source_hit is not None:
+                override_source = f"runs.config_json ({override_source_hit[1]})"
+            else:
+                override_source = "Override source not found; artifacts may be stale for this run_id."
+        if preset_name is None:
+            for job_run in job_runs:
+                if not isinstance(job_run, dict):
+                    continue
+                req = job_run.get("request_json")
+                if not isinstance(req, dict):
+                    continue
+                for key in ("options", "requested"):
+                    block = req.get(key)
+                    if isinstance(block, dict):
+                        preset = block.get("preset") or block.get("profile")
+                        if isinstance(preset, str) and preset.strip():
+                            preset_name = preset.strip()
+                            break
+                if preset_name is not None:
+                    break
+        if preset_name is None and isinstance(run_row, dict):
+            run_cfg = run_row.get("config_json")
+            if isinstance(run_cfg, dict):
+                preset = run_cfg.get("preset") or run_cfg.get("profile")
+                if isinstance(preset, str) and preset.strip():
+                    preset_name = preset.strip()
 
     # Get fused pairs count (identities with both face AND body tracks)
     fusion_identities = track_fusion_data.get("identities", {})
@@ -723,8 +1056,16 @@ def build_screentime_run_debug_pdf(
         ["Health Check", "Status", "Details"],
         ["DB Connected", _health_status(db_connected),
          "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")],
-        ["Body Tracking Ran", _health_status(body_enabled_effective),
-         f"Config: {'enabled' if body_config_enabled else 'disabled'} | Artifacts: {'present' if body_artifacts_exist else 'missing'}"],
+        [
+            "Body Tracking Ran (run-scoped)",
+            _health_status(bool(body_tracking_ran_effective)),
+            f"YAML enabled={'true' if body_config_enabled else 'false'} | dets={body_detect_count_run} tracks={body_track_count_run}",
+        ],
+        [
+            "Legacy Body Artifacts Present",
+            _health_status(legacy_body_artifacts_exist),
+            f"legacy_run_id={legacy_body_marker_run_id or 'unknown'} | out_of_scope={'yes' if legacy_body_out_of_scope else 'no'}",
+        ],
         ["Face-Body Pairs Fused", _health_status(actual_fused_pairs > 0),
          f"{actual_fused_pairs} pairs" if actual_fused_pairs > 0 else "No fusion occurred"],
         ["Face Duration Tracked", _health_status(face_only_duration > 0),
@@ -742,21 +1083,49 @@ def build_screentime_run_debug_pdf(
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             # Color code the status column
             ("TEXTCOLOR", (1, 1), (1, 1), colors.green if db_connected else colors.red),
-            ("TEXTCOLOR", (1, 2), (1, 2), colors.green if body_enabled_effective else colors.red),
-            ("TEXTCOLOR", (1, 3), (1, 3), colors.green if actual_fused_pairs > 0 else colors.red),
-            ("TEXTCOLOR", (1, 4), (1, 4), colors.green if face_only_duration > 0 else colors.red),
+            ("TEXTCOLOR", (1, 2), (1, 2), colors.green if body_tracking_ran_effective else colors.red),
+            ("TEXTCOLOR", (1, 3), (1, 3), colors.HexColor("#d69e2e") if legacy_body_out_of_scope else (colors.green if legacy_body_artifacts_exist else colors.red)),
+            ("TEXTCOLOR", (1, 4), (1, 4), colors.green if actual_fused_pairs > 0 else colors.red),
+            ("TEXTCOLOR", (1, 5), (1, 5), colors.green if face_only_duration > 0 else colors.red),
         ])
     )
     story.append(Paragraph("Run Health", subsection_style))
     story.append(health_table)
 
-    # Add warning if config/artifact mismatch for body tracking
-    if body_artifacts_exist and not body_config_enabled:
+    if body_config_enabled != bool(body_tracking_ran_effective) or legacy_body_out_of_scope:
         story.append(Paragraph(
-            "⚠️ <b>Config Mismatch:</b> body_tracking.enabled=False in config but body artifacts exist. "
-            "Artifacts may be from a previous run or the config was overridden at runtime.",
+            "⚠️ <b>Body Tracking Diagnostic:</b> body_tracking.enabled (YAML) does not match the effective run-scoped state "
+            "or only legacy artifacts are present.",
             warning_style
         ))
+        diag_rows = [
+            ["Field", "Value"],
+            ["body_tracking.enabled (YAML)", str(body_config_enabled)],
+            ["body_tracking.ran_effective (run-scoped)", str(bool(body_tracking_ran_effective))],
+            ["override_source", override_source],
+            ["preset/profile (if any)", str(preset_name or "N/A")],
+            ["cli_command (if captured)", (cli_command[:120] + "...") if cli_command and len(cli_command) > 120 else (cli_command or "N/A")],
+            ["legacy_body_tracking.run_id (marker)", str(legacy_body_marker_run_id or "N/A")],
+            ["legacy_body_tracking.out_of_scope", "yes" if legacy_body_out_of_scope else "no"],
+            ["run/body_tracking/body_detections.jsonl mtime", _format_mtime(body_detections_path)],
+            ["run/body_tracking/body_tracks.jsonl mtime", _format_mtime(body_tracks_path)],
+            ["legacy/body_tracking/body_detections.jsonl mtime", _format_mtime(legacy_body_detections_path)],
+            ["legacy/body_tracking/body_tracks.jsonl mtime", _format_mtime(legacy_body_tracks_path)],
+            ["legacy/body_tracking/track_fusion.json mtime", _format_mtime(legacy_track_fusion_path)],
+            ["legacy/body_tracking/screentime_comparison.json mtime", _format_mtime(legacy_screentime_comparison_path)],
+        ]
+        diag_table = Table(diag_rows, colWidths=[3.1 * inch, 2.4 * inch])
+        diag_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ])
+        )
+        story.append(diag_table)
 
     story.append(Spacer(1, 12))
 
@@ -816,15 +1185,78 @@ def build_screentime_run_debug_pdf(
         ["Generated At", _now_iso()],
     ]
 
-    # Try to get video metadata if available
+    # Video metadata (best-effort, prefer run-scoped markers when present)
     video_meta_path = manifests_root / "video_metadata.json"
-    video_meta = _read_json(video_meta_path) or {}
-    if video_meta:
-        lineage_data.extend([
-            ["Video Duration", f"{video_meta.get('duration', 'N/A')}s"],
-            ["Frame Rate", f"{video_meta.get('fps', 'N/A')} fps"],
-            ["Resolution", f"{video_meta.get('width', '?')}x{video_meta.get('height', '?')}"],
-        ])
+    video_meta = _read_json(video_meta_path) if video_meta_path.exists() else None
+    detect_track_marker = _read_json(run_root / "detect_track.json") if (run_root / "detect_track.json").exists() else None
+    progress_marker = _read_json(run_root / "progress.json") if (run_root / "progress.json").exists() else None
+
+    video_duration_s = None
+    fps_value = None
+    stride_value = None
+    frames_total_value = None
+    width_value = None
+    height_value = None
+
+    if isinstance(video_meta, dict):
+        video_duration_s = video_meta.get("duration") or video_meta.get("duration_sec")
+        fps_value = video_meta.get("fps")
+        width_value = video_meta.get("width")
+        height_value = video_meta.get("height")
+        frames_total_value = video_meta.get("frame_count") or video_meta.get("frames_total")
+        stride_value = video_meta.get("stride") or video_meta.get("detect_every_n_frames")
+
+    if isinstance(detect_track_marker, dict):
+        video_duration_s = detect_track_marker.get("video_duration_sec", video_duration_s)
+        fps_value = detect_track_marker.get("fps", fps_value)
+        frames_total_value = detect_track_marker.get("frames_total", frames_total_value)
+        stride_value = detect_track_marker.get("stride", stride_value)
+
+    if isinstance(progress_marker, dict):
+        frames_total_value = progress_marker.get("frames_total", frames_total_value)
+        stride_value = progress_marker.get("stride", stride_value)
+        fps_value = progress_marker.get("fps_detected", fps_value) or progress_marker.get("fps_infer", fps_value)
+
+    # If width/height still missing, probe the video file header when available.
+    if width_value is None or height_value is None:
+        try:
+            video_path = get_path(ep_id, "video")
+            if video_path.exists():
+                try:
+                    import cv2  # type: ignore
+                except Exception:
+                    cv2 = None  # type: ignore
+                if cv2 is not None:
+                    cap = cv2.VideoCapture(str(video_path))
+                    try:
+                        if cap.isOpened():
+                            width_probe = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                            height_probe = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                            if width_value is None and width_probe:
+                                width_value = int(width_probe)
+                            if height_value is None and height_probe:
+                                height_value = int(height_probe)
+                    finally:
+                        cap.release()
+        except Exception:
+            pass
+
+    if video_duration_s is not None:
+        try:
+            lineage_data.append(["Video Duration", f"{float(video_duration_s):.2f}s"])
+        except (TypeError, ValueError):
+            lineage_data.append(["Video Duration", str(video_duration_s)])
+    if fps_value is not None:
+        try:
+            lineage_data.append(["Frame Rate", f"{float(fps_value):.3g} fps"])
+        except (TypeError, ValueError):
+            lineage_data.append(["Frame Rate", f"{fps_value} fps"])
+    if width_value is not None or height_value is not None:
+        lineage_data.append(["Resolution", f"{width_value or '?'}x{height_value or '?'}"])
+    if frames_total_value is not None:
+        lineage_data.append(["Total Frames Processed", str(frames_total_value)])
+    if stride_value is not None:
+        lineage_data.append(["Sampling Stride", str(stride_value)])
 
     # Model versions
     lineage_data.extend([
@@ -1074,29 +1506,44 @@ def build_screentime_run_debug_pdf(
     # SECTION 4: BODY DETECT
     # =========================================================================
     story.append(Paragraph("4. Body Detect", section_style))
-    body_detect_count = _count_jsonl_lines(body_detections_path)
+    body_detect_count = body_detect_count_run
     story.append(Paragraph(f"Total body detections: <b>{body_detect_count}</b>", body_style))
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (body_detection.yaml):", subsection_style))
     person_det_cfg = body_detection_config.get("person_detection", {})
 
-    # Show effective body_tracking status with explanation
-    body_effective_str = f"{body_enabled_effective} (effective)"
-    if body_artifacts_exist and not body_config_enabled:
-        body_effective_str = "True (artifacts exist, config=False)"
-    elif body_config_enabled:
-        body_effective_str = "True (config=True)"
-    else:
-        body_effective_str = "False"
+    override_source_value = "N/A"
+    override_source_desc = "No override detected"
+    if override_source.startswith("job_runs.request_json"):
+        override_source_value = "job_runs.request_json"
+        override_source_desc = override_source
+    elif override_source.startswith("runs.config_json"):
+        override_source_value = "runs.config_json"
+        override_source_desc = override_source
+    elif override_source.startswith("Override source not found"):
+        override_source_value = "unknown"
+        override_source_desc = override_source
 
     body_detect_config_rows = [
         ["Setting", "Value", "Description", "Tuning"],
         [
-            "body_tracking.enabled",
-            body_effective_str,
-            "Master switch for body detection (resolved effective value)",
-            "Enable to track people when face not visible",
+            "body_tracking.enabled (YAML)",
+            str(body_config_enabled),
+            "Config value from config/pipeline/body_detection.yaml",
+            "Enable to run body tracking in detect_track",
+        ],
+        [
+            "body_tracking.ran_effective",
+            str(bool(body_tracking_ran_effective)),
+            "Resolved from run-scoped marker/artifacts for this run_id",
+            "If false but legacy artifacts exist, artifacts may be stale",
+        ],
+        [
+            "body_tracking.override_source",
+            override_source_value,
+            override_source_desc,
+            "If unknown, verify artifact scope + mtimes",
         ],
         [
             "model",
@@ -1141,12 +1588,34 @@ def build_screentime_run_debug_pdf(
 
     story.append(Paragraph("Artifacts:", subsection_style))
     story.append(Paragraph(f"&bull; body_tracking/body_detections.jsonl ({_file_size_str(body_detections_path)}) - {body_detect_count} records", bullet_style))
+    if legacy_body_artifacts_exist or body_artifacts_exist_run:
+        story.append(Paragraph("Body Artifact Timestamps (mtime, UTC):", subsection_style))
+        mtime_table = Table(
+            [
+                ["Artifact", "Run-scoped", "Legacy"],
+                ["body_detections.jsonl", _format_mtime(body_detections_path), _format_mtime(legacy_body_detections_path)],
+                ["body_tracks.jsonl", _format_mtime(body_tracks_path), _format_mtime(legacy_body_tracks_path)],
+                ["track_fusion.json", _format_mtime(track_fusion_path), _format_mtime(legacy_track_fusion_path)],
+                ["screentime_comparison.json", _format_mtime(screentime_comparison_path), _format_mtime(legacy_screentime_comparison_path)],
+            ],
+            colWidths=[1.8 * inch, 2.0 * inch, 2.0 * inch],
+        )
+        mtime_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ])
+        )
+        story.append(mtime_table)
 
     # =========================================================================
     # SECTION 5: BODY TRACK
     # =========================================================================
     story.append(Paragraph("5. Body Track", section_style))
-    body_track_count = _count_jsonl_lines(body_tracks_path)
+    body_track_count = body_track_count_run
     story.append(Paragraph(f"Total body tracks: <b>{body_track_count}</b>", body_style))
 
     # Configuration used with explanations
@@ -1215,7 +1684,7 @@ def build_screentime_run_debug_pdf(
         ["Face Tracks (input)", str(track_fusion_data.get("num_face_tracks", 0)), "From tracks.jsonl"],
         ["Body Tracks (input)", str(track_fusion_data.get("num_body_tracks", 0)), "From body_tracks.jsonl"],
         ["Total Tracked IDs", str(num_fused), "Union of face + body (NOT fused pairs)"],
-        ["Actual Fused Pairs", str(actual_fused_pairs), "Identities with both face AND body tracks"],
+        ["Actual Fused Pairs", str(actual_fused_pairs), "Mappings with both face AND body track IDs"],
     ]
     fusion_table = Table(fusion_stats, colWidths=[2 * inch, 1.2 * inch, 2.3 * inch])
     fusion_table.setStyle(
@@ -1229,10 +1698,91 @@ def build_screentime_run_debug_pdf(
     )
     story.append(fusion_table)
 
-    # Configuration used with explanations
-    story.append(Paragraph("Configuration (track_fusion.yaml):", subsection_style))
+    # Fusion Diagnostics (intermediate counts so "0 fused pairs" is explainable)
     iou_cfg = track_fusion_config.get("iou_association", {})
     reid_cfg = track_fusion_config.get("reid_handoff", {})
+
+    try:
+        iou_threshold = float(iou_cfg.get("iou_threshold", 0.50))
+    except (TypeError, ValueError):
+        iou_threshold = 0.50
+    try:
+        min_overlap_ratio = float(iou_cfg.get("min_overlap_ratio", 0.70))
+    except (TypeError, ValueError):
+        min_overlap_ratio = 0.70
+    face_in_upper_body = bool(iou_cfg.get("face_in_upper_body", True))
+    try:
+        upper_body_fraction = float(iou_cfg.get("upper_body_fraction", 0.5))
+    except (TypeError, ValueError):
+        upper_body_fraction = 0.5
+
+    overlap_diag = _track_fusion_overlap_diagnostics(
+        face_tracks_path=tracks_path,
+        body_tracks_path=body_tracks_path,
+        iou_threshold=iou_threshold,
+        min_overlap_ratio=min_overlap_ratio,
+        face_in_upper_body=face_in_upper_body,
+        upper_body_fraction=upper_body_fraction,
+    )
+
+    if overlap_diag.get("ok"):
+        candidates_value = f"{overlap_diag['comparisons_considered']} comparisons"
+        candidates_notes = (
+            f"{overlap_diag['pairs_considered']} pairs across {overlap_diag['frames_with_candidates']} frames"
+        )
+        passing_value = f"{overlap_diag['comparisons_passing']} comparisons"
+        passing_notes = (
+            f"{overlap_diag['pairs_passing']} pairs; {overlap_diag['pairs_passing_min_frames']} pairs with ≥3 frames"
+        )
+    else:
+        candidates_value = "unavailable"
+        candidates_notes = str(overlap_diag.get("error") or "unknown")
+        passing_value = "unavailable"
+        passing_notes = str(overlap_diag.get("error") or "unknown")
+
+    reid_enabled = bool(reid_cfg.get("enabled", False))
+    reid_similarity = reid_cfg.get("similarity_threshold")
+    body_embeddings_path = body_tracking_dir / "body_embeddings.npy"
+    if not reid_enabled:
+        reid_value = "N/A"
+        reid_notes = "reid_handoff.enabled=false"
+        match_value = "N/A"
+        match_notes = "Re-ID disabled"
+    elif not body_embeddings_path.exists():
+        reid_value = "0"
+        reid_notes = "body_embeddings.npy missing"
+        match_value = "0"
+        match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+    else:
+        reid_value = "0"
+        reid_notes = "Re-ID handoff not available in current fusion inputs"
+        match_value = "0"
+        match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+
+    story.append(Paragraph("Fusion Diagnostics", subsection_style))
+    fusion_diag = [
+        ["Step", "Count", "Notes"],
+        ["Candidate overlaps considered", candidates_value, candidates_notes],
+        ["Overlaps passing IoU threshold", passing_value, passing_notes],
+        ["Re-ID comparisons performed", reid_value, reid_notes],
+        ["Matches passing similarity threshold", match_value, match_notes],
+        ["Final fused pairs", str(actual_fused_pairs), "From body_tracking/track_fusion.json"],
+    ]
+    fusion_diag_table = Table(fusion_diag, colWidths=[2.2 * inch, 1.2 * inch, 2.1 * inch])
+    fusion_diag_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ])
+    )
+    story.append(fusion_diag_table)
+
+    # Configuration used with explanations
+    story.append(Paragraph("Configuration (track_fusion.yaml):", subsection_style))
     fusion_config_rows = [
         ["Setting", "Value", "Description", "Tuning"],
         [
@@ -1336,12 +1886,12 @@ def build_screentime_run_debug_pdf(
     cluster_config_rows = [
         ["Setting", "Value", "Description", "Tuning"],
         ["Algorithm", "Agglomerative", "Hierarchical clustering method", "Groups similar embeddings bottom-up"],
-        ["Distance Metric", "Cosine", "How similarity is measured", "distance = 1 - cosine_similarity"],
+        ["Similarity Metric", "Cosine similarity", "How similarity is measured", "Distance used internally: 1 - cosine_similarity"],
         [
             "cluster_thresh",
             str(clustering_config.get("cluster_thresh", "N/A")),
-            "Max distance to merge clusters",
-            "↓ Lower: Merge more aggressively (fewer clusters) | ↑ Higher: More separate identities",
+            "Cosine similarity threshold to merge clusters",
+            "↓ Lower: Merge more aggressively (fewer clusters) | ↑ Higher: Stricter merges (more clusters)",
         ],
         [
             "min_cluster_size",
@@ -1381,6 +1931,10 @@ def build_screentime_run_debug_pdf(
         ])
     )
     story.append(cluster_config_table)
+    story.append(Paragraph(
+        "<b>Note:</b> cluster_thresh interpreted as <b>similarity</b> threshold.",
+        note_style
+    ))
 
     story.append(Paragraph("Artifacts:", subsection_style))
     story.append(Paragraph(f"&bull; identities.json ({_file_size_str(identities_path)}) - {len(identities_list)} identities", bullet_style))
@@ -1424,10 +1978,16 @@ def build_screentime_run_debug_pdf(
             warning_style
         ))
         story.append(Paragraph(
-            "<b>Impact:</b> Identity locks and suggestion history may be incomplete. "
-            "DB-sourced counts (locks, batches, suggestions) should be treated as approximations.",
+            "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
             note_style
         ))
+        manual_assignments = identities_data.get("manual_assignments")
+        manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
+        if manual_assignments_count > 0:
+            story.append(Paragraph(
+                f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
+                note_style
+            ))
 
     story.append(Paragraph("Data Sources:", subsection_style))
     story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
@@ -1488,13 +2048,15 @@ def build_screentime_run_debug_pdf(
     combined_duration = screentime_summary.get("total_combined_duration", 0)
     duration_gain = screentime_summary.get("total_duration_gain", 0)
     body_only_duration = combined_duration - face_only_duration if combined_duration > face_only_duration else 0
+    gain_vs_combined_pct = _format_percent(duration_gain, combined_duration, na="N/A")
+    gain_vs_face_only_pct = _format_percent(duration_gain, face_only_duration, na="N/A")
 
     screentime_breakdown = [
         ["Source", "Duration", "% of Combined"],
-        ["Face-only segments", f"{face_only_duration:.2f}s", f"{(face_only_duration/combined_duration*100) if combined_duration > 0 else 0:.1f}%"],
-        ["Body-only segments", f"{body_only_duration:.2f}s", f"{(body_only_duration/combined_duration*100) if combined_duration > 0 else 0:.1f}%"],
+        ["Face-only segments", f"{face_only_duration:.2f}s", _format_percent(face_only_duration, combined_duration, na="N/A")],
+        ["Body-only segments", f"{body_only_duration:.2f}s", _format_percent(body_only_duration, combined_duration, na="N/A")],
         ["Combined Total", f"{combined_duration:.2f}s", "100%"],
-        ["Gain from Body Tracking", f"+{duration_gain:.2f}s", f"+{(duration_gain/face_only_duration*100) if face_only_duration > 0 else 0:.1f}%"],
+        ["Gain from Body Tracking (vs Combined)", f"+{duration_gain:.2f}s", gain_vs_combined_pct],
     ]
     screentime_table = Table(screentime_breakdown, colWidths=[2 * inch, 1.5 * inch, 1.5 * inch])
     screentime_table.setStyle(
@@ -1510,6 +2072,27 @@ def build_screentime_run_debug_pdf(
     )
     story.append(screentime_table)
 
+    # Explicitly report the two gain % references so "0.0%" isn't printed when face_only == 0.
+    story.append(Spacer(1, 6))
+    gain_pct_table = Table(
+        [
+            ["Gain % Reference", "Value"],
+            ["Gain vs Combined Total", gain_vs_combined_pct],
+            ["Gain vs Face-only Total", gain_vs_face_only_pct],
+        ],
+        colWidths=[2.2 * inch, 2.8 * inch],
+    )
+    gain_pct_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ])
+    )
+    story.append(gain_pct_table)
+
     # Adjust wording based on whether fusion actually occurred
     if actual_fused_pairs > 0:
         story.append(Paragraph(
@@ -1517,7 +2100,7 @@ def build_screentime_run_debug_pdf(
             f"from {actual_fused_pairs} fused face-body pair(s) where faces turned away but bodies remained visible.",
             note_style
         ))
-    elif body_enabled_effective and body_track_count > 0:
+    elif body_tracking_ran_effective and body_track_count > 0:
         story.append(Paragraph(
             "<b>Note:</b> Body tracking ran but no face-body pairs were successfully fused. "
             "This may indicate IoU/Re-ID thresholds need tuning, or faces and bodies didn't overlap temporally.",
@@ -1532,8 +2115,8 @@ def build_screentime_run_debug_pdf(
 
     # Additional stats
     story.append(Spacer(1, 8))
-    story.append(Paragraph(f"Total identities analyzed: <b>{screentime_summary.get('total_identities', 0)}</b>", body_style))
-    story.append(Paragraph(f"Identities with gain: <b>{screentime_summary.get('identities_with_gain', 0)}</b>", body_style))
+    story.append(Paragraph(f"Total tracked IDs analyzed: <b>{screentime_summary.get('total_identities', 0)}</b>", body_style))
+    story.append(Paragraph(f"Tracked IDs with gain: <b>{screentime_summary.get('identities_with_gain', 0)}</b>", body_style))
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (screen_time_v2.yaml):", subsection_style))
