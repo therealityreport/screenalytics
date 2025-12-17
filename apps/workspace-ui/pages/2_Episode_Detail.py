@@ -5107,71 +5107,106 @@ if not selected_attempt_run_id:
 else:
     st.caption(f"Exporting run_id: `{selected_attempt_run_id}`")
     opt_key_prefix = f"{ep_id}::{selected_attempt_run_id}::export_bundle"
-    include_artifacts = st.checkbox(
-        "Include raw artifacts (tracks/faces/identities)",
-        value=True,
-        key=f"{opt_key_prefix}::include_artifacts",
+    export_format_label = st.radio(
+        "Export format",
+        options=("PDF debug report", "ZIP raw bundle"),
+        index=0,
+        key=f"{opt_key_prefix}::format",
+        horizontal=True,
     )
-    include_images = st.checkbox(
-        "Include thumbnails/crops/frames (very large)",
-        value=False,
-        key=f"{opt_key_prefix}::include_images",
-    )
-    include_logs = st.checkbox(
-        "Include logs (recommended)",
-        value=True,
-        key=f"{opt_key_prefix}::include_logs",
-    )
+    export_format = "zip" if export_format_label.startswith("ZIP") else "pdf"
 
-    export_state_key = f"{opt_key_prefix}::payload"
+    include_artifacts = True
+    include_images = False
+    include_logs = True
+    if export_format == "zip":
+        include_artifacts = st.checkbox(
+            "Include raw artifacts (tracks/faces/identities)",
+            value=True,
+            key=f"{opt_key_prefix}::include_artifacts",
+        )
+        include_images = st.checkbox(
+            "Include thumbnails/crops/frames (very large)",
+            value=False,
+            key=f"{opt_key_prefix}::include_images",
+        )
+        include_logs = st.checkbox(
+            "Include logs (recommended)",
+            value=True,
+            key=f"{opt_key_prefix}::include_logs",
+        )
+    else:
+        st.caption("PDF export is a self-contained report (toggles apply to ZIP only).")
+
+    export_state_key = f"{opt_key_prefix}::payload::{export_format}"
+    export_button_label = "Generate Debug Report (PDF)" if export_format == "pdf" else "Export Run Debug Bundle (ZIP)"
     export_clicked = st.button(
-        "Export Run Debug Bundle",
-        key=f"{opt_key_prefix}::export",
+        export_button_label,
+        key=f"{opt_key_prefix}::export::{export_format}",
         type="primary",
         use_container_width=False,
     )
     if export_clicked:
-        with st.spinner("Building run debug bundle…"):
+        with st.spinner("Building export…"):
             url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{selected_attempt_run_id}/export"
-            params = {
-                "include_artifacts": "1" if include_artifacts else "0",
-                "include_images": "1" if include_images else "0",
-                "include_logs": "1" if include_logs else "0",
-            }
+            params = {"format": export_format}
+            if export_format == "zip":
+                params.update(
+                    {
+                        "include_artifacts": "1" if include_artifacts else "0",
+                        "include_images": "1" if include_images else "0",
+                        "include_logs": "1" if include_logs else "0",
+                    }
+                )
             try:
                 resp = requests.get(url, params=params, timeout=300)
                 resp.raise_for_status()
             except requests.RequestException as exc:
                 st.error(helpers.describe_error(url, exc))
             else:
+                content_type = resp.headers.get("Content-Type", "") or ""
+                mime = content_type.split(";", 1)[0].strip()
+                if not mime:
+                    mime = "application/pdf" if export_format == "pdf" else "application/zip"
                 content_disp = resp.headers.get("Content-Disposition", "") or ""
                 filename = None
                 if "filename=" in content_disp:
                     filename = content_disp.split("filename=", 1)[1].strip().strip('"')
                 if not filename:
-                    filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+                    if export_format == "pdf":
+                        filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
+                    else:
+                        filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
                 st.session_state[export_state_key] = {
                     "filename": filename,
                     "bytes": resp.content,
+                    "mime": mime,
                 }
 
     bundle = st.session_state.get(export_state_key)
     if isinstance(bundle, dict) and bundle.get("bytes"):
         file_bytes = bundle.get("bytes") or b""
-        filename = bundle.get("filename") or f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+        mime = bundle.get("mime") or ("application/pdf" if export_format == "pdf" else "application/zip")
+        default_name = (
+            f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
+            if export_format == "pdf"
+            else f"screenalytics_{ep_id}_{selected_attempt_run_id}_run_debug_bundle.zip"
+        )
+        filename = bundle.get("filename") or default_name
+        download_label = "Download .pdf" if export_format == "pdf" else "Download .zip"
         try:
-            st.caption(f"Bundle ready: {len(file_bytes) / 1_048_576:.1f} MiB")
+            st.caption(f"Export ready: {len(file_bytes) / 1_048_576:.1f} MiB")
         except Exception:
             pass
         st.download_button(
-            "Download .zip",
+            download_label,
             data=file_bytes,
             file_name=filename,
-            mime="application/zip",
-            key=f"{opt_key_prefix}::download",
+            mime=mime,
+            key=f"{opt_key_prefix}::download::{export_format}",
             use_container_width=False,
         )
-        if st.button("Clear bundle", key=f"{opt_key_prefix}::clear_bundle"):
+        if st.button("Clear export", key=f"{opt_key_prefix}::clear_bundle::{export_format}"):
             st.session_state.pop(export_state_key, None)
             st.rerun()
 

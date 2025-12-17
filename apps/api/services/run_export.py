@@ -331,6 +331,14 @@ def build_run_debug_bundle_zip(
                 json.dumps(applied_payload, indent=2, ensure_ascii=False),
             )
 
+            # Always include the PDF debug report for quick inspection.
+            try:
+                pdf_bytes, _pdf_name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id_norm)
+            except Exception as exc:
+                LOGGER.warning("[export] Failed to build debug report PDF: %s", exc)
+            else:
+                zip_handle.writestr("debug_report.pdf", pdf_bytes)
+
             # Run-scoped artifacts
             if include_artifacts:
                 for filename in (
@@ -848,27 +856,57 @@ def build_screentime_run_debug_pdf(
     detect_count = _count_jsonl_lines(detections_path)
     story.append(Paragraph(f"Total face detections: <b>{detect_count}</b>", body_style))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (detection.yaml):", subsection_style))
     detect_config_rows = [
-        ["Setting", "Value"],
-        ["model_id", detection_config.get("model_id", "N/A")],
-        ["confidence_th", str(detection_config.get("confidence_th", "N/A"))],
-        ["min_size", str(detection_config.get("min_size", "N/A"))],
-        ["iou_th", str(detection_config.get("iou_th", "N/A"))],
-        ["wide_shot_mode", str(detection_config.get("wide_shot_mode", "N/A"))],
-        ["wide_shot_confidence_th", str(detection_config.get("wide_shot_confidence_th", "N/A"))],
-        ["enable_person_fallback", str(detection_config.get("enable_person_fallback", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        [
+            "confidence_th",
+            str(detection_config.get("confidence_th", "N/A")),
+            "Min confidence to accept a detection",
+            "↓ Lower: More faces (+ false positives) | ↑ Higher: Fewer, more confident faces",
+        ],
+        [
+            "min_size",
+            str(detection_config.get("min_size", "N/A")),
+            "Min face size in pixels",
+            "↓ Lower: Detect smaller/distant faces | ↑ Higher: Ignore small faces",
+        ],
+        [
+            "iou_th",
+            str(detection_config.get("iou_th", "N/A")),
+            "NMS IoU threshold for duplicate removal",
+            "↓ Lower: More aggressive duplicate removal | ↑ Higher: Keep overlapping faces",
+        ],
+        [
+            "wide_shot_mode",
+            str(detection_config.get("wide_shot_mode", "N/A")),
+            "Enhanced detection for distant faces",
+            "Enable for wide shots with small faces; disable for close-ups",
+        ],
+        [
+            "wide_shot_confidence_th",
+            str(detection_config.get("wide_shot_confidence_th", "N/A")),
+            "Confidence threshold in wide shot mode",
+            "↓ Lower: More small faces | ↑ Higher: Stricter small face detection",
+        ],
+        [
+            "enable_person_fallback",
+            str(detection_config.get("enable_person_fallback", "N/A")),
+            "Use body detection when face fails",
+            "Enable if missing faces when people turn away",
+        ],
     ]
-    detect_config_table = Table(detect_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    detect_config_table = Table(detect_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     detect_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(detect_config_table)
@@ -919,25 +957,51 @@ def build_screentime_run_debug_pdf(
             warning_style
         ))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (tracking.yaml):", subsection_style))
     track_config_rows = [
-        ["Setting", "Value"],
-        ["track_thresh", str(tracking_config.get("track_thresh", "N/A"))],
-        ["match_thresh", str(tracking_config.get("match_thresh", "N/A"))],
-        ["track_buffer", str(tracking_config.get("track_buffer", "N/A"))],
-        ["new_track_thresh", str(tracking_config.get("new_track_thresh", "N/A"))],
-        ["gate_enabled", str(tracking_config.get("gate_enabled", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        [
+            "track_thresh",
+            str(tracking_config.get("track_thresh", "N/A")),
+            "Min confidence to continue tracking",
+            "↓ Lower: Track low-confidence faces | ↑ Higher: Drop uncertain faces",
+        ],
+        [
+            "match_thresh",
+            str(tracking_config.get("match_thresh", "N/A")),
+            "IoU threshold for bbox matching",
+            "↓ Lower: Match fast-moving faces | ↑ Higher: Reduce ID switches",
+        ],
+        [
+            "track_buffer",
+            str(tracking_config.get("track_buffer", "N/A")),
+            "Frames to keep track alive when lost",
+            "↓ Lower: Faster cleanup | ↑ Higher: Bridge brief occlusions",
+        ],
+        [
+            "new_track_thresh",
+            str(tracking_config.get("new_track_thresh", "N/A")),
+            "Min confidence to start a new track",
+            "↓ Lower: More new tracks | ↑ Higher: Fewer, more confident tracks",
+        ],
+        [
+            "gate_enabled",
+            str(tracking_config.get("gate_enabled", "N/A")),
+            "Appearance-based track splitting",
+            "Enable to split when face changes; disable if too many splits",
+        ],
     ]
-    track_config_table = Table(track_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    track_config_table = Table(track_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     track_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(track_config_table)
@@ -966,26 +1030,37 @@ def build_screentime_run_debug_pdf(
                 warning_style
             ))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (embedding.yaml):", subsection_style))
     emb_cfg = embedding_config.get("embedding", {})
     face_align_cfg = embedding_config.get("face_alignment", {})
     embed_config_rows = [
-        ["Setting", "Value"],
-        ["backend", str(emb_cfg.get("backend", "N/A"))],
-        ["face_alignment.enabled", str(face_align_cfg.get("enabled", "N/A"))],
-        ["face_alignment.min_alignment_quality", str(face_align_cfg.get("min_alignment_quality", "N/A"))],
-        ["output.embedding_dim", str(embedding_config.get("output", {}).get("embedding_dim", "512"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        ["backend", str(emb_cfg.get("backend", "N/A")), "Embedding computation backend", "tensorrt: Fast GPU | pytorch: Compatible fallback"],
+        ["face_alignment.enabled", str(face_align_cfg.get("enabled", "N/A")), "Apply face alignment before embedding", "Enable for better embeddings; disable for speed"],
+        [
+            "min_alignment_quality",
+            str(face_align_cfg.get("min_alignment_quality", "N/A")),
+            "Min quality score to embed a face",
+            "↓ Lower: Embed more faces (+ noise) | ↑ Higher: Only high-quality faces",
+        ],
+        [
+            "embedding_dim",
+            str(embedding_config.get("output", {}).get("embedding_dim", "512")),
+            "Output vector dimensions",
+            "512 standard for ArcFace; don't change unless using different model",
+        ],
     ]
-    embed_config_table = Table(embed_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    embed_config_table = Table(embed_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     embed_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(embed_config_table)
@@ -1002,35 +1077,64 @@ def build_screentime_run_debug_pdf(
     body_detect_count = _count_jsonl_lines(body_detections_path)
     story.append(Paragraph(f"Total body detections: <b>{body_detect_count}</b>", body_style))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (body_detection.yaml):", subsection_style))
     person_det_cfg = body_detection_config.get("person_detection", {})
 
     # Show effective body_tracking status with explanation
+    body_effective_str = f"{body_enabled_effective} (effective)"
     if body_artifacts_exist and not body_config_enabled:
-        body_effective_str = "True (effective) - artifacts exist, config=False"
+        body_effective_str = "True (artifacts exist, config=False)"
     elif body_config_enabled:
-        body_effective_str = "True (config enabled)"
+        body_effective_str = "True (config=True)"
     else:
         body_effective_str = "False"
 
     body_detect_config_rows = [
-        ["Setting", "Value"],
-        ["body_tracking.enabled", body_effective_str],
-        ["model", str(person_det_cfg.get("model", "N/A"))],
-        ["confidence_threshold", str(person_det_cfg.get("confidence_threshold", "N/A"))],
-        ["min_height_px", str(person_det_cfg.get("min_height_px", "N/A"))],
-        ["detect_every_n_frames", str(person_det_cfg.get("detect_every_n_frames", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        [
+            "body_tracking.enabled",
+            body_effective_str,
+            "Master switch for body detection (resolved effective value)",
+            "Enable to track people when face not visible",
+        ],
+        [
+            "model",
+            str(person_det_cfg.get("model", "N/A")),
+            "YOLO model variant",
+            "yolov8n: Fast | yolov8s/m: More accurate, slower",
+        ],
+        [
+            "confidence_threshold",
+            str(person_det_cfg.get("confidence_threshold", "N/A")),
+            "Min confidence for person detection",
+            "↓ Lower: More bodies (+ false positives) | ↑ Higher: Fewer, confident bodies",
+        ],
+        [
+            "min_height_px",
+            str(person_det_cfg.get("min_height_px", "N/A")),
+            "Min body height in pixels",
+            "↓ Lower: Detect distant people | ↑ Higher: Ignore small figures",
+        ],
+        [
+            "detect_every_n_frames",
+            str(person_det_cfg.get("detect_every_n_frames", "N/A")),
+            "Frame stride for detection",
+            "↓ Lower: More detections, slower | ↑ Higher: Faster, may miss brief appearances",
+        ],
     ]
-    body_detect_config_table = Table(body_detect_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    body_detect_config_table = Table(
+        body_detect_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch]
+    )
     body_detect_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(body_detect_config_table)
@@ -1045,27 +1149,53 @@ def build_screentime_run_debug_pdf(
     body_track_count = _count_jsonl_lines(body_tracks_path)
     story.append(Paragraph(f"Total body tracks: <b>{body_track_count}</b>", body_style))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (body_detection.yaml → person_tracking):", subsection_style))
     person_track_cfg = body_detection_config.get("person_tracking", {})
     body_track_config_rows = [
-        ["Setting", "Value"],
-        ["tracker", str(person_track_cfg.get("tracker", "N/A"))],
-        ["track_thresh", str(person_track_cfg.get("track_thresh", "N/A"))],
-        ["new_track_thresh", str(person_track_cfg.get("new_track_thresh", "N/A"))],
-        ["match_thresh", str(person_track_cfg.get("match_thresh", "N/A"))],
-        ["track_buffer", str(person_track_cfg.get("track_buffer", "N/A"))],
-        ["id_offset", str(person_track_cfg.get("id_offset", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        ["tracker", str(person_track_cfg.get("tracker", "N/A")), "Tracking algorithm", "bytetrack: Fast, robust | botsort/strongsort: More features"],
+        [
+            "track_thresh",
+            str(person_track_cfg.get("track_thresh", "N/A")),
+            "Min confidence to continue body track",
+            "↓ Lower: Track uncertain bodies | ↑ Higher: Drop low-confidence tracks",
+        ],
+        [
+            "new_track_thresh",
+            str(person_track_cfg.get("new_track_thresh", "N/A")),
+            "Min confidence to start new body track",
+            "↓ Lower: More new tracks | ↑ Higher: Fewer, confident tracks",
+        ],
+        [
+            "match_thresh",
+            str(person_track_cfg.get("match_thresh", "N/A")),
+            "IoU threshold for body bbox matching",
+            "↓ Lower: Match moving bodies | ↑ Higher: Stricter matching",
+        ],
+        [
+            "track_buffer",
+            str(person_track_cfg.get("track_buffer", "N/A")),
+            "Frames to keep lost body track alive",
+            "↓ Lower: Faster cleanup | ↑ Higher: Bridge longer occlusions",
+        ],
+        [
+            "id_offset",
+            str(person_track_cfg.get("id_offset", "N/A")),
+            "Starting ID for body tracks",
+            "Prevents ID collision with face tracks; typically 100000",
+        ],
     ]
-    body_track_config_table = Table(body_track_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    body_track_config_table = Table(body_track_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     body_track_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(body_track_config_table)
@@ -1078,16 +1208,7 @@ def build_screentime_run_debug_pdf(
     # =========================================================================
     story.append(Paragraph("6. Track Fusion", section_style))
 
-    # Get actual fused pair count from identities dict
-    fusion_identities = track_fusion_data.get("identities", {})
-    actual_fused_pairs = 0
-    if isinstance(fusion_identities, dict):
-        for identity_data in fusion_identities.values():
-            if isinstance(identity_data, dict):
-                face_tids = identity_data.get("face_track_ids", [])
-                body_tids = identity_data.get("body_track_ids", [])
-                if face_tids and body_tids:
-                    actual_fused_pairs += 1
+    # Note: actual_fused_pairs is computed earlier in the Run Health section
 
     fusion_stats = [
         ["Metric", "Value", "Notes"],
@@ -1108,27 +1229,53 @@ def build_screentime_run_debug_pdf(
     )
     story.append(fusion_table)
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (track_fusion.yaml):", subsection_style))
     iou_cfg = track_fusion_config.get("iou_association", {})
     reid_cfg = track_fusion_config.get("reid_handoff", {})
     fusion_config_rows = [
-        ["Setting", "Value"],
-        ["track_fusion.enabled", str(track_fusion_config.get("track_fusion", {}).get("enabled", "N/A"))],
-        ["iou_association.iou_threshold", str(iou_cfg.get("iou_threshold", "N/A"))],
-        ["iou_association.min_overlap_ratio", str(iou_cfg.get("min_overlap_ratio", "N/A"))],
-        ["reid_handoff.enabled", str(reid_cfg.get("enabled", "N/A"))],
-        ["reid_handoff.similarity_threshold", str(reid_cfg.get("similarity_threshold", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        [
+            "track_fusion.enabled",
+            str(track_fusion_config.get("track_fusion", {}).get("enabled", "N/A")),
+            "Master switch for face-body fusion",
+            "Enable to link face and body tracks for screen time",
+        ],
+        [
+            "iou_threshold",
+            str(iou_cfg.get("iou_threshold", "N/A")),
+            "Min IoU for face-in-body association",
+            "↓ Lower: More associations | ↑ Higher: Stricter spatial overlap required",
+        ],
+        [
+            "min_overlap_ratio",
+            str(iou_cfg.get("min_overlap_ratio", "N/A")),
+            "Min face area inside body bbox",
+            "↓ Lower: Associate partial overlaps | ↑ Higher: Require face fully inside body",
+        ],
+        [
+            "reid_handoff.enabled",
+            str(reid_cfg.get("enabled", "N/A")),
+            "Use Re-ID when face disappears",
+            "Enable to continue tracking via body when face turns away",
+        ],
+        [
+            "similarity_threshold",
+            str(reid_cfg.get("similarity_threshold", "N/A")),
+            "Min Re-ID similarity for handoff",
+            "↓ Lower: More handoffs (+ errors) | ↑ Higher: Conservative, fewer handoffs",
+        ],
     ]
-    fusion_config_table = Table(fusion_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    fusion_config_table = Table(fusion_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     fusion_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(fusion_config_table)
@@ -1183,28 +1330,54 @@ def build_screentime_run_debug_pdf(
             warning_style
         ))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (clustering.yaml):", subsection_style))
     singleton_merge_cfg = clustering_config.get("singleton_merge", {})
     cluster_config_rows = [
-        ["Setting", "Value"],
-        ["Algorithm", "Agglomerative Clustering"],
-        ["Distance Metric", "Cosine (1 - similarity)"],
-        ["cluster_thresh", str(clustering_config.get("cluster_thresh", "N/A"))],
-        ["min_cluster_size", str(clustering_config.get("min_cluster_size", "N/A"))],
-        ["min_identity_sim", str(clustering_config.get("min_identity_sim", "N/A"))],
-        ["singleton_merge.enabled", str(singleton_merge_cfg.get("enabled", "N/A"))],
-        ["singleton_merge.similarity_thresh", str(singleton_merge_cfg.get("similarity_thresh", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        ["Algorithm", "Agglomerative", "Hierarchical clustering method", "Groups similar embeddings bottom-up"],
+        ["Distance Metric", "Cosine", "How similarity is measured", "distance = 1 - cosine_similarity"],
+        [
+            "cluster_thresh",
+            str(clustering_config.get("cluster_thresh", "N/A")),
+            "Max distance to merge clusters",
+            "↓ Lower: Merge more aggressively (fewer clusters) | ↑ Higher: More separate identities",
+        ],
+        [
+            "min_cluster_size",
+            str(clustering_config.get("min_cluster_size", "N/A")),
+            "Min tracks per cluster",
+            "↑ Higher: Filter out brief appearances",
+        ],
+        [
+            "min_identity_sim",
+            str(clustering_config.get("min_identity_sim", "N/A")),
+            "Min similarity to cluster centroid",
+            "↓ Lower: Accept more outliers | ↑ Higher: Eject dissimilar tracks",
+        ],
+        [
+            "singleton_merge",
+            str(singleton_merge_cfg.get("enabled", "N/A")),
+            "Second-pass merge for singletons",
+            "Enable if many single-track clusters; disable if over-merging",
+        ],
+        [
+            "merge.similarity_thresh",
+            str(singleton_merge_cfg.get("similarity_thresh", "N/A")),
+            "Looser threshold for singleton merge",
+            "↓ Lower: Merge more singletons | ↑ Higher: Conservative merge",
+        ],
     ]
-    cluster_config_table = Table(cluster_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    cluster_config_table = Table(cluster_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     cluster_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(cluster_config_table)
@@ -1362,29 +1535,55 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph(f"Total identities analyzed: <b>{screentime_summary.get('total_identities', 0)}</b>", body_style))
     story.append(Paragraph(f"Identities with gain: <b>{screentime_summary.get('identities_with_gain', 0)}</b>", body_style))
 
-    # Configuration used
+    # Configuration used with explanations
     story.append(Paragraph("Configuration (screen_time_v2.yaml):", subsection_style))
     preset = screentime_config.get("preset", "bravo_default")
     presets = screentime_config.get("screen_time_presets", {})
     active_preset = presets.get(preset, {})
     screentime_config_rows = [
-        ["Setting", "Value"],
-        ["Active Preset", preset],
-        ["quality_min", str(active_preset.get("quality_min", "N/A"))],
-        ["gap_tolerance_s", str(active_preset.get("gap_tolerance_s", "N/A"))],
-        ["screen_time_mode", str(active_preset.get("screen_time_mode", "N/A"))],
-        ["edge_padding_s", str(active_preset.get("edge_padding_s", "N/A"))],
-        ["track_coverage_min", str(active_preset.get("track_coverage_min", "N/A"))],
+        ["Setting", "Value", "Description", "Tuning"],
+        ["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"],
+        [
+            "quality_min",
+            str(active_preset.get("quality_min", "N/A")),
+            "Min detection quality to count",
+            "↓ Lower: Count blurry/profile faces | ↑ Higher: Only clear faces",
+        ],
+        [
+            "gap_tolerance_s",
+            str(active_preset.get("gap_tolerance_s", "N/A")),
+            "Max gap to merge into one segment",
+            "↓ Lower: More separate segments | ↑ Higher: Merge through cuts/occlusions",
+        ],
+        [
+            "screen_time_mode",
+            str(active_preset.get("screen_time_mode", "N/A")),
+            "How to compute screen time",
+            "tracks: Use full track spans | faces: Only count detected frames",
+        ],
+        [
+            "edge_padding_s",
+            str(active_preset.get("edge_padding_s", "N/A")),
+            "Padding added to segment edges",
+            "↓ Lower: Conservative times | ↑ Higher: More generous counting",
+        ],
+        [
+            "track_coverage_min",
+            str(active_preset.get("track_coverage_min", "N/A")),
+            "Min detection coverage per track",
+            "↓ Lower: Count sparse tracks | ↑ Higher: Require consistent detection",
+        ],
     ]
-    screentime_config_table = Table(screentime_config_rows, colWidths=[2.5 * inch, 2 * inch])
+    screentime_config_table = Table(screentime_config_rows, colWidths=[1.3 * inch, 0.5 * inch, 1.8 * inch, 2.4 * inch])
     screentime_config_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTNAME", (0, 1), (-1, -1), "Courier"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTNAME", (0, 1), (1, -1), "Courier"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ])
     )
     story.append(screentime_config_table)

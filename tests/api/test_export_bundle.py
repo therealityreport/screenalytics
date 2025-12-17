@@ -1,7 +1,8 @@
 """Tests for the run debug bundle export endpoint.
 
-Verifies that GET /episodes/{ep_id}/runs/{run_id}/export returns a ZIP archive
-containing the expected files.
+Verifies that GET /episodes/{ep_id}/runs/{run_id}/export can return:
+- a ZIP archive (format=zip) containing expected files, and
+- a PDF report (default / format=pdf).
 """
 
 import io
@@ -100,6 +101,7 @@ def test_export_bundle_contains_expected_files(tmp_path, monkeypatch):
         assert "smart_suggestion_batches.json" in file_list, "Missing smart_suggestion_batches.json"
         assert "smart_suggestions.json" in file_list, "Missing smart_suggestions.json"
         assert "smart_suggestions_applied.json" in file_list, "Missing smart_suggestions_applied.json"
+        assert "debug_report.pdf" in file_list, "Missing debug_report.pdf"
 
         # Verify run_summary.json structure
         run_summary = json.loads(zf.read("run_summary.json"))
@@ -135,6 +137,35 @@ def test_export_bundle_contains_expected_files(tmp_path, monkeypatch):
         assert "tracks.jsonl" in file_list, "Missing tracks.jsonl artifact"
         assert "faces.jsonl" in file_list, "Missing faces.jsonl artifact"
         assert "identities.json" in file_list, "Missing identities.json artifact"
+
+
+def test_export_defaults_to_pdf_report(tmp_path, monkeypatch):
+    """Test that export defaults to PDF when format is omitted."""
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    ep_id = "demo-s01e01"
+    run_id = "test-run-001"
+    ensure_dirs(ep_id)
+
+    # Set up run directory structure
+    manifests_dir = get_path(ep_id, "detections").parent
+    run_dir = manifests_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Minimal artifacts (PDF generator is best-effort and tolerates missing files)
+    _write_jsonl(run_dir / "tracks.jsonl", [{"track_id": 1, "class": "face", "frame_count": 10}])
+    _write_jsonl(run_dir / "faces.jsonl", [{"track_id": 1, "frame_idx": 0, "ts": 0.0}])
+    _write_json(run_dir / "identities.json", {"ep_id": ep_id, "identities": [], "stats": {}})
+
+    client = TestClient(app)
+
+    resp = client.get(f"/episodes/{ep_id}/runs/{run_id}/export")
+    assert resp.status_code == 200, f"Export failed: {resp.text}"
+    assert resp.headers.get("content-type") == "application/pdf"
+    assert resp.content[:4] == b"%PDF"
 
 
 def test_export_bundle_404_for_missing_run(tmp_path, monkeypatch):
