@@ -46,6 +46,17 @@ def _is_s3_required() -> bool:
     return False
 
 
+def _should_delete_local_after_sync() -> bool:
+    """Check if local files should be deleted after successful S3 sync.
+
+    Returns True if STORAGE_DELETE_LOCAL_AFTER_SYNC is set to a truthy value.
+    When enabled, local copies of run artifacts are deleted after successful
+    S3 upload, making S3 the primary storage location.
+    """
+    val = os.environ.get("STORAGE_DELETE_LOCAL_AFTER_SYNC", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 @dataclass
 class ArtifactSyncResult:
     """Result of a run artifact sync operation."""
@@ -86,6 +97,12 @@ class ArtifactSyncResult:
     uploaded_files: list[str] = field(default_factory=list)
     """List of S3 keys that were uploaded."""
 
+    deleted_count: int = 0
+    """Number of local files deleted after successful upload."""
+
+    deleted_files: list[str] = field(default_factory=list)
+    """List of local files that were deleted."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "success": self.success,
@@ -100,6 +117,8 @@ class ArtifactSyncResult:
             "backend_type": self.backend_type,
             "errors": self.errors,
             "uploaded_files": self.uploaded_files,
+            "deleted_count": self.deleted_count,
+            "deleted_files": self.deleted_files,
         }
 
 
@@ -228,6 +247,7 @@ def sync_run_artifacts_to_s3(
     *,
     fail_on_error: bool | None = None,
     skip_existing: bool = True,
+    delete_local_after_sync: bool | None = None,
 ) -> ArtifactSyncResult:
     """Sync run-scoped artifacts to S3.
 
@@ -240,6 +260,9 @@ def sync_run_artifacts_to_s3(
         fail_on_error: If True, raise RuntimeError on S3 errors.
             If None (default), uses STORAGE_REQUIRE_S3 env var.
         skip_existing: If True, skip files that already exist in S3.
+        delete_local_after_sync: If True, delete local files after successful S3 upload.
+            If None (default), uses STORAGE_DELETE_LOCAL_AFTER_SYNC env var.
+            This makes S3 the primary storage location.
 
     Returns:
         ArtifactSyncResult with sync details.
@@ -250,6 +273,9 @@ def sync_run_artifacts_to_s3(
     # Default fail_on_error based on env var if not explicitly set
     if fail_on_error is None:
         fail_on_error = _is_s3_required()
+    # Default delete_local_after_sync based on env var if not explicitly set
+    if delete_local_after_sync is None:
+        delete_local_after_sync = _should_delete_local_after_sync()
     from py_screenalytics import run_layout
 
     start_time = time.perf_counter()
@@ -346,6 +372,37 @@ def sync_run_artifacts_to_s3(
             result.bytes_uploaded,
             result.sync_time_ms,
         )
+
+        # Delete local files after successful sync if requested
+        if delete_local_after_sync and (result.uploaded_count > 0 or result.skipped_count > 0):
+            LOGGER.info("[artifact-store] Deleting local copies after successful S3 sync...")
+            for local_path, s3_key in artifacts:
+                try:
+                    if local_path.exists():
+                        local_path.unlink()
+                        result.deleted_count += 1
+                        result.deleted_files.append(str(local_path))
+                        LOGGER.debug("[artifact-store] Deleted local file: %s", local_path)
+                except Exception as del_exc:
+                    LOGGER.warning("[artifact-store] Failed to delete %s: %s", local_path, del_exc)
+
+            # Clean up empty directories
+            run_root = run_layout.run_root(ep_id, run_id)
+            for subdir in ["body_tracking"]:
+                subdir_path = run_root / subdir
+                if subdir_path.exists() and subdir_path.is_dir():
+                    try:
+                        # Only remove if empty
+                        if not any(subdir_path.iterdir()):
+                            subdir_path.rmdir()
+                            LOGGER.debug("[artifact-store] Removed empty directory: %s", subdir_path)
+                    except Exception:
+                        pass  # Directory not empty or permission issue
+
+            LOGGER.info(
+                "[artifact-store] Deleted %d local files after S3 sync",
+                result.deleted_count,
+            )
     else:
         LOGGER.warning(
             "[artifact-store] Sync completed with %d failures: %s",
