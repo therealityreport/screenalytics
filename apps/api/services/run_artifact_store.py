@@ -388,7 +388,7 @@ def sync_run_artifacts_to_s3(
 
             # Clean up empty directories
             run_root = run_layout.run_root(ep_id, run_id)
-            for subdir in ["body_tracking"]:
+            for subdir in ["body_tracking", "face_alignment"]:
                 subdir_path = run_root / subdir
                 if subdir_path.exists() and subdir_path.is_dir():
                     try:

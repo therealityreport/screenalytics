@@ -231,8 +231,11 @@ RUN_ARTIFACT_ALLOWLIST = frozenset({
     "track_metrics.json",
     "track_reps.jsonl",
     "detect_track.json",
-    "embed.json",
+    "faces_embed.json",
     "cluster.json",
+    "body_tracking.json",
+    "body_tracking_fusion.json",
+    "face_alignment/aligned_faces.jsonl",
     # Body tracking artifacts
     "body_tracking/body_detections.jsonl",
     "body_tracking/body_tracks.jsonl",
@@ -261,4 +264,3 @@ def list_run_artifacts(ep_id: str, run_id: str) -> list[tuple[Path, str]]:
             s3_key = run_artifact_s3_key(ep_id, run_id, filename)
             artifacts.append((local_path, s3_key))
     return artifacts
-

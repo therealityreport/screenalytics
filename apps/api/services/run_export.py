@@ -1142,6 +1142,7 @@ def build_screentime_run_debug_pdf(
     identities_path = _resolved_path(identities_path, "identities.json")
     track_metrics_path = _resolved_path(track_metrics_path, "track_metrics.json")
     cluster_centroids_path = _resolved_path(cluster_centroids_path, "cluster_centroids.json")
+    face_alignment_path = _resolved_path(face_alignment_path, "face_alignment/aligned_faces.jsonl")
     body_detections_path = _resolved_path(body_detections_path, "body_tracking/body_detections.jsonl")
     body_tracks_path = _resolved_path(body_tracks_path, "body_tracking/body_tracks.jsonl")
     track_fusion_path = _resolved_path(track_fusion_path, "body_tracking/track_fusion.json")
@@ -1151,6 +1152,8 @@ def build_screentime_run_debug_pdf(
     )
     # Keep downstream derived paths pointing at the resolved body_tracking directory.
     body_tracking_dir = body_tracks_path.parent
+    detect_track_marker_path = _resolved_path(run_root / "detect_track.json", "detect_track.json")
+    body_tracking_marker_path = _resolved_path(run_root / "body_tracking.json", "body_tracking.json")
 
     # Load JSON artifact data
     identities_payload = _read_json(identities_path)
@@ -1359,7 +1362,7 @@ def build_screentime_run_debug_pdf(
     # Determine whether body tracking ran for this run_id.
     # IMPORTANT: Do not treat legacy presence as evidence of run-scoped execution.
     # Require the run-scoped artifacts to exist (even if empty).
-    run_body_tracking_marker = _read_json(run_root / "body_tracking.json")
+    run_body_tracking_marker = _read_json(body_tracking_marker_path)
     body_tracking_ran_effective = body_artifacts_exist_run
     body_tracking_effective_source = "run artifacts" if body_artifacts_exist_run else "missing artifacts"
 
@@ -1715,7 +1718,7 @@ def build_screentime_run_debug_pdf(
     video_path = get_path(ep_id, "video")
     ffprobe_meta = _ffprobe_video_metadata(video_path)
     opencv_meta = _opencv_video_metadata(video_path)
-    detect_track_marker = _read_json(run_root / "detect_track.json") if (run_root / "detect_track.json").exists() else None
+    detect_track_marker = _read_json(detect_track_marker_path) if detect_track_marker_path.exists() else None
 
     ffprobe_duration_s = ffprobe_meta.get("duration_s") if ffprobe_meta.get("ok") else None
     ffprobe_fps = ffprobe_meta.get("avg_fps") if ffprobe_meta.get("ok") else None
