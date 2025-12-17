@@ -1189,35 +1189,48 @@ def build_screentime_run_debug_pdf(
     track_fusion_config = _load_yaml_config("track_fusion.yaml")
     screentime_config = _load_yaml_config("screen_time_v2.yaml")
 
-    # Load DB data
+    # Load DB data (optional: enabled when DB_URL or SCREENALYTICS_FAKE_DB is configured).
+    db_connected: bool | None = None
     db_error: str | None = None
+    db_not_configured_reason: str | None = None
     run_row: dict[str, Any] | None = None
     job_runs: list[dict[str, Any]] = []
     identity_locks: list[dict[str, Any]] = []
     suggestion_batches: list[dict[str, Any]] = []
     suggestions_rows: list[dict[str, Any]] = []
     suggestion_applies: list[dict[str, Any]] = []
-    try:
-        from apps.api.services.run_persistence import run_persistence_service
 
-        run_row = run_persistence_service.get_run(ep_id=ep_id, run_id=run_id_norm)
-        job_runs = run_persistence_service.list_job_runs(ep_id=ep_id, run_id=run_id_norm)
-        identity_locks = run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
-        suggestion_batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=250)
-        for batch in suggestion_batches:
-            batch_id = batch.get("batch_id") if isinstance(batch, dict) else None
-            if batch_id:
-                suggestions_rows.extend(
-                    run_persistence_service.list_suggestions(
-                        ep_id=ep_id,
-                        run_id=run_id_norm,
-                        batch_id=str(batch_id),
-                        include_dismissed=True,
+    db_url = (os.getenv("DB_URL") or "").strip()
+    fake_db_enabled = (os.getenv("SCREENALYTICS_FAKE_DB") or "").strip() == "1"
+    db_configured = fake_db_enabled or bool(db_url)
+    if not db_configured:
+        db_connected = None
+        db_not_configured_reason = "DB_URL is not set"
+    else:
+        try:
+            from apps.api.services.run_persistence import run_persistence_service
+
+            run_row = run_persistence_service.get_run(ep_id=ep_id, run_id=run_id_norm)
+            job_runs = run_persistence_service.list_job_runs(ep_id=ep_id, run_id=run_id_norm)
+            identity_locks = run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
+            suggestion_batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=250)
+            for batch in suggestion_batches:
+                batch_id = batch.get("batch_id") if isinstance(batch, dict) else None
+                if batch_id:
+                    suggestions_rows.extend(
+                        run_persistence_service.list_suggestions(
+                            ep_id=ep_id,
+                            run_id=run_id_norm,
+                            batch_id=str(batch_id),
+                            include_dismissed=True,
+                        )
                     )
-                )
-        suggestion_applies = run_persistence_service.list_suggestion_applies(ep_id=ep_id, run_id=run_id_norm)
-    except Exception as exc:
-        db_error = str(exc)
+            suggestion_applies = run_persistence_service.list_suggestion_applies(ep_id=ep_id, run_id=run_id_norm)
+        except Exception as exc:
+            db_error = str(exc)
+            db_connected = False
+        else:
+            db_connected = True
 
     # Build PDF
     buffer = io.BytesIO()
@@ -1499,8 +1512,6 @@ def build_screentime_run_debug_pdf(
                 if face_tids and body_tids:
                     actual_fused_pairs += 1
 
-    db_connected = db_error is None
-
     # Health status helper
     def _health_status(ok: bool | None) -> str:
         if ok is True:
@@ -1536,10 +1547,16 @@ def build_screentime_run_debug_pdf(
         fused_pairs_ok = actual_fused_pairs > 0
         fused_pairs_detail = f"{actual_fused_pairs} pair(s)"
 
+    if db_connected is True:
+        db_details = "OK"
+    elif db_connected is None:
+        db_details = f"Not configured ({db_not_configured_reason or 'missing DB_URL'})"
+    else:
+        db_details = f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")
+
     health_data = [
         _wrap_row(["Health Check", "Status", "Details"]),
-        _wrap_row(["DB Connected", _health_status(db_connected),
-         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")]),
+        _wrap_row(["DB Connected", _health_status(db_connected), db_details]),
         _wrap_row(["Face Tracks Present", _health_status(face_tracks_present), face_tracks_detail]),
         _wrap_row([
             "Body Tracking Ran (run-scoped)",
@@ -1737,7 +1754,16 @@ def build_screentime_run_debug_pdf(
         ["Git SHA", _get_git_sha()],
         ["Generated At", _now_iso()],
         ["Artifact Store", storage_display],
-        ["DB Connected", "Yes" if db_connected else f"No ({db_error[:40]}...)" if db_error and len(db_error) > 40 else f"No ({db_error or 'unknown'})"],
+        [
+            "DB Connected",
+            "Yes"
+            if db_connected is True
+            else (
+                f"Not configured ({db_not_configured_reason or 'missing DB_URL'})"
+                if db_connected is None
+                else f"No ({db_error[:40]}...)" if db_error and len(db_error) > 40 else f"No ({db_error or 'unknown'})"
+            ),
+        ],
     ]
 
     # Video metadata sources (split, labeled, and validated for mismatches).
@@ -2890,8 +2916,8 @@ def build_screentime_run_debug_pdf(
     )
 
     # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_error:
-        locked_count_str = "unavailable (DB error)"
+    if db_connected is not True:
+        locked_count_str = "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)"
     else:
         locked_count = len([lock for lock in identity_locks if lock.get("locked")])
         locked_count_str = str(locked_count)
@@ -2915,15 +2941,14 @@ def build_screentime_run_debug_pdf(
     )
     story.append(review_table)
 
-    if db_error:
-        story.append(Paragraph(
-            f"⚠️ <b>DB Error:</b> {db_error}",
-            warning_style
-        ))
-        story.append(Paragraph(
-            "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
-            note_style
-        ))
+    if db_connected is False:
+        story.append(Paragraph(f"⚠️ <b>DB Error:</b> {db_error}", warning_style))
+        story.append(
+            Paragraph(
+                "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
+                note_style,
+            )
+        )
         manual_assignments = identities_data.get("manual_assignments")
         manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
         if manual_assignments_count > 0:
@@ -2931,6 +2956,13 @@ def build_screentime_run_debug_pdf(
                 f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
                 note_style
             ))
+    elif db_connected is None:
+        story.append(
+            Paragraph(
+                f"<b>DB Not Configured:</b> {db_not_configured_reason or 'missing DB_URL'} (DB-sourced state is omitted in this report).",
+                note_style,
+            )
+        )
 
     story.append(Paragraph("Data Sources:", subsection_style))
     story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
@@ -2942,10 +2974,13 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("9. Smart Suggestions", section_style))
 
     # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_error:
+    if db_connected is not True:
         suggestion_stats = [
             ["Metric", "Value"],
-            ["Suggestion Batches", "unavailable (DB error)"],
+            [
+                "Suggestion Batches",
+                "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)",
+            ],
             ["Total Suggestions", "unavailable"],
             ["Dismissed", "unavailable"],
             ["Applied", "unavailable"],
