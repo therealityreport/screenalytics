@@ -2777,17 +2777,29 @@ def build_screentime_run_debug_pdf(
     story.append(cluster_table)
 
     # Diagnostic notes
-    if isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5:
+    singleton_high = isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5
+    mixed_high = isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5
+    if singleton_high and mixed_high:
+        story.append(
+            Paragraph(
+                f"⚠️ High singleton fraction ({singleton_frac:.1%}) <i>and</i> high mixed tracks ({mixed_tracks}). "
+                "<b>Do this first:</b> reduce tracking fragmentation (e.g., high forced_splits / gate over-splitting) "
+                "so tracks are longer and more consistent. "
+                "<b>Then:</b> increase min_identity_sim to reduce mixed-person clusters before adjusting cluster_thresh.",
+                warning_style,
+            )
+        )
+    elif singleton_high:
         story.append(Paragraph(
             f"⚠️ High singleton fraction ({singleton_frac:.1%}): Over half of clusters have only 1 track. "
             "Consider lowering cluster_thresh in clustering.yaml (currently "
             f"{clustering_config.get('cluster_thresh', 'N/A')}) to merge more aggressively.",
             warning_style
         ))
-    if isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5:
+    elif mixed_high:
         story.append(Paragraph(
             f"⚠️ High mixed tracks ({mixed_tracks}): Some clusters contain tracks from different people. "
-            "Consider raising cluster_thresh or increasing min_identity_sim.",
+            "Consider increasing min_identity_sim (preferred) or raising cluster_thresh to separate people better.",
             warning_style
         ))
 
@@ -3214,18 +3226,27 @@ def build_screentime_run_debug_pdf(
             ))
 
     # Cluster tuning
-    if singleton_frac > 0.5:
+    singleton_high = isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5
+    mixed_high = isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5
+    if singleton_high and mixed_high:
+        tuning_suggestions.append((
+            "Clustering",
+            f"High singleton fraction ({singleton_frac:.1%}) and mixed tracks ({mixed_tracks})",
+            "First reduce tracking fragmentation (e.g., forced_splits / gate over-splitting), then increase "
+            "min_identity_sim. Adjust cluster_thresh only after tracking is stable.",
+        ))
+    elif singleton_high:
         tuning_suggestions.append((
             "Clustering",
             f"High singleton fraction ({singleton_frac:.1%})",
             f"Lower cluster_thresh (currently {clustering_config.get('cluster_thresh', 'N/A')}) "
-            "or enable singleton_merge"
+            "or enable singleton_merge",
         ))
-    if isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5:
+    elif mixed_high:
         tuning_suggestions.append((
             "Clustering",
             f"Mixed tracks ({mixed_tracks})",
-            "Raise cluster_thresh or min_identity_sim to separate people better"
+            "Increase min_identity_sim (preferred) or raise cluster_thresh to separate people better",
         ))
 
     # Body tracking tuning
