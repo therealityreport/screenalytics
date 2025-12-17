@@ -184,3 +184,82 @@ def test_export_pdf_with_body_tracking_data(tmp_path, monkeypatch):
     # Verify content-disposition header
     content_disp = resp.headers.get("content-disposition", "")
     assert "debug_report.pdf" in content_disp
+
+
+def test_export_returns_s3_upload_headers(tmp_path, monkeypatch):
+    """Test that export response includes S3 upload status headers."""
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")  # Local backend, no actual S3 upload
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    ep_id = "demo-s01e03"
+    run_id = "test-run-s3-headers"
+    ensure_dirs(ep_id)
+
+    # Set up run directory structure
+    manifests_dir = get_path(ep_id, "detections").parent
+    run_dir = manifests_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write minimal artifacts
+    _write_jsonl(run_dir / "tracks.jsonl", [{"track_id": 1}])
+    _write_jsonl(run_dir / "faces.jsonl", [{"track_id": 1, "frame_idx": 0}])
+    _write_json(run_dir / "identities.json", {"ep_id": ep_id, "identities": []})
+
+    client = TestClient(app)
+
+    # Call export with upload_to_s3=True (but local backend, so no actual upload)
+    resp = client.get(
+        f"/episodes/{ep_id}/runs/{run_id}/export",
+        params={"upload_to_s3": True},
+    )
+    assert resp.status_code == 200, f"Export failed: {resp.text}"
+
+    # With local backend, S3 upload returns success but nothing uploaded
+    s3_success = resp.headers.get("X-S3-Upload-Success")
+    assert s3_success == "true", f"Expected S3 upload success header, got: {s3_success}"
+
+    # PDF should still be valid
+    assert resp.content[:4] == b"%PDF"
+
+
+def test_export_pdf_is_valid_with_complete_artifacts(tmp_path, monkeypatch):
+    """Test that exported PDF is valid when all expected artifacts exist."""
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    ep_id = "demo-s01e04"
+    run_id = "test-run-full"
+    ensure_dirs(ep_id)
+
+    # Set up run directory structure
+    manifests_dir = get_path(ep_id, "detections").parent
+    run_dir = manifests_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write comprehensive artifacts
+    _write_jsonl(run_dir / "detections.jsonl", [{"frame_idx": 0, "bbox": [0, 0, 100, 100]}])
+    _write_jsonl(run_dir / "tracks.jsonl", [{"track_id": 1, "frame_count": 10}])
+    _write_jsonl(run_dir / "faces.jsonl", [{"track_id": 1, "frame_idx": 0}])
+    _write_json(run_dir / "identities.json", {"ep_id": ep_id, "identities": []})
+    _write_json(run_dir / "track_metrics.json", {"metrics": {}})
+    _write_json(run_dir / "detect_track.json", {"run_id": run_id, "frames_total": 1000})
+
+    # Add body tracking artifacts
+    body_dir = run_dir / "body_tracking"
+    body_dir.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(body_dir / "body_detections.jsonl", [{"frame_idx": 0}])
+    _write_jsonl(body_dir / "body_tracks.jsonl", [{"track_id": 100001}])
+    _write_json(body_dir / "track_fusion.json", {"num_face_tracks": 1, "num_body_tracks": 1})
+    _write_json(body_dir / "screentime_comparison.json", {"summary": {"total_identities": 1}})
+
+    client = TestClient(app)
+
+    resp = client.get(f"/episodes/{ep_id}/runs/{run_id}/export")
+    assert resp.status_code == 200
+    assert resp.content[:4] == b"%PDF"
+    # PDF with all artifacts should be larger than minimal
+    assert len(resp.content) > 5000, f"PDF too small: {len(resp.content)} bytes"

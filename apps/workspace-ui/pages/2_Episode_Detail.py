@@ -5102,6 +5102,18 @@ with col_cluster:
     st.divider()
 
 st.subheader("Debug / Export")
+
+# Display artifact store backend
+try:
+    from apps.api.services.run_artifact_store import get_artifact_store_display, get_artifact_store_status
+    _artifact_store_display = get_artifact_store_display()
+    _artifact_store_status = get_artifact_store_status()
+    _s3_enabled = _artifact_store_status.get("config", {}).get("s3_enabled", False)
+    st.caption(f"**Artifact Store:** {_artifact_store_display}")
+except Exception:
+    _s3_enabled = False
+    st.caption("**Artifact Store:** Local filesystem (status unavailable)")
+
 if not selected_attempt_run_id:
     st.info("Select a non-legacy attempt (run_id) to export a run debug report.")
 else:
@@ -5131,9 +5143,18 @@ else:
                     filename = content_disp.split("filename=", 1)[1].strip().strip('"')
                 if not filename:
                     filename = f"screenalytics_{ep_id}_{selected_attempt_run_id}_debug_report.pdf"
+
+                # Check S3 upload status from response headers
+                s3_upload_success = resp.headers.get("X-S3-Upload-Success", "").lower() == "true"
+                s3_upload_key = resp.headers.get("X-S3-Upload-Key")
+                s3_upload_error = resp.headers.get("X-S3-Upload-Error")
+
                 st.session_state[export_state_key] = {
                     "filename": filename,
                     "bytes": resp.content,
+                    "s3_upload_success": s3_upload_success,
+                    "s3_upload_key": s3_upload_key,
+                    "s3_upload_error": s3_upload_error,
                 }
 
     bundle = st.session_state.get(export_state_key)
@@ -5144,6 +5165,17 @@ else:
             st.caption(f"Report ready: {len(file_bytes) / 1024:.1f} KB")
         except Exception:
             pass
+
+        # Display S3 upload status
+        s3_upload_success = bundle.get("s3_upload_success")
+        s3_upload_key = bundle.get("s3_upload_key")
+        s3_upload_error = bundle.get("s3_upload_error")
+        if s3_upload_success and s3_upload_key:
+            st.success(f"✅ Saved to S3: `{s3_upload_key}`")
+        elif s3_upload_error:
+            st.warning(f"⚠️ S3 upload failed: {s3_upload_error}")
+        elif _s3_enabled and s3_upload_key is None:
+            st.info("S3 upload skipped (not enabled or local backend)")
         st.download_button(
             "Download PDF",
             data=file_bytes,
