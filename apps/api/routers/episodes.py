@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ from apps.api.services import identities as identity_service
 from apps.api.services import metrics as metrics_service
 from apps.api.services.archive import archive_service
 from apps.api.services.episodes import EpisodeStore
-from apps.api.services.run_export import build_screentime_run_debug_pdf
+from apps.api.services.run_export import build_run_debug_bundle_zip, build_screentime_run_debug_pdf
 from apps.api.services.storage import (
     StorageService,
     artifact_prefixes,
@@ -2368,38 +2369,99 @@ def unlock_identity(
 def export_run_debug_bundle(
     ep_id: str,
     run_id: str,
-) -> Response:
-    """Export a Screen Time Run Debug Report PDF.
+    format: str = Query("pdf", description="Export format: 'pdf' for debug report, 'zip' for raw bundle"),
+    include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities) - only for zip format"),
+    include_logs: bool = Query(True, description="Include persisted logs (recommended) - only for zip format"),
+    upload_to_s3: bool = Query(True, description="Upload export to S3 if configured (silent no-op if backend=local)"),
+) -> StreamingResponse:
+    """Export a run debug report (PDF) or raw bundle (ZIP).
 
-    Returns a PDF report containing pipeline statistics, artifact references,
-    and review state for the specified run. Sections include:
-    - Face Detect/Track/Embed
-    - Body Detect/Track
-    - Track Fusion
-    - Clustering
-    - Faces Review
-    - Smart Suggestions
-    - Screen Time Analysis
-    - Artifact Manifest
+    When S3 storage is configured, exports are automatically uploaded to:
+    - runs/{ep_id}/{run_id}/exports/debug_report.pdf (for PDF)
+    - runs/{ep_id}/{run_id}/exports/debug_bundle.zip (for ZIP)
+
+    S3 upload status is included in response headers:
+    - X-S3-Upload-Success: true/false
+    - X-S3-Upload-Key: S3 key (if successful)
+    - X-S3-Upload-Error: Error message (if failed)
     """
+    from apps.api.services.run_export import (
+        build_and_upload_debug_bundle,
+        build_and_upload_debug_pdf,
+    )
+
     ep_id_norm = normalize_ep_id(ep_id)
 
-    try:
-        pdf_bytes, download_name = build_screentime_run_debug_pdf(
-            ep_id=ep_id_norm,
-            run_id=run_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if format == "zip":
+        # ZIP export
+        try:
+            zip_path, download_name, upload_result = build_and_upload_debug_bundle(
+                ep_id=ep_id_norm,
+                run_id=run_id,
+                include_artifacts=include_artifacts,
+                include_logs=include_logs,
+                upload_to_s3=upload_to_s3,
+                fail_on_s3_error=False,  # Don't fail the request if S3 upload fails
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers=headers,
-    )
+        file_handle = open(zip_path, "rb")
+
+        def _cleanup() -> None:
+            try:
+                file_handle.close()
+            finally:
+                try:
+                    os.unlink(zip_path)
+                except OSError:
+                    pass
+
+        headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+        # Add S3 upload status to headers
+        if upload_result is not None:
+            headers["X-S3-Upload-Success"] = "true" if upload_result.success else "false"
+            if upload_result.s3_key:
+                headers["X-S3-Upload-Key"] = upload_result.s3_key
+            if upload_result.error:
+                headers["X-S3-Upload-Error"] = upload_result.error[:200]  # Truncate long errors
+
+        return StreamingResponse(
+            file_handle,
+            media_type="application/zip",
+            headers=headers,
+            background=BackgroundTask(_cleanup),
+        )
+    else:
+        # PDF export (default)
+        try:
+            pdf_bytes, download_name, upload_result = build_and_upload_debug_pdf(
+                ep_id=ep_id_norm,
+                run_id=run_id,
+                upload_to_s3=upload_to_s3,
+                fail_on_s3_error=False,  # Don't fail the request if S3 upload fails
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        headers = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+        # Add S3 upload status to headers
+        if upload_result is not None:
+            headers["X-S3-Upload-Success"] = "true" if upload_result.success else "false"
+            if upload_result.s3_key:
+                headers["X-S3-Upload-Key"] = upload_result.s3_key
+            if upload_result.error:
+                headers["X-S3-Upload-Error"] = upload_result.error[:200]  # Truncate long errors
+
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers=headers,
+        )
 
 
 @router.get(
