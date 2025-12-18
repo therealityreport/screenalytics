@@ -3420,6 +3420,13 @@ def build_screentime_run_debug_pdf(
 
         reid_value = f"{reid_comparisons} comparisons" if reid_comparisons is not None else "N/A"
         reid_notes = "From track_fusion.json diagnostics"
+        reid_skip_reason = fusion_diag_payload.get("reid_skip_reason")
+        if (
+            reid_comparisons == 0
+            and isinstance(reid_skip_reason, str)
+            and reid_skip_reason.strip()
+        ):
+            reid_notes = f"{reid_notes}; skip_reason={reid_skip_reason.strip()}"
         match_value = f"{reid_pass} matches" if reid_pass is not None else "N/A"
         match_notes = f"threshold={reid_cfg.get('similarity_threshold', 'N/A')}"
 

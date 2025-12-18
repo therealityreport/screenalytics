@@ -25,6 +25,23 @@ def test_body_reid_marks_runtime_error_when_torchreid_import_ok(
 
     monkeypatch.setattr(episode_run, "_load_body_tracking_config", lambda: {"body_tracking": {"enabled": True}})
 
+    # Provide a minimal torchreid module layout so the FeatureExtractor import check passes.
+    torchreid_pkg = types.ModuleType("torchreid")
+    torchreid_pkg.__version__ = "0.2.5"
+    torchreid_pkg.__path__ = []
+    reid_pkg = types.ModuleType("torchreid.reid")
+    reid_pkg.__path__ = []
+    reid_utils_pkg = types.ModuleType("torchreid.reid.utils")
+    reid_utils_pkg.__path__ = []
+
+    class _DummyFeatureExtractor:
+        pass
+
+    reid_utils_pkg.FeatureExtractor = _DummyFeatureExtractor
+    monkeypatch.setitem(sys.modules, "torchreid", torchreid_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.reid", reid_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.reid.utils", reid_utils_pkg)
+
     ep_id = "ep-test"
     run_id = "run-body-reid-runtime"
     run_root = run_layout.run_root(ep_id, run_id)
@@ -100,3 +117,217 @@ def test_body_reid_marks_runtime_error_when_torchreid_import_ok(
     assert body_reid.get("torchreid_runtime_ok") is False
     assert body_reid.get("reid_skip_reason") == "torchreid_runtime_error"
     assert "torchvision" in str(body_reid.get("torchreid_runtime_error"))
+
+
+def test_body_reid_marks_import_error_when_feature_extractor_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+
+    from py_screenalytics import run_layout
+    from tools import episode_run
+
+    monkeypatch.setattr(episode_run, "_load_body_tracking_config", lambda: {"body_tracking": {"enabled": True}})
+
+    torchreid_pkg = types.ModuleType("torchreid")
+    torchreid_pkg.__version__ = "0.2.5"
+    torchreid_pkg.__path__ = []
+    reid_pkg = types.ModuleType("torchreid.reid")
+    reid_pkg.__path__ = []
+    # Present but mispackaged: torchreid.reid.utils exists but doesn't export FeatureExtractor.
+    reid_utils_pkg = types.ModuleType("torchreid.reid.utils")
+    reid_utils_pkg.__path__ = []
+
+    monkeypatch.setitem(sys.modules, "torchreid", torchreid_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.reid", reid_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.reid.utils", reid_utils_pkg)
+
+    ep_id = "ep-test"
+    run_id = "run-body-reid-import-fail"
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    (run_root / "tracks.jsonl").write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
+
+    runner_mod = types.ModuleType("FEATURES.body_tracking.src.body_tracking_runner")
+
+    class _DummyBodyTrackingRunner:
+        def __init__(
+            self,
+            episode_id: str,
+            config_path=None,
+            fusion_config_path=None,
+            video_path=None,
+            output_dir: Path | None = None,
+            skip_existing: bool = True,
+        ) -> None:
+            assert output_dir is not None
+            self.output_dir = Path(output_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.config = types.SimpleNamespace(reid_enabled=True, reid_embedding_dim=256, reid_model="osnet_x1_0")
+            self.embeddings_path = self.output_dir / "body_embeddings.npy"
+            self.embeddings_meta_path = self.output_dir / "body_embeddings_meta.json"
+            self.metrics_path = self.output_dir / "body_metrics.json"
+            self.tracker_backend_configured = "bytetrack"
+            self.tracker_backend_actual = "bytetrack"
+            self.tracker_fallback_reason = None
+            self.embedding_called = False
+
+        def run_detection(self) -> Path:
+            path = self.output_dir / "body_detections.jsonl"
+            path.write_text(json.dumps({"frame_idx": 0}) + "\n", encoding="utf-8")
+            return path
+
+        def run_tracking(self) -> Path:
+            path = self.output_dir / "body_tracks.jsonl"
+            path.write_text(json.dumps({"track_id": 100000}) + "\n", encoding="utf-8")
+            return path
+
+        def run_embedding(self) -> Path:
+            self.embedding_called = True
+            raise AssertionError("run_embedding should not be called when FeatureExtractor import fails")
+
+    runner_mod.BodyTrackingRunner = _DummyBodyTrackingRunner
+
+    features_pkg = types.ModuleType("FEATURES")
+    features_pkg.__path__ = []
+    body_pkg = types.ModuleType("FEATURES.body_tracking")
+    body_pkg.__path__ = []
+    src_pkg = types.ModuleType("FEATURES.body_tracking.src")
+    src_pkg.__path__ = []
+
+    monkeypatch.setitem(sys.modules, "FEATURES", features_pkg)
+    monkeypatch.setitem(sys.modules, "FEATURES.body_tracking", body_pkg)
+    monkeypatch.setitem(sys.modules, "FEATURES.body_tracking.src", src_pkg)
+    monkeypatch.setitem(sys.modules, "FEATURES.body_tracking.src.body_tracking_runner", runner_mod)
+
+    payload = episode_run._maybe_run_body_tracking(
+        ep_id=ep_id,
+        run_id=run_id,
+        effective_run_id=run_id,
+        video_path=tmp_path / "video.mp4",
+        import_status={"torchreid": {"status": "ok", "version": "0.2.5"}},
+    )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "success"
+
+    body_reid = payload.get("body_reid")
+    assert isinstance(body_reid, dict)
+    assert body_reid.get("torchreid_import_ok") is False
+    assert body_reid.get("torchreid_runtime_ok") is False
+    assert body_reid.get("enabled_effective") is False
+    assert body_reid.get("reid_skip_reason") == "torchreid_import_error"
+    assert "FeatureExtractor not found" in str(body_reid.get("torchreid_runtime_error"))
+
+
+def test_body_reid_enables_when_feature_extractor_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+
+    from py_screenalytics import run_layout
+    from tools import episode_run
+
+    monkeypatch.setattr(episode_run, "_load_body_tracking_config", lambda: {"body_tracking": {"enabled": True}})
+
+    torchreid_pkg = types.ModuleType("torchreid")
+    torchreid_pkg.__version__ = "0.2.5"
+    torchreid_pkg.__path__ = []
+    reid_pkg = types.ModuleType("torchreid.reid")
+    reid_pkg.__path__ = []
+    reid_utils_pkg = types.ModuleType("torchreid.reid.utils")
+    reid_utils_pkg.__path__ = []
+
+    class _DummyFeatureExtractor:
+        pass
+
+    reid_utils_pkg.FeatureExtractor = _DummyFeatureExtractor
+
+    monkeypatch.setitem(sys.modules, "torchreid", torchreid_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.reid", reid_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.reid.utils", reid_utils_pkg)
+
+    ep_id = "ep-test"
+    run_id = "run-body-reid-ok"
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    (run_root / "tracks.jsonl").write_text(json.dumps({"track_id": 1}) + "\n", encoding="utf-8")
+
+    runner_mod = types.ModuleType("FEATURES.body_tracking.src.body_tracking_runner")
+
+    class _DummyBodyTrackingRunner:
+        def __init__(
+            self,
+            episode_id: str,
+            config_path=None,
+            fusion_config_path=None,
+            video_path=None,
+            output_dir: Path | None = None,
+            skip_existing: bool = True,
+        ) -> None:
+            assert output_dir is not None
+            self.output_dir = Path(output_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.config = types.SimpleNamespace(reid_enabled=True, reid_embedding_dim=256, reid_model="osnet_x1_0")
+            self.embeddings_path = self.output_dir / "body_embeddings.npy"
+            self.embeddings_meta_path = self.output_dir / "body_embeddings_meta.json"
+            self.metrics_path = self.output_dir / "body_metrics.json"
+            self.tracker_backend_configured = "bytetrack"
+            self.tracker_backend_actual = "bytetrack"
+            self.tracker_fallback_reason = None
+
+        def run_detection(self) -> Path:
+            path = self.output_dir / "body_detections.jsonl"
+            path.write_text(json.dumps({"frame_idx": 0}) + "\n", encoding="utf-8")
+            return path
+
+        def run_tracking(self) -> Path:
+            path = self.output_dir / "body_tracks.jsonl"
+            path.write_text(json.dumps({"track_id": 100000}) + "\n", encoding="utf-8")
+            return path
+
+        def run_embedding(self) -> Path:
+            import numpy as np
+
+            np.save(self.embeddings_path, np.zeros((1, 4), dtype=np.float32))
+            self.embeddings_meta_path.write_text(
+                json.dumps({"entries": [{"track_id": 100000, "frame_idx": 0}]}, indent=2),
+                encoding="utf-8",
+            )
+            return self.embeddings_path
+
+    runner_mod.BodyTrackingRunner = _DummyBodyTrackingRunner
+
+    features_pkg = types.ModuleType("FEATURES")
+    features_pkg.__path__ = []
+    body_pkg = types.ModuleType("FEATURES.body_tracking")
+    body_pkg.__path__ = []
+    src_pkg = types.ModuleType("FEATURES.body_tracking.src")
+    src_pkg.__path__ = []
+
+    monkeypatch.setitem(sys.modules, "FEATURES", features_pkg)
+    monkeypatch.setitem(sys.modules, "FEATURES.body_tracking", body_pkg)
+    monkeypatch.setitem(sys.modules, "FEATURES.body_tracking.src", src_pkg)
+    monkeypatch.setitem(sys.modules, "FEATURES.body_tracking.src.body_tracking_runner", runner_mod)
+
+    payload = episode_run._maybe_run_body_tracking(
+        ep_id=ep_id,
+        run_id=run_id,
+        effective_run_id=run_id,
+        video_path=tmp_path / "video.mp4",
+        import_status={"torchreid": {"status": "ok", "version": "0.2.5"}},
+    )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "success"
+
+    body_reid = payload.get("body_reid")
+    assert isinstance(body_reid, dict)
+    assert body_reid.get("torchreid_import_ok") is True
+    assert body_reid.get("torchreid_runtime_ok") is True
+    assert body_reid.get("reid_skip_reason") is None
+    assert body_reid.get("enabled_effective") is True

@@ -155,3 +155,26 @@ def test_track_fusion_records_reid_comparisons_and_attribution() -> None:
             any_reid_attributed = True
             assert isinstance(attribution.get("best_similarity"), (int, float))
     assert any_reid_attributed, "expected at least one Re-ID attributed fused identity"
+
+
+def test_track_fusion_records_skip_reason_when_reid_inputs_unavailable() -> None:
+    """0 Re-ID comparisons should not be ambiguous when inputs are missing/empty."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    import numpy as np
+
+    from FEATURES.body_tracking.src.track_fusion import TrackFusion
+
+    fusion = TrackFusion(reid_similarity_threshold=0.70, max_gap_seconds=30.0)
+    fusion.fuse_tracks(
+        face_tracks={1: {"track_id": 1, "detections": [], "start_frame": 0, "end_frame": 10}},
+        body_tracks={100001: {"track_id": 100001, "detections": [], "start_frame": 12, "end_frame": 20}},
+        face_embeddings=np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+        face_embeddings_meta=[{"track_id": 1}],
+        body_embeddings=np.zeros((0, 4), dtype=np.float32),
+        body_embeddings_meta=[],
+    )
+
+    diagnostics = getattr(fusion, "last_diagnostics", {})
+    assert diagnostics.get("reid_comparisons") == 0
+    assert diagnostics.get("reid_skip_reason") == "missing_body_embeddings_meta"
