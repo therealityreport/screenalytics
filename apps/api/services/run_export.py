@@ -45,6 +45,98 @@ def _read_json(path: Path) -> Any:
         return None
 
 
+def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) -> str:
+    """Insert zero-width break opportunities to keep long tokens from overflowing PDF cells.
+
+    ReportLab wraps on whitespace but can overflow on long unbroken tokens (paths, S3 keys, etc).
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+
+    # Add zero-width breakpoints after common separators.
+    separators = r"/_\-\.=:(),"
+    out_chars: list[str] = []
+    for ch in raw:
+        out_chars.append(ch)
+        if ch in separators:
+            out_chars.append("\u200b")
+    softened = "".join(out_chars)
+
+    # Fallback: chunk extremely long tokens that still have no breaks.
+    tokens = softened.split(" ")
+    for i, tok in enumerate(tokens):
+        if len(tok) <= max_token_len:
+            continue
+        # Only chunk tokens that are essentially unbreakable (no whitespace breaks already).
+        if "\u200b" in tok:
+            continue
+        tokens[i] = "\u200b".join(tok[j : j + chunk_len] for j in range(0, len(tok), chunk_len))
+    return " ".join(tokens)
+
+
+def _escape_reportlab_xml(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_wrap_safe_kv_table(
+    rows: list[tuple[str, str | list[tuple[str, str]] | None]],
+    *,
+    width: float,
+    header: tuple[str, str] = ("Input", "Value"),
+    label_ratio: float = 0.40,
+    cell_style: Any,
+    header_style: Any,
+) -> Any:
+    """Build a 2-column key/value table with Paragraph cells and wrap-safe text."""
+    from reportlab.lib import colors  # imported lazily to keep module import lightweight
+    from reportlab.platypus import Paragraph, Table, TableStyle
+
+    def _p(text: str, *, style: Any, allow_markup: bool = False) -> Paragraph:
+        softened = _soft_wrap_text(text)
+        if allow_markup:
+            return Paragraph(softened, style)
+        return Paragraph(_escape_reportlab_xml(softened), style)
+
+    def _value_cell(value: str | list[tuple[str, str]] | None) -> Paragraph:
+        if value is None:
+            return _p("N/A", style=cell_style)
+        if isinstance(value, list):
+            lines: list[str] = []
+            for k, v in value:
+                k_safe = _escape_reportlab_xml(_soft_wrap_text(k))
+                v_safe = _escape_reportlab_xml(_soft_wrap_text(v))
+                lines.append(f"<b>{k_safe}:</b> {v_safe}")
+            return _p("<br/>".join(lines), style=cell_style, allow_markup=True)
+        return _p(str(value), style=cell_style)
+
+    label_w = max(width * float(label_ratio), 1)
+    value_w = max(width - label_w, 1)
+    data: list[list[Any]] = [[_p(header[0], style=header_style), _p(header[1], style=header_style)]]
+    for label, value in rows:
+        data.append([_p(str(label), style=cell_style), _value_cell(value)])
+
+    table = Table(data, colWidths=[label_w, value_w])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+            ]
+        )
+    )
+    return table
+
+
 def _safe_add_file(zip_handle: zipfile.ZipFile, src: Path, *, arcname: str) -> None:
     try:
         if src.exists() and src.is_file():
@@ -1334,11 +1426,15 @@ def build_screentime_run_debug_pdf(
         fontSize=8,
         leading=10,
     )
+    # Ensure ReportLab breaks long tokens (paths, S3 keys) instead of overflowing.
+    cell_style.wordWrap = "CJK"
+    cell_style.splitLongWords = 1
+    cell_style_small.wordWrap = "CJK"
+    cell_style_small.splitLongWords = 1
 
     def _wrap_cell(text: str, style: ParagraphStyle = cell_style) -> Paragraph:
         """Wrap text in a Paragraph for table cell text wrapping."""
-        # Escape XML special characters for ReportLab
-        safe_text = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_text = _escape_reportlab_xml(_soft_wrap_text(str(text)))
         return Paragraph(safe_text, style)
 
     def _wrap_row(row: list, style: ParagraphStyle = cell_style) -> list:
@@ -1393,7 +1489,9 @@ def build_screentime_run_debug_pdf(
         )
         story.append(Paragraph(f"Hydrated keys ({len(hydrated_items)}):", subsection_style))
         for key, location in hydrated_items:
-            story.append(Paragraph(f"&bull; {key} (artifact_location={location})", bullet_style))
+            key_safe = _escape_reportlab_xml(_soft_wrap_text(key))
+            loc_safe = _escape_reportlab_xml(_soft_wrap_text(location))
+            story.append(Paragraph(f"&bull; {key_safe} (artifact_location={loc_safe})", bullet_style))
         story.append(Spacer(1, 8))
 
     # =========================================================================
@@ -1828,6 +1926,11 @@ def build_screentime_run_debug_pdf(
     marker_detect_device: str | None = None
     marker_requested_detect_device: str | None = None
     marker_resolved_detect_device: str | None = None
+    marker_onnx_provider_requested: str | None = None
+    marker_onnx_provider_resolved: str | None = None
+    marker_torch_device_requested: str | None = None
+    marker_torch_device_resolved: str | None = None
+    marker_torch_device_fallback_reason: str | None = None
     marker_face_detector_model: str | None = None
     marker_embed_requested_device: str | None = None
     marker_embed_resolved_device: str | None = None
@@ -1835,6 +1938,10 @@ def build_screentime_run_debug_pdf(
     marker_embedding_backend_actual: str | None = None
     marker_embedding_backend_fallback_reason: str | None = None
     marker_embedding_model_name: str | None = None
+    marker_scene_cut_count: int | None = None
+    marker_warmup_frames_per_cut_effective: float | None = None
+    marker_forced_scene_warmup_ratio: float | None = None
+    marker_wall_time_per_processed_frame_s: float | None = None
     if isinstance(detect_track_marker, dict):
         marker_duration_s = _parse_ffprobe_fraction(detect_track_marker.get("video_duration_sec"))
         marker_fps = _parse_ffprobe_fraction(detect_track_marker.get("fps"))
@@ -1902,6 +2009,39 @@ def build_screentime_run_debug_pdf(
             str(detect_track_marker.get("resolved_device")).strip()
             if isinstance(detect_track_marker.get("resolved_device"), str)
             else None
+        )
+        marker_onnx_provider_requested = (
+            str(detect_track_marker.get("onnx_provider_requested")).strip()
+            if isinstance(detect_track_marker.get("onnx_provider_requested"), str)
+            else None
+        )
+        marker_onnx_provider_resolved = (
+            str(detect_track_marker.get("onnx_provider_resolved")).strip()
+            if isinstance(detect_track_marker.get("onnx_provider_resolved"), str)
+            else None
+        )
+        marker_torch_device_requested = (
+            str(detect_track_marker.get("torch_device_requested")).strip()
+            if isinstance(detect_track_marker.get("torch_device_requested"), str)
+            else None
+        )
+        marker_torch_device_resolved = (
+            str(detect_track_marker.get("torch_device_resolved")).strip()
+            if isinstance(detect_track_marker.get("torch_device_resolved"), str)
+            else None
+        )
+        marker_torch_device_fallback_reason = (
+            str(detect_track_marker.get("torch_device_fallback_reason")).strip()
+            if isinstance(detect_track_marker.get("torch_device_fallback_reason"), str)
+            else None
+        )
+        marker_scene_cut_count = _safe_int_opt(detect_track_marker.get("scene_cut_count"))
+        marker_warmup_frames_per_cut_effective = _safe_float_opt(
+            detect_track_marker.get("warmup_frames_per_cut_effective")
+        )
+        marker_forced_scene_warmup_ratio = _safe_float_opt(detect_track_marker.get("forced_scene_warmup_ratio"))
+        marker_wall_time_per_processed_frame_s = _safe_float_opt(
+            detect_track_marker.get("wall_time_per_processed_frame_s")
         )
         marker_face_detector_model = (
             str(detect_track_marker.get("detector_model_name")).strip()
@@ -2010,15 +2150,45 @@ def build_screentime_run_debug_pdf(
             ["detect_track.marker.fps", _fmt_fps(marker_fps)],
             ["detect_track.marker.frames_total", _fmt_int(marker_frames_total)],
         ])
+
     if marker_stride_requested is not None:
         lineage_data.append(["Face Detection Stride (requested)", str(marker_stride_requested)])
-    if marker_requested_detect_device or marker_resolved_detect_device:
-        if marker_requested_detect_device:
-            lineage_data.append(["Face Detect Device (requested)", marker_requested_detect_device])
-        if marker_detect_device and marker_detect_device != marker_requested_detect_device:
-            lineage_data.append(["Face Detect Device (configured)", marker_detect_device])
-        if marker_resolved_detect_device:
-            lineage_data.append(["Face Detect Device (resolved)", marker_resolved_detect_device])
+
+    onnx_provider_requested = marker_onnx_provider_requested or marker_requested_detect_device
+    onnx_provider_resolved = marker_onnx_provider_resolved or marker_resolved_detect_device
+    if onnx_provider_requested or onnx_provider_resolved:
+        provider_lines: list[tuple[str, str]] = []
+        if onnx_provider_requested:
+            provider_lines.append(("requested", onnx_provider_requested))
+        if marker_detect_device and marker_detect_device != onnx_provider_requested:
+            provider_lines.append(("configured", marker_detect_device))
+        if onnx_provider_resolved:
+            provider_lines.append(("resolved", onnx_provider_resolved))
+        lineage_data.append(["Face Detect ONNX Provider", provider_lines])
+
+    torch_requested = marker_torch_device_requested
+    torch_resolved = marker_torch_device_resolved
+    torch_reason = marker_torch_device_fallback_reason
+    if not torch_requested and not torch_resolved and onnx_provider_requested:
+        # Legacy runs: infer a safe torch device summary from ONNX provider semantics.
+        inferred = onnx_provider_resolved or onnx_provider_requested
+        if inferred in {"cpu", "cuda", "mps"}:
+            torch_requested = inferred
+            torch_resolved = inferred
+        elif inferred == "coreml":
+            torch_requested = "mps"
+            torch_resolved = "mps"
+            torch_reason = "legacy_run: onnx_provider=coreml; torch_device inferred as mps"
+    if torch_requested or torch_resolved or torch_reason:
+        torch_lines: list[tuple[str, str]] = []
+        if torch_requested:
+            torch_lines.append(("requested", torch_requested))
+        if torch_resolved:
+            torch_lines.append(("resolved", torch_resolved))
+        if torch_reason:
+            torch_lines.append(("fallback_reason", torch_reason))
+        lineage_data.append(["Torch Device (fallback models)", torch_lines])
+
     if marker_face_detector_model:
         lineage_data.append(["Face Detector Model (runtime)", marker_face_detector_model])
     if marker_embedding_model_name:
@@ -2029,12 +2199,12 @@ def build_screentime_run_debug_pdf(
         if marker_embed_resolved_device:
             lineage_data.append(["Embedding Device (resolved)", marker_embed_resolved_device])
     if marker_embedding_backend_actual:
-        detail = marker_embedding_backend_actual
-        if marker_embedding_backend_fallback_reason:
-            detail = f"{detail} (fallback_reason={marker_embedding_backend_fallback_reason})"
+        backend_lines: list[tuple[str, str]] = [("actual", marker_embedding_backend_actual)]
         if marker_embedding_backend_configured and marker_embedding_backend_configured != marker_embedding_backend_actual:
-            detail = f"{detail} (configured={marker_embedding_backend_configured})"
-        lineage_data.append(["Embedding Backend (actual)", detail])
+            backend_lines.append(("configured", marker_embedding_backend_configured))
+        if marker_embedding_backend_fallback_reason:
+            backend_lines.append(("fallback_reason", marker_embedding_backend_fallback_reason))
+        lineage_data.append(["Embedding Backend (runtime)", backend_lines])
     if marker_stride_effective is not None:
         lineage_data.append(["Face Detection Stride (effective)", str(marker_stride_effective)])
     if marker_stride_observed_median is not None:
@@ -2042,17 +2212,32 @@ def build_screentime_run_debug_pdf(
     if marker_frames_scanned_total is not None:
         lineage_data.append(["Frames Scanned Total (OpenCV)", str(marker_frames_scanned_total)])
     if marker_face_detect_frames_processed is not None:
-        parts: list[str] = []
+        lines: list[tuple[str, str]] = [("total", str(marker_face_detect_frames_processed))]
         if marker_face_detect_frames_processed_stride is not None:
-            parts.append(f"stride_hits={marker_face_detect_frames_processed_stride}")
+            lines.append(("stride_hits", str(marker_face_detect_frames_processed_stride)))
         if marker_face_detect_frames_processed_forced_scene_warmup is not None:
-            parts.append(f"forced_scene_warmup={marker_face_detect_frames_processed_forced_scene_warmup}")
+            lines.append(("forced_scene_warmup", str(marker_face_detect_frames_processed_forced_scene_warmup)))
         if marker_expected_frames_by_stride is not None:
-            parts.append(f"expected_by_stride={marker_expected_frames_by_stride}")
-        detail = str(marker_face_detect_frames_processed)
-        if parts:
-            detail += " (" + ", ".join(parts) + ")"
-        lineage_data.append(["Face Detect Frames Processed", detail])
+            lines.append(("expected_by_stride", str(marker_expected_frames_by_stride)))
+        if marker_forced_scene_warmup_ratio is not None:
+            lines.append(("forced_scene_warmup_ratio", f"{marker_forced_scene_warmup_ratio:.3f}"))
+        lineage_data.append(["Face Detect Frames Processed", lines])
+
+    if (
+        marker_scene_cut_count is not None
+        or marker_warmup_frames_per_cut_effective is not None
+        or marker_wall_time_per_processed_frame_s is not None
+    ):
+        warmup_lines: list[tuple[str, str]] = []
+        if marker_scene_cut_count is not None:
+            warmup_lines.append(("scene_cut_count", str(marker_scene_cut_count)))
+        if marker_scene_warmup_dets is not None:
+            warmup_lines.append(("scene_warmup_frames_per_cut_configured", str(marker_scene_warmup_dets)))
+        if marker_warmup_frames_per_cut_effective is not None:
+            warmup_lines.append(("warmup_frames_per_cut_effective", f"{marker_warmup_frames_per_cut_effective:.3f}"))
+        if marker_wall_time_per_processed_frame_s is not None:
+            warmup_lines.append(("wall_time_per_processed_frame_s", f"{marker_wall_time_per_processed_frame_s:.6f}"))
+        lineage_data.append(["Scene Warmup Diagnostics", warmup_lines])
     if marker_scene_detect_wall_time_s is not None:
         lineage_data.append(["Scene Detect Wall Time (wall-clock)", f"{marker_scene_detect_wall_time_s:.1f}s"])
     if marker_detect_wall_time_s is not None:
@@ -2062,10 +2247,12 @@ def build_screentime_run_debug_pdf(
     if marker_effective_fps_processing is not None:
         lineage_data.append(["Detect Effective FPS", f"{marker_effective_fps_processing:.3f} fps"])
     if marker_tracker_backend_actual is not None:
-        detail = marker_tracker_backend_actual
+        tracker_lines: list[tuple[str, str]] = [("actual", marker_tracker_backend_actual)]
+        if marker_tracker_backend_configured and marker_tracker_backend_configured != marker_tracker_backend_actual:
+            tracker_lines.append(("configured", marker_tracker_backend_configured))
         if marker_tracker_fallback_reason:
-            detail = f"{detail} (fallback_reason={marker_tracker_fallback_reason})"
-        lineage_data.append(["Face Tracker Backend (actual)", detail])
+            tracker_lines.append(("fallback_reason", marker_tracker_fallback_reason))
+        lineage_data.append(["Face Tracker Backend (runtime)", tracker_lines])
     if marker_gate_enabled is not None:
         lineage_data.append(["Appearance Gate Enabled", "true" if marker_gate_enabled else "false"])
     if marker_gate_auto_rerun is not None:
@@ -2211,12 +2398,12 @@ def build_screentime_run_debug_pdf(
             configured_str = str(configured).strip() if isinstance(configured, str) and configured.strip() else None
             reason_str = str(reason).strip() if isinstance(reason, str) and reason.strip() else None
             if actual_str:
-                detail = actual_str
-                if reason_str:
-                    detail = f"{detail} (fallback_reason={reason_str})"
+                tracker_lines: list[tuple[str, str]] = [("actual", actual_str)]
                 if configured_str and configured_str != actual_str:
-                    detail = f"{detail} (configured={configured_str})"
-                lineage_data.append(["Body Tracker Backend (actual)", detail])
+                    tracker_lines.append(("configured", configured_str))
+                if reason_str:
+                    tracker_lines.append(("fallback_reason", reason_str))
+                lineage_data.append(["Body Tracker Backend (runtime)", tracker_lines])
 
     # Model versions
     lineage_data.extend([
@@ -2227,17 +2414,23 @@ def build_screentime_run_debug_pdf(
         ["Body Re-ID", body_detection_config.get("person_reid", {}).get("model", "osnet_x1_0")],
     ])
 
-    lineage_table = Table(lineage_data, colWidths=[2 * inch, 4.5 * inch])
-    lineage_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
-        ])
+    kv_header_style = ParagraphStyle(
+        "KVHeader",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+    )
+    lineage_rows: list[tuple[str, Any]] = []
+    for row in lineage_data[1:]:
+        if isinstance(row, list) and len(row) == 2:
+            lineage_rows.append((str(row[0]), row[1]))
+
+    lineage_table = build_wrap_safe_kv_table(
+        lineage_rows,
+        width=float(doc.width),
+        header=(str(lineage_data[0][0]), str(lineage_data[0][1])),
+        label_ratio=0.40,
+        cell_style=cell_style,
+        header_style=kv_header_style,
     )
     story.append(lineage_table)
 

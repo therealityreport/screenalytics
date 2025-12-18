@@ -93,10 +93,9 @@ def test_pdf_reports_detect_wall_time_rtf_and_stride_accounting(
 
     assert "Frames Scanned Total" in combined
     assert "Face Detect Frames Processed" in combined
-    assert "stride_hits=" in combined
-    assert "forced_scene_warmup=" in combined
-    assert "expected_by_stride=" in combined
+    assert "stride_hits" in combined
+    assert "forced_scene_warmup" in combined
+    assert "expected_by_stride" in combined
 
     assert "Face Tracker Backend" in combined
     assert "ultralytics.bytetrack" in combined
-
