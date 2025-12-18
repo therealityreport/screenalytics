@@ -86,6 +86,8 @@ docker compose -f infra/docker/compose.yaml up -d
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# For pipeline runs (detect/track, embeddings, body tracking):
+pip install -r requirements-ml.txt
 
 # Optional Next.js web app
 cd web && npm install && cd -
