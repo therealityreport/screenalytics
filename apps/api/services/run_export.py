@@ -2624,6 +2624,7 @@ def build_screentime_run_debug_pdf(
                 if (
                     torchreid_env_ok is True
                     and skip_reason_effective == "torchreid_import_error"
+                    and torchreid_import_ok is not False
                 ):
                     skip_reason_effective = "torchreid_runtime_error"
                 if skip_reason_effective:
@@ -3225,7 +3226,7 @@ def build_screentime_run_debug_pdf(
                 runtime_error_str = runtime_error_str[:177] + "..."
 
             skip_reason_effective = skip_reason.strip() if isinstance(skip_reason, str) and skip_reason.strip() else None
-            if torchreid_env_ok is True and skip_reason_effective == "torchreid_import_error":
+            if torchreid_env_ok is True and skip_reason_effective == "torchreid_import_error" and torchreid_import_ok is not False:
                 skip_reason_effective = "torchreid_runtime_error"
             if skip_reason_effective:
                 reid_lines.append(("skip_reason", skip_reason_effective))
