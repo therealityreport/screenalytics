@@ -1446,6 +1446,7 @@ class ByteTrackAdapter:
             track_buffer=self._effective_buffer,
             match_thresh=self.config.match_thresh,
             min_box_area=self.config.min_box_area,
+            fuse_score=False,
         )
         return BYTETracker(cfg, frame_rate=self.frame_rate)
 
