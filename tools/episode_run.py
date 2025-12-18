@@ -8813,7 +8813,7 @@ def _run_cluster_stage(
         except Exception as exc:
             LOGGER.warning("Failed to generate track representatives: %s", exc)
 
-        # Build preliminary summary for completion events (before S3 sync)
+        # Build preliminary summary (S3 sync + fusion may augment this before completion).
         finished_at = _utcnow_iso()
         summary: Dict[str, Any] = {
             "stage": "cluster",
@@ -8839,31 +8839,7 @@ def _run_cluster_stage(
             "stats": payload["stats"],
         }
 
-        # Emit completion BEFORE S3 sync (which might hang or take long)
-        progress.emit(
-            faces_total,
-            phase="cluster",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            summary=summary,
-            force=True,
-            extra=_non_video_phase_meta("done"),
-        )
-        progress.complete(
-            summary,
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            step="cluster",
-            extra=phase_meta,
-        )
-
-        # Persist phase marker promptly after completion; S3 sync may take a while.
-        # Brief delay to ensure final progress event is written and readable.
-        time.sleep(0.2)
+        # Persist phase marker before S3 sync so it's captured in the run-scoped bundle.
         _write_run_marker(
             args.ep_id,
             "cluster",
@@ -8893,7 +8869,7 @@ def _run_cluster_stage(
                 extra={"phase": "cluster", "status": "success", "finished_at": finished_at},
             )
 
-        # Run body tracking fusion (best-effort, requires body_tracks + faces to exist)
+        # Run body tracking fusion (best-effort, requires body_tracks + faces to exist).
         try:
             fusion_result = _maybe_run_body_tracking_fusion(
                 ep_id=args.ep_id,
@@ -8905,7 +8881,8 @@ def _run_cluster_stage(
         except Exception as exc:
             LOGGER.warning("[cluster] Body tracking fusion failed (non-fatal): %s", exc)
 
-        # Now do S3 sync after completion is signaled (legacy episode-level artifacts)
+        # S3 sync should run after all artifacts are written so S3-first mode (delete local)
+        # doesn't race exports/reporting that hydrate from S3.
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
         summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
         if s3_sync_result.errors:
@@ -8938,6 +8915,28 @@ def _run_cluster_stage(
             except Exception as exc:
                 LOGGER.warning("[cluster] Run-scoped S3 sync skipped: %s", exc)
                 summary["artifacts"]["run_scoped_s3"] = {"error": str(exc)}
+
+        # Emit completion after fusion + S3 sync so downstream steps see a consistent run bundle.
+        progress.emit(
+            faces_total,
+            phase="cluster",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            summary=summary,
+            force=True,
+            extra=_non_video_phase_meta("done"),
+        )
+        progress.complete(
+            summary,
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            step="cluster",
+            extra=phase_meta,
+        )
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:
