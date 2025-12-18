@@ -1077,6 +1077,27 @@ def build_screentime_run_debug_pdf(
 
     s3_layout = run_layout.get_run_s3_layout(ep_id, run_id_norm)
 
+    def _safe_float_opt(value: Any) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    def _safe_int_opt(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned.isdigit():
+                return int(cleaned)
+        return None
+
     manifests_root = get_path(ep_id, "detections").parent
     # Run-scoped body_tracking is authoritative for this report; legacy artifacts are diagnostic only.
     body_tracking_dir = run_root / "body_tracking"
@@ -1171,6 +1192,7 @@ def build_screentime_run_debug_pdf(
     body_tracking_dir = body_tracks_path.parent
     detect_track_marker_path = _resolved_path(run_root / "detect_track.json", "detect_track.json")
     body_tracking_marker_path = _resolved_path(run_root / "body_tracking.json", "body_tracking.json")
+    faces_embed_marker_path = _resolved_path(run_root / "faces_embed.json", "faces_embed.json")
 
     # Load JSON artifact data
     identities_payload = _read_json(identities_path)
@@ -1771,6 +1793,7 @@ def build_screentime_run_debug_pdf(
     ffprobe_meta = _ffprobe_video_metadata(video_path)
     opencv_meta = _opencv_video_metadata(video_path)
     detect_track_marker = _read_json(detect_track_marker_path) if detect_track_marker_path.exists() else None
+    faces_embed_marker = _read_json(faces_embed_marker_path) if faces_embed_marker_path.exists() else None
 
     ffprobe_duration_s = ffprobe_meta.get("duration_s") if ffprobe_meta.get("ok") else None
     ffprobe_fps = ffprobe_meta.get("avg_fps") if ffprobe_meta.get("ok") else None
@@ -1787,6 +1810,31 @@ def build_screentime_run_debug_pdf(
     marker_stride_requested = None
     marker_gate_enabled: bool | None = None
     marker_gate_auto_rerun: dict[str, Any] | None = None
+    marker_frames_scanned_total: int | None = None
+    marker_face_detect_frames_processed: int | None = None
+    marker_face_detect_frames_processed_stride: int | None = None
+    marker_face_detect_frames_processed_forced_scene_warmup: int | None = None
+    marker_stride_effective: int | None = None
+    marker_stride_observed_median: int | None = None
+    marker_expected_frames_by_stride: int | None = None
+    marker_detect_wall_time_s: float | None = None
+    marker_effective_fps_processing: float | None = None
+    marker_rtf: float | None = None
+    marker_scene_detect_wall_time_s: float | None = None
+    marker_scene_warmup_dets: int | None = None
+    marker_tracker_backend_configured: str | None = None
+    marker_tracker_backend_actual: str | None = None
+    marker_tracker_fallback_reason: str | None = None
+    marker_detect_device: str | None = None
+    marker_requested_detect_device: str | None = None
+    marker_resolved_detect_device: str | None = None
+    marker_face_detector_model: str | None = None
+    marker_embed_requested_device: str | None = None
+    marker_embed_resolved_device: str | None = None
+    marker_embedding_backend_configured: str | None = None
+    marker_embedding_backend_actual: str | None = None
+    marker_embedding_backend_fallback_reason: str | None = None
+    marker_embedding_model_name: str | None = None
     if isinstance(detect_track_marker, dict):
         marker_duration_s = _parse_ffprobe_fraction(detect_track_marker.get("video_duration_sec"))
         marker_fps = _parse_ffprobe_fraction(detect_track_marker.get("fps"))
@@ -1808,6 +1856,89 @@ def build_screentime_run_debug_pdf(
             auto_rerun_raw = tracking_gate.get("auto_rerun")
             if isinstance(auto_rerun_raw, dict):
                 marker_gate_auto_rerun = auto_rerun_raw
+
+        marker_frames_scanned_total = _safe_int_opt(detect_track_marker.get("frames_scanned_total"))
+        marker_face_detect_frames_processed = _safe_int_opt(detect_track_marker.get("face_detect_frames_processed"))
+        marker_face_detect_frames_processed_stride = _safe_int_opt(
+            detect_track_marker.get("face_detect_frames_processed_stride")
+        )
+        marker_face_detect_frames_processed_forced_scene_warmup = _safe_int_opt(
+            detect_track_marker.get("face_detect_frames_processed_forced_scene_warmup")
+        )
+        marker_stride_effective = _safe_int_opt(detect_track_marker.get("stride_effective"))
+        marker_stride_observed_median = _safe_int_opt(detect_track_marker.get("stride_observed_median"))
+        marker_expected_frames_by_stride = _safe_int_opt(detect_track_marker.get("expected_frames_by_stride"))
+        marker_detect_wall_time_s = _safe_float_opt(detect_track_marker.get("detect_wall_time_s"))
+        marker_effective_fps_processing = _safe_float_opt(detect_track_marker.get("effective_fps_processing"))
+        marker_rtf = _safe_float_opt(detect_track_marker.get("rtf"))
+        marker_scene_detect_wall_time_s = _safe_float_opt(detect_track_marker.get("scene_detect_wall_time_s"))
+        marker_scene_warmup_dets = _safe_int_opt(detect_track_marker.get("scene_warmup_dets"))
+        marker_tracker_backend_configured = (
+            str(detect_track_marker.get("tracker_backend_configured")).strip()
+            if isinstance(detect_track_marker.get("tracker_backend_configured"), str)
+            else None
+        )
+        marker_tracker_backend_actual = (
+            str(detect_track_marker.get("tracker_backend_actual")).strip()
+            if isinstance(detect_track_marker.get("tracker_backend_actual"), str)
+            else None
+        )
+        marker_tracker_fallback_reason = (
+            str(detect_track_marker.get("tracker_fallback_reason")).strip()
+            if isinstance(detect_track_marker.get("tracker_fallback_reason"), str)
+            else None
+        )
+        marker_detect_device = (
+            str(detect_track_marker.get("device")).strip()
+            if isinstance(detect_track_marker.get("device"), str)
+            else None
+        )
+        marker_requested_detect_device = (
+            str(detect_track_marker.get("requested_device")).strip()
+            if isinstance(detect_track_marker.get("requested_device"), str)
+            else None
+        )
+        marker_resolved_detect_device = (
+            str(detect_track_marker.get("resolved_device")).strip()
+            if isinstance(detect_track_marker.get("resolved_device"), str)
+            else None
+        )
+        marker_face_detector_model = (
+            str(detect_track_marker.get("detector_model_name")).strip()
+            if isinstance(detect_track_marker.get("detector_model_name"), str)
+            else None
+        )
+    if isinstance(faces_embed_marker, dict):
+        marker_embed_requested_device = (
+            str(faces_embed_marker.get("requested_device")).strip()
+            if isinstance(faces_embed_marker.get("requested_device"), str)
+            else None
+        )
+        marker_embed_resolved_device = (
+            str(faces_embed_marker.get("resolved_device")).strip()
+            if isinstance(faces_embed_marker.get("resolved_device"), str)
+            else None
+        )
+        marker_embedding_backend_configured = (
+            str(faces_embed_marker.get("embedding_backend_configured")).strip()
+            if isinstance(faces_embed_marker.get("embedding_backend_configured"), str)
+            else None
+        )
+        marker_embedding_backend_actual = (
+            str(faces_embed_marker.get("embedding_backend_actual")).strip()
+            if isinstance(faces_embed_marker.get("embedding_backend_actual"), str)
+            else None
+        )
+        marker_embedding_backend_fallback_reason = (
+            str(faces_embed_marker.get("embedding_backend_fallback_reason")).strip()
+            if isinstance(faces_embed_marker.get("embedding_backend_fallback_reason"), str)
+            else None
+        )
+        marker_embedding_model_name = (
+            str(faces_embed_marker.get("embedding_model_name")).strip()
+            if isinstance(faces_embed_marker.get("embedding_model_name"), str)
+            else None
+        )
 
     def _fmt_duration_s(value: float | None) -> str:
         if value is None:
@@ -1881,6 +2012,60 @@ def build_screentime_run_debug_pdf(
         ])
     if marker_stride_requested is not None:
         lineage_data.append(["Face Detection Stride (requested)", str(marker_stride_requested)])
+    if marker_requested_detect_device or marker_resolved_detect_device:
+        if marker_requested_detect_device:
+            lineage_data.append(["Face Detect Device (requested)", marker_requested_detect_device])
+        if marker_detect_device and marker_detect_device != marker_requested_detect_device:
+            lineage_data.append(["Face Detect Device (configured)", marker_detect_device])
+        if marker_resolved_detect_device:
+            lineage_data.append(["Face Detect Device (resolved)", marker_resolved_detect_device])
+    if marker_face_detector_model:
+        lineage_data.append(["Face Detector Model (runtime)", marker_face_detector_model])
+    if marker_embedding_model_name:
+        lineage_data.append(["Embedding Model (runtime)", marker_embedding_model_name])
+    if marker_embed_requested_device or marker_embed_resolved_device:
+        if marker_embed_requested_device:
+            lineage_data.append(["Embedding Device (requested)", marker_embed_requested_device])
+        if marker_embed_resolved_device:
+            lineage_data.append(["Embedding Device (resolved)", marker_embed_resolved_device])
+    if marker_embedding_backend_actual:
+        detail = marker_embedding_backend_actual
+        if marker_embedding_backend_fallback_reason:
+            detail = f"{detail} (fallback_reason={marker_embedding_backend_fallback_reason})"
+        if marker_embedding_backend_configured and marker_embedding_backend_configured != marker_embedding_backend_actual:
+            detail = f"{detail} (configured={marker_embedding_backend_configured})"
+        lineage_data.append(["Embedding Backend (actual)", detail])
+    if marker_stride_effective is not None:
+        lineage_data.append(["Face Detection Stride (effective)", str(marker_stride_effective)])
+    if marker_stride_observed_median is not None:
+        lineage_data.append(["Face Detection Stride (observed median)", str(marker_stride_observed_median)])
+    if marker_frames_scanned_total is not None:
+        lineage_data.append(["Frames Scanned Total (OpenCV)", str(marker_frames_scanned_total)])
+    if marker_face_detect_frames_processed is not None:
+        parts: list[str] = []
+        if marker_face_detect_frames_processed_stride is not None:
+            parts.append(f"stride_hits={marker_face_detect_frames_processed_stride}")
+        if marker_face_detect_frames_processed_forced_scene_warmup is not None:
+            parts.append(f"forced_scene_warmup={marker_face_detect_frames_processed_forced_scene_warmup}")
+        if marker_expected_frames_by_stride is not None:
+            parts.append(f"expected_by_stride={marker_expected_frames_by_stride}")
+        detail = str(marker_face_detect_frames_processed)
+        if parts:
+            detail += " (" + ", ".join(parts) + ")"
+        lineage_data.append(["Face Detect Frames Processed", detail])
+    if marker_scene_detect_wall_time_s is not None:
+        lineage_data.append(["Scene Detect Wall Time (wall-clock)", f"{marker_scene_detect_wall_time_s:.1f}s"])
+    if marker_detect_wall_time_s is not None:
+        lineage_data.append(["Detect Wall Time (wall-clock)", f"{marker_detect_wall_time_s:.1f}s"])
+    if marker_rtf is not None:
+        lineage_data.append(["Detect Real-time Factor (RTF)", f"{marker_rtf:.3f}x"])
+    if marker_effective_fps_processing is not None:
+        lineage_data.append(["Detect Effective FPS", f"{marker_effective_fps_processing:.3f} fps"])
+    if marker_tracker_backend_actual is not None:
+        detail = marker_tracker_backend_actual
+        if marker_tracker_fallback_reason:
+            detail = f"{detail} (fallback_reason={marker_tracker_fallback_reason})"
+        lineage_data.append(["Face Tracker Backend (actual)", detail])
     if marker_gate_enabled is not None:
         lineage_data.append(["Appearance Gate Enabled", "true" if marker_gate_enabled else "false"])
     if marker_gate_auto_rerun is not None:
@@ -1936,17 +2121,19 @@ def build_screentime_run_debug_pdf(
             )
         )
 
-    # Face detection observed frame stats (most reliable for stride/frame count).
+    # Face detection observed frame stats derived from detections.jsonl (frames that emitted ≥1 detection).
     det_stats = _face_detection_frame_stats(detections_path)
     if det_stats.get("ok"):
-        lineage_data.append(["Face Detection Frames Observed", str(det_stats.get("frames_observed"))])
-        stride_median = det_stats.get("stride_median")
-        lineage_data.append(
-            ["Face Detection Stride (observed)", str(stride_median) if stride_median is not None else "unknown"]
-        )
+        lineage_data.append(["Face Detection Frames With Detections Observed", str(det_stats.get("frames_observed"))])
+        if marker_stride_observed_median is None:
+            stride_median = det_stats.get("stride_median")
+            lineage_data.append(
+                ["Face Detection Stride (observed)", str(stride_median) if stride_median is not None else "unknown"]
+            )
     else:
-        lineage_data.append(["Face Detection Frames Observed", "unknown"])
-        lineage_data.append(["Face Detection Stride (observed)", "unknown"])
+        lineage_data.append(["Face Detection Frames With Detections Observed", "unknown"])
+        if marker_stride_observed_median is None:
+            lineage_data.append(["Face Detection Stride (observed)", "unknown"])
 
     detection_stride_cfg = None
     for key in ("stride", "detect_every_n_frames"):
@@ -1966,18 +2153,75 @@ def build_screentime_run_debug_pdf(
     if body_stride_cfg is not None:
         lineage_data.append(["Body Pipeline Stride (detect_every_n_frames)", str(body_stride_cfg)])
         if bool(body_tracking_ran_effective):
-            if isinstance(resolved_frames, int) and body_stride_cfg > 0:
-                body_frames_expected = (resolved_frames + body_stride_cfg - 1) // body_stride_cfg
-                lineage_data.append(["Body Frames Processed (expected)", str(body_frames_expected)])
+            total_frames_for_body = marker_frames_scanned_total if marker_frames_scanned_total is not None else resolved_frames
+            total_frames_source = "frames_scanned_total" if marker_frames_scanned_total is not None else "resolved_frames"
+            if isinstance(total_frames_for_body, int) and body_stride_cfg > 0:
+                body_frames_expected = (total_frames_for_body + body_stride_cfg - 1) // body_stride_cfg
+                lineage_data.append(
+                    ["Body Detect Frames Processed (expected)", f"{body_frames_expected} ({total_frames_source})"]
+                )
             else:
-                lineage_data.append(["Body Frames Processed (expected)", "N/A"])
+                lineage_data.append(["Body Detect Frames Processed (expected)", "unknown"])
         else:
-            lineage_data.append(["Body Frames Processed (expected)", "N/A (body tracking not run)"])
+            lineage_data.append(["Body Detect Frames Processed (expected)", "N/A (body tracking not run)"])
+
+        # Stride accounting: compute the union of frames that would be processed by face + body detection.
+        # This helps explain why wall time can be high when face/body strides differ and/or scene_warmup_dets is enabled.
+        if (
+            bool(body_tracking_ran_effective)
+            and marker_frames_scanned_total is not None
+            and marker_stride_effective is not None
+            and marker_scene_warmup_dets is not None
+            and body_stride_cfg > 0
+        ):
+            scene_indices_raw = (
+                (track_metrics_data.get("scene_cuts") or {}).get("indices") if isinstance(track_metrics_data, dict) else None
+            )
+            scene_indices: list[int] = []
+            if isinstance(scene_indices_raw, list):
+                for value in scene_indices_raw:
+                    parsed = _safe_int_opt(value)
+                    if parsed is not None:
+                        scene_indices.append(parsed)
+
+            frames_scanned_total = int(marker_frames_scanned_total)
+            stride_effective = max(int(marker_stride_effective), 1)
+            warmup = max(int(marker_scene_warmup_dets), 0)
+
+            face_processed: set[int] = set(range(0, frames_scanned_total, stride_effective))
+            if warmup > 0 and scene_indices:
+                for cut_idx in scene_indices:
+                    if cut_idx < 0:
+                        continue
+                    for frame in range(cut_idx, min(cut_idx + warmup, frames_scanned_total)):
+                        face_processed.add(frame)
+
+            body_processed: set[int] = set(range(0, frames_scanned_total, int(body_stride_cfg)))
+            lineage_data.append(["Unique Frames Processed (expected, Face ∪ Body)", str(len(face_processed | body_processed))])
+        elif bool(body_tracking_ran_effective):
+            lineage_data.append(["Unique Frames Processed (expected, Face ∪ Body)", "unknown"])
+        else:
+            lineage_data.append(["Unique Frames Processed (expected, Face ∪ Body)", "N/A (body tracking not run)"])
+
+        if isinstance(run_body_tracking_marker, dict):
+            actual = run_body_tracking_marker.get("tracker_backend_actual")
+            configured = run_body_tracking_marker.get("tracker_backend_configured")
+            reason = run_body_tracking_marker.get("tracker_fallback_reason")
+            actual_str = str(actual).strip() if isinstance(actual, str) and actual.strip() else None
+            configured_str = str(configured).strip() if isinstance(configured, str) and configured.strip() else None
+            reason_str = str(reason).strip() if isinstance(reason, str) and reason.strip() else None
+            if actual_str:
+                detail = actual_str
+                if reason_str:
+                    detail = f"{detail} (fallback_reason={reason_str})"
+                if configured_str and configured_str != actual_str:
+                    detail = f"{detail} (configured={configured_str})"
+                lineage_data.append(["Body Tracker Backend (actual)", detail])
 
     # Model versions
     lineage_data.extend([
         ["Face Detector", detection_config.get("model_id", "retinaface_r50")],
-        ["Face Tracker", "ByteTrack"],
+        ["Face Tracker", marker_tracker_backend_actual or "ByteTrack"],
         ["Embedding Model", embedding_config.get("embedding", {}).get("backend", "tensorrt") + " / ArcFace R100"],
         ["Body Detector", body_detection_config.get("person_detection", {}).get("model", "yolov8n")],
         ["Body Re-ID", body_detection_config.get("person_reid", {}).get("model", "osnet_x1_0")],
@@ -2084,6 +2328,22 @@ def build_screentime_run_debug_pdf(
     )
     story.append(Paragraph(f"Total face tracks: <b>{track_count_display}</b>", body_style))
 
+    face_tracker_backend_detail: str | None = None
+    if isinstance(detect_track_marker, dict):
+        backend_actual = detect_track_marker.get("tracker_backend_actual")
+        backend_configured = detect_track_marker.get("tracker_backend_configured")
+        fallback_reason = detect_track_marker.get("tracker_fallback_reason")
+        if isinstance(backend_actual, str) and backend_actual.strip():
+            face_tracker_backend_detail = backend_actual.strip()
+            if isinstance(fallback_reason, str) and fallback_reason.strip():
+                face_tracker_backend_detail += f" (fallback_reason={fallback_reason.strip()})"
+            if (
+                isinstance(backend_configured, str)
+                and backend_configured.strip()
+                and backend_configured.strip() != backend_actual.strip()
+            ):
+                face_tracker_backend_detail += f" (configured={backend_configured.strip()})"
+
     track_stats = [
         ["Metric", "Value"],
         ["Tracks Born", str(metrics.get("tracks_born", "N/A"))],
@@ -2092,6 +2352,8 @@ def build_screentime_run_debug_pdf(
         ["Forced Splits", str(metrics.get("forced_splits", "N/A"))],
         ["Scene Cuts", str(track_metrics_data.get("scene_cuts", {}).get("count", "N/A"))],
     ]
+    if face_tracker_backend_detail is not None:
+        track_stats.append(["Tracker Backend (actual)", face_tracker_backend_detail])
     track_table = Table(track_stats, colWidths=[2 * inch, 2 * inch])
     track_table.setStyle(
         TableStyle([
@@ -2395,6 +2657,28 @@ def build_screentime_run_debug_pdf(
     )
     story.append(Paragraph(f"Total body tracks: <b>{body_track_count_display}</b>", body_style))
 
+    body_tracker_backend_detail: str | None = None
+    body_tracker_fallback_reason: str | None = None
+    if isinstance(run_body_tracking_marker, dict):
+        backend_actual = run_body_tracking_marker.get("tracker_backend_actual")
+        backend_configured = run_body_tracking_marker.get("tracker_backend_configured")
+        fallback_reason = run_body_tracking_marker.get("tracker_fallback_reason")
+        if isinstance(backend_actual, str) and backend_actual.strip():
+            body_tracker_backend_detail = backend_actual.strip()
+            if isinstance(backend_configured, str) and backend_configured.strip() and backend_configured.strip() != body_tracker_backend_detail:
+                body_tracker_backend_detail += f" (configured={backend_configured.strip()})"
+            if isinstance(fallback_reason, str) and fallback_reason.strip():
+                body_tracker_fallback_reason = fallback_reason.strip()
+                body_tracker_backend_detail += f" (fallback_reason={body_tracker_fallback_reason})"
+    if body_tracker_backend_detail is not None:
+        story.append(Paragraph(f"Body tracker backend (actual): <b>{body_tracker_backend_detail}</b>", body_style))
+        if body_tracker_fallback_reason:
+            story.append(Paragraph(
+                "⚠️ tracking backend fallback activated: supervision is missing. "
+                "Install <b>supervision</b> to use supervision.ByteTrack for body tracking.",
+                warning_style,
+            ))
+
     # Configuration used with explanations
     story.append(Paragraph("Configuration (body_detection.yaml → person_tracking):", subsection_style))
     person_track_cfg = body_detection_config.get("person_tracking", {})
@@ -2536,17 +2820,6 @@ def build_screentime_run_debug_pdf(
     except (TypeError, ValueError):
         upper_body_fraction = 0.5
 
-    def _safe_int(value: Any) -> int | None:
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if cleaned.isdigit():
-                return int(cleaned)
-        return None
-
     def _format_dist(dist: Any) -> str:
         if not isinstance(dist, dict):
             return "N/A"
@@ -2563,15 +2836,15 @@ def build_screentime_run_debug_pdf(
         fusion_diag_payload = diag_block if isinstance(diag_block, dict) else None
 
     if fusion_diag_payload:
-        candidate_overlaps = _safe_int(fusion_diag_payload.get("candidate_overlaps"))
-        overlap_ratio_pass = _safe_int(fusion_diag_payload.get("overlap_ratio_pass"))
-        iou_pass_count = _safe_int(fusion_diag_payload.get("iou_pass"))
-        iou_pairs_count = _safe_int(fusion_diag_payload.get("iou_pairs"))
-        reid_pairs_count = _safe_int(fusion_diag_payload.get("reid_pairs"))
-        hybrid_pairs_count = _safe_int(fusion_diag_payload.get("hybrid_pairs"))
-        final_pairs_count = _safe_int(fusion_diag_payload.get("final_pairs"))
-        reid_comparisons = _safe_int(fusion_diag_payload.get("reid_comparisons"))
-        reid_pass = _safe_int(fusion_diag_payload.get("reid_pass"))
+        candidate_overlaps = _safe_int_opt(fusion_diag_payload.get("candidate_overlaps"))
+        overlap_ratio_pass = _safe_int_opt(fusion_diag_payload.get("overlap_ratio_pass"))
+        iou_pass_count = _safe_int_opt(fusion_diag_payload.get("iou_pass"))
+        iou_pairs_count = _safe_int_opt(fusion_diag_payload.get("iou_pairs"))
+        reid_pairs_count = _safe_int_opt(fusion_diag_payload.get("reid_pairs"))
+        hybrid_pairs_count = _safe_int_opt(fusion_diag_payload.get("hybrid_pairs"))
+        final_pairs_count = _safe_int_opt(fusion_diag_payload.get("final_pairs"))
+        reid_comparisons = _safe_int_opt(fusion_diag_payload.get("reid_comparisons"))
+        reid_pass = _safe_int_opt(fusion_diag_payload.get("reid_pass"))
 
         candidates_value = f"{candidate_overlaps} comparisons" if candidate_overlaps is not None else "N/A"
         candidates_notes = "From track_fusion.json diagnostics"
