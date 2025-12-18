@@ -45,22 +45,42 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) -> str:
-    """Insert zero-width break opportunities to keep long tokens from overflowing PDF cells.
+def _sanitize_pdf_text(text: str) -> str:
+    """Remove characters that render as black squares or replacement glyphs in PDF fonts.
 
-    ReportLab wraps on whitespace but can overflow on long unbroken tokens (paths, S3 keys, etc).
+    Helvetica (and other Type1 fonts) cannot render:
+    - U+200B (zero-width space) - renders as black square
+    - U+25A0 (black square) - should not appear in output
+    - U+FFFD (replacement character) - indicates encoding issues
+    """
+    return (
+        text.replace("\u200b", "")
+        .replace("\u25a0", "")
+        .replace("\ufffd", "")
+    )
+
+
+def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) -> str:
+    """Process long tokens to enable PDF line wrapping without overflow.
+
+    ReportLab wraps on whitespace. For long unbroken tokens (paths, S3 keys, etc.),
+    we chunk extremely long spans so wordWrap='CJK' can break at reasonable positions.
+
+    Note: Previously inserted U+200B (zero-width space) but Helvetica renders it as
+    black squares. Now relies on wordWrap='CJK' style for breaking at any character.
     """
     raw = str(text or "")
     if not raw:
         return ""
 
-    # Add zero-width breakpoints after common separators.
+    # Identify natural break positions after separators for internal chunking logic.
     separators = r"/_\-\.=:(),"
+    ZWSP = "\u200b"  # Internal marker only, stripped before return
     out_chars: list[str] = []
     for ch in raw:
         out_chars.append(ch)
         if ch in separators:
-            out_chars.append("\u200b")
+            out_chars.append(ZWSP)
     softened = "".join(out_chars)
 
     # Fallback: chunk extremely long spans that still have no breaks.
@@ -68,15 +88,20 @@ def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) 
     for i, tok in enumerate(tokens):
         if len(tok) <= max_token_len:
             continue
-        parts = tok.split("\u200b")
+        parts = tok.split(ZWSP)
         rebuilt: list[str] = []
         for part in parts:
             if len(part) <= max_token_len:
                 rebuilt.append(part)
                 continue
-            rebuilt.append("\u200b".join(part[j : j + chunk_len] for j in range(0, len(part), chunk_len)))
-        tokens[i] = "\u200b".join(rebuilt)
-    return " ".join(tokens)
+            # Insert markers to allow breaking in very long segments
+            rebuilt.append(ZWSP.join(part[j : j + chunk_len] for j in range(0, len(part), chunk_len)))
+        tokens[i] = ZWSP.join(rebuilt)
+    result = " ".join(tokens)
+
+    # CRITICAL: Strip zero-width spaces - Helvetica renders them as black squares (■).
+    # The wordWrap='CJK' paragraph style handles actual line breaking.
+    return _sanitize_pdf_text(result)
 
 
 def _escape_reportlab_xml(text: str) -> str:
@@ -1436,10 +1461,10 @@ def build_screentime_run_debug_pdf(
         leading=10,
     )
     # Ensure ReportLab breaks long tokens (paths, S3 keys) instead of overflowing.
-    cell_style.wordWrap = "CJK"
-    cell_style.splitLongWords = 1
-    cell_style_small.wordWrap = "CJK"
-    cell_style_small.splitLongWords = 1
+    # Apply to all styles that may contain long unbroken strings.
+    for style in [cell_style, cell_style_small, bullet_style, body_style, note_style]:
+        style.wordWrap = "CJK"
+        style.splitLongWords = 1
 
     def _wrap_cell(text: str, style: ParagraphStyle = cell_style) -> Paragraph:
         """Wrap text in a Paragraph for table cell text wrapping."""

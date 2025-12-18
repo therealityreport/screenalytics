@@ -134,3 +134,98 @@ def test_run_export_pdf_no_text_overflows_page_bounds(tmp_path: Path, monkeypatc
     finally:
         doc.close()
 
+
+def test_run_export_pdf_no_black_squares(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test: PDF must not contain black squares (■) or replacement chars (�).
+
+    These appear when Helvetica font cannot render certain Unicode characters like:
+    - U+200B (zero-width space) - renders as black square
+    - U+25A0 (black square) - should not appear in output
+    - U+FFFD (replacement character) - indicates encoding issues
+    """
+    fitz = pytest.importorskip("fitz")  # PyMuPDF
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    from py_screenalytics import run_layout
+    from apps.api.services import run_export
+
+    ep_id = "rhoslc-s06e11"
+    run_id = "test-black-squares"
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    # Create test data with many separators that trigger soft-wrap logic
+    long_s3_key = "s3://screenalytics-test/manifests/rhoslc-s06e11/runs/test-black-squares/analytics/screentime.json"
+    long_path = "/Volumes/HardDrive/SCREENALYTICS/data/manifests/rhoslc-s06e11/runs/test-black-squares/tracks.jsonl"
+
+    (run_root / "tracks.jsonl").write_text(
+        json.dumps({"track_id": 1, "first_ts": 0.0, "last_ts": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    (run_root / "detect_track.json").write_text(
+        json.dumps(
+            {
+                "phase": "detect_track",
+                "status": "success",
+                "run_id": run_id,
+                "video_duration_sec": 105.0,
+                "fps": 24.0,
+                "frames_total": 2525,
+                "frames_scanned_total": 2525,
+                "stride": 6,
+                "stride_effective": 6,
+                "torch_device_fallback_reason": f"path={long_path} s3_key={long_s3_key}",
+                "detector_model_name": "retinaface_r50",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    (run_root / "faces_embed.json").write_text(
+        json.dumps(
+            {
+                "phase": "faces_embed",
+                "status": "success",
+                "run_id": run_id,
+                "embedding_backend_fallback_reason": f"fallback_path={long_path}",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    pdf_bytes, _name = run_export.build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+
+    # Characters that should NOT appear in PDF text
+    forbidden_chars = {
+        "\u25a0": "BLACK SQUARE (■)",
+        "\u200b": "ZERO-WIDTH SPACE",
+        "\ufffd": "REPLACEMENT CHARACTER (�)",
+    }
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    violations: list[str] = []
+    try:
+        for page_num, page in enumerate(doc, 1):
+            full_text = page.get_text("text")
+            for char, description in forbidden_chars.items():
+                if char in full_text:
+                    # Find context around the forbidden char
+                    idx = full_text.find(char)
+                    context_start = max(0, idx - 20)
+                    context_end = min(len(full_text), idx + 20)
+                    context = full_text[context_start:context_end].replace("\n", "\\n")
+                    violations.append(
+                        f"Page {page_num}: Found {description} at position {idx}, context: ...{context}..."
+                    )
+    finally:
+        doc.close()
+
+    assert not violations, f"PDF contains forbidden characters:\n" + "\n".join(violations)
+

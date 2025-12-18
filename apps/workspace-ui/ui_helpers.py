@@ -4129,8 +4129,10 @@ def get_stored_celery_job_id(ep_id: str, job_type: str) -> str | None:
 # Cache for batch job fetches to avoid repeated API calls on page load
 # Suggestion 2: Use longer TTL during active jobs (10s) vs idle (3s)
 _running_jobs_cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any] | None]]] = {}
-_RUNNING_JOBS_CACHE_TTL_ACTIVE = 8.0  # 8 second TTL during active jobs
-_RUNNING_JOBS_CACHE_TTL_IDLE = 2.0  # 2 second TTL when idle
+# FIX: Reduced cache TTL for faster completion detection
+# Previous values: ACTIVE=8.0, IDLE=2.0
+_RUNNING_JOBS_CACHE_TTL_ACTIVE = 2.0  # 2 second TTL during active jobs (was 8s)
+_RUNNING_JOBS_CACHE_TTL_IDLE = 1.0  # 1 second TTL when idle (was 2s)
 
 
 def get_all_running_jobs_for_episode(ep_id: str) -> Dict[str, Dict[str, Any] | None]:
@@ -5039,6 +5041,108 @@ def render_previous_logs(
 
 
 # =============================================================================
+# Pipeline Timing Integration
+# =============================================================================
+
+
+def _get_timing_state_key(ep_id: str, run_id: str | None) -> str:
+    """Generate session state key for pipeline timing state."""
+    run_id_norm = str(run_id).strip() if run_id else "legacy"
+    return f"{ep_id}::{run_id_norm}::pipeline_timing"
+
+
+def get_or_create_timing_state(ep_id: str, run_id: str | None):
+    """Get or create PipelineTimingState from session state.
+
+    Returns the timing state and a LogEventParser configured for it.
+    """
+    # Lazy import to avoid circular dependencies
+    try:
+        from autorun_timing import PipelineTimingState, LogEventParser
+    except ImportError:
+        # Module not available - return None to signal no timing
+        return None, None
+
+    key = _get_timing_state_key(ep_id, run_id)
+
+    if key not in st.session_state:
+        state = PipelineTimingState(ep_id=ep_id, run_id=run_id)
+        st.session_state[key] = state
+        LOGGER.info("[TIMING] Created new PipelineTimingState for %s/%s", ep_id, run_id)
+
+    timing_state = st.session_state[key]
+    parser = LogEventParser(timing_state)
+    return timing_state, parser
+
+
+def get_timing_state(ep_id: str, run_id: str | None):
+    """Get existing PipelineTimingState from session state (read-only).
+
+    Returns None if no timing state exists for this episode/run.
+    """
+    try:
+        from autorun_timing import PipelineTimingState
+    except ImportError:
+        return None
+
+    key = _get_timing_state_key(ep_id, run_id)
+    return st.session_state.get(key)
+
+
+def format_timing_for_display(timing_state, operation: str) -> Dict[str, str]:
+    """Format timing metrics for a single operation for UI display.
+
+    Returns dict with keys: first_line, completed, runtime, stall_to_next
+    """
+    if timing_state is None:
+        return {"first_line": "—", "completed": "—", "runtime": "—", "stall_to_next": "—"}
+
+    try:
+        from autorun_timing import format_timing_duration, format_gap_display
+    except ImportError:
+        return {"first_line": "—", "completed": "—", "runtime": "—", "stall_to_next": "—"}
+
+    job = timing_state.jobs.get(operation)
+    if job is None:
+        return {"first_line": "—", "completed": "—", "runtime": "—", "stall_to_next": "—"}
+
+    # Format first_line timestamp (just time portion)
+    first_line = "—"
+    if job.first_line_at_utc:
+        try:
+            dt = datetime.fromisoformat(job.first_line_at_utc.replace("Z", "+00:00"))
+            first_line = dt.strftime("%H:%M:%S")
+        except Exception:
+            first_line = "set"
+
+    # Format completed timestamp
+    completed = "—"
+    if job.completed_at_utc:
+        try:
+            dt = datetime.fromisoformat(job.completed_at_utc.replace("Z", "+00:00"))
+            completed = dt.strftime("%H:%M:%S")
+        except Exception:
+            completed = "set"
+
+    # Runtime: prefer parsed duration from log, fallback to computed
+    runtime = format_timing_duration(job.parsed_runtime_s or job.computed_runtime_s)
+
+    # Stall to next stage
+    stall_gaps = timing_state.compute_stall_gaps()
+    next_stage_map = {"detect_track": "faces_embed", "faces_embed": "cluster"}
+    stall_key = f"{operation}_to_{next_stage_map.get(operation, 'none')}"
+    stall_seconds = stall_gaps.get(stall_key)
+    stall_to_next = format_gap_display(stall_seconds) if stall_seconds is not None else "—"
+
+    return {
+        "first_line": first_line,
+        "completed": completed,
+        "runtime": runtime,
+        "stall_to_next": stall_to_next,
+    }
+
+
+# =============================================================================
 # Execution Mode Job Helpers
 # =============================================================================
 
@@ -5266,6 +5370,12 @@ def run_pipeline_job_with_mode(
         # Track progress info for display
         current_progress = {"frames_done": 0, "frames_total": 0, "phase": "starting", "pct": 0.0}
 
+        # Initialize timing state for this operation
+        timing_state, timing_parser = get_or_create_timing_state(ep_id, run_id_str)
+        if timing_parser is not None:
+            timing_parser.set_current_operation(operation)
+            LOGGER.debug("[TIMING] Parser initialized for %s/%s op=%s", ep_id, run_id_str, operation)
+
         try:
             # Streaming request - reads lines as they arrive
             with requests.post(
@@ -5296,6 +5406,9 @@ def run_pipeline_job_with_mode(
                         line = msg.get("line", "")
                         log_lines.append(line)
                         log_placeholder.code("\n".join(log_lines), language="text")
+                        # Feed line to timing parser for first_line/completion detection
+                        if timing_parser is not None:
+                            timing_parser.process_line(line)
 
                     elif msg_type == "progress":
                         # Update progress bar with real-time data
