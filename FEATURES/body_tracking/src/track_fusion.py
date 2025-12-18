@@ -288,18 +288,24 @@ class TrackFusion:
         # Phase 2: Re-ID handoff for gaps
         reid_associations: List[FaceBodyAssociation] = []
         reid_diag: dict[str, object] = {"reid_enabled": False, "reid_comparisons": 0, "reid_pass": 0}
-        if body_embeddings is not None and face_embeddings is not None:
+        if (
+            body_embeddings is not None
+            and face_embeddings is not None
+            and body_embeddings_meta is not None
+            and face_embeddings_meta is not None
+        ):
             reid_diag = {
                 "reid_enabled": True,
                 "reid_comparisons": 0,
                 "reid_pass": 0,
             }
-            reid_associations = self._build_reid_associations(
+            reid_associations, reid_comparisons = self._build_reid_associations(
                 face_tracks, body_tracks,
                 face_embeddings, face_embeddings_meta,
                 body_embeddings, body_embeddings_meta,
             )
             logger.info(f"  Re-ID associations: {len(reid_associations)}")
+            reid_diag["reid_comparisons"] = int(reid_comparisons)
             reid_diag["reid_pass"] = len(reid_associations)
 
         # Phase 3: Build fused identities
@@ -499,7 +505,7 @@ class TrackFusion:
         face_embeddings_meta: List[dict],
         body_embeddings: np.ndarray,
         body_embeddings_meta: List[dict],
-    ) -> List[FaceBodyAssociation]:
+    ) -> tuple[list[FaceBodyAssociation], int]:
         """Build associations using Re-ID when face disappears."""
         # Group face embeddings by track
         face_emb_by_track: Dict[int, np.ndarray] = {}
@@ -516,6 +522,18 @@ class TrackFusion:
             face_avg_emb[track_id] = np.mean(embs, axis=0)
 
         associations = []
+        comparisons = 0
+
+        unique_body_tracks: set[int] = set()
+        for meta in body_embeddings_meta:
+            track_id = meta.get("track_id")
+            if track_id is None:
+                continue
+            try:
+                unique_body_tracks.add(int(track_id))
+            except (TypeError, ValueError):
+                continue
+        unique_body_track_count = len(unique_body_tracks)
 
         # Find body tracks that could continue a face track
         for face_track_id, face_track in face_tracks.items():
@@ -526,6 +544,7 @@ class TrackFusion:
             face_emb = face_avg_emb[face_track_id]
 
             # Find body tracks that start after this face track ends
+            comparisons += unique_body_track_count
             candidates = self.associate_by_reid(
                 body_embeddings, body_embeddings_meta, face_emb
             )
@@ -557,7 +576,7 @@ class TrackFusion:
                     best_similarity=float(similarity),
                 ))
 
-        return associations
+        return associations, comparisons
 
     def _build_fused_identities(
         self,

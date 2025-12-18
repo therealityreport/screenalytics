@@ -95,3 +95,63 @@ def test_track_fusion_diagnostics_reconcile_final_pairs(tmp_path: Path) -> None:
             assert isinstance(attribution.get("best_iou"), (int, float))
     assert any_attributed, "expected at least one IoU-attributed fused identity"
 
+
+def test_track_fusion_records_reid_comparisons_and_attribution() -> None:
+    """Re-ID path must record comparisons and attribute fused identities."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    import numpy as np
+
+    from FEATURES.body_tracking.src.track_fusion import TrackFusion
+
+    face_tracks = {
+        1: {
+            "track_id": 1,
+            "detections": [],
+            "start_frame": 0,
+            "end_frame": 10,
+        }
+    }
+    body_tracks = {
+        100001: {
+            "track_id": 100001,
+            "detections": [],
+            "start_frame": 12,
+            "end_frame": 20,
+        }
+    }
+
+    # 1 face embedding for face track 1.
+    face_embeddings = np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    face_embeddings_meta = [{"track_id": 1}]
+
+    # 1 body embedding row for body track 100001 (perfect match).
+    body_embeddings = np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    body_embeddings_meta = [{"track_id": 100001, "frame_idx": 12}]
+
+    fusion = TrackFusion(reid_similarity_threshold=0.70, max_gap_seconds=30.0)
+    identities = fusion.fuse_tracks(
+        face_tracks=face_tracks,
+        body_tracks=body_tracks,
+        body_embeddings=body_embeddings,
+        body_embeddings_meta=body_embeddings_meta,
+        face_embeddings=face_embeddings,
+        face_embeddings_meta=face_embeddings_meta,
+    )
+
+    diagnostics = getattr(fusion, "last_diagnostics", {})
+    assert diagnostics.get("reid_comparisons") == 1
+    assert diagnostics.get("reid_pass") == 1
+    assert diagnostics.get("final_pairs") == 1
+    assert diagnostics.get("reid_pairs") == 1
+    assert diagnostics.get("iou_pairs") == 0
+
+    assert identities, "expected fused identities via re-id"
+    any_reid_attributed = False
+    for identity in identities.values():
+        payload = identity.to_dict()
+        attribution = payload.get("attribution")
+        if isinstance(attribution, dict) and attribution.get("source") == "reid":
+            any_reid_attributed = True
+            assert isinstance(attribution.get("best_similarity"), (int, float))
+    assert any_reid_attributed, "expected at least one Re-ID attributed fused identity"
