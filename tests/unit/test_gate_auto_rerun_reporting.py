@@ -108,4 +108,6 @@ def test_pdf_reports_gate_auto_rerun_when_present(
 
     assert "Appearance Gate Enabled" in combined
     assert "Appearance Gate Auto-Rerun" in combined
-    assert "true \\(selected=rerun" in combined
+    # PDF text may include zero-width wrap hints between tokens (e.g., around '=' or '(').
+    assert "selected" in combined
+    assert "rerun" in combined

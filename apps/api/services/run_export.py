@@ -96,13 +96,13 @@ def build_wrap_safe_kv_table(
     from reportlab.lib import colors  # imported lazily to keep module import lightweight
     from reportlab.platypus import Paragraph, Table, TableStyle
 
-    def _p(text: str, *, style: Any, allow_markup: bool = False) -> Paragraph:
+    def _p(text: str, *, style: Any, allow_markup: bool = False, soft_wrap: bool = True) -> Paragraph:
         if allow_markup:
             # Markup strings are expected to already have soft-wrap opportunities injected into their
             # data segments; do not run soft-wrap across the markup itself (e.g., "<br/>").
             return Paragraph(text, style)
-        softened = _soft_wrap_text(text)
-        return Paragraph(_escape_reportlab_xml(softened), style)
+        payload = _soft_wrap_text(text) if soft_wrap else str(text)
+        return Paragraph(_escape_reportlab_xml(payload), style)
 
     def _value_cell(value: str | list[tuple[str, str]] | None) -> Paragraph:
         if value is None:
@@ -118,9 +118,11 @@ def build_wrap_safe_kv_table(
 
     label_w = max(width * float(label_ratio), 1)
     value_w = max(width - label_w, 1)
-    data: list[list[Any]] = [[_p(header[0], style=header_style), _p(header[1], style=header_style)]]
+    data: list[list[Any]] = [
+        [_p(header[0], style=header_style, soft_wrap=False), _p(header[1], style=header_style, soft_wrap=False)]
+    ]
     for label, value in rows:
-        data.append([_p(str(label), style=cell_style), _value_cell(value)])
+        data.append([_p(str(label), style=cell_style, soft_wrap=False), _value_cell(value)])
 
     table = Table(data, colWidths=[label_w, value_w])
     table.setStyle(
