@@ -307,9 +307,9 @@ class PhaseTracker:
             stride = stats.get("stride", 1)
             lines.append(
                 f"  {phase_name}: frames_processed={frames_proc} frames_scanned={frames_scan} "
-                f"stride={stride} duration={duration:.1f}s"
+                f"stride={stride} wall_time_s={duration:.1f}s"
             )
-        lines.append(f"  TOTAL: {total_duration:.1f}s ({total_duration/60:.1f}m)")
+        lines.append(f"  TOTAL wall_time_s={total_duration:.1f}s ({total_duration/60:.1f}m)")
         for line in lines:
             LOGGER.info(line)
             # Also print to stdout for local mode visibility
@@ -1325,6 +1325,17 @@ class _TrackerDetections:
         self.cls = classes.astype(np.float32)
         self._xywh: np.ndarray | None = None
 
+    def __len__(self) -> int:
+        return int(self.conf.shape[0])
+
+    def __getitem__(self, idx) -> "_TrackerDetections":
+        """Support boolean-mask / slice indexing used by ultralytics' BYTETracker."""
+        return _TrackerDetections(
+            self.xyxy[idx],
+            self.conf[idx],
+            self.cls[idx],
+        )
+
     @property
     def xywh(self) -> np.ndarray:
         if self._xywh is None:
@@ -1435,6 +1446,7 @@ class ByteTrackAdapter:
             track_buffer=self._effective_buffer,
             match_thresh=self.config.match_thresh,
             min_box_area=self.config.min_box_area,
+            fuse_score=False,
         )
         return BYTETracker(cfg, frame_rate=self.frame_rate)
 
@@ -1958,6 +1970,8 @@ class _FallbackEmbeddingBackend:
         self._primary_label = primary_label
         self._fallback_label = fallback_label
         self._active: EmbeddingBackend | None = None
+        self._active_label: str | None = None
+        self._fallback_reason: str | None = None
 
     def _activate_primary(self) -> None:
         if self._active is not None:
@@ -1965,6 +1979,8 @@ class _FallbackEmbeddingBackend:
         try:
             self._primary.ensure_ready()
             self._active = self._primary
+            self._active_label = self._primary_label
+            self._fallback_reason = None
         except Exception as exc:
             LOGGER.warning(
                 "[EMBED] Falling back from %s to %s: %s",
@@ -1974,6 +1990,8 @@ class _FallbackEmbeddingBackend:
             )
             self._fallback.ensure_ready()
             self._active = self._fallback
+            self._active_label = self._fallback_label
+            self._fallback_reason = str(exc)
 
     def ensure_ready(self) -> None:
         self._activate_primary()
@@ -1988,6 +2006,18 @@ class _FallbackEmbeddingBackend:
             except Exception:
                 return getattr(self._fallback, "resolved_device", "cpu")
         return getattr(self._active, "resolved_device", "cpu")
+
+    @property
+    def active_backend_label(self) -> str:
+        """Return the currently active backend label (primary vs fallback)."""
+        if self._active_label is not None:
+            return self._active_label
+        return self._primary_label
+
+    @property
+    def fallback_reason(self) -> str | None:
+        """Return the most recent reason for falling back (if any)."""
+        return self._fallback_reason
 
     def encode(self, crops: list[np.ndarray]) -> np.ndarray:
         self._activate_primary()
@@ -2004,6 +2034,8 @@ class _FallbackEmbeddingBackend:
                 )
                 self._fallback.ensure_ready()
                 self._active = self._fallback
+                self._active_label = self._fallback_label
+                self._fallback_reason = str(exc)
                 return self._active.encode(crops)
             raise
 
@@ -5643,7 +5675,7 @@ def _run_full_pipeline(
         )
         scene_msg = (
             f"[LOCAL MODE] Phase=scene_detect frames={total_frames or frames_goal or '?'} "
-            f"stride=1 duration={scene_detect_duration:.1f}s cuts={len(scene_cuts)}"
+            f"stride=1 wall_time_s={scene_detect_duration:.1f}s cuts={len(scene_cuts)}"
         )
         LOGGER.info(scene_msg)
         print(scene_msg)
@@ -5671,8 +5703,11 @@ def _run_full_pipeline(
     track_path = _tracks_path_for_run(args.ep_id, run_id)
     det_count = 0
     frames_sampled = 0
+    frames_sampled_stride = 0
+    frames_sampled_forced_scene_warmup = 0
     frame_idx = 0
     last_diag_stats: Dict[str, Any] | None = None
+    processed_frame_indices: list[int] = []
 
     def _diagnostic_stats(detections_in_frame: int, tracks_in_frame: int) -> Dict[str, Any]:
         stats: Dict[str, Any] = {
@@ -5768,6 +5803,11 @@ def _run_full_pipeline(
                     continue
 
                 frames_sampled += 1
+                if should_sample:
+                    frames_sampled_stride += 1
+                else:
+                    frames_sampled_forced_scene_warmup += 1
+                processed_frame_indices.append(frame_idx)
                 detect_frames, detect_meta = _progress_value(frame_idx, include_current=True)
                 ts = frame_idx / ts_fps if ts_fps else 0.0
 
@@ -6345,6 +6385,51 @@ def _run_full_pipeline(
 
     # Calculate detect/track phase duration
     detect_track_duration = time.time() - detect_track_start
+    stride_observed_median: int | None = None
+    if len(processed_frame_indices) >= 2:
+        deltas = [
+            processed_frame_indices[idx] - processed_frame_indices[idx - 1]
+            for idx in range(1, len(processed_frame_indices))
+        ]
+        deltas_arr = np.asarray(deltas, dtype=np.int32)
+        if deltas_arr.size > 0:
+            stride_observed_median = int(np.median(deltas_arr))
+
+    video_duration_est_s: float | None = None
+    if video_clock_fps and video_clock_fps > 0 and frame_idx > 0:
+        video_duration_est_s = frame_idx / float(video_clock_fps)
+
+    effective_fps_processing: float | None = None
+    if detect_track_duration > 0 and frames_sampled > 0:
+        effective_fps_processing = frames_sampled / detect_track_duration
+
+    rtf: float | None = None
+    if video_duration_est_s and video_duration_est_s > 0:
+        rtf = detect_track_duration / video_duration_est_s
+
+    expected_by_stride: int | None = None
+    if frame_stride > 0 and frame_idx > 0:
+        expected_by_stride = int(math.ceil(frame_idx / frame_stride))
+
+    LOGGER.info(
+        "[detect_track] video_duration_s=%s wall_time_s=%.1f rtf=%s effective_fps_processing=%s "
+        "frames_scanned_total=%d face_detect_frames_processed=%d (stride_requested=%s stride_effective=%d stride_observed_median=%s "
+        "stride_hits=%d forced_scene_warmup=%d expected_by_stride=%s scene_warmup_dets=%d scene_cuts=%d)",
+        f"{video_duration_est_s:.3f}" if video_duration_est_s is not None else "unknown",
+        detect_track_duration,
+        f"{rtf:.3f}" if rtf is not None else "unknown",
+        f"{effective_fps_processing:.3f}" if effective_fps_processing is not None else "unknown",
+        frame_idx,
+        frames_sampled,
+        getattr(args, "stride", None),
+        frame_stride,
+        stride_observed_median if stride_observed_median is not None else "unknown",
+        frames_sampled_stride,
+        frames_sampled_forced_scene_warmup,
+        expected_by_stride if expected_by_stride is not None else "unknown",
+        scene_warmup,
+        len(scene_cuts),
+    )
 
     # Record detect/track phase stats for local mode instrumentation
     if phase_tracker:
@@ -6357,7 +6442,7 @@ def _run_full_pipeline(
         )
         detect_msg = (
             f"[LOCAL MODE] Phase=detect frames_processed={frames_sampled} "
-            f"frames_scanned={frame_idx} stride={frame_stride} duration={detect_track_duration:.1f}s"
+            f"frames_scanned={frame_idx} stride={frame_stride} wall_time_s={detect_track_duration:.1f}s"
         )
         LOGGER.info(detect_msg)
         print(detect_msg)
@@ -6394,6 +6479,21 @@ def _run_full_pipeline(
         frame_exporter.write_indexes()
     track_rows = recorder.rows()
     final_diag_stats = last_diag_stats or _diagnostic_stats(0, 0)
+    final_diag_stats["wall_time_s"] = round(float(detect_track_duration), 3)
+    final_diag_stats["frames_scanned_total"] = int(frame_idx)
+    final_diag_stats["face_detect_frames_processed"] = int(frames_sampled)
+    final_diag_stats["face_detect_frames_processed_stride"] = int(frames_sampled_stride)
+    final_diag_stats["face_detect_frames_processed_forced_scene_warmup"] = int(frames_sampled_forced_scene_warmup)
+    final_diag_stats["stride_requested"] = getattr(args, "stride", None)
+    final_diag_stats["stride_effective"] = int(frame_stride)
+    final_diag_stats["stride_observed_median"] = stride_observed_median
+    final_diag_stats["expected_frames_by_stride"] = expected_by_stride
+    final_diag_stats["effective_fps_processing"] = round(float(effective_fps_processing), 3) if effective_fps_processing is not None else None
+    final_diag_stats["rtf"] = round(float(rtf), 3) if rtf is not None else None
+    final_diag_stats["video_duration_est_s"] = round(float(video_duration_est_s), 3) if video_duration_est_s is not None else None
+    final_diag_stats["scene_detect_wall_time_s"] = round(float(scene_detect_duration), 3)
+    final_diag_stats["scene_cuts_total"] = int(len(scene_cuts))
+    final_diag_stats["scene_warmup_dets"] = int(scene_warmup)
 
     # CRITICAL: Validate that tracking produced results when detections exist
     if det_count > 0 and len(track_rows) == 0:
@@ -6540,6 +6640,9 @@ def _maybe_run_body_tracking(
         )
         det_path = runner.run_detection()
         tracks_path = runner.run_tracking()
+        tracker_backend_configured = getattr(runner, "tracker_backend_configured", None)
+        tracker_backend_actual = getattr(runner, "tracker_backend_actual", None)
+        tracker_fallback_reason = getattr(runner, "tracker_fallback_reason", None)
 
         embeddings_path: Path | None = None
         embeddings_note: str | None = None
@@ -6593,6 +6696,9 @@ def _maybe_run_body_tracking(
                     "output_dir": str(output_dir),
                     "reid_enabled": reid_enabled,
                     "reid_note": embeddings_note,
+                    "tracker_backend_configured": tracker_backend_configured,
+                    "tracker_backend_actual": tracker_backend_actual,
+                    "tracker_fallback_reason": tracker_fallback_reason,
                     "artifacts": {
                         "body_detections": str(det_path),
                         "body_tracks": str(tracks_path),
@@ -6626,6 +6732,9 @@ def _maybe_run_body_tracking(
             "finished_at": _utcnow_iso(),
             "reid_enabled": reid_enabled,
             "reid_note": embeddings_note,
+            "tracker_backend_configured": tracker_backend_configured,
+            "tracker_backend_actual": tracker_backend_actual,
+            "tracker_fallback_reason": tracker_fallback_reason,
             "artifacts": {
                 "local": {
                     "body_tracking_dir": str(output_dir),
@@ -7109,6 +7218,15 @@ def _run_detect_track_stage(
         # Brief delay to ensure final progress event is written and readable
         time.sleep(0.2)
         finished_at = _utcnow_iso()
+        runtime_stats: Dict[str, Any] = detect_track_stats if isinstance(detect_track_stats, dict) else {}
+        marker_detect_wall_time_s = runtime_stats.get("wall_time_s")
+        marker_rtf = runtime_stats.get("rtf")
+        if (
+            isinstance(marker_detect_wall_time_s, (int, float))
+            and isinstance(progress.secs_total, (int, float))
+            and progress.secs_total > 0
+        ):
+            marker_rtf = round(float(marker_detect_wall_time_s) / float(progress.secs_total), 3)
         _write_run_marker(
             args.ep_id,
             "detect_track",
@@ -7120,8 +7238,29 @@ def _run_detect_track_stage(
                 "detections": det_count,
                 "tracks": track_count,
                 "detector": detector_choice,
+                "detector_model_name": (RETINAFACE_MODEL_NAME if detector_choice == "retinaface" else detector_choice),
                 "tracker": tracker_choice,
+                "tracker_backend_configured": tracker_choice,
+                "tracker_backend_actual": (
+                    "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
+                ),
+                "tracker_fallback_reason": None,
                 "stride": args.stride,
+                # Frame accounting (why frames_processed != frames_total/stride)
+                "frames_scanned_total": runtime_stats.get("frames_scanned_total"),
+                "face_detect_frames_processed": runtime_stats.get("face_detect_frames_processed"),
+                "face_detect_frames_processed_stride": runtime_stats.get("face_detect_frames_processed_stride"),
+                "face_detect_frames_processed_forced_scene_warmup": runtime_stats.get(
+                    "face_detect_frames_processed_forced_scene_warmup"
+                ),
+                "stride_effective": runtime_stats.get("stride_effective"),
+                "stride_observed_median": runtime_stats.get("stride_observed_median"),
+                "expected_frames_by_stride": runtime_stats.get("expected_frames_by_stride"),
+                # Runtime diagnostics (wall-clock vs video duration)
+                "detect_wall_time_s": marker_detect_wall_time_s,
+                "effective_fps_processing": runtime_stats.get("effective_fps_processing"),
+                "rtf": marker_rtf,
+                "scene_detect_wall_time_s": runtime_stats.get("scene_detect_wall_time_s"),
                 "det_thresh": args.det_thresh,
                 "max_gap": getattr(args, "max_gap", None),
                 "scene_detector": args.scene_detector,
@@ -7456,6 +7595,10 @@ def _run_faces_embed_stage(
     )
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
+    embedding_backend_actual = (
+        getattr(embedder, "active_backend_label", None) or embedding_backend_type
+    )
+    embedding_backend_fallback_reason = getattr(embedder, "fallback_reason", None)
     embedding_model_name = ARC_FACE_MODEL_NAME
     crop_interval_frames = getattr(args, "sample_every_n_frames", None)
     print(
@@ -7463,6 +7606,13 @@ def _run_faces_embed_stage(
         f"(type={embedding_backend_type}, resolved_device={embed_device}, "
         f"crop_interval_frames={crop_interval_frames}, allow_cpu_fallback={allow_embedding_fallback})",
         flush=True,
+    )
+    LOGGER.info(
+        "[faces_embed] embedding_backend_configured=%s embedding_backend_actual=%s resolved_device=%s model=%s",
+        embedding_backend_type,
+        embedding_backend_actual,
+        embed_device,
+        embedding_model_name,
     )
 
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
@@ -8282,6 +8432,10 @@ def _run_faces_embed_stage(
                 "device": device,
                 "requested_device": requested_embed_device,
                 "resolved_device": embed_device,
+                "embedding_backend_configured": embedding_backend_type,
+                "embedding_backend_actual": embedding_backend_actual,
+                "embedding_backend_fallback_reason": embedding_backend_fallback_reason,
+                "embedding_model_name": embedding_model_name,
                 "started_at": started_at,
                 "finished_at": finished_at,
             },

@@ -37,6 +37,8 @@ sudo -u screenalytics git clone <repo-url> /opt/screenalytics
 cd /opt/screenalytics
 sudo -u screenalytics python3.11 -m venv .venv
 sudo -u screenalytics .venv/bin/pip install -r requirements.txt
+# Required for the ML pipeline stages (detect/track, embeddings, body tracking):
+sudo -u screenalytics .venv/bin/pip install -r requirements-ml.txt
 
 # Configure environment
 sudo -u screenalytics cp .env.example /opt/screenalytics/.env

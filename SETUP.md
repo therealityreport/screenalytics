@@ -40,6 +40,8 @@ python -m venv .venv
 source .venv/bin/activate # or .\.venv\Scripts\activate on Windows
 pip install -U pip wheel setuptools
 pip install -r requirements.txt
+# For pipeline runs (detect/track, embeddings, body tracking), also install:
+pip install -r requirements-ml.txt
 ```
 
 ### Node deps (optional Next.js app)

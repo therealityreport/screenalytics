@@ -200,6 +200,9 @@ class BodyTrackingRunner:
         self.comparison_path = self.output_dir / "screentime_comparison.json"
 
         logger.info(f"Output directory: {self.output_dir}")
+        self.tracker_backend_configured: str | None = None
+        self.tracker_backend_actual: str | None = None
+        self.tracker_fallback_reason: str | None = None
 
     def _find_video_path(self) -> Path:
         """Find video path from episode manifest."""
@@ -302,6 +305,11 @@ class BodyTrackingRunner:
             detections_path=self.detections_path,
             output_path=self.tracks_path,
         )
+
+        # Capture tracker backend diagnostics for downstream reporting (episode_run marker + PDF).
+        self.tracker_backend_configured = getattr(tracker, "tracker_backend_configured", self.config.tracker)
+        self.tracker_backend_actual = getattr(tracker, "tracker_backend_actual", None)
+        self.tracker_fallback_reason = getattr(tracker, "tracker_fallback_reason", None)
 
         logger.info(f"  Output: {self.tracks_path}")
         return self.tracks_path

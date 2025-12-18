@@ -169,3 +169,55 @@ def test_pdf_body_tracking_ran_effective_requires_run_scoped_artifacts_even_if_l
     assert "yes" in legacy_window
 
     assert "out_of_scope=yes" in combined
+
+
+def test_pdf_reports_body_tracker_backend_fallback_when_supervision_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    from py_screenalytics import run_layout
+    from apps.api.services.run_export import build_screentime_run_debug_pdf
+
+    ep_id = "ep-test"
+    run_id = "run-body-fallback"
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    # Minimal face tracks so the report can render.
+    (run_root / "tracks.jsonl").write_text(
+        json.dumps({"track_id": 1, "first_ts": 0.0, "last_ts": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    # Simulate a body-tracking run marker that recorded a fallback backend due to missing supervision.
+    (run_root / "body_tracking.json").write_text(
+        json.dumps(
+            {
+                "phase": "body_tracking",
+                "status": "success",
+                "run_id": run_id,
+                "tracker_backend_configured": "bytetrack",
+                "tracker_backend_actual": "iou_fallback",
+                "tracker_fallback_reason": "supervision_missing",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    pdf_bytes, _name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+    combined = "\n".join(_ascii_strings(pdf_bytes))
+
+    assert "Body tracker backend" in combined
+    assert "iou_fallback" in combined
+    assert "tracking backend fallback activated" in combined
+    assert "Install" in combined

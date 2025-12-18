@@ -387,7 +387,7 @@ OPENAI_API_KEY=xxx
    sudo -u screenalytics git clone <repo-url> /opt/screenalytics
    cd /opt/screenalytics
    sudo -u screenalytics python3.11 -m venv .venv
-   sudo -u screenalytics .venv/bin/pip install -r requirements.txt
+   sudo -u screenalytics .venv/bin/pip install -r requirements.txt -r requirements-ml.txt
    ```
 
 5. **Configure environment**

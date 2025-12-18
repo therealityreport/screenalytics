@@ -95,6 +95,9 @@ class BodyTracker:
         self.id_offset = id_offset
 
         self._tracker = None
+        self.tracker_backend_configured = tracker_type
+        self.tracker_backend_actual: str | None = None
+        self.tracker_fallback_reason: str | None = None
 
     def _init_tracker(self):
         """Initialize the tracker."""
@@ -111,6 +114,9 @@ class BodyTracker:
         try:
             # Try to use supervision's ByteTrack
             import supervision as sv
+            self.tracker_backend_actual = "supervision.bytetrack"
+            self.tracker_fallback_reason = None
+            logger.info("tracking_backend=%s", self.tracker_backend_actual)
             return sv.ByteTrack(
                 track_activation_threshold=self.track_thresh,
                 lost_track_buffer=self.track_buffer,
@@ -118,10 +124,15 @@ class BodyTracker:
                 frame_rate=24,  # Will be updated per video
             )
         except ImportError:
-            pass
+            self.tracker_backend_actual = "iou_fallback"
+            self.tracker_fallback_reason = "supervision_missing"
+            logger.warning(
+                "[TRACKER] tracking backend fallback activated: configured=supervision.ByteTrack actual=%s reason=%s",
+                self.tracker_backend_actual,
+                self.tracker_fallback_reason,
+            )
 
         # Fallback to custom simple tracker
-        logger.warning("supervision not found, using simple IoU tracker")
         return SimpleIoUTracker(
             iou_threshold=self.match_thresh,
             max_age=self.track_buffer,
