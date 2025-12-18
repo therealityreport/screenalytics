@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -85,6 +86,38 @@ def _default_faces_min_frames_between_crops(video_meta: Dict[str, Any] | None) -
 def _get_pipeline_settings_key(ep_id: str, category: str, field: str) -> str:
     """Generate a session state key for pipeline settings."""
     return f"pipeline_settings::{ep_id}::{category}::{field}"
+
+
+def _generate_attempt_run_id(ep_id: str) -> str:
+    """Generate a human-readable run_id for an episode attempt.
+
+    Backward-compatible: if the currently loaded `py_screenalytics.run_layout` module
+    predates `generate_attempt_run_id`, compute it here so Streamlit hot reloads
+    don't crash on a stale import.
+    """
+    generator = getattr(run_layout, "generate_attempt_run_id", None)
+    if callable(generator):
+        return str(generator(ep_id))
+
+    existing = run_layout.list_run_ids(ep_id)
+    max_attempt = 0
+    for candidate in existing:
+        if not candidate.startswith("Attempt"):
+            continue
+        suffix = candidate[len("Attempt") :]
+        num_str = suffix.split("_", 1)[0]
+        try:
+            max_attempt = max(max_attempt, int(num_str))
+        except (TypeError, ValueError):
+            continue
+
+    attempt_num = (max_attempt + 1) if max_attempt > 0 else (len(existing) + 1)
+    timestamp = datetime.now(EST_TZ).strftime("%Y-%m-%d_%H%M%S")
+    run_id = f"Attempt{attempt_num}_{timestamp}EST"
+    while run_id in existing:
+        attempt_num += 1
+        run_id = f"Attempt{attempt_num}_{timestamp}EST"
+    return run_layout.normalize_run_id(run_id)
 
 
 def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | None) -> None:
@@ -1911,7 +1944,7 @@ attempt_locked = False
 # When other UI actions (e.g., Auto-Run) need to programmatically change the selected
 # attempt, they write the desired run_id to this pending key and trigger a rerun.
 _pending_attempt = st.session_state.pop(_active_run_id_pending_key, None)
-if isinstance(_pending_attempt, str) and _pending_attempt.strip():
+if isinstance(_pending_attempt, str):
     selected_attempt = _pending_attempt.strip()
     st.session_state[_active_run_id_key] = selected_attempt
     st.session_state[_status_force_refresh_key(ep_id)] = True
@@ -1919,7 +1952,11 @@ if isinstance(_pending_attempt, str) and _pending_attempt.strip():
     attempt_locked = True
 
 if st.session_state.pop(_new_attempt_requested_key, False):
-    selected_attempt = uuid.uuid4().hex
+    selected_attempt = _generate_attempt_run_id(ep_id)
+    try:
+        run_layout.run_root(ep_id, selected_attempt).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     st.session_state[_active_run_id_key] = selected_attempt
     st.session_state[_status_force_refresh_key(ep_id)] = True
     st.session_state[_attempt_init_key] = True
@@ -2524,6 +2561,77 @@ with st.expander("Pipeline Status", expanded=False):
         if api_active_run_id.strip() != selected_attempt_label:
             st.caption(f"API active_run_id: `{api_active_run_id.strip()}`")
 
+    if ep_id == "rhoslc-s06e11":
+        st.divider()
+        st.caption("Debug tools (rhoslc-s06e11)")
+        clear_confirm_key = f"{ep_id}::clear_attempts_confirm"
+        clear_confirmed = st.checkbox(
+            "Confirm: delete ALL run-scoped attempts for this episode (manifests + frames).",
+            key=clear_confirm_key,
+            disabled=job_running,
+        )
+        if st.button(
+            "🧹 Clear all previous attempts",
+            key=f"{ep_id}::clear_attempts_btn",
+            use_container_width=True,
+            disabled=job_running or not clear_confirmed,
+        ):
+            with st.spinner("Deleting run-scoped attempt artifacts..."):
+                try:
+                    runs_dir = run_layout.runs_root(ep_id)
+                    frames_runs_dir = get_path(ep_id, "frames_root") / "runs"
+
+                    removed_dirs = 0
+                    removed_files = 0
+
+                    if runs_dir.exists():
+                        for child in list(runs_dir.iterdir()):
+                            try:
+                                if child.is_dir():
+                                    shutil.rmtree(child)
+                                    removed_dirs += 1
+                                else:
+                                    child.unlink()
+                                    removed_files += 1
+                            except Exception as exc:
+                                LOGGER.warning("Failed to remove %s: %s", child, exc)
+
+                    if frames_runs_dir.exists():
+                        shutil.rmtree(frames_runs_dir)
+
+                    runs_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Reset attempt selection + status caches
+                    st.session_state[_active_run_id_pending_key] = ""
+                    st.session_state.pop(_autorun_run_id_key, None)
+                    st.session_state[_attempt_init_key] = True
+                    st.session_state[_status_force_refresh_key(ep_id)] = True
+                    st.session_state.pop(status_cache_key, None)
+                    st.session_state.pop(mtimes_key, None)
+
+                    try:
+                        qp = st.query_params
+                        try:
+                            del qp["run_id"]
+                        except Exception:
+                            pass
+                        st.query_params = qp
+                    except Exception:
+                        pass
+
+                    helpers.invalidate_running_jobs_cache(ep_id)
+                    st.success(
+                        f"Cleared {removed_dirs} run directories and {removed_files} run marker files for `{ep_id}`."
+                    )
+                    time.sleep(0.25)
+                    st.rerun()
+                except (RerunException, StopException):
+                    # st.rerun()/st.stop() raise control-flow exceptions; allow Streamlit to handle them.
+                    raise
+                except Exception as exc:
+                    st.error("Failed to clear previous attempts.")
+                    st.exception(exc)
+
     nav_disabled = not bool(selected_attempt_run_id)
     nav_help = "Select a run-scoped attempt (run_id) above." if nav_disabled else None
     nav_col1, nav_col2 = st.columns(2)
@@ -3110,7 +3218,11 @@ with st.container():
                     st.error("Auto-run is disabled (missing video or another job is running).")
                     st.stop()
 
-                new_run_id = uuid.uuid4().hex
+                new_run_id = _generate_attempt_run_id(ep_id)
+                try:
+                    run_layout.run_root(ep_id, new_run_id).mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
 
                 # Always reset review state when starting auto-run (best-effort; don't block pipeline start).
                 with st.spinner("Resetting review state..."):

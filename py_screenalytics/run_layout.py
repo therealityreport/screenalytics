@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from py_screenalytics.artifacts import get_path
 
@@ -30,12 +31,47 @@ RUNS_SUBDIR = "runs"
 ACTIVE_RUN_FILENAME = "active_run.json"
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ATTEMPT_RUN_ID_RE = re.compile(r"^Attempt(?P<num>[0-9]+)_")
+_EST_TZ = ZoneInfo("America/New_York")
 
 LOGGER = logging.getLogger(__name__)
 
 
 def generate_run_id() -> str:
     return uuid.uuid4().hex
+
+
+def generate_attempt_run_id(ep_id: str, *, now: datetime | None = None) -> str:
+    """Generate a human-readable run_id for an episode run attempt.
+
+    Format:
+        Attempt#_YYYY-MM-DD_HHMMSS_EST
+
+    Notes:
+    - Attempt number increments based on existing run directories for the episode.
+    - Timestamp is rendered in America/New_York time and suffixed with "EST" for
+      stable, greppable run identifiers.
+    """
+    existing = list_run_ids(ep_id)
+
+    max_attempt = 0
+    for candidate in existing:
+        match = _ATTEMPT_RUN_ID_RE.match(candidate)
+        if not match:
+            continue
+        try:
+            value = int(match.group("num"))
+        except (TypeError, ValueError):
+            continue
+        max_attempt = max(max_attempt, value)
+
+    attempt_num = (max_attempt + 1) if max_attempt > 0 else (len(existing) + 1)
+    timestamp = (now.astimezone(_EST_TZ) if now is not None else datetime.now(_EST_TZ)).strftime("%Y-%m-%d_%H%M%S")
+    run_id = f"Attempt{attempt_num}_{timestamp}EST"
+    while run_id in existing:
+        attempt_num += 1
+        run_id = f"Attempt{attempt_num}_{timestamp}EST"
+    return normalize_run_id(run_id)
 
 
 def normalize_run_id(run_id: str) -> str:
