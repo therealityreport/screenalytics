@@ -6865,13 +6865,20 @@ def _maybe_run_body_tracking(
         reid_skip_reason: str | None = None
         reid_comparisons_performed = 0
 
+        torchreid_import_ok: bool | None = None
         torchreid_status: str | None = None
         torchreid_error: str | None = None
+        torchreid_version: str | None = None
+        torchreid_runtime_ok: bool | None = None
+        torchreid_runtime_error: str | None = None
         if isinstance(import_status, dict):
             torchreid_state = import_status.get("torchreid")
             if isinstance(torchreid_state, dict):
                 torchreid_status = torchreid_state.get("status")
                 torchreid_error = torchreid_state.get("error")
+                torchreid_version = torchreid_state.get("version")
+                if isinstance(torchreid_status, str) and torchreid_status.strip():
+                    torchreid_import_ok = torchreid_status.strip() == "ok"
 
         if not reid_enabled_config:
             embeddings_note = "disabled"
@@ -6886,14 +6893,27 @@ def _maybe_run_body_tracking(
             try:
                 embeddings_path = runner.run_embedding()
                 reid_embeddings_generated = True
+                torchreid_runtime_ok = True
             except ImportError as exc:
-                reid_skip_reason = "torchreid_import_error"
-                embeddings_note = f"import_error: {exc}"
-                LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", exc)
+                torchreid_runtime_ok = False
+                torchreid_runtime_error = str(exc)
+                if torchreid_import_ok is True:
+                    reid_skip_reason = "torchreid_runtime_error"
+                    embeddings_note = f"runtime_error: {exc}"
+                else:
+                    reid_skip_reason = "torchreid_import_error"
+                    embeddings_note = f"import_error: {exc}"
+                LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", embeddings_note)
             except Exception as exc:
-                reid_skip_reason = "reid_error"
-                embeddings_note = f"error: {exc}"
-                LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", exc)
+                torchreid_runtime_ok = False
+                torchreid_runtime_error = f"{type(exc).__name__}: {exc}"
+                if torchreid_import_ok is True:
+                    reid_skip_reason = "torchreid_runtime_error"
+                    embeddings_note = f"runtime_error: {type(exc).__name__}: {exc}"
+                else:
+                    reid_skip_reason = "reid_error"
+                    embeddings_note = f"error: {type(exc).__name__}: {exc}"
+                LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", embeddings_note)
 
         body_reid = {
             "enabled_config": reid_enabled_config,
@@ -6901,6 +6921,10 @@ def _maybe_run_body_tracking(
             "reid_embeddings_generated": bool(reid_embeddings_generated),
             "reid_skip_reason": reid_skip_reason,
             "reid_comparisons_performed": int(reid_comparisons_performed),
+            "torchreid_import_ok": torchreid_import_ok,
+            "torchreid_version": torchreid_version,
+            "torchreid_runtime_ok": torchreid_runtime_ok,
+            "torchreid_runtime_error": torchreid_runtime_error,
         }
 
         # Always materialize placeholder embedding artifacts so run-scoped bundles are consistent.
@@ -7877,7 +7901,23 @@ def _run_faces_embed_stage(
     allow_cpu_fallback = getattr(args, "allow_cpu_fallback", False) or not getattr(args, "coreml_only", True)
 
     # Get backend selection from embedding config (already loaded earlier)
-    embedding_backend_type = embedding_config.get("embedding", {}).get("backend", "pytorch")
+    embedding_backend_configured = embedding_config.get("embedding", {}).get("backend", "pytorch")
+    if isinstance(embedding_backend_configured, str):
+        embedding_backend_configured = embedding_backend_configured.strip().lower() or "pytorch"
+    else:
+        embedding_backend_configured = "pytorch"
+    embedding_backend_configured_effective = embedding_backend_configured
+    embedding_backend_platform_reason: str | None = None
+    if embedding_backend_configured == "tensorrt":
+        system = platform.system()
+        _requested_cuda, resolved_cuda, _reason = _resolve_torch_device_request("cuda")
+        cuda_available = resolved_cuda == "cuda"
+        if system != "Linux":
+            embedding_backend_configured_effective = "pytorch"
+            embedding_backend_platform_reason = "TensorRT not supported on this platform; using PyTorch backend."
+        elif not cuda_available:
+            embedding_backend_configured_effective = "pytorch"
+            embedding_backend_platform_reason = "TensorRT requires CUDA; CUDA not available; using PyTorch backend."
     tensorrt_config_rel = embedding_config.get("embedding", {}).get(
         "tensorrt_config",
         "config/pipeline/arcface_tensorrt.yaml",
@@ -7891,12 +7931,18 @@ def _run_faces_embed_stage(
         tensorrt_config_path = str(REPO_ROOT / tensorrt_config_path)
     fallback_cfg = embedding_config.get("fallback", {}) if isinstance(embedding_config.get("fallback"), dict) else {}
     fallback_to_pytorch = bool(fallback_cfg.get("fallback_to_pytorch", True))
-    allow_embedding_fallback = allow_cpu_fallback or (embedding_backend_type == "tensorrt" and fallback_to_pytorch)
+    allow_embedding_fallback = allow_cpu_fallback
+    if embedding_backend_configured_effective == "tensorrt":
+        allow_embedding_fallback = allow_cpu_fallback or fallback_to_pytorch
 
     # Emit progress during model loading (can take time for CoreML compilation)
-    print(f"[INIT] Loading embedding backend (type={embedding_backend_type}, device={device})...", flush=True)
+    print(
+        "[INIT] Loading embedding backend "
+        f"(configured={embedding_backend_configured}, effective={embedding_backend_configured_effective}, device={device})...",
+        flush=True,
+    )
     embedder = get_embedding_backend(
-        backend_type=embedding_backend_type,
+        backend_type=embedding_backend_configured_effective,
         device=device,
         tensorrt_config=tensorrt_config_path,
         allow_cpu_fallback=allow_embedding_fallback,
@@ -7904,20 +7950,22 @@ def _run_faces_embed_stage(
     embedder.ensure_ready()
     embed_device = embedder.resolved_device
     embedding_backend_actual = (
-        getattr(embedder, "active_backend_label", None) or embedding_backend_type
+        getattr(embedder, "active_backend_label", None) or embedding_backend_configured_effective
     )
-    embedding_backend_fallback_reason = getattr(embedder, "fallback_reason", None)
+    embedding_backend_fallback_reason = getattr(embedder, "fallback_reason", None) or embedding_backend_platform_reason
     embedding_model_name = ARC_FACE_MODEL_NAME
     crop_interval_frames = getattr(args, "sample_every_n_frames", None)
     print(
         "[INIT] Embedding backend ready "
-        f"(type={embedding_backend_type}, resolved_device={embed_device}, "
+        f"(configured={embedding_backend_configured}, effective={embedding_backend_configured_effective}, "
+        f"resolved_device={embed_device}, "
         f"crop_interval_frames={crop_interval_frames}, allow_cpu_fallback={allow_embedding_fallback})",
         flush=True,
     )
     LOGGER.info(
-        "[faces_embed] embedding_backend_configured=%s embedding_backend_actual=%s resolved_device=%s model=%s",
-        embedding_backend_type,
+        "[faces_embed] embedding_backend_configured=%s embedding_backend_effective=%s embedding_backend_actual=%s resolved_device=%s model=%s",
+        embedding_backend_configured,
+        embedding_backend_configured_effective,
         embedding_backend_actual,
         embed_device,
         embedding_model_name,
@@ -8740,7 +8788,8 @@ def _run_faces_embed_stage(
                 "device": device,
                 "requested_device": requested_embed_device,
                 "resolved_device": embed_device,
-                "embedding_backend_configured": embedding_backend_type,
+                "embedding_backend_configured": embedding_backend_configured,
+                "embedding_backend_configured_effective": embedding_backend_configured_effective,
                 "embedding_backend_actual": embedding_backend_actual,
                 "embedding_backend_fallback_reason": embedding_backend_fallback_reason,
                 "embedding_model_name": embedding_model_name,

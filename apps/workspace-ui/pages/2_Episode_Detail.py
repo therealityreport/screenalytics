@@ -120,6 +120,74 @@ def _generate_attempt_run_id(ep_id: str) -> str:
     return run_layout.normalize_run_id(run_id)
 
 
+def _trigger_pdf_export_if_needed(
+    ep_id: str,
+    run_id: str,
+    cfg: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Tuple[bool, str]:
+    """Trigger PDF export if not already exported for this run.
+
+    Idempotency guard: checks export_index.json to avoid re-exporting.
+
+    Args:
+        ep_id: Episode ID.
+        run_id: Run ID.
+        cfg: Config dict with api_base.
+        force: If True, skip idempotency check and always export.
+
+    Returns:
+        Tuple of (success, message).
+    """
+    from apps.api.services.run_artifact_store import read_export_index
+
+    # Idempotency check: skip if PDF already exported for this run
+    if not force:
+        try:
+            export_index = read_export_index(ep_id, run_id)
+            if export_index:
+                export_type = export_index.get("export_type")
+                export_upload = export_index.get("export_upload", {})
+                if export_type == "pdf" and export_upload.get("success"):
+                    s3_key = export_upload.get("s3_key") or export_index.get("export_s3_key")
+                    LOGGER.info(
+                        "[PDF-EXPORT] Skipping export - PDF already exists for %s/%s (key=%s)",
+                        ep_id, run_id, s3_key,
+                    )
+                    return True, f"PDF already exported: {s3_key or 'local'}"
+        except Exception as exc:
+            LOGGER.warning("[PDF-EXPORT] Failed to check export index: %s", exc)
+
+    # Trigger PDF export via API
+    export_url = f"{cfg['api_base']}/episodes/{ep_id}/runs/{run_id}/export"
+    LOGGER.info("[PDF-EXPORT] Triggering export for %s/%s via %s", ep_id, run_id, export_url)
+
+    try:
+        resp = requests.get(export_url, timeout=300)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        error_msg = helpers.describe_error(export_url, exc)
+        LOGGER.error("[PDF-EXPORT] Export failed: %s", error_msg)
+        return False, f"Export failed: {error_msg}"
+
+    # Extract S3 upload status from response headers
+    s3_attempted = resp.headers.get("X-S3-Upload-Attempted", "").lower() == "true"
+    s3_success = resp.headers.get("X-S3-Upload-Success", "").lower() == "true"
+    s3_key = resp.headers.get("X-S3-Upload-Key", "")
+    s3_error = resp.headers.get("X-S3-Upload-Error", "")
+
+    if s3_attempted and s3_success and s3_key:
+        LOGGER.info("[PDF-EXPORT] Export successful - uploaded to S3: %s", s3_key)
+        return True, f"PDF exported to S3: {s3_key}"
+    elif s3_attempted and s3_error:
+        LOGGER.warning("[PDF-EXPORT] Export generated but S3 upload failed: %s", s3_error)
+        return True, f"PDF generated (S3 upload failed: {s3_error})"
+    else:
+        LOGGER.info("[PDF-EXPORT] Export generated (local storage)")
+        return True, "PDF exported (local storage)"
+
+
 def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | None) -> None:
     """Render the unified pipeline settings dialog with all phase settings."""
 
@@ -2353,7 +2421,27 @@ manifest_state = _detect_track_manifests_ready(detections_path, tracks_path)
 faces_status_value = str(faces_phase_status.get("status") or "missing").lower()
 cluster_status_value = str(cluster_phase_status.get("status") or "missing").lower()
 tracks_ready_flag = bool((status_payload or {}).get("tracks_ready"))
+
+# FIX: Override stale "running" status if job just completed (completion flag set)
+# This ensures the UI updates immediately when a job completes via log stream,
+# without waiting for cache invalidation or API polling
+if faces_status_value == "running" and st.session_state.get(f"{ep_id}::faces_embed_just_completed"):
+    faces_status_value = "success"  # Override to success since job completed
+    LOGGER.info("[STATUS-FIX] Faces: Override stale 'running' -> 'success' due to just_completed flag")
+    helpers.invalidate_running_jobs_cache(ep_id)
+if cluster_status_value == "running" and st.session_state.get(f"{ep_id}::cluster_just_completed"):
+    cluster_status_value = "success"  # Override to success since job completed
+    LOGGER.info("[STATUS-FIX] Cluster: Override stale 'running' -> 'success' due to just_completed flag")
+    helpers.invalidate_running_jobs_cache(ep_id)
 detect_job_state = (detect_job_record or {}).get("state")
+# FIX: Override stale "running" state if job just completed (completion flag set)
+# This ensures the UI updates immediately when a job completes via log stream,
+# without waiting for cache invalidation or API polling
+if detect_job_state == "running" and st.session_state.get(f"{ep_id}::detect_track_just_completed"):
+    detect_job_state = None  # Clear running state to allow status to reflect completion
+    LOGGER.info("[STATUS-FIX] Detected stale 'running' state with just_completed flag, clearing job_state")
+    # Invalidate cache to ensure next check uses fresh data
+    helpers.invalidate_running_jobs_cache(ep_id)
 detect_status_value, tracks_ready, using_manifest_fallback, tracks_only_fallback = _compute_detect_track_effective_status(
     detect_phase_status,
     manifest_ready=manifest_state["manifest_ready"],
@@ -3187,6 +3275,36 @@ with st.container():
             total_progress = completed_weight + (current_phase_pct * current_phase_weight)
             st.progress(min(total_progress, 1.0))
             st.caption(f"Pipeline: {int(total_progress * 100)}% complete")
+
+            # Timing metrics display (expandable)
+            _autorun_run_id = st.session_state.get(_autorun_run_id_key)
+            timing_state = helpers.get_timing_state(ep_id, _autorun_run_id or selected_attempt_run_id)
+            if timing_state and timing_state.jobs:
+                with st.expander("Stage Timing", expanded=False):
+                    # Build timing table
+                    stage_ops = ["detect_track", "faces_embed", "cluster"]
+                    stage_labels = {"detect_track": "Detect/Track", "faces_embed": "Faces Harvest", "cluster": "Cluster"}
+                    timing_rows = []
+                    for op in stage_ops:
+                        metrics = helpers.format_timing_for_display(timing_state, op)
+                        timing_rows.append({
+                            "Stage": stage_labels.get(op, op),
+                            "First Log": metrics["first_line"],
+                            "Complete": metrics["completed"],
+                            "Runtime": metrics["runtime"],
+                            "Stall→Next": metrics["stall_to_next"],
+                        })
+                    # Display as markdown table
+                    header = "| Stage | First Log | Complete | Runtime | Stall→Next |"
+                    divider = "|-------|-----------|----------|---------|------------|"
+                    rows = [f"| {r['Stage']} | {r['First Log']} | {r['Complete']} | {r['Runtime']} | {r['Stall→Next']} |" for r in timing_rows]
+                    st.markdown("\n".join([header, divider] + rows))
+
+                    # Total stall time summary
+                    total_stall = timing_state.total_stall_time()
+                    if total_stall > 0:
+                        from autorun_timing import format_timing_duration
+                        st.caption(f"Total inter-stage stall: {format_timing_duration(total_stall)}")
         else:
             st.caption("Run all pipeline stages in sequence: Detect/Track → Faces Harvest → Cluster")
     with auto_col2:
@@ -4430,12 +4548,13 @@ with col_faces:
             st.info("🤖 Auto-Run: Starting Faces Harvest...")
         else:
             # Suggestion 8: Mtime-based retry with longer limit
+            # FIX: Reduced retry delay from 1s to 0.25s for faster phase advancement
             retry_count = st.session_state.get(f"{ep_id}::autorun_faces_retry", 0) + 1
             should_retry, status_msg = _should_retry_phase_trigger(ep_id, "faces", retry_count)
             if should_retry:
                 st.session_state[f"{ep_id}::autorun_faces_retry"] = retry_count
                 st.caption(f"⏳ {status_msg}")
-                time.sleep(1)
+                time.sleep(0.25)  # Reduced from 1s for faster advancement
                 st.rerun()
             else:
                 # Give up after max retries
@@ -4701,6 +4820,25 @@ with col_cluster:
             if stage_label not in completed:
                 completed.append(stage_label)
                 st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+
+            # Trigger PDF export before marking auto-run complete (idempotent)
+            if selected_attempt_run_id:
+                with st.spinner("Generating PDF report..."):
+                    pdf_success, pdf_msg = _trigger_pdf_export_if_needed(
+                        ep_id, selected_attempt_run_id, cfg
+                    )
+                if pdf_success:
+                    st.success(f"📄 {pdf_msg}")
+                    # Add PDF stage to completed stages
+                    pdf_stage = "PDF Export"
+                    if pdf_stage not in completed:
+                        completed.append(pdf_stage)
+                        st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                else:
+                    st.warning(f"⚠️ {pdf_msg}")
+            else:
+                LOGGER.warning("[AUTORUN] No run_id available for PDF export")
+
             # Mark auto-run complete
             st.session_state[_autorun_key] = False
             st.session_state[_autorun_phase_key] = None
@@ -4733,8 +4871,18 @@ with col_cluster:
             if selected_attempt_run_id:
                 st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
 
-            # Check if auto-run is active - this is the final phase, mark complete
+            # Check if auto-run is active - this is the final phase, trigger PDF export and mark complete
             if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
+                # Trigger PDF export before marking auto-run complete (idempotent)
+                if selected_attempt_run_id:
+                    with st.spinner("Generating PDF report..."):
+                        pdf_success, pdf_msg = _trigger_pdf_export_if_needed(
+                            ep_id, selected_attempt_run_id, cfg
+                        )
+                    if pdf_success:
+                        st.success(f"📄 {pdf_msg}")
+                    else:
+                        st.warning(f"⚠️ {pdf_msg}")
                 st.success("🎉 **Auto-Run Pipeline Complete!** All phases finished successfully.")
                 st.session_state[_autorun_key] = False
                 st.session_state[_autorun_phase_key] = None
@@ -5001,12 +5149,13 @@ with col_cluster:
             st.info("🤖 Auto-Run: Starting Cluster...")
         else:
             # Suggestion 8: Mtime-based retry with longer limit
+            # FIX: Reduced retry delay from 1s to 0.25s for faster phase advancement
             retry_count = st.session_state.get(f"{ep_id}::autorun_cluster_retry", 0) + 1
             should_retry, status_msg = _should_retry_phase_trigger(ep_id, "cluster", retry_count)
             if should_retry:
                 st.session_state[f"{ep_id}::autorun_cluster_retry"] = retry_count
                 st.caption(f"⏳ {status_msg}")
-                time.sleep(1)
+                time.sleep(0.25)  # Reduced from 1s for faster advancement
                 st.rerun()
             else:
                 # Give up after max retries

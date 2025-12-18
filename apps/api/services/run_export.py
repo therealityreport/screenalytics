@@ -45,22 +45,42 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) -> str:
-    """Insert zero-width break opportunities to keep long tokens from overflowing PDF cells.
+def _sanitize_pdf_text(text: str) -> str:
+    """Remove characters that render as black squares or replacement glyphs in PDF fonts.
 
-    ReportLab wraps on whitespace but can overflow on long unbroken tokens (paths, S3 keys, etc).
+    Helvetica (and other Type1 fonts) cannot render:
+    - U+200B (zero-width space) - renders as black square
+    - U+25A0 (black square) - should not appear in output
+    - U+FFFD (replacement character) - indicates encoding issues
+    """
+    return (
+        text.replace("\u200b", "")
+        .replace("\u25a0", "")
+        .replace("\ufffd", "")
+    )
+
+
+def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) -> str:
+    """Process long tokens to enable PDF line wrapping without overflow.
+
+    ReportLab wraps on whitespace. For long unbroken tokens (paths, S3 keys, etc.),
+    we chunk extremely long spans so wordWrap='CJK' can break at reasonable positions.
+
+    Note: Previously inserted U+200B (zero-width space) but Helvetica renders it as
+    black squares. Now relies on wordWrap='CJK' style for breaking at any character.
     """
     raw = str(text or "")
     if not raw:
         return ""
 
-    # Add zero-width breakpoints after common separators.
+    # Identify natural break positions after separators for internal chunking logic.
     separators = r"/_\-\.=:(),"
+    ZWSP = "\u200b"  # Internal marker only, stripped before return
     out_chars: list[str] = []
     for ch in raw:
         out_chars.append(ch)
         if ch in separators:
-            out_chars.append("\u200b")
+            out_chars.append(ZWSP)
     softened = "".join(out_chars)
 
     # Fallback: chunk extremely long spans that still have no breaks.
@@ -68,15 +88,20 @@ def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) 
     for i, tok in enumerate(tokens):
         if len(tok) <= max_token_len:
             continue
-        parts = tok.split("\u200b")
+        parts = tok.split(ZWSP)
         rebuilt: list[str] = []
         for part in parts:
             if len(part) <= max_token_len:
                 rebuilt.append(part)
                 continue
-            rebuilt.append("\u200b".join(part[j : j + chunk_len] for j in range(0, len(part), chunk_len)))
-        tokens[i] = "\u200b".join(rebuilt)
-    return " ".join(tokens)
+            # Insert markers to allow breaking in very long segments
+            rebuilt.append(ZWSP.join(part[j : j + chunk_len] for j in range(0, len(part), chunk_len)))
+        tokens[i] = ZWSP.join(rebuilt)
+    result = " ".join(tokens)
+
+    # CRITICAL: Strip zero-width spaces - Helvetica renders them as black squares (■).
+    # The wordWrap='CJK' paragraph style handles actual line breaking.
+    return _sanitize_pdf_text(result)
 
 
 def _escape_reportlab_xml(text: str) -> str:
@@ -122,7 +147,7 @@ def build_wrap_safe_kv_table(
         [_p(header[0], style=header_style, soft_wrap=False), _p(header[1], style=header_style, soft_wrap=False)]
     ]
     for label, value in rows:
-        data.append([_p(str(label), style=cell_style, soft_wrap=False), _value_cell(value)])
+        data.append([_p(str(label), style=cell_style, soft_wrap=True), _value_cell(value)])
 
     table = Table(data, colWidths=[label_w, value_w])
     table.setStyle(
@@ -1436,10 +1461,10 @@ def build_screentime_run_debug_pdf(
         leading=10,
     )
     # Ensure ReportLab breaks long tokens (paths, S3 keys) instead of overflowing.
-    cell_style.wordWrap = "CJK"
-    cell_style.splitLongWords = 1
-    cell_style_small.wordWrap = "CJK"
-    cell_style_small.splitLongWords = 1
+    # Apply to all styles that may contain long unbroken strings.
+    for style in [cell_style, cell_style_small, bullet_style, body_style, note_style]:
+        style.wordWrap = "CJK"
+        style.splitLongWords = 1
 
     def _wrap_cell(text: str, style: ParagraphStyle = cell_style) -> Paragraph:
         """Wrap text in a Paragraph for table cell text wrapping."""
@@ -1901,6 +1926,7 @@ def build_screentime_run_debug_pdf(
         ],
     ]
 
+    import_status: dict[str, Any] | None = None
     env_diagnostics = _read_json(env_diagnostics_path) if env_diagnostics_path.exists() else None
     if isinstance(env_diagnostics, dict):
         env_lines: list[tuple[str, str]] = []
@@ -1999,6 +2025,7 @@ def build_screentime_run_debug_pdf(
     marker_embed_requested_device: str | None = None
     marker_embed_resolved_device: str | None = None
     marker_embedding_backend_configured: str | None = None
+    marker_embedding_backend_configured_effective: str | None = None
     marker_embedding_backend_actual: str | None = None
     marker_embedding_backend_fallback_reason: str | None = None
     marker_embedding_model_name: str | None = None
@@ -2148,6 +2175,11 @@ def build_screentime_run_debug_pdf(
         marker_embedding_backend_configured = (
             str(faces_embed_marker.get("embedding_backend_configured")).strip()
             if isinstance(faces_embed_marker.get("embedding_backend_configured"), str)
+            else None
+        )
+        marker_embedding_backend_configured_effective = (
+            str(faces_embed_marker.get("embedding_backend_configured_effective")).strip()
+            if isinstance(faces_embed_marker.get("embedding_backend_configured_effective"), str)
             else None
         )
         marker_embedding_backend_actual = (
@@ -2305,13 +2337,34 @@ def build_screentime_run_debug_pdf(
             lineage_data.append(["Embedding Device (requested)", marker_embed_requested_device])
         if marker_embed_resolved_device:
             lineage_data.append(["Embedding Device (resolved)", marker_embed_resolved_device])
-    if marker_embedding_backend_actual:
-        backend_lines: list[tuple[str, str]] = [("actual", marker_embedding_backend_actual)]
-        if marker_embedding_backend_configured and marker_embedding_backend_configured != marker_embedding_backend_actual:
+    if marker_embedding_backend_configured_effective or marker_embedding_backend_actual or marker_embedding_backend_configured:
+        embedding_backend_effective = (
+            marker_embedding_backend_configured_effective
+            or marker_embedding_backend_actual
+            or marker_embedding_backend_configured
+        )
+        backend_lines: list[tuple[str, str]] = [("effective", embedding_backend_effective)]
+        if (
+            marker_embedding_backend_configured
+            and embedding_backend_effective
+            and marker_embedding_backend_configured != embedding_backend_effective
+        ):
             backend_lines.append(("configured", marker_embedding_backend_configured))
-        if marker_embedding_backend_fallback_reason:
-            backend_lines.append(("fallback_reason", marker_embedding_backend_fallback_reason))
-        lineage_data.append(["Embedding Backend (runtime)", backend_lines])
+        if marker_embedding_backend_actual and embedding_backend_effective and marker_embedding_backend_actual != embedding_backend_effective:
+            backend_lines.append(("runtime_actual", marker_embedding_backend_actual))
+        backend_reason = marker_embedding_backend_fallback_reason
+        if (
+            embedding_backend_effective
+            and marker_embedding_backend_configured == "tensorrt"
+            and embedding_backend_effective != "tensorrt"
+            and backend_reason
+        ):
+            lowered = backend_reason.lower()
+            if "pip install" in lowered or "pycuda" in lowered:
+                backend_reason = "TensorRT requires CUDA (NVIDIA) and is not available; using PyTorch backend."
+        if backend_reason:
+            backend_lines.append(("reason", backend_reason))
+        lineage_data.append(["Embedding Backend (effective)", backend_lines])
     if marker_stride_effective is not None:
         lineage_data.append(["Face Detection Stride (effective)", str(marker_stride_effective)])
     if marker_stride_observed_median is not None:
@@ -2520,24 +2573,79 @@ def build_screentime_run_debug_pdf(
                 embeddings_generated = body_reid.get("reid_embeddings_generated")
                 skip_reason = body_reid.get("reid_skip_reason")
                 comparisons = body_reid.get("reid_comparisons_performed")
+                torchreid_import_ok = body_reid.get("torchreid_import_ok")
+                torchreid_version = body_reid.get("torchreid_version")
+                torchreid_runtime_ok = body_reid.get("torchreid_runtime_ok")
+                torchreid_runtime_error = body_reid.get("torchreid_runtime_error")
                 if isinstance(enabled_config, bool):
                     reid_lines.append(("enabled_config", "true" if enabled_config else "false"))
                 if isinstance(enabled_effective, bool):
                     reid_lines.append(("enabled_effective", "true" if enabled_effective else "false"))
                 if isinstance(embeddings_generated, bool):
                     reid_lines.append(("embeddings_generated", "true" if embeddings_generated else "false"))
-                if isinstance(skip_reason, str) and skip_reason.strip():
-                    reid_lines.append(("skip_reason", skip_reason.strip()))
+                torchreid_env_ok: bool | None = None
+                torchreid_env_version: str | None = None
+                if isinstance(import_status, dict):
+                    torchreid_env = import_status.get("torchreid")
+                    if isinstance(torchreid_env, dict):
+                        status = torchreid_env.get("status")
+                        if isinstance(status, str) and status.strip():
+                            torchreid_env_ok = status.strip() == "ok"
+                        version = torchreid_env.get("version")
+                        if isinstance(version, str) and version.strip():
+                            torchreid_env_version = version.strip()
+                if torchreid_env_ok is True:
+                    installed = "yes"
+                    if torchreid_env_version:
+                        installed += f" ({torchreid_env_version})"
+                    reid_lines.append(("torchreid_installed", installed))
+                elif torchreid_env_ok is False:
+                    reid_lines.append(("torchreid_installed", "no"))
+                if isinstance(torchreid_import_ok, bool):
+                    reid_lines.append(("torchreid_import_ok", "true" if torchreid_import_ok else "false"))
+                if isinstance(torchreid_version, str) and torchreid_version.strip():
+                    reid_lines.append(("torchreid_version", torchreid_version.strip()))
+                if isinstance(torchreid_runtime_ok, bool):
+                    reid_lines.append(("torchreid_runtime_ok", "true" if torchreid_runtime_ok else "false"))
+                runtime_error_str: str | None = None
+                if isinstance(torchreid_runtime_error, str) and torchreid_runtime_error.strip():
+                    runtime_error_str = torchreid_runtime_error.strip()
+                elif isinstance(run_body_tracking_marker.get("reid_note"), str) and run_body_tracking_marker.get("reid_note").strip():
+                    note = run_body_tracking_marker.get("reid_note").strip()
+                    if note.lower().startswith("import_error:"):
+                        note = note[len("import_error:") :].strip()
+                    if note.lower().startswith("runtime_error:"):
+                        note = note[len("runtime_error:") :].strip()
+                    runtime_error_str = note or None
+                if runtime_error_str and len(runtime_error_str) > 180:
+                    runtime_error_str = runtime_error_str[:177] + "..."
+
+                skip_reason_effective = skip_reason.strip() if isinstance(skip_reason, str) and skip_reason.strip() else None
+                if (
+                    torchreid_env_ok is True
+                    and skip_reason_effective == "torchreid_import_error"
+                ):
+                    skip_reason_effective = "torchreid_runtime_error"
+                if skip_reason_effective:
+                    reid_lines.append(("skip_reason", skip_reason_effective))
+                if runtime_error_str and (skip_reason_effective == "torchreid_runtime_error" or torchreid_runtime_ok is False):
+                    reid_lines.append(("runtime_error", runtime_error_str))
                 if isinstance(comparisons, int):
                     reid_lines.append(("comparisons_performed", str(comparisons)))
                 if reid_lines:
                     lineage_data.append(["Body Re-ID (runtime)", reid_lines])
 
     # Model versions
+    embedding_backend_display = (
+        marker_embedding_backend_configured_effective
+        or marker_embedding_backend_actual
+        or marker_embedding_backend_configured
+        or embedding_config.get("embedding", {}).get("backend", "tensorrt")
+    )
     lineage_data.extend([
         ["Face Detector", detection_config.get("model_id", "retinaface_r50")],
         ["Face Tracker", marker_tracker_backend_actual or "ByteTrack"],
-        ["Embedding Model", embedding_config.get("embedding", {}).get("backend", "tensorrt") + " / ArcFace R100"],
+        ["Embedding Model", str(embedding_backend_display) + " / ArcFace R100"],
         ["Body Detector", body_detection_config.get("person_detection", {}).get("model", "yolov8n")],
         ["Body Re-ID", body_detection_config.get("person_reid", {}).get("model", "osnet_x1_0")],
     ])
@@ -2674,7 +2782,7 @@ def build_screentime_run_debug_pdf(
         ["Scene Cuts", str(track_metrics_data.get("scene_cuts", {}).get("count", "N/A"))],
     ]
     if face_tracker_backend_detail is not None:
-        track_stats.append(["Tracker Backend (actual)", face_tracker_backend_detail])
+        track_stats.append(["Face Tracker Backend (actual)", face_tracker_backend_detail])
     track_table = Table(track_stats, colWidths=[2 * inch, 2 * inch])
     track_table.setStyle(
         TableStyle([
@@ -2688,14 +2796,45 @@ def build_screentime_run_debug_pdf(
     story.append(track_table)
 
     # Diagnostic notes for alarming metrics
+    gate_auto_rerun_reason: str | None = None
+    gate_splits_share: float | None = None
+    gate_splits_share_min: float | None = None
+    if isinstance(marker_gate_auto_rerun, dict):
+        reason_raw = marker_gate_auto_rerun.get("reason")
+        if isinstance(reason_raw, str) and reason_raw.strip():
+            gate_auto_rerun_reason = reason_raw.strip()
+        decision = marker_gate_auto_rerun.get("decision")
+        if isinstance(decision, dict):
+            gate_splits_share = _safe_float_opt(decision.get("gate_splits_share"))
+            thresholds = decision.get("thresholds")
+            if isinstance(thresholds, dict):
+                gate_splits_share_min = _safe_float_opt(thresholds.get("min_gate_share"))
+
     forced_splits = metrics.get("forced_splits", 0)
     id_switches = metrics.get("id_switches", 0)
     if isinstance(forced_splits, (int, float)) and forced_splits > 50:
-        story.append(Paragraph(
-            f"⚠️ High forced splits ({forced_splits}): Appearance gate is aggressively splitting tracks. "
-            "Consider disabling gate_enabled in tracking.yaml or adjusting appearance thresholds.",
-            warning_style
-        ))
+        gate_splits_share_low = False
+        if gate_splits_share is not None and gate_splits_share_min is not None:
+            gate_splits_share_low = gate_splits_share < gate_splits_share_min
+        if gate_auto_rerun_reason == "gate_share_too_low" or gate_splits_share_low or marker_gate_enabled is False:
+            share_str = f"{gate_splits_share:.3f}" if gate_splits_share is not None else "unknown"
+            story.append(
+                Paragraph(
+                    f"⚠️ High forced splits ({forced_splits}): appearance gate is not the primary driver "
+                    f"(auto_rerun_reason={gate_auto_rerun_reason or 'unknown'}, gate_splits_share={share_str}). "
+                    "Tune track_buffer/match_thresh and scene-cut/warmup settings; disabling gate_enabled is unlikely to help.",
+                    warning_style,
+                )
+            )
+        else:
+            extra = f" (gate_splits_share={gate_splits_share:.3f})" if gate_splits_share is not None else ""
+            story.append(
+                Paragraph(
+                    f"⚠️ High forced splits ({forced_splits}){extra}: Appearance gate is aggressively splitting tracks. "
+                    "Consider disabling gate_enabled in tracking.yaml or adjusting appearance thresholds.",
+                    warning_style,
+                )
+            )
     if isinstance(id_switches, (int, float)) and id_switches > 20:
         story.append(Paragraph(
             f"⚠️ High ID switches ({id_switches}): Tracker losing and re-acquiring faces frequently. "
@@ -3029,20 +3168,78 @@ def build_screentime_run_debug_pdf(
     if isinstance(run_body_tracking_marker, dict):
         body_reid = run_body_tracking_marker.get("body_reid")
         if isinstance(body_reid, dict):
+            reid_lines: list[tuple[str, str]] = []
+
+            torchreid_env_ok: bool | None = None
+            torchreid_env_version: str | None = None
+            if isinstance(import_status, dict):
+                torchreid_env = import_status.get("torchreid")
+                if isinstance(torchreid_env, dict):
+                    status = torchreid_env.get("status")
+                    if isinstance(status, str) and status.strip():
+                        torchreid_env_ok = status.strip() == "ok"
+                    version = torchreid_env.get("version")
+                    if isinstance(version, str) and version.strip():
+                        torchreid_env_version = version.strip()
+            if torchreid_env_ok is True:
+                installed = "yes"
+                if torchreid_env_version:
+                    installed += f" ({torchreid_env_version})"
+                reid_lines.append(("torchreid_installed", installed))
+            elif torchreid_env_ok is False:
+                reid_lines.append(("torchreid_installed", "no"))
+
+            enabled_config = body_reid.get("enabled_config")
             enabled_effective = body_reid.get("enabled_effective")
             embeddings_generated = body_reid.get("reid_embeddings_generated")
             skip_reason = body_reid.get("reid_skip_reason")
-            parts: list[str] = []
+            comparisons = body_reid.get("reid_comparisons_performed")
+            if isinstance(enabled_config, bool):
+                reid_lines.append(("enabled_config", "true" if enabled_config else "false"))
             if isinstance(enabled_effective, bool):
-                parts.append(f"enabled_effective={'true' if enabled_effective else 'false'}")
+                reid_lines.append(("enabled_effective", "true" if enabled_effective else "false"))
             if isinstance(embeddings_generated, bool):
-                parts.append(f"embeddings_generated={'true' if embeddings_generated else 'false'}")
-            if isinstance(skip_reason, str) and skip_reason.strip():
-                parts.append(f"skip_reason={skip_reason.strip()}")
-            if parts:
-                body_reid_detail = ", ".join(parts)
+                reid_lines.append(("embeddings_generated", "true" if embeddings_generated else "false"))
+            if isinstance(comparisons, int):
+                reid_lines.append(("comparisons_performed", str(comparisons)))
+
+            torchreid_import_ok = body_reid.get("torchreid_import_ok")
+            torchreid_runtime_ok = body_reid.get("torchreid_runtime_ok")
+            torchreid_runtime_error = body_reid.get("torchreid_runtime_error")
+            if isinstance(torchreid_import_ok, bool):
+                reid_lines.append(("torchreid_import_ok", "true" if torchreid_import_ok else "false"))
+            if isinstance(torchreid_runtime_ok, bool):
+                reid_lines.append(("torchreid_runtime_ok", "true" if torchreid_runtime_ok else "false"))
+
+            runtime_error_str: str | None = None
+            if isinstance(torchreid_runtime_error, str) and torchreid_runtime_error.strip():
+                runtime_error_str = torchreid_runtime_error.strip()
+            elif isinstance(run_body_tracking_marker.get("reid_note"), str) and run_body_tracking_marker.get("reid_note").strip():
+                note = run_body_tracking_marker.get("reid_note").strip()
+                if note.lower().startswith("import_error:"):
+                    note = note[len("import_error:") :].strip()
+                if note.lower().startswith("runtime_error:"):
+                    note = note[len("runtime_error:") :].strip()
+                runtime_error_str = note or None
+            if runtime_error_str and len(runtime_error_str) > 180:
+                runtime_error_str = runtime_error_str[:177] + "..."
+
+            skip_reason_effective = skip_reason.strip() if isinstance(skip_reason, str) and skip_reason.strip() else None
+            if torchreid_env_ok is True and skip_reason_effective == "torchreid_import_error":
+                skip_reason_effective = "torchreid_runtime_error"
+            if skip_reason_effective:
+                reid_lines.append(("skip_reason", skip_reason_effective))
+            if runtime_error_str and (skip_reason_effective == "torchreid_runtime_error" or torchreid_runtime_ok is False):
+                reid_lines.append(("runtime_error", runtime_error_str))
+
+            if reid_lines:
+                body_reid_detail = "<br/>".join(
+                    f"<b>{_escape_reportlab_xml(k)}:</b> {_escape_reportlab_xml(_soft_wrap_text(v))}"
+                    for k, v in reid_lines
+                    if isinstance(v, str) and v.strip()
+                )
     if body_reid_detail is not None:
-        story.append(Paragraph(f"Body Re-ID (runtime): <b>{_escape_reportlab_xml(body_reid_detail)}</b>", body_style))
+        story.append(Paragraph(f"Body Re-ID (runtime):<br/>{body_reid_detail}", body_style))
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (body_detection.yaml → person_tracking):", subsection_style))
@@ -3875,11 +4072,23 @@ def build_screentime_run_debug_pdf(
 
     # Track tuning
     if isinstance(forced_splits, (int, float)) and forced_splits > 50:
-        tuning_suggestions.append((
-            "Face Tracking",
-            f"High forced splits ({forced_splits})",
-            "Disable gate_enabled in tracking.yaml or adjust appearance thresholds to reduce false splits"
-        ))
+        gate_splits_share_low = False
+        if gate_splits_share is not None and gate_splits_share_min is not None:
+            gate_splits_share_low = gate_splits_share < gate_splits_share_min
+        if gate_auto_rerun_reason == "gate_share_too_low" or gate_splits_share_low or marker_gate_enabled is False:
+            share_str = f"{gate_splits_share:.3f}" if gate_splits_share is not None else "unknown"
+            tuning_suggestions.append((
+                "Face Tracking",
+                f"High forced splits ({forced_splits})",
+                f"Auto-rerun skipped (reason={gate_auto_rerun_reason or 'unknown'}, gate_splits_share={share_str}); "
+                "tune track_buffer/match_thresh and scene-cut/warmup settings (not gate_enabled).",
+            ))
+        else:
+            tuning_suggestions.append((
+                "Face Tracking",
+                f"High forced splits ({forced_splits})",
+                "Disable gate_enabled in tracking.yaml or adjust appearance thresholds to reduce false splits",
+            ))
     if isinstance(id_switches, (int, float)) and id_switches > 20:
         tuning_suggestions.append((
             "Face Tracking",
