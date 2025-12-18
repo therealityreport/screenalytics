@@ -356,6 +356,7 @@ RUN_ARTIFACT_ALLOWLIST = frozenset({
     "faces_embed.json",
     "cluster.json",
     "body_tracking.json",
+    "env_diagnostics.json",
     "body_tracking_fusion.json",
     "face_alignment/aligned_faces.jsonl",
     # Body tracking artifacts

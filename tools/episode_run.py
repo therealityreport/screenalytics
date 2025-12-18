@@ -5293,6 +5293,38 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
     ensure_dirs(args.ep_id)
+
+    # ---------------------------------------------------------------------
+    # Preflight: environment fingerprint (run-scoped when run_id is provided)
+    # ---------------------------------------------------------------------
+    try:
+        from py_screenalytics.env_diagnostics import DEFAULT_ENV_PACKAGES, collect_env_diagnostics, write_env_diagnostics_json
+
+        env_diag = collect_env_diagnostics(DEFAULT_ENV_PACKAGES)
+        setattr(args, "_env_diagnostics", env_diag)
+
+        LOGGER.info(
+            "[env] python=%s pip=%s venv_active=%s sys.executable=%s sys.prefix=%s",
+            env_diag.get("python_version"),
+            env_diag.get("pip_version"),
+            env_diag.get("venv_active"),
+            env_diag.get("sys_executable"),
+            env_diag.get("sys_prefix"),
+        )
+        pkg_versions = env_diag.get("package_versions")
+        if isinstance(pkg_versions, dict) and pkg_versions:
+            LOGGER.info("[env] package_versions=%s", pkg_versions)
+        import_status = env_diag.get("import_status")
+        if isinstance(import_status, dict) and import_status:
+            LOGGER.info("[env] import_status=%s", import_status)
+
+        if args.run_id:
+            run_root = run_layout.run_root(args.ep_id, run_layout.normalize_run_id(args.run_id))
+            env_path = run_root / "env_diagnostics.json"
+            write_env_diagnostics_json(env_path, env_diag)
+            LOGGER.info("[env] wrote %s", env_path)
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics
+        LOGGER.warning("[env] Failed to capture env diagnostics: %s", exc)
     storage, ep_ctx, s3_prefixes = _storage_context(args.ep_id)
 
     phase_flags = [flag for flag in (args.faces_embed, args.cluster) if flag]
@@ -6730,6 +6762,7 @@ def _maybe_run_body_tracking(
     run_id: str | None,
     effective_run_id: str | None,
     video_path: Path,
+    import_status: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     config = _load_body_tracking_config()
     enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
@@ -6825,6 +6858,7 @@ def _maybe_run_body_tracking(
                     "episode_id": ep_id,
                     "generated_at": _utcnow_iso(),
                     "output_dir": str(output_dir),
+                    "import_status": import_status,
                     "reid_enabled": reid_enabled,
                     "reid_note": embeddings_note,
                     "tracker_backend_configured": tracker_backend_configured,
@@ -6861,6 +6895,7 @@ def _maybe_run_body_tracking(
             "run_id": effective_run_id,
             "started_at": started_at,
             "finished_at": _utcnow_iso(),
+            "import_status": import_status,
             "reid_enabled": reid_enabled,
             "reid_note": embeddings_note,
             "tracker_backend_configured": tracker_backend_configured,
@@ -6890,6 +6925,7 @@ def _maybe_run_body_tracking(
             "run_id": effective_run_id,
             "started_at": started_at,
             "finished_at": _utcnow_iso(),
+            "import_status": import_status,
             "error": str(exc),
         }
         _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
@@ -7255,6 +7291,11 @@ def _run_detect_track_stage(
             run_id=run_id,
             effective_run_id=effective_run_id,
             video_path=video_dest,
+            import_status=(
+                getattr(args, "_env_diagnostics", {}).get("import_status")
+                if isinstance(getattr(args, "_env_diagnostics", None), dict)
+                else None
+            ),
         )
 
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
@@ -7366,6 +7407,11 @@ def _run_detect_track_stage(
                 "status": "success",
                 "version": APP_VERSION,
                 "run_id": effective_run_id,
+                "import_status": (
+                    getattr(args, "_env_diagnostics", {}).get("import_status")
+                    if isinstance(getattr(args, "_env_diagnostics", None), dict)
+                    else None
+                ),
                 "detections": det_count,
                 "tracks": track_count,
                 "detector": detector_choice,
