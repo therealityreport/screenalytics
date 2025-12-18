@@ -5072,7 +5072,13 @@ def run_pipeline_job_with_mode(
     """
     execution_mode = get_execution_mode(ep_id)
 
-    def _ensure_local_completion_signals(ep_id: str, operation: str, summary: Dict[str, Any]) -> None:
+    def _ensure_local_completion_signals(
+        ep_id: str,
+        operation: str,
+        summary: Dict[str, Any],
+        *,
+        run_id: str | None,
+    ) -> None:
         """Best-effort: write run marker + progress.json when local job completes.
 
         Local mode sometimes finishes without updating run markers; auto-run relies on
@@ -5085,8 +5091,22 @@ def run_pipeline_job_with_mode(
         LOGGER.info("[LOCAL MODE] Writing completion signals for %s/%s", ep_id, operation)
 
         manifests_dir = DATA_ROOT / "manifests" / ep_id
-        run_dir = manifests_dir / "runs"
+        run_id_norm: str | None = None
+        run_root: Path | None = None
+        if isinstance(run_id, str) and run_id.strip():
+            try:
+                from py_screenalytics import run_layout
+
+                run_id_norm = run_layout.normalize_run_id(run_id.strip())
+                run_root = run_layout.run_root(ep_id, run_id_norm)
+            except Exception:
+                run_id_norm = None
+                run_root = None
+
+        runs_root = manifests_dir / "runs"
         now_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        # Prefer run-scoped manifests for counts when run_id is present.
+        manifests_root_for_counts = run_root or manifests_dir
 
         def _count_lines(path: Path) -> int | None:
             try:
@@ -5098,7 +5118,9 @@ def run_pipeline_job_with_mode(
             return None
 
         def _write_progress_file(step_name: str) -> None:
-            progress_path = manifests_dir / "progress.json"
+            progress_path = (run_root or manifests_dir) / "progress.json"
+            if progress_path.exists():
+                return
             payload = {
                 "ep_id": ep_id,
                 "phase": "done",
@@ -5106,6 +5128,8 @@ def run_pipeline_job_with_mode(
                 "status": "completed",
                 "updated_at": now_iso,
             }
+            if run_id_norm:
+                payload["run_id"] = run_id_norm
             try:
                 progress_path.parent.mkdir(parents=True, exist_ok=True)
                 progress_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -5116,9 +5140,18 @@ def run_pipeline_job_with_mode(
 
         def _write_run_marker(step_name: str, payload: Dict[str, Any]) -> None:
             try:
-                run_dir.mkdir(parents=True, exist_ok=True)
-                marker_path = run_dir / f"{step_name}.json"
-                marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                # Legacy marker path (for backward compatibility).
+                runs_root.mkdir(parents=True, exist_ok=True)
+                legacy_marker_path = runs_root / f"{step_name}.json"
+                if not legacy_marker_path.exists():
+                    legacy_marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+                # Run-scoped marker path (preferred when run_id is present).
+                if run_root is not None:
+                    run_root.mkdir(parents=True, exist_ok=True)
+                    scoped_marker_path = run_root / f"{step_name}.json"
+                    if not scoped_marker_path.exists():
+                        scoped_marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             except OSError as exc:
                 LOGGER.warning("[LOCAL MODE] Failed to write run marker for %s/%s: %s", ep_id, step_name, exc)
 
@@ -5135,14 +5168,16 @@ def run_pipeline_job_with_mode(
             "profile": summary.get("profile"),
             "version": summary.get("version"),
         }
+        if run_id_norm:
+            marker_payload["run_id"] = run_id_norm
 
         manifests_counts = {
             "detect_track": {
-                "detections": _count_lines(manifests_dir / "detections.jsonl"),
-                "tracks": _count_lines(manifests_dir / "tracks.jsonl"),
+                "detections": _count_lines(manifests_root_for_counts / "detections.jsonl"),
+                "tracks": _count_lines(manifests_root_for_counts / "tracks.jsonl"),
             },
             "faces_embed": {
-                "faces": _count_lines(manifests_dir / "faces.jsonl"),
+                "faces": _count_lines(manifests_root_for_counts / "faces.jsonl"),
             },
             "cluster": {
                 "identities": None,
@@ -5150,7 +5185,7 @@ def run_pipeline_job_with_mode(
         }
         # Identities count (json structure)
         if operation == "cluster":
-            identities_path = manifests_dir / "identities.json"
+            identities_path = manifests_root_for_counts / "identities.json"
             try:
                 if identities_path.exists():
                     data = json.loads(identities_path.read_text(encoding="utf-8"))
@@ -5181,6 +5216,9 @@ def run_pipeline_job_with_mode(
 
     # Add execution_mode to payload
     payload = {**payload, "execution_mode": execution_mode}
+    run_id = payload.get("run_id") if isinstance(payload, dict) else None
+    run_id_str = str(run_id).strip() if run_id is not None else None
+    run_id_str = run_id_str if run_id_str else None
 
     # Map operation to endpoint
     endpoint_map = {
@@ -5352,7 +5390,7 @@ def run_pipeline_job_with_mode(
                     progress_bar.progress(1.0)
                     progress_text.caption(f"**100%** - Completed in {elapsed_str}")
                     status_placeholder.success(f"✅ [LOCAL MODE] {operation} completed in {elapsed_str}")
-                    _ensure_local_completion_signals(ep_id, operation, result)
+                    _ensure_local_completion_signals(ep_id, operation, result, run_id=run_id_str)
 
                     # CRITICAL: Set completion flags in session state BEFORE returning
                     # This ensures phase advancement even if Streamlit interrupts the return

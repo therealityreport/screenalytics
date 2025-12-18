@@ -241,6 +241,43 @@ class TestRunLayoutS3Keys:
             "runs/custom-episode-id/abc123/exports/debug_report.pdf"
         ]
 
+    def test_run_artifact_allowlist_includes_core_face_and_body_outputs(self) -> None:
+        """Lock in the minimum run-scoped bundle required for run health + PDF exports."""
+        import sys
+
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+        from py_screenalytics.run_layout import RUN_ARTIFACT_ALLOWLIST
+
+        required = {
+            # Face detect/track/embed/cluster core
+            "detections.jsonl",
+            "tracks.jsonl",
+            "faces.jsonl",
+            "identities.json",
+            "track_metrics.json",
+            "track_reps.jsonl",
+            "cluster_centroids.json",
+            # Phase markers (used by run diagnostics)
+            "detect_track.json",
+            "faces_embed.json",
+            "cluster.json",
+            "body_tracking.json",
+            "body_tracking_fusion.json",
+            # Face alignment output (embed gating + diagnostics)
+            "face_alignment/aligned_faces.jsonl",
+            # Body tracking outputs required for fusion + screentime
+            "body_tracking/body_detections.jsonl",
+            "body_tracking/body_tracks.jsonl",
+            "body_tracking/body_embeddings.npy",
+            "body_tracking/body_embeddings_meta.json",
+            "body_tracking/track_fusion.json",
+            "body_tracking/screentime_comparison.json",
+        }
+
+        missing = required - set(RUN_ARTIFACT_ALLOWLIST)
+        assert not missing, f"RUN_ARTIFACT_ALLOWLIST missing required entries: {sorted(missing)}"
+
 
 class TestSyncRunArtifactsToS3:
     """Tests for sync_run_artifacts_to_s3 function."""
