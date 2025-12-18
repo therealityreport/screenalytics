@@ -1120,6 +1120,166 @@ def _get_manifest_mtime(ep_id: str, phase: str) -> float | None:
     return None
 
 
+def _read_json_payload(path: Path) -> dict[str, Any] | None:
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _progress_pct_from_payload(payload: dict[str, Any] | None) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("progress", "progress_pct", "pct"):
+        value = payload.get(key)
+        if isinstance(value, (int, float)):
+            pct = float(value)
+            if pct > 1.0:
+                pct = pct / 100.0
+            return max(0.0, min(1.0, pct))
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"completed", "success"}:
+        return 1.0
+    return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_run_artifact_presence(
+    ep_id: str,
+    run_id: str,
+    rel_paths: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    try:
+        run_id_norm = run_layout.normalize_run_id(run_id)
+    except ValueError:
+        run_id_norm = None
+    if not run_id_norm:
+        for rel_path in rel_paths:
+            result[rel_path] = {"local": False, "remote": False, "s3_key": None, "path": None}
+        return result
+
+    storage = None
+    try:
+        from apps.api.services.storage import StorageService
+
+        storage = StorageService()
+    except Exception as exc:
+        LOGGER.warning("[RUN_ARTIFACT] Storage init failed: %s", exc)
+
+    for rel_path in rel_paths:
+        local_path = run_layout.run_root(ep_id, run_id_norm) / rel_path
+        local_exists = local_path.exists()
+        remote_exists = False
+        remote_key = None
+        if not local_exists and storage and storage.s3_enabled():
+            try:
+                for key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, rel_path):
+                    if storage.object_exists(key):
+                        remote_exists = True
+                        remote_key = key
+                        break
+            except Exception as exc:
+                LOGGER.warning("[RUN_ARTIFACT] S3 check failed for %s/%s: %s", ep_id, rel_path, exc)
+        result[rel_path] = {
+            "local": local_exists,
+            "remote": remote_exists,
+            "s3_key": remote_key,
+            "path": str(local_path),
+        }
+    return result
+
+
+def _presence_from_cache(
+    entry: dict[str, Any] | None,
+    local_path: Path,
+) -> stage_layout.ArtifactPresence:
+    local_exists = bool(entry.get("local")) if isinstance(entry, dict) else local_path.exists()
+    remote_exists = bool(entry.get("remote")) if isinstance(entry, dict) else False
+    s3_key = entry.get("s3_key") if isinstance(entry, dict) else None
+    return stage_layout.ArtifactPresence(
+        local=local_exists,
+        remote=remote_exists,
+        path=str(local_path),
+        s3_key=s3_key if isinstance(s3_key, str) else None,
+    )
+
+
+def _ensure_run_artifacts_local(
+    ep_id: str,
+    run_id: str,
+    artifacts: dict[str, stage_layout.ArtifactPresence],
+) -> tuple[bool, str | None]:
+    try:
+        from apps.api.services.storage import StorageService
+
+        storage = StorageService()
+    except Exception as exc:
+        return False, f"storage_init_failed: {exc}"
+
+    if not storage.s3_enabled() or not storage._client:
+        return False, "s3_disabled"
+
+    for rel_path, presence in artifacts.items():
+        if presence.local:
+            continue
+        if not presence.remote or not presence.s3_key:
+            return False, f"missing_remote: {rel_path}"
+        local_path = run_layout.run_root(ep_id, run_id) / rel_path
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            storage._client.download_file(storage.bucket, presence.s3_key, str(local_path))
+            LOGGER.info(
+                "[RUN_ARTIFACT] Mirrored %s from s3://%s/%s",
+                rel_path,
+                storage.bucket,
+                presence.s3_key,
+            )
+        except Exception as exc:
+            return False, f"download_failed: {rel_path}: {exc}"
+    return True, None
+
+
+def _render_downstream_progress(
+    progress_payload: dict[str, Any] | None,
+    *,
+    running: bool,
+) -> None:
+    progress_pct = _progress_pct_from_payload(progress_payload)
+    if progress_pct is None and running:
+        progress_pct = 0.05
+    if progress_pct is not None:
+        st.progress(min(progress_pct, 1.0))
+    if running and progress_payload:
+        status = progress_payload.get("status") or progress_payload.get("step")
+        if status:
+            st.caption(f"Status: {status}")
+
+
+def _render_downstream_log_expander(
+    label: str,
+    *,
+    marker_payload: dict[str, Any] | None,
+    progress_payload: dict[str, Any] | None,
+    artifacts_hint: str | None = None,
+) -> None:
+    with st.expander(f"{label} Detailed Log", expanded=False):
+        if progress_payload:
+            st.code(json.dumps(progress_payload, indent=2), language="json")
+            return
+        if marker_payload:
+            st.code(json.dumps(marker_payload, indent=2), language="json")
+            return
+        if artifacts_hint:
+            st.caption(artifacts_hint)
+            return
+        st.caption("No logs available yet.")
+
+
 def _should_retry_phase_trigger(ep_id: str, phase: str, retry_count: int) -> tuple[bool, str]:
     """Suggestion 8: Mtime-based retry backoff instead of fixed 10 attempts.
 
@@ -2907,21 +3067,55 @@ body_tracks_path = body_tracking_dir / "body_tracks.jsonl"
 track_fusion_path = body_tracking_dir / "track_fusion.json"
 screentime_comparison_path = body_tracking_dir / "screentime_comparison.json"
 
+faces_presence = stage_layout.ArtifactPresence(local=faces_path.exists(), remote=False, path=str(faces_path))
+body_detections_presence = stage_layout.ArtifactPresence(local=body_detections_path.exists(), remote=False, path=str(body_detections_path))
+body_tracks_presence = stage_layout.ArtifactPresence(local=body_tracks_path.exists(), remote=False, path=str(body_tracks_path))
+track_fusion_presence = stage_layout.ArtifactPresence(local=track_fusion_path.exists(), remote=False, path=str(track_fusion_path))
+
+if selected_attempt_run_id:
+    _presence_map = _cached_run_artifact_presence(
+        ep_id,
+        selected_attempt_run_id,
+        (
+            "faces.jsonl",
+            "body_tracking/body_detections.jsonl",
+            "body_tracking/body_tracks.jsonl",
+            "body_tracking/track_fusion.json",
+        ),
+    )
+    faces_presence = _presence_from_cache(_presence_map.get("faces.jsonl"), faces_path)
+    body_detections_presence = _presence_from_cache(
+        _presence_map.get("body_tracking/body_detections.jsonl"),
+        body_detections_path,
+    )
+    body_tracks_presence = _presence_from_cache(
+        _presence_map.get("body_tracking/body_tracks.jsonl"),
+        body_tracks_path,
+    )
+    track_fusion_presence = _presence_from_cache(
+        _presence_map.get("body_tracking/track_fusion.json"),
+        track_fusion_path,
+    )
+
 body_tracking_marker_path = _scoped_markers_dir / "body_tracking.json"
 body_fusion_marker_path = _scoped_markers_dir / "body_tracking_fusion.json"
 
 body_tracking_status_value = "missing"
 body_tracking_error: str | None = None
 body_tracking_marker_payload: dict[str, Any] | None = None
+body_tracking_manifest_fallback = False
 
 body_fusion_status_value = "missing"
 body_fusion_error: str | None = None
 body_fusion_marker_payload: dict[str, Any] | None = None
+body_fusion_manifest_fallback = False
 
 pdf_export_status_value = "missing"
 pdf_export_detail: str | None = None
 fusion_mode_label: str | None = None
 fusion_mode_detail: str | None = None
+_running_body_tracking_job: dict[str, Any] | None = None
+_running_body_fusion_job: dict[str, Any] | None = None
 
 if selected_attempt_run_id:
     _jobs_payload_for_downstream = _cached_episode_jobs(ep_id)
@@ -2931,12 +3125,14 @@ if selected_attempt_run_id:
     _running_body_fusion_job = _find_running_subprocess_job(
         _jobs_payload_for_downstream, job_type="body_tracking_fusion", run_id=selected_attempt_run_id
     )
-    if _running_body_tracking_job:
+    body_tracking_running = bool(_running_body_tracking_job)
+    body_fusion_running = bool(_running_body_fusion_job)
+    if body_tracking_running:
         body_tracking_status_value = "running"
-    if _running_body_fusion_job:
+    if body_fusion_running:
         body_fusion_status_value = "running"
 
-    if body_tracking_marker_path.exists():
+    if body_tracking_marker_path.exists() and not body_tracking_running:
         try:
             payload = json.loads(body_tracking_marker_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2946,7 +3142,10 @@ if selected_attempt_run_id:
         marker_error = (body_tracking_marker_payload or {}).get("error")
         marker_run_id = (body_tracking_marker_payload or {}).get("run_id")
         marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
-        artifacts_ok = body_detections_path.exists() and body_tracks_path.exists()
+        artifacts_ok = (
+            stage_layout.artifact_available(body_detections_presence)
+            and stage_layout.artifact_available(body_tracks_presence)
+        )
         if marker_status in {"error", "failed"} or marker_error:
             body_tracking_status_value = "error"
             body_tracking_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
@@ -2958,8 +3157,16 @@ if selected_attempt_run_id:
                 body_tracking_error = "run_id_mismatch"
             elif not artifacts_ok:
                 body_tracking_error = "missing_artifacts"
+    elif not body_tracking_running:
+        artifacts_ok = (
+            stage_layout.artifact_available(body_detections_presence)
+            and stage_layout.artifact_available(body_tracks_presence)
+        )
+        if artifacts_ok:
+            body_tracking_status_value = "success"
+            body_tracking_manifest_fallback = True
 
-    if body_fusion_marker_path.exists():
+    if body_fusion_marker_path.exists() and not body_fusion_running:
         try:
             payload = json.loads(body_fusion_marker_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2969,7 +3176,7 @@ if selected_attempt_run_id:
         marker_error = (body_fusion_marker_payload or {}).get("error")
         marker_run_id = (body_fusion_marker_payload or {}).get("run_id")
         marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
-        artifacts_ok = track_fusion_path.exists()
+        artifacts_ok = stage_layout.artifact_available(track_fusion_presence)
         if marker_status in {"error", "failed"} or marker_error:
             body_fusion_status_value = "error"
             body_fusion_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
@@ -2981,6 +3188,11 @@ if selected_attempt_run_id:
                 body_fusion_error = "run_id_mismatch"
             elif not artifacts_ok:
                 body_fusion_error = "missing_artifacts"
+    elif not body_fusion_running:
+        artifacts_ok = stage_layout.artifact_available(track_fusion_presence)
+        if artifacts_ok:
+            body_fusion_status_value = "success"
+            body_fusion_manifest_fallback = True
 
     # PDF export is run-scoped via exports/export_index.json.
     try:
@@ -3028,6 +3240,12 @@ if selected_attempt_run_id:
                 detail_bits.append(f"torchreid_error={runtime_error.strip()}")
             fusion_mode_detail = "; ".join(detail_bits) if detail_bits else "Re-ID unavailable"
 
+body_tracking_progress_payload = None
+track_fusion_progress_payload = None
+if selected_attempt_run_id:
+    body_tracking_progress_payload = _read_json_payload(manifests_dir / "progress_body_tracking.json")
+    track_fusion_progress_payload = _read_json_payload(manifests_dir / "progress_body_tracking_fusion.json")
+
 status_running = (
     detect_status_value == "running"
     or faces_status_value == "running"
@@ -3048,12 +3266,13 @@ identities_count_value = helpers.coerce_int(cluster_phase_status.get("identities
 faces_manifest_count = None
 faces_ready_state = False
 faces_manifest_fallback = bool(faces_phase_status.get("faces_manifest_fallback"))
-faces_manifest_exists = faces_path.exists()
+faces_manifest_exists = faces_presence.local
+faces_manifest_available = stage_layout.artifact_available(faces_presence)
 if faces_manifest_exists:
     faces_manifest_count = _count_manifest_rows(faces_path) or 0
 if faces_status_value == "success":
     faces_ready_state = True
-elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_exists:
+elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_available:
     # Manifest exists but API reports missing/unknown/stale - use manifest fallback
     faces_ready_state = True
     faces_manifest_fallback = True
@@ -3107,8 +3326,8 @@ body_tracks_count = _count_manifest_rows(body_tracks_path)
 track_fusion_started_at = (body_fusion_marker_payload or {}).get("started_at")
 track_fusion_finished_at = (body_fusion_marker_payload or {}).get("finished_at")
 track_fusion_runtime = _format_runtime(_runtime_from_iso(track_fusion_started_at, track_fusion_finished_at))
-track_fusion_faces_ready = faces_path.exists()
-track_fusion_body_tracks_ready = body_tracks_path.exists()
+track_fusion_faces_ready = stage_layout.artifact_available(faces_presence)
+track_fusion_body_tracks_ready = stage_layout.artifact_available(body_tracks_presence)
 
 # Add pipeline state indicators (even if status API is temporarily unavailable)
 with st.expander("Pipeline Status", expanded=False):
@@ -3291,6 +3510,7 @@ with st.expander("Pipeline Status", expanded=False):
         st.warning(
             "⚠️ CoreML acceleration isn't available on this host. Install `onnxruntime-coreml` to avoid CPU-only runs."
         )
+    running_jobs_snapshot = helpers.get_all_running_jobs_for_episode(ep_id)
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -3359,6 +3579,13 @@ with st.expander("Pipeline Status", expanded=False):
             st.info("⏳ **Detect/Track**: Running")
             if detect_job_record and detect_job_record.get("started_at"):
                 st.caption(f"Started at {detect_job_record['started_at']}")
+            running_detect_snapshot = running_jobs_snapshot.get("detect_track") if running_jobs_snapshot else None
+            if running_detect_snapshot and running_detect_snapshot.get("progress_pct") is not None:
+                st.progress(min(running_detect_snapshot["progress_pct"] / 100, 1.0))
+                if running_detect_snapshot.get("message"):
+                    st.caption(running_detect_snapshot["message"])
+            else:
+                st.progress(0.05)
             st.caption("Live progress appears in the log panel below.")
         elif detect_status_value == "stale":
             st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
@@ -3438,6 +3665,19 @@ with st.expander("Pipeline Status", expanded=False):
         elif faces_status_value == "success":
             st.warning("⚠️ **Faces Harvest**: Manifest unavailable locally")
             st.caption("Faces completed on the backend, but faces.jsonl has not been mirrored locally yet.")
+        elif faces_status_value == "running":
+            st.info("⏳ **Faces Harvest**: Running")
+            started = _format_timestamp(faces_phase_status.get("started_at"))
+            if started:
+                st.caption(f"Started at {started}")
+            running_faces_snapshot = running_jobs_snapshot.get("faces_embed") if running_jobs_snapshot else None
+            if running_faces_snapshot and running_faces_snapshot.get("progress_pct") is not None:
+                st.progress(min(running_faces_snapshot["progress_pct"] / 100, 1.0))
+                if running_faces_snapshot.get("message"):
+                    st.caption(running_faces_snapshot["message"])
+            else:
+                st.progress(0.05)
+            st.caption("Live progress appears in the log panel below.")
         elif faces_job_state == "failed":
             st.error("⚠️ **Faces Harvest**: Failed")
             if faces_error_msg:
@@ -3497,6 +3737,13 @@ with st.expander("Pipeline Status", expanded=False):
             started = _format_timestamp(cluster_phase_status.get("started_at"))
             if started:
                 st.caption(f"Started at {started}")
+            running_cluster_snapshot = running_jobs_snapshot.get("cluster") if running_jobs_snapshot else None
+            if running_cluster_snapshot and running_cluster_snapshot.get("progress_pct") is not None:
+                st.progress(min(running_cluster_snapshot["progress_pct"] / 100, 1.0))
+                if running_cluster_snapshot.get("message"):
+                    st.caption(running_cluster_snapshot["message"])
+            else:
+                st.progress(0.05)
             st.caption("Live progress appears in the log panel below.")
         elif cluster_job_state == "failed":
             st.error("⚠️ **Cluster**: Failed")
@@ -3608,6 +3855,7 @@ with st.expander("Pipeline Status", expanded=False):
 if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in stage_card_layout.primary_stage_keys:
     downstream_col1, downstream_col2 = st.columns(2)
     with downstream_col1:
+        st.markdown('<a name="body-tracking-card"></a>', unsafe_allow_html=True)
         if not body_tracking_enabled:
             st.info("⏳ **Body Tracking**: Disabled")
             if selected_attempt_run_id:
@@ -3621,12 +3869,14 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
                 st.caption(f"Body detections: {body_detections_count:,}")
             if body_tracks_count is not None:
                 st.caption(f"Body tracks: {body_tracks_count:,}")
+            if body_tracks_presence.remote and not body_tracks_presence.local and body_tracks_presence.s3_key:
+                st.caption(f"S3 key: `{body_tracks_presence.s3_key}`")
         elif body_tracking_status_value == "running":
             st.info("⏳ **Body Tracking**: Running")
             started = _format_timestamp(body_tracking_started_at)
             if started:
                 st.caption(f"Started at {started}")
-            st.caption("Live progress appears in the log panel below.")
+            _render_downstream_progress(body_tracking_progress_payload, running=True)
         elif body_tracking_status_value in {"error", "failed"}:
             st.error("⚠️ **Body Tracking**: Failed")
             if body_tracking_error:
@@ -3636,6 +3886,8 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
         else:
             st.info("⏳ **Body Tracking**: Not started")
             st.caption("Run body tracking to generate body tracks.")
+        if body_tracking_manifest_fallback:
+            st.caption("ℹ️ Artifacts found without a run marker; status inferred from manifests.")
         finished = _format_timestamp(body_tracking_finished_at)
         if finished:
             st.caption(f"Last run: {finished}")
@@ -3643,6 +3895,14 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
             st.caption(f"Run Duration: {body_tracking_runtime}")
         elif body_tracking_status_value == "success":
             st.caption("Run Duration: n/a")
+        _render_downstream_log_expander(
+            "Body Tracking",
+            marker_payload=body_tracking_marker_payload,
+            progress_payload=body_tracking_progress_payload,
+            artifacts_hint="Body tracking artifacts are present; no run marker was recorded."
+            if body_tracking_manifest_fallback
+            else None,
+        )
 
     with downstream_col2:
         if not track_fusion_enabled:
@@ -3658,12 +3918,14 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
                 st.caption(f"Fusion output: {helpers.link_local(track_fusion_path)}")
             if screentime_comparison_path.exists():
                 st.caption(f"Screen time comparison: {helpers.link_local(screentime_comparison_path)}")
+            if track_fusion_presence.remote and not track_fusion_presence.local and track_fusion_presence.s3_key:
+                st.caption(f"S3 key: `{track_fusion_presence.s3_key}`")
         elif body_fusion_status_value == "running":
             st.info("⏳ **Track Fusion**: Running")
             started = _format_timestamp(track_fusion_started_at)
             if started:
                 st.caption(f"Started at {started}")
-            st.caption("Live progress appears in the log panel below.")
+            _render_downstream_progress(track_fusion_progress_payload, running=True)
         elif body_fusion_status_value in {"error", "failed"}:
             st.error("⚠️ **Track Fusion**: Failed")
             if body_fusion_error:
@@ -3675,11 +3937,14 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
                 st.warning("⚠️ **Track Fusion**: Missing prerequisites")
                 run_label = selected_attempt_run_id or "legacy"
                 if not track_fusion_body_tracks_ready:
-                    st.caption(
-                        f"Run Body Tracking for this run_id (`{run_label}`) to generate "
-                        f"`body_tracking/body_tracks.jsonl`."
+                    st.markdown(
+                        f"Run [Body Tracking](#body-tracking-card) for this run_id (`{run_label}`) to generate "
+                        "`body_tracking/body_tracks.jsonl`.",
+                        unsafe_allow_html=True,
                     )
                     st.caption(f"Missing: {helpers.link_local(body_tracks_path)}")
+                    if body_tracks_presence.s3_key:
+                        st.caption(f"S3 key: `{body_tracks_presence.s3_key}`")
                 if not track_fusion_faces_ready:
                     st.markdown(
                         f"Run [Faces Harvest](#faces-harvest-card) for this run_id (`{run_label}`) "
@@ -3687,9 +3952,15 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
                         unsafe_allow_html=True,
                     )
                     st.caption(f"Missing: {helpers.link_local(faces_path)}")
+                    if faces_presence.s3_key:
+                        st.caption(f"S3 key: `{faces_presence.s3_key}`")
             else:
                 st.info("⏳ **Track Fusion**: Ready to run")
                 st.caption("Body tracks and faces are available.")
+                if body_tracks_presence.remote and not body_tracks_presence.local:
+                    st.caption("Body tracks are available in S3; local mirror will be pulled on run.")
+                if faces_presence.remote and not faces_presence.local:
+                    st.caption("Faces manifest is available in S3; local mirror will be pulled on run.")
         finished = _format_timestamp(track_fusion_finished_at)
         if finished:
             st.caption(f"Last run: {finished}")
@@ -3697,12 +3968,52 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
             st.caption(f"Run Duration: {track_fusion_runtime}")
         elif body_fusion_status_value == "success":
             st.caption("Run Duration: n/a")
+        if body_fusion_manifest_fallback:
+            st.caption("ℹ️ Artifacts found without a run marker; status inferred from manifests.")
+        _render_downstream_log_expander(
+            "Track Fusion",
+            marker_payload=body_fusion_marker_payload,
+            progress_payload=track_fusion_progress_payload,
+            artifacts_hint="Track fusion output is present; no run marker was recorded."
+            if body_fusion_manifest_fallback
+            else None,
+        )
 
 if autorun_active_now and stage_card_layout.show_active_downstream_panel:
     active_label = stage_layout.stage_label(stage_card_layout.active_downstream_stage)
     with st.expander("Downstream Stage (Active)", expanded=True):
         st.markdown(f"**Currently running: {active_label}**")
-        st.caption("Live activity details are available below.")
+        active_key = stage_card_layout.active_downstream_stage
+        if active_key == "body_tracking":
+            _render_downstream_progress(
+                body_tracking_progress_payload,
+                running=body_tracking_status_value == "running",
+            )
+            if body_tracking_progress_payload:
+                st.code(json.dumps(body_tracking_progress_payload, indent=2), language="json")
+            elif body_tracking_marker_payload:
+                st.code(json.dumps(body_tracking_marker_payload, indent=2), language="json")
+            else:
+                st.caption("Body tracking is running; logs will appear as soon as they are captured.")
+        elif active_key == "track_fusion":
+            _render_downstream_progress(
+                track_fusion_progress_payload,
+                running=body_fusion_status_value == "running",
+            )
+            if track_fusion_progress_payload:
+                st.code(json.dumps(track_fusion_progress_payload, indent=2), language="json")
+            elif body_fusion_marker_payload:
+                st.code(json.dumps(body_fusion_marker_payload, indent=2), language="json")
+            else:
+                st.caption("Track fusion is running; logs will appear as soon as they are captured.")
+        elif active_key == "screentime":
+            st.caption(f"Status: {screentime_status_value or 'unknown'}")
+            if screentime_started_at:
+                st.caption(f"Started at {screentime_started_at}")
+        elif active_key == "pdf":
+            st.caption(f"Status: {pdf_export_status_value or 'unknown'}")
+            if pdf_export_detail:
+                st.caption(pdf_export_detail)
         st.markdown("[Jump to logs](#downstream-logs)", unsafe_allow_html=True)
 
 
@@ -3896,6 +4207,16 @@ with st.container():
                 current_phase_pct = _running_jobs["faces_embed"].get("progress_pct", 0) / 100
             elif current_phase_key == "cluster" and _running_jobs.get("cluster"):
                 current_phase_pct = _running_jobs["cluster"].get("progress_pct", 0) / 100
+            elif current_phase_key == "body_tracking":
+                pct = _progress_pct_from_payload(body_tracking_progress_payload)
+                if pct is None and _running_body_tracking_job:
+                    pct = 0.05
+                current_phase_pct = pct or 0.0
+            elif current_phase_key == "track_fusion":
+                pct = _progress_pct_from_payload(track_fusion_progress_payload)
+                if pct is None and _running_body_fusion_job:
+                    pct = 0.05
+                current_phase_pct = pct or 0.0
 
             if total_count:
                 if current_phase_key in stage_plan and current_phase_key not in completed_keys:
@@ -4565,11 +4886,11 @@ def _autorun_drive_downstream(run_id: str) -> None:
             st.session_state[_autorun_phase_key] = "screentime"
             st.toast("Body tracking disabled - skipping to Screentime...")
             st.rerun()
-        if body_tracking_status_value == "success":
+        if stage_layout.downstream_stage_allows_advance(body_tracking_status_value, body_tracking_error):
             _autorun_append_completed("Body Tracking")
             st.session_state[_autorun_phase_key] = "track_fusion" if track_fusion_enabled else "screentime"
             st.rerun()
-        if body_tracking_status_value in {"error", "stale"}:
+        if body_tracking_status_value in {"error", "failed"}:
             _autorun_stop("Body Tracking", body_tracking_error or body_tracking_status_value)
             return
         if body_tracking_status_value == "running":
@@ -4592,22 +4913,39 @@ def _autorun_drive_downstream(run_id: str) -> None:
             st.session_state[_autorun_phase_key] = "screentime"
             st.toast("Track fusion disabled - skipping to Screentime...")
             st.rerun()
-        missing: list[str] = []
-        if not faces_path.exists():
-            missing.append("faces.jsonl")
-        if not body_tracks_path.exists():
-            missing.append("body_tracking/body_tracks.jsonl")
-        if missing:
+        prereq_ok, missing = stage_layout.track_fusion_prereq_state(faces_presence, body_tracks_presence)
+        if not prereq_ok:
             _autorun_stop("Track Fusion", f"missing_prereqs: {', '.join(missing)}")
             return
-        if body_fusion_status_value == "success":
+        if not (faces_presence.local and body_tracks_presence.local):
+            hydrate_key = f"{ep_id}::{run_id}::track_fusion_hydrate_attempted"
+            if not st.session_state.get(hydrate_key):
+                st.session_state[hydrate_key] = True
+                with st.spinner("Mirroring run artifacts from S3…"):
+                    ok, err = _ensure_run_artifacts_local(
+                        ep_id,
+                        run_id,
+                        {
+                            "faces.jsonl": faces_presence,
+                            "body_tracking/body_tracks.jsonl": body_tracks_presence,
+                        },
+                    )
+                if not ok:
+                    _autorun_stop("Track Fusion", f"hydrate_failed: {err}")
+                    return
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.rerun()
+            else:
+                _autorun_stop("Track Fusion", "local_artifacts_missing_after_hydrate")
+                return
+        if stage_layout.downstream_stage_allows_advance(body_fusion_status_value, body_fusion_error):
             stage_label = "Track Fusion"
             if fusion_mode_label:
                 stage_label = f"{stage_label} ({fusion_mode_label})"
             _autorun_append_completed(stage_label)
             st.session_state[_autorun_phase_key] = "screentime"
             st.rerun()
-        if body_fusion_status_value in {"error", "stale"}:
+        if body_fusion_status_value in {"error", "failed"}:
             _autorun_stop("Track Fusion", body_fusion_error or body_fusion_status_value)
             return
         if body_fusion_status_value == "running":
@@ -6303,24 +6641,26 @@ with col_cluster:
                 st.rerun()
 
     st.markdown('<a name="downstream-logs"></a>', unsafe_allow_html=True)
-    st.markdown("#### Downstream Pipeline")
+    st.markdown("#### Downstream Logs")
     downstream_log_col1, downstream_log_col2 = st.columns(2)
     with downstream_log_col1:
-        with st.expander("Body Tracking Logs", expanded=False):
-            if body_tracking_marker_payload:
-                st.code(json.dumps(body_tracking_marker_payload, indent=2), language="json")
-            elif body_tracks_path.exists():
-                st.caption("Body tracking artifacts are present; no run marker was recorded.")
-            else:
-                st.caption("No body tracking logs available.")
+        _render_downstream_log_expander(
+            "Body Tracking",
+            marker_payload=body_tracking_marker_payload,
+            progress_payload=body_tracking_progress_payload,
+            artifacts_hint="Body tracking artifacts are present; no run marker was recorded."
+            if body_tracking_manifest_fallback
+            else None,
+        )
     with downstream_log_col2:
-        with st.expander("Track Fusion Logs", expanded=False):
-            if body_fusion_marker_payload:
-                st.code(json.dumps(body_fusion_marker_payload, indent=2), language="json")
-            elif track_fusion_path.exists():
-                st.caption("Track fusion output is present; no run marker was recorded.")
-            else:
-                st.caption("No track fusion logs available.")
+        _render_downstream_log_expander(
+            "Track Fusion",
+            marker_payload=body_fusion_marker_payload,
+            progress_payload=track_fusion_progress_payload,
+            artifacts_hint="Track fusion output is present; no run marker was recorded."
+            if body_fusion_manifest_fallback
+            else None,
+        )
 
     st.divider()
 
@@ -6333,9 +6673,7 @@ else:
 
     with downstream_cols[0]:
         st.markdown("#### Body Tracking")
-        st.caption(f"Status: `{body_tracking_status_value}`")
-        if body_tracking_error:
-            st.caption(f"Error: {body_tracking_error}")
+        st.caption("Status shown above in the stage cards.")
         if not body_tracking_enabled:
             st.caption("Disabled by config/env (AUTO_RUN_BODY_TRACKING).")
         body_tracking_btn_label = "Run" if body_tracking_status_value in {"missing", "stale"} else "Rerun"
@@ -6360,35 +6698,16 @@ else:
 
     with downstream_cols[1]:
         st.markdown("#### Track Fusion")
-        st.caption(f"Status: `{body_fusion_status_value}`")
         if fusion_mode_label:
             st.caption(f"Fusion mode: **{fusion_mode_label}**")
         if fusion_mode_detail:
             st.caption(f"Mode detail: {fusion_mode_detail}")
-        if body_fusion_error:
-            st.caption(f"Error: {body_fusion_error}")
+        st.caption("Prerequisites and status are shown above in the stage cards.")
         if not track_fusion_enabled:
             st.caption("Disabled by config (track_fusion.enabled) or body tracking disabled.")
-        fusion_prereqs_ok = faces_path.exists() and body_tracks_path.exists()
-        if not fusion_prereqs_ok and track_fusion_enabled:
-            run_label = selected_attempt_run_id or "legacy"
-            if not faces_path.exists():
-                st.markdown(
-                    f"Run [Faces Harvest](#faces-harvest-card) for this run_id (`{run_label}`) "
-                    "to generate `faces.jsonl`.",
-                    unsafe_allow_html=True,
-                )
-                st.caption(f"Missing: {helpers.link_local(faces_path)}")
-            if not body_tracks_path.exists():
-                st.caption(
-                    f"Run Body Tracking for this run_id (`{run_label}`) to generate "
-                    "`body_tracking/body_tracks.jsonl`."
-                )
-                st.caption(f"Missing: {helpers.link_local(body_tracks_path)}")
+        fusion_prereqs_ok, _ = stage_layout.track_fusion_prereq_state(faces_presence, body_tracks_presence)
         fusion_btn_label = "Run" if body_fusion_status_value in {"missing", "stale"} else "Rerun"
-        fusion_btn_disabled = (
-            job_running or not track_fusion_enabled or not fusion_prereqs_ok
-        )
+        fusion_btn_disabled = job_running or not track_fusion_enabled or not fusion_prereqs_ok
         if st.button(
             f"🔗 {fusion_btn_label}",
             key=f"{ep_id}::{selected_attempt_run_id}::body_fusion_run",
@@ -6396,6 +6715,19 @@ else:
             disabled=fusion_btn_disabled,
         ):
             try:
+                if not (faces_presence.local and body_tracks_presence.local):
+                    with st.spinner("Mirroring run artifacts from S3…"):
+                        ok, err = _ensure_run_artifacts_local(
+                            ep_id,
+                            selected_attempt_run_id,
+                            {
+                                "faces.jsonl": faces_presence,
+                                "body_tracking/body_tracks.jsonl": body_tracks_presence,
+                            },
+                        )
+                    if not ok:
+                        st.error(f"Unable to mirror prerequisites: {err}")
+                        st.stop()
                 helpers.api_post(
                     "/jobs/body_tracking/fusion",
                     json={"ep_id": ep_id, "run_id": selected_attempt_run_id},

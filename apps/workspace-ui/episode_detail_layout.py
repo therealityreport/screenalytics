@@ -31,7 +31,7 @@ DOWNSTREAM_STAGE_KEYS: tuple[str, ...] = (
 STAGE_LABELS: dict[str, str] = {
     "detect": "Detect/Track",
     "faces": "Faces Harvest",
-    "cluster": "Clustering",
+    "cluster": "Cluster",
     "body_tracking": "Body Tracking",
     "track_fusion": "Track Fusion",
     "screentime": "Screentime Analyze",
@@ -72,6 +72,14 @@ class StageCardLayout:
     active_downstream_stage: str | None
 
 
+@dataclass(frozen=True)
+class ArtifactPresence:
+    local: bool
+    remote: bool
+    path: str | None = None
+    s3_key: str | None = None
+
+
 def normalize_stage_key(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -106,6 +114,32 @@ def progress_counts(
     completed_keys = set(normalize_completed_stages(completed_stages))
     completed_in_plan = [stage for stage in stage_plan if stage in completed_keys]
     return len(completed_in_plan), len(stage_plan)
+
+
+def artifact_available(presence: ArtifactPresence | None) -> bool:
+    if not presence:
+        return False
+    return bool(presence.local or presence.remote)
+
+
+def track_fusion_prereq_state(
+    faces: ArtifactPresence | None,
+    body_tracks: ArtifactPresence | None,
+) -> tuple[bool, tuple[str, ...]]:
+    missing: list[str] = []
+    if not artifact_available(faces):
+        missing.append("faces.jsonl")
+    if not artifact_available(body_tracks):
+        missing.append("body_tracking/body_tracks.jsonl")
+    return (not missing, tuple(missing))
+
+
+def downstream_stage_allows_advance(status: str, error_reason: str | None = None) -> bool:
+    if status != "success":
+        return False
+    if error_reason in {"run_id_mismatch", "missing_artifacts"}:
+        return False
+    return True
 
 
 def get_stage_card_layout(autorun_phase: str | None) -> StageCardLayout:
