@@ -43,3 +43,10 @@ person_fallback_min_body_height: 100  # Minimum body height in pixels
 person_fallback_face_region_ratio: 0.25  # Top portion of body box to estimate face region
 person_fallback_confidence_th: 0.50  # Confidence threshold for person detection
 person_fallback_max_per_frame: 10  # Maximum person detections per frame to avoid explosion
+
+# Scene-cut warmup (extra face detection frames immediately after a cut)
+# This reduces missed faces right after cuts when stride > 1, but can add significant work.
+# Defaults tuned to keep overhead bounded; override per job via --scene-warmup-dets if needed.
+scene_warmup_frames_per_cut: 1
+# Max warmup overhead as a ratio of expected stride hits (forced_scene_warmup <= ratio * expected_stride_hits).
+scene_warmup_cap_ratio: 0.25

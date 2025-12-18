@@ -41,7 +41,7 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          pip install pytest pytest-cov pyyaml numpy opencv-python-headless fastapi httpx requests pillow python-multipart reportlab
+          pip install pytest pytest-cov pyyaml numpy opencv-python-headless fastapi httpx requests pillow python-multipart reportlab PyMuPDF==1.24.14
 
       - name: Run face_alignment tests
         run: |
@@ -67,6 +67,7 @@ jobs:
             tests/unit/test_body_tracker_backend_fallback.py \
             tests/unit/test_run_export_missing_artifacts_na.py \
             tests/unit/test_run_export_detect_runtime_diagnostics.py \
+            tests/unit/test_run_export_pdf_layout_no_clipping.py \
             tests/unit/test_run_export_screentime_totals.py \
             tests/unit/test_gate_auto_rerun_reporting.py \
             tests/unit/test_run_export_db_optional.py \

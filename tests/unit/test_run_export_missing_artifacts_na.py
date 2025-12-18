@@ -64,7 +64,8 @@ def test_pdf_missing_body_artifacts_renders_na_and_keeps_face_inputs(
     assert "No face time recorded" not in combined
 
     # Track Fusion must use run_root/tracks.jsonl for face track inputs even when body artifacts are missing.
-    label_idx = next(idx for idx, s in enumerate(strings) if "Face Tracks \\(input\\)" in s)
+    # Note: PDF text may include zero-width wrap hints, so avoid matching the full label as a single ASCII run.
+    label_idx = next(idx for idx, s in enumerate(strings) if "Face Tracks" in s)
     lookahead = "\n".join(strings[label_idx : label_idx + 250])
     assert f"({face_track_count})" in lookahead
 

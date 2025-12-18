@@ -555,6 +555,8 @@ class JobService:
             "stride": stride,
             "fps": fps,
             "device": device,
+            # Back-compat alias used by API/UI and tests.
+            "device_resolved": resolved_detect_device or device,
             "resolved_detect_device": resolved_detect_device or device,
             "profile": profile,
             "cpu_threads": cpu_threads,
