@@ -6810,18 +6810,48 @@ def _maybe_run_body_tracking(
 
         embeddings_path: Path | None = None
         embeddings_note: str | None = None
-        reid_enabled = bool(getattr(runner.config, "reid_enabled", False))
-        if reid_enabled:
+        reid_enabled_config = bool(getattr(runner.config, "reid_enabled", False))
+        reid_embeddings_generated = False
+        reid_skip_reason: str | None = None
+        reid_comparisons_performed = 0
+
+        torchreid_status: str | None = None
+        torchreid_error: str | None = None
+        if isinstance(import_status, dict):
+            torchreid_state = import_status.get("torchreid")
+            if isinstance(torchreid_state, dict):
+                torchreid_status = torchreid_state.get("status")
+                torchreid_error = torchreid_state.get("error")
+
+        if not reid_enabled_config:
+            embeddings_note = "disabled"
+            reid_skip_reason = "disabled"
+        elif torchreid_status is not None and torchreid_status != "ok":
+            reid_skip_reason = f"torchreid_{torchreid_status}"
+            embeddings_note = reid_skip_reason
+            if torchreid_error:
+                embeddings_note = f"{reid_skip_reason}: {torchreid_error}"
+            LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", embeddings_note)
+        else:
             try:
                 embeddings_path = runner.run_embedding()
+                reid_embeddings_generated = True
             except ImportError as exc:
+                reid_skip_reason = "torchreid_import_error"
                 embeddings_note = f"import_error: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", exc)
             except Exception as exc:
+                reid_skip_reason = "reid_error"
                 embeddings_note = f"error: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", exc)
-        else:
-            embeddings_note = "disabled"
+
+        body_reid = {
+            "enabled_config": reid_enabled_config,
+            "enabled_effective": bool(reid_enabled_config and reid_embeddings_generated),
+            "reid_embeddings_generated": bool(reid_embeddings_generated),
+            "reid_skip_reason": reid_skip_reason,
+            "reid_comparisons_performed": int(reid_comparisons_performed),
+        }
 
         # Always materialize placeholder embedding artifacts so run-scoped bundles are consistent.
         # Fusion can still proceed without embeddings; empty arrays safely no-op the Re-ID path.
@@ -6844,7 +6874,7 @@ def _maybe_run_body_tracking(
                     "model_name": getattr(runner.config, "reid_model", None),
                     "num_embeddings": 0,
                     "entries": [],
-                    "reid_enabled": reid_enabled,
+                    "reid_enabled": reid_enabled_config,
                     "note": embeddings_note,
                 }
                 runner.embeddings_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -6859,11 +6889,15 @@ def _maybe_run_body_tracking(
                     "generated_at": _utcnow_iso(),
                     "output_dir": str(output_dir),
                     "import_status": import_status,
-                    "reid_enabled": reid_enabled,
+                    "reid_enabled": reid_enabled_config,
                     "reid_note": embeddings_note,
+                    "body_reid": body_reid,
                     "tracker_backend_configured": tracker_backend_configured,
                     "tracker_backend_actual": tracker_backend_actual,
                     "tracker_fallback_reason": tracker_fallback_reason,
+                    "body_tracker_backend_configured": tracker_backend_configured,
+                    "body_tracker_backend_actual": tracker_backend_actual,
+                    "body_tracker_fallback_reason": tracker_fallback_reason,
                     "artifacts": {
                         "body_detections": str(det_path),
                         "body_tracks": str(tracks_path),
@@ -6896,11 +6930,15 @@ def _maybe_run_body_tracking(
             "started_at": started_at,
             "finished_at": _utcnow_iso(),
             "import_status": import_status,
-            "reid_enabled": reid_enabled,
+            "reid_enabled": reid_enabled_config,
             "reid_note": embeddings_note,
+            "body_reid": body_reid,
             "tracker_backend_configured": tracker_backend_configured,
             "tracker_backend_actual": tracker_backend_actual,
             "tracker_fallback_reason": tracker_fallback_reason,
+            "body_tracker_backend_configured": tracker_backend_configured,
+            "body_tracker_backend_actual": tracker_backend_actual,
+            "body_tracker_fallback_reason": tracker_fallback_reason,
             "artifacts": {
                 "local": {
                     "body_tracking_dir": str(output_dir),
@@ -7422,6 +7460,11 @@ def _run_detect_track_stage(
                     "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
                 ),
                 "tracker_fallback_reason": None,
+                "face_tracker_backend_configured": tracker_choice,
+                "face_tracker_backend_actual": (
+                    "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
+                ),
+                "face_tracker_fallback_reason": None,
                 "stride": args.stride,
                 # Frame accounting (why frames_processed != frames_total/stride)
                 "frames_scanned_total": runtime_stats.get("frames_scanned_total"),

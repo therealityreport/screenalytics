@@ -66,31 +66,29 @@ class BodyEmbedder:
             logger.info("[device] resolved=%s (reason=%s requested=%s)", device, reason, self.device)
         self._device_resolved = device
 
-        # Try torchreid first
         try:
             from torchreid.utils import FeatureExtractor
+        except ModuleNotFoundError as exc:
+            if getattr(exc, "name", None) == "torchreid":
+                raise ImportError(
+                    "torchreid_missing: torchreid package required for body Re-ID (pip install -r requirements-ml.txt)"
+                ) from exc
+            raise ImportError(f"torchreid_import_error: {exc}") from exc
+        except Exception as exc:
+            raise ImportError(f"torchreid_import_error: {type(exc).__name__}: {exc}") from exc
+
+        try:
             self._model = FeatureExtractor(
                 model_name=self.model_name,
                 model_path=self.weights_path,
                 device=device,
             )
-            self._model_type = "torchreid"
-            logger.info(f"Loaded torchreid {self.model_name} on {device}")
-            return
-        except ImportError:
-            logger.warning("torchreid not found, trying alternative")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize torchreid FeatureExtractor: {exc}") from exc
 
-        # Fallback to timm or custom
-        try:
-            import timm
-            # OSNet is not in timm, but this shows the pattern
-            # For now, raise to indicate we need torchreid
-            raise ImportError("OSNet requires torchreid")
-        except ImportError:
-            raise ImportError(
-                "torchreid package required for body Re-ID. "
-                "Install with: pip install torchreid"
-            )
+        self._model_type = "torchreid"
+        logger.info("Loaded torchreid %s on %s", self.model_name, device)
+        return
 
     def _preprocess_crop(self, crop: np.ndarray) -> np.ndarray:
         """Preprocess body crop for Re-ID model."""
