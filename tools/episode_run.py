@@ -1325,6 +1325,17 @@ class _TrackerDetections:
         self.cls = classes.astype(np.float32)
         self._xywh: np.ndarray | None = None
 
+    def __len__(self) -> int:
+        return int(self.conf.shape[0])
+
+    def __getitem__(self, idx) -> "_TrackerDetections":
+        """Support boolean-mask / slice indexing used by ultralytics' BYTETracker."""
+        return _TrackerDetections(
+            self.xyxy[idx],
+            self.conf[idx],
+            self.cls[idx],
+        )
+
     @property
     def xywh(self) -> np.ndarray:
         if self._xywh is None:
