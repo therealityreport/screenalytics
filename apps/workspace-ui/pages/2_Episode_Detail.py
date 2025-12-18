@@ -1912,7 +1912,7 @@ attempt_locked = False
 # When other UI actions (e.g., Auto-Run) need to programmatically change the selected
 # attempt, they write the desired run_id to this pending key and trigger a rerun.
 _pending_attempt = st.session_state.pop(_active_run_id_pending_key, None)
-if isinstance(_pending_attempt, str) and _pending_attempt.strip():
+if isinstance(_pending_attempt, str):
     selected_attempt = _pending_attempt.strip()
     st.session_state[_active_run_id_key] = selected_attempt
     st.session_state[_status_force_refresh_key(ep_id)] = True
@@ -2570,8 +2570,7 @@ with st.expander("Pipeline Status", expanded=False):
                     runs_dir.mkdir(parents=True, exist_ok=True)
 
                     # Reset attempt selection + status caches
-                    st.session_state[_active_run_id_key] = ""
-                    st.session_state.pop(_active_run_id_pending_key, None)
+                    st.session_state[_active_run_id_pending_key] = ""
                     st.session_state.pop(_autorun_run_id_key, None)
                     st.session_state[_attempt_init_key] = True
                     st.session_state[_status_force_refresh_key(ep_id)] = True
