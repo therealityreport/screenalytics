@@ -5,6 +5,8 @@ storage backend status, device capabilities, and validation results.
 """
 
 import logging
+import os
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -253,6 +255,100 @@ def get_storage_status() -> Dict[str, Any]:
             "error": "Storage validation module not available",
             "backend_type": "unknown",
         }
+
+
+# =============================================================================
+# DB Health (optional DB_URL)
+# =============================================================================
+
+
+@router.get("/db_health")
+def get_db_health() -> Dict[str, Any]:
+    """Lightweight DB connectivity + schema preflight (optional).
+
+    DB-backed features (identity locks, suggestion batches, audit trails) require DB_URL.
+    This endpoint never raises; it returns a structured error instead.
+    """
+    db_url = (os.getenv("DB_URL") or "").strip()
+    fake_db = (os.getenv("SCREENALYTICS_FAKE_DB") or "").strip() == "1"
+    result: Dict[str, Any] = {
+        "configured": bool(db_url) or fake_db,
+        "fake_db": fake_db,
+        "psycopg2_available": None,
+        "ok": None,
+        "latency_ms": None,
+        "tables": {},
+        "migrations_ok": None,
+        "error": None,
+    }
+
+    if fake_db:
+        result["psycopg2_available"] = False
+        result["ok"] = True
+        result["migrations_ok"] = True
+        result["tables"] = {"mode": "fake_db"}
+        return result
+
+    if not db_url:
+        result["psycopg2_available"] = False
+        result["ok"] = False
+        result["migrations_ok"] = False
+        result["error"] = "DB_URL is not set"
+        return result
+
+    try:
+        import psycopg2  # type: ignore
+    except Exception as exc:
+        result["psycopg2_available"] = False
+        result["ok"] = False
+        result["migrations_ok"] = False
+        result["error"] = f"psycopg2_import_error: {type(exc).__name__}: {exc}"
+        return result
+
+    result["psycopg2_available"] = True
+    started = time.perf_counter()
+    try:
+        conn = psycopg2.connect(db_url, connect_timeout=3)  # type: ignore[arg-type]
+    except Exception as exc:
+        result["ok"] = False
+        result["migrations_ok"] = False
+        result["error"] = f"connect_error: {type(exc).__name__}: {exc}"
+        return result
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+
+                tables = [
+                    "runs",
+                    "job_runs",
+                    "identity_locks",
+                    "suggestion_batches",
+                    "suggestions",
+                    "suggestion_applies",
+                ]
+                table_status: Dict[str, bool] = {}
+                for table in tables:
+                    cur.execute("SELECT to_regclass(%s);", (f"public.{table}",))
+                    row = cur.fetchone()
+                    table_status[table] = bool(row and row[0])
+                result["tables"] = table_status
+                result["migrations_ok"] = all(table_status.values())
+        result["ok"] = True
+        result["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    except Exception as exc:
+        result["ok"] = False
+        result["migrations_ok"] = False
+        result["error"] = f"query_error: {type(exc).__name__}: {exc}"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return result
 
 
 # =============================================================================

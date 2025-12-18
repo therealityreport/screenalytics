@@ -2601,6 +2601,33 @@ def build_screentime_run_debug_pdf(
                     reid_lines.append(("torchreid_installed", installed))
                 elif torchreid_env_ok is False:
                     reid_lines.append(("torchreid_installed", "no"))
+                if isinstance(import_status, dict):
+                    utils_state = import_status.get("torchreid.utils")
+                    if isinstance(utils_state, dict):
+                        utils_status = utils_state.get("status")
+                        if isinstance(utils_status, str) and utils_status.strip():
+                            reid_lines.append(
+                                ("torchreid_utils_import_ok", "true" if utils_status.strip() == "ok" else "false")
+                            )
+                        utils_err = utils_state.get("error")
+                        if isinstance(utils_err, str) and utils_err.strip():
+                            detail = utils_err.strip()
+                            if len(detail) > 160:
+                                detail = detail[:157] + "..."
+                            reid_lines.append(("torchreid_utils_error", detail))
+                    torchreid_env = import_status.get("torchreid")
+                    if isinstance(torchreid_env, dict):
+                        dists = torchreid_env.get("distribution")
+                        if isinstance(dists, list) and dists:
+                            first = dists[0] if isinstance(dists[0], dict) else None
+                            if isinstance(first, dict):
+                                name = first.get("name")
+                                ver = first.get("version")
+                                if isinstance(name, str) and name.strip():
+                                    label = name.strip()
+                                    if isinstance(ver, str) and ver.strip():
+                                        label = f"{label} ({ver.strip()})"
+                                    reid_lines.append(("torchreid_distribution", label))
                 if isinstance(torchreid_import_ok, bool):
                     reid_lines.append(("torchreid_import_ok", "true" if torchreid_import_ok else "false"))
                 if isinstance(torchreid_version, str) and torchreid_version.strip():
@@ -2624,6 +2651,7 @@ def build_screentime_run_debug_pdf(
                 if (
                     torchreid_env_ok is True
                     and skip_reason_effective == "torchreid_import_error"
+                    and torchreid_import_ok is not False
                 ):
                     skip_reason_effective = "torchreid_runtime_error"
                 if skip_reason_effective:
@@ -3188,6 +3216,33 @@ def build_screentime_run_debug_pdf(
                 reid_lines.append(("torchreid_installed", installed))
             elif torchreid_env_ok is False:
                 reid_lines.append(("torchreid_installed", "no"))
+            if isinstance(import_status, dict):
+                utils_state = import_status.get("torchreid.utils")
+                if isinstance(utils_state, dict):
+                    utils_status = utils_state.get("status")
+                    if isinstance(utils_status, str) and utils_status.strip():
+                        reid_lines.append(
+                            ("torchreid_utils_import_ok", "true" if utils_status.strip() == "ok" else "false")
+                        )
+                    utils_err = utils_state.get("error")
+                    if isinstance(utils_err, str) and utils_err.strip():
+                        detail = utils_err.strip()
+                        if len(detail) > 180:
+                            detail = detail[:177] + "..."
+                        reid_lines.append(("torchreid_utils_error", detail))
+                torchreid_env = import_status.get("torchreid")
+                if isinstance(torchreid_env, dict):
+                    dists = torchreid_env.get("distribution")
+                    if isinstance(dists, list) and dists:
+                        first = dists[0] if isinstance(dists[0], dict) else None
+                        if isinstance(first, dict):
+                            name = first.get("name")
+                            ver = first.get("version")
+                            if isinstance(name, str) and name.strip():
+                                label = name.strip()
+                                if isinstance(ver, str) and ver.strip():
+                                    label = f"{label} ({ver.strip()})"
+                                reid_lines.append(("torchreid_distribution", label))
 
             enabled_config = body_reid.get("enabled_config")
             enabled_effective = body_reid.get("enabled_effective")
@@ -3225,7 +3280,7 @@ def build_screentime_run_debug_pdf(
                 runtime_error_str = runtime_error_str[:177] + "..."
 
             skip_reason_effective = skip_reason.strip() if isinstance(skip_reason, str) and skip_reason.strip() else None
-            if torchreid_env_ok is True and skip_reason_effective == "torchreid_import_error":
+            if torchreid_env_ok is True and skip_reason_effective == "torchreid_import_error" and torchreid_import_ok is not False:
                 skip_reason_effective = "torchreid_runtime_error"
             if skip_reason_effective:
                 reid_lines.append(("skip_reason", skip_reason_effective))
@@ -3344,9 +3399,36 @@ def build_screentime_run_debug_pdf(
     else:
         fused_pairs_value = _na_artifact(track_fusion_path, "body_tracking/track_fusion.json")
 
+    fusion_mode_value = "IoU-only"
+    fusion_mode_notes = "Re-ID disabled or unavailable"
+    try:
+        reid_cfg_enabled = bool(track_fusion_config.get("reid_handoff", {}).get("enabled", False))
+    except Exception:
+        reid_cfg_enabled = False
+    body_reid = run_body_tracking_marker.get("body_reid") if isinstance(run_body_tracking_marker, dict) else None
+    if not reid_cfg_enabled:
+        fusion_mode_value = "IoU-only"
+        fusion_mode_notes = "reid_handoff.enabled=false"
+    elif isinstance(body_reid, dict) and body_reid.get("enabled_effective") is True:
+        fusion_mode_value = "Hybrid (IoU + Re-ID)"
+        fusion_mode_notes = "Re-ID enabled_effective=true"
+    else:
+        skip_reason = body_reid.get("reid_skip_reason") if isinstance(body_reid, dict) else None
+        torchreid_err = body_reid.get("torchreid_runtime_error") if isinstance(body_reid, dict) else None
+        parts: list[str] = ["reid_handoff.enabled=true", "enabled_effective=false"]
+        if isinstance(skip_reason, str) and skip_reason.strip():
+            parts.append(f"skip_reason={skip_reason.strip()}")
+        if isinstance(torchreid_err, str) and torchreid_err.strip():
+            err_str = torchreid_err.strip()
+            if len(err_str) > 120:
+                err_str = err_str[:117] + "..."
+            parts.append(f"torchreid_error={err_str}")
+        fusion_mode_notes = "; ".join(parts)
+
     fusion_stats = [
         _wrap_row(["Metric", "Value", "Notes"]),
         _wrap_row(["Fusion Status", fusion_status, "Run-scoped inputs + outputs"]),
+        _wrap_row(["Fusion Mode", fusion_mode_value, fusion_mode_notes]),
         _wrap_row(["Face Tracks (input)", face_tracks_input, "From run tracks.jsonl"]),
         _wrap_row(["Body Tracks (input)", body_tracks_input, "From run body_tracking/body_tracks.jsonl"]),
         _wrap_row(["Tracked IDs (from fusion output)", tracked_ids_value, "From body_tracking/track_fusion.json"]),
@@ -3419,6 +3501,13 @@ def build_screentime_run_debug_pdf(
 
         reid_value = f"{reid_comparisons} comparisons" if reid_comparisons is not None else "N/A"
         reid_notes = "From track_fusion.json diagnostics"
+        reid_skip_reason = fusion_diag_payload.get("reid_skip_reason")
+        if (
+            reid_comparisons == 0
+            and isinstance(reid_skip_reason, str)
+            and reid_skip_reason.strip()
+        ):
+            reid_notes = f"{reid_notes}; skip_reason={reid_skip_reason.strip()}"
         match_value = f"{reid_pass} matches" if reid_pass is not None else "N/A"
         match_notes = f"threshold={reid_cfg.get('similarity_threshold', 'N/A')}"
 

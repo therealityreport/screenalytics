@@ -5,6 +5,8 @@ torch==2.3.1
 torchvision==0.18.1
 ultralytics>=8.2.70
 supervision>=0.20.0
+# deep-person-reid (provides torchreid.utils.FeatureExtractor; PyPI torchreid==0.2.x is incompatible)
+torchreid @ git+https://github.com/KaiyangZhou/deep-person-reid.git@v1.0.6
 scikit-learn==1.5.1
 # DEPRECATED: pyannote.audio - being replaced by NeMo MSDD
 # pyannote.audio==3.1.1  # Remove after NeMo migration complete

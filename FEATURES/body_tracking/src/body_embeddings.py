@@ -67,13 +67,11 @@ class BodyEmbedder:
         self._device_resolved = device
 
         try:
-            from torchreid.utils import FeatureExtractor
-        except ModuleNotFoundError as exc:
-            if getattr(exc, "name", None) == "torchreid":
-                raise ImportError(
-                    "torchreid_missing: torchreid package required for body Re-ID (pip install -r requirements-ml.txt)"
-                ) from exc
-            raise ImportError(f"torchreid_import_error: {exc}") from exc
+            from py_screenalytics.torchreid_compat import get_torchreid_feature_extractor
+
+            FeatureExtractor, _torchreid_version = get_torchreid_feature_extractor()
+        except ImportError:
+            raise
         except Exception as exc:
             raise ImportError(f"torchreid_import_error: {type(exc).__name__}: {exc}") from exc
 

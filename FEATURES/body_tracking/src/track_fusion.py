@@ -288,25 +288,42 @@ class TrackFusion:
         # Phase 2: Re-ID handoff for gaps
         reid_associations: List[FaceBodyAssociation] = []
         reid_diag: dict[str, object] = {"reid_enabled": False, "reid_comparisons": 0, "reid_pass": 0}
-        if (
-            body_embeddings is not None
-            and face_embeddings is not None
-            and body_embeddings_meta is not None
-            and face_embeddings_meta is not None
-        ):
+        reid_skip_reason: str | None = None
+        if body_embeddings is None:
+            reid_skip_reason = "missing_body_embeddings"
+        elif not body_embeddings_meta:
+            reid_skip_reason = "missing_body_embeddings_meta"
+        elif face_embeddings is None:
+            reid_skip_reason = "missing_face_embeddings"
+        elif not face_embeddings_meta:
+            reid_skip_reason = "missing_face_embeddings_meta"
+        elif not isinstance(body_embeddings, np.ndarray) or body_embeddings.size == 0:
+            reid_skip_reason = "empty_body_embeddings"
+        elif not isinstance(face_embeddings, np.ndarray) or face_embeddings.size == 0:
+            reid_skip_reason = "empty_face_embeddings"
+        elif body_embeddings.ndim != 2 or face_embeddings.ndim != 2:
+            reid_skip_reason = "invalid_embedding_shape"
+        elif body_embeddings.shape[1] != face_embeddings.shape[1]:
+            reid_skip_reason = "embedding_dim_mismatch"
+        else:
             reid_diag = {
                 "reid_enabled": True,
                 "reid_comparisons": 0,
                 "reid_pass": 0,
             }
             reid_associations, reid_comparisons = self._build_reid_associations(
-                face_tracks, body_tracks,
-                face_embeddings, face_embeddings_meta,
-                body_embeddings, body_embeddings_meta,
+                face_tracks,
+                body_tracks,
+                face_embeddings,
+                face_embeddings_meta,
+                body_embeddings,
+                body_embeddings_meta,
             )
             logger.info(f"  Re-ID associations: {len(reid_associations)}")
             reid_diag["reid_comparisons"] = int(reid_comparisons)
             reid_diag["reid_pass"] = len(reid_associations)
+        if reid_skip_reason:
+            reid_diag["reid_skip_reason"] = reid_skip_reason
 
         # Phase 3: Build fused identities
         all_associations = iou_associations + reid_associations
@@ -339,8 +356,10 @@ class TrackFusion:
             "overlap_ratio_pass": int(spatial_diag.get("overlap_ratio_pass", 0) or 0),
             "iou_distribution": spatial_diag.get("iou_distribution"),
             "overlap_ratio_distribution": spatial_diag.get("overlap_ratio_distribution"),
+            "reid_enabled": bool(reid_diag.get("reid_enabled", False)),
             "reid_comparisons": int(reid_diag.get("reid_comparisons", 0) or 0),
             "reid_pass": int(reid_diag.get("reid_pass", 0) or 0),
+            "reid_skip_reason": reid_diag.get("reid_skip_reason"),
             "final_pairs": final_pairs,
             "iou_pairs": iou_pairs,
             "reid_pairs": reid_pairs,
@@ -703,6 +722,7 @@ def fuse_face_body_tracks(
     # Load face tracks - aggregate individual detections into tracks
     # faces.jsonl has one line per face detection (not aggregated tracks)
     face_tracks: Dict[int, dict] = {}
+    best_face_embeddings: dict[int, tuple[float, np.ndarray]] = {}
     logger.info(f"Loading face tracks from: {face_tracks_path}")
 
     with open(face_tracks_path) as f:
@@ -731,6 +751,19 @@ def fuse_face_body_tracks(
                 "score": face.get("conf", 1.0),
             })
 
+            embedding = face.get("embedding")
+            if isinstance(embedding, list) and embedding:
+                try:
+                    emb = np.asarray(embedding, dtype=np.float32)
+                    if emb.ndim == 1 and emb.size > 0:
+                        quality_raw = face.get("quality")
+                        quality = float(quality_raw) if quality_raw is not None else 0.0
+                        prev = best_face_embeddings.get(track_id)
+                        if prev is None or quality >= prev[0]:
+                            best_face_embeddings[track_id] = (quality, emb)
+                except Exception:
+                    pass
+
             # Update track bounds
             frame_idx = face.get("frame_idx")
             ts = face.get("ts", 0.0)
@@ -748,6 +781,27 @@ def fuse_face_body_tracks(
         track["duration"] = track["end_time"] - track["start_time"]
 
     logger.info(f"Loaded {len(face_tracks)} face tracks (aggregated from detections)")
+
+    face_embeddings = None
+    face_embeddings_meta = None
+    if best_face_embeddings:
+        dim_counts: dict[int, int] = {}
+        for _track_id, (_quality, emb) in best_face_embeddings.items():
+            dim = int(getattr(emb, "size", 0) or 0)
+            if dim > 0:
+                dim_counts[dim] = dim_counts.get(dim, 0) + 1
+        target_dim = max(dim_counts.items(), key=lambda kv: kv[1])[0] if dim_counts else None
+        if target_dim:
+            embeddings_list: list[np.ndarray] = []
+            meta_list: list[dict] = []
+            for track_id in sorted(best_face_embeddings):
+                emb = best_face_embeddings[track_id][1]
+                if emb.ndim == 1 and emb.size == target_dim:
+                    embeddings_list.append(emb)
+                    meta_list.append({"track_id": track_id})
+            if embeddings_list:
+                face_embeddings = np.stack(embeddings_list, axis=0).astype(np.float32, copy=False)
+                face_embeddings_meta = meta_list
 
     # Load body tracks
     body_tracks: Dict[int, dict] = {}
@@ -778,6 +832,8 @@ def fuse_face_body_tracks(
         body_tracks=body_tracks,
         body_embeddings=body_embeddings,
         body_embeddings_meta=body_embeddings_meta,
+        face_embeddings=face_embeddings,
+        face_embeddings_meta=face_embeddings_meta,
     )
 
     # Save results

@@ -955,6 +955,76 @@ class JobService:
             requested=requested,
         )
 
+    def start_body_tracking_job(
+        self,
+        *,
+        ep_id: str,
+        run_id: str,
+    ) -> JobRecord:
+        """Run the body tracking stage (YOLO/ByteTrack + optional Re-ID embeddings)."""
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        video_path = get_path(ep_id, "video")
+        if not video_path.exists():
+            raise FileNotFoundError(f"Episode video not found for {ep_id}: {video_path}")
+
+        progress_path = run_layout.run_root(ep_id, run_id_norm) / "progress_body_tracking.json"
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "body_tracking_run.py"),
+            "--ep-id",
+            ep_id,
+            "--run-id",
+            run_id_norm,
+            "--progress-file",
+            str(progress_path),
+        ]
+        return self._launch_job(
+            job_type="body_tracking",
+            ep_id=ep_id,
+            command=command,
+            progress_path=progress_path,
+            requested={"run_id": run_id_norm},
+        )
+
+    def start_body_tracking_fusion_job(
+        self,
+        *,
+        ep_id: str,
+        run_id: str,
+    ) -> JobRecord:
+        """Run face↔body fusion + screen-time comparison for a run."""
+        run_id_norm = run_layout.normalize_run_id(run_id)
+        manifests_dir = run_layout.run_root(ep_id, run_id_norm)
+        missing: list[str] = []
+        if not (manifests_dir / "faces.jsonl").exists():
+            missing.append("faces.jsonl")
+        if not (manifests_dir / "body_tracking" / "body_tracks.jsonl").exists():
+            missing.append("body_tracking/body_tracks.jsonl")
+        if missing:
+            raise FileNotFoundError(
+                "Required artifacts missing for body tracking fusion "
+                f"(run_id={run_id_norm}, manifests_dir={manifests_dir}): {', '.join(missing)}"
+            )
+
+        progress_path = manifests_dir / "progress_body_tracking_fusion.json"
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "tools" / "body_tracking_fusion_run.py"),
+            "--ep-id",
+            ep_id,
+            "--run-id",
+            run_id_norm,
+            "--progress-file",
+            str(progress_path),
+        ]
+        return self._launch_job(
+            job_type="body_tracking_fusion",
+            ep_id=ep_id,
+            command=command,
+            progress_path=progress_path,
+            requested={"run_id": run_id_norm},
+        )
+
     def start_video_export_job(
         self,
         *,

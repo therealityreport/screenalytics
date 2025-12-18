@@ -6871,6 +6871,7 @@ def _maybe_run_body_tracking(
         torchreid_version: str | None = None
         torchreid_runtime_ok: bool | None = None
         torchreid_runtime_error: str | None = None
+        torchreid_import_error: str | None = None
         if isinstance(import_status, dict):
             torchreid_state = import_status.get("torchreid")
             if isinstance(torchreid_state, dict):
@@ -6883,11 +6884,34 @@ def _maybe_run_body_tracking(
         if not reid_enabled_config:
             embeddings_note = "disabled"
             reid_skip_reason = "disabled"
-        elif torchreid_status is not None and torchreid_status != "ok":
-            reid_skip_reason = f"torchreid_{torchreid_status}"
-            embeddings_note = reid_skip_reason
-            if torchreid_error:
-                embeddings_note = f"{reid_skip_reason}: {torchreid_error}"
+        else:
+            try:
+                from py_screenalytics.torchreid_compat import get_torchreid_feature_extractor
+
+                get_torchreid_feature_extractor()
+                torchreid_import_ok = True
+            except ImportError as exc:
+                torchreid_import_ok = False
+                torchreid_import_error = str(exc)
+            except Exception as exc:
+                torchreid_import_ok = False
+                torchreid_import_error = f"{type(exc).__name__}: {exc}"
+
+        if not reid_enabled_config:
+            pass
+        elif torchreid_import_ok is False:
+            reid_skip_reason = (
+                f"torchreid_{torchreid_status}"
+                if torchreid_status and torchreid_status != "ok"
+                else "torchreid_import_error"
+            )
+            if torchreid_import_error and torchreid_import_error.startswith("torchreid_missing:"):
+                reid_skip_reason = "torchreid_missing"
+            elif torchreid_import_error and torchreid_import_error.startswith("torchreid_runtime_error:"):
+                reid_skip_reason = "torchreid_runtime_error"
+            torchreid_runtime_ok = False
+            torchreid_runtime_error = torchreid_import_error or torchreid_error or "torchreid import failed"
+            embeddings_note = f"import_error: {torchreid_runtime_error}"
             LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", embeddings_note)
         else:
             try:
@@ -6897,12 +6921,8 @@ def _maybe_run_body_tracking(
             except ImportError as exc:
                 torchreid_runtime_ok = False
                 torchreid_runtime_error = str(exc)
-                if torchreid_import_ok is True:
-                    reid_skip_reason = "torchreid_runtime_error"
-                    embeddings_note = f"runtime_error: {exc}"
-                else:
-                    reid_skip_reason = "torchreid_import_error"
-                    embeddings_note = f"import_error: {exc}"
+                reid_skip_reason = "torchreid_runtime_error" if torchreid_import_ok is True else "torchreid_import_error"
+                embeddings_note = f"{'runtime_error' if torchreid_import_ok is True else 'import_error'}: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", embeddings_note)
             except Exception as exc:
                 torchreid_runtime_ok = False

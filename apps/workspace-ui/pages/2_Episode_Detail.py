@@ -20,6 +20,7 @@ LOGGER = logging.getLogger("episode_detail")
 
 PAGE_PATH = Path(__file__).resolve()
 WORKSPACE_DIR = PAGE_PATH.parents[1]
+PROJECT_ROOT = PAGE_PATH.parents[3]
 if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
@@ -118,6 +119,20 @@ def _generate_attempt_run_id(ep_id: str) -> str:
         attempt_num += 1
         run_id = f"Attempt{attempt_num}_{timestamp}EST"
     return run_layout.normalize_run_id(run_id)
+
+
+_SUCCESS_JOB_STATUSES = {"completed", "success", "succeeded"}
+
+
+def _summary_status_ok(summary: Dict[str, Any] | None) -> bool:
+    if not isinstance(summary, dict) or not summary:
+        return False
+    status = str(summary.get("status") or "").strip().lower()
+    if status not in _SUCCESS_JOB_STATUSES:
+        return False
+    if summary.get("error"):
+        return False
+    return True
 
 
 def _trigger_pdf_export_if_needed(
@@ -1135,6 +1150,9 @@ def _sync_job_state_with_api(
     running_faces_job: dict | None,
     running_cluster_job: dict | None,
     running_audio_job: dict | None,
+    running_body_tracking_job: dict | None = None,
+    running_body_fusion_job: dict | None = None,
+    running_screentime_job: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Synchronize session state with API-based job status.
 
@@ -1150,6 +1168,9 @@ def _sync_job_state_with_api(
         running_faces_job,
         running_cluster_job,
         running_audio_job,
+        running_body_tracking_job,
+        running_body_fusion_job,
+        running_screentime_job,
     ])
     session_says_running = (
         st.session_state.get(running_job_key, False) or
@@ -1552,6 +1573,15 @@ def _cached_storage_status() -> Dict[str, Any] | None:
         return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_db_health() -> Dict[str, Any] | None:
+    """Cache DB health API response with 30s TTL."""
+    try:
+        return helpers.api_get("/config/db_health")
+    except requests.RequestException:
+        return None
+
+
 # Suggestion 2: Adaptive cache TTL based on job state
 # During active jobs: 10s TTL (human can't perceive <10s delay in progress updates)
 # When idle: 3s TTL for responsive manual refresh
@@ -1561,11 +1591,9 @@ _CACHE_TTL_IDLE = 3  # Shorter TTL when idle
 
 def _any_job_active(ep_id: str) -> bool:
     """Check if any job is active for this episode (from session state)."""
-    _autorun_key = f"{ep_id}::autorun_active"
-    if st.session_state.get(_autorun_key):
+    if st.session_state.get(f"{ep_id}::autorun_pipeline"):
         return True
-    running_key = f"episode_detail_running_job:{ep_id}"
-    if st.session_state.get(running_key):
+    if _job_active(ep_id):
         return True
     return False
 
@@ -1591,6 +1619,35 @@ def _cached_episode_jobs(ep_id: str) -> Dict[str, Any] | None:
         return helpers.api_get(f"/jobs?ep_id={ep_id}&limit=20")
     except requests.RequestException:
         return None
+
+
+def _find_running_subprocess_job(
+    jobs_payload: Dict[str, Any] | None,
+    *,
+    job_type: str,
+    run_id: str | None = None,
+) -> Dict[str, Any] | None:
+    if not isinstance(jobs_payload, dict):
+        return None
+    jobs = jobs_payload.get("jobs")
+    if not isinstance(jobs, list):
+        return None
+    running_states = {"running", "queued", "in_progress"}
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        if str(job.get("job_type") or "") != job_type:
+            continue
+        state = str(job.get("state") or "").strip().lower()
+        if state not in running_states:
+            continue
+        if run_id:
+            requested = job.get("requested") if isinstance(job.get("requested"), dict) else {}
+            requested_run_id = requested.get("run_id") if isinstance(requested.get("run_id"), str) else None
+            if requested_run_id and requested_run_id.strip() != run_id:
+                continue
+        return job
+    return None
 
 
 @st.cache_data(ttl=_CACHE_TTL_ACTIVE, show_spinner=False)
@@ -1636,18 +1693,19 @@ def _compute_detect_track_effective_status(
     normalized_job_state = str(job_state or "").strip().lower()
     if normalized_job_state == "running":
         return "running", False, False, tracks_only_fallback
-    if tracks_ready_flag:
-        return "success", True, False, tracks_only_fallback
     normalized_status = str(detect_status.get("status") or "missing").strip().lower()
     if not normalized_status:
         normalized_status = "missing"
-    manifest_tracks_ready = bool(manifest_ready)
+    if normalized_status in {"error", "failed"}:
+        return "error", False, False, tracks_only_fallback
+    if normalized_status == "stale":
+        return "stale", False, False, tracks_only_fallback
+    if tracks_ready_flag and normalized_status == "success" and not detect_status.get("error"):
+        return "success", True, False, tracks_only_fallback
     if normalized_status == "success":
-        if manifest_tracks_ready:
+        if manifest_ready:
             return "success", True, False, tracks_only_fallback
         return "stale", False, False, tracks_only_fallback
-    if manifest_tracks_ready:
-        return "success", True, True, tracks_only_fallback
     return normalized_status, False, False, tracks_only_fallback
 
 
@@ -1671,6 +1729,43 @@ def _estimated_sampled_frames(meta: Dict[str, Any] | None, stride: int) -> int |
         return None
     stride_val = max(int(stride or 1), 1)
     return max(int(frames // stride_val), 0)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_yaml(path_str: str) -> Dict[str, Any]:
+    path = Path(path_str)
+    if not path.exists():
+        return {}
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return {}
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _body_tracking_enabled_config() -> bool:
+    cfg = _cached_yaml(str(PROJECT_ROOT / "config" / "pipeline" / "body_detection.yaml"))
+    enabled = bool((cfg.get("body_tracking") or {}).get("enabled", False))
+    env_override = os.environ.get("AUTO_RUN_BODY_TRACKING", "").strip().lower()
+    if env_override in ("0", "false", "no", "off"):
+        enabled = False
+    elif env_override in ("1", "true", "yes", "on"):
+        enabled = True
+    return enabled
+
+
+def _track_fusion_enabled_config() -> bool:
+    cfg = _cached_yaml(str(PROJECT_ROOT / "config" / "pipeline" / "track_fusion.yaml"))
+    return bool((cfg.get("track_fusion") or {}).get("enabled", False))
+
+
+def _track_fusion_reid_enabled_config() -> bool:
+    cfg = _cached_yaml(str(PROJECT_ROOT / "config" / "pipeline" / "track_fusion.yaml"))
+    return bool((cfg.get("reid_handoff") or {}).get("enabled", False))
 
 
 cfg = helpers.init_page("Episode Detail")
@@ -2132,11 +2227,20 @@ current_mtimes = (
     _safe_mtime(_scoped_markers_dir / "detect_track.json"),
     _safe_mtime(_scoped_markers_dir / "faces_embed.json"),
     _safe_mtime(_scoped_markers_dir / "cluster.json"),
+    _safe_mtime(_scoped_markers_dir / "body_tracking.json"),
+    _safe_mtime(_scoped_markers_dir / "body_tracking_fusion.json"),
     _safe_mtime(_scoped_manifests_dir / "detections.jsonl"),
     _safe_mtime(_scoped_manifests_dir / "tracks.jsonl"),
     _safe_mtime(_scoped_manifests_dir / "faces.jsonl"),
     _safe_mtime(_track_metrics_path),
     _safe_mtime(_scoped_manifests_dir / "identities.json"),
+    _safe_mtime(_scoped_manifests_dir / "body_tracking" / "body_tracks.jsonl"),
+    _safe_mtime(_scoped_manifests_dir / "body_tracking" / "track_fusion.json"),
+    _safe_mtime(_scoped_manifests_dir / "body_tracking" / "screentime_comparison.json"),
+    _safe_mtime(_scoped_manifests_dir / "exports" / "export_index.json") if selected_attempt_run_id else 0,
+    _safe_mtime(_scoped_manifests_dir / "analytics" / "screentime.json")
+    if selected_attempt_run_id
+    else _safe_mtime(helpers.DATA_ROOT / "analytics" / ep_id / "screentime.json"),
 )
 cached_mtimes = st.session_state.get(mtimes_key)
 should_refresh_status = force_refresh or _job_active(ep_id) or status_payload is None or cached_mtimes != current_mtimes
@@ -2221,6 +2325,24 @@ def _render_system_status():
                     error = s3_preflight.get("error", "Unknown error")
                     st.error(f"🔴 **S3 Credentials Invalid**: {error}")
 
+        # Check DB health (cached for 30s)
+        db_health = _cached_db_health()
+        if isinstance(db_health, dict):
+            configured = bool(db_health.get("configured"))
+            ok = db_health.get("ok")
+            migrations_ok = db_health.get("migrations_ok")
+            err = db_health.get("error")
+            if not configured:
+                st.warning(
+                    "⚠️ **DB Not Configured**: `DB_URL` is not set. DB-backed features are disabled "
+                    "(identity locks, suggestion history/audit, some review actions). "
+                    "Set `DB_URL` (Postgres) or `SCREENALYTICS_FAKE_DB=1` for local-only dev."
+                )
+            elif ok is False:
+                st.error(f"🔴 **DB Unhealthy**: {err or 'unknown error'}")
+            elif migrations_ok is False:
+                st.warning("⚠️ **DB Schema Incomplete**: required tables/migrations are missing.")
+
     except Exception as exc:
         LOGGER.debug("[system-status] Failed to fetch storage status: %s", exc)
 
@@ -2228,6 +2350,206 @@ def _render_system_status():
 # Show system status warnings at top of page
 _render_system_status()
 
+with st.expander("🗄️ DB Health", expanded=False):
+    db_health = _cached_db_health()
+    if not isinstance(db_health, dict):
+        st.caption("DB health unavailable.")
+    else:
+        configured = bool(db_health.get("configured"))
+        ok = db_health.get("ok")
+        fake_db = bool(db_health.get("fake_db"))
+        psycopg2_available = db_health.get("psycopg2_available")
+        latency_ms = db_health.get("latency_ms")
+        migrations_ok = db_health.get("migrations_ok")
+        err = db_health.get("error")
+
+        st.caption(f"configured={configured} fake_db={fake_db} psycopg2={psycopg2_available}")
+        if isinstance(latency_ms, (int, float)):
+            st.caption(f"latency_ms={latency_ms}")
+        if err:
+            st.caption(f"error={err}")
+        if migrations_ok is not None:
+            st.caption(f"migrations_ok={migrations_ok}")
+        tables = db_health.get("tables")
+        if isinstance(tables, dict) and tables and not fake_db:
+            missing = [name for name, present in tables.items() if present is False]
+            if missing:
+                st.warning(f"Missing tables: {', '.join(missing)}")
+            else:
+                st.success("All required tables present.")
+
+
+# =============================================================================
+# Run Performance / Quality (UI-only diagnostics)
+# =============================================================================
+with st.expander("⚡ Performance & Quality", expanded=False):
+    if not selected_attempt_run_id:
+        st.caption("Select a run-scoped attempt (run_id) to view run-specific performance + quality diagnostics.")
+    else:
+        _run_perf_prefix = f"{ep_id}::{selected_attempt_run_id}"
+
+        def _read_json_best_effort(path: Path) -> dict[str, Any] | None:
+            path = Path(path)
+            if not path.exists():
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        def _iter_jsonl_best_effort(path: Path):
+            path = Path(path)
+            if not path.exists():
+                return
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(row, dict):
+                            yield row
+            except OSError:
+                return
+
+        detect_marker = _read_json_best_effort(_scoped_markers_dir / "detect_track.json") or {}
+        faces_marker = _read_json_best_effort(_scoped_markers_dir / "faces_embed.json") or {}
+        cluster_marker = _read_json_best_effort(_scoped_markers_dir / "cluster.json") or {}
+        body_marker = _read_json_best_effort(_scoped_markers_dir / "body_tracking.json") or {}
+        fusion_marker = _read_json_best_effort(_scoped_markers_dir / "body_tracking_fusion.json") or {}
+
+        detect_rtf = helpers.coerce_float(detect_marker.get("rtf"))
+        detect_eff_fps = helpers.coerce_float(detect_marker.get("effective_fps_processing"))
+        detect_frames_processed = helpers.coerce_int(detect_marker.get("face_detect_frames_processed"))
+        detect_frames_total = helpers.coerce_int(detect_marker.get("frames_total"))
+        detect_stride_eff = helpers.coerce_int(detect_marker.get("stride_effective")) or helpers.coerce_int(detect_marker.get("stride"))
+        detect_onnx_provider = detect_marker.get("onnx_provider_resolved") or detect_marker.get("resolved_device")
+        forced_scene_warmup_ratio = helpers.coerce_float(detect_marker.get("forced_scene_warmup_ratio"))
+        scene_cuts_total = (
+            helpers.coerce_int(detect_marker.get("scene_cut_count"))
+            or helpers.coerce_int(detect_marker.get("scene_cuts_total"))
+            or helpers.coerce_int(detect_marker.get("scene_cuts"))
+        )
+
+        baseline_rtf = helpers.coerce_float(st.session_state.get(f"{_run_perf_prefix}::baseline_detect_rtf"))
+        baseline_eff_fps = helpers.coerce_float(st.session_state.get(f"{_run_perf_prefix}::baseline_detect_eff_fps"))
+        delta_rtf = None
+        delta_eff_fps = None
+        if detect_rtf is not None and baseline_rtf is not None:
+            delta_rtf = f"{(detect_rtf - baseline_rtf):+.2f}x"
+        if detect_eff_fps is not None and baseline_eff_fps is not None:
+            delta_eff_fps = f"{(detect_eff_fps - baseline_eff_fps):+.2f} fps"
+
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+        with metric_col1:
+            st.metric("Detect RTF", f"{detect_rtf:.2f}x" if detect_rtf is not None else "n/a", delta=delta_rtf)
+        with metric_col2:
+            st.metric(
+                "Detect Effective FPS",
+                f"{detect_eff_fps:.2f} fps" if detect_eff_fps is not None else "n/a",
+                delta=delta_eff_fps,
+            )
+        with metric_col3:
+            if detect_frames_processed is not None:
+                note = f"/ {detect_frames_total:,}" if isinstance(detect_frames_total, int) and detect_frames_total > 0 else ""
+                st.metric("Frames Processed", f"{detect_frames_processed:,}{note}")
+            else:
+                st.metric("Frames Processed", "n/a")
+
+        perf_lines: list[str] = []
+        if detect_stride_eff is not None:
+            perf_lines.append(f"stride_effective={detect_stride_eff}")
+        if detect_onnx_provider:
+            perf_lines.append(f"onnx_provider={detect_onnx_provider}")
+        if forced_scene_warmup_ratio is not None:
+            perf_lines.append(f"forced_scene_warmup_ratio={forced_scene_warmup_ratio:.3f}")
+        if scene_cuts_total is not None:
+            perf_lines.append(f"scene_cuts={scene_cuts_total}")
+        if perf_lines:
+            st.caption("Detect/Track: " + " · ".join(perf_lines))
+
+        # Tracking fragmentation stats from run-scoped track_metrics.json (if present).
+        forced_splits = None
+        id_switches = None
+        try:
+            if _track_metrics_path.exists():
+                _tm = json.loads(_track_metrics_path.read_text(encoding="utf-8"))
+                metrics_block = _tm.get("metrics") if isinstance(_tm, dict) else None
+                if isinstance(metrics_block, dict):
+                    forced_splits = helpers.coerce_int(metrics_block.get("forced_splits"))
+                    id_switches = helpers.coerce_int(metrics_block.get("id_switches"))
+        except (OSError, json.JSONDecodeError):
+            pass
+        frag_bits: list[str] = []
+        if forced_splits is not None:
+            frag_bits.append(f"forced_splits={forced_splits:,}")
+        if id_switches is not None:
+            frag_bits.append(f"id_switches={id_switches:,}")
+        if frag_bits:
+            st.caption("Tracking: " + " · ".join(frag_bits))
+
+        # Track embedding coherence (spread) - computed from tracks.jsonl (best effort).
+        coherence_threshold = 0.30
+        try:
+            coherence_threshold = float(os.environ.get("TRACK_COHERENCE_WARN", "0.30"))
+        except (TypeError, ValueError):
+            coherence_threshold = 0.30
+        spreads: list[float] = []
+        flagged = 0
+        try:
+            if tracks_path.exists():
+                for row in _iter_jsonl_best_effort(tracks_path):
+                    spread = helpers.coerce_float(row.get("face_embedding_spread"))
+                    if spread is None:
+                        continue
+                    spreads.append(float(spread))
+                    if spread >= coherence_threshold:
+                        flagged += 1
+        except Exception:
+            spreads = []
+            flagged = 0
+        if spreads:
+            avg_spread = sum(spreads) / max(len(spreads), 1)
+            st.caption(
+                f"Track coherence: tracks_with_spread={len(spreads):,} · mixed_tracks={flagged:,} "
+                f"(spread≥{coherence_threshold:.2f}) · avg_spread={avg_spread:.3f} · max_spread={max(spreads):.3f}"
+            )
+
+        # Embedding backend (faces) and fusion mode (body/fusion).
+        embed_backend_actual = faces_marker.get("embedding_backend_actual") or faces_phase_status.get("embedding_backend_actual")
+        embed_fallback = faces_marker.get("embedding_backend_fallback_reason") or faces_phase_status.get(
+            "embedding_backend_fallback_reason"
+        )
+        if embed_backend_actual:
+            msg = f"Faces embed backend: {embed_backend_actual}"
+            if isinstance(embed_fallback, str) and embed_fallback.strip():
+                msg = msg + f" (fallback_reason={embed_fallback.strip()})"
+            st.caption(msg)
+
+        body_reid = body_marker.get("body_reid")
+        if isinstance(body_reid, dict):
+            cfg_enabled = body_reid.get("enabled_config")
+            effective = body_reid.get("enabled_effective")
+            skip_reason = body_reid.get("reid_skip_reason")
+            st.caption(
+                "Body Re-ID: "
+                + " · ".join(
+                    [
+                        f"enabled_config={cfg_enabled}",
+                        f"enabled_effective={effective}",
+                        f"skip_reason={skip_reason}" if skip_reason else "skip_reason=None",
+                    ]
+                )
+            )
+
+        if fusion_marker:
+            fusion_status = fusion_marker.get("status")
+            if fusion_status:
+                st.caption(f"Track fusion marker: status={fusion_status}")
 
 # =============================================================================
 # Execution Mode Selector
@@ -2531,30 +2853,188 @@ screentime_status_value = "missing"
 screentime_error = None
 screentime_started_at = None
 screentime_finished_at = None
+screentime_job_record_for_run: Dict[str, Any] | None = None
 if screentime_job_record:
-    job_state = str(screentime_job_record.get("state") or "").lower()
-    screentime_error = screentime_job_record.get("error")
-    screentime_started_at = screentime_job_record.get("started_at")
-    screentime_finished_at = screentime_job_record.get("ended_at")
+    requested = screentime_job_record.get("requested")
+    requested_run_id = requested.get("run_id") if isinstance(requested, dict) else None
+    if selected_attempt_run_id:
+        if isinstance(requested_run_id, str) and requested_run_id.strip() == selected_attempt_run_id:
+            screentime_job_record_for_run = screentime_job_record
+    else:
+        if not requested_run_id:
+            screentime_job_record_for_run = screentime_job_record
+
+screentime_artifact_ok = False
+if screentime_json_path.exists():
+    if selected_attempt_run_id:
+        try:
+            payload = json.loads(screentime_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        file_run_id = payload.get("run_id") if isinstance(payload, dict) else None
+        screentime_artifact_ok = isinstance(file_run_id, str) and file_run_id.strip() == selected_attempt_run_id
+    else:
+        screentime_artifact_ok = True
+
+if screentime_job_record_for_run:
+    job_state = str(screentime_job_record_for_run.get("state") or "").lower()
+    screentime_error = screentime_job_record_for_run.get("error")
+    screentime_started_at = screentime_job_record_for_run.get("started_at")
+    screentime_finished_at = screentime_job_record_for_run.get("ended_at")
     if job_state == "running":
         screentime_status_value = "running"
     elif job_state in {"failed", "error"}:
         screentime_status_value = "error"
-    elif job_state == "succeeded":
-        screentime_status_value = "success"
-if screentime_status_value == "missing" and screentime_json_path.exists():
+
+if screentime_status_value != "running" and screentime_artifact_ok:
     screentime_status_value = "success"
     if screentime_finished_at is None:
         screentime_finished_at = (
-            datetime.fromtimestamp(screentime_json_path.stat().st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat() + "Z"
+            datetime.fromtimestamp(screentime_json_path.stat().st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat()
+            + "Z"
         )
 screentime_runtime = _format_runtime(_runtime_from_iso(screentime_started_at, screentime_finished_at))
+
+# Downstream pipeline config + run-scoped artifacts (body tracking / fusion / PDF).
+body_tracking_enabled = bool(selected_attempt_run_id) and _body_tracking_enabled_config()
+track_fusion_enabled = bool(selected_attempt_run_id) and body_tracking_enabled and _track_fusion_enabled_config()
+track_fusion_reid_enabled = bool(selected_attempt_run_id) and track_fusion_enabled and _track_fusion_reid_enabled_config()
+
+body_tracking_dir = manifests_dir / "body_tracking"
+body_detections_path = body_tracking_dir / "body_detections.jsonl"
+body_tracks_path = body_tracking_dir / "body_tracks.jsonl"
+track_fusion_path = body_tracking_dir / "track_fusion.json"
+screentime_comparison_path = body_tracking_dir / "screentime_comparison.json"
+
+body_tracking_marker_path = _scoped_markers_dir / "body_tracking.json"
+body_fusion_marker_path = _scoped_markers_dir / "body_tracking_fusion.json"
+
+body_tracking_status_value = "missing"
+body_tracking_error: str | None = None
+body_tracking_marker_payload: dict[str, Any] | None = None
+
+body_fusion_status_value = "missing"
+body_fusion_error: str | None = None
+body_fusion_marker_payload: dict[str, Any] | None = None
+
+pdf_export_status_value = "missing"
+pdf_export_detail: str | None = None
+fusion_mode_label: str | None = None
+fusion_mode_detail: str | None = None
+
+if selected_attempt_run_id:
+    _jobs_payload_for_downstream = _cached_episode_jobs(ep_id)
+    _running_body_tracking_job = _find_running_subprocess_job(
+        _jobs_payload_for_downstream, job_type="body_tracking", run_id=selected_attempt_run_id
+    )
+    _running_body_fusion_job = _find_running_subprocess_job(
+        _jobs_payload_for_downstream, job_type="body_tracking_fusion", run_id=selected_attempt_run_id
+    )
+    if _running_body_tracking_job:
+        body_tracking_status_value = "running"
+    if _running_body_fusion_job:
+        body_fusion_status_value = "running"
+
+    if body_tracking_marker_path.exists():
+        try:
+            payload = json.loads(body_tracking_marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        body_tracking_marker_payload = payload if isinstance(payload, dict) else None
+        marker_status = str((body_tracking_marker_payload or {}).get("status") or "").strip().lower()
+        marker_error = (body_tracking_marker_payload or {}).get("error")
+        marker_run_id = (body_tracking_marker_payload or {}).get("run_id")
+        marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
+        artifacts_ok = body_detections_path.exists() and body_tracks_path.exists()
+        if marker_status in {"error", "failed"} or marker_error:
+            body_tracking_status_value = "error"
+            body_tracking_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
+        elif marker_status == "success" and marker_run_matches and artifacts_ok:
+            body_tracking_status_value = "success"
+        elif marker_status == "success":
+            body_tracking_status_value = "stale"
+            if not marker_run_matches:
+                body_tracking_error = "run_id_mismatch"
+            elif not artifacts_ok:
+                body_tracking_error = "missing_artifacts"
+
+    if body_fusion_marker_path.exists():
+        try:
+            payload = json.loads(body_fusion_marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        body_fusion_marker_payload = payload if isinstance(payload, dict) else None
+        marker_status = str((body_fusion_marker_payload or {}).get("status") or "").strip().lower()
+        marker_error = (body_fusion_marker_payload or {}).get("error")
+        marker_run_id = (body_fusion_marker_payload or {}).get("run_id")
+        marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
+        artifacts_ok = track_fusion_path.exists()
+        if marker_status in {"error", "failed"} or marker_error:
+            body_fusion_status_value = "error"
+            body_fusion_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
+        elif marker_status == "success" and marker_run_matches and artifacts_ok:
+            body_fusion_status_value = "success"
+        elif marker_status == "success":
+            body_fusion_status_value = "stale"
+            if not marker_run_matches:
+                body_fusion_error = "run_id_mismatch"
+            elif not artifacts_ok:
+                body_fusion_error = "missing_artifacts"
+
+    # PDF export is run-scoped via exports/export_index.json.
+    try:
+        from apps.api.services.run_artifact_store import read_export_index
+
+        export_index = read_export_index(ep_id, selected_attempt_run_id)
+    except Exception:
+        export_index = None
+    if isinstance(export_index, dict):
+        export_type = export_index.get("export_type")
+        export_bytes = export_index.get("export_bytes")
+        export_upload = export_index.get("export_upload") if isinstance(export_index.get("export_upload"), dict) else {}
+        export_success = export_type == "pdf" and isinstance(export_bytes, int) and export_bytes > 0
+        if export_success:
+            pdf_export_status_value = "success"
+            if export_upload.get("attempted") and not export_upload.get("success"):
+                pdf_export_detail = "PDF generated (S3 upload failed)"
+            elif export_upload.get("success"):
+                pdf_export_detail = "PDF uploaded"
+            else:
+                pdf_export_detail = "PDF generated"
+
+    if track_fusion_enabled:
+        body_reid = body_tracking_marker_payload.get("body_reid") if isinstance(body_tracking_marker_payload, dict) else None
+        enabled_effective = False
+        skip_reason = None
+        runtime_error = None
+        if isinstance(body_reid, dict):
+            enabled_effective = bool(body_reid.get("enabled_effective"))
+            skip_reason = body_reid.get("reid_skip_reason")
+            runtime_error = body_reid.get("torchreid_runtime_error")
+
+        if not track_fusion_reid_enabled:
+            fusion_mode_label = "IoU-only"
+            fusion_mode_detail = "reid_handoff.enabled=false"
+        elif enabled_effective:
+            fusion_mode_label = "Hybrid (IoU + Re-ID)"
+            fusion_mode_detail = None
+        else:
+            fusion_mode_label = "IoU-only"
+            detail_bits: list[str] = []
+            if isinstance(skip_reason, str) and skip_reason.strip():
+                detail_bits.append(f"skip_reason={skip_reason.strip()}")
+            if isinstance(runtime_error, str) and runtime_error.strip():
+                detail_bits.append(f"torchreid_error={runtime_error.strip()}")
+            fusion_mode_detail = "; ".join(detail_bits) if detail_bits else "Re-ID unavailable"
+
 status_running = (
     detect_status_value == "running"
     or faces_status_value == "running"
     or cluster_status_value == "running"
     or str(detect_job_state or "").lower() == "running"
     or screentime_status_value == "running"
+    or body_tracking_status_value == "running"
+    or body_fusion_status_value == "running"
 )
 if status_running:
     _set_job_active(ep_id, True)
@@ -2572,24 +3052,46 @@ if faces_manifest_exists:
     faces_manifest_count = _count_manifest_rows(faces_path) or 0
 if faces_status_value == "success":
     faces_ready_state = True
-elif faces_status_value in {"missing", "unknown"} and faces_manifest_exists:
-    # Manifest exists but API reports missing/unknown - use manifest fallback
+elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_exists:
+    # Manifest exists but API reports missing/unknown/stale - use manifest fallback
     faces_ready_state = True
     faces_manifest_fallback = True
-# Note: "stale" status is NOT treated as ready - it needs to be re-run
 if faces_count_value is None and faces_manifest_count is not None:
     faces_count_value = faces_manifest_count
 
-# If detect status is missing but manifests are present, synthesize a summary so the UI still shows completion.
+# If status API is missing but run-scoped artifacts exist, only synthesize a "success"
+# when we can also validate a matching run marker (prevents stale/other-run promotion).
 if not detect_phase_status and manifest_state["manifest_ready"]:
-    detect_phase_status = {
-        "status": "success",
-        "detections": _count_manifest_rows(detections_path) or 0,
-        "tracks": _count_manifest_rows(tracks_path) or 0,
-        "finished_at": None,
-    }
-    detect_status_value = "success"
-    using_manifest_fallback = True
+    marker_ok = False
+    marker_payload: dict[str, Any] | None = None
+    marker_path = _scoped_markers_dir / "detect_track.json"
+    if marker_path.exists():
+        try:
+            marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            marker_payload = None
+    if isinstance(marker_payload, dict):
+        marker_status = str(marker_payload.get("status") or "").strip().lower()
+        marker_error = marker_payload.get("error")
+        marker_run_id = marker_payload.get("run_id")
+        marker_run_matches = True
+        if selected_attempt_run_id:
+            marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
+        marker_ok = marker_status == "success" and not marker_error and marker_run_matches
+
+    if marker_ok:
+        detect_phase_status = {
+            "status": "success",
+            "run_id": selected_attempt_run_id,
+            "detections": _count_manifest_rows(detections_path) or 0,
+            "tracks": _count_manifest_rows(tracks_path) or 0,
+            "finished_at": (marker_payload or {}).get("finished_at"),
+            "source": "marker_manifest_fallback",
+            "metadata_missing": True,
+        }
+        detect_status_value = "success"
+        tracks_ready = True
+        using_manifest_fallback = True
 
 # Add pipeline state indicators (even if status API is temporarily unavailable)
 with st.expander("Pipeline Status", expanded=False):
@@ -3223,7 +3725,7 @@ profile_defaults = helpers.profile_defaults(profile_value)
 # ── Auto-Run Pipeline ────────────────────────────────────────────────────────
 # Session state keys for auto-run pipeline
 _autorun_key = f"{ep_id}::autorun_pipeline"
-_autorun_phase_key = f"{ep_id}::autorun_phase"  # "detect", "faces", "cluster", or None
+_autorun_phase_key = f"{ep_id}::autorun_phase"  # detect|faces|cluster|body_tracking|track_fusion|screentime|pdf|None
 
 # Check if auto-run is active and a phase just completed
 autorun_active = st.session_state.get(_autorun_key, False)
@@ -3234,7 +3736,15 @@ with st.container():
     auto_col1, auto_col2 = st.columns([3, 1])
     with auto_col1:
         if autorun_active:
-            phase_labels = {"detect": "Detect/Track", "faces": "Faces Harvest", "cluster": "Clustering"}
+            phase_labels = {
+                "detect": "Detect/Track",
+                "faces": "Faces Harvest",
+                "cluster": "Clustering",
+                "body_tracking": "Body Tracking",
+                "track_fusion": "Track Fusion",
+                "screentime": "Screentime Analyze",
+                "pdf": "PDF Export",
+            }
             current_phase_label = phase_labels.get(autorun_phase, "Unknown")
             # Get completed stages log
             completed_stages = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
@@ -3245,36 +3755,27 @@ with st.container():
             status_lines.append(f"🔄 Currently running: {current_phase_label}")
             st.info("**Auto-Run Pipeline Active**\n\n" + "\n\n".join(status_lines))
 
-            # Suggestion 4: Pipeline Progress Bar with ETA
-            # Weight phases by typical duration: detect=50%, faces=30%, cluster=20%
-            phase_weights = {"detect": 0.50, "faces": 0.30, "cluster": 0.20}
-            phase_order = ["detect", "faces", "cluster"]
+            # Progress: count completed enabled stages for the selected run_id.
+            from py_screenalytics.autorun_plan import build_autorun_stage_plan
 
-            # Calculate completed phase weight
-            completed_weight = 0.0
-            for phase in phase_order:
-                if phase in [s.split(" ")[0].lower() for s in completed_stages]:
-                    completed_weight += phase_weights.get(phase, 0)
-                elif phase == "detect" and any("Detect" in s for s in completed_stages):
-                    completed_weight += phase_weights["detect"]
-                elif phase == "faces" and any("Faces" in s for s in completed_stages):
-                    completed_weight += phase_weights["faces"]
+            stage_plan = build_autorun_stage_plan(
+                body_tracking_enabled=body_tracking_enabled,
+                track_fusion_enabled=track_fusion_enabled,
+            )
 
-            # Get current phase progress (from running jobs or 0)
-            current_phase_weight = phase_weights.get(autorun_phase, 0)
-            current_phase_pct = 0.0
-            # Fetch running jobs for progress (uses cached batch API)
-            _running_jobs = helpers.get_all_running_jobs_for_episode(ep_id)
-            if autorun_phase == "detect" and _running_jobs.get("detect_track"):
-                current_phase_pct = _running_jobs["detect_track"].get("progress_pct", 0) / 100
-            elif autorun_phase == "faces" and _running_jobs.get("faces_embed"):
-                current_phase_pct = _running_jobs["faces_embed"].get("progress_pct", 0) / 100
-            elif autorun_phase == "cluster" and _running_jobs.get("cluster"):
-                current_phase_pct = _running_jobs["cluster"].get("progress_pct", 0) / 100
-
-            total_progress = completed_weight + (current_phase_pct * current_phase_weight)
+            done_map = {
+                "detect": detect_status_value == "success",
+                "faces": bool(faces_ready_state),
+                "cluster": cluster_status_value == "success",
+                "body_tracking": (not body_tracking_enabled) or body_tracking_status_value == "success",
+                "track_fusion": (not track_fusion_enabled) or body_fusion_status_value == "success",
+                "screentime": screentime_status_value == "success",
+                "pdf": pdf_export_status_value == "success",
+            }
+            completed_count = sum(1 for key in stage_plan if done_map.get(key))
+            total_progress = (completed_count / max(len(stage_plan), 1)) if stage_plan else 0.0
             st.progress(min(total_progress, 1.0))
-            st.caption(f"Pipeline: {int(total_progress * 100)}% complete")
+            st.caption(f"Pipeline: {completed_count}/{len(stage_plan)} stages complete ({int(total_progress * 100)}%)")
 
             # Timing metrics display (expandable)
             _autorun_run_id = st.session_state.get(_autorun_run_id_key)
@@ -3306,7 +3807,7 @@ with st.container():
                         from autorun_timing import format_timing_duration
                         st.caption(f"Total inter-stage stall: {format_timing_duration(total_stall)}")
         else:
-            st.caption("Run all pipeline stages in sequence: Detect/Track → Faces Harvest → Cluster")
+            st.caption("Run all pipeline stages in sequence: Detect/Track → Faces → Cluster → (Body/Fusion) → Screentime → PDF")
     with auto_col2:
         if autorun_active:
             if st.button("⏹️ Stop Auto-Run", key="stop_autorun", use_container_width=True, type="secondary"):
@@ -3317,7 +3818,7 @@ with st.container():
                 st.rerun()
         else:
             # Disable if no video or job already running
-            autorun_disabled = not local_video_exists or st.session_state.get(running_job_key, False)
+            autorun_disabled = not local_video_exists or _job_active(ep_id) or st.session_state.get(running_job_key, False)
             autorun_start_requested_key = f"{ep_id}::autorun_start_requested"
 
             if st.button(
@@ -3326,7 +3827,7 @@ with st.container():
                 use_container_width=True,
                 type="primary",
                 disabled=autorun_disabled,
-                help="Run Detect/Track → Faces Harvest → Cluster automatically (resets review state first)",
+                help="Run Detect/Track → Faces → Cluster → (Body Tracking/Fusion) → Screentime → PDF for a new run_id (resets review state first)",
             ):
                 st.session_state[autorun_start_requested_key] = True
                 st.rerun()
@@ -3451,6 +3952,7 @@ with st.container():
                 # Clear any stale promotion keys from previous runs
                 st.session_state.pop(f"{ep_id}::autorun_detect_promoted_mtime", None)
                 st.session_state.pop(f"{ep_id}::autorun_faces_promoted_mtime", None)
+                st.session_state.pop(f"{ep_id}::autorun_cluster_promoted_mtime", None)
 
                 st.session_state[_autorun_key] = True
                 st.session_state[_autorun_phase_key] = "detect"
@@ -3735,9 +4237,8 @@ if autorun_active:
         faces_api_status = faces_phase_status.get("status")
         faces_job_running = helpers.get_running_job_for_episode(ep_id, "faces_embed") is not None
 
-        # Accept "success" or "stale" - both mean faces harvest has run at some point
-        # "stale" occurs when detect_track marker is newer than faces marker (timestamp comparison)
-        faces_status_ok = faces_api_status in ("success", "stale")
+        # Only treat explicit success as promotable; "stale" must re-run before clustering.
+        faces_status_ok = str(faces_api_status or "").strip().lower() == "success"
 
         # Get when auto-run started - manifest/marker must be newer than this
         autorun_started_at = st.session_state.get(f"{ep_id}::autorun_started_at", 0.0)
@@ -3824,6 +4325,42 @@ if autorun_active:
                     st.toast("✅ Faces Harvest complete - advancing to Cluster...")
                     _fallback_triggered = True
 
+    # Fallback 3: cluster → downstream (body tracking / screentime)
+    elif autorun_phase == "cluster":
+        cluster_job_running = helpers.get_running_job_for_episode(ep_id, "cluster") is not None
+        cluster_baseline = st.session_state.get(f"{ep_id}::autorun_cluster_baseline_mtime", 0.0)
+        cluster_marker_path = _scoped_markers_dir / "cluster.json"
+        marker_payload: dict[str, Any] | None = None
+        marker_mtime = 0.0
+        if cluster_marker_path.exists():
+            try:
+                marker_payload = json.loads(cluster_marker_path.read_text(encoding="utf-8"))
+                if isinstance(marker_payload, dict):
+                    marker_mtime = cluster_marker_path.stat().st_mtime
+                else:
+                    marker_payload = None
+            except (OSError, json.JSONDecodeError):
+                marker_payload = None
+        marker_status = str((marker_payload or {}).get("status") or "").strip().lower()
+        marker_error = (marker_payload or {}).get("error")
+        marker_run_id = (marker_payload or {}).get("run_id")
+        marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == (selected_attempt_run_id or "")
+        cluster_from_current_run = marker_mtime > float(cluster_baseline or 0.0)
+
+        if not cluster_job_running and marker_status == "success" and not marker_error and marker_run_matches and cluster_from_current_run:
+            _cluster_promoted_key = f"{ep_id}::autorun_cluster_promoted_mtime"
+            last_promoted = st.session_state.get(_cluster_promoted_key)
+            if last_promoted is None or marker_mtime > float(last_promoted or 0.0):
+                st.session_state[_cluster_promoted_key] = marker_mtime
+                completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+                if not any("Cluster" in s or "Clustering" in s for s in completed):
+                    completed.append("Cluster")
+                    st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+                next_phase = "body_tracking" if body_tracking_enabled else "screentime"
+                st.session_state[_autorun_phase_key] = next_phase
+                st.toast(f"✅ Cluster complete - advancing to {next_phase.replace('_', ' ').title()}...")
+                _fallback_triggered = True
+
     if _fallback_triggered:
         st.rerun()
 
@@ -3834,6 +4371,16 @@ running_detect_job = helpers.get_running_job_for_episode(ep_id, "detect_track")
 running_faces_job = helpers.get_running_job_for_episode(ep_id, "faces_embed")
 running_cluster_job = helpers.get_running_job_for_episode(ep_id, "cluster")
 running_audio_job = helpers.get_running_job_for_episode(ep_id, "audio_pipeline")
+_subprocess_jobs_payload = _cached_episode_jobs(ep_id)
+running_body_tracking_job = _find_running_subprocess_job(
+    _subprocess_jobs_payload, job_type="body_tracking", run_id=selected_attempt_run_id
+)
+running_body_fusion_job = _find_running_subprocess_job(
+    _subprocess_jobs_payload, job_type="body_tracking_fusion", run_id=selected_attempt_run_id
+)
+running_screentime_job = _find_running_subprocess_job(
+    _subprocess_jobs_payload, job_type="screen_time_analyze", run_id=selected_attempt_run_id
+)
 
 # Synchronize session state with API-based job status
 # This is the single source of truth - clears stale session flags if API says no job running
@@ -3844,9 +4391,174 @@ job_running, stale_job_warning = _sync_job_state_with_api(
     running_faces_job,
     running_cluster_job,
     running_audio_job,
+    running_body_tracking_job,
+    running_body_fusion_job,
+    running_screentime_job,
 )
 if stale_job_warning:
     st.warning(f"⚠️ {stale_job_warning}")
+
+# =============================================================================
+# AUTO-RUN DOWNSTREAM ORCHESTRATION (body tracking -> fusion -> screentime -> PDF)
+# =============================================================================
+def _autorun_stop(stage_label: str, message: str) -> None:
+    LOGGER.error("[AUTORUN] Stopping at %s: %s", stage_label, message)
+    st.session_state[_autorun_key] = False
+    st.session_state[_autorun_phase_key] = None
+    st.session_state[f"{ep_id}::autorun_error"] = message
+    st.error(f"❌ Auto-run stopped ({stage_label}): {message}")
+
+
+def _autorun_append_completed(label: str) -> None:
+    completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+    if not isinstance(completed, list):
+        completed = []
+    if label not in completed:
+        completed.append(label)
+        st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
+
+
+def _autorun_drive_downstream(run_id: str) -> None:
+    phase_now = st.session_state.get(_autorun_phase_key)
+    if phase_now not in {"body_tracking", "track_fusion", "screentime", "pdf"}:
+        return
+
+    if phase_now == "body_tracking":
+        if not body_tracking_enabled:
+            st.session_state[_autorun_phase_key] = "screentime"
+            st.toast("Body tracking disabled - skipping to Screentime...")
+            st.rerun()
+        if body_tracking_status_value == "success":
+            _autorun_append_completed("Body Tracking")
+            st.session_state[_autorun_phase_key] = "track_fusion" if track_fusion_enabled else "screentime"
+            st.rerun()
+        if body_tracking_status_value in {"error", "stale"}:
+            _autorun_stop("Body Tracking", body_tracking_error or body_tracking_status_value)
+            return
+        if body_tracking_status_value == "running":
+            return
+        try:
+            helpers.api_post(
+                "/jobs/body_tracking/run",
+                json={"ep_id": ep_id, "run_id": run_id},
+                timeout=15,
+            )
+        except Exception as exc:
+            _autorun_stop("Body Tracking", f"enqueue_failed: {exc}")
+            return
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.toast("🏃 Starting Body Tracking...")
+        st.rerun()
+
+    if phase_now == "track_fusion":
+        if not track_fusion_enabled:
+            st.session_state[_autorun_phase_key] = "screentime"
+            st.toast("Track fusion disabled - skipping to Screentime...")
+            st.rerun()
+        missing: list[str] = []
+        if not faces_path.exists():
+            missing.append("faces.jsonl")
+        if not body_tracks_path.exists():
+            missing.append("body_tracking/body_tracks.jsonl")
+        if missing:
+            _autorun_stop("Track Fusion", f"missing_prereqs: {', '.join(missing)}")
+            return
+        if body_fusion_status_value == "success":
+            stage_label = "Track Fusion"
+            if fusion_mode_label:
+                stage_label = f"{stage_label} ({fusion_mode_label})"
+            _autorun_append_completed(stage_label)
+            st.session_state[_autorun_phase_key] = "screentime"
+            st.rerun()
+        if body_fusion_status_value in {"error", "stale"}:
+            _autorun_stop("Track Fusion", body_fusion_error or body_fusion_status_value)
+            return
+        if body_fusion_status_value == "running":
+            return
+        try:
+            helpers.api_post(
+                "/jobs/body_tracking/fusion",
+                json={"ep_id": ep_id, "run_id": run_id},
+                timeout=15,
+            )
+        except Exception as exc:
+            _autorun_stop("Track Fusion", f"enqueue_failed: {exc}")
+            return
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.toast("🔗 Starting Track Fusion...")
+        st.rerun()
+
+    if phase_now == "screentime":
+        if screentime_status_value == "success":
+            _autorun_append_completed("Screentime Analyze")
+            st.session_state[_autorun_phase_key] = "pdf"
+            st.rerun()
+        if screentime_status_value == "error":
+            _autorun_stop("Screentime Analyze", screentime_error or "screentime_error")
+            return
+        if screentime_status_value == "running":
+            return
+        try:
+            resp = helpers.api_post(
+                "/jobs/screen_time/analyze",
+                json={"ep_id": ep_id, "run_id": run_id},
+                timeout=15,
+            )
+        except Exception as exc:
+            _autorun_stop("Screentime Analyze", f"enqueue_failed: {exc}")
+            return
+        job_id = resp.get("job_id") if isinstance(resp, dict) else None
+        if job_id:
+            st.session_state[f"{ep_id}::screentime_job"] = job_id
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.toast("🧮 Starting Screentime Analyze...")
+        st.rerun()
+
+    if phase_now == "pdf":
+        if pdf_export_status_value == "success":
+            _autorun_append_completed("PDF Export")
+            # Finalize auto-run only when all enabled stages are complete for this run_id.
+            st.session_state[_autorun_key] = False
+            st.session_state[_autorun_phase_key] = None
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            completion_bits = ["Face pipeline"]
+            if body_tracking_enabled:
+                completion_bits.append("Body tracking")
+            else:
+                completion_bits.append("Body tracking disabled")
+            if track_fusion_enabled:
+                completion_bits.append("Track fusion")
+            elif body_tracking_enabled:
+                completion_bits.append("Track fusion disabled")
+            completion_bits.extend(["Screentime", "PDF"])
+            completion_label = " · ".join(completion_bits)
+            st.success(f"🎉 **Auto-Run Complete!** ({completion_label})")
+            # Now that downstream is complete, open Improve Faces for this run (best-effort).
+            if selected_attempt_run_id:
+                st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
+            st.rerun()
+
+        with st.spinner("Generating PDF report..."):
+            ok, msg = _trigger_pdf_export_if_needed(ep_id, run_id, cfg)
+        if not ok:
+            _autorun_stop("PDF Export", msg)
+            return
+        st.success(msg)
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.rerun()
+
+
+_autorun_active_now = bool(st.session_state.get(_autorun_key))
+_autorun_phase_now = st.session_state.get(_autorun_phase_key)
+_autorun_run_id_now = st.session_state.get(_autorun_run_id_key) or selected_attempt_run_id
+if _autorun_active_now and isinstance(_autorun_run_id_now, str) and _autorun_run_id_now.strip():
+    _autorun_run_id_now = _autorun_run_id_now.strip()
+    if selected_attempt_run_id and _autorun_run_id_now != selected_attempt_run_id:
+        st.session_state[_active_run_id_pending_key] = _autorun_run_id_now
+        st.session_state[_status_force_refresh_key(ep_id)] = True
+        st.rerun()
+    if _autorun_phase_now in {"body_tracking", "track_fusion", "screentime", "pdf"} and selected_attempt_run_id:
+        _autorun_drive_downstream(selected_attempt_run_id)
 
 # Session state keys for cancel confirmation dialogs
 confirm_cancel_detect_key = f"{ep_id}::confirm_cancel_detect"
@@ -4011,19 +4723,33 @@ with col_detect:
         if summary:
             LOGGER.info("[AUTORUN] Summary type=%s, keys=%s", type(summary).__name__, list(summary.keys())[:10])
 
-        # FIX 3: Synthesize summary if empty but no error
-        # This handles cases where streaming succeeded but didn't return a proper summary
+        # Best-effort fallback: only synthesize a "completed" summary when we can also
+        # validate a successful run marker for the selected run_id (prevents stale promotion).
         if not summary and not error_message:
-            LOGGER.warning("[AUTORUN] No summary received, attempting to synthesize from manifests")
+            LOGGER.warning("[AUTORUN] No summary received, attempting to synthesize from run marker + manifests")
             det_path = detections_path
             trk_path = tracks_path
-            if det_path.exists() and trk_path.exists():
-                LOGGER.info("[AUTORUN] Manifests exist, synthesizing summary")
+            marker_path = _scoped_markers_dir / "detect_track.json"
+            marker_payload: dict[str, Any] | None = None
+            if marker_path.exists():
+                try:
+                    marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    marker_payload = None
+            from py_screenalytics.run_scoping import should_synthesize_detect_track_success
+
+            if should_synthesize_detect_track_success(
+                run_id=selected_attempt_run_id,
+                marker_payload=marker_payload,
+                detections_exists=det_path.exists(),
+                tracks_exists=trk_path.exists(),
+            ):
+                LOGGER.info("[AUTORUN] Marker+manifests validated; synthesizing summary")
                 summary = {"status": "completed", "fallback": True}
 
-        # IMPORTANT: Set auto-run progression FIRST, before any early returns
-        # This ensures the next phase is triggered even if we can't display counts
-        if summary and not error_message:
+        # IMPORTANT: Set auto-run progression FIRST, before any early returns.
+        # Never treat a truthy dict as success; require a success status and no error.
+        if _summary_status_ok(summary) and not error_message:
             # Mark job complete flags for single runs and refresh helpers
             detect_job_complete_key = f"{ep_id}::detect_job_complete"
             st.session_state[detect_job_complete_key] = True
@@ -4231,6 +4957,31 @@ with col_detect:
         st.warning(f"⚠️ A detect/track job is already running ({running_detect_job.get('progress_pct', 0):.1f}% complete). Cancel it above to start a new one.")
 
     if st.button(run_label, use_container_width=True, disabled=detect_button_disabled):
+        # Capture current detect RTF/FPS so the Performance panel can show before/after deltas after reruns.
+        if selected_attempt_run_id:
+            perf_prefix = f"{ep_id}::{selected_attempt_run_id}"
+            marker_payload: dict[str, Any] | None = None
+            marker_path = _scoped_markers_dir / "detect_track.json"
+            if marker_path.exists():
+                try:
+                    marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    marker_payload = None
+            if isinstance(marker_payload, dict) and str(marker_payload.get("status") or "").strip().lower() == "success":
+                rtf = helpers.coerce_float(marker_payload.get("rtf"))
+                eff_fps = helpers.coerce_float(marker_payload.get("effective_fps_processing"))
+                if rtf is not None:
+                    st.session_state[f"{perf_prefix}::baseline_detect_rtf"] = float(rtf)
+                else:
+                    st.session_state.pop(f"{perf_prefix}::baseline_detect_rtf", None)
+                if eff_fps is not None:
+                    st.session_state[f"{perf_prefix}::baseline_detect_eff_fps"] = float(eff_fps)
+                else:
+                    st.session_state.pop(f"{perf_prefix}::baseline_detect_eff_fps", None)
+            else:
+                st.session_state.pop(f"{perf_prefix}::baseline_detect_rtf", None)
+                st.session_state.pop(f"{perf_prefix}::baseline_detect_eff_fps", None)
+
         # Keep runtime logs anchored just below the button for local mode runs.
         detect_log_container = st.container()
         with detect_log_container:
@@ -4621,15 +5372,29 @@ with col_faces:
 
             # IMPORTANT: Set auto-run progression FIRST, before any UI display
             # This ensures the next phase is triggered even if UI display has issues
-            LOGGER.info("[AUTORUN] Faces job returned: summary=%s, error=%s", bool(summary), error_message)
-            # Synthesize summary if empty but no error (parity with detect path)
+            LOGGER.info("[AUTORUN] Faces job returned: summary=%s, status=%s, error=%s", bool(summary), getattr(summary, "get", lambda *_: None)("status") if isinstance(summary, dict) else None, error_message)
+            # Best-effort fallback: only synthesize a "completed" summary when we can also
+            # validate a successful run marker for the selected run_id (prevents stale promotion).
             if not summary and not error_message:
-                LOGGER.warning("[AUTORUN] Faces summary missing, synthesizing from manifests")
-                summary = {"status": "completed", "fallback": True}
-            # If summary exists but status missing, set completed to allow progression
-            if summary and not summary.get("status"):
-                summary["status"] = "completed"
-            if summary and not error_message:
+                LOGGER.warning("[AUTORUN] Faces summary missing, attempting to synthesize from run marker + manifests")
+                marker_path = _scoped_markers_dir / "faces_embed.json"
+                marker_payload: dict[str, Any] | None = None
+                if marker_path.exists():
+                    try:
+                        marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        marker_payload = None
+                marker_status = str((marker_payload or {}).get("status") or "").strip().lower()
+                marker_error = (marker_payload or {}).get("error")
+                marker_run_id = (marker_payload or {}).get("run_id")
+                marker_run_matches = True
+                if selected_attempt_run_id:
+                    marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
+                if faces_path.exists() and marker_status == "success" and not marker_error and marker_run_matches:
+                    LOGGER.info("[AUTORUN] Marker+faces.jsonl validated; synthesizing summary")
+                    summary = {"status": "completed", "fallback": True}
+
+            if _summary_status_ok(summary) and not error_message:
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.session_state[f"{ep_id}::faces_completed_at"] = time.time()  # Bug 4 fix: Use timestamp
                 # Invalidate ALL caches to force fresh status on next page load
@@ -4790,7 +5555,7 @@ with col_cluster:
     # This handles the final phase where cluster completes and marks auto-run done
     _cluster_just_completed_key = f"{ep_id}::cluster_just_completed"
     if st.session_state.get(_cluster_just_completed_key):
-        LOGGER.info("[AUTORUN] Detected cluster_just_completed flag, finalizing auto-run")
+        LOGGER.info("[AUTORUN] Detected cluster_just_completed flag")
         # Clear the flag to prevent re-processing
         st.session_state.pop(_cluster_just_completed_key, None)
         # Get the summary that was stored
@@ -4821,34 +5586,31 @@ with col_cluster:
                 completed.append(stage_label)
                 st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
 
-            # Trigger PDF export before marking auto-run complete (idempotent)
-            if selected_attempt_run_id:
-                with st.spinner("Generating PDF report..."):
-                    pdf_success, pdf_msg = _trigger_pdf_export_if_needed(
-                        ep_id, selected_attempt_run_id, cfg
-                    )
-                if pdf_success:
-                    st.success(f"📄 {pdf_msg}")
-                    # Add PDF stage to completed stages
-                    pdf_stage = "PDF Export"
-                    if pdf_stage not in completed:
-                        completed.append(pdf_stage)
-                        st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
-                else:
-                    st.warning(f"⚠️ {pdf_msg}")
-            else:
-                LOGGER.warning("[AUTORUN] No run_id available for PDF export")
-
-            # Mark auto-run complete
-            st.session_state[_autorun_key] = False
-            st.session_state[_autorun_phase_key] = None
+            next_phase = "body_tracking" if body_tracking_enabled else "screentime"
+            st.session_state[_autorun_phase_key] = next_phase
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            LOGGER.info("[AUTORUN] Auto-run pipeline complete via completion flag")
-            st.success("🎉 **Auto-Run Pipeline Complete!** All phases finished successfully.")
+            LOGGER.info("[AUTORUN] Cluster complete -> advancing to %s", next_phase)
+            st.toast(f"✅ Cluster complete - advancing to {next_phase.replace('_', ' ').title()}...")
             st.rerun()
 
     st.markdown("### Cluster Identities")
     st.caption(_format_phase_status("Cluster Identities", cluster_phase_status, "identities"))
+
+    # If we just ran a recluster sweep, surface deltas against the captured baseline.
+    _recluster_prefix = f"{ep_id}::{selected_attempt_run_id}::recluster"
+    recluster_baseline = st.session_state.get(f"{_recluster_prefix}::baseline")
+    if isinstance(recluster_baseline, dict) and cluster_status_value == "success":
+        before_frac = helpers.coerce_float(recluster_baseline.get("singleton_fraction_after"))
+        after_frac = helpers.coerce_float(cluster_phase_status.get("singleton_fraction_after"))
+        before_thresh = helpers.coerce_float(recluster_baseline.get("cluster_thresh"))
+        after_thresh = helpers.coerce_float(cluster_phase_status.get("cluster_thresh"))
+        if before_frac is not None and after_frac is not None:
+            delta = after_frac - before_frac
+            st.caption(
+                f"Recluster delta: singleton_fraction_after {before_frac:.1%} → {after_frac:.1%} ({delta:+.1%})"
+            )
+        if before_thresh is not None and after_thresh is not None and before_thresh != after_thresh:
+            st.caption(f"Recluster delta: cluster_thresh {before_thresh:.2f} → {after_thresh:.2f}")
 
     # Show running job progress if a job is active
     # Skip if we already marked this job as complete (prevents infinite refresh loop)
@@ -4867,28 +5629,23 @@ with col_cluster:
             st.session_state[cluster_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            # Trigger Improve Faces when cluster finishes (run-scoped).
-            if selected_attempt_run_id:
+            autorun_cluster_active = bool(st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster")
+            # Trigger Improve Faces when cluster finishes (run-scoped), but defer during Auto-Run
+            # so downstream stages (screentime/PDF) can complete without st.stop().
+            if selected_attempt_run_id and not autorun_cluster_active:
                 st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
 
-            # Check if auto-run is active - this is the final phase, trigger PDF export and mark complete
-            if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
-                # Trigger PDF export before marking auto-run complete (idempotent)
-                if selected_attempt_run_id:
-                    with st.spinner("Generating PDF report..."):
-                        pdf_success, pdf_msg = _trigger_pdf_export_if_needed(
-                            ep_id, selected_attempt_run_id, cfg
-                        )
-                    if pdf_success:
-                        st.success(f"📄 {pdf_msg}")
-                    else:
-                        st.warning(f"⚠️ {pdf_msg}")
-                st.success("🎉 **Auto-Run Pipeline Complete!** All phases finished successfully.")
-                st.session_state[_autorun_key] = False
-                st.session_state[_autorun_phase_key] = None
+            # Auto-run: advance to downstream stages after clustering finishes.
+            if autorun_cluster_active:
+                next_phase = "body_tracking" if body_tracking_enabled else "screentime"
+                st.session_state[_autorun_phase_key] = next_phase
+                st.toast(f"✅ Cluster complete - advancing to {next_phase.replace('_', ' ').title()}...")
             # Trigger Improve Faces modal on this page (not redirect)
             if selected_attempt_run_id:
-                st.caption("Opening Improve Faces...")
+                if autorun_cluster_active:
+                    st.caption("Cluster complete (Auto-Run). Continuing downstream stages before Improve Faces.")
+                else:
+                    st.caption("Opening Improve Faces...")
             else:
                 st.caption("Cluster complete (legacy run). Select a run-scoped attempt (run_id) to use Improve Faces.")
             time.sleep(0.3)
@@ -5115,7 +5872,9 @@ with col_cluster:
                 st.markdown("**Disabled because:**")
                 reasons = []
                 if not effective_faces_ready:
-                    reasons.append(f"- faces not ready (faces_ready={faces_ready}, faces_just_completed={faces_just_completed})")
+                    reasons.append(
+                        f"- faces not ready (faces_ready={faces_ready}, faces_just_completed={faces_just_completed})"
+                    )
                 if not detector_face_only:
                     reasons.append(f"- detector not face-only ({detector_face_only=})")
                 if not effective_tracks_ready_for_cluster:
@@ -5129,14 +5888,55 @@ with col_cluster:
                 if not combo_supported_cluster:
                     reasons.append(f"- combo not supported ({combo_supported_cluster=})")
                 if effective_faces_stale:
-                    reasons.append(f"- faces stale (faces_status_value={faces_status_value}, faces_just_completed={faces_just_completed})")
+                    reasons.append(
+                        f"- faces stale (faces_status_value={faces_status_value}, faces_just_completed={faces_just_completed})"
+                    )
                 if cluster_status_value == "running":
                     reasons.append(f"- cluster status is 'running' ({cluster_status_value=})")
                 if running_cluster_job is not None:
                     reasons.append(f"- cluster job already running ({running_cluster_job=})")
                 st.code("\n".join(reasons) if reasons else "No specific reason found", language="text")
 
-    should_run_cluster = st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled)
+    # Quick recluster control (cluster_thresh sweep entrypoint).
+    quick_recluster_disabled = cluster_disabled or (not bool(selected_attempt_run_id))
+    quick_thresh_options = [0.45, 0.50, 0.52, 0.55, 0.60, 0.65, 0.70]
+    try:
+        current_thresh = float(cluster_thresh_value)
+    except (TypeError, ValueError):
+        current_thresh = None
+    if current_thresh is not None:
+        quick_thresh_options.append(round(current_thresh, 2))
+    quick_thresh_options = sorted({round(float(v), 2) for v in quick_thresh_options})
+    quick_thresh_default = round(current_thresh, 2) if current_thresh is not None else quick_thresh_options[0]
+    quick_thresh = st.selectbox(
+        "Quick recluster: cluster_thresh override",
+        quick_thresh_options,
+        index=quick_thresh_options.index(quick_thresh_default) if quick_thresh_default in quick_thresh_options else 0,
+        key=f"{_recluster_prefix}::cluster_thresh_override",
+        disabled=quick_recluster_disabled,
+    )
+    quick_recluster_clicked = st.button(
+        f"Recluster with cluster_thresh={float(quick_thresh):.2f}",
+        use_container_width=True,
+        disabled=quick_recluster_disabled,
+        type="secondary",
+        help="Select a run-scoped attempt (run_id) to use quick recluster." if not selected_attempt_run_id else None,
+        key=f"{_recluster_prefix}::quick_recluster",
+    )
+    run_cluster_clicked = st.button("Run Cluster", use_container_width=True, disabled=cluster_disabled)
+
+    if quick_recluster_clicked:
+        # Capture baseline metrics for delta display.
+        st.session_state[f"{_recluster_prefix}::baseline"] = {
+            "cluster_thresh": helpers.coerce_float(cluster_phase_status.get("cluster_thresh")),
+            "singleton_fraction_after": helpers.coerce_float(cluster_phase_status.get("singleton_fraction_after")),
+            "captured_at": time.time(),
+        }
+        # Apply override to session-scoped cluster settings so the payload uses it.
+        st.session_state[_get_pipeline_settings_key(ep_id, "cluster", "cluster_thresh")] = float(quick_thresh)
+        cluster_thresh_value = float(quick_thresh)
+
+    should_run_cluster = bool(quick_recluster_clicked or run_cluster_clicked)
 
     # Auto-run trigger: simulate button click if auto-run is active and not disabled
     if autorun_cluster_trigger:
@@ -5243,7 +6043,10 @@ with col_cluster:
                 # Invalidate running jobs cache to ensure fresh state
                 helpers.invalidate_running_jobs_cache(ep_id)
                 _cached_local_jobs.clear()
-                if st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster":
+                autorun_cluster_active = bool(
+                    st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster"
+                )
+                if autorun_cluster_active:
                     # Log completed stage with counts from summary
                     normalized = helpers.normalize_summary(ep_id, summary)
                     identities_count = normalized.get("identities")
@@ -5253,10 +6056,9 @@ with col_cluster:
                     fc_count = faces_count if isinstance(faces_count, int) else "?"
                     completed.append(f"Clustering ({id_count} identities, {fc_count} faces)")
                     st.session_state[f"{ep_id}::autorun_completed_stages"] = completed
-                    st.session_state[_autorun_key] = False
-                    st.session_state[_autorun_phase_key] = None
-                    # Don't navigate away - let Improve Faces modal show on this page
-                    st.toast("🎉 Auto-Run Pipeline Complete! Opening Improve Faces...")
+                    next_phase = "body_tracking" if body_tracking_enabled else "screentime"
+                    st.session_state[_autorun_phase_key] = next_phase
+                    st.toast(f"✅ Cluster complete - advancing to {next_phase.replace('_', ' ').title()}...")
 
             if error_message:
                 # Bug 2 fix: Stop auto-run on error to prevent getting stuck
@@ -5295,14 +6097,15 @@ with col_cluster:
 
                 # Build completion flash message
                 completed = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
-                if completed:
-                    completion_summary = " → ".join([s.split(" (")[0] for s in completed])
-                    flash_msg = f"Auto-Run Pipeline Complete! ({completion_summary}) " + flash_msg
+                # Downstream stages run after cluster; do not mark Auto-Run complete here.
 
                 st.session_state["episode_detail_flash"] = flash_msg
 
                 # Trigger Improve Faces modal on this page (not redirect)
-                if selected_attempt_run_id:
+                autorun_cluster_active = bool(
+                    st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster"
+                )
+                if selected_attempt_run_id and not autorun_cluster_active:
                     st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
                     LOGGER.info(
                         "[CLUSTER_COMPLETE] Set trigger flag for Improve Faces modal, ep_id=%s run_id=%s",
@@ -5310,6 +6113,8 @@ with col_cluster:
                         selected_attempt_run_id,
                     )
                     st.toast("🎯 Cluster complete! Opening Improve Faces...")
+                elif autorun_cluster_active:
+                    st.toast("✅ Cluster complete (Auto-Run). Continuing downstream stages…")
                 else:
                     st.toast("🎯 Cluster complete! Select a run-scoped attempt (run_id) to use Improve Faces.")
                 st.rerun()
@@ -5361,6 +6166,136 @@ with col_cluster:
                 st.rerun()
 
     st.divider()
+
+st.subheader("Downstream Pipeline")
+if not selected_attempt_run_id:
+    st.info("Select a non-legacy attempt (run_id) to run body tracking, fusion, screentime analysis, and PDF export.")
+else:
+    st.caption(f"Downstream run_id: `{selected_attempt_run_id}`")
+    downstream_cols = st.columns(4)
+
+    with downstream_cols[0]:
+        st.markdown("#### Body Tracking")
+        st.caption(f"Status: `{body_tracking_status_value}`")
+        if body_tracking_error:
+            st.caption(f"Error: {body_tracking_error}")
+        if not body_tracking_enabled:
+            st.caption("Disabled by config/env (AUTO_RUN_BODY_TRACKING).")
+        body_tracking_btn_label = "Run" if body_tracking_status_value in {"missing", "stale"} else "Rerun"
+        body_tracking_btn_disabled = job_running or not body_tracking_enabled or not local_video_exists
+        if st.button(
+            f"🏃 {body_tracking_btn_label}",
+            key=f"{ep_id}::{selected_attempt_run_id}::body_tracking_run",
+            use_container_width=True,
+            disabled=body_tracking_btn_disabled,
+        ):
+            try:
+                helpers.api_post(
+                    "/jobs/body_tracking/run",
+                    json={"ep_id": ep_id, "run_id": selected_attempt_run_id},
+                    timeout=15,
+                )
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.toast("Queued body tracking job")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to start body tracking: {exc}")
+
+    with downstream_cols[1]:
+        st.markdown("#### Track Fusion")
+        st.caption(f"Status: `{body_fusion_status_value}`")
+        if fusion_mode_label:
+            st.caption(f"Fusion mode: **{fusion_mode_label}**")
+        if fusion_mode_detail:
+            st.caption(f"Mode detail: {fusion_mode_detail}")
+        if body_fusion_error:
+            st.caption(f"Error: {body_fusion_error}")
+        if not track_fusion_enabled:
+            st.caption("Disabled by config (track_fusion.enabled) or body tracking disabled.")
+        fusion_prereqs_ok = faces_path.exists() and body_tracks_path.exists()
+        if not fusion_prereqs_ok and track_fusion_enabled:
+            missing_bits = []
+            if not faces_path.exists():
+                missing_bits.append("faces.jsonl")
+            if not body_tracks_path.exists():
+                missing_bits.append("body_tracking/body_tracks.jsonl")
+            st.caption(f"Missing prerequisites: {', '.join(missing_bits)}")
+        fusion_btn_label = "Run" if body_fusion_status_value in {"missing", "stale"} else "Rerun"
+        fusion_btn_disabled = (
+            job_running or not track_fusion_enabled or not fusion_prereqs_ok
+        )
+        if st.button(
+            f"🔗 {fusion_btn_label}",
+            key=f"{ep_id}::{selected_attempt_run_id}::body_fusion_run",
+            use_container_width=True,
+            disabled=fusion_btn_disabled,
+        ):
+            try:
+                helpers.api_post(
+                    "/jobs/body_tracking/fusion",
+                    json={"ep_id": ep_id, "run_id": selected_attempt_run_id},
+                    timeout=15,
+                )
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.toast("Queued track fusion job")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to start track fusion: {exc}")
+
+    with downstream_cols[2]:
+        st.markdown("#### Screentime Analyze")
+        st.caption(f"Status: `{screentime_status_value}`")
+        if screentime_error:
+            st.caption(f"Error: {screentime_error}")
+        screentime_btn_label = "Run" if screentime_status_value in {"missing", "error"} else "Rerun"
+        screentime_btn_disabled = job_running or not bool(selected_attempt_run_id)
+        if st.button(
+            f"🧮 {screentime_btn_label}",
+            key=f"{ep_id}::{selected_attempt_run_id}::screentime_analyze",
+            use_container_width=True,
+            disabled=screentime_btn_disabled,
+        ):
+            try:
+                resp = helpers.api_post(
+                    "/jobs/screen_time/analyze",
+                    json={"ep_id": ep_id, "run_id": selected_attempt_run_id},
+                    timeout=15,
+                )
+                job_id = resp.get("job_id")
+                if job_id:
+                    st.session_state[f"{ep_id}::screentime_job"] = job_id
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.toast("Queued screentime analysis job")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to start screentime analysis: {exc}")
+
+    with downstream_cols[3]:
+        st.markdown("#### PDF Export")
+        st.caption(f"Status: `{pdf_export_status_value}`")
+        if pdf_export_detail:
+            st.caption(pdf_export_detail)
+        pdf_btn_label = "Export" if pdf_export_status_value != "success" else "Re-export"
+        pdf_btn_disabled = job_running or not bool(selected_attempt_run_id)
+        if st.button(
+            f"📄 {pdf_btn_label}",
+            key=f"{ep_id}::{selected_attempt_run_id}::pdf_export",
+            use_container_width=True,
+            disabled=pdf_btn_disabled,
+        ):
+            with st.spinner("Generating PDF report..."):
+                ok, msg = _trigger_pdf_export_if_needed(
+                    ep_id,
+                    selected_attempt_run_id,
+                    cfg,
+                    force=bool(pdf_export_status_value == "success"),
+                )
+            if ok:
+                st.success(msg)
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.rerun()
+            else:
+                st.error(msg)
 
 st.subheader("Debug / Export")
 
