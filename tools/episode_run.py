@@ -1770,11 +1770,17 @@ class PersonFallbackDetector:
         self.face_region_ratio = face_region_ratio
         self.max_detections = max_detections
         self._model = None
+        self._load_attempted = False
+        self._load_error: str | None = None
+        self._load_status: str = "uninitialized"
+        self.invocations = 0
+        self.detections_emitted = 0
 
     def _lazy_model(self):
         """Lazily load YOLO model on first use."""
-        if self._model is not None:
+        if self._load_attempted:
             return self._model
+        self._load_attempted = True
         try:
             from ultralytics import YOLO
 
@@ -1784,10 +1790,35 @@ class PersonFallbackDetector:
             if self.device and self.device != "cpu":
                 self._model.to(self.device)
             LOGGER.info("Loaded YOLOv8n for person fallback detection on device=%s", self.device)
+            self._load_status = "ok"
+            self._load_error = None
+        except ModuleNotFoundError as exc:
+            self._load_status = "error"
+            if getattr(exc, "name", None) == "ultralytics":
+                self._load_error = "ultralytics_missing"
+            else:
+                self._load_error = f"import_error: {exc}"
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", self._load_error)
+            self._model = None
+        except ImportError as exc:
+            self._load_status = "error"
+            self._load_error = f"ultralytics_import_error: {exc}"
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", self._load_error)
+            self._model = None
         except Exception as exc:
-            LOGGER.warning("Failed to load YOLO for person fallback: %s", exc)
+            self._load_status = "error"
+            self._load_error = f"yolo_load_error: {type(exc).__name__}: {exc}"
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", self._load_error)
             self._model = None
         return self._model
+
+    @property
+    def load_status(self) -> str:
+        return self._load_status
+
+    @property
+    def load_error(self) -> str | None:
+        return self._load_error
 
     def detect_persons(self, image: np.ndarray) -> list[DetectionSample]:
         """Detect persons and return estimated face regions.
@@ -1801,6 +1832,7 @@ class PersonFallbackDetector:
         if not PERSON_FALLBACK_ENABLED:
             return []
 
+        self.invocations += 1
         model = self._lazy_model()
         if model is None:
             return []
@@ -1858,6 +1890,7 @@ class PersonFallbackDetector:
                 )
 
             LOGGER.debug("Person fallback: found %d estimated faces from %d persons", len(detections), len(boxes))
+            self.detections_emitted += len(detections)
             return detections
 
         except Exception as exc:
@@ -6658,6 +6691,23 @@ def _run_full_pipeline(
     final_diag_stats["torch_device_resolved"] = torch_device_resolved
     final_diag_stats["torch_device_fallback_reason"] = torch_device_reason
 
+    # YOLO/person fallback diagnostics (torch-backed; should never receive "coreml" as a torch device).
+    final_diag_stats["yolo_fallback_enabled"] = bool(PERSON_FALLBACK_ENABLED)
+    if person_fallback_detector is None:
+        final_diag_stats["yolo_fallback_device"] = None
+        final_diag_stats["yolo_fallback_load_status"] = "disabled" if not PERSON_FALLBACK_ENABLED else "not_initialized"
+        final_diag_stats["yolo_fallback_disabled_reason"] = "disabled" if not PERSON_FALLBACK_ENABLED else None
+        final_diag_stats["yolo_fallback_invocations"] = 0
+        final_diag_stats["yolo_fallback_detections_added"] = 0
+    else:
+        final_diag_stats["yolo_fallback_device"] = str(getattr(person_fallback_detector, "device", "")).strip() or None
+        final_diag_stats["yolo_fallback_load_status"] = getattr(person_fallback_detector, "load_status", "unknown")
+        final_diag_stats["yolo_fallback_disabled_reason"] = getattr(person_fallback_detector, "load_error", None)
+        final_diag_stats["yolo_fallback_invocations"] = int(getattr(person_fallback_detector, "invocations", 0) or 0)
+        final_diag_stats["yolo_fallback_detections_added"] = int(
+            getattr(person_fallback_detector, "detections_emitted", 0) or 0
+        )
+
     # CRITICAL: Validate that tracking produced results when detections exist
     if det_count > 0 and len(track_rows) == 0:
         cfg = tracker_config_summary or {}
@@ -7508,6 +7558,12 @@ def _run_detect_track_stage(
                 "torch_device_requested": runtime_stats.get("torch_device_requested"),
                 "torch_device_resolved": runtime_stats.get("torch_device_resolved"),
                 "torch_device_fallback_reason": runtime_stats.get("torch_device_fallback_reason"),
+                "yolo_fallback_enabled": runtime_stats.get("yolo_fallback_enabled"),
+                "yolo_fallback_device": runtime_stats.get("yolo_fallback_device"),
+                "yolo_fallback_load_status": runtime_stats.get("yolo_fallback_load_status"),
+                "yolo_fallback_disabled_reason": runtime_stats.get("yolo_fallback_disabled_reason"),
+                "yolo_fallback_invocations": runtime_stats.get("yolo_fallback_invocations"),
+                "yolo_fallback_detections_added": runtime_stats.get("yolo_fallback_detections_added"),
                 "tracking_gate": {
                     "enabled": bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT)),
                     "auto_rerun": gate_auto_rerun,
