@@ -958,6 +958,82 @@ def pick_device(explicit: str | None = None) -> str:
     return "cpu"
 
 
+def resolve_device(device: str | None = None, logger: logging.Logger | None = None) -> str:
+    """Resolve a torch-compatible device string for torch-backed models.
+
+    NOTE: This is intentionally torch-centric (cpu/cuda/mps). ONNX providers are tracked separately.
+    """
+    _requested, resolved, reason = _resolve_torch_device_request(device)
+    if logger and reason:
+        logger.info("[device] resolved=%s (reason=%s requested=%s)", resolved, reason, device)
+    return resolved
+
+
+def _onnx_provider_label(device: str | None) -> str:
+    """Normalize a device selection into ONNX provider semantics for diagnostics."""
+    normalized = (device or "auto").strip().lower()
+    if normalized in {"0", "cuda", "gpu"}:
+        return "cuda"
+    if normalized in {"coreml", "mps", "metal", "apple"}:
+        return "coreml"
+    if normalized == "cpu":
+        return "cpu"
+    return "auto"
+
+
+def _resolve_torch_device_request(device: str | None) -> tuple[str, str, str | None]:
+    """Resolve a torch device string from a pipeline device request.
+
+    - ONNX providers allow "coreml"; torch does not. Map "coreml" → "mps" (else "cpu") and record why.
+    """
+    requested_raw = (device or "auto").strip().lower()
+
+    def _has_cuda() -> bool:
+        try:
+            import torch  # type: ignore
+
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _has_mps() -> bool:
+        try:
+            import torch  # type: ignore
+
+            mps = getattr(torch.backends, "mps", None)
+            return bool(mps is not None and mps.is_available())
+        except Exception:
+            return False
+
+    if requested_raw in {"0", "cuda", "gpu"}:
+        requested = "cuda"
+        if _has_cuda():  # pragma: no cover - depends on env
+            return requested, "cuda", None
+        return requested, "cpu", "CUDA requested but not available; using cpu"
+
+    if requested_raw in {"mps", "metal", "apple"}:
+        requested = "mps"
+        if _has_mps():  # pragma: no cover - mac only
+            return requested, "mps", None
+        return requested, "cpu", "MPS requested but not available; using cpu"
+
+    if requested_raw == "coreml":
+        requested = "mps"
+        if _has_mps():  # pragma: no cover - mac only
+            return requested, "mps", "CoreML requested; torch models run on mps"
+        return requested, "cpu", "CoreML requested; mps not available; torch models run on cpu"
+
+    if requested_raw == "cpu":
+        return "cpu", "cpu", None
+
+    # auto (or unknown): prefer CUDA, then MPS, then CPU.
+    if _has_cuda():  # pragma: no cover - depends on env
+        return "cuda", "cuda", "auto: selected cuda"
+    if _has_mps():  # pragma: no cover - mac only
+        return "mps", "mps", "auto: selected mps"
+    return "cpu", "cpu", "auto: selected cpu"
+
+
 def _normalize_detector_choice(detector: str | None) -> str:
     if detector:
         value = detector.strip().lower()
@@ -1788,6 +1864,10 @@ def _build_person_fallback_detector(device: str) -> PersonFallbackDetector | Non
     """Build person fallback detector if enabled in config."""
     if not PERSON_FALLBACK_ENABLED:
         return None
+    # Guardrail: torch does not accept "coreml" as a device string.
+    if device.strip().lower() == "coreml":
+        _requested, resolved, _reason = _resolve_torch_device_request("coreml")
+        device = resolved
     return PersonFallbackDetector(
         device=device,
         confidence_thresh=PERSON_FALLBACK_CONFIDENCE_TH,
@@ -5578,6 +5658,8 @@ def _run_full_pipeline(
         return value, meta
 
     device = pick_device(args.device)
+    onnx_provider_requested = _onnx_provider_label(args.device)
+    torch_device_requested, torch_device_resolved, torch_device_reason = _resolve_torch_device_request(args.device)
     detector_choice = _normalize_detector_choice(getattr(args, "detector", None))
     tracker_choice = _normalize_tracker_choice(getattr(args, "tracker", None))
     args.detector = detector_choice
@@ -5599,10 +5681,17 @@ def _run_full_pipeline(
     detector_backend.ensure_ready()
     detector_device = getattr(detector_backend, "resolved_device", device)
 
-    # Initialize person fallback detector if enabled
-    person_fallback_detector = _build_person_fallback_detector(detector_device)
+    # Initialize person fallback detector if enabled (torch-backed)
+    person_fallback_detector = _build_person_fallback_detector(torch_device_resolved)
     if person_fallback_detector:
-        LOGGER.info("Person fallback detector initialized for wide shot detection")
+        if torch_device_reason:
+            LOGGER.info(
+                "Person fallback detector initialized (torch_device=%s, reason=%s)",
+                torch_device_resolved,
+                torch_device_reason,
+            )
+        else:
+            LOGGER.info("Person fallback detector initialized (torch_device=%s)", torch_device_resolved)
 
     tracker_label = tracker_choice
     if progress:
@@ -6493,7 +6582,25 @@ def _run_full_pipeline(
     final_diag_stats["video_duration_est_s"] = round(float(video_duration_est_s), 3) if video_duration_est_s is not None else None
     final_diag_stats["scene_detect_wall_time_s"] = round(float(scene_detect_duration), 3)
     final_diag_stats["scene_cuts_total"] = int(len(scene_cuts))
+    final_diag_stats["scene_cut_count"] = int(len(scene_cuts))
     final_diag_stats["scene_warmup_dets"] = int(scene_warmup)
+    if frames_sampled_stride > 0:
+        final_diag_stats["forced_scene_warmup_ratio"] = round(frames_sampled_forced_scene_warmup / frames_sampled_stride, 6)
+    else:
+        final_diag_stats["forced_scene_warmup_ratio"] = None
+    final_diag_stats["warmup_frames_per_cut_effective"] = (
+        round(frames_sampled_forced_scene_warmup / max(len(scene_cuts), 1), 6) if scene_cuts else 0.0
+    )
+    final_diag_stats["wall_time_per_processed_frame_s"] = (
+        round(float(detect_track_duration) / max(frames_sampled, 1), 9) if detect_track_duration is not None else None
+    )
+
+    # Device semantics: ONNX provider vs torch device (avoid "coreml" being treated as torch device).
+    final_diag_stats["onnx_provider_requested"] = onnx_provider_requested
+    final_diag_stats["onnx_provider_resolved"] = str(detector_device or "").strip() or None
+    final_diag_stats["torch_device_requested"] = torch_device_requested
+    final_diag_stats["torch_device_resolved"] = torch_device_resolved
+    final_diag_stats["torch_device_fallback_reason"] = torch_device_reason
 
     # CRITICAL: Validate that tracking produced results when detections exist
     if det_count > 0 and len(track_rows) == 0:
@@ -7267,6 +7374,10 @@ def _run_detect_track_stage(
                 "scene_threshold": args.scene_threshold,
                 "scene_min_len": args.scene_min_len,
                 "scene_warmup_dets": args.scene_warmup_dets,
+                "scene_cut_count": runtime_stats.get("scene_cut_count"),
+                "warmup_frames_per_cut_effective": runtime_stats.get("warmup_frames_per_cut_effective"),
+                "forced_scene_warmup_ratio": runtime_stats.get("forced_scene_warmup_ratio"),
+                "wall_time_per_processed_frame_s": runtime_stats.get("wall_time_per_processed_frame_s"),
                 "track_high_thresh": getattr(args, "track_high_thresh", None),
                 "new_track_thresh": getattr(args, "new_track_thresh", None),
                 "fps": analyzed_fps,
@@ -7278,6 +7389,11 @@ def _run_detect_track_stage(
                 "device": pipeline_device,
                 "requested_device": args.device,
                 "resolved_device": detector_device,
+                "onnx_provider_requested": runtime_stats.get("onnx_provider_requested") or _onnx_provider_label(args.device),
+                "onnx_provider_resolved": runtime_stats.get("onnx_provider_resolved") or detector_device,
+                "torch_device_requested": runtime_stats.get("torch_device_requested"),
+                "torch_device_resolved": runtime_stats.get("torch_device_resolved"),
+                "torch_device_fallback_reason": runtime_stats.get("torch_device_fallback_reason"),
                 "tracking_gate": {
                     "enabled": bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT)),
                     "auto_rerun": gate_auto_rerun,
