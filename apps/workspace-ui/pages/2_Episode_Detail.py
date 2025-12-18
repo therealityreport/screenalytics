@@ -25,6 +25,7 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.append(str(WORKSPACE_DIR))
 
 import ui_helpers as helpers  # noqa: E402
+import episode_detail_layout as stage_layout  # noqa: E402
 
 from py_screenalytics.artifacts import get_path  # noqa: E402
 from py_screenalytics import run_layout  # noqa: E402
@@ -3093,6 +3094,22 @@ if not detect_phase_status and manifest_state["manifest_ready"]:
         tracks_ready = True
         using_manifest_fallback = True
 
+autorun_phase_raw = st.session_state.get(f"{ep_id}::autorun_phase")
+autorun_active_now = bool(st.session_state.get(f"{ep_id}::autorun_pipeline"))
+stage_card_layout = stage_layout.get_stage_card_layout(autorun_phase_raw)
+active_stage_key = stage_layout.normalize_stage_key(autorun_phase_raw)
+body_tracking_started_at = (body_tracking_marker_payload or {}).get("started_at")
+body_tracking_finished_at = (body_tracking_marker_payload or {}).get("finished_at")
+body_tracking_runtime = _format_runtime(_runtime_from_iso(body_tracking_started_at, body_tracking_finished_at))
+body_detections_count = _count_manifest_rows(body_detections_path)
+body_tracks_count = _count_manifest_rows(body_tracks_path)
+
+track_fusion_started_at = (body_fusion_marker_payload or {}).get("started_at")
+track_fusion_finished_at = (body_fusion_marker_payload or {}).get("finished_at")
+track_fusion_runtime = _format_runtime(_runtime_from_iso(track_fusion_started_at, track_fusion_finished_at))
+track_fusion_faces_ready = faces_path.exists()
+track_fusion_body_tracks_ready = body_tracks_path.exists()
+
 # Add pipeline state indicators (even if status API is temporarily unavailable)
 with st.expander("Pipeline Status", expanded=False):
     if st.button("Refresh status", key="episode_status_refresh", use_container_width=True):
@@ -3379,6 +3396,7 @@ with st.expander("Pipeline Status", expanded=False):
             st.caption("Run Duration: n/a")
 
     with col2:
+        st.markdown('<a name="faces-harvest-card"></a>', unsafe_allow_html=True)
         faces_params: list[str] = []
         faces_device_state = faces_phase_status.get("device")
         faces_device_request = faces_phase_status.get("requested_device")
@@ -3587,6 +3605,107 @@ with st.expander("Pipeline Status", expanded=False):
             st.caption("Run Duration: n/a")
 
 
+if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in stage_card_layout.primary_stage_keys:
+    downstream_col1, downstream_col2 = st.columns(2)
+    with downstream_col1:
+        if not body_tracking_enabled:
+            st.info("⏳ **Body Tracking**: Disabled")
+            if selected_attempt_run_id:
+                st.caption("Disabled by config/env (AUTO_RUN_BODY_TRACKING).")
+            else:
+                st.caption("Select a run-scoped attempt (run_id) to enable body tracking.")
+        elif body_tracking_status_value == "success":
+            runtime_label = body_tracking_runtime or "n/a"
+            st.success(f"✅ **Body Tracking**: Complete (Runtime: {runtime_label})")
+            if body_detections_count is not None:
+                st.caption(f"Body detections: {body_detections_count:,}")
+            if body_tracks_count is not None:
+                st.caption(f"Body tracks: {body_tracks_count:,}")
+        elif body_tracking_status_value == "running":
+            st.info("⏳ **Body Tracking**: Running")
+            started = _format_timestamp(body_tracking_started_at)
+            if started:
+                st.caption(f"Started at {started}")
+            st.caption("Live progress appears in the log panel below.")
+        elif body_tracking_status_value in {"error", "failed"}:
+            st.error("⚠️ **Body Tracking**: Failed")
+            if body_tracking_error:
+                st.caption(body_tracking_error)
+        elif body_tracking_status_value not in {"missing", "unknown"}:
+            st.warning(f"⚠️ **Body Tracking**: {body_tracking_status_value.title()}")
+        else:
+            st.info("⏳ **Body Tracking**: Not started")
+            st.caption("Run body tracking to generate body tracks.")
+        finished = _format_timestamp(body_tracking_finished_at)
+        if finished:
+            st.caption(f"Last run: {finished}")
+        if body_tracking_runtime:
+            st.caption(f"Run Duration: {body_tracking_runtime}")
+        elif body_tracking_status_value == "success":
+            st.caption("Run Duration: n/a")
+
+    with downstream_col2:
+        if not track_fusion_enabled:
+            st.info("⏳ **Track Fusion**: Disabled")
+            if selected_attempt_run_id:
+                st.caption("Disabled by config (track_fusion.enabled) or body tracking disabled.")
+            else:
+                st.caption("Select a run-scoped attempt (run_id) to enable track fusion.")
+        elif body_fusion_status_value == "success":
+            runtime_label = track_fusion_runtime or "n/a"
+            st.success(f"✅ **Track Fusion**: Complete (Runtime: {runtime_label})")
+            if track_fusion_path.exists():
+                st.caption(f"Fusion output: {helpers.link_local(track_fusion_path)}")
+            if screentime_comparison_path.exists():
+                st.caption(f"Screen time comparison: {helpers.link_local(screentime_comparison_path)}")
+        elif body_fusion_status_value == "running":
+            st.info("⏳ **Track Fusion**: Running")
+            started = _format_timestamp(track_fusion_started_at)
+            if started:
+                st.caption(f"Started at {started}")
+            st.caption("Live progress appears in the log panel below.")
+        elif body_fusion_status_value in {"error", "failed"}:
+            st.error("⚠️ **Track Fusion**: Failed")
+            if body_fusion_error:
+                st.caption(body_fusion_error)
+        elif body_fusion_status_value not in {"missing", "unknown"}:
+            st.warning(f"⚠️ **Track Fusion**: {body_fusion_status_value.title()}")
+        else:
+            if not track_fusion_body_tracks_ready or not track_fusion_faces_ready:
+                st.warning("⚠️ **Track Fusion**: Missing prerequisites")
+                run_label = selected_attempt_run_id or "legacy"
+                if not track_fusion_body_tracks_ready:
+                    st.caption(
+                        f"Run Body Tracking for this run_id (`{run_label}`) to generate "
+                        f"`body_tracking/body_tracks.jsonl`."
+                    )
+                    st.caption(f"Missing: {helpers.link_local(body_tracks_path)}")
+                if not track_fusion_faces_ready:
+                    st.markdown(
+                        f"Run [Faces Harvest](#faces-harvest-card) for this run_id (`{run_label}`) "
+                        "to generate `faces.jsonl`.",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(f"Missing: {helpers.link_local(faces_path)}")
+            else:
+                st.info("⏳ **Track Fusion**: Ready to run")
+                st.caption("Body tracks and faces are available.")
+        finished = _format_timestamp(track_fusion_finished_at)
+        if finished:
+            st.caption(f"Last run: {finished}")
+        if track_fusion_runtime:
+            st.caption(f"Run Duration: {track_fusion_runtime}")
+        elif body_fusion_status_value == "success":
+            st.caption("Run Duration: n/a")
+
+if autorun_active_now and stage_card_layout.show_active_downstream_panel:
+    active_label = stage_layout.stage_label(stage_card_layout.active_downstream_stage)
+    with st.expander("Downstream Stage (Active)", expanded=True):
+        st.markdown(f"**Currently running: {active_label}**")
+        st.caption("Live activity details are available below.")
+        st.markdown("[Jump to logs](#downstream-logs)", unsafe_allow_html=True)
+
+
 detector_override = st.session_state.pop("episode_detail_detector_override", None)
 tracker_override = st.session_state.pop("episode_detail_tracker_override", None)
 device_override = st.session_state.pop("episode_detail_device_override", None)
@@ -3736,23 +3855,16 @@ with st.container():
     auto_col1, auto_col2 = st.columns([3, 1])
     with auto_col1:
         if autorun_active:
-            phase_labels = {
-                "detect": "Detect/Track",
-                "faces": "Faces Harvest",
-                "cluster": "Clustering",
-                "body_tracking": "Body Tracking",
-                "track_fusion": "Track Fusion",
-                "screentime": "Screentime Analyze",
-                "pdf": "PDF Export",
-            }
-            current_phase_label = phase_labels.get(autorun_phase, "Unknown")
+            current_phase_key = stage_layout.normalize_stage_key(autorun_phase)
+            current_phase_label = stage_layout.stage_label(current_phase_key)
             # Get completed stages log
             completed_stages = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
             # Build status display
             status_lines = []
             for stage_info in completed_stages:
                 status_lines.append(f"✅ {stage_info}")
-            status_lines.append(f"🔄 Currently running: {current_phase_label}")
+            if not status_lines:
+                status_lines.append("No stages completed yet.")
             st.info("**Auto-Run Pipeline Active**\n\n" + "\n\n".join(status_lines))
 
             # Progress: count completed enabled stages for the selected run_id.
@@ -3772,10 +3884,32 @@ with st.container():
                 "screentime": screentime_status_value == "success",
                 "pdf": pdf_export_status_value == "success",
             }
-            completed_count = sum(1 for key in stage_plan if done_map.get(key))
-            total_progress = (completed_count / max(len(stage_plan), 1)) if stage_plan else 0.0
+            done_labels = [stage_layout.stage_label(stage) for stage in stage_plan if done_map.get(stage)]
+            completed_count, total_count = stage_layout.progress_counts(done_labels, stage_plan)
+            completed_keys = set(stage_layout.normalize_completed_stages(done_labels))
+
+            current_phase_pct = 0.0
+            _running_jobs = helpers.get_all_running_jobs_for_episode(ep_id)
+            if current_phase_key == "detect" and _running_jobs.get("detect_track"):
+                current_phase_pct = _running_jobs["detect_track"].get("progress_pct", 0) / 100
+            elif current_phase_key == "faces" and _running_jobs.get("faces_embed"):
+                current_phase_pct = _running_jobs["faces_embed"].get("progress_pct", 0) / 100
+            elif current_phase_key == "cluster" and _running_jobs.get("cluster"):
+                current_phase_pct = _running_jobs["cluster"].get("progress_pct", 0) / 100
+
+            if total_count:
+                if current_phase_key in stage_plan and current_phase_key not in completed_keys:
+                    total_progress = (completed_count + current_phase_pct) / total_count
+                else:
+                    total_progress = completed_count / total_count
+            else:
+                total_progress = 0.0
+
             st.progress(min(total_progress, 1.0))
-            st.caption(f"Pipeline: {completed_count}/{len(stage_plan)} stages complete ({int(total_progress * 100)}%)")
+            progress_label = f"Pipeline: {int(total_progress * 100)}% complete"
+            count_label = f"{completed_count}/{total_count} stages complete" if total_count else "Stages: n/a"
+            running_label = f"Currently running: {current_phase_label}"
+            st.caption(f"{progress_label} · {count_label} · {running_label}")
 
             # Timing metrics display (expandable)
             _autorun_run_id = st.session_state.get(_autorun_run_id_key)
@@ -3807,7 +3941,10 @@ with st.container():
                         from autorun_timing import format_timing_duration
                         st.caption(f"Total inter-stage stall: {format_timing_duration(total_stall)}")
         else:
-            st.caption("Run all pipeline stages in sequence: Detect/Track → Faces → Cluster → (Body/Fusion) → Screentime → PDF")
+            st.caption(
+                "Run all pipeline stages in sequence: Detect/Track → Faces → Cluster → "
+                "(Body Tracking/Fusion) → Screentime → PDF"
+            )
     with auto_col2:
         if autorun_active:
             if st.button("⏹️ Stop Auto-Run", key="stop_autorun", use_container_width=True, type="secondary"):
@@ -6165,6 +6302,26 @@ with col_cluster:
                 st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
                 st.rerun()
 
+    st.markdown('<a name="downstream-logs"></a>', unsafe_allow_html=True)
+    st.markdown("#### Downstream Pipeline")
+    downstream_log_col1, downstream_log_col2 = st.columns(2)
+    with downstream_log_col1:
+        with st.expander("Body Tracking Logs", expanded=False):
+            if body_tracking_marker_payload:
+                st.code(json.dumps(body_tracking_marker_payload, indent=2), language="json")
+            elif body_tracks_path.exists():
+                st.caption("Body tracking artifacts are present; no run marker was recorded.")
+            else:
+                st.caption("No body tracking logs available.")
+    with downstream_log_col2:
+        with st.expander("Track Fusion Logs", expanded=False):
+            if body_fusion_marker_payload:
+                st.code(json.dumps(body_fusion_marker_payload, indent=2), language="json")
+            elif track_fusion_path.exists():
+                st.caption("Track fusion output is present; no run marker was recorded.")
+            else:
+                st.caption("No track fusion logs available.")
+
     st.divider()
 
 st.subheader("Downstream Pipeline")
@@ -6214,12 +6371,20 @@ else:
             st.caption("Disabled by config (track_fusion.enabled) or body tracking disabled.")
         fusion_prereqs_ok = faces_path.exists() and body_tracks_path.exists()
         if not fusion_prereqs_ok and track_fusion_enabled:
-            missing_bits = []
+            run_label = selected_attempt_run_id or "legacy"
             if not faces_path.exists():
-                missing_bits.append("faces.jsonl")
+                st.markdown(
+                    f"Run [Faces Harvest](#faces-harvest-card) for this run_id (`{run_label}`) "
+                    "to generate `faces.jsonl`.",
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"Missing: {helpers.link_local(faces_path)}")
             if not body_tracks_path.exists():
-                missing_bits.append("body_tracking/body_tracks.jsonl")
-            st.caption(f"Missing prerequisites: {', '.join(missing_bits)}")
+                st.caption(
+                    f"Run Body Tracking for this run_id (`{run_label}`) to generate "
+                    "`body_tracking/body_tracks.jsonl`."
+                )
+                st.caption(f"Missing: {helpers.link_local(body_tracks_path)}")
         fusion_btn_label = "Run" if body_fusion_status_value in {"missing", "stale"} else "Rerun"
         fusion_btn_disabled = (
             job_running or not track_fusion_enabled or not fusion_prereqs_ok
