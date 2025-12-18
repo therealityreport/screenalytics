@@ -8,7 +8,7 @@ track_fusion:
 # IoU-based association (when face visible)
 iou_association:
   enabled: true
-  iou_threshold: 0.50              # Minimum IoU for face inside body
+  iou_threshold: 0.02              # Minimum IoU for face inside body (face is much smaller than body)
   min_overlap_ratio: 0.7           # Face area overlap with body
 
   # Spatial constraints

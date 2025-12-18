@@ -97,8 +97,15 @@ Compares face-only screen time with face+body screen time.
     "total_identities": 8,
     "identities_with_gain": 6,
     "total_face_only_duration": 125.5,
+    "total_body_duration": 160.2,
+    "total_fused_duration": 115.0,
     "total_combined_duration": 170.7,
     "total_duration_gain": 45.2,
+    "face_total_s": 125.5,
+    "body_total_s": 160.2,
+    "fused_total_s": 115.0,
+    "combined_total_s": 170.7,
+    "gain_total_s": 45.2,
     "avg_duration_gain_pct": 36.0
   },
   "breakdowns": [...]
@@ -168,7 +175,7 @@ performance:
 
 ```yaml
 iou_association:
-  iou_threshold: 0.50
+  iou_threshold: 0.02
   min_overlap_ratio: 0.7
   face_in_upper_body: true    # Face should be in upper 50% of body
 

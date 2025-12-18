@@ -1189,35 +1189,48 @@ def build_screentime_run_debug_pdf(
     track_fusion_config = _load_yaml_config("track_fusion.yaml")
     screentime_config = _load_yaml_config("screen_time_v2.yaml")
 
-    # Load DB data
+    # Load DB data (optional: enabled when DB_URL or SCREENALYTICS_FAKE_DB is configured).
+    db_connected: bool | None = None
     db_error: str | None = None
+    db_not_configured_reason: str | None = None
     run_row: dict[str, Any] | None = None
     job_runs: list[dict[str, Any]] = []
     identity_locks: list[dict[str, Any]] = []
     suggestion_batches: list[dict[str, Any]] = []
     suggestions_rows: list[dict[str, Any]] = []
     suggestion_applies: list[dict[str, Any]] = []
-    try:
-        from apps.api.services.run_persistence import run_persistence_service
 
-        run_row = run_persistence_service.get_run(ep_id=ep_id, run_id=run_id_norm)
-        job_runs = run_persistence_service.list_job_runs(ep_id=ep_id, run_id=run_id_norm)
-        identity_locks = run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
-        suggestion_batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=250)
-        for batch in suggestion_batches:
-            batch_id = batch.get("batch_id") if isinstance(batch, dict) else None
-            if batch_id:
-                suggestions_rows.extend(
-                    run_persistence_service.list_suggestions(
-                        ep_id=ep_id,
-                        run_id=run_id_norm,
-                        batch_id=str(batch_id),
-                        include_dismissed=True,
+    db_url = (os.getenv("DB_URL") or "").strip()
+    fake_db_enabled = (os.getenv("SCREENALYTICS_FAKE_DB") or "").strip() == "1"
+    db_configured = fake_db_enabled or bool(db_url)
+    if not db_configured:
+        db_connected = None
+        db_not_configured_reason = "DB_URL is not set"
+    else:
+        try:
+            from apps.api.services.run_persistence import run_persistence_service
+
+            run_row = run_persistence_service.get_run(ep_id=ep_id, run_id=run_id_norm)
+            job_runs = run_persistence_service.list_job_runs(ep_id=ep_id, run_id=run_id_norm)
+            identity_locks = run_persistence_service.list_identity_locks(ep_id=ep_id, run_id=run_id_norm)
+            suggestion_batches = run_persistence_service.list_suggestion_batches(ep_id=ep_id, run_id=run_id_norm, limit=250)
+            for batch in suggestion_batches:
+                batch_id = batch.get("batch_id") if isinstance(batch, dict) else None
+                if batch_id:
+                    suggestions_rows.extend(
+                        run_persistence_service.list_suggestions(
+                            ep_id=ep_id,
+                            run_id=run_id_norm,
+                            batch_id=str(batch_id),
+                            include_dismissed=True,
+                        )
                     )
-                )
-        suggestion_applies = run_persistence_service.list_suggestion_applies(ep_id=ep_id, run_id=run_id_norm)
-    except Exception as exc:
-        db_error = str(exc)
+            suggestion_applies = run_persistence_service.list_suggestion_applies(ep_id=ep_id, run_id=run_id_norm)
+        except Exception as exc:
+            db_error = str(exc)
+            db_connected = False
+        else:
+            db_connected = True
 
     # Build PDF
     buffer = io.BytesIO()
@@ -1499,8 +1512,6 @@ def build_screentime_run_debug_pdf(
                 if face_tids and body_tids:
                     actual_fused_pairs += 1
 
-    db_connected = db_error is None
-
     # Health status helper
     def _health_status(ok: bool | None) -> str:
         if ok is True:
@@ -1536,10 +1547,16 @@ def build_screentime_run_debug_pdf(
         fused_pairs_ok = actual_fused_pairs > 0
         fused_pairs_detail = f"{actual_fused_pairs} pair(s)"
 
+    if db_connected is True:
+        db_details = "OK"
+    elif db_connected is None:
+        db_details = f"Not configured ({db_not_configured_reason or 'missing DB_URL'})"
+    else:
+        db_details = f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")
+
     health_data = [
         _wrap_row(["Health Check", "Status", "Details"]),
-        _wrap_row(["DB Connected", _health_status(db_connected),
-         "OK" if db_connected else f"Error: {db_error[:50]}..." if db_error and len(db_error) > 50 else (db_error or "Unknown")]),
+        _wrap_row(["DB Connected", _health_status(db_connected), db_details]),
         _wrap_row(["Face Tracks Present", _health_status(face_tracks_present), face_tracks_detail]),
         _wrap_row([
             "Body Tracking Ran (run-scoped)",
@@ -1737,7 +1754,16 @@ def build_screentime_run_debug_pdf(
         ["Git SHA", _get_git_sha()],
         ["Generated At", _now_iso()],
         ["Artifact Store", storage_display],
-        ["DB Connected", "Yes" if db_connected else f"No ({db_error[:40]}...)" if db_error and len(db_error) > 40 else f"No ({db_error or 'unknown'})"],
+        [
+            "DB Connected",
+            "Yes"
+            if db_connected is True
+            else (
+                f"Not configured ({db_not_configured_reason or 'missing DB_URL'})"
+                if db_connected is None
+                else f"No ({db_error[:40]}...)" if db_error and len(db_error) > 40 else f"No ({db_error or 'unknown'})"
+            ),
+        ],
     ]
 
     # Video metadata sources (split, labeled, and validated for mismatches).
@@ -1759,6 +1785,8 @@ def build_screentime_run_debug_pdf(
     marker_fps = None
     marker_frames_total = None
     marker_stride_requested = None
+    marker_gate_enabled: bool | None = None
+    marker_gate_auto_rerun: dict[str, Any] | None = None
     if isinstance(detect_track_marker, dict):
         marker_duration_s = _parse_ffprobe_fraction(detect_track_marker.get("video_duration_sec"))
         marker_fps = _parse_ffprobe_fraction(detect_track_marker.get("fps"))
@@ -1772,6 +1800,14 @@ def build_screentime_run_debug_pdf(
             marker_stride_requested = stride_raw
         elif isinstance(stride_raw, str) and stride_raw.isdigit():
             marker_stride_requested = int(stride_raw)
+        tracking_gate = detect_track_marker.get("tracking_gate")
+        if isinstance(tracking_gate, dict):
+            enabled_raw = tracking_gate.get("enabled")
+            if isinstance(enabled_raw, bool):
+                marker_gate_enabled = enabled_raw
+            auto_rerun_raw = tracking_gate.get("auto_rerun")
+            if isinstance(auto_rerun_raw, dict):
+                marker_gate_auto_rerun = auto_rerun_raw
 
     def _fmt_duration_s(value: float | None) -> str:
         if value is None:
@@ -1845,6 +1881,21 @@ def build_screentime_run_debug_pdf(
         ])
     if marker_stride_requested is not None:
         lineage_data.append(["Face Detection Stride (requested)", str(marker_stride_requested)])
+    if marker_gate_enabled is not None:
+        lineage_data.append(["Appearance Gate Enabled", "true" if marker_gate_enabled else "false"])
+    if marker_gate_auto_rerun is not None:
+        triggered = marker_gate_auto_rerun.get("triggered")
+        selected = marker_gate_auto_rerun.get("selected")
+        reason = marker_gate_auto_rerun.get("reason")
+        if triggered is True:
+            lineage_data.append(
+                [
+                    "Appearance Gate Auto-Rerun",
+                    f"true (selected={selected or 'unknown'}, reason={reason or 'unknown'})",
+                ]
+            )
+        elif triggered is False:
+            lineage_data.append(["Appearance Gate Auto-Rerun", f"false (reason={reason or 'unknown'})"])
 
     def _rel_diff(a: float, b: float) -> float:
         denom = max(abs(a), abs(b))
@@ -2071,6 +2122,12 @@ def build_screentime_run_debug_pdf(
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (tracking.yaml):", subsection_style))
+    gate_enabled_effective: str = str(tracking_config.get("gate_enabled", "N/A"))
+    tracking_gate_meta = metrics.get("tracking_gate") if isinstance(metrics, dict) else None
+    if isinstance(tracking_gate_meta, dict):
+        enabled_raw = tracking_gate_meta.get("enabled")
+        if isinstance(enabled_raw, bool):
+            gate_enabled_effective = ("true" if enabled_raw else "false") + " (effective)"
     track_config_rows = [
         _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
         _wrap_row([
@@ -2099,7 +2156,7 @@ def build_screentime_run_debug_pdf(
         ], cell_style_small),
         _wrap_row([
             "gate_enabled",
-            str(tracking_config.get("gate_enabled", "N/A")),
+            gate_enabled_effective,
             "Appearance-based track splitting",
             "Enable to split when face changes; disable if too many splits",
         ], cell_style_small),
@@ -2479,57 +2536,139 @@ def build_screentime_run_debug_pdf(
     except (TypeError, ValueError):
         upper_body_fraction = 0.5
 
-    overlap_diag = _track_fusion_overlap_diagnostics(
-        face_tracks_path=tracks_path,
-        body_tracks_path=body_tracks_path,
-        iou_threshold=iou_threshold,
-        min_overlap_ratio=min_overlap_ratio,
-        face_in_upper_body=face_in_upper_body,
-        upper_body_fraction=upper_body_fraction,
-    )
+    def _safe_int(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned.isdigit():
+                return int(cleaned)
+        return None
 
-    if overlap_diag.get("ok"):
-        candidates_value = f"{overlap_diag['comparisons_considered']} comparisons"
-        candidates_notes = (
-            f"{overlap_diag['pairs_considered']} pairs across {overlap_diag['frames_with_candidates']} frames"
+    def _format_dist(dist: Any) -> str:
+        if not isinstance(dist, dict):
+            return "N/A"
+        parts: list[str] = []
+        for key in ("min", "median", "p95", "max"):
+            val = dist.get(key)
+            if isinstance(val, (int, float)):
+                parts.append(f"{key}={float(val):.4f}")
+        return " ".join(parts) if parts else "N/A"
+
+    fusion_diag_payload = None
+    if track_fusion_payload is not None:
+        diag_block = track_fusion_payload.get("diagnostics")
+        fusion_diag_payload = diag_block if isinstance(diag_block, dict) else None
+
+    if fusion_diag_payload:
+        candidate_overlaps = _safe_int(fusion_diag_payload.get("candidate_overlaps"))
+        overlap_ratio_pass = _safe_int(fusion_diag_payload.get("overlap_ratio_pass"))
+        iou_pass_count = _safe_int(fusion_diag_payload.get("iou_pass"))
+        iou_pairs_count = _safe_int(fusion_diag_payload.get("iou_pairs"))
+        reid_pairs_count = _safe_int(fusion_diag_payload.get("reid_pairs"))
+        hybrid_pairs_count = _safe_int(fusion_diag_payload.get("hybrid_pairs"))
+        final_pairs_count = _safe_int(fusion_diag_payload.get("final_pairs"))
+        reid_comparisons = _safe_int(fusion_diag_payload.get("reid_comparisons"))
+        reid_pass = _safe_int(fusion_diag_payload.get("reid_pass"))
+
+        candidates_value = f"{candidate_overlaps} comparisons" if candidate_overlaps is not None else "N/A"
+        candidates_notes = "From track_fusion.json diagnostics"
+        overlap_value = f"{overlap_ratio_pass} comparisons" if overlap_ratio_pass is not None else "N/A"
+        overlap_notes = f"threshold=min_overlap_ratio≥{min_overlap_ratio:.2f}"
+        iou_value = f"{iou_pass_count} comparisons" if iou_pass_count is not None else "N/A"
+        iou_notes = f"threshold=iou≥{iou_threshold:.3f} (and overlap_ratio pass)"
+        iou_dist_value = _format_dist(fusion_diag_payload.get("iou_distribution"))
+        overlap_dist_value = _format_dist(fusion_diag_payload.get("overlap_ratio_distribution"))
+
+        reid_value = f"{reid_comparisons} comparisons" if reid_comparisons is not None else "N/A"
+        reid_notes = "From track_fusion.json diagnostics"
+        match_value = f"{reid_pass} matches" if reid_pass is not None else "N/A"
+        match_notes = f"threshold={reid_cfg.get('similarity_threshold', 'N/A')}"
+
+        final_pairs_detail = (
+            f"{final_pairs_count} pairs (iou={iou_pairs_count or 0}, reid={reid_pairs_count or 0}, hybrid={hybrid_pairs_count or 0})"
+            if final_pairs_count is not None
+            else "N/A"
         )
-        passing_value = f"{overlap_diag['comparisons_passing']} comparisons"
-        passing_notes = (
-            f"{overlap_diag['pairs_passing']} pairs; {overlap_diag['pairs_passing_min_frames']} pairs with ≥3 frames"
+        final_pairs_notes = (
+            "final_pairs == iou_pairs + reid_pairs + hybrid_pairs"
+            if (
+                final_pairs_count is not None
+                and iou_pairs_count is not None
+                and reid_pairs_count is not None
+                and hybrid_pairs_count is not None
+                and final_pairs_count == (iou_pairs_count + reid_pairs_count + hybrid_pairs_count)
+            )
+            else "From track_fusion.json diagnostics"
         )
     else:
-        candidates_value = "N/A"
-        candidates_notes = str(overlap_diag.get("error") or "unknown")
-        passing_value = "N/A"
-        passing_notes = str(overlap_diag.get("error") or "unknown")
+        overlap_diag = _track_fusion_overlap_diagnostics(
+            face_tracks_path=tracks_path,
+            body_tracks_path=body_tracks_path,
+            iou_threshold=iou_threshold,
+            min_overlap_ratio=min_overlap_ratio,
+            face_in_upper_body=face_in_upper_body,
+            upper_body_fraction=upper_body_fraction,
+        )
 
-    reid_enabled = bool(reid_cfg.get("enabled", False))
-    reid_similarity = reid_cfg.get("similarity_threshold")
-    body_embeddings_path = body_tracking_dir / "body_embeddings.npy"
-    if not reid_enabled:
-        reid_value = "N/A"
-        reid_notes = "reid_handoff.enabled=false"
-        match_value = "N/A"
-        match_notes = "Re-ID disabled"
-    elif not body_embeddings_path.exists():
-        reid_value = "N/A"
-        reid_notes = "missing body_tracking/body_embeddings.npy"
-        match_value = "N/A"
-        match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
-    else:
-        reid_value = "N/A"
-        reid_notes = "Re-ID comparison counts are not recorded in current artifacts"
-        match_value = "N/A"
-        match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+        if overlap_diag.get("ok"):
+            candidates_value = f"{overlap_diag['comparisons_considered']} comparisons"
+            candidates_notes = (
+                f"{overlap_diag['pairs_considered']} pairs across {overlap_diag['frames_with_candidates']} frames"
+            )
+            overlap_value = "N/A"
+            overlap_notes = "N/A (not recorded in legacy diagnostics)"
+            iou_value = f"{overlap_diag['comparisons_passing']} comparisons"
+            iou_notes = (
+                f"{overlap_diag['pairs_passing']} pairs; {overlap_diag['pairs_passing_min_frames']} pairs with ≥3 frames"
+            )
+            iou_dist_value = "N/A"
+            overlap_dist_value = "N/A"
+        else:
+            candidates_value = "N/A"
+            candidates_notes = str(overlap_diag.get("error") or "unknown")
+            overlap_value = "N/A"
+            overlap_notes = str(overlap_diag.get("error") or "unknown")
+            iou_value = "N/A"
+            iou_notes = str(overlap_diag.get("error") or "unknown")
+            iou_dist_value = "N/A"
+            overlap_dist_value = "N/A"
+
+        reid_enabled = bool(reid_cfg.get("enabled", False))
+        reid_similarity = reid_cfg.get("similarity_threshold")
+        body_embeddings_path = body_tracking_dir / "body_embeddings.npy"
+        if not reid_enabled:
+            reid_value = "N/A"
+            reid_notes = "reid_handoff.enabled=false"
+            match_value = "N/A"
+            match_notes = "Re-ID disabled"
+        elif not body_embeddings_path.exists():
+            reid_value = "N/A"
+            reid_notes = "missing body_tracking/body_embeddings.npy"
+            match_value = "N/A"
+            match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+        else:
+            reid_value = "N/A"
+            reid_notes = "Re-ID comparison counts are not recorded in current artifacts"
+            match_value = "N/A"
+            match_notes = f"threshold={reid_similarity if reid_similarity is not None else 'N/A'}"
+
+        final_pairs_detail = fused_pairs_value
+        final_pairs_notes = "From body_tracking/track_fusion.json"
 
     story.append(Paragraph("Fusion Diagnostics", subsection_style))
     fusion_diag = [
         _wrap_row(["Step", "Count", "Notes"]),
         _wrap_row(["Candidate overlaps considered", candidates_value, candidates_notes]),
-        _wrap_row(["Overlaps passing IoU threshold", passing_value, passing_notes]),
+        _wrap_row(["Overlaps passing overlap_ratio", overlap_value, overlap_notes]),
+        _wrap_row(["Overlaps passing IoU threshold", iou_value, iou_notes]),
+        _wrap_row(["IoU distribution (min/median/p95/max)", iou_dist_value, "Sampled over candidate overlaps"]),
+        _wrap_row(["Overlap ratio distribution (min/median/p95/max)", overlap_dist_value, "Sampled over candidate overlaps"]),
         _wrap_row(["Re-ID comparisons performed", reid_value, reid_notes]),
         _wrap_row(["Matches passing similarity threshold", match_value, match_notes]),
-        _wrap_row(["Final fused pairs", fused_pairs_value, "From body_tracking/track_fusion.json"]),
+        _wrap_row(["Final fused pairs", final_pairs_detail, final_pairs_notes]),
     ]
     fusion_diag_table = Table(fusion_diag, colWidths=[2.0 * inch, 1.0 * inch, 2.5 * inch])
     fusion_diag_table.setStyle(
@@ -2664,17 +2803,29 @@ def build_screentime_run_debug_pdf(
     story.append(cluster_table)
 
     # Diagnostic notes
-    if isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5:
+    singleton_high = isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5
+    mixed_high = isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5
+    if singleton_high and mixed_high:
+        story.append(
+            Paragraph(
+                f"⚠️ High singleton fraction ({singleton_frac:.1%}) <i>and</i> high mixed tracks ({mixed_tracks}). "
+                "<b>Do this first:</b> reduce tracking fragmentation (e.g., high forced_splits / gate over-splitting) "
+                "so tracks are longer and more consistent. "
+                "<b>Then:</b> increase min_identity_sim to reduce mixed-person clusters before adjusting cluster_thresh.",
+                warning_style,
+            )
+        )
+    elif singleton_high:
         story.append(Paragraph(
             f"⚠️ High singleton fraction ({singleton_frac:.1%}): Over half of clusters have only 1 track. "
             "Consider lowering cluster_thresh in clustering.yaml (currently "
             f"{clustering_config.get('cluster_thresh', 'N/A')}) to merge more aggressively.",
             warning_style
         ))
-    if isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5:
+    elif mixed_high:
         story.append(Paragraph(
             f"⚠️ High mixed tracks ({mixed_tracks}): Some clusters contain tracks from different people. "
-            "Consider raising cluster_thresh or increasing min_identity_sim.",
+            "Consider increasing min_identity_sim (preferred) or raising cluster_thresh to separate people better.",
             warning_style
         ))
 
@@ -2765,8 +2916,8 @@ def build_screentime_run_debug_pdf(
     )
 
     # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_error:
-        locked_count_str = "unavailable (DB error)"
+    if db_connected is not True:
+        locked_count_str = "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)"
     else:
         locked_count = len([lock for lock in identity_locks if lock.get("locked")])
         locked_count_str = str(locked_count)
@@ -2790,15 +2941,14 @@ def build_screentime_run_debug_pdf(
     )
     story.append(review_table)
 
-    if db_error:
-        story.append(Paragraph(
-            f"⚠️ <b>DB Error:</b> {db_error}",
-            warning_style
-        ))
-        story.append(Paragraph(
-            "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
-            note_style
-        ))
+    if db_connected is False:
+        story.append(Paragraph(f"⚠️ <b>DB Error:</b> {db_error}", warning_style))
+        story.append(
+            Paragraph(
+                "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
+                note_style,
+            )
+        )
         manual_assignments = identities_data.get("manual_assignments")
         manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
         if manual_assignments_count > 0:
@@ -2806,6 +2956,13 @@ def build_screentime_run_debug_pdf(
                 f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
                 note_style
             ))
+    elif db_connected is None:
+        story.append(
+            Paragraph(
+                f"<b>DB Not Configured:</b> {db_not_configured_reason or 'missing DB_URL'} (DB-sourced state is omitted in this report).",
+                note_style,
+            )
+        )
 
     story.append(Paragraph("Data Sources:", subsection_style))
     story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
@@ -2817,10 +2974,13 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("9. Smart Suggestions", section_style))
 
     # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_error:
+    if db_connected is not True:
         suggestion_stats = [
             ["Metric", "Value"],
-            ["Suggestion Batches", "unavailable (DB error)"],
+            [
+                "Suggestion Batches",
+                "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)",
+            ],
             ["Total Suggestions", "unavailable"],
             ["Dismissed", "unavailable"],
             ["Applied", "unavailable"],
@@ -2899,19 +3059,32 @@ def build_screentime_run_debug_pdf(
         story.append(Paragraph(f"Total tracked IDs analyzed: <b>{unavailable}</b>", body_style))
         story.append(Paragraph(f"Tracked IDs with gain: <b>{unavailable}</b>", body_style))
     else:
-        face_only_duration = _safe_float(screentime_summary.get("total_face_only_duration", 0))
-        combined_duration = _safe_float(screentime_summary.get("total_combined_duration", 0))
-        duration_gain = _safe_float(screentime_summary.get("total_duration_gain", 0))
-        body_only_duration = combined_duration - face_only_duration if combined_duration > face_only_duration else 0.0
-        gain_vs_combined_pct = _format_percent(duration_gain, combined_duration, na="N/A")
-        gain_vs_face_only_pct = _format_percent(duration_gain, face_only_duration, na="N/A")
+        face_total_s = _safe_float(
+            screentime_summary.get("face_total_s", screentime_summary.get("total_face_only_duration", 0))
+        )
+        body_total_s = _safe_float(
+            screentime_summary.get("body_total_s", screentime_summary.get("total_body_duration", 0))
+        )
+        fused_total_s = _safe_float(
+            screentime_summary.get("fused_total_s", screentime_summary.get("total_fused_duration", 0))
+        )
+        combined_total_s = _safe_float(
+            screentime_summary.get("combined_total_s", screentime_summary.get("total_combined_duration", 0))
+        )
+        gain_total_s = _safe_float(
+            screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain", 0))
+        )
+        duration_gain = gain_total_s
+        gain_vs_combined_pct = _format_percent(gain_total_s, combined_total_s, na="N/A")
+        gain_vs_face_only_pct = _format_percent(gain_total_s, face_total_s, na="N/A")
 
         screentime_breakdown = [
-            ["Source", "Duration", "% of Combined"],
-            ["Face-only segments", f"{face_only_duration:.2f}s", _format_percent(face_only_duration, combined_duration, na="N/A")],
-            ["Body-only segments", f"{body_only_duration:.2f}s", _format_percent(body_only_duration, combined_duration, na="N/A")],
-            ["Combined Total", f"{combined_duration:.2f}s", "100%"],
-            ["Gain from Body Tracking (vs Combined)", f"+{duration_gain:.2f}s", gain_vs_combined_pct],
+            ["Metric", "Duration", "% of Combined"],
+            ["Face baseline total", f"{face_total_s:.2f}s", _format_percent(face_total_s, combined_total_s, na="N/A")],
+            ["Body total (absolute)", f"{body_total_s:.2f}s", _format_percent(body_total_s, combined_total_s, na="N/A")],
+            ["Face∩Body overlap total", f"{fused_total_s:.2f}s", _format_percent(fused_total_s, combined_total_s, na="N/A")],
+            ["Combined total (Face ∪ Body)", f"{combined_total_s:.2f}s", "100%"],
+            ["Gain vs Face baseline (Combined − Face)", f"+{gain_total_s:.2f}s", gain_vs_combined_pct],
         ]
         screentime_table = Table(screentime_breakdown, colWidths=[2 * inch, 1.5 * inch, 1.5 * inch])
         screentime_table.setStyle(
@@ -2951,8 +3124,8 @@ def build_screentime_run_debug_pdf(
         # Adjust wording based on whether fusion actually occurred
         if actual_fused_pairs is not None and actual_fused_pairs > 0:
             story.append(Paragraph(
-                f"<b>Note:</b> 'Gain from Body Tracking' represents body-only duration gain—additional screen time "
-                f"from {actual_fused_pairs} fused face-body pair(s) where faces turned away but bodies remained visible.",
+                f"<b>Note:</b> 'Gain vs Face baseline' is the incremental time added by body visibility "
+                f"(Combined − Face baseline), from {actual_fused_pairs} fused face-body pair(s).",
                 note_style
             ))
         elif body_tracking_ran_effective and (body_track_count_run or 0) > 0:
@@ -3088,18 +3261,27 @@ def build_screentime_run_debug_pdf(
             ))
 
     # Cluster tuning
-    if singleton_frac > 0.5:
+    singleton_high = isinstance(singleton_frac, (int, float)) and singleton_frac > 0.5
+    mixed_high = isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5
+    if singleton_high and mixed_high:
+        tuning_suggestions.append((
+            "Clustering",
+            f"High singleton fraction ({singleton_frac:.1%}) and mixed tracks ({mixed_tracks})",
+            "First reduce tracking fragmentation (e.g., forced_splits / gate over-splitting), then increase "
+            "min_identity_sim. Adjust cluster_thresh only after tracking is stable.",
+        ))
+    elif singleton_high:
         tuning_suggestions.append((
             "Clustering",
             f"High singleton fraction ({singleton_frac:.1%})",
             f"Lower cluster_thresh (currently {clustering_config.get('cluster_thresh', 'N/A')}) "
-            "or enable singleton_merge"
+            "or enable singleton_merge",
         ))
-    if isinstance(mixed_tracks, (int, float)) and mixed_tracks > 5:
+    elif mixed_high:
         tuning_suggestions.append((
             "Clustering",
             f"Mixed tracks ({mixed_tracks})",
-            "Raise cluster_thresh or min_identity_sim to separate people better"
+            "Increase min_identity_sim (preferred) or raise cluster_thresh to separate people better",
         ))
 
     # Body tracking tuning
