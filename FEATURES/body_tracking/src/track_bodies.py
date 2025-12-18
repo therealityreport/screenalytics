@@ -125,7 +125,24 @@ class BodyTracker:
             )
         except Exception as exc:
             self.tracker_backend_actual = "iou_fallback"
-            if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", None) == "supervision":
+
+            def _is_missing_supervision(error: BaseException) -> bool:
+                name = getattr(error, "name", None)
+                if isinstance(error, ModuleNotFoundError) and name == "supervision":
+                    return True
+                if isinstance(error, ImportError):
+                    if name == "supervision":
+                        return True
+                    msg = str(error)
+                    if msg in {
+                        "No module named 'supervision'",
+                        'No module named "supervision"',
+                        "No module named supervision",
+                    }:
+                        return True
+                return False
+
+            if _is_missing_supervision(exc):
                 self.tracker_fallback_reason = "supervision_missing"
             else:
                 self.tracker_fallback_reason = "supervision_import_error"
