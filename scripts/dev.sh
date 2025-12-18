@@ -132,4 +132,4 @@ if [[ "$health_ok" != "true" ]]; then
   fi
 fi
 
-"${CPULIMIT_PREFIX[@]}" streamlit run apps/workspace-ui/Upload_Video.py
+"${CPULIMIT_PREFIX[@]}" streamlit run apps/workspace-ui/streamlit_app.py
