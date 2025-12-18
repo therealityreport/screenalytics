@@ -7,9 +7,12 @@ from typing import Any
 def get_torchreid_feature_extractor() -> tuple[Any, str | None]:
     """Return (FeatureExtractor, torchreid_version) with compat import paths.
 
-    Supports both:
+    Requires:
     - torchreid.utils.FeatureExtractor
-    - torchreid.reid.utils.FeatureExtractor
+
+    Note: The PyPI `torchreid` distribution (0.2.x) is known to be incompatible
+    with the deep-person-reid module layout used by Screenalytics. Install the
+    vetted deep-person-reid source distribution instead.
     """
     try:
         torchreid = importlib.import_module("torchreid")
@@ -25,25 +28,17 @@ def get_torchreid_feature_extractor() -> tuple[Any, str | None]:
     version = getattr(torchreid, "__version__", None)
     torchreid_version = version.strip() if isinstance(version, str) and version.strip() else None
 
-    errors: list[str] = []
-    for module_name in ("torchreid.utils", "torchreid.reid.utils"):
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:
-            errors.append(f"{module_name}: {exc}")
-            continue
-        except Exception as exc:
-            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
-            continue
+    try:
+        module = importlib.import_module("torchreid.utils")
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            "torchreid_runtime_error: missing torchreid.utils (install deep-person-reid; "
+            "pip torchreid==0.2.x is incompatible)"
+        ) from exc
+    except Exception as exc:
+        raise ImportError(f"torchreid_runtime_error: {type(exc).__name__}: {exc}") from exc
 
-        extractor = getattr(module, "FeatureExtractor", None)
-        if extractor is not None:
-            return extractor, torchreid_version
-        errors.append(f"{module_name}: missing FeatureExtractor")
-
-    details = "; ".join(errors) if errors else "unknown"
-    raise ImportError(
-        "torchreid_import_error: FeatureExtractor not found (tried torchreid.utils and torchreid.reid.utils); "
-        f"{details}"
-    )
-
+    extractor = getattr(module, "FeatureExtractor", None)
+    if extractor is None:
+        raise ImportError("torchreid_runtime_error: torchreid.utils missing FeatureExtractor")
+    return extractor, torchreid_version

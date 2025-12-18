@@ -29,18 +29,15 @@ def test_body_reid_marks_runtime_error_when_torchreid_import_ok(
     torchreid_pkg = types.ModuleType("torchreid")
     torchreid_pkg.__version__ = "0.2.5"
     torchreid_pkg.__path__ = []
-    reid_pkg = types.ModuleType("torchreid.reid")
-    reid_pkg.__path__ = []
-    reid_utils_pkg = types.ModuleType("torchreid.reid.utils")
-    reid_utils_pkg.__path__ = []
+    utils_pkg = types.ModuleType("torchreid.utils")
+    utils_pkg.__path__ = []
 
     class _DummyFeatureExtractor:
         pass
 
-    reid_utils_pkg.FeatureExtractor = _DummyFeatureExtractor
+    utils_pkg.FeatureExtractor = _DummyFeatureExtractor
     monkeypatch.setitem(sys.modules, "torchreid", torchreid_pkg)
-    monkeypatch.setitem(sys.modules, "torchreid.reid", reid_pkg)
-    monkeypatch.setitem(sys.modules, "torchreid.reid.utils", reid_utils_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.utils", utils_pkg)
 
     ep_id = "ep-test"
     run_id = "run-body-reid-runtime"
@@ -134,15 +131,12 @@ def test_body_reid_marks_import_error_when_feature_extractor_missing(
     torchreid_pkg = types.ModuleType("torchreid")
     torchreid_pkg.__version__ = "0.2.5"
     torchreid_pkg.__path__ = []
-    reid_pkg = types.ModuleType("torchreid.reid")
-    reid_pkg.__path__ = []
-    # Present but mispackaged: torchreid.reid.utils exists but doesn't export FeatureExtractor.
-    reid_utils_pkg = types.ModuleType("torchreid.reid.utils")
-    reid_utils_pkg.__path__ = []
+    # Present but mispackaged: torchreid.utils exists but doesn't export FeatureExtractor.
+    utils_pkg = types.ModuleType("torchreid.utils")
+    utils_pkg.__path__ = []
 
     monkeypatch.setitem(sys.modules, "torchreid", torchreid_pkg)
-    monkeypatch.setitem(sys.modules, "torchreid.reid", reid_pkg)
-    monkeypatch.setitem(sys.modules, "torchreid.reid.utils", reid_utils_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.utils", utils_pkg)
 
     ep_id = "ep-test"
     run_id = "run-body-reid-import-fail"
@@ -218,8 +212,8 @@ def test_body_reid_marks_import_error_when_feature_extractor_missing(
     assert body_reid.get("torchreid_import_ok") is False
     assert body_reid.get("torchreid_runtime_ok") is False
     assert body_reid.get("enabled_effective") is False
-    assert body_reid.get("reid_skip_reason") == "torchreid_import_error"
-    assert "FeatureExtractor not found" in str(body_reid.get("torchreid_runtime_error"))
+    assert body_reid.get("reid_skip_reason") == "torchreid_runtime_error"
+    assert "missing FeatureExtractor" in str(body_reid.get("torchreid_runtime_error"))
 
 
 def test_body_reid_enables_when_feature_extractor_available(
@@ -237,19 +231,16 @@ def test_body_reid_enables_when_feature_extractor_available(
     torchreid_pkg = types.ModuleType("torchreid")
     torchreid_pkg.__version__ = "0.2.5"
     torchreid_pkg.__path__ = []
-    reid_pkg = types.ModuleType("torchreid.reid")
-    reid_pkg.__path__ = []
-    reid_utils_pkg = types.ModuleType("torchreid.reid.utils")
-    reid_utils_pkg.__path__ = []
+    utils_pkg = types.ModuleType("torchreid.utils")
+    utils_pkg.__path__ = []
 
     class _DummyFeatureExtractor:
         pass
 
-    reid_utils_pkg.FeatureExtractor = _DummyFeatureExtractor
+    utils_pkg.FeatureExtractor = _DummyFeatureExtractor
 
     monkeypatch.setitem(sys.modules, "torchreid", torchreid_pkg)
-    monkeypatch.setitem(sys.modules, "torchreid.reid", reid_pkg)
-    monkeypatch.setitem(sys.modules, "torchreid.reid.utils", reid_utils_pkg)
+    monkeypatch.setitem(sys.modules, "torchreid.utils", utils_pkg)
 
     ep_id = "ep-test"
     run_id = "run-body-reid-ok"

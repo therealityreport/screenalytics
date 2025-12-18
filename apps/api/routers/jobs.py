@@ -1383,6 +1383,47 @@ async def analyze_screen_time(req: AnalyzeScreenTimeRequest, request: Request) -
     }
 
 
+class BodyTrackingRequest(BaseModel):
+    ep_id: str = Field(..., description="Episode identifier")
+    run_id: str = Field(..., description="Pipeline run identifier (required for body tracking)")
+
+
+@router.post("/body_tracking/run")
+async def run_body_tracking(req: BodyTrackingRequest, request: Request) -> dict:
+    """Run body tracking for a specific run_id."""
+    await _reject_legacy_payload(request)
+    try:
+        job = JOB_SERVICE.start_body_tracking_job(ep_id=req.ep_id, run_id=req.run_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "job_id": job["job_id"],
+        "ep_id": req.ep_id,
+        "state": job["state"],
+        "started_at": job["started_at"],
+        "progress_file": job.get("progress_file"),
+        "requested": job.get("requested"),
+    }
+
+
+@router.post("/body_tracking/fusion")
+async def run_body_tracking_fusion(req: BodyTrackingRequest, request: Request) -> dict:
+    """Run face↔body fusion + screen-time comparison for a specific run_id."""
+    await _reject_legacy_payload(request)
+    try:
+        job = JOB_SERVICE.start_body_tracking_fusion_job(ep_id=req.ep_id, run_id=req.run_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "job_id": job["job_id"],
+        "ep_id": req.ep_id,
+        "state": job["state"],
+        "started_at": job["started_at"],
+        "progress_file": job.get("progress_file"),
+        "requested": job.get("requested"),
+    }
+
+
 class VideoExportRequest(BaseModel):
     """Request model for video export job."""
 
@@ -1444,6 +1485,7 @@ def list_jobs(ep_id: str | None = None, job_type: str | None = None, limit: int 
                 "started_at": job["started_at"],
                 "ended_at": job.get("ended_at"),
                 "error": job.get("error"),
+                "requested": job.get("requested"),
             }
         )
     return {"jobs": simplified_jobs, "count": len(simplified_jobs)}

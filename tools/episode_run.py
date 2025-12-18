@@ -6900,9 +6900,15 @@ def _maybe_run_body_tracking(
         if not reid_enabled_config:
             pass
         elif torchreid_import_ok is False:
-            reid_skip_reason = f"torchreid_{torchreid_status}" if torchreid_status and torchreid_status != "ok" else "torchreid_import_error"
+            reid_skip_reason = (
+                f"torchreid_{torchreid_status}"
+                if torchreid_status and torchreid_status != "ok"
+                else "torchreid_import_error"
+            )
             if torchreid_import_error and torchreid_import_error.startswith("torchreid_missing:"):
                 reid_skip_reason = "torchreid_missing"
+            elif torchreid_import_error and torchreid_import_error.startswith("torchreid_runtime_error:"):
+                reid_skip_reason = "torchreid_runtime_error"
             torchreid_runtime_ok = False
             torchreid_runtime_error = torchreid_import_error or torchreid_error or "torchreid import failed"
             embeddings_note = f"import_error: {torchreid_runtime_error}"
