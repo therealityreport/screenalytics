@@ -608,7 +608,12 @@ SCENE_DETECTOR_DEFAULT = _RAW_SCENE_DETECTOR if _RAW_SCENE_DETECTOR in SCENE_DET
 SCENE_DETECT_DEFAULT = SCENE_DETECTOR_DEFAULT != "off"
 SCENE_THRESHOLD_DEFAULT = _env_float("SCENE_THRESHOLD", 27.0)
 SCENE_MIN_LEN_DEFAULT = max(_env_int("SCENE_MIN_LEN", 12), 1)
-SCENE_WARMUP_DETS_DEFAULT = max(_env_int("SCENE_WARMUP_DETS", 3), 0)
+_SCENE_WARMUP_FRAMES_PER_CUT_DEFAULT = max(int(_DETECTION_CONFIG.get("scene_warmup_frames_per_cut", 1) or 0), 0)
+SCENE_WARMUP_DETS_DEFAULT = max(_env_int("SCENE_WARMUP_DETS", _SCENE_WARMUP_FRAMES_PER_CUT_DEFAULT), 0)
+SCENE_WARMUP_CAP_RATIO_DEFAULT = float(
+    os.environ.get("SCENE_WARMUP_CAP_RATIO", _DETECTION_CONFIG.get("scene_warmup_cap_ratio", 0.25))
+)
+SCENE_WARMUP_CAP_RATIO_DEFAULT = max(min(SCENE_WARMUP_CAP_RATIO_DEFAULT, 10.0), 0.0)
 
 
 def _normalize_device_label(device: str | None) -> str:
@@ -5777,6 +5782,13 @@ def _run_full_pipeline(
     cut_ix = 0
     next_cut = scene_cuts[cut_ix] if scene_cuts else None
     frames_since_cut = 10**9
+    warmup_window = 0
+    warmup_cuts_applied = 0
+    warmup_cap_total: int | None = None
+    if scene_warmup > 0 and SCENE_WARMUP_CAP_RATIO_DEFAULT > 0 and frame_stride > 0:
+        expected_total_frames = frames_goal or total_frames or 0
+        expected_stride_hits_est = int(math.ceil(expected_total_frames / frame_stride)) if expected_total_frames > 0 else 0
+        warmup_cap_total = int(math.floor(SCENE_WARMUP_CAP_RATIO_DEFAULT * expected_stride_hits_est))
     max_gap_frames = _resolved_max_gap(args.max_gap, analyzed_fps)
     if max_gap_frames != max(1, int(args.max_gap)):
         LOGGER.info(
@@ -5869,6 +5881,15 @@ def _run_full_pipeline(
                         appearance_gate.reset_all()
                     recorder.on_cut(frame_idx)
                     frames_since_cut = 0
+                    # Only warm up when the cut creates a stride gap (i.e., sampling coverage drops).
+                    # Warmup covers the non-stride frames until the next stride hit, bounded by config + cap ratio.
+                    if scene_warmup > 0 and frame_stride > 0:
+                        gap_to_next_stride = (frame_stride - (frame_idx % frame_stride)) % frame_stride
+                        warmup_window = min(scene_warmup, gap_to_next_stride) if gap_to_next_stride > 0 else 0
+                        if warmup_window > 0:
+                            warmup_cuts_applied += 1
+                    else:
+                        warmup_window = 0
                     cut_ix += 1
                     next_cut = scene_cuts[cut_ix] if cut_ix < len(scene_cuts) else None
                     if progress:
@@ -5884,8 +5905,10 @@ def _run_full_pipeline(
                             force=True,
                             extra=video_meta,
                         )
-                force_detect = frames_since_cut < scene_warmup
                 should_sample = frame_idx % frame_stride == 0
+                force_detect = (not should_sample) and warmup_window > 0 and frames_since_cut < warmup_window
+                if warmup_cap_total is not None and frames_sampled_forced_scene_warmup >= warmup_cap_total:
+                    force_detect = False
                 if not (should_sample or force_detect):
                     frame_idx += 1
                     frames_since_cut += 1
@@ -6588,8 +6611,9 @@ def _run_full_pipeline(
         final_diag_stats["forced_scene_warmup_ratio"] = round(frames_sampled_forced_scene_warmup / frames_sampled_stride, 6)
     else:
         final_diag_stats["forced_scene_warmup_ratio"] = None
+    final_diag_stats["warmup_cuts_applied"] = int(warmup_cuts_applied)
     final_diag_stats["warmup_frames_per_cut_effective"] = (
-        round(frames_sampled_forced_scene_warmup / max(len(scene_cuts), 1), 6) if scene_cuts else 0.0
+        round(frames_sampled_forced_scene_warmup / max(warmup_cuts_applied, 1), 6) if warmup_cuts_applied else 0.0
     )
     final_diag_stats["wall_time_per_processed_frame_s"] = (
         round(float(detect_track_duration) / max(frames_sampled, 1), 9) if detect_track_duration is not None else None
@@ -7375,6 +7399,7 @@ def _run_detect_track_stage(
                 "scene_min_len": args.scene_min_len,
                 "scene_warmup_dets": args.scene_warmup_dets,
                 "scene_cut_count": runtime_stats.get("scene_cut_count"),
+                "warmup_cuts_applied": runtime_stats.get("warmup_cuts_applied"),
                 "warmup_frames_per_cut_effective": runtime_stats.get("warmup_frames_per_cut_effective"),
                 "forced_scene_warmup_ratio": runtime_stats.get("forced_scene_warmup_ratio"),
                 "wall_time_per_processed_frame_s": runtime_stats.get("wall_time_per_processed_frame_s"),
