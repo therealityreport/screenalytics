@@ -8881,24 +8881,58 @@ def _run_cluster_stage(
         except Exception as exc:
             LOGGER.warning("[cluster] Body tracking fusion failed (non-fatal): %s", exc)
 
+        # Guardrail: when STORAGE_REQUIRE_S3=true (or EXPORT_REQUIRE_S3=true), do not report completion
+        # until S3 sync succeeds. This prevents the "cluster complete" UI race where an immediate
+        # PDF export can't hydrate a consistent run-scoped bundle from S3.
+        s3_required = False
+        for var in ("STORAGE_REQUIRE_S3", "EXPORT_REQUIRE_S3"):
+            if os.environ.get(var, "").strip().lower() in ("1", "true", "yes", "on"):
+                s3_required = True
+                break
+
         # S3 sync should run after all artifacts are written so S3-first mode (delete local)
         # doesn't race exports/reporting that hydrate from S3.
+        # Emit a post-cluster progress update so Streamlit/local-mode UIs don't appear "stuck" at 100%.
+        progress.emit(
+            faces_total,
+            phase="cluster",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            extra=_non_video_phase_meta("s3_sync_legacy"),
+            force=True,
+        )
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
         summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
         if s3_sync_result.errors:
             summary["artifacts"]["s3_errors"] = s3_sync_result.errors
         if not s3_sync_result.success:
             LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
+            if s3_required:
+                raise RuntimeError(f"S3 sync failed for {args.ep_id}: {s3_sync_result.errors}")
 
         # Sync run-scoped artifacts to S3 with deterministic key layout
         if run_id:
             try:
                 from apps.api.services.run_artifact_store import sync_run_artifacts_to_s3
 
+                # Emit a post-cluster progress update so Streamlit/local-mode UIs don't appear "stuck" at 100%.
+                progress.emit(
+                    faces_total,
+                    phase="cluster",
+                    device=device,
+                    detector=detector_choice,
+                    tracker=tracker_choice,
+                    resolved_device=device,
+                    extra=_non_video_phase_meta("s3_sync_run_scoped"),
+                    force=True,
+                )
                 run_sync_result = sync_run_artifacts_to_s3(
                     ep_id=args.ep_id,
                     run_id=run_id,
-                    fail_on_error=False,  # Don't fail the job on S3 errors
+                    # Fail loud when STORAGE_REQUIRE_S3=true so runs aren't marked complete without artifacts.
+                    fail_on_error=s3_required,
                 )
                 summary["artifacts"]["run_scoped_s3"] = run_sync_result.to_dict()
                 if run_sync_result.success:
@@ -8915,6 +8949,8 @@ def _run_cluster_stage(
             except Exception as exc:
                 LOGGER.warning("[cluster] Run-scoped S3 sync skipped: %s", exc)
                 summary["artifacts"]["run_scoped_s3"] = {"error": str(exc)}
+                if s3_required:
+                    raise
 
         # Emit completion after fusion + S3 sync so downstream steps see a consistent run bundle.
         progress.emit(
