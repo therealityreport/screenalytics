@@ -15,6 +15,7 @@ pandas==2.2.3
 plotly==5.24.1
 kaleido==0.2.1  # For Plotly static image export (PDF reports)
 reportlab==4.2.5  # For Screen Time Debug PDF reports
+PyMuPDF==1.24.14  # For PDF layout regression tests (no clipping/overflow assertions)
 psycopg2-binary~=2.9
 # Background job queue (Phase 2)
 celery[redis]==5.3.6

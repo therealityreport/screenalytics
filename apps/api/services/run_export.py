@@ -63,15 +63,19 @@ def _soft_wrap_text(text: str, *, max_token_len: int = 60, chunk_len: int = 24) 
             out_chars.append("\u200b")
     softened = "".join(out_chars)
 
-    # Fallback: chunk extremely long tokens that still have no breaks.
+    # Fallback: chunk extremely long spans that still have no breaks.
     tokens = softened.split(" ")
     for i, tok in enumerate(tokens):
         if len(tok) <= max_token_len:
             continue
-        # Only chunk tokens that are essentially unbreakable (no whitespace breaks already).
-        if "\u200b" in tok:
-            continue
-        tokens[i] = "\u200b".join(tok[j : j + chunk_len] for j in range(0, len(tok), chunk_len))
+        parts = tok.split("\u200b")
+        rebuilt: list[str] = []
+        for part in parts:
+            if len(part) <= max_token_len:
+                rebuilt.append(part)
+                continue
+            rebuilt.append("\u200b".join(part[j : j + chunk_len] for j in range(0, len(part), chunk_len)))
+        tokens[i] = "\u200b".join(rebuilt)
     return " ".join(tokens)
 
 
@@ -93,9 +97,11 @@ def build_wrap_safe_kv_table(
     from reportlab.platypus import Paragraph, Table, TableStyle
 
     def _p(text: str, *, style: Any, allow_markup: bool = False) -> Paragraph:
-        softened = _soft_wrap_text(text)
         if allow_markup:
-            return Paragraph(softened, style)
+            # Markup strings are expected to already have soft-wrap opportunities injected into their
+            # data segments; do not run soft-wrap across the markup itself (e.g., "<br/>").
+            return Paragraph(text, style)
+        softened = _soft_wrap_text(text)
         return Paragraph(_escape_reportlab_xml(softened), style)
 
     def _value_cell(value: str | list[tuple[str, str]] | None) -> Paragraph:
@@ -1458,7 +1464,13 @@ def build_screentime_run_debug_pdf(
         ["S3 Layout (write)", s3_layout.s3_layout],
         ["S3 Run Prefix (write)", s3_layout.write_prefix],
     ]
-    summary_table = Table(summary_data, colWidths=[1.5 * inch, 5 * inch])
+    summary_label_style = ParagraphStyle(
+        "SummaryLabel",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+    )
+    summary_rows = [[_wrap_cell(k, summary_label_style), _wrap_cell(v, cell_style)] for k, v in summary_data]
+    summary_table = Table(summary_rows, colWidths=[1.5 * inch, 5 * inch])
     summary_table.setStyle(
         TableStyle([
             ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e2e8f0")),
