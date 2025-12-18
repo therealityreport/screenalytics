@@ -250,6 +250,9 @@ codex exec --config config/codex.config.toml --task agents/tasks/aggregate-scree
 | Symptom | Fix |
 | --------------------- | ------------------------------------------------ |
 | `ModuleNotFoundError` | Activate `.venv` |
+| `supervision_missing` / `ModuleNotFoundError: supervision` | Install ML deps: `pip install -r requirements-ml.txt` (macOS: `install supervision` is not `pip install supervision`) |
+| `torchreid_missing` / `ModuleNotFoundError: torchreid` | Install ML deps: `pip install -r requirements-ml.txt` |
+| Dependency doctor | `python -c "import supervision, torchreid; print('ok')"` |
 | `pgvector` not found | Run migrations, ensure Postgres ≥15 |
 | UI blank | Run `pnpm build` inside `apps/workspace-ui` |
 | Codex writes blocked | Ensure correct profile (`promote` for root docs) |

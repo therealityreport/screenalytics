@@ -123,13 +123,34 @@ class BodyTracker:
                 minimum_matching_threshold=self.match_thresh,
                 frame_rate=24,  # Will be updated per video
             )
-        except ImportError:
+        except Exception as exc:
             self.tracker_backend_actual = "iou_fallback"
-            self.tracker_fallback_reason = "supervision_missing"
+
+            def _is_missing_supervision(error: BaseException) -> bool:
+                name = getattr(error, "name", None)
+                if isinstance(error, ModuleNotFoundError) and name == "supervision":
+                    return True
+                if isinstance(error, ImportError):
+                    if name == "supervision":
+                        return True
+                    msg = str(error)
+                    if msg in {
+                        "No module named 'supervision'",
+                        'No module named "supervision"',
+                        "No module named supervision",
+                    }:
+                        return True
+                return False
+
+            if _is_missing_supervision(exc):
+                self.tracker_fallback_reason = "supervision_missing"
+            else:
+                self.tracker_fallback_reason = "supervision_import_error"
             logger.warning(
-                "[TRACKER] tracking backend fallback activated: configured=supervision.ByteTrack actual=%s reason=%s",
+                "[TRACKER] tracking backend fallback activated: configured=supervision.ByteTrack actual=%s reason=%s error=%s",
                 self.tracker_backend_actual,
                 self.tracker_fallback_reason,
+                exc,
             )
 
         # Fallback to custom simple tracker

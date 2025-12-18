@@ -311,6 +311,9 @@ See [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md) for acceptance criteria.
 - `Connection refused` → Start API: `python -m uvicorn apps.api.main:app --reload`
 - `NoSuchBucket` → Run `bash scripts/s3_bootstrap.sh` or set `S3_AUTO_CREATE=1`
 - `RetinaFace init failed` → Download models: `python scripts/fetch_models.py`
+- `supervision_missing` / `ModuleNotFoundError: supervision` → Install ML deps in the same venv: `pip install -r requirements-ml.txt` (macOS tip: `install supervision` is a different command; you want `pip install supervision`)
+- `torchreid_missing` / `ModuleNotFoundError: torchreid` → Install ML deps: `pip install -r requirements-ml.txt`
+- Dependency doctor → `python -c "import supervision, torchreid; print('ok')"`
 - `Blank/gray crops` → See [docs/ops/troubleshooting_faces_pipeline.md#blank-crops](docs/ops/troubleshooting_faces_pipeline.md)
 - `Too many tracks` → See [docs/ops/troubleshooting_faces_pipeline.md#track-explosion](docs/ops/troubleshooting_faces_pipeline.md)
 

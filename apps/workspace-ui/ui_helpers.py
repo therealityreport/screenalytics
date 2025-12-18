@@ -12,6 +12,7 @@ import platform
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from functools import lru_cache
@@ -769,7 +770,7 @@ def _restart_api_server() -> bool:
         env["PYTHONUNBUFFERED"] = "1"
         subprocess.Popen(
             [
-                str(project_root / ".venv" / "bin" / "python"),
+                sys.executable,
                 "-m", "uvicorn",
                 "apps.api.main:app",
                 "--host", "0.0.0.0",

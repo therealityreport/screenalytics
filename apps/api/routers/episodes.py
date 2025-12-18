@@ -183,6 +183,7 @@ _RUN_ACTIVITY_FILES: tuple[str, ...] = (
     "detect_track.json",
     "faces_embed.json",
     "cluster.json",
+    "env_diagnostics.json",
     "detections.jsonl",
     "tracks.jsonl",
     "faces.jsonl",

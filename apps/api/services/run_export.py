@@ -1293,6 +1293,7 @@ def build_screentime_run_debug_pdf(
     detect_track_marker_path = _resolved_path(run_root / "detect_track.json", "detect_track.json")
     body_tracking_marker_path = _resolved_path(run_root / "body_tracking.json", "body_tracking.json")
     faces_embed_marker_path = _resolved_path(run_root / "faces_embed.json", "faces_embed.json")
+    env_diagnostics_path = _resolved_path(run_root / "env_diagnostics.json", "env_diagnostics.json")
 
     # Load JSON artifact data
     identities_payload = _read_json(identities_path)
@@ -1900,6 +1901,49 @@ def build_screentime_run_debug_pdf(
         ],
     ]
 
+    env_diagnostics = _read_json(env_diagnostics_path) if env_diagnostics_path.exists() else None
+    if isinstance(env_diagnostics, dict):
+        env_lines: list[tuple[str, str]] = []
+        python_version = env_diagnostics.get("python_version")
+        if isinstance(python_version, str) and python_version.strip():
+            env_lines.append(("python_version", python_version.strip()))
+        pip_version = env_diagnostics.get("pip_version")
+        if isinstance(pip_version, str) and pip_version.strip():
+            env_lines.append(("pip_version", pip_version.strip()))
+        venv_active = env_diagnostics.get("venv_active")
+        if isinstance(venv_active, bool):
+            env_lines.append(("venv_active", "true" if venv_active else "false"))
+        sys_executable = env_diagnostics.get("sys_executable")
+        if isinstance(sys_executable, str) and sys_executable.strip():
+            env_lines.append(("sys.executable", sys_executable.strip()))
+
+        import_status = env_diagnostics.get("import_status") if isinstance(env_diagnostics.get("import_status"), dict) else None
+
+        def _fmt_dep(name: str) -> str:
+            if not isinstance(import_status, dict):
+                return "unknown"
+            entry = import_status.get(name)
+            if not isinstance(entry, dict):
+                return "unknown"
+            status = entry.get("status")
+            version = entry.get("version")
+            error = entry.get("error")
+            status_str = status if isinstance(status, str) and status.strip() else "unknown"
+            if isinstance(version, str) and version.strip():
+                return f"{status_str} ({version.strip()})"
+            if isinstance(error, str) and error.strip() and status_str != "ok":
+                trimmed = error.strip()
+                if len(trimmed) > 120:
+                    trimmed = trimmed[:117] + "..."
+                return f"{status_str}: {trimmed}"
+            return status_str
+
+        env_lines.append(("supervision", _fmt_dep("supervision")))
+        env_lines.append(("torchreid", _fmt_dep("torchreid")))
+        lineage_data.append(["Environment (run-scoped preflight)", env_lines])
+    else:
+        lineage_data.append(["Environment (run-scoped preflight)", _na_artifact(env_diagnostics_path, "env_diagnostics.json")])
+
     # Video metadata sources (split, labeled, and validated for mismatches).
     video_path = get_path(ep_id, "video")
     ffprobe_meta = _ffprobe_video_metadata(video_path)
@@ -1945,6 +1989,12 @@ def build_screentime_run_debug_pdf(
     marker_torch_device_requested: str | None = None
     marker_torch_device_resolved: str | None = None
     marker_torch_device_fallback_reason: str | None = None
+    marker_yolo_fallback_enabled: bool | None = None
+    marker_yolo_fallback_device: str | None = None
+    marker_yolo_fallback_load_status: str | None = None
+    marker_yolo_fallback_disabled_reason: str | None = None
+    marker_yolo_fallback_invocations: int | None = None
+    marker_yolo_fallback_detections_added: int | None = None
     marker_face_detector_model: str | None = None
     marker_embed_requested_device: str | None = None
     marker_embed_resolved_device: str | None = None
@@ -2048,6 +2098,28 @@ def build_screentime_run_debug_pdf(
             str(detect_track_marker.get("torch_device_fallback_reason")).strip()
             if isinstance(detect_track_marker.get("torch_device_fallback_reason"), str)
             else None
+        )
+        yolo_enabled_raw = detect_track_marker.get("yolo_fallback_enabled")
+        if isinstance(yolo_enabled_raw, bool):
+            marker_yolo_fallback_enabled = yolo_enabled_raw
+        marker_yolo_fallback_device = (
+            str(detect_track_marker.get("yolo_fallback_device")).strip()
+            if isinstance(detect_track_marker.get("yolo_fallback_device"), str)
+            else None
+        )
+        marker_yolo_fallback_load_status = (
+            str(detect_track_marker.get("yolo_fallback_load_status")).strip()
+            if isinstance(detect_track_marker.get("yolo_fallback_load_status"), str)
+            else None
+        )
+        marker_yolo_fallback_disabled_reason = (
+            str(detect_track_marker.get("yolo_fallback_disabled_reason")).strip()
+            if isinstance(detect_track_marker.get("yolo_fallback_disabled_reason"), str)
+            else None
+        )
+        marker_yolo_fallback_invocations = _safe_int_opt(detect_track_marker.get("yolo_fallback_invocations"))
+        marker_yolo_fallback_detections_added = _safe_int_opt(
+            detect_track_marker.get("yolo_fallback_detections_added")
         )
         marker_scene_cut_count = _safe_int_opt(detect_track_marker.get("scene_cut_count"))
         marker_warmup_frames_per_cut_effective = _safe_float_opt(
@@ -2202,6 +2274,27 @@ def build_screentime_run_debug_pdf(
         if torch_reason:
             torch_lines.append(("fallback_reason", torch_reason))
         lineage_data.append(["Torch Device (fallback models)", torch_lines])
+
+    if (
+        marker_yolo_fallback_enabled is not None
+        or marker_yolo_fallback_device
+        or marker_yolo_fallback_load_status
+        or marker_yolo_fallback_disabled_reason
+    ):
+        yolo_lines: list[tuple[str, str]] = []
+        if marker_yolo_fallback_enabled is not None:
+            yolo_lines.append(("enabled", "true" if marker_yolo_fallback_enabled else "false"))
+        if marker_yolo_fallback_device:
+            yolo_lines.append(("torch_device", marker_yolo_fallback_device))
+        if marker_yolo_fallback_load_status:
+            yolo_lines.append(("load_status", marker_yolo_fallback_load_status))
+        if marker_yolo_fallback_disabled_reason:
+            yolo_lines.append(("disabled_reason", marker_yolo_fallback_disabled_reason))
+        if marker_yolo_fallback_invocations is not None:
+            yolo_lines.append(("invocations", str(marker_yolo_fallback_invocations)))
+        if marker_yolo_fallback_detections_added is not None:
+            yolo_lines.append(("detections_added", str(marker_yolo_fallback_detections_added)))
+        lineage_data.append(["Person Fallback (YOLO)", yolo_lines])
 
     if marker_face_detector_model:
         lineage_data.append(["Face Detector Model (runtime)", marker_face_detector_model])
@@ -2418,6 +2511,27 @@ def build_screentime_run_debug_pdf(
                 if reason_str:
                     tracker_lines.append(("fallback_reason", reason_str))
                 lineage_data.append(["Body Tracker Backend (runtime)", tracker_lines])
+
+            body_reid = run_body_tracking_marker.get("body_reid")
+            if isinstance(body_reid, dict):
+                reid_lines: list[tuple[str, str]] = []
+                enabled_config = body_reid.get("enabled_config")
+                enabled_effective = body_reid.get("enabled_effective")
+                embeddings_generated = body_reid.get("reid_embeddings_generated")
+                skip_reason = body_reid.get("reid_skip_reason")
+                comparisons = body_reid.get("reid_comparisons_performed")
+                if isinstance(enabled_config, bool):
+                    reid_lines.append(("enabled_config", "true" if enabled_config else "false"))
+                if isinstance(enabled_effective, bool):
+                    reid_lines.append(("enabled_effective", "true" if enabled_effective else "false"))
+                if isinstance(embeddings_generated, bool):
+                    reid_lines.append(("embeddings_generated", "true" if embeddings_generated else "false"))
+                if isinstance(skip_reason, str) and skip_reason.strip():
+                    reid_lines.append(("skip_reason", skip_reason.strip()))
+                if isinstance(comparisons, int):
+                    reid_lines.append(("comparisons_performed", str(comparisons)))
+                if reid_lines:
+                    lineage_data.append(["Body Re-ID (runtime)", reid_lines])
 
     # Model versions
     lineage_data.extend([
@@ -2880,11 +2994,55 @@ def build_screentime_run_debug_pdf(
     if body_tracker_backend_detail is not None:
         story.append(Paragraph(f"Body tracker backend (actual): <b>{body_tracker_backend_detail}</b>", body_style))
         if body_tracker_fallback_reason:
-            story.append(Paragraph(
-                "⚠️ tracking backend fallback activated: supervision is missing. "
-                "Install <b>supervision</b> to use supervision.ByteTrack for body tracking.",
-                warning_style,
-            ))
+            supervision_status: str | None = None
+            supervision_error: str | None = None
+            if isinstance(run_body_tracking_marker, dict):
+                import_status = run_body_tracking_marker.get("import_status")
+                if isinstance(import_status, dict):
+                    sup = import_status.get("supervision")
+                    if isinstance(sup, dict):
+                        supervision_status = sup.get("status") if isinstance(sup.get("status"), str) else None
+                        supervision_error = sup.get("error") if isinstance(sup.get("error"), str) else None
+
+            if body_tracker_fallback_reason == "supervision_missing":
+                warn_msg = (
+                    "⚠️ tracking backend fallback activated: supervision is missing. "
+                    "Install <b>supervision</b> to use supervision.ByteTrack for body tracking "
+                    "(e.g., <font name='Courier'>pip install -r requirements-ml.txt</font>)."
+                )
+            elif body_tracker_fallback_reason == "supervision_import_error":
+                detail = supervision_error or "unknown import error"
+                if len(detail) > 160:
+                    detail = detail[:157] + "..."
+                warn_msg = (
+                    "⚠️ tracking backend fallback activated: supervision failed to import. "
+                    f"(status={supervision_status or 'import_error'} error={_escape_reportlab_xml(detail)})"
+                )
+            else:
+                warn_msg = (
+                    "⚠️ tracking backend fallback activated. "
+                    f"(fallback_reason={_escape_reportlab_xml(body_tracker_fallback_reason)})"
+                )
+            story.append(Paragraph(warn_msg, warning_style))
+
+    body_reid_detail: str | None = None
+    if isinstance(run_body_tracking_marker, dict):
+        body_reid = run_body_tracking_marker.get("body_reid")
+        if isinstance(body_reid, dict):
+            enabled_effective = body_reid.get("enabled_effective")
+            embeddings_generated = body_reid.get("reid_embeddings_generated")
+            skip_reason = body_reid.get("reid_skip_reason")
+            parts: list[str] = []
+            if isinstance(enabled_effective, bool):
+                parts.append(f"enabled_effective={'true' if enabled_effective else 'false'}")
+            if isinstance(embeddings_generated, bool):
+                parts.append(f"embeddings_generated={'true' if embeddings_generated else 'false'}")
+            if isinstance(skip_reason, str) and skip_reason.strip():
+                parts.append(f"skip_reason={skip_reason.strip()}")
+            if parts:
+                body_reid_detail = ", ".join(parts)
+    if body_reid_detail is not None:
+        story.append(Paragraph(f"Body Re-ID (runtime): <b>{_escape_reportlab_xml(body_reid_detail)}</b>", body_style))
 
     # Configuration used with explanations
     story.append(Paragraph("Configuration (body_detection.yaml → person_tracking):", subsection_style))

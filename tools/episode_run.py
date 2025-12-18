@@ -1770,11 +1770,17 @@ class PersonFallbackDetector:
         self.face_region_ratio = face_region_ratio
         self.max_detections = max_detections
         self._model = None
+        self._load_attempted = False
+        self._load_error: str | None = None
+        self._load_status: str = "uninitialized"
+        self.invocations = 0
+        self.detections_emitted = 0
 
     def _lazy_model(self):
         """Lazily load YOLO model on first use."""
-        if self._model is not None:
+        if self._load_attempted:
             return self._model
+        self._load_attempted = True
         try:
             from ultralytics import YOLO
 
@@ -1784,10 +1790,35 @@ class PersonFallbackDetector:
             if self.device and self.device != "cpu":
                 self._model.to(self.device)
             LOGGER.info("Loaded YOLOv8n for person fallback detection on device=%s", self.device)
+            self._load_status = "ok"
+            self._load_error = None
+        except ModuleNotFoundError as exc:
+            self._load_status = "error"
+            if getattr(exc, "name", None) == "ultralytics":
+                self._load_error = "ultralytics_missing"
+            else:
+                self._load_error = f"import_error: {exc}"
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", self._load_error)
+            self._model = None
+        except ImportError as exc:
+            self._load_status = "error"
+            self._load_error = f"ultralytics_import_error: {exc}"
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", self._load_error)
+            self._model = None
         except Exception as exc:
-            LOGGER.warning("Failed to load YOLO for person fallback: %s", exc)
+            self._load_status = "error"
+            self._load_error = f"yolo_load_error: {type(exc).__name__}: {exc}"
+            LOGGER.warning("Failed to load YOLO for person fallback: %s", self._load_error)
             self._model = None
         return self._model
+
+    @property
+    def load_status(self) -> str:
+        return self._load_status
+
+    @property
+    def load_error(self) -> str | None:
+        return self._load_error
 
     def detect_persons(self, image: np.ndarray) -> list[DetectionSample]:
         """Detect persons and return estimated face regions.
@@ -1801,6 +1832,7 @@ class PersonFallbackDetector:
         if not PERSON_FALLBACK_ENABLED:
             return []
 
+        self.invocations += 1
         model = self._lazy_model()
         if model is None:
             return []
@@ -1858,6 +1890,7 @@ class PersonFallbackDetector:
                 )
 
             LOGGER.debug("Person fallback: found %d estimated faces from %d persons", len(detections), len(boxes))
+            self.detections_emitted += len(detections)
             return detections
 
         except Exception as exc:
@@ -5293,6 +5326,38 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
     ensure_dirs(args.ep_id)
+
+    # ---------------------------------------------------------------------
+    # Preflight: environment fingerprint (run-scoped when run_id is provided)
+    # ---------------------------------------------------------------------
+    try:
+        from py_screenalytics.env_diagnostics import DEFAULT_ENV_PACKAGES, collect_env_diagnostics, write_env_diagnostics_json
+
+        env_diag = collect_env_diagnostics(DEFAULT_ENV_PACKAGES)
+        setattr(args, "_env_diagnostics", env_diag)
+
+        LOGGER.info(
+            "[env] python=%s pip=%s venv_active=%s sys.executable=%s sys.prefix=%s",
+            env_diag.get("python_version"),
+            env_diag.get("pip_version"),
+            env_diag.get("venv_active"),
+            env_diag.get("sys_executable"),
+            env_diag.get("sys_prefix"),
+        )
+        pkg_versions = env_diag.get("package_versions")
+        if isinstance(pkg_versions, dict) and pkg_versions:
+            LOGGER.info("[env] package_versions=%s", pkg_versions)
+        import_status = env_diag.get("import_status")
+        if isinstance(import_status, dict) and import_status:
+            LOGGER.info("[env] import_status=%s", import_status)
+
+        if args.run_id:
+            run_root = run_layout.run_root(args.ep_id, run_layout.normalize_run_id(args.run_id))
+            env_path = run_root / "env_diagnostics.json"
+            write_env_diagnostics_json(env_path, env_diag)
+            LOGGER.info("[env] wrote %s", env_path)
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics
+        LOGGER.warning("[env] Failed to capture env diagnostics: %s", exc)
     storage, ep_ctx, s3_prefixes = _storage_context(args.ep_id)
 
     phase_flags = [flag for flag in (args.faces_embed, args.cluster) if flag]
@@ -6626,6 +6691,23 @@ def _run_full_pipeline(
     final_diag_stats["torch_device_resolved"] = torch_device_resolved
     final_diag_stats["torch_device_fallback_reason"] = torch_device_reason
 
+    # YOLO/person fallback diagnostics (torch-backed; should never receive "coreml" as a torch device).
+    final_diag_stats["yolo_fallback_enabled"] = bool(PERSON_FALLBACK_ENABLED)
+    if person_fallback_detector is None:
+        final_diag_stats["yolo_fallback_device"] = None
+        final_diag_stats["yolo_fallback_load_status"] = "disabled" if not PERSON_FALLBACK_ENABLED else "not_initialized"
+        final_diag_stats["yolo_fallback_disabled_reason"] = "disabled" if not PERSON_FALLBACK_ENABLED else None
+        final_diag_stats["yolo_fallback_invocations"] = 0
+        final_diag_stats["yolo_fallback_detections_added"] = 0
+    else:
+        final_diag_stats["yolo_fallback_device"] = str(getattr(person_fallback_detector, "device", "")).strip() or None
+        final_diag_stats["yolo_fallback_load_status"] = getattr(person_fallback_detector, "load_status", "unknown")
+        final_diag_stats["yolo_fallback_disabled_reason"] = getattr(person_fallback_detector, "load_error", None)
+        final_diag_stats["yolo_fallback_invocations"] = int(getattr(person_fallback_detector, "invocations", 0) or 0)
+        final_diag_stats["yolo_fallback_detections_added"] = int(
+            getattr(person_fallback_detector, "detections_emitted", 0) or 0
+        )
+
     # CRITICAL: Validate that tracking produced results when detections exist
     if det_count > 0 and len(track_rows) == 0:
         cfg = tracker_config_summary or {}
@@ -6730,6 +6812,7 @@ def _maybe_run_body_tracking(
     run_id: str | None,
     effective_run_id: str | None,
     video_path: Path,
+    import_status: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     config = _load_body_tracking_config()
     enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
@@ -6777,18 +6860,48 @@ def _maybe_run_body_tracking(
 
         embeddings_path: Path | None = None
         embeddings_note: str | None = None
-        reid_enabled = bool(getattr(runner.config, "reid_enabled", False))
-        if reid_enabled:
+        reid_enabled_config = bool(getattr(runner.config, "reid_enabled", False))
+        reid_embeddings_generated = False
+        reid_skip_reason: str | None = None
+        reid_comparisons_performed = 0
+
+        torchreid_status: str | None = None
+        torchreid_error: str | None = None
+        if isinstance(import_status, dict):
+            torchreid_state = import_status.get("torchreid")
+            if isinstance(torchreid_state, dict):
+                torchreid_status = torchreid_state.get("status")
+                torchreid_error = torchreid_state.get("error")
+
+        if not reid_enabled_config:
+            embeddings_note = "disabled"
+            reid_skip_reason = "disabled"
+        elif torchreid_status is not None and torchreid_status != "ok":
+            reid_skip_reason = f"torchreid_{torchreid_status}"
+            embeddings_note = reid_skip_reason
+            if torchreid_error:
+                embeddings_note = f"{reid_skip_reason}: {torchreid_error}"
+            LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", embeddings_note)
+        else:
             try:
                 embeddings_path = runner.run_embedding()
+                reid_embeddings_generated = True
             except ImportError as exc:
+                reid_skip_reason = "torchreid_import_error"
                 embeddings_note = f"import_error: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", exc)
             except Exception as exc:
+                reid_skip_reason = "reid_error"
                 embeddings_note = f"error: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", exc)
-        else:
-            embeddings_note = "disabled"
+
+        body_reid = {
+            "enabled_config": reid_enabled_config,
+            "enabled_effective": bool(reid_enabled_config and reid_embeddings_generated),
+            "reid_embeddings_generated": bool(reid_embeddings_generated),
+            "reid_skip_reason": reid_skip_reason,
+            "reid_comparisons_performed": int(reid_comparisons_performed),
+        }
 
         # Always materialize placeholder embedding artifacts so run-scoped bundles are consistent.
         # Fusion can still proceed without embeddings; empty arrays safely no-op the Re-ID path.
@@ -6811,7 +6924,7 @@ def _maybe_run_body_tracking(
                     "model_name": getattr(runner.config, "reid_model", None),
                     "num_embeddings": 0,
                     "entries": [],
-                    "reid_enabled": reid_enabled,
+                    "reid_enabled": reid_enabled_config,
                     "note": embeddings_note,
                 }
                 runner.embeddings_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -6825,11 +6938,16 @@ def _maybe_run_body_tracking(
                     "episode_id": ep_id,
                     "generated_at": _utcnow_iso(),
                     "output_dir": str(output_dir),
-                    "reid_enabled": reid_enabled,
+                    "import_status": import_status,
+                    "reid_enabled": reid_enabled_config,
                     "reid_note": embeddings_note,
+                    "body_reid": body_reid,
                     "tracker_backend_configured": tracker_backend_configured,
                     "tracker_backend_actual": tracker_backend_actual,
                     "tracker_fallback_reason": tracker_fallback_reason,
+                    "body_tracker_backend_configured": tracker_backend_configured,
+                    "body_tracker_backend_actual": tracker_backend_actual,
+                    "body_tracker_fallback_reason": tracker_fallback_reason,
                     "artifacts": {
                         "body_detections": str(det_path),
                         "body_tracks": str(tracks_path),
@@ -6861,11 +6979,16 @@ def _maybe_run_body_tracking(
             "run_id": effective_run_id,
             "started_at": started_at,
             "finished_at": _utcnow_iso(),
-            "reid_enabled": reid_enabled,
+            "import_status": import_status,
+            "reid_enabled": reid_enabled_config,
             "reid_note": embeddings_note,
+            "body_reid": body_reid,
             "tracker_backend_configured": tracker_backend_configured,
             "tracker_backend_actual": tracker_backend_actual,
             "tracker_fallback_reason": tracker_fallback_reason,
+            "body_tracker_backend_configured": tracker_backend_configured,
+            "body_tracker_backend_actual": tracker_backend_actual,
+            "body_tracker_fallback_reason": tracker_fallback_reason,
             "artifacts": {
                 "local": {
                     "body_tracking_dir": str(output_dir),
@@ -6890,6 +7013,7 @@ def _maybe_run_body_tracking(
             "run_id": effective_run_id,
             "started_at": started_at,
             "finished_at": _utcnow_iso(),
+            "import_status": import_status,
             "error": str(exc),
         }
         _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
@@ -7255,15 +7379,42 @@ def _run_detect_track_stage(
             run_id=run_id,
             effective_run_id=effective_run_id,
             video_path=video_dest,
+            import_status=(
+                getattr(args, "_env_diagnostics", {}).get("import_status")
+                if isinstance(getattr(args, "_env_diagnostics", None), dict)
+                else None
+            ),
         )
 
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
+        mirror_tracker = tracker_choice
+        try:
+            face_backend_actual = "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
+            body_backend_actual = None
+            body_fallback_reason = None
+            if isinstance(body_tracking_summary, dict):
+                body_backend_actual = (
+                    body_tracking_summary.get("body_tracker_backend_actual")
+                    or body_tracking_summary.get("tracker_backend_actual")
+                )
+                body_fallback_reason = (
+                    body_tracking_summary.get("body_tracker_fallback_reason")
+                    or body_tracking_summary.get("tracker_fallback_reason")
+                )
+            if isinstance(body_backend_actual, str) and body_backend_actual.strip():
+                mirror_tracker = f"face={face_backend_actual} body={body_backend_actual.strip()}"
+                if isinstance(body_fallback_reason, str) and body_fallback_reason.strip():
+                    mirror_tracker = f"{mirror_tracker} (body_fallback_reason={body_fallback_reason.strip()})"
+            else:
+                mirror_tracker = face_backend_actual
+        except Exception:
+            mirror_tracker = tracker_choice
         _report_s3_upload(
             progress,
             s3_sync_result,
             device=pipeline_device,
             detector=detector_choice,
-            tracker=tracker_choice,
+            tracker=mirror_tracker,
             resolved_device=detector_device,
         )
         if not s3_sync_result.success:
@@ -7366,6 +7517,11 @@ def _run_detect_track_stage(
                 "status": "success",
                 "version": APP_VERSION,
                 "run_id": effective_run_id,
+                "import_status": (
+                    getattr(args, "_env_diagnostics", {}).get("import_status")
+                    if isinstance(getattr(args, "_env_diagnostics", None), dict)
+                    else None
+                ),
                 "detections": det_count,
                 "tracks": track_count,
                 "detector": detector_choice,
@@ -7376,6 +7532,11 @@ def _run_detect_track_stage(
                     "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
                 ),
                 "tracker_fallback_reason": None,
+                "face_tracker_backend_configured": tracker_choice,
+                "face_tracker_backend_actual": (
+                    "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
+                ),
+                "face_tracker_fallback_reason": None,
                 "stride": args.stride,
                 # Frame accounting (why frames_processed != frames_total/stride)
                 "frames_scanned_total": runtime_stats.get("frames_scanned_total"),
@@ -7419,6 +7580,12 @@ def _run_detect_track_stage(
                 "torch_device_requested": runtime_stats.get("torch_device_requested"),
                 "torch_device_resolved": runtime_stats.get("torch_device_resolved"),
                 "torch_device_fallback_reason": runtime_stats.get("torch_device_fallback_reason"),
+                "yolo_fallback_enabled": runtime_stats.get("yolo_fallback_enabled"),
+                "yolo_fallback_device": runtime_stats.get("yolo_fallback_device"),
+                "yolo_fallback_load_status": runtime_stats.get("yolo_fallback_load_status"),
+                "yolo_fallback_disabled_reason": runtime_stats.get("yolo_fallback_disabled_reason"),
+                "yolo_fallback_invocations": runtime_stats.get("yolo_fallback_invocations"),
+                "yolo_fallback_detections_added": runtime_stats.get("yolo_fallback_detections_added"),
                 "tracking_gate": {
                     "enabled": bool(getattr(args, "gate_enabled", GATE_ENABLED_DEFAULT)),
                     "auto_rerun": gate_auto_rerun,
