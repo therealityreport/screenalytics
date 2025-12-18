@@ -70,12 +70,20 @@ fi
 echo "[dev.sh] Checking Python dependencies..."
 REQUIREMENTS_HASH="${ROOT}/.requirements_hash"
 CURRENT_HASH=$(cat requirements-ml.txt requirements-core.txt 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
+: "${SCREENALYTICS_INSTALL_ML:=1}"
 
 if [[ ! -f "$REQUIREMENTS_HASH" ]] || [[ "$(cat "$REQUIREMENTS_HASH" 2>/dev/null)" != "$CURRENT_HASH" ]]; then
   echo "[dev.sh] Installing/updating requirements..."
   pip install -q -r requirements.txt || {
     echo "[dev.sh] WARNING: Some packages failed to install. Continuing anyway..." >&2
   }
+  if [[ "${SCREENALYTICS_INSTALL_ML}" == "1" ]]; then
+    pip install -q -r requirements-ml.txt || {
+      echo "[dev.sh] WARNING: ML requirements failed to install. Continuing anyway..." >&2
+    }
+  else
+    echo "[dev.sh] Skipping ML requirements (SCREENALYTICS_INSTALL_ML=${SCREENALYTICS_INSTALL_ML})"
+  fi
   echo "$CURRENT_HASH" > "$REQUIREMENTS_HASH"
   echo "[dev.sh] ✅ Requirements up to date"
 else
