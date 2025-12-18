@@ -30,7 +30,6 @@ def test_pdf_missing_body_artifacts_renders_na_and_keeps_face_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("reportlab")
     import sys
 
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -75,7 +74,6 @@ def test_pdf_missing_face_artifacts_render_na_not_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression: missing face artifacts must render as N/A (not '0')."""
-    pytest.importorskip("reportlab")
     import sys
 
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -111,12 +109,12 @@ def test_pdf_missing_face_artifacts_render_na_not_zero(
 
     det_idx = next(idx for idx, s in enumerate(strings) if "Total face detections:" in s)
     det_window = "\n".join(strings[det_idx : det_idx + 80])
-    assert "N/A (missing detections.jsonl)" in det_window
+    assert "N/A \\(missing detections.jsonl\\)" in det_window
     assert "Total face detections: <b>0</b>" not in det_window
 
     trk_idx = next(idx for idx, s in enumerate(strings) if "Total face tracks:" in s)
     trk_window = "\n".join(strings[trk_idx : trk_idx + 80])
-    assert "N/A (missing tracks.jsonl)" in trk_window
+    assert "N/A \\(missing tracks.jsonl\\)" in trk_window
     assert "Total face tracks: <b>0</b>" not in trk_window
 
     assert "missing identities.json" in combined
@@ -127,7 +125,6 @@ def test_pdf_body_tracking_ran_effective_requires_run_scoped_artifacts_even_if_l
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression: legacy body artifacts must not imply run-scoped execution."""
-    pytest.importorskip("reportlab")
     import sys
 
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -163,7 +160,7 @@ def test_pdf_body_tracking_ran_effective_requires_run_scoped_artifacts_even_if_l
     strings = _ascii_strings(pdf_bytes)
     combined = "\n".join(strings)
 
-    ran_idx = next(idx for idx, s in enumerate(strings) if "body_tracking.ran_effective (run-scoped)" in s)
+    ran_idx = next(idx for idx, s in enumerate(strings) if "body_tracking.ran_effective \\(run-scoped\\)" in s)
     ran_window = "\n".join(strings[ran_idx : ran_idx + 80])
     assert "False" in ran_window
 

@@ -32,13 +32,9 @@ def test_gate_auto_rerun_decision_triggers_for_extreme_forced_splits() -> None:
 
     from tools.episode_run import (
         _gate_auto_rerun_decision,
-        GATE_AUTO_RERUN_ENABLED,
         GATE_AUTO_RERUN_FORCED_SPLITS_THRESHOLD,
         GATE_AUTO_RERUN_MIN_GATE_SPLITS_SHARE,
     )
-
-    if not GATE_AUTO_RERUN_ENABLED:
-        pytest.skip("gate auto rerun disabled via env")
 
     forced_splits = max(GATE_AUTO_RERUN_FORCED_SPLITS_THRESHOLD + 1, 1)
     gate_splits = int(forced_splits * GATE_AUTO_RERUN_MIN_GATE_SPLITS_SHARE) + 1
@@ -58,8 +54,6 @@ def test_pdf_reports_gate_auto_rerun_when_present(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("reportlab")
-
     sys.path.insert(0, str(PROJECT_ROOT))
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
@@ -114,5 +108,4 @@ def test_pdf_reports_gate_auto_rerun_when_present(
 
     assert "Appearance Gate Enabled" in combined
     assert "Appearance Gate Auto-Rerun" in combined
-    assert "true (selected=rerun" in combined
-
+    assert "true \\(selected=rerun" in combined

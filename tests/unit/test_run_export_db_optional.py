@@ -32,8 +32,6 @@ def test_pdf_db_not_configured_renders_na_instead_of_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("reportlab")
-
     sys.path.insert(0, str(PROJECT_ROOT))
 
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))

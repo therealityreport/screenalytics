@@ -32,8 +32,6 @@ def test_pdf_renders_face_baseline_total_when_present(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pytest.importorskip("reportlab")
-
     sys.path.insert(0, str(PROJECT_ROOT))
     monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
@@ -85,4 +83,3 @@ def test_pdf_renders_face_baseline_total_when_present(
 
     assert "Face baseline total" in combined
     assert "12.34s" in combined
-
