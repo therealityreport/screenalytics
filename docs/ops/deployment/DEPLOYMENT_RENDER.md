@@ -32,7 +32,7 @@ This guide covers deploying SCREANALYTICS to Render with the Celery background j
 
 **Type:** Background Worker
 **Runtime:** Python 3
-**Build Command:** `pip install -r requirements.txt`
+**Build Command:** `pip install -r requirements.txt -r requirements-ml.txt`
 **Start Command:** `celery -A apps.api.celery_app:celery_app worker -l info --concurrency 2`
 
 ### 3. Redis (Key-Value Store)
@@ -97,7 +97,7 @@ services:
   - type: worker
     name: screanalytics-worker
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt -r requirements-ml.txt
     startCommand: celery -A apps.api.celery_app:celery_app worker -l info --concurrency 2
     envVars:
       - key: REDIS_URL
