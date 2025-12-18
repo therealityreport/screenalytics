@@ -88,6 +88,38 @@ def _get_pipeline_settings_key(ep_id: str, category: str, field: str) -> str:
     return f"pipeline_settings::{ep_id}::{category}::{field}"
 
 
+def _generate_attempt_run_id(ep_id: str) -> str:
+    """Generate a human-readable run_id for an episode attempt.
+
+    Backward-compatible: if the currently loaded `py_screenalytics.run_layout` module
+    predates `generate_attempt_run_id`, compute it here so Streamlit hot reloads
+    don't crash on a stale import.
+    """
+    generator = getattr(run_layout, "generate_attempt_run_id", None)
+    if callable(generator):
+        return str(generator(ep_id))
+
+    existing = run_layout.list_run_ids(ep_id)
+    max_attempt = 0
+    for candidate in existing:
+        if not candidate.startswith("Attempt"):
+            continue
+        suffix = candidate[len("Attempt") :]
+        num_str = suffix.split("_", 1)[0]
+        try:
+            max_attempt = max(max_attempt, int(num_str))
+        except (TypeError, ValueError):
+            continue
+
+    attempt_num = (max_attempt + 1) if max_attempt > 0 else (len(existing) + 1)
+    timestamp = datetime.now(EST_TZ).strftime("%Y-%m-%d_%H%M%S")
+    run_id = f"Attempt{attempt_num}_{timestamp}EST"
+    while run_id in existing:
+        attempt_num += 1
+        run_id = f"Attempt{attempt_num}_{timestamp}EST"
+    return run_layout.normalize_run_id(run_id)
+
+
 def _render_pipeline_settings_dialog(ep_id: str, video_meta: Dict[str, Any] | None) -> None:
     """Render the unified pipeline settings dialog with all phase settings."""
 
@@ -1920,7 +1952,7 @@ if isinstance(_pending_attempt, str):
     attempt_locked = True
 
 if st.session_state.pop(_new_attempt_requested_key, False):
-    selected_attempt = run_layout.generate_attempt_run_id(ep_id)
+    selected_attempt = _generate_attempt_run_id(ep_id)
     try:
         run_layout.run_root(ep_id, selected_attempt).mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -3186,7 +3218,7 @@ with st.container():
                     st.error("Auto-run is disabled (missing video or another job is running).")
                     st.stop()
 
-                new_run_id = run_layout.generate_attempt_run_id(ep_id)
+                new_run_id = _generate_attempt_run_id(ep_id)
                 try:
                     run_layout.run_root(ep_id, new_run_id).mkdir(parents=True, exist_ok=True)
                 except Exception:
