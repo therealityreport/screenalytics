@@ -68,3 +68,107 @@ def test_pdf_missing_body_artifacts_renders_na_and_keeps_face_inputs(
     label_idx = next(idx for idx, s in enumerate(strings) if "Face Tracks \\(input\\)" in s)
     lookahead = "\n".join(strings[label_idx : label_idx + 250])
     assert f"({face_track_count})" in lookahead
+
+
+def test_pdf_missing_face_artifacts_render_na_not_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: missing face artifacts must render as N/A (not '0')."""
+    pytest.importorskip("reportlab")
+    import sys
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    import numpy as np
+
+    from py_screenalytics import run_layout
+    from apps.api.services.run_export import build_screentime_run_debug_pdf
+
+    ep_id = "ep-test"
+    run_id = "run-missing-faces"
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    # Simulate "embed outputs exist" while upstream face artifacts are missing.
+    (run_root / "face_alignment").mkdir(parents=True, exist_ok=True)
+    (run_root / "face_alignment" / "aligned_faces.jsonl").write_text(
+        json.dumps({"track_id": 1, "frame_idx": 0, "alignment_quality": 0.9}) + "\n",
+        encoding="utf-8",
+    )
+    embeds_dir = tmp_path / "embeds" / ep_id / "runs" / run_id
+    embeds_dir.mkdir(parents=True, exist_ok=True)
+    np.save(embeds_dir / "faces.npy", np.zeros((1, 512), dtype=np.float32))
+
+    pdf_bytes, _name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+    strings = _ascii_strings(pdf_bytes)
+    combined = "\n".join(strings)
+
+    det_idx = next(idx for idx, s in enumerate(strings) if "Total face detections:" in s)
+    det_window = "\n".join(strings[det_idx : det_idx + 80])
+    assert "N/A (missing detections.jsonl)" in det_window
+    assert "Total face detections: <b>0</b>" not in det_window
+
+    trk_idx = next(idx for idx, s in enumerate(strings) if "Total face tracks:" in s)
+    trk_window = "\n".join(strings[trk_idx : trk_idx + 80])
+    assert "N/A (missing tracks.jsonl)" in trk_window
+    assert "Total face tracks: <b>0</b>" not in trk_window
+
+    assert "missing identities.json" in combined
+
+
+def test_pdf_body_tracking_ran_effective_requires_run_scoped_artifacts_even_if_legacy_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: legacy body artifacts must not imply run-scoped execution."""
+    pytest.importorskip("reportlab")
+    import sys
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+
+    from py_screenalytics import run_layout
+    from apps.api.services.run_export import build_screentime_run_debug_pdf
+
+    ep_id = "ep-test"
+    run_id = "run-legacy-body-only"
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    # Only legacy body artifacts exist (episode-level); run-scoped body artifacts are missing.
+    legacy_body_dir = tmp_path / "manifests" / ep_id / "body_tracking"
+    legacy_body_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_body_dir / "body_detections.jsonl").write_text(json.dumps({"frame_idx": 0}) + "\n", encoding="utf-8")
+    (legacy_body_dir / "body_tracks.jsonl").write_text(json.dumps({"track_id": 100000}) + "\n", encoding="utf-8")
+
+    legacy_runs_dir = tmp_path / "manifests" / ep_id / "runs"
+    legacy_runs_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_runs_dir / "body_tracking.json").write_text(
+        json.dumps({"phase": "body_tracking", "status": "success", "run_id": run_id}, indent=2),
+        encoding="utf-8",
+    )
+
+    pdf_bytes, _name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+    strings = _ascii_strings(pdf_bytes)
+    combined = "\n".join(strings)
+
+    ran_idx = next(idx for idx, s in enumerate(strings) if "body_tracking.ran_effective (run-scoped)" in s)
+    ran_window = "\n".join(strings[ran_idx : ran_idx + 80])
+    assert "False" in ran_window
+
+    legacy_idx = next(idx for idx, s in enumerate(strings) if "legacy_body_tracking.out_of_scope" in s)
+    legacy_window = "\n".join(strings[legacy_idx : legacy_idx + 80])
+    assert "yes" in legacy_window
+
+    assert "out_of_scope=yes" in combined
