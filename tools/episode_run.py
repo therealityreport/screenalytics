@@ -7387,12 +7387,34 @@ def _run_detect_track_stage(
         )
 
         s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, frame_exporter)
+        mirror_tracker = tracker_choice
+        try:
+            face_backend_actual = "ultralytics.bytetrack" if tracker_choice == "bytetrack" else tracker_choice
+            body_backend_actual = None
+            body_fallback_reason = None
+            if isinstance(body_tracking_summary, dict):
+                body_backend_actual = (
+                    body_tracking_summary.get("body_tracker_backend_actual")
+                    or body_tracking_summary.get("tracker_backend_actual")
+                )
+                body_fallback_reason = (
+                    body_tracking_summary.get("body_tracker_fallback_reason")
+                    or body_tracking_summary.get("tracker_fallback_reason")
+                )
+            if isinstance(body_backend_actual, str) and body_backend_actual.strip():
+                mirror_tracker = f"face={face_backend_actual} body={body_backend_actual.strip()}"
+                if isinstance(body_fallback_reason, str) and body_fallback_reason.strip():
+                    mirror_tracker = f"{mirror_tracker} (body_fallback_reason={body_fallback_reason.strip()})"
+            else:
+                mirror_tracker = face_backend_actual
+        except Exception:
+            mirror_tracker = tracker_choice
         _report_s3_upload(
             progress,
             s3_sync_result,
             device=pipeline_device,
             detector=detector_choice,
-            tracker=tracker_choice,
+            tracker=mirror_tracker,
             resolved_device=detector_device,
         )
         if not s3_sync_result.success:
