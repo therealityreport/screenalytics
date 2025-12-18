@@ -59,17 +59,11 @@ class BodyEmbedder:
         if self._model is not None:
             return
 
-        import torch
+        from .device_routing import resolve_torch_device_request
 
-        # Determine device
-        device = self.device
-        if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
+        _requested, device, reason = resolve_torch_device_request(self.device)
+        if reason:
+            logger.info("[device] resolved=%s (reason=%s requested=%s)", device, reason, self.device)
         self._device_resolved = device
 
         # Try torchreid first
