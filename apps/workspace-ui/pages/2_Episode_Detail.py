@@ -2593,6 +2593,9 @@ with st.expander("Pipeline Status", expanded=False):
                     )
                     time.sleep(0.25)
                     st.rerun()
+                except (RerunException, StopException):
+                    # st.rerun()/st.stop() raise control-flow exceptions; allow Streamlit to handle them.
+                    raise
                 except Exception as exc:
                     st.error("Failed to clear previous attempts.")
                     st.exception(exc)
