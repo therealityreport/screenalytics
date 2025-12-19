@@ -29,6 +29,7 @@ import episode_detail_layout as stage_layout  # noqa: E402
 
 from py_screenalytics.artifacts import get_path  # noqa: E402
 from py_screenalytics import run_layout  # noqa: E402
+from py_screenalytics.episode_status import stage_artifacts  # noqa: E402
 
 FRAME_JPEG_SIZE_EST_BYTES = 220_000
 CROP_JPEG_SIZE_EST_BYTES = 40_000
@@ -1447,6 +1448,11 @@ def _session_improve_faces_state_key(ep_id: str, suffix: str) -> str:
     return _improve_faces_state_key(ep_id, _resolve_session_run_id(ep_id), suffix)
 
 
+def _clear_improve_faces_state(ep_id: str, run_id: str | None) -> None:
+    for suffix in ("complete", "active", "suggestions", "index", "empty_reason", "trigger"):
+        st.session_state.pop(_improve_faces_state_key(ep_id, run_id, suffix), None)
+
+
 def _start_improve_faces_ep_detail(ep_id: str, *, force: bool = False) -> bool:
     """Fetch initial suggestions and activate the Improve Faces modal on Episode Detail."""
     run_id = _resolve_session_run_id(ep_id)
@@ -1723,6 +1729,21 @@ def _cached_episode_status(
         run_id: Optional attempt/run_id to scope status.
     """
     return helpers.get_episode_status(ep_id, run_id=run_id)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_episode_status_file(
+    ep_id: str,
+    run_id: str | None,
+    status_mtime: float,
+) -> Dict[str, Any] | None:
+    if not run_id:
+        return None
+    try:
+        run_root = run_layout.run_root(ep_id, run_id)
+    except ValueError:
+        return None
+    return _read_json_payload(run_root / "episode_status.json")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -2198,18 +2219,30 @@ if canonical_ep_id != ep_id:
     st.rerun()
 ep_id = canonical_ep_id
 
+# DB-dependent features (suggestions/locks) should be disabled when DB is unavailable.
+db_health_snapshot = _cached_db_health()
+db_available = False
+if isinstance(db_health_snapshot, dict):
+    configured = bool(db_health_snapshot.get("configured"))
+    ok = db_health_snapshot.get("ok")
+    migrations_ok = db_health_snapshot.get("migrations_ok")
+    db_available = configured and ok is not False and migrations_ok is not False
+
 # Legacy: Smart Suggestions navigation (now replaced by Improve Faces modal)
 # Clear any stale navigation flags from previous sessions
 _autorun_navigate_key = f"{ep_id}::autorun_navigate_to_suggestions"
 st.session_state.pop(_autorun_navigate_key, None)
 
 # Trigger Improve Faces modal if flag is set (after cluster completion)
-if st.session_state.get(_session_improve_faces_state_key(ep_id, "trigger")):
+if not db_available:
+    _clear_improve_faces_state(ep_id, _resolve_session_run_id(ep_id))
+elif st.session_state.get(_session_improve_faces_state_key(ep_id, "trigger")):
     LOGGER.info("[IMPROVE_FACES] Trigger flag detected, starting Improve Faces modal")
     _start_improve_faces_ep_detail(ep_id, force=True)
 
 # Render Improve Faces modal if active
-_render_improve_faces_modal_ep_detail(ep_id)
+if db_available:
+    _render_improve_faces_modal_ep_detail(ep_id)
 # Skip heavy page rendering while modal is open to speed up YES/NO flows
 if st.session_state.get(_session_improve_faces_state_key(ep_id, "active")):
     st.stop()
@@ -2383,6 +2416,8 @@ def _safe_mtime(path: Path) -> float:
         return 0
 
 
+episode_status_mtime = _safe_mtime(_scoped_manifests_dir / "episode_status.json") if selected_attempt_run_id else 0
+
 current_mtimes = (
     selected_attempt_run_id or "legacy",
     _safe_mtime(_scoped_markers_dir / "detect_track.json"),
@@ -2390,6 +2425,7 @@ current_mtimes = (
     _safe_mtime(_scoped_markers_dir / "cluster.json"),
     _safe_mtime(_scoped_markers_dir / "body_tracking.json"),
     _safe_mtime(_scoped_markers_dir / "body_tracking_fusion.json"),
+    episode_status_mtime,
     _safe_mtime(_scoped_manifests_dir / "detections.jsonl"),
     _safe_mtime(_scoped_manifests_dir / "tracks.jsonl"),
     _safe_mtime(_scoped_manifests_dir / "faces.jsonl"),
@@ -2414,6 +2450,52 @@ if should_refresh_status:
     st.session_state[status_ts_key] = time.time()
     st.session_state[mtimes_key] = current_mtimes
 status_refreshed_at = st.session_state.get(status_ts_key)
+episode_status_payload = _cached_episode_status_file(ep_id, selected_attempt_run_id, episode_status_mtime)
+
+def _phase_from_episode_status(
+    status_payload: dict[str, Any] | None,
+    stage_key: str,
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(status_payload, dict):
+        return fallback
+    stages = status_payload.get("stages")
+    if not isinstance(stages, dict):
+        return fallback
+    stage_entry = stages.get(stage_key)
+    if not isinstance(stage_entry, dict):
+        return fallback
+    merged = dict(fallback or {})
+    status_value = stage_entry.get("status")
+    if status_value:
+        merged["status"] = status_value
+    started_at = stage_entry.get("started_at")
+    if started_at:
+        merged["started_at"] = started_at
+    ended_at = stage_entry.get("ended_at")
+    if ended_at:
+        merged["finished_at"] = ended_at
+    duration = stage_entry.get("duration_s")
+    if duration is not None:
+        merged["runtime_sec"] = duration
+    error_reason = stage_entry.get("error_reason")
+    if error_reason:
+        merged["error"] = error_reason
+        merged["error_reason"] = error_reason
+    metrics = stage_entry.get("metrics") if isinstance(stage_entry.get("metrics"), dict) else {}
+    if stage_key == "detect":
+        for key in ("detections", "tracks", "rtf", "effective_fps_processing", "scene_cut_count", "forced_scene_warmup_ratio"):
+            if metrics.get(key) is not None:
+                merged[key] = metrics.get(key)
+    elif stage_key == "faces":
+        for key in ("faces", "embedding_backend_actual", "embedding_model_name", "embedding_backend_fallback_reason"):
+            if metrics.get(key) is not None:
+                merged[key] = metrics.get(key)
+    elif stage_key == "cluster":
+        for key in ("identities", "faces", "singleton_fraction_before", "singleton_fraction_after", "cluster_thresh", "min_cluster_size", "min_identity_sim"):
+            if metrics.get(key) is not None:
+                merged[key] = metrics.get(key)
+    return merged
 
 if status_payload is None:
     detect_phase_status: Dict[str, Any] = {}
@@ -2423,6 +2505,11 @@ else:
     detect_phase_status = status_payload.get("detect_track") or {}
     faces_phase_status = status_payload.get("faces_embed") or {}
     cluster_phase_status = status_payload.get("cluster") or {}
+
+if isinstance(episode_status_payload, dict):
+    detect_phase_status = _phase_from_episode_status(episode_status_payload, "detect", detect_phase_status)
+    faces_phase_status = _phase_from_episode_status(episode_status_payload, "faces", faces_phase_status)
+    cluster_phase_status = _phase_from_episode_status(episode_status_payload, "cluster", cluster_phase_status)
 
 api_active_run_id = (status_payload or {}).get("active_run_id")
 if not st.session_state.get(_attempt_init_key) and not selected_attempt:
@@ -2636,9 +2723,14 @@ with st.expander("⚡ Performance & Quality", expanded=False):
         # Tracking fragmentation stats from run-scoped track_metrics.json (if present).
         forced_splits = None
         id_switches = None
+        track_metrics_payload: dict[str, Any] | None = None
+        cluster_metrics_block: dict[str, Any] | None = None
         try:
             if _track_metrics_path.exists():
                 _tm = json.loads(_track_metrics_path.read_text(encoding="utf-8"))
+                if isinstance(_tm, dict):
+                    track_metrics_payload = _tm
+                    cluster_metrics_block = _tm.get("cluster_metrics") if isinstance(_tm.get("cluster_metrics"), dict) else None
                 metrics_block = _tm.get("metrics") if isinstance(_tm, dict) else None
                 if isinstance(metrics_block, dict):
                     forced_splits = helpers.coerce_int(metrics_block.get("forced_splits"))
@@ -2711,6 +2803,187 @@ with st.expander("⚡ Performance & Quality", expanded=False):
             fusion_status = fusion_marker.get("status")
             if fusion_status:
                 st.caption(f"Track fusion marker: status={fusion_status}")
+
+        st.divider()
+        st.markdown("#### Regression Flags")
+
+        def _safe_ratio(numer: int | None, denom: int | None) -> float | None:
+            if numer is None or denom is None or denom <= 0:
+                return None
+            return float(numer) / float(denom)
+
+        def _singleton_rate_from_metrics(metrics_payload: dict[str, Any] | None) -> float | None:
+            if not isinstance(metrics_payload, dict):
+                return None
+            block = metrics_payload.get("cluster_metrics")
+            if not isinstance(block, dict):
+                return None
+            rate = helpers.coerce_float(block.get("singleton_fraction_after") or block.get("singleton_fraction"))
+            if rate is not None:
+                return rate
+            singles = helpers.coerce_int(block.get("singleton_count"))
+            total = helpers.coerce_int(block.get("total_clusters"))
+            return _safe_ratio(singles, total)
+
+        def _detect_rtf_for_run(run_root: Path) -> float | None:
+            status_payload = _read_json_best_effort(run_root / "episode_status.json")
+            if isinstance(status_payload, dict):
+                detect_block = status_payload.get("stages", {}).get("detect")
+                if isinstance(detect_block, dict):
+                    metrics = detect_block.get("metrics")
+                    if isinstance(metrics, dict):
+                        rtf_val = helpers.coerce_float(metrics.get("rtf"))
+                        if rtf_val is not None:
+                            return rtf_val
+            marker = _read_json_best_effort(run_root / "detect_track.json") or {}
+            return helpers.coerce_float(marker.get("rtf"))
+
+        def _track_count_for_run(run_root: Path) -> int | None:
+            status_payload = _read_json_best_effort(run_root / "episode_status.json")
+            if isinstance(status_payload, dict):
+                detect_block = status_payload.get("stages", {}).get("detect")
+                if isinstance(detect_block, dict):
+                    metrics = detect_block.get("metrics")
+                    if isinstance(metrics, dict):
+                        count = helpers.coerce_int(metrics.get("tracks"))
+                        if count is not None:
+                            return count
+            marker = _read_json_best_effort(run_root / "detect_track.json") or {}
+            return helpers.coerce_int(marker.get("tracks"))
+
+        def _forced_splits_share_for_run(run_root: Path) -> float | None:
+            metrics_payload = _read_json_best_effort(run_root / "track_metrics.json") or {}
+            metrics_block = metrics_payload.get("metrics") if isinstance(metrics_payload, dict) else None
+            forced = helpers.coerce_int(metrics_block.get("forced_splits") if isinstance(metrics_block, dict) else None)
+            tracks_total = helpers.coerce_int(metrics_block.get("tracks_born") if isinstance(metrics_block, dict) else None)
+            if tracks_total is None:
+                tracks_total = _track_count_for_run(run_root)
+            return _safe_ratio(forced, tracks_total)
+
+        def _fused_pairs_for_run(run_root: Path) -> tuple[int | None, int | None, dict[str, Any] | None]:
+            payload = _read_json_best_effort(run_root / "body_tracking" / "track_fusion.json") or {}
+            if not isinstance(payload, dict):
+                return None, None, None
+            diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+            pairs = helpers.coerce_int(diagnostics.get("final_pairs"))
+            if pairs is None:
+                pairs = helpers.coerce_int(payload.get("num_fused_identities"))
+            comparisons = helpers.coerce_int(diagnostics.get("reid_comparisons"))
+            return pairs, comparisons, payload
+
+        def _prev_successful_run_id() -> str | None:
+            if not selected_attempt_run_id:
+                return None
+            candidates: list[tuple[float, str]] = []
+            for run_id in run_layout.list_run_ids(ep_id):
+                if run_id == selected_attempt_run_id:
+                    continue
+                try:
+                    mtime = run_layout.run_root(ep_id, run_id).stat().st_mtime
+                except (OSError, ValueError):
+                    mtime = 0.0
+                candidates.append((mtime, run_id))
+            for _, run_id in sorted(candidates, reverse=True):
+                run_root = run_layout.run_root(ep_id, run_id)
+                status_payload = _read_json_best_effort(run_root / "episode_status.json")
+                if isinstance(status_payload, dict):
+                    detect_block = status_payload.get("stages", {}).get("detect")
+                    if isinstance(detect_block, dict) and detect_block.get("status") == "success":
+                        return run_id
+                marker = _read_json_best_effort(run_root / "detect_track.json")
+                if isinstance(marker, dict) and str(marker.get("status") or "").lower() == "success":
+                    return run_id
+            return None
+
+        baseline_run_id = _prev_successful_run_id()
+        baseline_root = run_layout.run_root(ep_id, baseline_run_id) if baseline_run_id else None
+
+        current_tracks = helpers.coerce_int(detect_marker.get("tracks")) if isinstance(detect_marker, dict) else None
+        current_forced_share = _safe_ratio(forced_splits, current_tracks)
+        current_singleton_rate = _singleton_rate_from_metrics(track_metrics_payload)
+        current_fused_pairs, current_reid_comparisons, _ = _fused_pairs_for_run(_scoped_manifests_dir)
+
+        baseline_rtf = _detect_rtf_for_run(baseline_root) if baseline_root else None
+        baseline_forced_share = _forced_splits_share_for_run(baseline_root) if baseline_root else None
+        baseline_singleton_rate = _singleton_rate_from_metrics(
+            _read_json_best_effort(baseline_root / "track_metrics.json") if baseline_root else None
+        )
+        baseline_fused_pairs = _fused_pairs_for_run(baseline_root)[0] if baseline_root else None
+
+        warn_msgs: list[str] = []
+        fail_msgs: list[str] = []
+
+        if detect_rtf is not None:
+            warn_thresh = max((baseline_rtf or 0) * 1.3, 2.5)
+            fail_thresh = max((baseline_rtf or 0) * 2.0, 4.0)
+            if detect_rtf > fail_thresh:
+                fail_msgs.append(f"Detect RTF {detect_rtf:.2f}x > {fail_thresh:.2f}x (quality gate fail)")
+            elif detect_rtf > warn_thresh:
+                warn_msgs.append(f"Detect RTF {detect_rtf:.2f}x > {warn_thresh:.2f}x")
+
+        if current_forced_share is not None:
+            if baseline_forced_share is None:
+                warn_limit = 0.85
+                fail_limit = 0.95
+            else:
+                warn_limit = baseline_forced_share + 0.05
+                fail_limit = baseline_forced_share + 0.10
+            if current_forced_share > fail_limit:
+                fail_msgs.append(
+                    f"Forced splits share {current_forced_share:.2%} > {fail_limit:.2%} (quality gate fail)"
+                )
+            elif current_forced_share > warn_limit:
+                warn_msgs.append(f"Forced splits share {current_forced_share:.2%} > {warn_limit:.2%}")
+
+        if current_singleton_rate is not None:
+            warn_limit = (baseline_singleton_rate + 0.05) if baseline_singleton_rate is not None else 0.65
+            fail_limit = 0.75
+            if current_singleton_rate > fail_limit:
+                fail_msgs.append(
+                    f"Singleton rate {current_singleton_rate:.2%} > {fail_limit:.2%} (quality gate fail)"
+                )
+            elif current_singleton_rate > warn_limit:
+                warn_msgs.append(f"Singleton rate {current_singleton_rate:.2%} > {warn_limit:.2%}")
+
+        if current_fused_pairs is not None:
+            if baseline_fused_pairs is None:
+                warn_limit = 10
+                fail_limit = 0
+            else:
+                warn_limit = int(baseline_fused_pairs * 0.8)
+                fail_limit = int(baseline_fused_pairs * 0.5)
+            if current_fused_pairs == 0 or (baseline_fused_pairs is not None and current_fused_pairs < fail_limit):
+                fail_msgs.append(
+                    f"Fused pairs {current_fused_pairs} below baseline ({baseline_fused_pairs}) (quality gate fail)"
+                )
+            elif baseline_fused_pairs is None and current_fused_pairs < warn_limit:
+                warn_msgs.append(f"Fused pairs {current_fused_pairs} < {warn_limit}")
+            elif baseline_fused_pairs is not None and current_fused_pairs < warn_limit:
+                warn_msgs.append(f"Fused pairs {current_fused_pairs} < {warn_limit}")
+
+        reid_enabled = _track_fusion_reid_enabled_config()
+        if reid_enabled and (current_reid_comparisons is not None and current_reid_comparisons == 0):
+            reid_skip_reason = None
+            body_reid = body_marker.get("body_reid") if isinstance(body_marker, dict) else None
+            if isinstance(body_reid, dict):
+                reid_skip_reason = body_reid.get("reid_skip_reason")
+            warn_msgs.append(
+                "Re-ID handoff enabled but 0 comparisons performed"
+                + (f" (skip_reason={reid_skip_reason})" if reid_skip_reason else "")
+                + ". Verify torchreid install or disable reid_handoff."
+            )
+
+        if baseline_run_id:
+            st.caption(f"Baseline run_id: `{baseline_run_id}`")
+        else:
+            st.caption("Baseline run_id: none (using absolute thresholds)")
+
+        for msg in fail_msgs:
+            st.error(f"🚨 {msg}")
+        for msg in warn_msgs:
+            st.warning(f"⚠️ {msg}")
+        if not fail_msgs and not warn_msgs:
+            st.success("No regression flags triggered.")
 
 # =============================================================================
 # Execution Mode Selector
@@ -3484,7 +3757,9 @@ with st.expander("Pipeline Status", expanded=False):
                 pass
             st.switch_page("pages/3_Faces_Review.py")
     with nav_col2:
-        if st.button(
+        if not db_available:
+            st.caption("Smart Suggestions unavailable (DB not configured).")
+        elif st.button(
             "Smart Suggestions",
             key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::nav_smart_suggestions",
             use_container_width=True,
@@ -3505,6 +3780,166 @@ with st.expander("Pipeline Status", expanded=False):
             except Exception:
                 pass
             st.switch_page("pages/3_Smart_Suggestions.py")
+
+    st.subheader("Stage Summary")
+    if not selected_attempt_run_id:
+        st.info("Select a run-scoped attempt (run_id) to view per-stage status and artifacts.")
+    else:
+        stage_plan = list(stage_layout.PIPELINE_STAGE_PLAN)
+        if isinstance(episode_status_payload, dict):
+            raw_plan = episode_status_payload.get("stage_plan")
+            if isinstance(raw_plan, list) and raw_plan:
+                normalized = [stage_layout.normalize_stage_key(str(item)) for item in raw_plan]
+                stage_plan = [item for item in normalized if item]
+        if episode_status_payload:
+            st.caption("Source: episode_status.json (run-scoped)")
+        else:
+            st.caption("Source: stage markers + manifests (episode_status.json missing)")
+
+        run_root = run_layout.run_root(ep_id, selected_attempt_run_id)
+        stage_artifact_map: dict[str, list[dict[str, Any]]] = {}
+        artifact_rel_paths: set[str] = set()
+
+        def _artifact_rel(path: Path) -> str | None:
+            try:
+                return str(path.relative_to(run_root))
+            except Exception:
+                return None
+
+        for stage_key in stage_plan:
+            stage_entry = (
+                (episode_status_payload or {}).get("stages", {}).get(stage_key)
+                if isinstance(episode_status_payload, dict)
+                else None
+            )
+            artifacts = stage_entry.get("artifacts") if isinstance(stage_entry, dict) else None
+            if not isinstance(artifacts, list):
+                artifacts = stage_artifacts(ep_id, selected_attempt_run_id, stage_key)
+            stage_artifact_map[stage_key] = artifacts
+            for artifact in artifacts:
+                path_raw = artifact.get("path") if isinstance(artifact, dict) else None
+                if not path_raw:
+                    continue
+                rel = _artifact_rel(Path(path_raw))
+                if rel:
+                    artifact_rel_paths.add(rel)
+
+        presence_map: dict[str, dict[str, Any]] = {}
+        if artifact_rel_paths:
+            presence_map = _cached_run_artifact_presence(
+                ep_id,
+                selected_attempt_run_id,
+                tuple(sorted(artifact_rel_paths)),
+            )
+
+        def _artifact_display(artifact: dict[str, Any]) -> str:
+            path_raw = artifact.get("path")
+            label = artifact.get("label") or (Path(path_raw).name if path_raw else "artifact")
+            scope = artifact.get("scope") or ("run" if "runs" in str(path_raw or "") else "legacy")
+            source = "missing"
+            if path_raw:
+                path_obj = Path(path_raw)
+                if path_obj.exists():
+                    source = "local"
+                else:
+                    rel = _artifact_rel(path_obj)
+                    presence = presence_map.get(rel or "")
+                    if isinstance(presence, dict) and presence.get("remote"):
+                        source = "s3"
+            return f"{label} ({scope} · {source})"
+
+        def _fallback_stage_entry(stage_key: str) -> dict[str, Any]:
+            if stage_key == "detect":
+                return {
+                    "status": detect_status_value,
+                    "started_at": detect_phase_status.get("started_at"),
+                    "ended_at": detect_phase_status.get("finished_at"),
+                    "duration_s": detect_phase_status.get("runtime_sec"),
+                    "error_reason": detect_phase_status.get("error") or detect_phase_status.get("error_reason"),
+                }
+            if stage_key == "faces":
+                return {
+                    "status": faces_status_value,
+                    "started_at": faces_phase_status.get("started_at"),
+                    "ended_at": faces_phase_status.get("finished_at"),
+                    "duration_s": faces_phase_status.get("runtime_sec"),
+                    "error_reason": faces_phase_status.get("error") or faces_phase_status.get("error_reason"),
+                }
+            if stage_key == "cluster":
+                return {
+                    "status": cluster_status_value,
+                    "started_at": cluster_phase_status.get("started_at"),
+                    "ended_at": cluster_phase_status.get("finished_at"),
+                    "duration_s": cluster_phase_status.get("runtime_sec"),
+                    "error_reason": cluster_phase_status.get("error") or cluster_phase_status.get("error_reason"),
+                }
+            if stage_key == "body_tracking":
+                return {
+                    "status": body_tracking_status_value,
+                    "started_at": body_tracking_started_at,
+                    "ended_at": body_tracking_finished_at,
+                    "duration_s": _runtime_from_iso(body_tracking_started_at, body_tracking_finished_at),
+                    "error_reason": body_tracking_error,
+                }
+            if stage_key == "track_fusion":
+                return {
+                    "status": body_fusion_status_value,
+                    "started_at": track_fusion_started_at,
+                    "ended_at": track_fusion_finished_at,
+                    "duration_s": _runtime_from_iso(track_fusion_started_at, track_fusion_finished_at),
+                    "error_reason": body_fusion_error,
+                }
+            if stage_key == "screentime":
+                return {
+                    "status": screentime_status_value,
+                    "started_at": screentime_started_at,
+                    "ended_at": screentime_finished_at,
+                    "duration_s": _runtime_from_iso(screentime_started_at, screentime_finished_at),
+                    "error_reason": screentime_error,
+                }
+            if stage_key == "pdf":
+                return {
+                    "status": pdf_export_status_value,
+                    "started_at": None,
+                    "ended_at": None,
+                    "duration_s": None,
+                    "error_reason": pdf_export_detail if pdf_export_status_value == "error" else None,
+                }
+            return {"status": "unknown"}
+
+        summary_rows: list[dict[str, Any]] = []
+        stages_payload = episode_status_payload.get("stages", {}) if isinstance(episode_status_payload, dict) else {}
+        for stage_key in stage_plan:
+            stage_entry = stages_payload.get(stage_key)
+            if not isinstance(stage_entry, dict):
+                stage_entry = _fallback_stage_entry(stage_key)
+            started_at = stage_entry.get("started_at")
+            ended_at = stage_entry.get("ended_at")
+            duration_val = stage_entry.get("duration_s")
+            if duration_val is None:
+                duration_val = _runtime_from_iso(started_at, ended_at)
+            duration_label = _format_runtime(duration_val) or "n/a"
+            artifacts = stage_artifact_map.get(stage_key) or []
+            artifacts_label = ", ".join(_artifact_display(a) for a in artifacts if isinstance(a, dict)) or "n/a"
+            summary_rows.append(
+                {
+                    "Stage": stage_layout.stage_label(stage_key),
+                    "Status": stage_entry.get("status") or "unknown",
+                    "Started": started_at or "—",
+                    "Ended": ended_at or "—",
+                    "Duration": duration_label,
+                    "Artifacts": artifacts_label,
+                    "Error": stage_entry.get("error_reason") or "",
+                }
+            )
+
+        if summary_rows:
+            st.dataframe(summary_rows, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No stage summary available.")
+
+    with st.expander("Pipeline Dependencies", expanded=False):
+        st.caption("detect → faces → cluster → body_tracking → track_fusion → screentime → pdf")
     coreml_available = status_payload.get("coreml_available") if status_payload else None
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
@@ -4302,22 +4737,23 @@ with st.container():
                     pass
 
                 # Always reset review state when starting auto-run (best-effort; don't block pipeline start).
-                with st.spinner("Resetting review state..."):
-                    try:
-                        helpers.api_post(
-                            f"/episodes/{ep_id}/dismissed_suggestions/reset_state",
-                            json={"archive_existing": True},
-                            params={"run_id": new_run_id},
-                            timeout=15,
-                        )
-                        helpers.api_post(
-                            f"/episodes/{ep_id}/face_review/reset_state",
-                            json={"archive_existing": True},
-                            params={"run_id": new_run_id},
-                            timeout=15,
-                        )
-                    except Exception as exc:
-                        LOGGER.warning("[AUTORUN] Reset review state failed (continuing anyway): %s", exc)
+                if db_available:
+                    with st.spinner("Resetting review state..."):
+                        try:
+                            helpers.api_post(
+                                f"/episodes/{ep_id}/dismissed_suggestions/reset_state",
+                                json={"archive_existing": True},
+                                params={"run_id": new_run_id},
+                                timeout=15,
+                            )
+                            helpers.api_post(
+                                f"/episodes/{ep_id}/face_review/reset_state",
+                                json={"archive_existing": True},
+                                params={"run_id": new_run_id},
+                                timeout=15,
+                            )
+                        except Exception as exc:
+                            LOGGER.warning("[AUTORUN] Reset review state failed (continuing anyway): %s", exc)
 
                 # Clear local UI session state so the next cluster run can re-open Improve Faces cleanly.
                 for suffix in ("complete", "active", "suggestions", "index", "empty_reason", "trigger"):
@@ -6580,7 +7016,7 @@ with col_cluster:
                 autorun_cluster_active = bool(
                     st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster"
                 )
-                if selected_attempt_run_id and not autorun_cluster_active:
+                if selected_attempt_run_id and not autorun_cluster_active and db_available:
                     st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
                     LOGGER.info(
                         "[CLUSTER_COMPLETE] Set trigger flag for Improve Faces modal, ep_id=%s run_id=%s",
@@ -6591,7 +7027,10 @@ with col_cluster:
                 elif autorun_cluster_active:
                     st.toast("✅ Cluster complete (Auto-Run). Continuing downstream stages…")
                 else:
-                    st.toast("🎯 Cluster complete! Select a run-scoped attempt (run_id) to use Improve Faces.")
+                    if db_available:
+                        st.toast("🎯 Cluster complete! Select a run-scoped attempt (run_id) to use Improve Faces.")
+                    else:
+                        st.toast("🎯 Cluster complete! Improve Faces unavailable (DB not configured).")
                 st.rerun()
 
     # Keep latest cluster log handy for copy/paste
@@ -6629,13 +7068,18 @@ with col_cluster:
                 st.switch_page("pages/3_Faces_Review.py")
         else:
             # Manual Improve Faces launcher
-            improve_faces_disabled = not bool(selected_attempt_run_id)
+            improve_faces_disabled = not bool(selected_attempt_run_id) or not db_available
+            improve_faces_help = None
+            if not selected_attempt_run_id:
+                improve_faces_help = "Select a run-scoped attempt (run_id) to enable Improve Faces."
+            elif not db_available:
+                improve_faces_help = "Improve Faces requires a configured DB."
             if st.button(
                 "🎯 Improve Faces",
                 key=f"improve_faces_cta_{ep_id}",
                 use_container_width=True,
                 disabled=improve_faces_disabled,
-                help="Select a run-scoped attempt (run_id) to enable Improve Faces." if improve_faces_disabled else None,
+                help=improve_faces_help,
             ):
                 st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
                 st.rerun()

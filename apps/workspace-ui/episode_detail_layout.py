@@ -51,6 +51,8 @@ _STAGE_KEY_ALIASES: dict[str, str] = {
     "clustering": "cluster",
     "body tracking": "body_tracking",
     "body_tracking": "body_tracking",
+    "body tracking fusion": "track_fusion",
+    "body_tracking_fusion": "track_fusion",
     "track fusion": "track_fusion",
     "track_fusion": "track_fusion",
     "screentime": "screentime",
