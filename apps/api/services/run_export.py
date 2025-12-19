@@ -12,7 +12,9 @@ import io
 import json
 import logging
 import os
+import platform
 import subprocess
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -24,6 +26,12 @@ import yaml
 
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
+from py_screenalytics.episode_status import (
+    collect_git_state,
+    normalize_stage_key,
+    stage_artifacts,
+    update_episode_status,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -620,6 +628,94 @@ def _get_git_sha() -> str:
     except Exception:
         pass
     return "N/A"
+
+
+def _get_git_branch() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or "N/A"
+    except Exception:
+        pass
+    return "N/A"
+
+
+def _get_git_dirty() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return "true" if result.stdout.strip() else "false"
+    except Exception:
+        pass
+    return "N/A"
+
+
+def _format_git_dirty(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "N/A"
+
+
+def _cpu_model() -> str:
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+    if sys.platform.startswith("linux"):
+        try:
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+    return platform.processor() or platform.machine() or "N/A"
+
+
+def _ram_total_gb() -> str:
+    try:
+        import psutil  # type: ignore
+
+        return f"{psutil.virtual_memory().total / (1024 ** 3):.1f} GB"
+    except Exception:
+        pass
+    try:
+        if hasattr(os, "sysconf"):
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            pages = os.sysconf("SC_PHYS_PAGES")
+            total = float(page_size) * float(pages)
+            return f"{total / (1024 ** 3):.1f} GB"
+    except Exception:
+        pass
+    return "N/A"
+
+
+def _hw_decode_label() -> str:
+    env = os.environ.get("SCREENALYTICS_HW_DECODE")
+    if env:
+        return env
+    if sys.platform == "darwin":
+        return "videotoolbox (default)"
+    return "unknown"
 
 
 def _format_yaml_subset(config: dict[str, Any], keys: list[str]) -> str:
@@ -1319,12 +1415,14 @@ def build_screentime_run_debug_pdf(
     body_tracking_marker_path = _resolved_path(run_root / "body_tracking.json", "body_tracking.json")
     faces_embed_marker_path = _resolved_path(run_root / "faces_embed.json", "faces_embed.json")
     env_diagnostics_path = _resolved_path(run_root / "env_diagnostics.json", "env_diagnostics.json")
+    episode_status_path = _resolved_path(run_root / "episode_status.json", "episode_status.json")
 
     # Load JSON artifact data
     identities_payload = _read_json(identities_path)
     identities_data = identities_payload if isinstance(identities_payload, dict) else {}
     track_metrics_payload = _read_json(track_metrics_path)
     track_metrics_data = track_metrics_payload if isinstance(track_metrics_payload, dict) else {}
+    episode_status_payload = _read_json(episode_status_path) if episode_status_path.exists() else None
     track_fusion_data = _read_json(track_fusion_path) if track_fusion_path.exists() else None
     screentime_data = _read_json(screentime_comparison_path) if screentime_comparison_path.exists() else None
 
@@ -1483,11 +1581,24 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph("Screen Time Run Debug Report", title_style))
     story.append(Spacer(1, 12))
 
+    git_sha_value = None
+    git_branch_value = None
+    git_dirty_value: Any = None
+    if isinstance(episode_status_payload, dict):
+        git_sha_value = episode_status_payload.get("git_sha")
+        git_branch_value = episode_status_payload.get("git_branch")
+        git_dirty_value = episode_status_payload.get("git_dirty")
+    git_sha_value = git_sha_value or _get_git_sha()
+    git_branch_value = git_branch_value or _get_git_branch()
+    git_dirty_label = _format_git_dirty(git_dirty_value if git_dirty_value is not None else _get_git_dirty())
+
     summary_data = [
         ["Episode ID", ep_id],
         ["Run ID", run_id_norm],
         ["Generated At", _now_iso()],
-        ["Git SHA", _get_git_sha()],
+        ["Git SHA", git_sha_value],
+        ["Git Branch", git_branch_value],
+        ["Git Dirty", git_dirty_label],
         ["Run Root", str(run_root)],
         ["S3 Layout (write)", s3_layout.s3_layout],
         ["S3 Run Prefix (write)", s3_layout.write_prefix],
@@ -1911,7 +2022,9 @@ def build_screentime_run_debug_pdf(
         ["Input", "Value"],
         ["Episode ID", ep_id],
         ["Run ID", run_id_norm],
-        ["Git SHA", _get_git_sha()],
+        ["Git SHA", git_sha_value],
+        ["Git Branch", git_branch_value],
+        ["Git Dirty", git_dirty_label],
         ["Generated At", _now_iso()],
         ["Artifact Store", storage_display],
         [
@@ -1925,6 +2038,18 @@ def build_screentime_run_debug_pdf(
             ),
         ],
     ]
+    env_payload = episode_status_payload.get("env") if isinstance(episode_status_payload, dict) else {}
+    torch_device_value = env_payload.get("torch_device") if isinstance(env_payload, dict) else None
+    onnx_provider_value = env_payload.get("onnx_provider") if isinstance(env_payload, dict) else None
+    host_lines = [
+        ("cpu", _cpu_model()),
+        ("ram", _ram_total_gb()),
+        ("os", platform.platform()),
+        ("hw_decode", _hw_decode_label()),
+        ("torch_device", torch_device_value or "N/A"),
+        ("onnx_provider", onnx_provider_value or "N/A"),
+    ]
+    lineage_data.append(["Host & Acceleration", host_lines])
 
     import_status: dict[str, Any] | None = None
     env_diagnostics = _read_json(env_diagnostics_path) if env_diagnostics_path.exists() else None
@@ -2697,6 +2822,407 @@ def build_screentime_run_debug_pdf(
         header_style=kv_header_style,
     )
     story.append(lineage_table)
+    story.append(Spacer(1, 12))
+
+    # =========================================================================
+    # SECTION 0.5: RUN-TO-RUN DIFF
+    # =========================================================================
+    story.append(Paragraph("0.5 Run-to-Run Diff", section_style))
+
+    def _safe_ratio(numer: int | float | None, denom: int | float | None) -> float | None:
+        if numer is None or denom in (None, 0):
+            return None
+        try:
+            return float(numer) / float(denom)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _singleton_rate_from_metrics(metrics_payload: dict[str, Any] | None) -> float | None:
+        if not isinstance(metrics_payload, dict):
+            return None
+        block = metrics_payload.get("cluster_metrics")
+        if not isinstance(block, dict):
+            return None
+        rate = _safe_float_opt(block.get("singleton_fraction_after") or block.get("singleton_fraction"))
+        if rate is not None:
+            return rate
+        singles = _safe_int_opt(block.get("singleton_count"))
+        total = _safe_int_opt(block.get("total_clusters"))
+        return _safe_ratio(singles, total)
+
+    def _detect_rtf_for_root(root: Path) -> float | None:
+        status_payload = _read_json(root / "episode_status.json")
+        if isinstance(status_payload, dict):
+            detect_block = status_payload.get("stages", {}).get("detect")
+            if isinstance(detect_block, dict):
+                metrics = detect_block.get("metrics")
+                if isinstance(metrics, dict):
+                    rtf_val = _safe_float_opt(metrics.get("rtf"))
+                    if rtf_val is not None:
+                        return rtf_val
+        marker = _read_json(root / "detect_track.json") or {}
+        if isinstance(marker, dict):
+            return _safe_float_opt(marker.get("rtf"))
+        return None
+
+    def _track_count_for_root(root: Path) -> int | None:
+        status_payload = _read_json(root / "episode_status.json")
+        if isinstance(status_payload, dict):
+            detect_block = status_payload.get("stages", {}).get("detect")
+            if isinstance(detect_block, dict):
+                metrics = detect_block.get("metrics")
+                if isinstance(metrics, dict):
+                    count = _safe_int_opt(metrics.get("tracks"))
+                    if count is not None:
+                        return count
+        marker = _read_json(root / "detect_track.json") or {}
+        if isinstance(marker, dict):
+            return _safe_int_opt(marker.get("tracks"))
+        return None
+
+    def _forced_splits_share_from_metrics(metrics_payload: dict[str, Any] | None) -> float | None:
+        metrics_block = metrics_payload.get("metrics") if isinstance(metrics_payload, dict) else None
+        forced = _safe_int_opt(metrics_block.get("forced_splits") if isinstance(metrics_block, dict) else None)
+        tracks_total = _safe_int_opt(metrics_block.get("tracks_born") if isinstance(metrics_block, dict) else None)
+        return _safe_ratio(forced, tracks_total)
+
+    def _forced_splits_share_for_root(root: Path) -> float | None:
+        metrics_payload = _read_json(root / "track_metrics.json")
+        share = _forced_splits_share_from_metrics(metrics_payload)
+        if share is not None:
+            return share
+        metrics_block = metrics_payload.get("metrics") if isinstance(metrics_payload, dict) else None
+        forced = _safe_int_opt(metrics_block.get("forced_splits") if isinstance(metrics_block, dict) else None)
+        tracks_total = _track_count_for_root(root)
+        return _safe_ratio(forced, tracks_total)
+
+    def _fused_pairs_for_root(root: Path) -> int | None:
+        payload = _read_json(root / "body_tracking" / "track_fusion.json")
+        if not isinstance(payload, dict):
+            return None
+        identities = payload.get("identities")
+        if isinstance(identities, dict):
+            pairs = 0
+            for identity_data in identities.values():
+                if not isinstance(identity_data, dict):
+                    continue
+                if identity_data.get("face_track_ids") and identity_data.get("body_track_ids"):
+                    pairs += 1
+            return pairs
+        diagnostics = payload.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            return _safe_int_opt(diagnostics.get("final_pairs"))
+        return _safe_int_opt(payload.get("num_fused_identities"))
+
+    def _gain_for_root(root: Path) -> float | None:
+        payload = _read_json(root / "body_tracking" / "screentime_comparison.json")
+        if not isinstance(payload, dict):
+            return None
+        summary = payload.get("summary")
+        if not isinstance(summary, dict):
+            return None
+        return _safe_float_opt(summary.get("gain_total_s", summary.get("total_duration_gain")))
+
+    def _prev_successful_run_id() -> str | None:
+        candidates: list[tuple[float, str]] = []
+        for run_id in run_layout.list_run_ids(ep_id):
+            if run_id == run_id_norm:
+                continue
+            try:
+                mtime = run_layout.run_root(ep_id, run_id).stat().st_mtime
+            except (OSError, ValueError):
+                mtime = 0.0
+            candidates.append((mtime, run_id))
+        for _, candidate in sorted(candidates, reverse=True):
+            run_root = run_layout.run_root(ep_id, candidate)
+            status_payload = _read_json(run_root / "episode_status.json")
+            if isinstance(status_payload, dict):
+                detect_block = status_payload.get("stages", {}).get("detect")
+                if isinstance(detect_block, dict) and detect_block.get("status") == "success":
+                    return candidate
+            marker = _read_json(run_root / "detect_track.json")
+            if isinstance(marker, dict) and str(marker.get("status") or "").lower() == "success":
+                return candidate
+        return None
+
+    baseline_run_id = _prev_successful_run_id()
+    if baseline_run_id:
+        baseline_root = run_layout.run_root(ep_id, baseline_run_id)
+
+        current_rtf = marker_rtf
+        if current_rtf is None and isinstance(episode_status_payload, dict):
+            detect_block = episode_status_payload.get("stages", {}).get("detect")
+            if isinstance(detect_block, dict):
+                metrics = detect_block.get("metrics")
+                if isinstance(metrics, dict):
+                    current_rtf = _safe_float_opt(metrics.get("rtf"))
+        current_forced_share = _forced_splits_share_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
+        if current_forced_share is None:
+            current_forced_share = _forced_splits_share_for_root(run_root)
+        current_singleton_rate = _singleton_rate_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
+        current_fused_pairs = actual_fused_pairs
+        current_gain = None
+        if isinstance(screentime_summary, dict):
+            current_gain = _safe_float_opt(
+                screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain"))
+            )
+        if current_gain is None:
+            current_gain = _gain_for_root(run_root)
+
+        baseline_rtf = _detect_rtf_for_root(baseline_root)
+        baseline_forced_share = _forced_splits_share_for_root(baseline_root)
+        baseline_singleton_rate = _singleton_rate_from_metrics(_read_json(baseline_root / "track_metrics.json"))
+        baseline_fused_pairs = _fused_pairs_for_root(baseline_root)
+        baseline_gain = _gain_for_root(baseline_root)
+
+        def _delta_text(current: float | int | None, baseline: float | int | None, suffix: str = "") -> str:
+            if current is None or baseline is None:
+                return "N/A"
+            delta = float(current) - float(baseline)
+            return f"{delta:+.2f}{suffix}"
+
+        diff_rows = [
+            ["Metric", "Current", f"Baseline ({baseline_run_id})", "Delta"],
+            [
+                "Detect RTF",
+                f"{current_rtf:.2f}x" if current_rtf is not None else "N/A",
+                f"{baseline_rtf:.2f}x" if baseline_rtf is not None else "N/A",
+                _delta_text(current_rtf, baseline_rtf, "x"),
+            ],
+            [
+                "Forced splits share",
+                f"{current_forced_share:.2%}" if current_forced_share is not None else "N/A",
+                f"{baseline_forced_share:.2%}" if baseline_forced_share is not None else "N/A",
+                _delta_text(
+                    current_forced_share * 100 if current_forced_share is not None else None,
+                    baseline_forced_share * 100 if baseline_forced_share is not None else None,
+                    "pp",
+                ),
+            ],
+            [
+                "Singleton rate",
+                f"{current_singleton_rate:.2%}" if current_singleton_rate is not None else "N/A",
+                f"{baseline_singleton_rate:.2%}" if baseline_singleton_rate is not None else "N/A",
+                _delta_text(
+                    current_singleton_rate * 100 if current_singleton_rate is not None else None,
+                    baseline_singleton_rate * 100 if baseline_singleton_rate is not None else None,
+                    "pp",
+                ),
+            ],
+            [
+                "Fused pairs",
+                str(current_fused_pairs) if current_fused_pairs is not None else "N/A",
+                str(baseline_fused_pairs) if baseline_fused_pairs is not None else "N/A",
+                _delta_text(current_fused_pairs, baseline_fused_pairs, ""),
+            ],
+            [
+                "Screen time gain",
+                f"{current_gain:.2f}s" if current_gain is not None else "N/A",
+                f"{baseline_gain:.2f}s" if baseline_gain is not None else "N/A",
+                _delta_text(current_gain, baseline_gain, "s"),
+            ],
+        ]
+
+        diff_table = Table(diff_rows, colWidths=[1.6 * inch, 1.3 * inch, 1.7 * inch, 1.0 * inch])
+        diff_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+            ])
+        )
+        story.append(diff_table)
+    else:
+        story.append(Paragraph("No prior successful run found for baseline comparison.", note_style))
+
+    story.append(Spacer(1, 12))
+
+    # =========================================================================
+    # SECTION 0.6: JOB LIFECYCLE
+    # =========================================================================
+    story.append(Paragraph("0.6 Job Lifecycle", section_style))
+
+    stage_labels = {
+        "detect": "Detect/Track",
+        "faces": "Faces Harvest",
+        "cluster": "Cluster",
+        "body_tracking": "Body Tracking",
+        "track_fusion": "Track Fusion",
+        "screentime": "Screentime",
+        "pdf": "PDF Export",
+    }
+    raw_plan = (
+        [str(item) for item in episode_status_payload.get("stage_plan", []) if isinstance(item, str)]
+        if isinstance(episode_status_payload, dict)
+        else []
+    )
+    stage_plan: list[str] = []
+    for item in raw_plan:
+        normalized = normalize_stage_key(item)
+        if normalized and normalized not in stage_plan:
+            stage_plan.append(normalized)
+    if not stage_plan:
+        stage_plan = ["detect", "faces", "cluster", "body_tracking", "track_fusion", "screentime", "pdf"]
+
+    job_records: list[dict[str, Any]] = []
+    jobs_dir = get_path(ep_id, "video").parents[2] / "jobs"
+    if jobs_dir.exists():
+        for path in jobs_dir.glob("*.json"):
+            payload = _read_json(path)
+            if isinstance(payload, dict) and payload.get("ep_id") == ep_id:
+                job_records.append(payload)
+
+    def _record_run_id(record: dict[str, Any]) -> str | None:
+        for source_key in ("requested", "summary"):
+            source = record.get(source_key)
+            if isinstance(source, dict):
+                value = source.get("run_id")
+                if isinstance(value, str) and value.strip():
+                    try:
+                        return run_layout.normalize_run_id(value)
+                    except ValueError:
+                        return value.strip()
+        command = record.get("command")
+        if isinstance(command, list):
+            for idx, token in enumerate(command):
+                if token == "--run-id" and idx + 1 < len(command):
+                    return str(command[idx + 1])
+        if isinstance(command, str) and "--run-id" in command:
+            parts = command.split()
+            for idx, token in enumerate(parts):
+                if token == "--run-id" and idx + 1 < len(parts):
+                    return parts[idx + 1]
+        return None
+
+    job_type_map = {
+        "detect_track": "detect",
+        "faces_embed": "faces",
+        "cluster": "cluster",
+        "body_tracking": "body_tracking",
+        "body_tracking_fusion": "track_fusion",
+        "screen_time_analyze": "screentime",
+        "pdf_export": "pdf",
+    }
+
+    job_records_by_stage: dict[str, list[dict[str, Any]]] = {}
+    for record in job_records:
+        stage_key = job_type_map.get(record.get("job_type"))
+        if not stage_key:
+            continue
+        record_run_id = _record_run_id(record)
+        if record_run_id and record_run_id != run_id_norm:
+            continue
+        job_records_by_stage.setdefault(stage_key, []).append(record)
+
+    job_runs_by_stage: dict[str, list[dict[str, Any]]] = {}
+    for job_run in job_runs:
+        if not isinstance(job_run, dict):
+            continue
+        stage_key = job_type_map.get(job_run.get("job_name"))
+        if stage_key:
+            job_runs_by_stage.setdefault(stage_key, []).append(job_run)
+
+    def _last_log_line(record: dict[str, Any] | None) -> str | None:
+        if not isinstance(record, dict):
+            return None
+        summary = record.get("summary")
+        if isinstance(summary, dict):
+            phase = summary.get("phase")
+            step = summary.get("step")
+            message = summary.get("message") or summary.get("status") or summary.get("error")
+            parts = [str(val) for val in (phase, step, message) if val]
+            if parts:
+                return " · ".join(parts)
+        error_text = record.get("error")
+        if isinstance(error_text, str) and error_text.strip():
+            return error_text.strip()
+        stderr_log = record.get("stderr_log")
+        if isinstance(stderr_log, str):
+            try:
+                log_path = Path(stderr_log)
+                if log_path.exists():
+                    content = log_path.read_text(encoding="utf-8", errors="ignore")
+                    for line in reversed(content.splitlines()):
+                        cleaned = line.strip()
+                        if cleaned:
+                            return cleaned[:200]
+            except OSError:
+                return None
+        return None
+
+    job_rows = [_wrap_row(["Stage", "Status", "Started", "Ended", "Exit/Retry", "Last Log"], cell_style_small)]
+    marker_map = {
+        "detect": "detect_track.json",
+        "faces": "faces_embed.json",
+        "cluster": "cluster.json",
+        "body_tracking": "body_tracking.json",
+        "track_fusion": "body_tracking_fusion.json",
+    }
+    for stage_key in stage_plan:
+        stage_entry = None
+        if isinstance(episode_status_payload, dict):
+            stage_entry = episode_status_payload.get("stages", {}).get(stage_key)
+        if not isinstance(stage_entry, dict):
+            stage_entry = {}
+        status_val = stage_entry.get("status") or "unknown"
+        started_at = stage_entry.get("started_at")
+        ended_at = stage_entry.get("ended_at")
+        if not started_at and not ended_at:
+            marker_name = marker_map.get(stage_key)
+            if marker_name:
+                marker = _read_json(run_root / marker_name)
+                if isinstance(marker, dict):
+                    status_val = status_val if status_val != "unknown" else str(marker.get("status") or "unknown")
+                    started_at = marker.get("started_at")
+                    ended_at = marker.get("finished_at") or marker.get("ended_at")
+        started_at = started_at or "—"
+        ended_at = ended_at or "—"
+        records = job_records_by_stage.get(stage_key, [])
+        records.sort(key=lambda r: r.get("started_at") or "")
+        latest_record = records[-1] if records else None
+        exit_code = None
+        if isinstance(latest_record, dict):
+            exit_code = latest_record.get("return_code")
+        retries = max(len(records) - 1, 0) if records else max(len(job_runs_by_stage.get(stage_key, [])) - 1, 0)
+        last_line = _last_log_line(latest_record)
+        if last_line is None and job_runs_by_stage.get(stage_key):
+            last_error = job_runs_by_stage[stage_key][-1].get("error_text")
+            if isinstance(last_error, str) and last_error.strip():
+                last_line = last_error.strip()
+        job_rows.append(
+            _wrap_row(
+                [
+                    stage_labels.get(stage_key, stage_key),
+                    str(status_val),
+                    str(started_at),
+                    str(ended_at),
+                    f"exit={exit_code if exit_code is not None else 'N/A'} retry={retries}",
+                    last_line or "—",
+                ],
+                cell_style_small,
+            )
+        )
+
+    job_table = Table(job_rows, colWidths=[1.1 * inch, 0.8 * inch, 1.2 * inch, 1.2 * inch, 1.0 * inch, 1.7 * inch])
+    job_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ])
+    )
+    story.append(job_table)
+    story.append(Spacer(1, 12))
 
     # =========================================================================
     # SECTION 1: FACE DETECT
@@ -4065,6 +4591,71 @@ def build_screentime_run_debug_pdf(
                 note_style
             ))
 
+        breakdowns = screentime_payload.get("breakdowns") if isinstance(screentime_payload, dict) else None
+        if isinstance(breakdowns, list) and breakdowns:
+            contributors: list[dict[str, Any]] = []
+            for entry in breakdowns:
+                if not isinstance(entry, dict):
+                    continue
+                delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
+                gain = _safe_float_opt(delta.get("duration_gain"))
+                if gain is None or gain <= 0:
+                    continue
+                contributors.append(entry)
+
+            contributors.sort(
+                key=lambda item: _safe_float_opt((item.get("delta") or {}).get("duration_gain")) or 0.0,
+                reverse=True,
+            )
+            contributors = contributors[:5]
+
+            if contributors:
+                story.append(Spacer(1, 8))
+                story.append(Paragraph("Top Contributors to Screen Time Gain", subsection_style))
+                contrib_rows = [_wrap_row(["Identity", "Gain", "Body-only segments"], cell_style_small)]
+                for entry in contributors:
+                    identity_id = str(entry.get("identity_id") or "unknown")
+                    delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
+                    gain = _safe_float_opt(delta.get("duration_gain")) or 0.0
+                    body_only_segments = entry.get("body_only_segments")
+                    if not isinstance(body_only_segments, list):
+                        segments_block = entry.get("segments") if isinstance(entry.get("segments"), dict) else {}
+                        body_only_segments = segments_block.get("body_only") if isinstance(segments_block, dict) else None
+                    segment_texts: list[str] = []
+                    if isinstance(body_only_segments, list):
+                        for seg in body_only_segments[:3]:
+                            if not isinstance(seg, dict):
+                                continue
+                            start_time = _safe_float_opt(seg.get("start_time"))
+                            end_time = _safe_float_opt(seg.get("end_time"))
+                            duration = _safe_float_opt(seg.get("duration"))
+                            if start_time is None or end_time is None:
+                                continue
+                            if duration is None:
+                                duration = max(end_time - start_time, 0.0)
+                            segment_texts.append(f"{start_time:.2f}-{end_time:.2f}s ({duration:.2f}s)")
+                    segments_label = ", ".join(segment_texts) if segment_texts else "N/A"
+                    if isinstance(body_only_segments, list) and len(body_only_segments) > 3:
+                        segments_label = f"{segments_label} (+{len(body_only_segments) - 3} more)"
+                    contrib_rows.append(
+                        _wrap_row([identity_id, f"+{gain:.2f}s", segments_label], cell_style_small)
+                    )
+
+                contrib_table = Table(contrib_rows, colWidths=[1.2 * inch, 0.9 * inch, 4.4 * inch])
+                contrib_table.setStyle(
+                    TableStyle([
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, -1), 8),
+                        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+                    ])
+                )
+                story.append(contrib_table)
+
         # Additional stats
         story.append(Spacer(1, 8))
         story.append(Paragraph(f"Total tracked IDs analyzed: <b>{screentime_summary.get('total_identities', 0)}</b>", body_style))
@@ -4272,6 +4863,56 @@ def build_screentime_run_debug_pdf(
     story.append(PageBreak())
     story.append(Paragraph("Appendix: Artifact Manifest", section_style))
     story.append(Paragraph("Complete listing of all referenced artifacts with status, size, and record counts:", body_style))
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Artifact Provenance (run-scoped)", subsection_style))
+    provenance_targets: list[tuple[str, str]] = [
+        ("episode_status.json", "episode_status.json"),
+        ("detections.jsonl", "detections.jsonl"),
+        ("tracks.jsonl", "tracks.jsonl"),
+        ("track_metrics.json", "track_metrics.json"),
+        ("faces.jsonl", "faces.jsonl"),
+        ("face_alignment/aligned_faces.jsonl", "face_alignment/aligned_faces.jsonl"),
+        ("identities.json", "identities.json"),
+        ("cluster_centroids.json", "cluster_centroids.json"),
+        ("body_tracking/body_detections.jsonl", "body_tracking/body_detections.jsonl"),
+        ("body_tracking/body_tracks.jsonl", "body_tracking/body_tracks.jsonl"),
+        ("body_tracking/track_fusion.json", "body_tracking/track_fusion.json"),
+        ("body_tracking/screentime_comparison.json", "body_tracking/screentime_comparison.json"),
+        ("analytics/screentime.json", "analytics/screentime.json"),
+        ("exports/export_index.json", "exports/export_index.json"),
+    ]
+    provenance_rows = [_wrap_row(["Artifact", "Scope", "Source", "Local mtime", "Hydrated mtime", "S3 key"], cell_style_small)]
+    for label, rel_name in provenance_targets:
+        local_path = run_root / rel_name
+        hydrated_path = hydrated_paths.get(rel_name)
+        source = "hydrated" if hydrated_path else ("local" if local_path.exists() else "missing")
+        local_mtime = _format_mtime(local_path) if local_path.exists() else "N/A"
+        hydrated_mtime = _format_mtime(hydrated_path) if hydrated_path else "—"
+        s3_key = hydrated_s3_keys.get(rel_name) or "—"
+        provenance_rows.append(
+            _wrap_row([label, "run", source, local_mtime, hydrated_mtime, s3_key], cell_style_small)
+        )
+
+    provenance_table = Table(
+        provenance_rows,
+        colWidths=[2.1 * inch, 0.6 * inch, 0.7 * inch, 1.1 * inch, 1.1 * inch, 1.4 * inch],
+    )
+    provenance_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ])
+    )
+    story.append(provenance_table)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Legacy artifacts are listed in the section below as out-of-scope references.", note_style))
     story.append(Spacer(1, 8))
 
     # "In Bundle" indicates whether the artifact is included when exporting as ZIP with include_artifacts=True
@@ -4570,7 +5211,29 @@ def build_and_upload_debug_pdf(
     Returns:
         (pdf_bytes, download_filename, upload_result or None)
     """
-    pdf_bytes, download_name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+    started_at = _now_iso()
+    try:
+        pdf_bytes, download_name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+    except Exception as exc:
+        try:
+            update_episode_status(
+                ep_id,
+                run_id,
+                stage_key="pdf",
+                stage_update={
+                    "status": "error",
+                    "started_at": started_at,
+                    "ended_at": _now_iso(),
+                    "duration_s": None,
+                    "error_reason": str(exc),
+                    "artifacts": stage_artifacts(ep_id, run_id, "pdf"),
+                    "metrics": {},
+                },
+                git_info=collect_git_state(),
+            )
+        except Exception as status_exc:
+            LOGGER.warning("[export] Failed to update episode_status.json for PDF error: %s", status_exc)
+        raise
 
     upload_result = None
     if upload_to_s3:
@@ -4613,6 +5276,29 @@ def build_and_upload_debug_pdf(
             )
         except Exception as exc:
             LOGGER.warning("[export] Failed to write export index: %s", exc)
+
+    try:
+        update_episode_status(
+            ep_id,
+            run_id,
+            stage_key="pdf",
+            stage_update={
+                "status": "success",
+                "started_at": started_at,
+                "ended_at": _now_iso(),
+                "duration_s": None,
+                "error_reason": None,
+                "artifacts": stage_artifacts(ep_id, run_id, "pdf"),
+                "metrics": {
+                    "export_bytes": len(pdf_bytes),
+                    "export_key": upload_result.s3_key if upload_result else None,
+                    "upload_success": upload_result.success if upload_result else None,
+                },
+            },
+            git_info=collect_git_state(),
+        )
+    except Exception as exc:
+        LOGGER.warning("[export] Failed to update episode_status.json for PDF success: %s", exc)
 
     return pdf_bytes, download_name, upload_result
 
