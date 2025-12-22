@@ -181,6 +181,9 @@ TRACKER_CONFIG = os.environ.get("SCREENALYTICS_TRACKER_CONFIG", "bytetrack.yaml"
 TRACKER_NAME = Path(TRACKER_CONFIG).stem if TRACKER_CONFIG else "bytetrack"
 PROGRESS_FRAME_STEP = int(os.environ.get("SCREENALYTICS_PROGRESS_FRAME_STEP", 10))  # Smoother progress (was 25)
 PROGRESS_TIME_INTERVAL = float(os.environ.get("SCREENALYTICS_PROGRESS_TIME_INTERVAL", 2.0))  # Emit at least every N seconds
+STAGE_HEARTBEAT_INTERVAL = float(
+    os.environ.get("SCREENALYTICS_STAGE_HEARTBEAT_INTERVAL", 5.0)
+)  # Episode_status heartbeat cadence
 TRACKING_DIAG_INTERVAL = max(int(os.environ.get("SCREENALYTICS_TRACK_DIAG_INTERVAL", "100")), 1)
 LOGGER = logging.getLogger("episode_run")
 DATA_ROOT = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
@@ -3528,6 +3531,98 @@ def _video_phase_meta(
 
 def _utcnow_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+@dataclass
+class StageStatusHeartbeat:
+    ep_id: str
+    run_id: str | None
+    stage_key: str
+    frames_total: int
+    started_at: str
+    heartbeat_interval: float = STAGE_HEARTBEAT_INTERVAL
+    _last_tick: float = field(default_factory=time.time)
+    frames_done_at: str | None = None
+    finalize_started_at: str | None = None
+    ended_at: str | None = None
+    _enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.run_id:
+            self._enabled = False
+            return
+        try:
+            self.run_id = run_layout.normalize_run_id(self.run_id)
+        except ValueError:
+            self._enabled = False
+
+    def update(
+        self,
+        *,
+        done: int,
+        phase: str,
+        message: str | None = None,
+        force: bool = False,
+        mark_frames_done: bool = False,
+        mark_finalize_start: bool = False,
+        mark_end: bool = False,
+    ) -> None:
+        if not self._enabled:
+            return
+        now = time.time()
+        if not force and (now - self._last_tick) < self.heartbeat_interval:
+            return
+        stamp = _utcnow_iso()
+        if mark_frames_done and self.frames_done_at is None:
+            self.frames_done_at = stamp
+        if mark_finalize_start and self.finalize_started_at is None:
+            self.finalize_started_at = stamp
+        if mark_end:
+            self.ended_at = stamp
+
+        done_val = max(int(done or 0), 0)
+        total_val = max(int(self.frames_total or 0), 0)
+        pct = None
+        if total_val > 0:
+            pct = max(min(done_val / total_val, 1.0), 0.0)
+
+        progress_payload = {
+            "done": done_val,
+            "total": total_val,
+            "pct": pct,
+            "phase": phase,
+            "message": message,
+            "last_update_at": stamp,
+        }
+        timestamps_payload = {
+            "started_at": self.started_at,
+            "frames_done_at": self.frames_done_at,
+            "finalize_started_at": self.finalize_started_at,
+            "ended_at": self.ended_at,
+        }
+        update_episode_status(
+            self.ep_id,
+            self.run_id,
+            stage_key=self.stage_key,
+            stage_update={"progress": progress_payload, "timestamps": timestamps_payload},
+        )
+        self._last_tick = now
+
+
+def _run_with_heartbeat(
+    action: Callable[[], Any],
+    heartbeat: Callable[[], None],
+    *,
+    interval: float,
+) -> Any:
+    """Run a long action while emitting heartbeat updates at a fixed interval."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(action)
+        while True:
+            try:
+                return future.result(timeout=interval)
+            except TimeoutError:
+                heartbeat()
 
 
 def _manifests_dir_for_run(ep_id: str, run_id: str | None) -> Path:
@@ -8144,17 +8239,56 @@ def _run_faces_embed_stage(
 
     faces_done = 0
     started_at = _utcnow_iso()
+    stage_heartbeat = StageStatusHeartbeat(
+        ep_id=args.ep_id,
+        run_id=run_id,
+        stage_key="faces",
+        frames_total=faces_total,
+        started_at=started_at,
+    )
     faces_embed_succeeded = False
     try:
-        progress.emit(
+        def _emit_faces_progress(
+            done: int,
+            *,
+            subphase: str,
+            message: str | None = None,
+            force: bool = False,
+            summary: Dict[str, Any] | None = None,
+            step: str | None = None,
+            mark_frames_done: bool = False,
+            mark_finalize_start: bool = False,
+            mark_end: bool = False,
+        ) -> None:
+            extra = _phase_meta(step)
+            if message:
+                extra["message"] = message
+            progress.emit(
+                done,
+                phase="faces_embed",
+                device=device,
+                detector=detector_choice,
+                tracker=tracker_choice,
+                resolved_device=embed_device,
+                summary=summary,
+                force=force,
+                extra=extra,
+            )
+            stage_heartbeat.update(
+                done=done,
+                phase=subphase,
+                message=message,
+                force=force,
+                mark_frames_done=mark_frames_done,
+                mark_finalize_start=mark_finalize_start,
+                mark_end=mark_end,
+            )
+
+        _emit_faces_progress(
             0,
-            phase="faces_embed",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
+            subphase="running_frames",
+            message="Embedding faces",
             force=True,
-            extra=_phase_meta(),
         )
         rows: List[Dict[str, Any]] = []
         
@@ -8222,14 +8356,10 @@ def _run_faces_embed_stage(
                         )
                     )
                     faces_done = min(faces_total, faces_done + 1)
-                progress.emit(
+                _emit_faces_progress(
                     faces_done,
-                    phase="faces_embed",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=embed_device,
-                    extra=_phase_meta(),
+                    subphase="running_frames",
+                    message="Embedding faces",
                 )
                 continue
 
@@ -8769,35 +8899,34 @@ def _run_faces_embed_stage(
                     faces_done = min(faces_total, faces_done + 1)
 
             # Emit progress per frame (not per face) - reduces progress overhead
-            progress.emit(
+            _emit_faces_progress(
                 faces_done,
-                phase="faces_embed",
-                device=device,
-                detector=detector_choice,
-                tracker=tracker_choice,
-                resolved_device=embed_device,
-                extra=_phase_meta(),
+                subphase="running_frames",
+                message="Embedding faces",
             )
-        progress.emit(
+        _emit_faces_progress(
             faces_done,
-            phase="faces_embed",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
-            extra=_phase_meta(),
+            subphase="running_frames",
+            message="Embedding faces",
         )
 
         # Force emit final progress after loop completes
-        progress.emit(
-            len(rows),
-            phase="faces_embed",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
-            extra=_phase_meta(),
+        _emit_faces_progress(
+            faces_done,
+            subphase="running_frames",
+            message="Embedding faces",
             force=True,
+        )
+
+        finalize_message = "Finalizing embeddings / writing artifacts / syncing..."
+        _emit_faces_progress(
+            faces_done,
+            subphase="finalizing",
+            message=finalize_message,
+            step="finalizing",
+            force=True,
+            mark_frames_done=True,
+            mark_finalize_start=True,
         )
 
         _write_jsonl(faces_path, rows)
@@ -8833,8 +8962,7 @@ def _run_faces_embed_stage(
         if run_id:
             _promote_run_manifests_to_root(args.ep_id, run_id, ("faces.jsonl", "tracks.jsonl"))
 
-        # Build preliminary summary for completion events (before S3 sync)
-        finished_at = _utcnow_iso()
+        # Build summary before S3 sync; finalize timing after sync completes.
         summary: Dict[str, Any] = {
             "stage": "faces_embed",
             "ep_id": args.ep_id,
@@ -8882,17 +9010,43 @@ def _run_faces_embed_stage(
         if coherence_result.get("mixed_tracks"):
             summary["mixed_tracks"] = coherence_result["mixed_tracks"]
 
-        # Emit completion BEFORE S3 sync (which might hang or take long)
-        progress.emit(
+        def _finalize_heartbeat() -> None:
+            _emit_faces_progress(
+                faces_done,
+                subphase="finalizing",
+                message=finalize_message,
+                step="finalizing",
+                force=True,
+            )
+
+        # Keep heartbeats alive during long sync/finalization steps.
+        s3_sync_result = _run_with_heartbeat(
+            lambda: _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir),
+            _finalize_heartbeat,
+            interval=STAGE_HEARTBEAT_INTERVAL,
+        )
+        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
+        if s3_sync_result.errors:
+            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
+
+        finished_at = _utcnow_iso()
+        try:
+            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+            summary["runtime_sec"] = max((end_dt - start_dt).total_seconds(), 0.0)
+        except ValueError:
+            pass
+
+        _emit_faces_progress(
             len(rows),
-            phase="faces_embed",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=embed_device,
+            subphase="done",
+            message="Completed",
             summary=summary,
+            step="done",
             force=True,
-            extra=_phase_meta("done"),
+            mark_end=True,
         )
         progress.complete(
             summary,
@@ -8904,7 +9058,6 @@ def _run_faces_embed_stage(
             extra=_phase_meta(),
         )
 
-        # Persist phase marker promptly after completion; S3 sync may take a while.
         # Brief delay to ensure final progress event is written and readable.
         time.sleep(0.2)
         _write_run_marker(
@@ -8933,14 +9086,6 @@ def _run_faces_embed_stage(
             },
             run_id=run_id,
         )
-
-        # Now do S3 sync after completion is signaled
-        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter, thumb_writer.root_dir)
-        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
-        if s3_sync_result.errors:
-            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
-        if not s3_sync_result.success:
-            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:
@@ -9362,20 +9507,59 @@ def _run_cluster_stage(
         fps_requested=None,
         run_id=run_id,
     )
-    phase_meta = _non_video_phase_meta()
     device = pick_device(args.device)
-    progress.emit(
-        0,
-        phase="cluster",
-        device=device,
-        detector=detector_choice,
-        tracker=tracker_choice,
-        resolved_device=device,
-        force=True,
-        extra=phase_meta,
+    started_at = _utcnow_iso()
+    stage_heartbeat = StageStatusHeartbeat(
+        ep_id=args.ep_id,
+        run_id=run_id,
+        stage_key="cluster",
+        frames_total=faces_total,
+        started_at=started_at,
     )
 
-    started_at = _utcnow_iso()
+    def _emit_cluster_progress(
+        done: int,
+        *,
+        subphase: str,
+        message: str | None = None,
+        force: bool = False,
+        summary: Dict[str, Any] | None = None,
+        step: str | None = None,
+        mark_frames_done: bool = False,
+        mark_finalize_start: bool = False,
+        mark_end: bool = False,
+    ) -> None:
+        extra = _non_video_phase_meta(step)
+        if message:
+            extra["message"] = message
+        progress.emit(
+            done,
+            phase="cluster",
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            summary=summary,
+            force=force,
+            extra=extra,
+        )
+        stage_heartbeat.update(
+            done=done,
+            phase=subphase,
+            message=message,
+            force=force,
+            mark_frames_done=mark_frames_done,
+            mark_finalize_start=mark_finalize_start,
+            mark_end=mark_end,
+        )
+
+    _emit_cluster_progress(
+        0,
+        subphase="running_frames",
+        message="Clustering identities",
+        force=True,
+    )
+
     try:
         embedding_rows: List[np.ndarray] = []
         track_ids: List[int] = []
@@ -9564,25 +9748,17 @@ def _run_cluster_stage(
 
                 identity_payload.append(identity_record)
                 faces_done = min(faces_total, faces_done + identity_faces)
-                progress.emit(
+                _emit_cluster_progress(
                     faces_done,
-                    phase="cluster",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=device,
-                    extra=phase_meta,
+                    subphase="running_frames",
+                    message="Clustering identities",
                 )
 
         # Force emit final progress after loop completes
-        progress.emit(
+        _emit_cluster_progress(
             faces_total,
-            phase="cluster",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            extra=phase_meta,
+            subphase="running_frames",
+            message="Clustering identities",
             force=True,
         )
 
@@ -9647,8 +9823,7 @@ def _run_cluster_stage(
         except Exception as exc:
             LOGGER.warning("Failed to generate track representatives: %s", exc)
 
-        # Build preliminary summary (S3 sync + fusion may augment this before completion).
-        finished_at = _utcnow_iso()
+        # Build summary (S3 sync + fusion may augment this before completion).
         summary: Dict[str, Any] = {
             "stage": "cluster",
             "ep_id": args.ep_id,
@@ -9673,7 +9848,127 @@ def _run_cluster_stage(
             "stats": payload["stats"],
         }
 
-        # Persist phase marker before S3 sync so it's captured in the run-scoped bundle.
+        finalize_message = "Finalizing clusters / syncing artifacts..."
+        _emit_cluster_progress(
+            faces_total,
+            subphase="finalizing",
+            message=finalize_message,
+            step="finalizing",
+            force=True,
+            mark_frames_done=True,
+            mark_finalize_start=True,
+        )
+
+        # Run body tracking fusion (best-effort, requires body_tracks + faces to exist).
+        try:
+            fusion_result = _maybe_run_body_tracking_fusion(
+                ep_id=args.ep_id,
+                run_id=run_id,
+                effective_run_id=run_id or progress.run_id,
+            )
+            if fusion_result and fusion_result.get("status") == "success":
+                summary["body_tracking_fusion"] = fusion_result
+        except Exception as exc:
+            LOGGER.warning("[cluster] Body tracking fusion failed (non-fatal): %s", exc)
+
+        # Guardrail: when STORAGE_REQUIRE_S3=true (or EXPORT_REQUIRE_S3=true), do not report completion
+        # until S3 sync succeeds. This prevents the "cluster complete" UI race where an immediate
+        # PDF export can't hydrate a consistent run-scoped bundle from S3.
+        s3_required = False
+        for var in ("STORAGE_REQUIRE_S3", "EXPORT_REQUIRE_S3"):
+            if os.environ.get(var, "").strip().lower() in ("1", "true", "yes", "on"):
+                s3_required = True
+                break
+
+        def _finalize_tick(step_label: str, message: str) -> None:
+            _emit_cluster_progress(
+                faces_total,
+                subphase="finalizing",
+                message=message,
+                step=step_label,
+                force=True,
+            )
+
+        # S3 sync should run after all artifacts are written so S3-first mode (delete local)
+        # doesn't race exports/reporting that hydrate from S3.
+        _finalize_tick("s3_sync_legacy", "Syncing artifacts to S3...")
+        s3_sync_result = _run_with_heartbeat(
+            lambda: _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root),
+            lambda: _finalize_tick("s3_sync_legacy", "Syncing artifacts to S3..."),
+            interval=STAGE_HEARTBEAT_INTERVAL,
+        )
+        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
+        if s3_sync_result.errors:
+            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
+        if not s3_sync_result.success:
+            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
+            if s3_required:
+                raise RuntimeError(f"S3 sync failed for {args.ep_id}: {s3_sync_result.errors}")
+
+        # Sync run-scoped artifacts to S3 with deterministic key layout
+        if run_id:
+            try:
+                from apps.api.services.run_artifact_store import sync_run_artifacts_to_s3
+
+                _finalize_tick("s3_sync_run_scoped", "Syncing run bundle to S3...")
+                run_sync_result = _run_with_heartbeat(
+                    lambda: sync_run_artifacts_to_s3(
+                        ep_id=args.ep_id,
+                        run_id=run_id,
+                        # Fail loud when STORAGE_REQUIRE_S3=true so runs aren't marked complete without artifacts.
+                        fail_on_error=s3_required,
+                    ),
+                    lambda: _finalize_tick("s3_sync_run_scoped", "Syncing run bundle to S3..."),
+                    interval=STAGE_HEARTBEAT_INTERVAL,
+                )
+                summary["artifacts"]["run_scoped_s3"] = run_sync_result.to_dict()
+                if run_sync_result.success:
+                    LOGGER.info(
+                        "[cluster] Run-scoped S3 sync: %d artifacts uploaded to %s",
+                        run_sync_result.uploaded_count,
+                        run_sync_result.s3_prefix,
+                    )
+                else:
+                    LOGGER.warning(
+                        "[cluster] Run-scoped S3 sync failed: %s",
+                        run_sync_result.errors,
+                    )
+            except Exception as exc:
+                LOGGER.warning("[cluster] Run-scoped S3 sync skipped: %s", exc)
+                summary["artifacts"]["run_scoped_s3"] = {"error": str(exc)}
+                if s3_required:
+                    raise
+
+        finished_at = _utcnow_iso()
+        try:
+            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+            summary["runtime_sec"] = max((end_dt - start_dt).total_seconds(), 0.0)
+        except ValueError:
+            pass
+
+        # Emit completion after fusion + S3 sync so downstream steps see a consistent run bundle.
+        _emit_cluster_progress(
+            faces_total,
+            subphase="done",
+            message="Completed",
+            summary=summary,
+            step="done",
+            force=True,
+            mark_end=True,
+        )
+        progress.complete(
+            summary,
+            device=device,
+            detector=detector_choice,
+            tracker=tracker_choice,
+            resolved_device=device,
+            step="cluster",
+            extra=_non_video_phase_meta(),
+        )
+
+        # Brief delay to ensure final progress event is written and readable.
+        time.sleep(0.2)
         _write_run_marker(
             args.ep_id,
             "cluster",
@@ -9702,111 +9997,6 @@ def _run_cluster_stage(
                 run_id,
                 extra={"phase": "cluster", "status": "success", "finished_at": finished_at},
             )
-
-        # Run body tracking fusion (best-effort, requires body_tracks + faces to exist).
-        try:
-            fusion_result = _maybe_run_body_tracking_fusion(
-                ep_id=args.ep_id,
-                run_id=run_id,
-                effective_run_id=run_id or progress.run_id,
-            )
-            if fusion_result and fusion_result.get("status") == "success":
-                summary["body_tracking_fusion"] = fusion_result
-        except Exception as exc:
-            LOGGER.warning("[cluster] Body tracking fusion failed (non-fatal): %s", exc)
-
-        # Guardrail: when STORAGE_REQUIRE_S3=true (or EXPORT_REQUIRE_S3=true), do not report completion
-        # until S3 sync succeeds. This prevents the "cluster complete" UI race where an immediate
-        # PDF export can't hydrate a consistent run-scoped bundle from S3.
-        s3_required = False
-        for var in ("STORAGE_REQUIRE_S3", "EXPORT_REQUIRE_S3"):
-            if os.environ.get(var, "").strip().lower() in ("1", "true", "yes", "on"):
-                s3_required = True
-                break
-
-        # S3 sync should run after all artifacts are written so S3-first mode (delete local)
-        # doesn't race exports/reporting that hydrate from S3.
-        # Emit a post-cluster progress update so Streamlit/local-mode UIs don't appear "stuck" at 100%.
-        progress.emit(
-            faces_total,
-            phase="cluster",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            extra=_non_video_phase_meta("s3_sync_legacy"),
-            force=True,
-        )
-        s3_sync_result = _sync_artifacts_to_s3(args.ep_id, storage, ep_ctx, exporter=None, thumb_dir=thumb_root)
-        summary["artifacts"]["s3_uploads"] = s3_sync_result.stats
-        if s3_sync_result.errors:
-            summary["artifacts"]["s3_errors"] = s3_sync_result.errors
-        if not s3_sync_result.success:
-            LOGGER.error("S3 sync failed for %s: %s", args.ep_id, s3_sync_result.errors)
-            if s3_required:
-                raise RuntimeError(f"S3 sync failed for {args.ep_id}: {s3_sync_result.errors}")
-
-        # Sync run-scoped artifacts to S3 with deterministic key layout
-        if run_id:
-            try:
-                from apps.api.services.run_artifact_store import sync_run_artifacts_to_s3
-
-                # Emit a post-cluster progress update so Streamlit/local-mode UIs don't appear "stuck" at 100%.
-                progress.emit(
-                    faces_total,
-                    phase="cluster",
-                    device=device,
-                    detector=detector_choice,
-                    tracker=tracker_choice,
-                    resolved_device=device,
-                    extra=_non_video_phase_meta("s3_sync_run_scoped"),
-                    force=True,
-                )
-                run_sync_result = sync_run_artifacts_to_s3(
-                    ep_id=args.ep_id,
-                    run_id=run_id,
-                    # Fail loud when STORAGE_REQUIRE_S3=true so runs aren't marked complete without artifacts.
-                    fail_on_error=s3_required,
-                )
-                summary["artifacts"]["run_scoped_s3"] = run_sync_result.to_dict()
-                if run_sync_result.success:
-                    LOGGER.info(
-                        "[cluster] Run-scoped S3 sync: %d artifacts uploaded to %s",
-                        run_sync_result.uploaded_count,
-                        run_sync_result.s3_prefix,
-                    )
-                else:
-                    LOGGER.warning(
-                        "[cluster] Run-scoped S3 sync failed: %s",
-                        run_sync_result.errors,
-                    )
-            except Exception as exc:
-                LOGGER.warning("[cluster] Run-scoped S3 sync skipped: %s", exc)
-                summary["artifacts"]["run_scoped_s3"] = {"error": str(exc)}
-                if s3_required:
-                    raise
-
-        # Emit completion after fusion + S3 sync so downstream steps see a consistent run bundle.
-        progress.emit(
-            faces_total,
-            phase="cluster",
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            summary=summary,
-            force=True,
-            extra=_non_video_phase_meta("done"),
-        )
-        progress.complete(
-            summary,
-            device=device,
-            detector=detector_choice,
-            tracker=tracker_choice,
-            resolved_device=device,
-            step="cluster",
-            extra=phase_meta,
-        )
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:

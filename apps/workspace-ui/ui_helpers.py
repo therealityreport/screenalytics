@@ -3133,6 +3133,71 @@ def progress_ratio(progress: Dict[str, Any]) -> float:
     return 0.0
 
 
+STAGE_PROGRESS_STALL_SECONDS = int(os.environ.get("SCREENALYTICS_STAGE_STALL_SECONDS", "30"))
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+
+
+def stage_progress_line(progress: Dict[str, Any]) -> str | None:
+    if not isinstance(progress, dict):
+        return None
+    done_val = coerce_int(progress.get("done"))
+    total_val = coerce_int(progress.get("total"))
+    pct_val = progress.get("pct")
+    if isinstance(pct_val, (int, float)):
+        pct = float(pct_val)
+        if pct > 1.0:
+            pct = pct / 100.0
+    elif done_val is not None and total_val:
+        pct = done_val / max(total_val, 1)
+    else:
+        pct = None
+
+    frames_line = None
+    if done_val is not None and total_val:
+        pct_label = f"{(pct or 0.0) * 100:.0f}%"
+        frames_line = f"Frames: {done_val:,} / {total_val:,} ({pct_label})"
+
+    message = progress.get("message")
+    phase = progress.get("phase")
+    phase_label = None
+    if isinstance(message, str) and message.strip():
+        phase_label = message.strip()
+    elif isinstance(phase, str) and phase.strip():
+        phase_label = phase.replace("_", " ").strip().capitalize()
+
+    if frames_line and phase_label:
+        return f"{frames_line} — {phase_label}"
+    return frames_line or phase_label
+
+
+def stage_progress_stall_message(
+    progress: Dict[str, Any],
+    *,
+    now: datetime | None = None,
+    threshold_seconds: int = STAGE_PROGRESS_STALL_SECONDS,
+) -> str | None:
+    if not isinstance(progress, dict):
+        return None
+    last_update = progress.get("last_update_at")
+    last_dt = _parse_iso_timestamp(last_update) if isinstance(last_update, str) else None
+    if last_dt is None:
+        return None
+    now_dt = now or datetime.now(timezone.utc)
+    age = (now_dt - last_dt).total_seconds()
+    if age < 0 or age <= threshold_seconds:
+        return None
+    return f"Stalled (no updates for {int(age)}s)"
+
+
 def eta_seconds(progress: Dict[str, Any]) -> float | None:
     secs_total = progress.get("secs_total")
     secs_done = progress.get("secs_done")
@@ -4196,7 +4261,11 @@ def get_all_running_jobs_for_episode(ep_id: str) -> Dict[str, Dict[str, Any] | N
                     frames_total = progress_data.get("frames_total", 1)
                     if frames_total > 0:
                         result["progress_pct"] = (frames_done / frames_total) * 100
-                    result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                    message = progress_data.get("message")
+                    if message:
+                        result["message"] = str(message)
+                    else:
+                        result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
                     result["frames_done"] = frames_done
                     result["frames_total"] = frames_total
                 results[op] = result

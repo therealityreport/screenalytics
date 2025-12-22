@@ -2469,15 +2469,22 @@ def _phase_from_episode_status(
     status_value = stage_entry.get("status")
     if status_value:
         merged["status"] = status_value
-    started_at = stage_entry.get("started_at")
+    timestamps = stage_entry.get("timestamps") if isinstance(stage_entry.get("timestamps"), dict) else {}
+    progress_payload = stage_entry.get("progress")
+    if isinstance(progress_payload, dict):
+        merged["progress"] = progress_payload
+    started_at = timestamps.get("started_at") or stage_entry.get("started_at")
     if started_at:
         merged["started_at"] = started_at
-    ended_at = stage_entry.get("ended_at")
+    ended_at = timestamps.get("ended_at") or stage_entry.get("ended_at")
     if ended_at:
         merged["finished_at"] = ended_at
-    duration = stage_entry.get("duration_s")
-    if duration is not None:
-        merged["runtime_sec"] = duration
+    if started_at and ended_at:
+        merged["runtime_sec"] = _runtime_from_iso(started_at, ended_at)
+    else:
+        duration = stage_entry.get("duration_s")
+        if duration is not None:
+            merged["runtime_sec"] = duration
     error_reason = stage_entry.get("error_reason")
     if error_reason:
         merged["error"] = error_reason
@@ -4029,6 +4036,13 @@ with st.expander("Pipeline Status", expanded=False):
                     st.caption(running_detect_snapshot["message"])
             else:
                 st.progress(0.05)
+            detect_progress = detect_phase_status.get("progress")
+            progress_line = helpers.stage_progress_line(detect_progress) if detect_progress else None
+            if progress_line:
+                st.caption(progress_line)
+            stall_msg = helpers.stage_progress_stall_message(detect_progress) if detect_progress else None
+            if stall_msg:
+                st.warning(stall_msg)
             st.caption("Live progress appears in the log panel below.")
         elif detect_status_value == "stale":
             st.warning("⚠️ **Detect/Track**: Status stale (manifests missing)")
@@ -4120,6 +4134,13 @@ with st.expander("Pipeline Status", expanded=False):
                     st.caption(running_faces_snapshot["message"])
             else:
                 st.progress(0.05)
+            faces_progress = faces_phase_status.get("progress")
+            progress_line = helpers.stage_progress_line(faces_progress) if faces_progress else None
+            if progress_line:
+                st.caption(progress_line)
+            stall_msg = helpers.stage_progress_stall_message(faces_progress) if faces_progress else None
+            if stall_msg:
+                st.warning(stall_msg)
             st.caption("Live progress appears in the log panel below.")
         elif faces_job_state == "failed":
             st.error("⚠️ **Faces Harvest**: Failed")
@@ -4187,6 +4208,13 @@ with st.expander("Pipeline Status", expanded=False):
                     st.caption(running_cluster_snapshot["message"])
             else:
                 st.progress(0.05)
+            cluster_progress = cluster_phase_status.get("progress")
+            progress_line = helpers.stage_progress_line(cluster_progress) if cluster_progress else None
+            if progress_line:
+                st.caption(progress_line)
+            stall_msg = helpers.stage_progress_stall_message(cluster_progress) if cluster_progress else None
+            if stall_msg:
+                st.warning(stall_msg)
             st.caption("Live progress appears in the log panel below.")
         elif cluster_job_state == "failed":
             st.error("⚠️ **Cluster**: Failed")
