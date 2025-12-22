@@ -45,6 +45,11 @@ from apps.api.services.storage import (
 )
 from py_screenalytics.artifacts import ensure_dirs, get_path
 from py_screenalytics import run_layout
+from py_screenalytics.episode_status import (
+    collect_git_state,
+    stage_update_from_marker,
+    update_episode_status,
+)
 from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
 from tools.debug_thumbs import (
     init_debug_logger,
@@ -3596,6 +3601,111 @@ def _promote_run_manifests_to_root(ep_id: str, run_id: str, filenames: Iterable[
         tmp.replace(dest)
 
 
+_GIT_STATE_CACHE: dict[str, Any] | None = None
+
+
+def _git_state() -> dict[str, Any]:
+    global _GIT_STATE_CACHE
+    if _GIT_STATE_CACHE is None:
+        _GIT_STATE_CACHE = collect_git_state()
+    return dict(_GIT_STATE_CACHE)
+
+
+def _read_json_best_effort(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _delete_local_after_sync() -> bool:
+    return os.environ.get("STORAGE_DELETE_LOCAL_AFTER_SYNC", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _storage_summary_for_status(ep_id: str, run_id: str) -> dict[str, Any]:
+    run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
+    allowlist = sorted(run_layout.RUN_ARTIFACT_ALLOWLIST)
+    local_present = [name for name in allowlist if (run_root / name).exists()]
+    summary: dict[str, Any] = {
+        "delete_local_after_sync": _delete_local_after_sync(),
+        "hydrated_from_s3": False,
+        "local_present": {"count": len(local_present), "total": len(allowlist)},
+        "remote_present": {"count": None, "total": len(allowlist), "checked": False},
+    }
+    try:
+        storage = StorageService()
+        if storage.s3_enabled():
+            remote_present = 0
+            for filename in allowlist:
+                for s3_key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id, filename):
+                    try:
+                        if storage.object_exists(s3_key):
+                            remote_present += 1
+                            break
+                    except Exception:
+                        continue
+            summary["remote_present"] = {
+                "count": remote_present,
+                "total": len(allowlist),
+                "checked": True,
+            }
+    except Exception:
+        pass
+    return summary
+
+
+def _env_payload_for_status(run_root: Path, marker_payload: dict[str, Any]) -> dict[str, Any]:
+    env_payload: dict[str, Any] = {}
+    env_diag = _read_json_best_effort(run_root / "env_diagnostics.json")
+    if isinstance(env_diag, dict):
+        env_payload["python_version"] = env_diag.get("python_version")
+        env_payload["package_versions"] = env_diag.get("package_versions")
+    torch_device = (
+        marker_payload.get("torch_device_resolved")
+        or marker_payload.get("resolved_device")
+        or marker_payload.get("device")
+    )
+    onnx_provider = marker_payload.get("onnx_provider_resolved")
+    if torch_device:
+        env_payload["torch_device"] = torch_device
+    if onnx_provider:
+        env_payload["onnx_provider"] = onnx_provider
+    env_payload["db_url_present"] = bool(
+        os.environ.get("DB_URL") or os.environ.get("SCREENALYTICS_FAKE_DB")
+    )
+    return env_payload
+
+
+def _update_episode_status_from_marker(
+    ep_id: str,
+    run_id: str,
+    phase: str,
+    marker_payload: dict[str, Any],
+) -> None:
+    try:
+        stage_key, stage_update = stage_update_from_marker(
+            ep_id=ep_id,
+            run_id=run_id,
+            phase=phase,
+            marker_payload=marker_payload,
+        )
+        if not stage_key:
+            return
+        run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
+        update_episode_status(
+            ep_id,
+            run_id,
+            stage_key=stage_key,
+            stage_update=stage_update,
+            git_info=_git_state(),
+            env=_env_payload_for_status(run_root, marker_payload),
+            storage=_storage_summary_for_status(ep_id, run_id),
+        )
+    except Exception as exc:
+        LOGGER.debug("[episode_status] Failed to update: %s", exc)
+
+
 def _write_run_marker(
     ep_id: str,
     phase: str,
@@ -3614,6 +3724,9 @@ def _write_run_marker(
         # Avoid leaking ProgressEmitter.run_id into legacy markers when the job
         # was run without an explicit run_id (legacy/unscoped mode).
         marker_payload.pop("run_id", None)
+    for key, value in _git_state().items():
+        if value is not None and key not in marker_payload:
+            marker_payload[key] = value
 
     # Legacy marker path (kept for UI compatibility)
     marker_path = runs_root / f"{phase}.json"
@@ -3625,6 +3738,7 @@ def _write_run_marker(
         run_root.mkdir(parents=True, exist_ok=True)
         run_marker_path = run_root / f"{phase}.json"
         run_marker_path.write_text(json.dumps(marker_payload, indent=2), encoding="utf-8")
+        _update_episode_status_from_marker(ep_id, run_id, phase, marker_payload)
 
 
 class CropQualityThresholdExceeded(RuntimeError):
@@ -6969,6 +7083,7 @@ def _maybe_run_body_tracking(
                     "num_embeddings": 0,
                     "entries": [],
                     "reid_enabled": reid_enabled_config,
+                    "reid_skip_reason": reid_skip_reason,
                     "note": embeddings_note,
                 }
                 runner.embeddings_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")

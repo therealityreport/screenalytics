@@ -38,3 +38,29 @@ def test_progress_counts_use_normalized_stage_keys_and_plan_order() -> None:
 
     assert completed_count == 4
     assert total_count == len(layout.PIPELINE_STAGE_PLAN)
+
+
+def test_track_fusion_prereqs_accept_remote_artifacts() -> None:
+    layout = _load_layout_module()
+    faces = layout.ArtifactPresence(local=True, remote=False)
+    body_tracks = layout.ArtifactPresence(local=True, remote=False)
+
+    ready, missing = layout.track_fusion_prereq_state(faces, body_tracks)
+
+    assert ready is True
+    assert missing == ()
+
+    faces_remote = layout.ArtifactPresence(local=False, remote=True)
+    body_tracks_remote = layout.ArtifactPresence(local=False, remote=True)
+    ready_remote, missing_remote = layout.track_fusion_prereq_state(faces_remote, body_tracks_remote)
+
+    assert ready_remote is True
+    assert missing_remote == ()
+
+
+def test_downstream_stage_gate_blocks_failed_or_wrong_run() -> None:
+    layout = _load_layout_module()
+
+    assert layout.downstream_stage_allows_advance("error") is False
+    assert layout.downstream_stage_allows_advance("success", "run_id_mismatch") is False
+    assert layout.downstream_stage_allows_advance("success") is True

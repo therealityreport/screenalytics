@@ -74,6 +74,7 @@ class ScreenTimeBreakdown:
     # Breakdown
     face_visible_duration: float = 0.0
     body_only_duration: float = 0.0
+    body_only_segments: List[TimeSegment] = field(default_factory=list)
 
     # Delta
     duration_gain: float = 0.0
@@ -104,6 +105,7 @@ class ScreenTimeBreakdown:
                 "face_visible_duration": round(self.face_visible_duration, 3),
                 "body_only_duration": round(self.body_only_duration, 3),
             },
+            "body_only_segments": [segment.to_dict() for segment in self.body_only_segments],
             "delta": {
                 "duration_gain": round(self.duration_gain, 3),
                 "duration_gain_pct": round(self.duration_gain_pct, 2),
@@ -293,6 +295,7 @@ class ScreenTimeComparator:
             fused_frames=len(overlap_frames),
             face_visible_duration=face_only_duration,
             body_only_duration=body_only_duration,
+            body_only_segments=body_only_segments,
             duration_gain=duration_gain,
             duration_gain_pct=duration_gain_pct,
         )
