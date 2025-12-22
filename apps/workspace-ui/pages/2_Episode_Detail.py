@@ -3387,6 +3387,7 @@ pdf_export_status_value = "missing"
 pdf_export_detail: str | None = None
 fusion_mode_label: str | None = None
 fusion_mode_detail: str | None = None
+fusion_mode_hint: str | None = None
 _running_body_tracking_job: dict[str, Any] | None = None
 _running_body_fusion_job: dict[str, Any] | None = None
 
@@ -3507,11 +3508,19 @@ if selected_attempt_run_id:
         else:
             fusion_mode_label = "IoU-only"
             detail_bits: list[str] = []
-            if isinstance(skip_reason, str) and skip_reason.strip():
-                detail_bits.append(f"skip_reason={skip_reason.strip()}")
-            if isinstance(runtime_error, str) and runtime_error.strip():
-                detail_bits.append(f"torchreid_error={runtime_error.strip()}")
-            fusion_mode_detail = "; ".join(detail_bits) if detail_bits else "Re-ID unavailable"
+            runtime_clean = runtime_error.strip() if isinstance(runtime_error, str) else ""
+            if "missing torchreid.utils" in runtime_clean:
+                fusion_mode_detail = "Re-ID unavailable: missing torchreid.utils"
+                fusion_mode_hint = (
+                    "Install deep-person-reid (pip install -r requirements-ml.txt); "
+                    "pip torchreid==0.2.x is incompatible"
+                )
+            else:
+                if isinstance(skip_reason, str) and skip_reason.strip():
+                    detail_bits.append(f"skip_reason={skip_reason.strip()}")
+                if runtime_clean:
+                    detail_bits.append(f"torchreid_error={runtime_clean}")
+                fusion_mode_detail = "; ".join(detail_bits) if detail_bits else "Re-ID unavailable"
 
 body_tracking_progress_payload = None
 track_fusion_progress_payload = None
@@ -7148,9 +7157,14 @@ else:
     with downstream_cols[1]:
         st.markdown("#### Track Fusion")
         if fusion_mode_label:
-            st.caption(f"Fusion mode: **{fusion_mode_label}**")
-        if fusion_mode_detail:
+            mode_caption = f"Fusion mode: **{fusion_mode_label}**"
+            if isinstance(fusion_mode_detail, str) and fusion_mode_detail.startswith("Re-ID unavailable"):
+                mode_caption = f"{mode_caption} ({fusion_mode_detail})"
+            st.caption(mode_caption)
+        if fusion_mode_detail and not (isinstance(fusion_mode_detail, str) and fusion_mode_detail.startswith("Re-ID unavailable")):
             st.caption(f"Mode detail: {fusion_mode_detail}")
+        if fusion_mode_hint:
+            st.caption(f"Re-ID install hint: {fusion_mode_hint}")
         st.caption("Prerequisites and status are shown above in the stage cards.")
         if not track_fusion_enabled:
             st.caption("Disabled by config (track_fusion.enabled) or body tracking disabled.")

@@ -178,3 +178,59 @@ def test_track_fusion_records_skip_reason_when_reid_inputs_unavailable() -> None
     diagnostics = getattr(fusion, "last_diagnostics", {})
     assert diagnostics.get("reid_comparisons") == 0
     assert diagnostics.get("reid_skip_reason") == "missing_body_embeddings_meta"
+
+
+def test_track_fusion_prefers_upstream_reid_skip_reason(tmp_path: Path) -> None:
+    """Prefer upstream Re-ID skip reason over derived input gaps."""
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    import numpy as np
+
+    from FEATURES.body_tracking.src.track_fusion import TrackFusion, fuse_face_body_tracks
+
+    faces_path = tmp_path / "faces.jsonl"
+    body_tracks_path = tmp_path / "body_tracks.jsonl"
+    body_embeddings_path = tmp_path / "body_embeddings.npy"
+    output_path = tmp_path / "track_fusion.json"
+
+    _write_jsonl(
+        faces_path,
+        [
+            {
+                "track_id": 1,
+                "frame_idx": 0,
+                "ts": 0.0,
+                "bbox_xyxy": [0, 0, 5, 5],
+                "embedding": [1.0, 0.0, 0.0, 0.0],
+                "quality": 0.9,
+            }
+        ],
+    )
+    _write_jsonl(
+        body_tracks_path,
+        [
+            {
+                "track_id": 100001,
+                "start_frame": 0,
+                "end_frame": 1,
+                "detections": [{"frame_idx": 0, "bbox": [0, 0, 10, 10]}],
+            }
+        ],
+    )
+    np.save(body_embeddings_path, np.zeros((0, 4), dtype=np.float32))
+
+    fusion = TrackFusion(reid_similarity_threshold=0.70, max_gap_seconds=30.0)
+    fuse_face_body_tracks(
+        fusion=fusion,
+        face_tracks_path=faces_path,
+        body_tracks_path=body_tracks_path,
+        body_embeddings_path=body_embeddings_path,
+        embeddings_meta={"entries": [], "reid_skip_reason": "torchreid_runtime_error"},
+        output_path=output_path,
+    )
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    diagnostics = payload.get("diagnostics")
+    assert isinstance(diagnostics, dict)
+    assert diagnostics.get("reid_skip_reason") == "torchreid_runtime_error"
+    assert "missing_body_embeddings_meta" in (diagnostics.get("reid_secondary_skip_reasons") or [])

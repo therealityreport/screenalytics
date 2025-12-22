@@ -3941,15 +3941,21 @@ def build_screentime_run_debug_pdf(
     else:
         skip_reason = body_reid.get("reid_skip_reason") if isinstance(body_reid, dict) else None
         torchreid_err = body_reid.get("torchreid_runtime_error") if isinstance(body_reid, dict) else None
-        parts: list[str] = ["reid_handoff.enabled=true", "enabled_effective=false"]
-        if isinstance(skip_reason, str) and skip_reason.strip():
-            parts.append(f"skip_reason={skip_reason.strip()}")
-        if isinstance(torchreid_err, str) and torchreid_err.strip():
-            err_str = torchreid_err.strip()
-            if len(err_str) > 120:
-                err_str = err_str[:117] + "..."
-            parts.append(f"torchreid_error={err_str}")
-        fusion_mode_notes = "; ".join(parts)
+        if isinstance(torchreid_err, str) and "missing torchreid.utils" in torchreid_err:
+            fusion_mode_notes = (
+                "Re-ID unavailable: missing torchreid.utils "
+                "(install deep-person-reid; pip install -r requirements-ml.txt)"
+            )
+        else:
+            parts: list[str] = ["reid_handoff.enabled=true", "enabled_effective=false"]
+            if isinstance(skip_reason, str) and skip_reason.strip():
+                parts.append(f"skip_reason={skip_reason.strip()}")
+            if isinstance(torchreid_err, str) and torchreid_err.strip():
+                err_str = torchreid_err.strip()
+                if len(err_str) > 120:
+                    err_str = err_str[:117] + "..."
+                parts.append(f"torchreid_error={err_str}")
+            fusion_mode_notes = "; ".join(parts)
 
     fusion_stats = [
         _wrap_row(["Metric", "Value", "Notes"]),

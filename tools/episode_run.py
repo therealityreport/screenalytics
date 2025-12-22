@@ -7083,6 +7083,7 @@ def _maybe_run_body_tracking(
                     "num_embeddings": 0,
                     "entries": [],
                     "reid_enabled": reid_enabled_config,
+                    "reid_skip_reason": reid_skip_reason,
                     "note": embeddings_note,
                 }
                 runner.embeddings_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")

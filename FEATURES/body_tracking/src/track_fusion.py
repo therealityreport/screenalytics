@@ -835,6 +835,21 @@ def fuse_face_body_tracks(
         face_embeddings=face_embeddings,
         face_embeddings_meta=face_embeddings_meta,
     )
+    # Prefer upstream skip reason (e.g., torchreid runtime failure) over derived input gaps.
+    diagnostics = getattr(fusion, "last_diagnostics", None)
+    if isinstance(diagnostics, dict) and isinstance(embeddings_meta, dict):
+        meta_skip_reason = embeddings_meta.get("reid_skip_reason")
+        if isinstance(meta_skip_reason, str) and meta_skip_reason.strip():
+            meta_skip_reason = meta_skip_reason.strip()
+            existing_skip = diagnostics.get("reid_skip_reason")
+            secondary: list[str] = []
+            if isinstance(existing_skip, str) and existing_skip.strip() and existing_skip.strip() != meta_skip_reason:
+                secondary.append(existing_skip.strip())
+            diagnostics["reid_skip_reason"] = meta_skip_reason
+            if secondary:
+                diagnostics["reid_secondary_skip_reasons"] = secondary
+            else:
+                diagnostics.pop("reid_secondary_skip_reasons", None)
 
     # Save results
     if output_path:
