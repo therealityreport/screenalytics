@@ -3947,8 +3947,7 @@ with st.expander("Pipeline Status", expanded=False):
         else:
             st.caption("No stage summary available.")
 
-    with st.expander("Pipeline Dependencies", expanded=False):
-        st.caption("detect → faces → cluster → body_tracking → track_fusion → screentime → pdf")
+    st.caption("Pipeline dependencies: detect → faces → cluster → body_tracking → track_fusion → screentime → pdf")
     coreml_available = status_payload.get("coreml_available") if status_payload else None
     if coreml_available is False and helpers.is_apple_silicon():
         st.warning(
