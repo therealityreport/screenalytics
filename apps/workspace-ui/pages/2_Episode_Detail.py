@@ -5369,6 +5369,11 @@ def _autorun_drive_downstream(run_id: str) -> None:
                 if not ok:
                     _autorun_stop("Track Fusion", f"hydrate_failed: {err}")
                     return
+                # Clear cached presence so the rerun re-checks freshly hydrated artifacts.
+                try:
+                    _cached_run_artifact_presence.clear()
+                except Exception as exc:
+                    LOGGER.debug("[RUN_ARTIFACT] Cache clear failed after hydrate: %s", exc)
                 st.session_state[_status_force_refresh_key(ep_id)] = True
                 st.rerun()
             else:
