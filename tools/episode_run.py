@@ -7769,6 +7769,7 @@ def _maybe_run_body_tracking_fusion(
             return None
 
     output_dir = _body_tracking_dir_for_run(ep_id, run_id)
+    manifests_dir = _manifests_dir_for_run(ep_id, stage_run_id)
     config_path = REPO_ROOT / "config" / "pipeline" / "body_detection.yaml"
     fusion_config_path = REPO_ROOT / "config" / "pipeline" / "track_fusion.yaml"
 
@@ -10354,6 +10355,7 @@ def _run_cluster_stage(
             raise RuntimeError(blocked_reason.message)
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
+    started_at: str | None = None
     try:
         # Validate faces.jsonl exists, is non-empty, and has required fields
         faces_row_count = require_manifest(
@@ -10436,7 +10438,7 @@ def _run_cluster_stage(
                         run_id,
                         "cluster",
                         "FAILED",
-                        started_at=started_at if "started_at" in locals() else _utcnow_iso(),
+                        started_at=started_at or _utcnow_iso(),
                         finished_at=_utcnow_iso(),
                         duration_s=None,
                         error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
