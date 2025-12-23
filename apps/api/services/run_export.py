@@ -2973,6 +2973,26 @@ def build_screentime_run_debug_pdf(
             return None
         return _safe_float_opt(summary.get("gain_total_s", summary.get("total_duration_gain")))
 
+    current_rtf = marker_rtf
+    if current_rtf is None and isinstance(episode_status_payload, dict):
+        detect_block = episode_status_payload.get("stages", {}).get("detect")
+        if isinstance(detect_block, dict):
+            metrics = detect_block.get("metrics")
+            if isinstance(metrics, dict):
+                current_rtf = _safe_float_opt(metrics.get("rtf"))
+    current_forced_share = _forced_splits_share_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
+    if current_forced_share is None:
+        current_forced_share = _forced_splits_share_for_root(run_root)
+    current_singleton_rate = _singleton_rate_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
+    current_fused_pairs = actual_fused_pairs
+    current_gain = None
+    if isinstance(screentime_summary, dict):
+        current_gain = _safe_float_opt(
+            screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain"))
+        )
+    if current_gain is None:
+        current_gain = _gain_for_root(run_root)
+
     def _prev_successful_run_id() -> str | None:
         candidates: list[tuple[float, str]] = []
         for run_id in run_layout.list_run_ids(ep_id):
@@ -2998,26 +3018,6 @@ def build_screentime_run_debug_pdf(
     baseline_run_id = _prev_successful_run_id()
     if baseline_run_id:
         baseline_root = run_layout.run_root(ep_id, baseline_run_id)
-
-        current_rtf = marker_rtf
-        if current_rtf is None and isinstance(episode_status_payload, dict):
-            detect_block = episode_status_payload.get("stages", {}).get("detect")
-            if isinstance(detect_block, dict):
-                metrics = detect_block.get("metrics")
-                if isinstance(metrics, dict):
-                    current_rtf = _safe_float_opt(metrics.get("rtf"))
-        current_forced_share = _forced_splits_share_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
-        if current_forced_share is None:
-            current_forced_share = _forced_splits_share_for_root(run_root)
-        current_singleton_rate = _singleton_rate_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
-        current_fused_pairs = actual_fused_pairs
-        current_gain = None
-        if isinstance(screentime_summary, dict):
-            current_gain = _safe_float_opt(
-                screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain"))
-            )
-        if current_gain is None:
-            current_gain = _gain_for_root(run_root)
 
         baseline_rtf = _detect_rtf_for_root(baseline_root)
         baseline_forced_share = _forced_splits_share_for_root(baseline_root)
@@ -3292,6 +3292,174 @@ def build_screentime_run_debug_pdf(
         ])
     )
     story.append(job_table)
+    story.append(Spacer(1, 12))
+
+    # =========================================================================
+    # SECTION 0.7: PERFORMANCE & QUALITY
+    # =========================================================================
+    story.append(Paragraph("0.7 Performance &amp; Quality", section_style))
+
+    detect_eff_fps = marker_effective_fps_processing
+    if detect_eff_fps is None and isinstance(episode_status_payload, dict):
+        detect_block = episode_status_payload.get("stages", {}).get("detect")
+        if isinstance(detect_block, dict):
+            metrics = detect_block.get("metrics")
+            if isinstance(metrics, dict):
+                detect_eff_fps = _safe_float_opt(metrics.get("effective_fps_processing"))
+
+    forced_scene_ratio = marker_forced_scene_warmup_ratio
+    embedding_backend_effective = (
+        marker_embedding_backend_configured_effective
+        or marker_embedding_backend_actual
+        or marker_embedding_backend_configured
+        or embedding_config.get("embedding", {}).get("backend", "tensorrt")
+    )
+    embedding_backend_note = marker_embedding_backend_fallback_reason or ""
+
+    reid_cfg_enabled = bool(track_fusion_config.get("reid_handoff", {}).get("enabled", False))
+    body_reid = run_body_tracking_marker.get("body_reid") if isinstance(run_body_tracking_marker, dict) else None
+    reid_effective = body_reid.get("enabled_effective") if isinstance(body_reid, dict) else None
+    reid_skip_reason = body_reid.get("reid_skip_reason") if isinstance(body_reid, dict) else None
+    torchreid_error = body_reid.get("torchreid_runtime_error") if isinstance(body_reid, dict) else None
+
+    if not reid_cfg_enabled:
+        fusion_mode_value = "IoU-only"
+        fusion_mode_note = "reid_handoff.enabled=false"
+    elif reid_effective:
+        fusion_mode_value = "Hybrid (IoU + Re-ID)"
+        fusion_mode_note = "enabled_effective=true"
+    else:
+        fusion_mode_value = "IoU-only"
+        fusion_mode_note = "Re-ID unavailable"
+        if isinstance(torchreid_error, str) and torchreid_error.strip():
+            fusion_mode_note = f"{fusion_mode_note}; {torchreid_error.strip()}"
+        elif isinstance(reid_skip_reason, str) and reid_skip_reason.strip():
+            fusion_mode_note = f"{fusion_mode_note}; skip_reason={reid_skip_reason.strip()}"
+
+    reid_value = "available" if reid_effective else "unavailable"
+    if not reid_cfg_enabled:
+        reid_value = "disabled"
+    reid_note = None
+    if isinstance(torchreid_error, str) and torchreid_error.strip():
+        reid_note = torchreid_error.strip()
+        if "missing torchreid.utils" in reid_note:
+            reid_note = (
+                "missing torchreid.utils (install deep-person-reid; "
+                "pip install -r requirements-ml.txt)"
+            )
+    elif isinstance(reid_skip_reason, str) and reid_skip_reason.strip():
+        reid_note = f"skip_reason={reid_skip_reason.strip()}"
+
+    perf_rows = [
+        _wrap_row(["Metric", "Value", "Notes"]),
+        _wrap_row([
+            "Detect RTF",
+            f"{current_rtf:.2f}x" if current_rtf is not None else "N/A",
+            "detect_track marker / status",
+        ]),
+        _wrap_row([
+            "Detect Effective FPS",
+            f"{detect_eff_fps:.2f} fps" if detect_eff_fps is not None else "N/A",
+            "detect_track marker / status",
+        ]),
+        _wrap_row([
+            "Forced splits share",
+            f"{current_forced_share:.2%}" if current_forced_share is not None else "N/A",
+            "track_metrics.json",
+        ]),
+        _wrap_row([
+            "Singleton rate",
+            f"{current_singleton_rate:.2%}" if current_singleton_rate is not None else "N/A",
+            "cluster metrics",
+        ]),
+        _wrap_row([
+            "Fusion mode",
+            fusion_mode_value,
+            fusion_mode_note or "",
+        ]),
+        _wrap_row([
+            "Fusion yield (fused pairs)",
+            str(current_fused_pairs) if current_fused_pairs is not None else "N/A",
+            "track_fusion.json diagnostics",
+        ]),
+        _wrap_row([
+            "Body Re-ID availability",
+            reid_value,
+            reid_note or "",
+        ]),
+        _wrap_row([
+            "Embedding backend (effective)",
+            str(embedding_backend_effective),
+            embedding_backend_note,
+        ]),
+    ]
+    if forced_scene_ratio is not None:
+        perf_rows.append(
+            _wrap_row([
+                "Forced scene warmup ratio",
+                f"{forced_scene_ratio:.3f}",
+                "detect_track marker",
+            ])
+        )
+
+    perf_table = Table(perf_rows, colWidths=[1.6 * inch, 1.4 * inch, 2.6 * inch])
+    perf_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ])
+    )
+    story.append(perf_table)
+    story.append(Spacer(1, 12))
+
+    # =========================================================================
+    # SECTION 0.8: DB HEALTH
+    # =========================================================================
+    story.append(Paragraph("0.8 DB Health", section_style))
+    db_rows = [
+        _wrap_row(["Signal", "Value", "Notes"]),
+        _wrap_row(
+            [
+                "DB_URL configured",
+                "Yes" if db_configured else "No",
+                db_not_configured_reason or "",
+            ]
+        ),
+        _wrap_row(
+            [
+                "DB Connected",
+                _health_status(db_connected),
+                db_error or ("OK" if db_connected else ""),
+            ]
+        ),
+        _wrap_row(
+            [
+                "Fake DB enabled",
+                "Yes" if fake_db_enabled else "No",
+                "SCREENALYTICS_FAKE_DB=1" if fake_db_enabled else "",
+            ]
+        ),
+    ]
+    db_table = Table(db_rows, colWidths=[1.6 * inch, 1.0 * inch, 3.0 * inch])
+    db_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ])
+    )
+    story.append(db_table)
     story.append(Spacer(1, 12))
 
     # =========================================================================
