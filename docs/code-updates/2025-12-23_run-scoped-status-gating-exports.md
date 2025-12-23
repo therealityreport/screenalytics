@@ -78,6 +78,13 @@ Acceptance:
   - `blocked` for BLOCKED (reasons + suggested_actions).
 - Digest caching: `data/manifests/{ep_id}/runs/{run_id}/digests.json` (size/mtime keyed sha256).
 
+## Run-scoped logs (JSONL)
+- Module: `py_screenalytics/run_logs.py`.
+- Location: `data/manifests/{ep_id}/runs/{run_id}/logs/{stage}.jsonl`.
+- Event fields: `ts`, `level`, `episode_id`, `run_id`, `stage`, `msg`, `progress` (optional), `meta` (optional).
+- Writer/reader: `append_log(...)`, `tail_logs(...)`, `read_stage_progress(...)`.
+- UI: Episode Detail tail-reads per-stage logs and progress for RUNNING/FAILED stages (see `apps/workspace-ui/pages/2_Episode_Detail.py`).
+
 ## Current status sources (writers)
 - `tools/episode_run.py` writes phase markers via `_write_run_marker(...)` for detect/track, faces_embed, cluster, body_tracking, track_fusion.
 - `_write_run_marker(...)` writes **both** legacy and run-scoped markers and calls `_update_episode_status_from_marker(...)`.
@@ -86,12 +93,13 @@ Acceptance:
 
 ## Current status sources (readers)
 - Episode Detail UI reads API status (`/episodes/{ep_id}/status`) via `apps/workspace-ui/ui_helpers.py:get_episode_status()`.
-- Episode Detail UI also reads the run-scoped status file directly via `apps/workspace-ui/pages/2_Episode_Detail.py:_cached_episode_status_file()` → `{run_root}/episode_status.json`.
+- Episode Detail UI reads the canonical run-scoped status via `apps/workspace-ui/pages/2_Episode_Detail.py:_cached_episode_status_file()` → `py_screenalytics/episode_status.read_episode_status(...)`.
 - Export/diagnostics read the file in `apps/api/services/run_export.py`.
 
 ## Stage cards + stage plan rendering
 - Stage plan + labels + aliases are defined in `apps/workspace-ui/episode_detail_layout.py`.
 - Stage cards and downstream UI wiring live in `apps/workspace-ui/pages/2_Episode_Detail.py`.
+- Stage cards use canonical status + gating reasons; log panels read from `py_screenalytics/run_logs.py`.
 
 ## Consistency notes
 - jobs.py disambiguation:

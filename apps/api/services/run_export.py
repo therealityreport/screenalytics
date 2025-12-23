@@ -41,6 +41,7 @@ from py_screenalytics.episode_status import (
 )
 from py_screenalytics.run_gates import check_prereqs
 from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
+from py_screenalytics.run_logs import append_log
 
 LOGGER = logging.getLogger(__name__)
 
@@ -5552,6 +5553,22 @@ def build_and_upload_debug_pdf(
         except Exception as exc:  # pragma: no cover - best effort status update
             LOGGER.warning("[export] Failed to mark PDF blocked: %s", exc)
         try:
+            append_log(
+                ep_id,
+                run_id,
+                "pdf",
+                "WARNING",
+                "stage blocked",
+                progress=0.0,
+                meta={
+                    "reason_code": blocked_reason.code,
+                    "reason_message": blocked_reason.message,
+                    "suggested_actions": list(gate.suggested_actions),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log PDF blocked: %s", exc)
+        try:
             write_stage_manifest(
                 ep_id,
                 run_id,
@@ -5566,6 +5583,10 @@ def build_and_upload_debug_pdf(
             LOGGER.warning("[export] Failed to write PDF blocked manifest: %s", exc)
         raise RuntimeError(blocked_reason.message)
     try:
+        try:
+            append_log(ep_id, run_id, "pdf", "INFO", "stage started", progress=0.0)
+        except Exception as exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log PDF start: %s", exc)
         write_stage_started(
             ep_id,
             run_id,
@@ -5680,6 +5701,18 @@ def build_and_upload_debug_pdf(
         except Exception as status_exc:
             LOGGER.warning("[export] Failed to update episode_status.json for PDF error: %s", status_exc)
         try:
+            append_log(
+                ep_id,
+                run_id,
+                "pdf",
+                "ERROR",
+                "stage failed",
+                progress=100.0,
+                meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+            )
+        except Exception as log_exc:
+            LOGGER.debug("[run_logs] Failed to log PDF failure: %s", log_exc)
+        try:
             write_stage_manifest(
                 ep_id,
                 run_id,
@@ -5781,6 +5814,18 @@ def build_and_upload_debug_pdf(
         )
     except Exception as exc:
         LOGGER.warning("[export] Failed to update episode_status.json for PDF success: %s", exc)
+    try:
+        append_log(
+            ep_id,
+            run_id,
+            "pdf",
+            "INFO",
+            "stage finished",
+            progress=100.0,
+            meta={"export_bytes": len(pdf_bytes)},
+        )
+    except Exception as log_exc:
+        LOGGER.debug("[run_logs] Failed to log PDF success: %s", log_exc)
     try:
         write_stage_manifest(
             ep_id,

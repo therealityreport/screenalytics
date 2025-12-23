@@ -48,6 +48,7 @@ from py_screenalytics import run_layout
 from py_screenalytics.episode_status import (
     BlockedReason,
     collect_git_state,
+    normalize_stage_key,
     stage_artifacts,
     stage_update_from_marker,
     update_episode_status,
@@ -58,6 +59,7 @@ from py_screenalytics.episode_status import (
 )
 from py_screenalytics.run_gates import GateReason, GateResult, check_prereqs
 from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
+from py_screenalytics.run_logs import append_log
 from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
 from tools.debug_thumbs import (
     init_debug_logger,
@@ -3369,6 +3371,35 @@ class ProgressEmitter:
             # Print to stdout for local mode streaming
             if LOCAL_MODE_INSTRUMENTATION:
                 print(log_msg, flush=True)
+
+        stage_key = _log_stage_for_phase(str(phase))
+        if stage_key and self.run_id:
+            progress_pct = None
+            if isinstance(total, (int, float)) and total > 0:
+                try:
+                    progress_pct = round((float(frames) / float(total)) * 100.0, 2)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    progress_pct = None
+            message = payload.get("message")
+            if not isinstance(message, str) or not message.strip():
+                message = f"{phase} progress"
+            try:
+                append_log(
+                    self.ep_id,
+                    self.run_id,
+                    stage_key,
+                    "INFO",
+                    message,
+                    progress=progress_pct,
+                    meta={
+                        "phase": phase,
+                        "step": step,
+                        "frames_done": frames,
+                        "frames_total": total,
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to append progress log: %s", exc)
 
         # Persist progress to storage backend or local filesystem
         if self._use_backend_writes and self._storage_backend is not None:
@@ -7043,6 +7074,18 @@ def _status_artifact_paths(ep_id: str, run_id: str, stage_key: str) -> dict[str,
     return paths
 
 
+def _log_stage_for_phase(phase: str | None) -> str | None:
+    if not phase:
+        return None
+    normalized = normalize_stage_key(phase)
+    if normalized:
+        return normalized
+    phase_lower = str(phase).strip().lower()
+    if phase_lower.startswith("scene_detect") or phase_lower in {"detect", "track"}:
+        return "detect"
+    return None
+
+
 def _blocked_details(gate: GateResult) -> tuple[BlockedReason, StageBlockedInfo]:
     reasons = gate.reasons or [GateReason(code="blocked", message="Stage blocked by prerequisites", details=None)]
     primary = reasons[0]
@@ -7075,6 +7118,22 @@ def _maybe_run_body_tracking(
         if not gate.ok:
             blocked_reason, blocked_info = _blocked_details(gate)
             try:
+                try:
+                    append_log(
+                        ep_id,
+                        stage_run_id,
+                        "body_tracking",
+                        "WARNING",
+                        "stage blocked",
+                        progress=0.0,
+                        meta={
+                            "reason_code": blocked_reason.code,
+                            "reason_message": blocked_reason.message,
+                            "suggested_actions": list(gate.suggested_actions),
+                        },
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.debug("[run_logs] Failed to log body_tracking blocked: %s", log_exc)
                 write_stage_blocked(
                     ep_id,
                     stage_run_id,
@@ -7128,6 +7187,18 @@ def _maybe_run_body_tracking(
             )
         except Exception as exc:  # pragma: no cover - best effort status update
             LOGGER.warning("[episode_status] Failed to mark body_tracking start: %s", exc)
+        try:
+            append_log(
+                ep_id,
+                effective_run_id,
+                "body_tracking",
+                "INFO",
+                "stage started",
+                progress=0.0,
+                meta={"video_path": str(video_path)},
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log body_tracking start: %s", log_exc)
     stage_heartbeat.update(
         done=0,
         phase="running_frames",
@@ -7179,6 +7250,18 @@ def _maybe_run_body_tracking(
                     )
                 except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                     LOGGER.warning("[manifest] Failed to write body_tracking failed manifest: %s", manifest_exc)
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={"error_code": "import_error", "error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log body_tracking failure: %s", log_exc)
         stage_heartbeat.update(
             done=0,
             phase="error",
@@ -7207,6 +7290,19 @@ def _maybe_run_body_tracking(
             ),
             interval=stage_heartbeat.heartbeat_interval,
         )
+        if effective_run_id:
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    "INFO",
+                    "body detection complete",
+                    progress=40.0,
+                    meta={"det_path": str(det_path) if det_path else None},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log body detection: %s", log_exc)
         tracks_path = _run_with_heartbeat(
             runner.run_tracking,
             lambda: stage_heartbeat.update(
@@ -7216,6 +7312,19 @@ def _maybe_run_body_tracking(
             ),
             interval=stage_heartbeat.heartbeat_interval,
         )
+        if effective_run_id:
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    "INFO",
+                    "body tracking complete",
+                    progress=70.0,
+                    meta={"tracks_path": str(tracks_path) if tracks_path else None},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log body tracking: %s", log_exc)
         tracker_backend_configured = getattr(runner, "tracker_backend_configured", None)
         tracker_backend_actual = getattr(runner, "tracker_backend_actual", None)
         tracker_fallback_reason = getattr(runner, "tracker_fallback_reason", None)
@@ -7313,6 +7422,24 @@ def _maybe_run_body_tracking(
                     reid_skip_reason = "reid_error"
                     embeddings_note = f"error: {type(exc).__name__}: {exc}"
                 LOGGER.warning("[body_tracking] Re-ID embeddings failed: %s", embeddings_note)
+
+        if effective_run_id:
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    "INFO",
+                    "body re-id embeddings processed",
+                    progress=85.0,
+                    meta={
+                        "reid_enabled": reid_enabled_config,
+                        "reid_embeddings_generated": reid_embeddings_generated,
+                        "reid_skip_reason": reid_skip_reason,
+                    },
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log body re-id status: %s", log_exc)
 
         body_reid = {
             "enabled_config": reid_enabled_config,
@@ -7458,6 +7585,17 @@ def _maybe_run_body_tracking(
                     )
                 except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                     LOGGER.warning("[manifest] Failed to write body_tracking success manifest: %s", manifest_exc)
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    "INFO",
+                    "stage finished",
+                    progress=100.0,
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log body_tracking success: %s", log_exc)
         stage_heartbeat.update(
             done=1,
             phase="done",
@@ -7508,6 +7646,18 @@ def _maybe_run_body_tracking(
                     )
                 except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                     LOGGER.warning("[manifest] Failed to write body_tracking failed manifest: %s", manifest_exc)
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log body_tracking failure: %s", log_exc)
         stage_heartbeat.update(
             done=1,
             phase="error",
@@ -7542,6 +7692,22 @@ def _maybe_run_body_tracking_fusion(
             blocked_reason, blocked_info = _blocked_details(gate)
             LOGGER.debug("[body_tracking_fusion] Gate blocked: %s", blocked_reason.message)
             try:
+                try:
+                    append_log(
+                        ep_id,
+                        stage_run_id,
+                        "track_fusion",
+                        "WARNING",
+                        "stage blocked",
+                        progress=0.0,
+                        meta={
+                            "reason_code": blocked_reason.code,
+                            "reason_message": blocked_reason.message,
+                            "suggested_actions": list(gate.suggested_actions),
+                        },
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.debug("[run_logs] Failed to log track_fusion blocked: %s", log_exc)
                 write_stage_blocked(
                     ep_id,
                     stage_run_id,
@@ -7596,6 +7762,17 @@ def _maybe_run_body_tracking_fusion(
             )
         except Exception as exc:  # pragma: no cover - best effort status update
             LOGGER.warning("[episode_status] Failed to mark track_fusion start: %s", exc)
+        try:
+            append_log(
+                ep_id,
+                effective_run_id,
+                "track_fusion",
+                "INFO",
+                "stage started",
+                progress=0.0,
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.debug("[run_logs] Failed to log track_fusion start: %s", log_exc)
     stage_heartbeat.update(
         done=0,
         phase="running_frames",
@@ -7644,6 +7821,18 @@ def _maybe_run_body_tracking_fusion(
                     )
                 except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                     LOGGER.warning("[manifest] Failed to write track_fusion failed manifest: %s", manifest_exc)
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={"error_code": "import_error", "error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log track_fusion failure: %s", log_exc)
         stage_heartbeat.update(
             done=0,
             phase="error",
@@ -7679,6 +7868,19 @@ def _maybe_run_body_tracking_fusion(
             interval=stage_heartbeat.heartbeat_interval,
         )
         LOGGER.info("[body_tracking_fusion] Fusion complete: %s", fusion_path)
+        if effective_run_id:
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    "INFO",
+                    "fusion complete",
+                    progress=50.0,
+                    meta={"fusion_path": str(fusion_path) if fusion_path else None},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log fusion progress: %s", log_exc)
 
         # Run comparison (calculates face-only vs face+body screen time)
         comparison_path: Path | None = None
@@ -7701,8 +7903,36 @@ def _maybe_run_body_tracking_fusion(
                 interval=stage_heartbeat.heartbeat_interval,
             )
             LOGGER.info("[body_tracking_fusion] Comparison complete: %s", comparison_path)
+            if effective_run_id:
+                try:
+                    append_log(
+                        ep_id,
+                        effective_run_id,
+                        "track_fusion",
+                        "INFO",
+                        "comparison complete",
+                        progress=80.0,
+                        meta={
+                            "comparison_path": str(comparison_path) if comparison_path else None,
+                        },
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.debug("[run_logs] Failed to log comparison progress: %s", log_exc)
         except Exception as exc:
             LOGGER.warning("[body_tracking_fusion] Comparison failed: %s", exc)
+            if effective_run_id:
+                try:
+                    append_log(
+                        ep_id,
+                        effective_run_id,
+                        "track_fusion",
+                        "WARNING",
+                        "comparison failed",
+                        progress=80.0,
+                        meta={"error_message": str(exc)},
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.debug("[run_logs] Failed to log comparison failure: %s", log_exc)
 
         # Promote artifacts to root manifests dir
         if run_id:
@@ -7757,6 +7987,17 @@ def _maybe_run_body_tracking_fusion(
                     )
                 except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                     LOGGER.warning("[manifest] Failed to write track_fusion success manifest: %s", manifest_exc)
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    "INFO",
+                    "stage finished",
+                    progress=100.0,
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log track_fusion success: %s", log_exc)
         stage_heartbeat.update(
             done=1,
             phase="done",
@@ -7803,6 +8044,18 @@ def _maybe_run_body_tracking_fusion(
                     )
                 except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
                     LOGGER.warning("[manifest] Failed to write track_fusion failed manifest: %s", manifest_exc)
+            try:
+                append_log(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log track_fusion failure: %s", log_exc)
         stage_heartbeat.update(
             done=1,
             phase="error",

@@ -28,6 +28,7 @@ from py_screenalytics.episode_status import (
 )
 from py_screenalytics.run_gates import GateReason, check_prereqs
 from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
+from py_screenalytics.run_logs import append_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,6 +158,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run_id = run_layout.normalize_run_id(args.run_id) if args.run_id else None
         if run_id:
+            try:
+                append_log(args.ep_id, run_id, "screentime", "INFO", "stage started", progress=0.0)
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime start: %s", log_exc)
+        if run_id:
             gate = check_prereqs("screentime", args.ep_id, run_id)
             if not gate.ok:
                 reasons = gate.reasons or []
@@ -174,6 +180,22 @@ def main(argv: list[str] | None = None) -> int:
                     write_stage_blocked(args.ep_id, run_id, "screentime", blocked_reason)
                 except Exception as status_exc:  # pragma: no cover - best effort status update
                     LOGGER.warning("[screentime] Failed to mark screentime blocked: %s", status_exc)
+                try:
+                    append_log(
+                        args.ep_id,
+                        run_id,
+                        "screentime",
+                        "WARNING",
+                        "stage blocked",
+                        progress=0.0,
+                        meta={
+                            "reason_code": blocked_reason.code,
+                            "reason_message": blocked_reason.message,
+                            "suggested_actions": list(gate.suggested_actions),
+                        },
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.debug("[run_logs] Failed to log screentime blocked: %s", log_exc)
                 try:
                     write_stage_manifest(
                         args.ep_id,
@@ -204,6 +226,19 @@ def main(argv: list[str] | None = None) -> int:
         # Load config
         raw_config = load_config(args.config)
         resolved = resolve_config(raw_config, args.preset)
+        if run_id:
+            try:
+                append_log(
+                    args.ep_id,
+                    run_id,
+                    "screentime",
+                    "INFO",
+                    "config resolved",
+                    progress=20.0,
+                    meta={"preset": args.preset or raw_config.get("preset")},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime config: %s", log_exc)
 
         # Apply CLI overrides
         cli_overrides = {
@@ -242,7 +277,25 @@ def main(argv: list[str] | None = None) -> int:
 
         # Run analyzer
         analyzer = ScreenTimeAnalyzer(config)
+        if run_id:
+            try:
+                append_log(args.ep_id, run_id, "screentime", "INFO", "analysis started", progress=40.0)
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime analyze start: %s", log_exc)
         metrics_data = analyzer.analyze_episode(args.ep_id, run_id=run_id)
+        if run_id:
+            try:
+                append_log(
+                    args.ep_id,
+                    run_id,
+                    "screentime",
+                    "INFO",
+                    "analysis complete",
+                    progress=70.0,
+                    meta={"cast_count": len(metrics_data.get("metrics", []))},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime analyze complete: %s", log_exc)
 
         emit_progress(
             "analyzing",
@@ -254,6 +307,19 @@ def main(argv: list[str] | None = None) -> int:
         # Write outputs
         emit_progress("writing", "Writing screen time outputs", run_id=run_id)
         json_path, csv_path = analyzer.write_outputs(args.ep_id, metrics_data, run_id=run_id)
+        if run_id:
+            try:
+                append_log(
+                    args.ep_id,
+                    run_id,
+                    "screentime",
+                    "INFO",
+                    "outputs written",
+                    progress=90.0,
+                    meta={"json_path": str(json_path), "csv_path": str(csv_path)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime outputs: %s", log_exc)
 
         emit_progress(
             "done",
@@ -289,6 +355,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except Exception as exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[screentime] Failed to mark screentime success: %s", exc)
+            try:
+                append_log(
+                    args.ep_id,
+                    run_id,
+                    "screentime",
+                    "INFO",
+                    "stage finished",
+                    progress=100.0,
+                    meta={"metrics_count": metrics_count},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime finish: %s", log_exc)
             try:
                 write_stage_manifest(
                     args.ep_id,
@@ -338,6 +416,18 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as status_exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[screentime] Failed to mark screentime blocked: %s", status_exc)
             try:
+                append_log(
+                    args.ep_id,
+                    run_id_norm,
+                    "screentime",
+                    "WARNING",
+                    "stage blocked",
+                    progress=100.0,
+                    meta={"error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime blocked: %s", log_exc)
+            try:
                 write_stage_manifest(
                     args.ep_id,
                     run_id_norm,
@@ -371,6 +461,18 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as status_exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[screentime] Failed to mark screentime failure: %s", status_exc)
             try:
+                append_log(
+                    args.ep_id,
+                    run_id_norm,
+                    "screentime",
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime failure: %s", log_exc)
+            try:
                 write_stage_manifest(
                     args.ep_id,
                     run_id_norm,
@@ -400,6 +502,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except Exception as status_exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[screentime] Failed to mark screentime failure: %s", status_exc)
+            try:
+                append_log(
+                    args.ep_id,
+                    run_id_norm,
+                    "screentime",
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={"error_code": type(exc).__name__, "error_message": str(exc)},
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.debug("[run_logs] Failed to log screentime failure: %s", log_exc)
             try:
                 write_stage_manifest(
                     args.ep_id,

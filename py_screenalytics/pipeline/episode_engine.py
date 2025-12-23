@@ -63,6 +63,7 @@ from py_screenalytics.episode_status import (
 )
 from py_screenalytics.run_gates import GateReason, GateResult, check_prereqs
 from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
+from py_screenalytics.run_logs import append_log
 
 LOGGER = logging.getLogger("episode_engine")
 
@@ -726,6 +727,22 @@ def run_stage(
     if not gate.ok:
         blocked_reason, blocked_info = _blocked_details(gate)
         try:
+            append_log(
+                episode_id,
+                config.run_id,
+                stage.value,
+                "WARNING",
+                "stage blocked",
+                progress=0.0,
+                meta={
+                    "reason_code": blocked_reason.code,
+                    "reason_message": blocked_reason.message,
+                    "suggested_actions": list(gate.suggested_actions),
+                },
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.warning("[run_logs] Failed to log %s blocked: %s", stage.value, log_exc)
+        try:
             write_stage_blocked(episode_id, config.run_id, stage.value, blocked_reason)
         except Exception as exc:  # pragma: no cover - best effort status update
             LOGGER.warning("[episode_status] Failed to mark %s blocked: %s", stage.value, exc)
@@ -764,6 +781,18 @@ def run_stage(
 
     if config.run_id:
         try:
+            append_log(
+                episode_id,
+                config.run_id,
+                stage.value,
+                "INFO",
+                "stage started",
+                progress=0.0,
+                meta={"video_path": str(video_path)},
+            )
+        except Exception as log_exc:  # pragma: no cover - best effort log write
+            LOGGER.warning("[run_logs] Failed to log %s start: %s", stage.value, log_exc)
+        try:
             write_stage_started(episode_id, config.run_id, stage.value)
         except Exception as exc:  # pragma: no cover - best effort status update
             LOGGER.warning("[episode_status] Failed to mark %s start: %s", stage.value, exc)
@@ -792,6 +821,21 @@ def run_stage(
         # Check for stage-level failure
         if not summary.get("success", True):
             if config.run_id:
+                try:
+                    append_log(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        "ERROR",
+                        "stage failed",
+                        progress=100.0,
+                        meta={
+                            "error_code": "stage_failed",
+                            "error_message": str(summary.get("error", "Unknown error")),
+                        },
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.warning("[run_logs] Failed to log %s failure: %s", stage.value, log_exc)
                 try:
                     write_stage_failed(
                         episode_id,
@@ -835,6 +879,18 @@ def run_stage(
         if config.run_id:
             try:
                 counts = _stage_counts(stage, summary)
+                try:
+                    append_log(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        "INFO",
+                        "stage finished",
+                        progress=100.0,
+                        meta={"counts": counts},
+                    )
+                except Exception as log_exc:  # pragma: no cover - best effort log write
+                    LOGGER.warning("[run_logs] Failed to log %s success: %s", stage.value, log_exc)
                 write_stage_finished(
                     episode_id,
                     config.run_id,
@@ -884,6 +940,21 @@ def run_stage(
         LOGGER.exception("Stage %s failed: %s", stage.value, exc)
 
         if config.run_id:
+            try:
+                append_log(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "ERROR",
+                    "stage failed",
+                    progress=100.0,
+                    meta={
+                        "error_code": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                )
+            except Exception as log_exc:  # pragma: no cover - best effort log write
+                LOGGER.warning("[run_logs] Failed to log %s failure: %s", stage.value, log_exc)
             try:
                 write_stage_failed(
                     episode_id,
