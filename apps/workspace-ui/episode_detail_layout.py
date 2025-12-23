@@ -9,7 +9,6 @@ PIPELINE_STAGE_PLAN: tuple[str, ...] = (
     "cluster",
     "body_tracking",
     "track_fusion",
-    "screentime",
     "pdf",
 )
 
@@ -19,14 +18,10 @@ PRIMARY_STAGE_CARD_KEYS: tuple[str, ...] = (
     "cluster",
     "body_tracking",
     "track_fusion",
-)
-
-DOWNSTREAM_STAGE_KEYS: tuple[str, ...] = (
-    "body_tracking",
-    "track_fusion",
-    "screentime",
     "pdf",
 )
+
+ACTIVE_STAGE_KEYS: tuple[str, ...] = PIPELINE_STAGE_PLAN
 
 STAGE_LABELS: dict[str, str] = {
     "detect": "Detect/Track",
@@ -34,7 +29,6 @@ STAGE_LABELS: dict[str, str] = {
     "cluster": "Cluster",
     "body_tracking": "Body Tracking",
     "track_fusion": "Track Fusion",
-    "screentime": "Screentime Analyze",
     "pdf": "PDF Export",
 }
 
@@ -55,12 +49,6 @@ _STAGE_KEY_ALIASES: dict[str, str] = {
     "body_tracking_fusion": "track_fusion",
     "track fusion": "track_fusion",
     "track_fusion": "track_fusion",
-    "screentime": "screentime",
-    "screentime analyze": "screentime",
-    "screen time": "screentime",
-    "screen time analyze": "screentime",
-    "screen_time_analyze": "screentime",
-    "screen_time": "screentime",
     "pdf": "pdf",
     "pdf export": "pdf",
     "export pdf": "pdf",
@@ -146,7 +134,7 @@ def downstream_stage_allows_advance(status: str, error_reason: str | None = None
 
 def get_stage_card_layout(autorun_phase: str | None) -> StageCardLayout:
     autorun_key = normalize_stage_key(autorun_phase)
-    show_panel = bool(autorun_key in DOWNSTREAM_STAGE_KEYS)
+    show_panel = bool(autorun_key in ACTIVE_STAGE_KEYS)
     active_stage = autorun_key if show_panel else None
     return StageCardLayout(
         primary_stage_keys=PRIMARY_STAGE_CARD_KEYS,

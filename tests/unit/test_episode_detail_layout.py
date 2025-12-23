@@ -14,7 +14,7 @@ def _load_layout_module():
     return episode_detail_layout
 
 
-def test_stage_card_layout_includes_downstream_when_autorun_phase_downstream() -> None:
+def test_stage_card_layout_marks_active_stage() -> None:
     layout = _load_layout_module()
     card_layout = layout.get_stage_card_layout("body_tracking")
 
@@ -24,13 +24,20 @@ def test_stage_card_layout_includes_downstream_when_autorun_phase_downstream() -
     assert card_layout.active_downstream_stage == "body_tracking"
 
 
+def test_stage_plan_matches_primary_cards() -> None:
+    layout = _load_layout_module()
+
+    assert layout.PIPELINE_STAGE_PLAN == layout.PRIMARY_STAGE_CARD_KEYS
+    assert layout.ACTIVE_STAGE_KEYS == layout.PIPELINE_STAGE_PLAN
+
+
 def test_progress_counts_use_normalized_stage_keys_and_plan_order() -> None:
     layout = _load_layout_module()
     completed = [
         "Detect/Track (120 detections)",
         "Faces Harvest (80 faces)",
         "Clustering (12 identities)",
-        "Screen Time Analyze",
+        "PDF Export",
         "Detect/Track (duplicate)",
     ]
 

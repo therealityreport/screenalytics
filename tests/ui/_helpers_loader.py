@@ -82,7 +82,19 @@ def _ensure_streamlit_shims() -> None:
 
 def _ensure_requests_shim() -> None:
     if "requests" not in sys.modules:
-        sys.modules["requests"] = types.SimpleNamespace(RequestException=Exception, HTTPError=Exception)
+        def _dummy_get(*_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+            return types.SimpleNamespace(
+                headers={},
+                content=b"",
+                raise_for_status=lambda: None,
+                json=lambda: {},
+            )
+
+        sys.modules["requests"] = types.SimpleNamespace(
+            RequestException=Exception,
+            HTTPError=Exception,
+            get=_dummy_get,
+        )
 
 
 @lru_cache(maxsize=1)

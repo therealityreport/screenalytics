@@ -16,7 +16,9 @@ import platform
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1040,6 +1042,42 @@ def _find_body_tracking_enabled(payload: Any) -> tuple[bool, str] | None:
     return _check(payload, "request_json")
 
 
+def _resolve_lifecycle_status(stage_key: str, stage_entry: dict[str, Any] | None, artifact_state: dict[str, Any]) -> str:
+    """Resolve lifecycle status using episode_status first, then artifact presence."""
+    stage_entry = stage_entry if isinstance(stage_entry, dict) else {}
+    status_val = str(stage_entry.get("status") or "").strip().lower()
+    if status_val in {"success", "completed", "done", "error", "failed", "running", "finalizing", "syncing", "skipped"}:
+        return status_val
+
+    if stage_key == "detect":
+        detections_ok = bool(artifact_state.get("detections"))
+        tracks_ok = bool(artifact_state.get("tracks"))
+        if detections_ok and tracks_ok:
+            return "success"
+        if detections_ok or tracks_ok:
+            return "partial"
+    elif stage_key == "faces":
+        if artifact_state.get("faces"):
+            return "success"
+    elif stage_key == "cluster":
+        if artifact_state.get("identities"):
+            return "success"
+    elif stage_key == "body_tracking":
+        if artifact_state.get("body_tracks"):
+            return "success"
+        if artifact_state.get("legacy"):
+            return "success (legacy)"
+    elif stage_key == "track_fusion":
+        if artifact_state.get("track_fusion"):
+            return "success"
+        if artifact_state.get("legacy"):
+            return "success (legacy)"
+    elif stage_key == "pdf":
+        if artifact_state.get("export_index"):
+            return "success"
+    return status_val or "missing"
+
+
 def _track_fusion_overlap_diagnostics(
     *,
     face_tracks_path: Path,
@@ -1269,6 +1307,7 @@ def build_screentime_run_debug_pdf(
     *,
     ep_id: str,
     run_id: str,
+    include_screentime: bool = True,
 ) -> tuple[bytes, str]:
     """Build a Screen Time Run Debug Report PDF.
 
@@ -1296,6 +1335,7 @@ def build_screentime_run_debug_pdf(
     if not run_root.exists():
         raise FileNotFoundError(f"Run not found on disk: {run_root}")
 
+    include_faces_review = bool(include_screentime)
     s3_layout = run_layout.get_run_s3_layout(ep_id, run_id_norm)
 
     def _safe_float_opt(value: Any) -> float | None:
@@ -1318,6 +1358,21 @@ def build_screentime_run_debug_pdf(
             if cleaned.isdigit():
                 return int(cleaned)
         return None
+
+    def _sanitize_tensorrt_fallback_reason(
+        *,
+        configured: str | None,
+        effective: str | None,
+        reason: str | None,
+    ) -> str | None:
+        if not reason:
+            return reason
+        if configured != "tensorrt" or not effective or effective == "tensorrt":
+            return reason
+        lowered = reason.lower()
+        if "pip install" in lowered or "pycuda" in lowered:
+            return "TensorRT requires CUDA (NVIDIA) and is not available; using PyTorch backend."
+        return reason
 
     manifests_root = get_path(ep_id, "detections").parent
     # Run-scoped body_tracking is authoritative for this report; legacy artifacts are diagnostic only.
@@ -1578,7 +1633,8 @@ def build_screentime_run_debug_pdf(
     # =========================================================================
     # COVER / EXECUTIVE SUMMARY
     # =========================================================================
-    story.append(Paragraph("Screen Time Run Debug Report", title_style))
+    report_title = "Screen Time Run Debug Report" if include_screentime else "Setup Pipeline Run Debug Report"
+    story.append(Paragraph(report_title, title_style))
     story.append(Spacer(1, 12))
 
     git_sha_value = None
@@ -1765,6 +1821,15 @@ def build_screentime_run_debug_pdf(
         # Only set screentime_summary if it's a proper dict; otherwise keep None for N/A display
         screentime_summary = summary_block if isinstance(summary_block, dict) else None
 
+    comparison_label = "Screen Time" if include_screentime else "Fusion Comparison"
+    comparison_stage_label = "Screen Time" if include_screentime else "Track Fusion"
+    gain_label = "Screen Time Gain" if include_screentime else "Fusion Gain"
+    duration_gain: float | None = None
+    if screentime_summary is not None:
+        duration_gain = _safe_float_opt(
+            screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain"))
+        )
+
     # Face-only fallback for cases where screentime_comparison.json is missing.
     face_tracks_count_run = _count_jsonl_lines_optional(tracks_path)
     face_tracks_fallback = _face_tracks_duration_fallback(tracks_path)
@@ -1843,7 +1908,7 @@ def build_screentime_run_debug_pdf(
         ]),
         _wrap_row(["Face-Body Pairs Fused", _health_status(fused_pairs_ok), fused_pairs_detail]),
         _wrap_row([
-            "Screen Time Comparison Present",
+            f"{comparison_label} Present",
             _health_status(screentime_available),
             "Present" if screentime_available is True else (
                 "Missing body_tracking/screentime_comparison.json" if screentime_available is False else "Unreadable screentime_comparison.json"
@@ -1958,7 +2023,7 @@ def build_screentime_run_debug_pdf(
         ["Total Body Tracks", body_tracks_exec],
         ["Face Clusters (identities.json)", identities_count_display],
         ["Tracked IDs (from fusion output)", tracked_ids_exec],
-        ["Screen Time Gain (from comparison)", screentime_gain_exec],
+        [f"{gain_label} (from comparison)", screentime_gain_exec],
     ]
     exec_table = Table(exec_stats, colWidths=[3 * inch, 2 * inch])
     exec_table.setStyle(
@@ -2477,16 +2542,11 @@ def build_screentime_run_debug_pdf(
             backend_lines.append(("configured", marker_embedding_backend_configured))
         if marker_embedding_backend_actual and embedding_backend_effective and marker_embedding_backend_actual != embedding_backend_effective:
             backend_lines.append(("runtime_actual", marker_embedding_backend_actual))
-        backend_reason = marker_embedding_backend_fallback_reason
-        if (
-            embedding_backend_effective
-            and marker_embedding_backend_configured == "tensorrt"
-            and embedding_backend_effective != "tensorrt"
-            and backend_reason
-        ):
-            lowered = backend_reason.lower()
-            if "pip install" in lowered or "pycuda" in lowered:
-                backend_reason = "TensorRT requires CUDA (NVIDIA) and is not available; using PyTorch backend."
+        backend_reason = _sanitize_tensorrt_fallback_reason(
+            configured=marker_embedding_backend_configured,
+            effective=embedding_backend_effective,
+            reason=marker_embedding_backend_fallback_reason,
+        )
         if backend_reason:
             backend_lines.append(("reason", backend_reason))
         lineage_data.append(["Embedding Backend (effective)", backend_lines])
@@ -2923,6 +2983,26 @@ def build_screentime_run_debug_pdf(
             return None
         return _safe_float_opt(summary.get("gain_total_s", summary.get("total_duration_gain")))
 
+    current_rtf = marker_rtf
+    if current_rtf is None and isinstance(episode_status_payload, dict):
+        detect_block = episode_status_payload.get("stages", {}).get("detect")
+        if isinstance(detect_block, dict):
+            metrics = detect_block.get("metrics")
+            if isinstance(metrics, dict):
+                current_rtf = _safe_float_opt(metrics.get("rtf"))
+    current_forced_share = _forced_splits_share_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
+    if current_forced_share is None:
+        current_forced_share = _forced_splits_share_for_root(run_root)
+    current_singleton_rate = _singleton_rate_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
+    current_fused_pairs = actual_fused_pairs
+    current_gain = None
+    if isinstance(screentime_summary, dict):
+        current_gain = _safe_float_opt(
+            screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain"))
+        )
+    if current_gain is None:
+        current_gain = _gain_for_root(run_root)
+
     def _prev_successful_run_id() -> str | None:
         candidates: list[tuple[float, str]] = []
         for run_id in run_layout.list_run_ids(ep_id):
@@ -2948,26 +3028,6 @@ def build_screentime_run_debug_pdf(
     baseline_run_id = _prev_successful_run_id()
     if baseline_run_id:
         baseline_root = run_layout.run_root(ep_id, baseline_run_id)
-
-        current_rtf = marker_rtf
-        if current_rtf is None and isinstance(episode_status_payload, dict):
-            detect_block = episode_status_payload.get("stages", {}).get("detect")
-            if isinstance(detect_block, dict):
-                metrics = detect_block.get("metrics")
-                if isinstance(metrics, dict):
-                    current_rtf = _safe_float_opt(metrics.get("rtf"))
-        current_forced_share = _forced_splits_share_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
-        if current_forced_share is None:
-            current_forced_share = _forced_splits_share_for_root(run_root)
-        current_singleton_rate = _singleton_rate_from_metrics(track_metrics_data if isinstance(track_metrics_data, dict) else None)
-        current_fused_pairs = actual_fused_pairs
-        current_gain = None
-        if isinstance(screentime_summary, dict):
-            current_gain = _safe_float_opt(
-                screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain"))
-            )
-        if current_gain is None:
-            current_gain = _gain_for_root(run_root)
 
         baseline_rtf = _detect_rtf_for_root(baseline_root)
         baseline_forced_share = _forced_splits_share_for_root(baseline_root)
@@ -3016,7 +3076,7 @@ def build_screentime_run_debug_pdf(
                 _delta_text(current_fused_pairs, baseline_fused_pairs, ""),
             ],
             [
-                "Screen time gain",
+                gain_label,
                 f"{current_gain:.2f}s" if current_gain is not None else "N/A",
                 f"{baseline_gain:.2f}s" if baseline_gain is not None else "N/A",
                 _delta_text(current_gain, baseline_gain, "s"),
@@ -3053,9 +3113,10 @@ def build_screentime_run_debug_pdf(
         "cluster": "Cluster",
         "body_tracking": "Body Tracking",
         "track_fusion": "Track Fusion",
-        "screentime": "Screentime",
         "pdf": "PDF Export",
     }
+    if include_screentime:
+        stage_labels["screentime"] = "Screentime"
     raw_plan = (
         [str(item) for item in episode_status_payload.get("stage_plan", []) if isinstance(item, str)]
         if isinstance(episode_status_payload, dict)
@@ -3066,8 +3127,12 @@ def build_screentime_run_debug_pdf(
         normalized = normalize_stage_key(item)
         if normalized and normalized not in stage_plan:
             stage_plan.append(normalized)
+    if not include_screentime:
+        stage_plan = [stage for stage in stage_plan if stage != "screentime"]
     if not stage_plan:
-        stage_plan = ["detect", "faces", "cluster", "body_tracking", "track_fusion", "screentime", "pdf"]
+        stage_plan = ["detect", "faces", "cluster", "body_tracking", "track_fusion", "pdf"]
+        if include_screentime:
+            stage_plan.insert(-1, "screentime")
 
     job_records: list[dict[str, Any]] = []
     jobs_dir = get_path(ep_id, "video").parents[2] / "jobs"
@@ -3163,13 +3228,28 @@ def build_screentime_run_debug_pdf(
         "body_tracking": "body_tracking.json",
         "track_fusion": "body_tracking_fusion.json",
     }
+    export_index_path = run_root / "exports" / "export_index.json"
+    artifact_state_by_stage: dict[str, dict[str, Any]] = {
+        "detect": {"detections": detections_path.exists(), "tracks": tracks_path.exists()},
+        "faces": {"faces": faces_path.exists()},
+        "cluster": {"identities": identities_path.exists()},
+        "body_tracking": {
+            "body_tracks": body_tracks_path.exists(),
+            "legacy": legacy_body_artifacts_exist,
+        },
+        "track_fusion": {
+            "track_fusion": track_fusion_path.exists(),
+            "legacy": legacy_track_fusion_path.exists(),
+        },
+        "pdf": {"export_index": export_index_path.exists()},
+    }
     for stage_key in stage_plan:
         stage_entry = None
         if isinstance(episode_status_payload, dict):
             stage_entry = episode_status_payload.get("stages", {}).get(stage_key)
         if not isinstance(stage_entry, dict):
             stage_entry = {}
-        status_val = stage_entry.get("status") or "unknown"
+        status_val = _resolve_lifecycle_status(stage_key, stage_entry, artifact_state_by_stage.get(stage_key, {}))
         started_at = stage_entry.get("started_at")
         ended_at = stage_entry.get("ended_at")
         if not started_at and not ended_at:
@@ -3222,6 +3302,181 @@ def build_screentime_run_debug_pdf(
         ])
     )
     story.append(job_table)
+    story.append(Spacer(1, 12))
+
+    # =========================================================================
+    # SECTION 0.7: PERFORMANCE & QUALITY
+    # =========================================================================
+    story.append(Paragraph("0.7 Performance &amp; Quality", section_style))
+
+    detect_eff_fps = marker_effective_fps_processing
+    if detect_eff_fps is None and isinstance(episode_status_payload, dict):
+        detect_block = episode_status_payload.get("stages", {}).get("detect")
+        if isinstance(detect_block, dict):
+            metrics = detect_block.get("metrics")
+            if isinstance(metrics, dict):
+                detect_eff_fps = _safe_float_opt(metrics.get("effective_fps_processing"))
+
+    forced_scene_ratio = marker_forced_scene_warmup_ratio
+    embedding_backend_effective = (
+        marker_embedding_backend_configured_effective
+        or marker_embedding_backend_actual
+        or marker_embedding_backend_configured
+        or embedding_config.get("embedding", {}).get("backend", "tensorrt")
+    )
+    embedding_backend_note = (
+        _sanitize_tensorrt_fallback_reason(
+            configured=marker_embedding_backend_configured,
+            effective=embedding_backend_effective,
+            reason=marker_embedding_backend_fallback_reason,
+        )
+        or ""
+    )
+
+    reid_cfg_enabled = bool(track_fusion_config.get("reid_handoff", {}).get("enabled", False))
+    body_reid = run_body_tracking_marker.get("body_reid") if isinstance(run_body_tracking_marker, dict) else None
+    reid_effective = body_reid.get("enabled_effective") if isinstance(body_reid, dict) else None
+    reid_skip_reason = body_reid.get("reid_skip_reason") if isinstance(body_reid, dict) else None
+    torchreid_error = body_reid.get("torchreid_runtime_error") if isinstance(body_reid, dict) else None
+
+    if not reid_cfg_enabled:
+        fusion_mode_value = "IoU-only"
+        fusion_mode_note = "reid_handoff.enabled=false"
+    elif reid_effective:
+        fusion_mode_value = "Hybrid (IoU + Re-ID)"
+        fusion_mode_note = "enabled_effective=true"
+    else:
+        fusion_mode_value = "IoU-only"
+        fusion_mode_note = "Re-ID unavailable"
+        if isinstance(torchreid_error, str) and torchreid_error.strip():
+            fusion_mode_note = f"{fusion_mode_note}; {torchreid_error.strip()}"
+        elif isinstance(reid_skip_reason, str) and reid_skip_reason.strip():
+            fusion_mode_note = f"{fusion_mode_note}; skip_reason={reid_skip_reason.strip()}"
+
+    reid_value = "available" if reid_effective else "unavailable"
+    if not reid_cfg_enabled:
+        reid_value = "disabled"
+    reid_note = None
+    if isinstance(torchreid_error, str) and torchreid_error.strip():
+        reid_note = torchreid_error.strip()
+        if "missing torchreid.utils" in reid_note:
+            reid_note = (
+                "missing torchreid.utils (install deep-person-reid; "
+                "pip install -r requirements-ml.txt)"
+            )
+    elif isinstance(reid_skip_reason, str) and reid_skip_reason.strip():
+        reid_note = f"skip_reason={reid_skip_reason.strip()}"
+
+    perf_rows = [
+        _wrap_row(["Metric", "Value", "Notes"]),
+        _wrap_row([
+            "Detect RTF",
+            f"{current_rtf:.2f}x" if current_rtf is not None else "N/A",
+            "detect_track marker / status",
+        ]),
+        _wrap_row([
+            "Detect Effective FPS",
+            f"{detect_eff_fps:.2f} fps" if detect_eff_fps is not None else "N/A",
+            "detect_track marker / status",
+        ]),
+        _wrap_row([
+            "Forced splits share",
+            f"{current_forced_share:.2%}" if current_forced_share is not None else "N/A",
+            "track_metrics.json",
+        ]),
+        _wrap_row([
+            "Singleton rate",
+            f"{current_singleton_rate:.2%}" if current_singleton_rate is not None else "N/A",
+            "cluster metrics",
+        ]),
+        _wrap_row([
+            "Fusion mode",
+            fusion_mode_value,
+            fusion_mode_note or "",
+        ]),
+        _wrap_row([
+            "Fusion yield (fused pairs)",
+            str(current_fused_pairs) if current_fused_pairs is not None else "N/A",
+            "track_fusion.json diagnostics",
+        ]),
+        _wrap_row([
+            "Body Re-ID availability",
+            reid_value,
+            reid_note or "",
+        ]),
+        _wrap_row([
+            "Embedding backend (effective)",
+            str(embedding_backend_effective),
+            embedding_backend_note,
+        ]),
+    ]
+    if forced_scene_ratio is not None:
+        perf_rows.append(
+            _wrap_row([
+                "Forced scene warmup ratio",
+                f"{forced_scene_ratio:.3f}",
+                "detect_track marker",
+            ])
+        )
+
+    perf_table = Table(perf_rows, colWidths=[1.6 * inch, 1.4 * inch, 2.6 * inch])
+    perf_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ])
+    )
+    story.append(perf_table)
+    story.append(Spacer(1, 12))
+
+    # =========================================================================
+    # SECTION 0.8: DB HEALTH
+    # =========================================================================
+    story.append(Paragraph("0.8 DB Health", section_style))
+    db_rows = [
+        _wrap_row(["Signal", "Value", "Notes"]),
+        _wrap_row(
+            [
+                "DB_URL configured",
+                "Yes" if db_configured else "No",
+                db_not_configured_reason or "",
+            ]
+        ),
+        _wrap_row(
+            [
+                "DB Connected",
+                _health_status(db_connected),
+                db_error or ("OK" if db_connected else ""),
+            ]
+        ),
+        _wrap_row(
+            [
+                "Fake DB enabled",
+                "Yes" if fake_db_enabled else "No",
+                "SCREENALYTICS_FAKE_DB=1" if fake_db_enabled else "",
+            ]
+        ),
+    ]
+    db_table = Table(db_rows, colWidths=[1.6 * inch, 1.0 * inch, 3.0 * inch])
+    db_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ])
+    )
+    story.append(db_table)
     story.append(Spacer(1, 12))
 
     # =========================================================================
@@ -4351,222 +4606,47 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph(f"&bull; cluster_centroids.json ({_file_size_str(cluster_centroids_path)})", bullet_style))
 
     # =========================================================================
-    # SECTION 8: FACES REVIEW (DB State)
+    # SECTION 8: FACES REVIEW (DB State) + SECTION 9: SMART SUGGESTIONS
     # =========================================================================
-    story.append(Paragraph("8. Faces Review (DB State)", section_style))
-    assigned_count = sum(1 for identity in identities_list if identity.get("person_id")) if identities_count_run is not None else None
-    assigned_count_display = _format_optional_count(
-        assigned_count,
-        path=identities_path,
-        label="identities.json",
-    )
-    unassigned_count = (
-        (identities_count_run - assigned_count)
-        if identities_count_run is not None and isinstance(assigned_count, int)
-        else None
-    )
-    unassigned_count_display = _format_optional_count(
-        unassigned_count,
-        path=identities_path,
-        label="identities.json",
-    )
-
-    # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_connected is not True:
-        locked_count_str = "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)"
-    else:
-        locked_count = len([lock for lock in identity_locks if lock.get("locked")])
-        locked_count_str = str(locked_count)
-
-    review_stats = [
-        ["Metric", "Value"],
-        ["Total Identities", identities_count_display],
-        ["Assigned to Cast", assigned_count_display],
-        ["Locked Identities", locked_count_str],
-        ["Unassigned", unassigned_count_display],
-    ]
-    review_table = Table(review_stats, colWidths=[2 * inch, 2 * inch])
-    review_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ])
-    )
-    story.append(review_table)
-
-    if db_connected is False:
-        story.append(Paragraph(f"⚠️ <b>DB Error:</b> {db_error}", warning_style))
-        story.append(
-            Paragraph(
-                "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
-                note_style,
-            )
+    if include_faces_review:
+        story.append(Paragraph("8. Faces Review (DB State)", section_style))
+        assigned_count = (
+            sum(1 for identity in identities_list if identity.get("person_id"))
+            if identities_count_run is not None
+            else None
         )
-        manual_assignments = identities_data.get("manual_assignments")
-        manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
-        if manual_assignments_count > 0:
-            story.append(Paragraph(
-                f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
-                note_style
-            ))
-    elif db_connected is None:
-        story.append(
-            Paragraph(
-                f"<b>DB Not Configured:</b> {db_not_configured_reason or 'missing DB_URL'} (DB-sourced state is omitted in this report).",
-                note_style,
-            )
+        assigned_count_display = _format_optional_count(
+            assigned_count,
+            path=identities_path,
+            label="identities.json",
+        )
+        unassigned_count = (
+            (identities_count_run - assigned_count)
+            if identities_count_run is not None and isinstance(assigned_count, int)
+            else None
+        )
+        unassigned_count_display = _format_optional_count(
+            unassigned_count,
+            path=identities_path,
+            label="identities.json",
         )
 
-    story.append(Paragraph("Data Sources:", subsection_style))
-    story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
-    story.append(Paragraph("&bull; identities.json (manual_assignments)", bullet_style))
-
-    # =========================================================================
-    # SECTION 9: SMART SUGGESTIONS
-    # =========================================================================
-    story.append(Paragraph("9. Smart Suggestions", section_style))
-
-    # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_connected is not True:
-        suggestion_stats = [
-            ["Metric", "Value"],
-            [
-                "Suggestion Batches",
-                "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)",
-            ],
-            ["Total Suggestions", "unavailable"],
-            ["Dismissed", "unavailable"],
-            ["Applied", "unavailable"],
-            ["Pending", "unavailable"],
-        ]
-    else:
-        dismissed_count = sum(1 for s in suggestions_rows if s.get("dismissed"))
-        applied_count = len(suggestion_applies)
-        pending_count = len(suggestions_rows) - dismissed_count - applied_count
-        suggestion_stats = [
-            ["Metric", "Value"],
-            ["Suggestion Batches", str(len(suggestion_batches))],
-            ["Total Suggestions", str(len(suggestions_rows))],
-            ["Dismissed", str(dismissed_count)],
-            ["Applied", str(applied_count)],
-            ["Pending", str(pending_count)],
-        ]
-
-    suggestion_table = Table(suggestion_stats, colWidths=[2 * inch, 2 * inch])
-    suggestion_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ])
-    )
-    story.append(suggestion_table)
-
-    story.append(Paragraph("Data Sources:", subsection_style))
-    story.append(Paragraph("&bull; suggestion_batches table (DB)", bullet_style))
-    story.append(Paragraph("&bull; suggestions table (DB)", bullet_style))
-    story.append(Paragraph("&bull; suggestion_applies table (DB)", bullet_style))
-
-    # =========================================================================
-    # SECTION 10: SCREEN TIME ANALYZE
-    # =========================================================================
-    story.append(Paragraph("10. Screen Time Analyze", section_style))
-
-    duration_gain: float | None
-    if screentime_summary is None:
-        duration_gain = None
-        story.append(Paragraph(
-            f"⚠️ Screen Time Analyze is unavailable: {_na_artifact(screentime_comparison_path, 'body_tracking/screentime_comparison.json')}.",
-            warning_style,
-        ))
-        if face_tracks_fallback.get("ok") and isinstance(face_tracks_fallback.get("total_duration_s"), (int, float)):
-            approx_duration_s = float(face_tracks_fallback["total_duration_s"])
-            fallback_table = Table(
-                [
-                    ["Metric", "Value", "Notes"],
-                    ["Face-only screen time (approx)", f"{approx_duration_s:.2f}s", "Sum of per-track spans from tracks.jsonl"],
-                ],
-                colWidths=[2.2 * inch, 1.2 * inch, 2.1 * inch],
-            )
-            fallback_table.setStyle(
-                TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ])
-            )
-            story.append(Spacer(1, 6))
-            story.append(fallback_table)
+        # Show "unavailable" for DB-sourced data when DB is not connected
+        if db_connected is not True:
+            locked_count_str = "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)"
         else:
-            story.append(Paragraph(
-                "Face-only fallback is unavailable because run tracks.jsonl is missing or unreadable.",
-                note_style,
-            ))
-        story.append(Spacer(1, 8))
-        unavailable = _na_artifact(screentime_comparison_path, "body_tracking/screentime_comparison.json")
-        story.append(Paragraph(f"Total tracked IDs analyzed: <b>{unavailable}</b>", body_style))
-        story.append(Paragraph(f"Tracked IDs with gain: <b>{unavailable}</b>", body_style))
-    else:
-        face_total_s = _safe_float(
-            screentime_summary.get("face_total_s", screentime_summary.get("total_face_only_duration", 0))
-        )
-        body_total_s = _safe_float(
-            screentime_summary.get("body_total_s", screentime_summary.get("total_body_duration", 0))
-        )
-        fused_total_s = _safe_float(
-            screentime_summary.get("fused_total_s", screentime_summary.get("total_fused_duration", 0))
-        )
-        combined_total_s = _safe_float(
-            screentime_summary.get("combined_total_s", screentime_summary.get("total_combined_duration", 0))
-        )
-        gain_total_s = _safe_float(
-            screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain", 0))
-        )
-        duration_gain = gain_total_s
-        gain_vs_combined_pct = _format_percent(gain_total_s, combined_total_s, na="N/A")
-        gain_vs_face_only_pct = _format_percent(gain_total_s, face_total_s, na="N/A")
+            locked_count = len([lock for lock in identity_locks if lock.get("locked")])
+            locked_count_str = str(locked_count)
 
-        screentime_breakdown = [
-            ["Metric", "Duration", "% of Combined"],
-            ["Face baseline total", f"{face_total_s:.2f}s", _format_percent(face_total_s, combined_total_s, na="N/A")],
-            ["Body total (absolute)", f"{body_total_s:.2f}s", _format_percent(body_total_s, combined_total_s, na="N/A")],
-            ["Face∩Body overlap total", f"{fused_total_s:.2f}s", _format_percent(fused_total_s, combined_total_s, na="N/A")],
-            ["Combined total (Face ∪ Body)", f"{combined_total_s:.2f}s", "100%"],
-            ["Gain vs Face baseline (Combined − Face)", f"+{gain_total_s:.2f}s", gain_vs_combined_pct],
+        review_stats = [
+            ["Metric", "Value"],
+            ["Total Identities", identities_count_display],
+            ["Assigned to Cast", assigned_count_display],
+            ["Locked Identities", locked_count_str],
+            ["Unassigned", unassigned_count_display],
         ]
-        screentime_table = Table(screentime_breakdown, colWidths=[2 * inch, 1.5 * inch, 1.5 * inch])
-        screentime_table.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#c6f6d5")),
-            ])
-        )
-        story.append(screentime_table)
-
-        # Explicitly report the two gain % references so "0.0%" isn't printed when face_only == 0.
-        story.append(Spacer(1, 6))
-        gain_pct_table = Table(
-            [
-                ["Gain % Reference", "Value"],
-                ["Gain vs Combined Total", gain_vs_combined_pct],
-                ["Gain vs Face-only Total", gain_vs_face_only_pct],
-            ],
-            colWidths=[2.2 * inch, 2.8 * inch],
-        )
-        gain_pct_table.setStyle(
+        review_table = Table(review_stats, colWidths=[2 * inch, 2 * inch])
+        review_table.setStyle(
             TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
@@ -4575,155 +4655,351 @@ def build_screentime_run_debug_pdf(
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
             ])
         )
-        story.append(gain_pct_table)
+        story.append(review_table)
 
-        # Adjust wording based on whether fusion actually occurred
-        if actual_fused_pairs is not None and actual_fused_pairs > 0:
-            story.append(Paragraph(
-                f"<b>Note:</b> 'Gain vs Face baseline' is the incremental time added by body visibility "
-                f"(Combined − Face baseline), from {actual_fused_pairs} fused face-body pair(s).",
-                note_style
-            ))
-        elif body_tracking_ran_effective and (body_track_count_run or 0) > 0:
-            story.append(Paragraph(
-                "<b>Note:</b> Body tracking ran but no face-body pairs were successfully fused. "
-                "This may indicate IoU/Re-ID thresholds need tuning, or faces and bodies didn't overlap temporally.",
-                warning_style
-            ))
-        else:
-            story.append(Paragraph(
-                "<b>Note:</b> Body tracking was not enabled or produced no tracks. "
-                "'Gain from Body Tracking' will be zero without body-based fusion.",
-                note_style
-            ))
-
-        breakdowns = screentime_payload.get("breakdowns") if isinstance(screentime_payload, dict) else None
-        if isinstance(breakdowns, list) and breakdowns:
-            contributors: list[dict[str, Any]] = []
-            for entry in breakdowns:
-                if not isinstance(entry, dict):
-                    continue
-                delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
-                gain = _safe_float_opt(delta.get("duration_gain"))
-                if gain is None or gain <= 0:
-                    continue
-                contributors.append(entry)
-
-            contributors.sort(
-                key=lambda item: _safe_float_opt((item.get("delta") or {}).get("duration_gain")) or 0.0,
-                reverse=True,
+        if db_connected is False:
+            story.append(Paragraph(f"⚠️ <b>DB Error:</b> {db_error}", warning_style))
+            story.append(
+                Paragraph(
+                    "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
+                    note_style,
+                )
             )
-            contributors = contributors[:5]
+            manual_assignments = identities_data.get("manual_assignments")
+            manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
+            if manual_assignments_count > 0:
+                story.append(Paragraph(
+                    f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
+                    note_style
+                ))
+        elif db_connected is None:
+            story.append(
+                Paragraph(
+                    f"<b>DB Not Configured:</b> {db_not_configured_reason or 'missing DB_URL'} (DB-sourced state is omitted in this report).",
+                    note_style,
+                )
+            )
 
-            if contributors:
-                story.append(Spacer(1, 8))
-                story.append(Paragraph("Top Contributors to Screen Time Gain", subsection_style))
-                contrib_rows = [_wrap_row(["Identity", "Gain", "Body-only segments"], cell_style_small)]
-                for entry in contributors:
-                    identity_id = str(entry.get("identity_id") or "unknown")
-                    delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
-                    gain = _safe_float_opt(delta.get("duration_gain")) or 0.0
-                    body_only_segments = entry.get("body_only_segments")
-                    if not isinstance(body_only_segments, list):
-                        segments_block = entry.get("segments") if isinstance(entry.get("segments"), dict) else {}
-                        body_only_segments = segments_block.get("body_only") if isinstance(segments_block, dict) else None
-                    segment_texts: list[str] = []
-                    if isinstance(body_only_segments, list):
-                        for seg in body_only_segments[:3]:
-                            if not isinstance(seg, dict):
-                                continue
-                            start_time = _safe_float_opt(seg.get("start_time"))
-                            end_time = _safe_float_opt(seg.get("end_time"))
-                            duration = _safe_float_opt(seg.get("duration"))
-                            if start_time is None or end_time is None:
-                                continue
-                            if duration is None:
-                                duration = max(end_time - start_time, 0.0)
-                            segment_texts.append(f"{start_time:.2f}-{end_time:.2f}s ({duration:.2f}s)")
-                    segments_label = ", ".join(segment_texts) if segment_texts else "N/A"
-                    if isinstance(body_only_segments, list) and len(body_only_segments) > 3:
-                        segments_label = f"{segments_label} (+{len(body_only_segments) - 3} more)"
-                    contrib_rows.append(
-                        _wrap_row([identity_id, f"+{gain:.2f}s", segments_label], cell_style_small)
-                    )
+        story.append(Paragraph("Data Sources:", subsection_style))
+        story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
+        story.append(Paragraph("&bull; identities.json (manual_assignments)", bullet_style))
 
-                contrib_table = Table(contrib_rows, colWidths=[1.2 * inch, 0.9 * inch, 4.4 * inch])
-                contrib_table.setStyle(
+        story.append(Paragraph("9. Smart Suggestions", section_style))
+
+        # Show "unavailable" for DB-sourced data when DB is not connected
+        if db_connected is not True:
+            suggestion_stats = [
+                ["Metric", "Value"],
+                [
+                    "Suggestion Batches",
+                    "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)",
+                ],
+                ["Total Suggestions", "unavailable"],
+                ["Dismissed", "unavailable"],
+                ["Applied", "unavailable"],
+                ["Pending", "unavailable"],
+            ]
+        else:
+            dismissed_count = sum(1 for s in suggestions_rows if s.get("dismissed"))
+            applied_count = len(suggestion_applies)
+            pending_count = len(suggestions_rows) - dismissed_count - applied_count
+            suggestion_stats = [
+                ["Metric", "Value"],
+                ["Suggestion Batches", str(len(suggestion_batches))],
+                ["Total Suggestions", str(len(suggestions_rows))],
+                ["Dismissed", str(dismissed_count)],
+                ["Applied", str(applied_count)],
+                ["Pending", str(pending_count)],
+            ]
+
+        suggestion_table = Table(suggestion_stats, colWidths=[2 * inch, 2 * inch])
+        suggestion_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ])
+        )
+        story.append(suggestion_table)
+
+        story.append(Paragraph("Data Sources:", subsection_style))
+        story.append(Paragraph("&bull; suggestion_batches table (DB)", bullet_style))
+        story.append(Paragraph("&bull; suggestions table (DB)", bullet_style))
+        story.append(Paragraph("&bull; suggestion_applies table (DB)", bullet_style))
+    else:
+        story.append(Paragraph("8. Out-of-Scope Sections", section_style))
+        story.append(
+            Paragraph(
+                "Faces Review (DB state) and Smart Suggestions are out of scope for setup-only exports.",
+                note_style,
+            )
+        )
+        out_of_scope_items: list[str] = []
+        if screentime_comparison_path.exists():
+            out_of_scope_items.append("body_tracking/screentime_comparison.json")
+        analytics_dir = run_root / "analytics"
+        for filename in ("screentime.json", "screentime.csv"):
+            if (analytics_dir / filename).exists():
+                out_of_scope_items.append(f"analytics/{filename}")
+        if out_of_scope_items:
+            story.append(Paragraph("Out-of-scope artifacts present:", subsection_style))
+            for item in out_of_scope_items:
+                story.append(Paragraph(f"&bull; {item}", bullet_style))
+
+    # =========================================================================
+    if include_screentime:
+        # SECTION 10: SCREEN TIME ANALYZE
+        # =========================================================================
+        story.append(Paragraph("10. Screen Time Analyze", section_style))
+    
+        if screentime_summary is None:
+            duration_gain = None
+            story.append(Paragraph(
+                f"⚠️ Screen Time Analyze is unavailable: {_na_artifact(screentime_comparison_path, 'body_tracking/screentime_comparison.json')}.",
+                warning_style,
+            ))
+            if face_tracks_fallback.get("ok") and isinstance(face_tracks_fallback.get("total_duration_s"), (int, float)):
+                approx_duration_s = float(face_tracks_fallback["total_duration_s"])
+                fallback_table = Table(
+                    [
+                        ["Metric", "Value", "Notes"],
+                        ["Face-only screen time (approx)", f"{approx_duration_s:.2f}s", "Sum of per-track spans from tracks.jsonl"],
+                    ],
+                    colWidths=[2.2 * inch, 1.2 * inch, 2.1 * inch],
+                )
+                fallback_table.setStyle(
                     TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
                         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                         ("FONTSIZE", (0, 0), (-1, -1), 8),
                         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                         ("LEFTPADDING", (0, 0), (-1, -1), 4),
                         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
                     ])
                 )
-                story.append(contrib_table)
-
-        # Additional stats
-        story.append(Spacer(1, 8))
-        story.append(Paragraph(f"Total tracked IDs analyzed: <b>{screentime_summary.get('total_identities', 0)}</b>", body_style))
-        story.append(Paragraph(f"Tracked IDs with gain: <b>{screentime_summary.get('identities_with_gain', 0)}</b>", body_style))
-
-    # Configuration used with explanations
-    story.append(Paragraph("Configuration (screen_time_v2.yaml):", subsection_style))
-    preset = screentime_config.get("preset", "bravo_default")
-    presets = screentime_config.get("screen_time_presets", {})
-    active_preset = presets.get(preset, {})
-    screentime_config_rows = [
-        _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
-        _wrap_row(["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"], cell_style_small),
-        _wrap_row([
-            "quality_min",
-            str(active_preset.get("quality_min", "N/A")),
-            "Min detection quality to count",
-            "Lower: Count blurry faces | Higher: Only clear",
-        ], cell_style_small),
-        _wrap_row([
-            "gap_tolerance_s",
-            str(active_preset.get("gap_tolerance_s", "N/A")),
-            "Max gap to merge into one segment",
-            "Lower: More segments | Higher: Merge through cuts",
-        ], cell_style_small),
-        _wrap_row([
-            "screen_time_mode",
-            str(active_preset.get("screen_time_mode", "N/A")),
-            "How to compute screen time",
-            "tracks: Full spans | faces: Only detected frames",
-        ], cell_style_small),
-        _wrap_row([
-            "edge_padding_s",
-            str(active_preset.get("edge_padding_s", "N/A")),
-            "Padding added to segment edges",
-            "Lower: Conservative | Higher: Generous counting",
-        ], cell_style_small),
-        _wrap_row([
-            "track_coverage_min",
-            str(active_preset.get("track_coverage_min", "N/A")),
-            "Min detection coverage per track",
-            "Lower: Count sparse | Higher: Require consistent",
-        ], cell_style_small),
-    ]
-    screentime_config_table = Table(screentime_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
-    screentime_config_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7),
-            ("FONTNAME", (0, 1), (1, -1), "Courier"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 3),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ])
-    )
-    story.append(screentime_config_table)
-
-    story.append(Paragraph("Artifacts:", subsection_style))
-    story.append(Paragraph(f"&bull; body_tracking/screentime_comparison.json ({_file_size_str(screentime_comparison_path)})", bullet_style))
-
-    # =========================================================================
+                story.append(Spacer(1, 6))
+                story.append(fallback_table)
+            else:
+                story.append(Paragraph(
+                    "Face-only fallback is unavailable because run tracks.jsonl is missing or unreadable.",
+                    note_style,
+                ))
+            story.append(Spacer(1, 8))
+            unavailable = _na_artifact(screentime_comparison_path, "body_tracking/screentime_comparison.json")
+            story.append(Paragraph(f"Total tracked IDs analyzed: <b>{unavailable}</b>", body_style))
+            story.append(Paragraph(f"Tracked IDs with gain: <b>{unavailable}</b>", body_style))
+        else:
+            face_total_s = _safe_float(
+                screentime_summary.get("face_total_s", screentime_summary.get("total_face_only_duration", 0))
+            )
+            body_total_s = _safe_float(
+                screentime_summary.get("body_total_s", screentime_summary.get("total_body_duration", 0))
+            )
+            fused_total_s = _safe_float(
+                screentime_summary.get("fused_total_s", screentime_summary.get("total_fused_duration", 0))
+            )
+            combined_total_s = _safe_float(
+                screentime_summary.get("combined_total_s", screentime_summary.get("total_combined_duration", 0))
+            )
+            gain_total_s = _safe_float(
+                screentime_summary.get("gain_total_s", screentime_summary.get("total_duration_gain", 0))
+            )
+            duration_gain = gain_total_s
+            gain_vs_combined_pct = _format_percent(gain_total_s, combined_total_s, na="N/A")
+            gain_vs_face_only_pct = _format_percent(gain_total_s, face_total_s, na="N/A")
+    
+            screentime_breakdown = [
+                ["Metric", "Duration", "% of Combined"],
+                ["Face baseline total", f"{face_total_s:.2f}s", _format_percent(face_total_s, combined_total_s, na="N/A")],
+                ["Body total (absolute)", f"{body_total_s:.2f}s", _format_percent(body_total_s, combined_total_s, na="N/A")],
+                ["Face∩Body overlap total", f"{fused_total_s:.2f}s", _format_percent(fused_total_s, combined_total_s, na="N/A")],
+                ["Combined total (Face ∪ Body)", f"{combined_total_s:.2f}s", "100%"],
+                ["Gain vs Face baseline (Combined − Face)", f"+{gain_total_s:.2f}s", gain_vs_combined_pct],
+            ]
+            screentime_table = Table(screentime_breakdown, colWidths=[2 * inch, 1.5 * inch, 1.5 * inch])
+            screentime_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#c6f6d5")),
+                ])
+            )
+            story.append(screentime_table)
+    
+            # Explicitly report the two gain % references so "0.0%" isn't printed when face_only == 0.
+            story.append(Spacer(1, 6))
+            gain_pct_table = Table(
+                [
+                    ["Gain % Reference", "Value"],
+                    ["Gain vs Combined Total", gain_vs_combined_pct],
+                    ["Gain vs Face-only Total", gain_vs_face_only_pct],
+                ],
+                colWidths=[2.2 * inch, 2.8 * inch],
+            )
+            gain_pct_table.setStyle(
+                TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ])
+            )
+            story.append(gain_pct_table)
+    
+            # Adjust wording based on whether fusion actually occurred
+            if actual_fused_pairs is not None and actual_fused_pairs > 0:
+                story.append(Paragraph(
+                    f"<b>Note:</b> 'Gain vs Face baseline' is the incremental time added by body visibility "
+                    f"(Combined − Face baseline), from {actual_fused_pairs} fused face-body pair(s).",
+                    note_style
+                ))
+            elif body_tracking_ran_effective and (body_track_count_run or 0) > 0:
+                story.append(Paragraph(
+                    "<b>Note:</b> Body tracking ran but no face-body pairs were successfully fused. "
+                    "This may indicate IoU/Re-ID thresholds need tuning, or faces and bodies didn't overlap temporally.",
+                    warning_style
+                ))
+            else:
+                story.append(Paragraph(
+                    "<b>Note:</b> Body tracking was not enabled or produced no tracks. "
+                    "'Gain from Body Tracking' will be zero without body-based fusion.",
+                    note_style
+                ))
+    
+            breakdowns = screentime_payload.get("breakdowns") if isinstance(screentime_payload, dict) else None
+            if isinstance(breakdowns, list) and breakdowns:
+                contributors: list[dict[str, Any]] = []
+                for entry in breakdowns:
+                    if not isinstance(entry, dict):
+                        continue
+                    delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
+                    gain = _safe_float_opt(delta.get("duration_gain"))
+                    if gain is None or gain <= 0:
+                        continue
+                    contributors.append(entry)
+    
+                contributors.sort(
+                    key=lambda item: _safe_float_opt((item.get("delta") or {}).get("duration_gain")) or 0.0,
+                    reverse=True,
+                )
+                contributors = contributors[:5]
+    
+                if contributors:
+                    story.append(Spacer(1, 8))
+                    story.append(Paragraph("Top Contributors to Screen Time Gain", subsection_style))
+                    contrib_rows = [_wrap_row(["Identity", "Gain", "Body-only segments"], cell_style_small)]
+                    for entry in contributors:
+                        identity_id = str(entry.get("identity_id") or "unknown")
+                        delta = entry.get("delta") if isinstance(entry.get("delta"), dict) else {}
+                        gain = _safe_float_opt(delta.get("duration_gain")) or 0.0
+                        body_only_segments = entry.get("body_only_segments")
+                        if not isinstance(body_only_segments, list):
+                            segments_block = entry.get("segments") if isinstance(entry.get("segments"), dict) else {}
+                            body_only_segments = segments_block.get("body_only") if isinstance(segments_block, dict) else None
+                        segment_texts: list[str] = []
+                        if isinstance(body_only_segments, list):
+                            for seg in body_only_segments[:3]:
+                                if not isinstance(seg, dict):
+                                    continue
+                                start_time = _safe_float_opt(seg.get("start_time"))
+                                end_time = _safe_float_opt(seg.get("end_time"))
+                                duration = _safe_float_opt(seg.get("duration"))
+                                if start_time is None or end_time is None:
+                                    continue
+                                if duration is None:
+                                    duration = max(end_time - start_time, 0.0)
+                                segment_texts.append(f"{start_time:.2f}-{end_time:.2f}s ({duration:.2f}s)")
+                        segments_label = ", ".join(segment_texts) if segment_texts else "N/A"
+                        if isinstance(body_only_segments, list) and len(body_only_segments) > 3:
+                            segments_label = f"{segments_label} (+{len(body_only_segments) - 3} more)"
+                        contrib_rows.append(
+                            _wrap_row([identity_id, f"+{gain:.2f}s", segments_label], cell_style_small)
+                        )
+    
+                    contrib_table = Table(contrib_rows, colWidths=[1.2 * inch, 0.9 * inch, 4.4 * inch])
+                    contrib_table.setStyle(
+                        TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d3748")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                            ("FONTSIZE", (0, 0), (-1, -1), 8),
+                            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+                        ])
+                    )
+                    story.append(contrib_table)
+    
+            # Additional stats
+            story.append(Spacer(1, 8))
+            story.append(Paragraph(f"Total tracked IDs analyzed: <b>{screentime_summary.get('total_identities', 0)}</b>", body_style))
+            story.append(Paragraph(f"Tracked IDs with gain: <b>{screentime_summary.get('identities_with_gain', 0)}</b>", body_style))
+    
+        # Configuration used with explanations
+        story.append(Paragraph("Configuration (screen_time_v2.yaml):", subsection_style))
+        preset = screentime_config.get("preset", "bravo_default")
+        presets = screentime_config.get("screen_time_presets", {})
+        active_preset = presets.get(preset, {})
+        screentime_config_rows = [
+            _wrap_row(["Setting", "Value", "Description", "Tuning"], cell_style_small),
+            _wrap_row(["Active Preset", preset, "Named configuration profile", "bravo_default: Loose | stricter: Moderate | strict: Conservative"], cell_style_small),
+            _wrap_row([
+                "quality_min",
+                str(active_preset.get("quality_min", "N/A")),
+                "Min detection quality to count",
+                "Lower: Count blurry faces | Higher: Only clear",
+            ], cell_style_small),
+            _wrap_row([
+                "gap_tolerance_s",
+                str(active_preset.get("gap_tolerance_s", "N/A")),
+                "Max gap to merge into one segment",
+                "Lower: More segments | Higher: Merge through cuts",
+            ], cell_style_small),
+            _wrap_row([
+                "screen_time_mode",
+                str(active_preset.get("screen_time_mode", "N/A")),
+                "How to compute screen time",
+                "tracks: Full spans | faces: Only detected frames",
+            ], cell_style_small),
+            _wrap_row([
+                "edge_padding_s",
+                str(active_preset.get("edge_padding_s", "N/A")),
+                "Padding added to segment edges",
+                "Lower: Conservative | Higher: Generous counting",
+            ], cell_style_small),
+            _wrap_row([
+                "track_coverage_min",
+                str(active_preset.get("track_coverage_min", "N/A")),
+                "Min detection coverage per track",
+                "Lower: Count sparse | Higher: Require consistent",
+            ], cell_style_small),
+        ]
+        screentime_config_table = Table(screentime_config_rows, colWidths=[1.2 * inch, 0.5 * inch, 1.6 * inch, 2.2 * inch])
+        screentime_config_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("FONTNAME", (0, 1), (1, -1), "Courier"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ])
+        )
+        story.append(screentime_config_table)
+    
+        story.append(Paragraph("Artifacts:", subsection_style))
+        story.append(Paragraph(f"&bull; body_tracking/screentime_comparison.json ({_file_size_str(screentime_comparison_path)})", bullet_style))
+    
+        # =========================================================================
     # SECTION 11: WHAT LIKELY NEEDS TUNING
     # =========================================================================
     story.append(PageBreak())
@@ -4831,11 +5107,12 @@ def build_screentime_run_debug_pdf(
             "Lower iou_association.iou_threshold or reid_handoff.similarity_threshold in track_fusion.yaml"
         ))
 
-    # Screen time tuning
+    # Comparison tuning
     if duration_gain == 0 and num_body_tracks > 0:
+        tuning_stage = "Screen Time" if include_screentime else "Track Fusion"
         tuning_suggestions.append((
-            "Screen Time",
-            "No duration gain from body tracking",
+            tuning_stage,
+            "No duration gain from fusion comparison",
             "Verify track fusion is working; check screentime_comparison.json for details"
         ))
 
@@ -4885,9 +5162,10 @@ def build_screentime_run_debug_pdf(
         ("body_tracking/body_tracks.jsonl", "body_tracking/body_tracks.jsonl"),
         ("body_tracking/track_fusion.json", "body_tracking/track_fusion.json"),
         ("body_tracking/screentime_comparison.json", "body_tracking/screentime_comparison.json"),
-        ("analytics/screentime.json", "analytics/screentime.json"),
         ("exports/export_index.json", "exports/export_index.json"),
     ]
+    if include_screentime:
+        provenance_targets.insert(-1, ("analytics/screentime.json", "analytics/screentime.json"))
     provenance_rows = [_wrap_row(["Artifact", "Scope", "Source", "Local mtime", "Hydrated mtime", "S3 key"], cell_style_small)]
     for label, rel_name in provenance_targets:
         local_path = run_root / rel_name
@@ -4918,6 +5196,26 @@ def build_screentime_run_debug_pdf(
     )
     story.append(provenance_table)
     story.append(Spacer(1, 8))
+    if not include_screentime:
+        out_of_scope_paths: list[tuple[str, Path]] = []
+        run_analytics_dir = run_root / "analytics"
+        for filename in ("screentime.json", "screentime.csv"):
+            candidate = run_analytics_dir / filename
+            if candidate.exists():
+                out_of_scope_paths.append((f"run analytics/{filename}", candidate))
+        data_root = Path(os.environ.get("SCREENALYTICS_DATA_ROOT", "data")).expanduser()
+        legacy_analytics_dir = data_root / "analytics" / ep_id
+        for filename in ("screentime.json", "screentime.csv"):
+            candidate = legacy_analytics_dir / filename
+            if candidate.exists():
+                out_of_scope_paths.append((f"legacy analytics/{filename}", candidate))
+        story.append(Paragraph("Out-of-scope artifacts present", subsection_style))
+        if out_of_scope_paths:
+            for label, path in out_of_scope_paths:
+                story.append(Paragraph(f"&bull; {label} ({path})", bullet_style))
+        else:
+            story.append(Paragraph("None detected.", note_style))
+        story.append(Spacer(1, 8))
     story.append(Paragraph("Legacy artifacts are listed in the section below as out-of-scope references.", note_style))
     story.append(Spacer(1, 8))
 
@@ -4938,7 +5236,7 @@ def build_screentime_run_debug_pdf(
         (*_artifact_row(body_detections_path, "body_tracking/body_detections.jsonl"), body_detect_count_display, "Body Detect", _bundle_status(body_detections_path, in_allowlist=True)),
         (*_artifact_row(body_tracks_path, "body_tracking/body_tracks.jsonl"), body_track_count_display, "Body Track", _bundle_status(body_tracks_path, in_allowlist=True)),
         (*_artifact_row(track_fusion_path, "body_tracking/track_fusion.json"), "-", "Track Fusion", _bundle_status(track_fusion_path, in_allowlist=True)),
-        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", "Screen Time", _bundle_status(screentime_comparison_path, in_allowlist=True)),
+        (*_artifact_row(screentime_comparison_path, "body_tracking/screentime_comparison.json"), "-", comparison_stage_label, _bundle_status(screentime_comparison_path, in_allowlist=True)),
     ]
     artifact_table = Table(artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
     artifact_table.setStyle(
@@ -4979,7 +5277,10 @@ def build_screentime_run_debug_pdf(
             (*_artifact_row(legacy_body_detections_path, "legacy/body_tracking/body_detections.jsonl"), legacy_body_detect_display, "Legacy Body Detect", _bundle_status(legacy_body_detections_path, in_allowlist=False)),
             (*_artifact_row(legacy_body_tracks_path, "legacy/body_tracking/body_tracks.jsonl"), legacy_body_track_display, "Legacy Body Track", _bundle_status(legacy_body_tracks_path, in_allowlist=False)),
             (*_artifact_row(legacy_track_fusion_path, "legacy/body_tracking/track_fusion.json"), "-", "Legacy Track Fusion", _bundle_status(legacy_track_fusion_path, in_allowlist=False)),
-            (*_artifact_row(legacy_screentime_comparison_path, "legacy/body_tracking/screentime_comparison.json"), "-", "Legacy Screen Time", _bundle_status(legacy_screentime_comparison_path, in_allowlist=False)),
+            (*_artifact_row(
+                legacy_screentime_comparison_path,
+                "legacy/body_tracking/screentime_comparison.json",
+            ), "-", f"Legacy {comparison_label}", _bundle_status(legacy_screentime_comparison_path, in_allowlist=False)),
         ]
         legacy_table = Table(legacy_artifact_data, colWidths=[2.5 * inch, 0.6 * inch, 0.6 * inch, 0.5 * inch, 0.9 * inch, 0.6 * inch])
         legacy_table.setStyle(
@@ -5201,6 +5502,7 @@ def build_and_upload_debug_pdf(
     *,
     ep_id: str,
     run_id: str,
+    include_screentime: bool = True,
     upload_to_s3: bool = True,
     fail_on_s3_error: bool = False,
     write_index: bool = True,
@@ -5210,6 +5512,7 @@ def build_and_upload_debug_pdf(
     Args:
         ep_id: Episode ID
         run_id: Run ID
+        include_screentime: Whether to include screentime sections in the report
         upload_to_s3: Whether to upload to S3 (if configured)
         fail_on_s3_error: If True, raise on S3 upload failure
         write_index: If True, write export_index.json marker file
@@ -5218,9 +5521,103 @@ def build_and_upload_debug_pdf(
         (pdf_bytes, download_filename, upload_result or None)
     """
     started_at = _now_iso()
+    heartbeat_interval = 5.0
+    last_tick = 0.0
+    frames_done_at: str | None = None
+    finalize_started_at: str | None = None
+    ended_at: str | None = None
+    total_steps = 1
+
+    def _emit_pdf_progress(
+        *,
+        done: int,
+        phase: str,
+        message: str,
+        force: bool = False,
+        mark_frames_done: bool = False,
+        mark_finalize_start: bool = False,
+        mark_end: bool = False,
+    ) -> None:
+        nonlocal last_tick, frames_done_at, finalize_started_at, ended_at
+        now = time.time()
+        if not force and (now - last_tick) < heartbeat_interval:
+            return
+        stamp = _now_iso()
+        if mark_frames_done and frames_done_at is None:
+            frames_done_at = stamp
+        if mark_finalize_start and finalize_started_at is None:
+            finalize_started_at = stamp
+        if mark_end:
+            ended_at = stamp
+        progress_payload = {
+            "done": max(int(done), 0),
+            "total": total_steps,
+            "pct": min(max(float(done) / max(total_steps, 1), 0.0), 1.0),
+            "phase": phase,
+            "message": message,
+            "last_update_at": stamp,
+        }
+        timestamps_payload = {
+            "started_at": started_at,
+            "frames_done_at": frames_done_at,
+            "finalize_started_at": finalize_started_at,
+            "ended_at": ended_at,
+        }
+        stage_update = {
+            "status": "running",
+            "progress": progress_payload,
+            "timestamps": timestamps_payload,
+        }
+        try:
+            update_episode_status(
+                ep_id,
+                run_id,
+                stage_key="pdf",
+                stage_update=stage_update,
+                git_info=collect_git_state(),
+            )
+        except Exception as exc:
+            LOGGER.warning("[export] Failed to update PDF heartbeat status: %s", exc)
+        last_tick = now
+
+    def _run_with_heartbeat(action, *, phase: str, message: str, done: int, mark_finalize: bool = False):
+        def _heartbeat():
+            _emit_pdf_progress(
+                done=done,
+                phase=phase,
+                message=message,
+                mark_frames_done=mark_finalize,
+                mark_finalize_start=mark_finalize,
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(action)
+            while True:
+                try:
+                    return future.result(timeout=heartbeat_interval)
+                except TimeoutError:
+                    _heartbeat()
+
+    _emit_pdf_progress(done=0, phase="running", message="Building debug PDF", force=True)
     try:
-        pdf_bytes, download_name = build_screentime_run_debug_pdf(ep_id=ep_id, run_id=run_id)
+        pdf_bytes, download_name = _run_with_heartbeat(
+            lambda: build_screentime_run_debug_pdf(
+                ep_id=ep_id,
+                run_id=run_id,
+                include_screentime=include_screentime,
+            ),
+            phase="running",
+            message="Building debug PDF",
+            done=0,
+        )
     except Exception as exc:
+        _emit_pdf_progress(
+            done=0,
+            phase="error",
+            message=f"PDF export failed: {exc}",
+            force=True,
+            mark_end=True,
+        )
         try:
             update_episode_status(
                 ep_id,
@@ -5242,14 +5639,28 @@ def build_and_upload_debug_pdf(
         raise
 
     upload_result = None
+    _emit_pdf_progress(
+        done=1,
+        phase="finalizing",
+        message="Uploading debug PDF",
+        force=True,
+        mark_frames_done=True,
+        mark_finalize_start=True,
+    )
     if upload_to_s3:
-        upload_result = upload_export_to_s3(
-            ep_id=ep_id,
-            run_id=run_id,
-            file_bytes=pdf_bytes,
-            filename="debug_report.pdf",
-            content_type="application/pdf",
-            fail_on_error=fail_on_s3_error,
+        upload_result = _run_with_heartbeat(
+            lambda: upload_export_to_s3(
+                ep_id=ep_id,
+                run_id=run_id,
+                file_bytes=pdf_bytes,
+                filename="debug_report.pdf",
+                content_type="application/pdf",
+                fail_on_error=fail_on_s3_error,
+            ),
+            phase="finalizing",
+            message="Uploading debug PDF",
+            done=1,
+            mark_finalize=True,
         )
 
     # Write export index marker for later lookup
@@ -5282,6 +5693,14 @@ def build_and_upload_debug_pdf(
             )
         except Exception as exc:
             LOGGER.warning("[export] Failed to write export index: %s", exc)
+
+    _emit_pdf_progress(
+        done=1,
+        phase="done",
+        message="PDF export complete",
+        force=True,
+        mark_end=True,
+    )
 
     try:
         update_episode_status(

@@ -17,7 +17,7 @@ import threading
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from datetime import datetime, timezone
@@ -2672,6 +2672,132 @@ def _paths_present(paths_expected: Any) -> tuple[bool, list[str]]:
     return len(missing) == 0, missing
 
 
+def _parse_plan_doc_checklist(doc_path: str) -> dict[str, Any]:
+    """Parse markdown checklist from plan doc.
+
+    Returns dict with:
+        complete: list of {"id": "A1", "text": "..."}
+        incomplete: list of {"id": "C1", "text": "..."}
+        total: int
+        done: int
+        error: str or None
+    """
+    import re
+
+    repo_root = _repo_root()
+    full_path = repo_root / doc_path
+
+    if not full_path.exists():
+        return {"complete": [], "incomplete": [], "total": 0, "done": 0, "error": f"File not found: {doc_path}"}
+
+    try:
+        content = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return {"complete": [], "incomplete": [], "total": 0, "done": 0, "error": str(e)}
+
+    complete: list[dict[str, str]] = []
+    incomplete: list[dict[str, str]] = []
+
+    # Match checklist items: - [x] **A1.** Description or - [ ] **A1.** Description
+    pattern = re.compile(
+        r"^-\s*\[([xX ])\]\s*\*{0,2}([A-Z]\d+\.?)\*{0,2}\s*(.+?)$",
+        re.MULTILINE
+    )
+
+    for match in pattern.finditer(content):
+        checked = match.group(1).lower() == "x"
+        task_id = match.group(2).rstrip(".")
+        text = match.group(3).strip()
+        text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
+        if len(text) > 80:
+            text = text[:77] + "..."
+
+        item = {"id": task_id, "text": text}
+        if checked:
+            complete.append(item)
+        else:
+            incomplete.append(item)
+
+    return {
+        "complete": complete,
+        "incomplete": incomplete,
+        "total": len(complete) + len(incomplete),
+        "done": len(complete),
+        "error": None,
+    }
+
+
+def _get_anthropic_client_for_ui():
+    """Get Anthropic client for UI analysis. Returns (client, error_msg)."""
+    import os
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY not set"
+
+    try:
+        import anthropic
+        # Create client - avoid any proxy/httpx issues by using default httpx client
+        client = anthropic.Anthropic(api_key=api_key)
+        return client, None
+    except ImportError:
+        return None, "anthropic package not installed (pip install anthropic>=0.39.0)"
+    except TypeError as e:
+        return None, f"TypeError initializing client: {e}"
+    except Exception as e:
+        return None, f"Failed to initialize client: {e}"
+
+
+def _analyze_feature_with_claude(doc_path: str, feature_title: str) -> str:
+    """Use Anthropic API to analyze plan doc and generate checklist summary."""
+    import os
+
+    repo_root = _repo_root()
+    full_path = repo_root / doc_path
+
+    if not full_path.exists():
+        return f"Error: Plan doc not found at {doc_path}"
+
+    try:
+        content = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    client, error = _get_anthropic_client_for_ui()
+    if error:
+        return f"API Error: {error}"
+
+    # Use ANTHROPIC_MODEL env var, fallback to claude-sonnet-4
+    model = os.environ.get("ANTHROPIC_MODEL", os.environ.get("ANTHROPIC_DIAGNOSTIC_MODEL", "claude-sonnet-4-20250514"))
+
+    prompt = f"""Analyze this feature plan document and provide a concise checklist summary.
+
+## Feature: {feature_title}
+
+## Plan Document:
+{content}
+
+---
+
+Provide a brief analysis with:
+1. **Completed Tasks**: List the key tasks that are done (marked [x])
+2. **Remaining Tasks**: List the key tasks still pending (marked [ ])
+3. **Blocking Issues**: What's the most critical next step?
+4. **Estimated Completion**: Rough assessment of % complete
+
+Keep your response concise (under 300 words). Use bullet points."""
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"API Error: {e}"
+
+
 def _feature_present_in_ui(feature_id: str, catalog: dict[str, Any]) -> bool:
     docs = catalog.get("docs") or []
     if not isinstance(docs, list):
@@ -2976,14 +3102,23 @@ def render_page_header(page_id: str, page_title: str) -> None:
                 current_phase = first_incomplete_phase or "all complete"
                 progress = f"{complete_count}/{total_phases}" if total_phases > 0 else "—"
 
+                # Get plan doc paths for this feature
+                feature_docs = fmeta.get("docs") or []
+                if not isinstance(feature_docs, list):
+                    feature_docs = []
+                plan_docs = [d for d in feature_docs if "in_progress" in d]
+
                 # Add feature-level row to TODO table
                 feature_todo_rows.append({
+                    "fid": fid,
                     "feature": feature_title,
                     "current_phase": current_phase,
                     "progress": progress,
                     "jobs": _format_jobs(feature_jobs) if feature_jobs else "—",
                     "created": feature_created,
                     "updated": feature_updated,
+                    "plan_docs": plan_docs,
+                    "pending": fmeta.get("pending") or [],
                 })
 
             st.markdown("### Feature Status (Registry)")
@@ -2992,7 +3127,67 @@ def render_page_header(page_id: str, page_title: str) -> None:
 
             if feature_todo_rows:
                 st.markdown("**TODO** (Features)")
-                st.dataframe(feature_todo_rows, use_container_width=True, hide_index=True)
+                for row in feature_todo_rows:
+                    fid = row.get("fid", "unknown")
+                    feature_title = row.get("feature", fid)
+                    progress = row.get("progress", "—")
+                    plan_docs = row.get("plan_docs", [])
+                    pending_items = row.get("pending", [])
+
+                    # Keep expander open if there's a cached analysis
+                    analysis_key = f"feature_analysis_{fid}"
+                    has_analysis = analysis_key in st.session_state
+
+                    with st.expander(f"{feature_title} ({progress})", expanded=has_analysis):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.caption(f"Current phase: {row.get('current_phase', '—')}")
+                        with col2:
+                            st.caption(f"Jobs: {row.get('jobs', '—')}")
+
+                        if plan_docs:
+                            doc_path = plan_docs[0]
+                            checklist = _parse_plan_doc_checklist(doc_path)
+
+                            if checklist.get("error"):
+                                st.warning(checklist["error"])
+                            else:
+                                done = checklist.get("done", 0)
+                                total = checklist.get("total", 0)
+                                st.markdown(f"**Checklist Progress**: {done}/{total} tasks complete")
+
+                                complete_items = checklist.get("complete", [])
+                                if complete_items:
+                                    st.markdown("**Completed:**")
+                                    for item in complete_items[:5]:
+                                        st.markdown(f"- :white_check_mark: **{item['id']}**: {item['text']}")
+                                    if len(complete_items) > 5:
+                                        st.caption(f"...and {len(complete_items) - 5} more")
+
+                                incomplete_items = checklist.get("incomplete", [])
+                                if incomplete_items:
+                                    st.markdown("**Remaining:**")
+                                    for item in incomplete_items[:5]:
+                                        st.markdown(f"- :white_large_square: **{item['id']}**: {item['text']}")
+                                    if len(incomplete_items) > 5:
+                                        st.caption(f"...and {len(incomplete_items) - 5} more")
+
+                            if st.button("Analyze with AI", key=f"analyze_{fid}"):
+                                with st.spinner("Analyzing with Claude..."):
+                                    analysis = _analyze_feature_with_claude(doc_path, feature_title)
+                                    st.session_state[analysis_key] = analysis
+                                    st.rerun()  # Rerun to show analysis with expander open
+
+                            if analysis_key in st.session_state:
+                                st.markdown("---")
+                                st.markdown("**AI Analysis:**")
+                                st.markdown(st.session_state[analysis_key])
+                        else:
+                            st.info("No plan doc linked for this feature.")
+                            if pending_items:
+                                st.markdown("**Pending (from registry):**")
+                                for item in pending_items:
+                                    st.markdown(f"- {item}")
 
             if phase_in_progress_rows:
                 st.markdown("**IN PROGRESS** (Remaining Phases)")
@@ -3131,6 +3326,71 @@ def progress_ratio(progress: Dict[str, Any]) -> float:
     if frames_total and frames_total > 0:
         return max(min(frames_done / frames_total, 1.0), 0.0)
     return 0.0
+
+
+STAGE_PROGRESS_STALL_SECONDS = int(os.environ.get("SCREENALYTICS_STAGE_STALL_SECONDS", "30"))
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+
+
+def stage_progress_line(progress: Dict[str, Any]) -> str | None:
+    if not isinstance(progress, dict):
+        return None
+    done_val = coerce_int(progress.get("done"))
+    total_val = coerce_int(progress.get("total"))
+    pct_val = progress.get("pct")
+    if isinstance(pct_val, (int, float)):
+        pct = float(pct_val)
+        if pct > 1.0:
+            pct = pct / 100.0
+    elif done_val is not None and total_val:
+        pct = done_val / max(total_val, 1)
+    else:
+        pct = None
+
+    frames_line = None
+    if done_val is not None and total_val:
+        pct_label = f"{(pct or 0.0) * 100:.0f}%"
+        frames_line = f"Frames: {done_val:,} / {total_val:,} ({pct_label})"
+
+    message = progress.get("message")
+    phase = progress.get("phase")
+    phase_label = None
+    if isinstance(message, str) and message.strip():
+        phase_label = message.strip()
+    elif isinstance(phase, str) and phase.strip():
+        phase_label = phase.replace("_", " ").strip().capitalize()
+
+    if frames_line and phase_label:
+        return f"{frames_line} — {phase_label}"
+    return frames_line or phase_label
+
+
+def stage_progress_stall_message(
+    progress: Dict[str, Any],
+    *,
+    now: datetime | None = None,
+    threshold_seconds: int = STAGE_PROGRESS_STALL_SECONDS,
+) -> str | None:
+    if not isinstance(progress, dict):
+        return None
+    last_update = progress.get("last_update_at")
+    last_dt = _parse_iso_timestamp(last_update) if isinstance(last_update, str) else None
+    if last_dt is None:
+        return None
+    now_dt = now or datetime.now(timezone.utc)
+    age = (now_dt - last_dt).total_seconds()
+    if age < 0 or age <= threshold_seconds:
+        return None
+    return f"Stalled (no updates for {int(age)}s)"
 
 
 def eta_seconds(progress: Dict[str, Any]) -> float | None:
@@ -3668,6 +3928,31 @@ def s3_uri(prefix: str | None, bucket: str | None = None) -> str:
     return f"s3://{bucket_name}/{cleaned}"
 
 
+def run_artifact_s3_keys(ep_id: str, run_id: str, rel_path: str) -> tuple[str, str | None]:
+    """Return (canonical, legacy) S3 keys for a run-scoped artifact."""
+    from py_screenalytics import run_layout
+
+    keys = run_layout.run_artifact_s3_keys_for_read(ep_id, run_id, rel_path)
+    canonical = keys[0] if keys else ""
+    legacy = keys[1] if len(keys) > 1 and keys[1] != canonical else None
+    return canonical, legacy
+
+
+def describe_prereq_state(
+    missing: Sequence[str],
+    *,
+    upstream_complete: bool,
+) -> tuple[str, str]:
+    """Return (state, message) for prerequisite checks."""
+    missing_list = [item for item in missing if item]
+    if not missing_list:
+        return "ready", "Prerequisites satisfied."
+    pretty = " + ".join(missing_list)
+    if not upstream_complete:
+        return "waiting", f"Waiting for {pretty}."
+    return "error", f"Missing prerequisites: {pretty}."
+
+
 def run_job_with_progress(
     ep_id: str,
     endpoint_path: str,
@@ -4196,7 +4481,11 @@ def get_all_running_jobs_for_episode(ep_id: str) -> Dict[str, Dict[str, Any] | N
                     frames_total = progress_data.get("frames_total", 1)
                     if frames_total > 0:
                         result["progress_pct"] = (frames_done / frames_total) * 100
-                    result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
+                    message = progress_data.get("message")
+                    if message:
+                        result["message"] = str(message)
+                    else:
+                        result["message"] = f"Phase: {progress_data.get('phase', 'unknown')}"
                     result["frames_done"] = frames_done
                     result["frames_total"] = frames_total
                 results[op] = result
