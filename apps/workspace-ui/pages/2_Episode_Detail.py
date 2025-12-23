@@ -2471,6 +2471,22 @@ _scoped_manifests_dir = (
 _scoped_markers_dir = _scoped_manifests_dir if selected_attempt_run_id else _runs_root
 _track_metrics_path = _scoped_manifests_dir / "track_metrics.json"
 
+detect_marker_payload, _, _ = _load_marker_payload_with_fallback(
+    _scoped_markers_dir / "detect_track.json",
+    (_runs_root / "detect_track.json") if selected_attempt_run_id else None,
+    run_id=selected_attempt_run_id,
+)
+faces_marker_payload, _, _ = _load_marker_payload_with_fallback(
+    _scoped_markers_dir / "faces_embed.json",
+    (_runs_root / "faces_embed.json") if selected_attempt_run_id else None,
+    run_id=selected_attempt_run_id,
+)
+cluster_marker_payload, _, _ = _load_marker_payload_with_fallback(
+    _scoped_markers_dir / "cluster.json",
+    (_runs_root / "cluster.json") if selected_attempt_run_id else None,
+    run_id=selected_attempt_run_id,
+)
+
 
 # Batch file stat operations for efficiency - use try/except to avoid separate exists() calls
 def _safe_mtime(path: Path) -> float:
@@ -2676,393 +2692,6 @@ def _render_system_status():
 
 # Show system status warnings at top of page
 _render_system_status()
-
-with st.expander("🗄️ DB Health", expanded=False):
-    db_health = _cached_db_health()
-    if not isinstance(db_health, dict):
-        st.caption("DB health unavailable.")
-    else:
-        configured = bool(db_health.get("configured"))
-        ok = db_health.get("ok")
-        fake_db = bool(db_health.get("fake_db"))
-        psycopg2_available = db_health.get("psycopg2_available")
-        latency_ms = db_health.get("latency_ms")
-        migrations_ok = db_health.get("migrations_ok")
-        err = db_health.get("error")
-
-        st.caption(f"configured={configured} fake_db={fake_db} psycopg2={psycopg2_available}")
-        if isinstance(latency_ms, (int, float)):
-            st.caption(f"latency_ms={latency_ms}")
-        if err:
-            st.caption(f"error={err}")
-        if migrations_ok is not None:
-            st.caption(f"migrations_ok={migrations_ok}")
-        tables = db_health.get("tables")
-        if isinstance(tables, dict) and tables and not fake_db:
-            missing = [name for name, present in tables.items() if present is False]
-            if missing:
-                st.warning(f"Missing tables: {', '.join(missing)}")
-            else:
-                st.success("All required tables present.")
-
-
-# =============================================================================
-# Run Performance / Quality (UI-only diagnostics)
-# =============================================================================
-with st.expander("⚡ Performance & Quality", expanded=False):
-    if not selected_attempt_run_id:
-        st.caption("Select a run-scoped attempt (run_id) to view run-specific performance + quality diagnostics.")
-    else:
-        _run_perf_prefix = f"{ep_id}::{selected_attempt_run_id}"
-
-        def _read_json_best_effort(path: Path) -> dict[str, Any] | None:
-            path = Path(path)
-            if not path.exists():
-                return None
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return None
-            return payload if isinstance(payload, dict) else None
-
-        def _iter_jsonl_best_effort(path: Path):
-            path = Path(path)
-            if not path.exists():
-                return
-            try:
-                with path.open("r", encoding="utf-8") as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        try:
-                            row = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(row, dict):
-                            yield row
-            except OSError:
-                return
-
-        detect_marker = _read_json_best_effort(_scoped_markers_dir / "detect_track.json") or {}
-        faces_marker = _read_json_best_effort(_scoped_markers_dir / "faces_embed.json") or {}
-        cluster_marker = _read_json_best_effort(_scoped_markers_dir / "cluster.json") or {}
-        body_marker = _read_json_best_effort(_scoped_markers_dir / "body_tracking.json") or {}
-        fusion_marker = _read_json_best_effort(_scoped_markers_dir / "body_tracking_fusion.json") or {}
-
-        detect_rtf = helpers.coerce_float(detect_marker.get("rtf"))
-        detect_eff_fps = helpers.coerce_float(detect_marker.get("effective_fps_processing"))
-        detect_frames_processed = helpers.coerce_int(detect_marker.get("face_detect_frames_processed"))
-        detect_frames_total = helpers.coerce_int(detect_marker.get("frames_total"))
-        detect_stride_eff = helpers.coerce_int(detect_marker.get("stride_effective")) or helpers.coerce_int(detect_marker.get("stride"))
-        detect_onnx_provider = detect_marker.get("onnx_provider_resolved") or detect_marker.get("resolved_device")
-        forced_scene_warmup_ratio = helpers.coerce_float(detect_marker.get("forced_scene_warmup_ratio"))
-        scene_cuts_total = (
-            helpers.coerce_int(detect_marker.get("scene_cut_count"))
-            or helpers.coerce_int(detect_marker.get("scene_cuts_total"))
-            or helpers.coerce_int(detect_marker.get("scene_cuts"))
-        )
-
-        baseline_rtf = helpers.coerce_float(st.session_state.get(f"{_run_perf_prefix}::baseline_detect_rtf"))
-        baseline_eff_fps = helpers.coerce_float(st.session_state.get(f"{_run_perf_prefix}::baseline_detect_eff_fps"))
-        delta_rtf = None
-        delta_eff_fps = None
-        if detect_rtf is not None and baseline_rtf is not None:
-            delta_rtf = f"{(detect_rtf - baseline_rtf):+.2f}x"
-        if detect_eff_fps is not None and baseline_eff_fps is not None:
-            delta_eff_fps = f"{(detect_eff_fps - baseline_eff_fps):+.2f} fps"
-
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        with metric_col1:
-            st.metric("Detect RTF", f"{detect_rtf:.2f}x" if detect_rtf is not None else "n/a", delta=delta_rtf)
-        with metric_col2:
-            st.metric(
-                "Detect Effective FPS",
-                f"{detect_eff_fps:.2f} fps" if detect_eff_fps is not None else "n/a",
-                delta=delta_eff_fps,
-            )
-        with metric_col3:
-            if detect_frames_processed is not None:
-                note = f"/ {detect_frames_total:,}" if isinstance(detect_frames_total, int) and detect_frames_total > 0 else ""
-                st.metric("Frames Processed", f"{detect_frames_processed:,}{note}")
-            else:
-                st.metric("Frames Processed", "n/a")
-
-        perf_lines: list[str] = []
-        if detect_stride_eff is not None:
-            perf_lines.append(f"stride_effective={detect_stride_eff}")
-        if detect_onnx_provider:
-            perf_lines.append(f"onnx_provider={detect_onnx_provider}")
-        if forced_scene_warmup_ratio is not None:
-            perf_lines.append(f"forced_scene_warmup_ratio={forced_scene_warmup_ratio:.3f}")
-        if scene_cuts_total is not None:
-            perf_lines.append(f"scene_cuts={scene_cuts_total}")
-        if perf_lines:
-            st.caption("Detect/Track: " + " · ".join(perf_lines))
-
-        # Tracking fragmentation stats from run-scoped track_metrics.json (if present).
-        forced_splits = None
-        id_switches = None
-        track_metrics_payload: dict[str, Any] | None = None
-        cluster_metrics_block: dict[str, Any] | None = None
-        try:
-            if _track_metrics_path.exists():
-                _tm = json.loads(_track_metrics_path.read_text(encoding="utf-8"))
-                if isinstance(_tm, dict):
-                    track_metrics_payload = _tm
-                    cluster_metrics_block = _tm.get("cluster_metrics") if isinstance(_tm.get("cluster_metrics"), dict) else None
-                metrics_block = _tm.get("metrics") if isinstance(_tm, dict) else None
-                if isinstance(metrics_block, dict):
-                    forced_splits = helpers.coerce_int(metrics_block.get("forced_splits"))
-                    id_switches = helpers.coerce_int(metrics_block.get("id_switches"))
-        except (OSError, json.JSONDecodeError):
-            pass
-        frag_bits: list[str] = []
-        if forced_splits is not None:
-            frag_bits.append(f"forced_splits={forced_splits:,}")
-        if id_switches is not None:
-            frag_bits.append(f"id_switches={id_switches:,}")
-        if frag_bits:
-            st.caption("Tracking: " + " · ".join(frag_bits))
-
-        # Track embedding coherence (spread) - computed from tracks.jsonl (best effort).
-        coherence_threshold = 0.30
-        try:
-            coherence_threshold = float(os.environ.get("TRACK_COHERENCE_WARN", "0.30"))
-        except (TypeError, ValueError):
-            coherence_threshold = 0.30
-        spreads: list[float] = []
-        flagged = 0
-        try:
-            if tracks_path.exists():
-                for row in _iter_jsonl_best_effort(tracks_path):
-                    spread = helpers.coerce_float(row.get("face_embedding_spread"))
-                    if spread is None:
-                        continue
-                    spreads.append(float(spread))
-                    if spread >= coherence_threshold:
-                        flagged += 1
-        except Exception:
-            spreads = []
-            flagged = 0
-        if spreads:
-            avg_spread = sum(spreads) / max(len(spreads), 1)
-            st.caption(
-                f"Track coherence: tracks_with_spread={len(spreads):,} · mixed_tracks={flagged:,} "
-                f"(spread≥{coherence_threshold:.2f}) · avg_spread={avg_spread:.3f} · max_spread={max(spreads):.3f}"
-            )
-
-        # Embedding backend (faces) and fusion mode (body/fusion).
-        embed_backend_actual = faces_marker.get("embedding_backend_actual") or faces_phase_status.get("embedding_backend_actual")
-        embed_fallback = faces_marker.get("embedding_backend_fallback_reason") or faces_phase_status.get(
-            "embedding_backend_fallback_reason"
-        )
-        if embed_backend_actual:
-            msg = f"Faces embed backend: {embed_backend_actual}"
-            if isinstance(embed_fallback, str) and embed_fallback.strip():
-                msg = msg + f" (fallback_reason={embed_fallback.strip()})"
-            st.caption(msg)
-
-        body_reid = body_marker.get("body_reid")
-        if isinstance(body_reid, dict):
-            cfg_enabled = body_reid.get("enabled_config")
-            effective = body_reid.get("enabled_effective")
-            skip_reason = body_reid.get("reid_skip_reason")
-            st.caption(
-                "Body Re-ID: "
-                + " · ".join(
-                    [
-                        f"enabled_config={cfg_enabled}",
-                        f"enabled_effective={effective}",
-                        f"skip_reason={skip_reason}" if skip_reason else "skip_reason=None",
-                    ]
-                )
-            )
-
-        if fusion_marker:
-            fusion_status = fusion_marker.get("status")
-            if fusion_status:
-                st.caption(f"Track fusion marker: status={fusion_status}")
-
-        st.divider()
-        st.markdown("#### Regression Flags")
-
-        def _safe_ratio(numer: int | None, denom: int | None) -> float | None:
-            if numer is None or denom is None or denom <= 0:
-                return None
-            return float(numer) / float(denom)
-
-        def _singleton_rate_from_metrics(metrics_payload: dict[str, Any] | None) -> float | None:
-            if not isinstance(metrics_payload, dict):
-                return None
-            block = metrics_payload.get("cluster_metrics")
-            if not isinstance(block, dict):
-                return None
-            rate = helpers.coerce_float(block.get("singleton_fraction_after") or block.get("singleton_fraction"))
-            if rate is not None:
-                return rate
-            singles = helpers.coerce_int(block.get("singleton_count"))
-            total = helpers.coerce_int(block.get("total_clusters"))
-            return _safe_ratio(singles, total)
-
-        def _detect_rtf_for_run(run_root: Path) -> float | None:
-            status_payload = _read_json_best_effort(run_root / "episode_status.json")
-            if isinstance(status_payload, dict):
-                detect_block = status_payload.get("stages", {}).get("detect")
-                if isinstance(detect_block, dict):
-                    metrics = detect_block.get("metrics")
-                    if isinstance(metrics, dict):
-                        rtf_val = helpers.coerce_float(metrics.get("rtf"))
-                        if rtf_val is not None:
-                            return rtf_val
-            marker = _read_json_best_effort(run_root / "detect_track.json") or {}
-            return helpers.coerce_float(marker.get("rtf"))
-
-        def _track_count_for_run(run_root: Path) -> int | None:
-            status_payload = _read_json_best_effort(run_root / "episode_status.json")
-            if isinstance(status_payload, dict):
-                detect_block = status_payload.get("stages", {}).get("detect")
-                if isinstance(detect_block, dict):
-                    metrics = detect_block.get("metrics")
-                    if isinstance(metrics, dict):
-                        count = helpers.coerce_int(metrics.get("tracks"))
-                        if count is not None:
-                            return count
-            marker = _read_json_best_effort(run_root / "detect_track.json") or {}
-            return helpers.coerce_int(marker.get("tracks"))
-
-        def _forced_splits_share_for_run(run_root: Path) -> float | None:
-            metrics_payload = _read_json_best_effort(run_root / "track_metrics.json") or {}
-            metrics_block = metrics_payload.get("metrics") if isinstance(metrics_payload, dict) else None
-            forced = helpers.coerce_int(metrics_block.get("forced_splits") if isinstance(metrics_block, dict) else None)
-            tracks_total = helpers.coerce_int(metrics_block.get("tracks_born") if isinstance(metrics_block, dict) else None)
-            if tracks_total is None:
-                tracks_total = _track_count_for_run(run_root)
-            return _safe_ratio(forced, tracks_total)
-
-        def _fused_pairs_for_run(run_root: Path) -> tuple[int | None, int | None, dict[str, Any] | None]:
-            payload = _read_json_best_effort(run_root / "body_tracking" / "track_fusion.json") or {}
-            if not isinstance(payload, dict):
-                return None, None, None
-            diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
-            pairs = helpers.coerce_int(diagnostics.get("final_pairs"))
-            if pairs is None:
-                pairs = helpers.coerce_int(payload.get("num_fused_identities"))
-            comparisons = helpers.coerce_int(diagnostics.get("reid_comparisons"))
-            return pairs, comparisons, payload
-
-        def _prev_successful_run_id() -> str | None:
-            if not selected_attempt_run_id:
-                return None
-            candidates: list[tuple[float, str]] = []
-            for run_id in run_layout.list_run_ids(ep_id):
-                if run_id == selected_attempt_run_id:
-                    continue
-                try:
-                    mtime = run_layout.run_root(ep_id, run_id).stat().st_mtime
-                except (OSError, ValueError):
-                    mtime = 0.0
-                candidates.append((mtime, run_id))
-            for _, run_id in sorted(candidates, reverse=True):
-                run_root = run_layout.run_root(ep_id, run_id)
-                status_payload = _read_json_best_effort(run_root / "episode_status.json")
-                if isinstance(status_payload, dict):
-                    detect_block = status_payload.get("stages", {}).get("detect")
-                    if isinstance(detect_block, dict) and detect_block.get("status") == "success":
-                        return run_id
-                marker = _read_json_best_effort(run_root / "detect_track.json")
-                if isinstance(marker, dict) and str(marker.get("status") or "").lower() == "success":
-                    return run_id
-            return None
-
-        baseline_run_id = _prev_successful_run_id()
-        baseline_root = run_layout.run_root(ep_id, baseline_run_id) if baseline_run_id else None
-
-        current_tracks = helpers.coerce_int(detect_marker.get("tracks")) if isinstance(detect_marker, dict) else None
-        current_forced_share = _safe_ratio(forced_splits, current_tracks)
-        current_singleton_rate = _singleton_rate_from_metrics(track_metrics_payload)
-        current_fused_pairs, current_reid_comparisons, _ = _fused_pairs_for_run(_scoped_manifests_dir)
-
-        baseline_rtf = _detect_rtf_for_run(baseline_root) if baseline_root else None
-        baseline_forced_share = _forced_splits_share_for_run(baseline_root) if baseline_root else None
-        baseline_singleton_rate = _singleton_rate_from_metrics(
-            _read_json_best_effort(baseline_root / "track_metrics.json") if baseline_root else None
-        )
-        baseline_fused_pairs = _fused_pairs_for_run(baseline_root)[0] if baseline_root else None
-
-        warn_msgs: list[str] = []
-        fail_msgs: list[str] = []
-
-        if detect_rtf is not None:
-            warn_thresh = max((baseline_rtf or 0) * 1.3, 2.5)
-            fail_thresh = max((baseline_rtf or 0) * 2.0, 4.0)
-            if detect_rtf > fail_thresh:
-                fail_msgs.append(f"Detect RTF {detect_rtf:.2f}x > {fail_thresh:.2f}x (quality gate fail)")
-            elif detect_rtf > warn_thresh:
-                warn_msgs.append(f"Detect RTF {detect_rtf:.2f}x > {warn_thresh:.2f}x")
-
-        if current_forced_share is not None:
-            if baseline_forced_share is None:
-                warn_limit = 0.85
-                fail_limit = 0.95
-            else:
-                warn_limit = baseline_forced_share + 0.05
-                fail_limit = baseline_forced_share + 0.10
-            if current_forced_share > fail_limit:
-                fail_msgs.append(
-                    f"Forced splits share {current_forced_share:.2%} > {fail_limit:.2%} (quality gate fail)"
-                )
-            elif current_forced_share > warn_limit:
-                warn_msgs.append(f"Forced splits share {current_forced_share:.2%} > {warn_limit:.2%}")
-
-        if current_singleton_rate is not None:
-            warn_limit = (baseline_singleton_rate + 0.05) if baseline_singleton_rate is not None else 0.65
-            fail_limit = 0.75
-            if current_singleton_rate > fail_limit:
-                fail_msgs.append(
-                    f"Singleton rate {current_singleton_rate:.2%} > {fail_limit:.2%} (quality gate fail)"
-                )
-            elif current_singleton_rate > warn_limit:
-                warn_msgs.append(f"Singleton rate {current_singleton_rate:.2%} > {warn_limit:.2%}")
-
-        if current_fused_pairs is not None:
-            if baseline_fused_pairs is None:
-                warn_limit = 10
-                fail_limit = 0
-            else:
-                warn_limit = int(baseline_fused_pairs * 0.8)
-                fail_limit = int(baseline_fused_pairs * 0.5)
-            if current_fused_pairs == 0 or (baseline_fused_pairs is not None and current_fused_pairs < fail_limit):
-                fail_msgs.append(
-                    f"Fused pairs {current_fused_pairs} below baseline ({baseline_fused_pairs}) (quality gate fail)"
-                )
-            elif baseline_fused_pairs is None and current_fused_pairs < warn_limit:
-                warn_msgs.append(f"Fused pairs {current_fused_pairs} < {warn_limit}")
-            elif baseline_fused_pairs is not None and current_fused_pairs < warn_limit:
-                warn_msgs.append(f"Fused pairs {current_fused_pairs} < {warn_limit}")
-
-        reid_enabled = _track_fusion_reid_enabled_config()
-        if reid_enabled and (current_reid_comparisons is not None and current_reid_comparisons == 0):
-            reid_skip_reason = None
-            body_reid = body_marker.get("body_reid") if isinstance(body_marker, dict) else None
-            if isinstance(body_reid, dict):
-                reid_skip_reason = body_reid.get("reid_skip_reason")
-            warn_msgs.append(
-                "Re-ID handoff enabled but 0 comparisons performed"
-                + (f" (skip_reason={reid_skip_reason})" if reid_skip_reason else "")
-                + ". Verify torchreid install or disable reid_handoff."
-            )
-
-        if baseline_run_id:
-            st.caption(f"Baseline run_id: `{baseline_run_id}`")
-        else:
-            st.caption("Baseline run_id: none (using absolute thresholds)")
-
-        for msg in fail_msgs:
-            st.error(f"🚨 {msg}")
-        for msg in warn_msgs:
-            st.warning(f"⚠️ {msg}")
-        if not fail_msgs and not warn_msgs:
-            st.success("No regression flags triggered.")
 
 # =============================================================================
 # Execution Mode Selector
@@ -3678,6 +3307,12 @@ track_fusion_status_progress = (
     track_fusion_phase_status.get("progress") if isinstance(track_fusion_phase_status, dict) else None
 )
 pdf_status_progress = pdf_phase_status.get("progress") if isinstance(pdf_phase_status, dict) else None
+detect_progress_payload = detect_phase_status.get("progress") if isinstance(detect_phase_status, dict) else None
+faces_progress_payload = faces_phase_status.get("progress") if isinstance(faces_phase_status, dict) else None
+cluster_progress_payload = cluster_phase_status.get("progress") if isinstance(cluster_phase_status, dict) else None
+body_tracking_progress_display = body_tracking_status_progress or body_tracking_progress_payload
+track_fusion_progress_display = track_fusion_status_progress or track_fusion_progress_payload
+pdf_progress_display = pdf_status_progress
 
 status_running = (
     detect_status_value == "running"
@@ -4515,7 +4150,6 @@ row2_col1, row2_col2, row2_col3 = st.columns(3)
 
 with row2_col1:
     st.markdown('<a name="body-tracking-card"></a>', unsafe_allow_html=True)
-    body_tracking_progress_display = body_tracking_status_progress or body_tracking_progress_payload
     if not selected_attempt_run_id:
         st.info("⏳ **Body Tracking**: Select a run_id")
         st.caption("Select a run-scoped attempt (run_id) to enable body tracking.")
@@ -4592,33 +4226,8 @@ with row2_col1:
         if body_tracking_manifest_fallback
         else None,
     )
-    body_tracking_artifacts = [
-        ("body_tracking/body_detections.jsonl", body_detections_path, "run"),
-        ("body_tracking/body_tracks.jsonl", body_tracks_path, "run"),
-    ]
-    show_legacy_body_tracking = body_tracking_legacy_available and not stage_layout.artifact_available(
-        body_tracks_presence
-    )
-    if show_legacy_body_tracking:
-        body_tracking_artifacts.extend(
-            [
-                ("legacy/body_tracking/body_detections.jsonl", legacy_body_detections_path, "legacy"),
-                ("legacy/body_tracking/body_tracks.jsonl", legacy_body_tracks_path, "legacy"),
-            ]
-        )
-    body_tracking_hint = (
-        "⚠️ Legacy artifacts detected; run-scoped artifacts are missing for this attempt."
-        if show_legacy_body_tracking
-        else None
-    )
-    _render_stage_artifacts_expander(
-        "Body Tracking",
-        body_tracking_artifacts,
-        hint=body_tracking_hint,
-    )
 
 with row2_col2:
-    track_fusion_progress_display = track_fusion_status_progress or track_fusion_progress_payload
     if not selected_attempt_run_id:
         st.info("⏳ **Track Fusion**: Select a run_id")
         st.caption("Select a run-scoped attempt (run_id) to enable track fusion.")
@@ -4737,30 +4346,8 @@ with row2_col2:
         if body_fusion_manifest_fallback
         else None,
     )
-    track_fusion_artifacts = [
-        ("body_tracking/track_fusion.json", track_fusion_path, "run"),
-        ("body_tracking/screentime_comparison.json", screentime_comparison_path, "run"),
-    ]
-    show_legacy_track_fusion = body_fusion_legacy_available and not stage_layout.artifact_available(
-        track_fusion_presence
-    )
-    if show_legacy_track_fusion:
-        track_fusion_artifacts.append(
-            ("legacy/body_tracking/track_fusion.json", legacy_track_fusion_path, "legacy")
-        )
-    track_fusion_hint = (
-        "⚠️ Legacy artifacts detected; run-scoped artifacts are missing for this attempt."
-        if show_legacy_track_fusion
-        else None
-    )
-    _render_stage_artifacts_expander(
-        "Track Fusion",
-        track_fusion_artifacts,
-        hint=track_fusion_hint,
-    )
 
 with row2_col3:
-    pdf_progress_display = pdf_status_progress
     if not selected_attempt_run_id:
         st.info("⏳ **PDF Export**: Select a run_id")
         st.caption("Select a run-scoped attempt (run_id) to export a debug report.")
@@ -4830,10 +4417,6 @@ with row2_col3:
         marker_payload=export_index if isinstance(export_index, dict) else None,
         progress_payload=pdf_progress_display,
     )
-    pdf_artifacts = [
-        ("exports/export_index.json", _scoped_manifests_dir / "exports" / "export_index.json", "run"),
-    ]
-    _render_stage_artifacts_expander("PDF Export", pdf_artifacts)
 
 detector_override = st.session_state.pop("episode_detail_detector_override", None)
 tracker_override = st.session_state.pop("episode_detail_tracker_override", None)
@@ -5173,12 +4756,12 @@ with st.container():
             elif current_phase_key == "cluster" and _running_jobs.get("cluster"):
                 current_phase_pct = _running_jobs["cluster"].get("progress_pct", 0) / 100
             elif current_phase_key == "body_tracking":
-                pct = _progress_pct_from_payload(body_tracking_status_progress or body_tracking_progress_payload)
+                pct = _progress_pct_from_payload(body_tracking_progress_display)
                 if pct is None and _running_body_tracking_job:
                     pct = 0.05
                 current_phase_pct = pct or 0.0
             elif current_phase_key == "track_fusion":
-                pct = _progress_pct_from_payload(track_fusion_status_progress or track_fusion_progress_payload)
+                pct = _progress_pct_from_payload(track_fusion_progress_display)
                 if pct is None and _running_body_fusion_job:
                     pct = 0.05
                 current_phase_pct = pct or 0.0
@@ -6421,6 +6004,11 @@ with col_detect:
                 st.session_state[_autorun_key] = False
                 st.session_state[_autorun_phase_key] = None
     st.caption("Mirrors required video artifacts automatically before detect/track starts.")
+    _render_downstream_log_expander(
+        "Detect/Track",
+        marker_payload=detect_marker_payload,
+        progress_payload=detect_progress_payload,
+    )
 
 
 
@@ -6912,6 +6500,12 @@ with col_faces:
                 st.session_state["episode_detail_flash"] = flash_msg
                 # Note: status refresh and auto-run progression are now set BEFORE this block
                 st.rerun()
+
+    _render_downstream_log_expander(
+        "Faces Harvest",
+        marker_payload=faces_marker_payload,
+        progress_payload=faces_progress_payload,
+    )
 
 
 
@@ -7534,6 +7128,240 @@ with col_cluster:
                     st.toast("✅ Cluster complete (Auto-Run). Continuing setup stages…")
                 st.rerun()
 
+    _render_downstream_log_expander(
+        "Cluster",
+        marker_payload=cluster_marker_payload,
+        progress_payload=cluster_progress_payload,
+    )
+
+row3_col1, row3_col2, row3_col3 = st.columns(3)
+
+with row3_col1:
+    st.markdown("### Body Tracking")
+    st.caption(_format_phase_status("Body Tracking", body_tracking_phase_status, "body_tracks"))
+    if not selected_attempt_run_id:
+        st.info("⏳ **Body Tracking**: Select a run_id")
+        st.caption("Select a run-scoped attempt (run_id) to enable body tracking.")
+    elif not body_tracking_config_enabled:
+        st.error("⚠️ **Body Tracking**: Disabled (required)")
+        st.caption("Enable body tracking (AUTO_RUN_BODY_TRACKING or body_detection.yaml).")
+    elif body_tracking_status_value == "success":
+        runtime_label = body_tracking_runtime or "n/a"
+        st.success(f"✅ **Body Tracking**: Complete (Runtime: {runtime_label})")
+    elif body_tracking_status_value == "running":
+        st.info("⏳ **Body Tracking**: Running")
+        _render_downstream_progress(body_tracking_progress_display, running=True)
+    elif body_tracking_status_value in {"error", "failed"}:
+        st.error("⚠️ **Body Tracking**: Failed")
+        if body_tracking_error:
+            st.caption(body_tracking_error)
+    else:
+        st.info("⏳ **Body Tracking**: Ready to run")
+        st.caption("Run body tracking to generate body tracks.")
+    if body_tracking_manifest_fallback:
+        st.caption("ℹ️ Using manifest fallback; run-scoped marker/artifacts may be missing.")
+    finished = _format_timestamp(body_tracking_finished_at)
+    if finished:
+        st.caption(f"Last run: {finished}")
+    if body_tracking_runtime:
+        st.caption(f"Run Duration: {body_tracking_runtime}")
+    elif body_tracking_status_value == "success":
+        st.caption("Run Duration: n/a")
+
+    body_tracking_btn_label = (
+        "Re-run Body Tracking" if body_tracking_status_value == "success" else "Run Body Tracking"
+    )
+    body_tracking_btn_disabled = (
+        job_running
+        or _running_body_tracking_job is not None
+        or not selected_attempt_run_id
+        or not body_tracking_enabled
+        or not local_video_exists
+    )
+    if st.button(
+        body_tracking_btn_label,
+        key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::run_body_tracking_runner",
+        use_container_width=True,
+        disabled=body_tracking_btn_disabled,
+    ):
+        with st.spinner("Starting body tracking..."):
+            try:
+                helpers.api_post(
+                    "/jobs/body_tracking/run",
+                    json={"ep_id": ep_id, "run_id": selected_attempt_run_id},
+                    timeout=15,
+                )
+            except Exception as exc:
+                st.error(f"Failed to start body tracking: {exc}")
+            else:
+                st.success("Body tracking started.")
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.rerun()
+
+    _render_downstream_log_expander(
+        "Body Tracking",
+        marker_payload=body_tracking_marker_payload,
+        progress_payload=body_tracking_progress_display,
+        artifacts_hint="Body tracking artifacts found via manifest fallback."
+        if body_tracking_manifest_fallback
+        else None,
+    )
+
+with row3_col2:
+    st.markdown("### Track Fusion")
+    st.caption(_format_phase_status("Track Fusion", track_fusion_phase_status, "fusion_pairs"))
+    if not selected_attempt_run_id:
+        st.info("⏳ **Track Fusion**: Select a run_id")
+        st.caption("Select a run-scoped attempt (run_id) to enable track fusion.")
+    elif not track_fusion_config_enabled or not body_tracking_enabled:
+        st.error("⚠️ **Track Fusion**: Disabled (required)")
+        st.caption("Enable track fusion (track_fusion.enabled) and body tracking.")
+    elif body_fusion_status_value == "success":
+        runtime_label = track_fusion_runtime or "n/a"
+        st.success(f"✅ **Track Fusion**: Complete (Runtime: {runtime_label})")
+    elif body_fusion_status_value == "running":
+        st.info("⏳ **Track Fusion**: Running")
+        _render_downstream_progress(track_fusion_progress_display, running=True)
+    elif body_fusion_status_value in {"error", "failed"}:
+        st.error("⚠️ **Track Fusion**: Failed")
+        if body_fusion_error:
+            st.caption(body_fusion_error)
+        else:
+            st.warning(f"⚠️ **Track Fusion**: {body_fusion_status_value.title()}")
+    elif body_fusion_status_value in {"missing", "unknown"}:
+        missing = []
+        if not track_fusion_body_tracks_ready:
+            missing.append("body_tracking/body_tracks.jsonl")
+        if not track_fusion_faces_ready:
+            missing.append("faces.jsonl")
+        upstream_complete = body_tracking_status_value == "success" and faces_ready_state
+        prereq_state, prereq_message = helpers.describe_prereq_state(
+            missing,
+            upstream_complete=upstream_complete,
+        )
+        if missing:
+            if prereq_state == "waiting":
+                st.info("⏳ **Track Fusion**: Waiting for prerequisites")
+            else:
+                st.warning("⚠️ **Track Fusion**: Missing prerequisites")
+            st.caption(prereq_message)
+        else:
+            st.info("⏳ **Track Fusion**: Ready to run")
+            st.caption("Body tracks and faces are available.")
+    if fusion_mode_label:
+        detail = f" ({fusion_mode_detail})" if fusion_mode_detail else ""
+        st.caption(f"Fusion mode: {fusion_mode_label}{detail}")
+    if fusion_mode_hint:
+        st.caption(f"Install hint: {fusion_mode_hint}")
+    finished = _format_timestamp(track_fusion_finished_at)
+    if finished:
+        st.caption(f"Last run: {finished}")
+    if track_fusion_runtime:
+        st.caption(f"Run Duration: {track_fusion_runtime}")
+    elif body_fusion_status_value == "success":
+        st.caption("Run Duration: n/a")
+    if body_fusion_manifest_fallback:
+        st.caption("ℹ️ Using manifest fallback; run-scoped marker/artifacts may be missing.")
+
+    track_fusion_btn_label = (
+        "Re-run Track Fusion" if body_fusion_status_value == "success" else "Run Track Fusion"
+    )
+    track_fusion_btn_disabled = (
+        job_running
+        or _running_body_fusion_job is not None
+        or not selected_attempt_run_id
+        or not track_fusion_enabled
+        or not track_fusion_body_tracks_ready
+        or not track_fusion_faces_ready
+    )
+    if st.button(
+        track_fusion_btn_label,
+        key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::run_track_fusion_runner",
+        use_container_width=True,
+        disabled=track_fusion_btn_disabled,
+    ):
+        with st.spinner("Starting track fusion..."):
+            try:
+                helpers.api_post(
+                    "/jobs/body_tracking/fusion",
+                    json={"ep_id": ep_id, "run_id": selected_attempt_run_id},
+                    timeout=15,
+                )
+            except Exception as exc:
+                st.error(f"Failed to start track fusion: {exc}")
+            else:
+                st.success("Track fusion started.")
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.rerun()
+
+    _render_downstream_log_expander(
+        "Track Fusion",
+        marker_payload=body_fusion_marker_payload,
+        progress_payload=track_fusion_progress_display,
+        artifacts_hint="Track fusion output found via manifest fallback."
+        if body_fusion_manifest_fallback
+        else None,
+    )
+
+with row3_col3:
+    st.markdown("### PDF Export")
+    st.caption(_format_phase_status("PDF Export", pdf_phase_status, "exports"))
+    if not selected_attempt_run_id:
+        st.info("⏳ **PDF Export**: Select a run_id")
+        st.caption("Select a run-scoped attempt (run_id) to export a debug report.")
+    elif pdf_export_status_value == "success":
+        runtime_label = pdf_export_runtime or "n/a"
+        detail = f" ({pdf_export_detail})" if pdf_export_detail else ""
+        st.success(f"✅ **PDF Export**: Complete (Runtime: {runtime_label}){detail}")
+    elif pdf_export_status_value == "running":
+        st.info("⏳ **PDF Export**: Running")
+        _render_downstream_progress(pdf_progress_display, running=True)
+    elif pdf_export_status_value in {"error", "failed"}:
+        st.error("⚠️ **PDF Export**: Failed")
+        if pdf_export_detail:
+            st.caption(pdf_export_detail)
+    else:
+        st.info("⏳ **PDF Export**: Ready to run")
+        st.caption("Generate the Episode Details debug report.")
+    finished = _format_timestamp(pdf_export_finished_at)
+    if finished:
+        st.caption(f"Last run: {finished}")
+    if pdf_export_runtime:
+        st.caption(f"Run Duration: {pdf_export_runtime}")
+    elif pdf_export_status_value == "success":
+        st.caption("Run Duration: n/a")
+
+    pdf_btn_label = "Re-export PDF" if pdf_export_status_value == "success" else "Export PDF"
+    pdf_btn_disabled = (
+        job_running
+        or not selected_attempt_run_id
+        or pdf_export_status_value == "running"
+    )
+    if st.button(
+        pdf_btn_label,
+        key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::run_pdf_export_runner",
+        use_container_width=True,
+        disabled=pdf_btn_disabled,
+    ):
+        with st.spinner("Generating PDF report..."):
+            ok, msg = _trigger_pdf_export_if_needed(
+                ep_id,
+                selected_attempt_run_id,
+                cfg,
+                force=pdf_export_status_value == "success",
+            )
+        if not ok:
+            st.error(msg)
+        else:
+            st.success(msg)
+            st.session_state[_status_force_refresh_key(ep_id)] = True
+            st.rerun()
+
+    _render_downstream_log_expander(
+        "PDF Export",
+        marker_payload=export_index if isinstance(export_index, dict) else None,
+        progress_payload=pdf_progress_display,
+    )
 
 st.subheader("Debug / Export")
 
@@ -7733,6 +7561,98 @@ with st.expander("Artifacts", expanded=False):
         "identities",
         _run_s3_entries("identities.json", local_exists=identities_path.exists()) or None,
     )
+
+    st.divider()
+    st.markdown("#### Stage Artifacts (Selected Attempt)")
+    if not selected_attempt_run_id:
+        st.caption("Select a run-scoped attempt (run_id) to view stage artifacts.")
+    else:
+        stage_keys = ["detect", "faces", "cluster", "body_tracking", "track_fusion", "pdf"]
+        run_root = run_layout.run_root(ep_id, selected_attempt_run_id)
+        stage_artifact_map: dict[str, list[dict[str, Any]]] = {}
+        artifact_rel_paths: set[str] = set()
+
+        for stage_key in stage_keys:
+            artifacts = stage_artifacts(ep_id, selected_attempt_run_id, stage_key)
+            stage_artifact_map[stage_key] = artifacts
+            for artifact in artifacts:
+                path_raw = artifact.get("path") if isinstance(artifact, dict) else None
+                if not path_raw:
+                    continue
+                try:
+                    rel_path = str(Path(path_raw).relative_to(run_root))
+                except Exception:
+                    continue
+                artifact_rel_paths.add(rel_path)
+
+        presence_map: dict[str, dict[str, Any]] = {}
+        if artifact_rel_paths:
+            presence_map = _cached_run_artifact_presence(
+                ep_id,
+                selected_attempt_run_id,
+                tuple(sorted(artifact_rel_paths)),
+            )
+
+        marker_files = {
+            "detect_track.json",
+            "faces_embed.json",
+            "cluster.json",
+            "body_tracking.json",
+            "body_tracking_fusion.json",
+        }
+
+        def _legacy_path_for(rel_path: str) -> Path:
+            if rel_path in marker_files:
+                return run_layout.phase_marker_path(ep_id, rel_path.replace(".json", ""))
+            return helpers.DATA_ROOT / "manifests" / ep_id / rel_path
+
+        def _render_stage_artifact_row(rel_path: str, local_path: Path, presence: dict[str, Any]) -> None:
+            local_status = "present" if local_path.exists() else "missing"
+            st.write(f"`{rel_path}`")
+            st.caption(f"Local: {helpers.link_local(local_path)} ({local_status})")
+
+            canonical_key = presence.get("canonical_key") or presence.get("s3_key")
+            canonical_remote = bool(presence.get("canonical_remote"))
+            if canonical_key:
+                status = "present" if canonical_remote else "missing"
+                st.caption(f"S3: {helpers.s3_uri(canonical_key, bucket_name)} ({status})")
+            else:
+                st.caption("S3: n/a")
+
+            legacy_key = presence.get("legacy_key")
+            legacy_remote = bool(presence.get("legacy_remote"))
+            legacy_path = _legacy_path_for(rel_path)
+            legacy_local = legacy_path.exists()
+            if legacy_key or legacy_local:
+                legacy_status = "present" if (legacy_local or legacy_remote) else "missing"
+                legacy_bits: list[str] = []
+                if legacy_local:
+                    legacy_bits.append(f"Local: {helpers.link_local(legacy_path)}")
+                if legacy_key:
+                    legacy_bits.append(
+                        f"S3: {helpers.s3_uri(legacy_key, bucket_name)} "
+                        f"({'present' if legacy_remote else 'missing'})"
+                    )
+                legacy_detail = " · ".join(legacy_bits) if legacy_bits else "n/a"
+                st.caption(f"legacy/out-of-scope fallback ({legacy_status}): {legacy_detail}")
+
+        for stage_key in stage_keys:
+            st.markdown(f"**{stage_layout.stage_label(stage_key)}**")
+            artifacts = stage_artifact_map.get(stage_key) or []
+            if not artifacts:
+                st.caption("No artifacts recorded for this stage.")
+                continue
+            for artifact in artifacts:
+                path_raw = artifact.get("path") if isinstance(artifact, dict) else None
+                if not path_raw:
+                    continue
+                path_obj = Path(path_raw)
+                try:
+                    rel_path = str(path_obj.relative_to(run_root))
+                except Exception:
+                    rel_path = path_obj.name
+                presence = presence_map.get(rel_path) if rel_path in presence_map else {}
+                _render_stage_artifact_row(rel_path, path_obj, presence if isinstance(presence, dict) else {})
     
     out_of_scope_artifacts: list[tuple[str, Path]] = []
     if selected_attempt_run_id:
