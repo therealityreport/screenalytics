@@ -49,6 +49,9 @@ from py_screenalytics.episode_status import (
     collect_git_state,
     stage_update_from_marker,
     update_episode_status,
+    write_stage_failed,
+    write_stage_finished,
+    write_stage_started,
 )
 from tools._img_utils import safe_crop, safe_imwrite, to_u8_bgr
 from tools.debug_thumbs import (
@@ -7623,7 +7626,13 @@ def _run_detect_track_stage(
         else None
     )
 
+    run_id = getattr(args, "run_id", None)
     started_at = _utcnow_iso()
+    if run_id:
+        try:
+            write_stage_started(args.ep_id, run_id, "detect")
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark detect start: %s", exc)
     try:
         (
             det_count,
@@ -7723,7 +7732,6 @@ def _run_detect_track_stage(
         elif tracker_choice == "bytetrack":
             gate_auto_rerun = {"triggered": False, "reason": "gate_disabled"}
 
-        run_id = getattr(args, "run_id", None)
         effective_run_id = run_id or progress.run_id
         manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
 
@@ -7988,8 +7996,30 @@ def _run_detect_track_stage(
             },
             run_id=run_id,
         )
+        if run_id:
+            try:
+                write_stage_finished(
+                    args.ep_id,
+                    run_id,
+                    "detect",
+                    counts={"detections": det_count, "tracks": track_count},
+                    metrics={"detections": det_count, "tracks": track_count},
+                )
+            except Exception as exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark detect success: %s", exc)
         return summary
     except Exception as exc:
+        if run_id:
+            try:
+                write_stage_failed(
+                    args.ep_id,
+                    run_id,
+                    "detect",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark detect failure: %s", status_exc)
         progress.fail(str(exc))
         raise
     finally:
