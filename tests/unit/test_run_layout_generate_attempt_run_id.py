@@ -36,3 +36,20 @@ def test_generate_attempt_run_id_falls_back_to_count_when_no_attempt_prefix(tmp_
     run_id = run_layout.generate_attempt_run_id(ep_id, now=now)
     assert run_id == "Attempt3_2025-01-02_030405EST"
 
+
+def test_get_or_create_run_id_normalizes_explicit_value(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "rhoslc-s06e11"
+
+    run_id = run_layout.get_or_create_run_id(ep_id, " Attempt2_2025-01-02_030405EST ")
+    assert run_id == "Attempt2_2025-01-02_030405EST"
+
+
+def test_get_or_create_run_id_generates_attempt_and_creates_dir(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    ep_id = "rhoslc-s06e11"
+
+    now = datetime(2025, 1, 2, 3, 4, 5, tzinfo=ZoneInfo("America/New_York"))
+    run_id = run_layout.get_or_create_run_id(ep_id, None, now=now)
+    assert run_id == "Attempt1_2025-01-02_030405EST"
+    assert run_layout.run_root(ep_id, run_id).exists()

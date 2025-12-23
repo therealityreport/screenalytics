@@ -140,6 +140,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Data root override (defaults to SCREENALYTICS_DATA_ROOT or ./data)",
     )
     parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional pipeline run identifier (generated when omitted).",
+    )
+    parser.add_argument(
         "--progress-file",
         help="Progress JSON file to update during processing",
     )
@@ -189,6 +194,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Import the engine
     from py_screenalytics.pipeline import run_episode, EpisodeRunConfig
+    from py_screenalytics import run_layout
+
+    raw_run_id = args.run_id
+    run_id_missing = raw_run_id is None or not str(raw_run_id).strip()
+    run_id = run_layout.get_or_create_run_id(args.ep_id, raw_run_id)
+    if run_id_missing:
+        print(f"[run_pipeline] run_id={run_id}", file=sys.stderr)
 
     # Build config
     config = EpisodeRunConfig(
@@ -209,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         progress_file=Path(args.progress_file) if args.progress_file else None,
         reuse_detections=args.reuse_detections,
         reuse_embeddings=args.reuse_embeddings,
+        run_id=run_id,
     )
 
     if not args.quiet:

@@ -5144,8 +5144,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--run-id",
         default=None,
         help=(
-            "Optional pipeline run identifier. When provided, phase outputs are also written under "
-            "data/manifests/{ep_id}/runs/{run_id}/ and then promoted to the legacy root manifests dir."
+            "Optional pipeline run identifier. When omitted, a new run_id is generated. Phase outputs are "
+            "written under data/manifests/{ep_id}/runs/{run_id}/ and then promoted to the legacy root manifests dir."
         ),
     )
     parser.add_argument("--video", help="Path to source video (required for detect/track runs)")
@@ -5443,12 +5443,6 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     raw_argv: List[str] = getattr(args, "_raw_argv", [])
 
-    # Normalize optional run_id (used for run-scoped artifact storage)
-    raw_run_id = getattr(args, "run_id", None)
-    if raw_run_id is not None:
-        run_id_str = str(raw_run_id).strip()
-        args.run_id = run_layout.normalize_run_id(run_id_str) if run_id_str else None
-
     # Apply performance profile defaults when provided (explicit CLI flags win)
     profile_cfg = _load_performance_profile(args.profile or os.environ.get("SCREENALYTICS_PERF_PROFILE"))
     if profile_cfg:
@@ -5538,6 +5532,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     os.environ["SCREENALYTICS_DATA_ROOT"] = str(data_root)
     ensure_dirs(args.ep_id)
+
+    # Ensure run_id is always set for run-scoped outputs/status
+    raw_run_id = getattr(args, "run_id", None)
+    run_id_missing = raw_run_id is None or not str(raw_run_id).strip()
+    args.run_id = run_layout.get_or_create_run_id(args.ep_id, raw_run_id)
+    if run_id_missing:
+        LOGGER.info("[episode_run] Generated run_id=%s for ep_id=%s", args.run_id, args.ep_id)
+        print(f"[episode_run] run_id={args.run_id}", file=sys.stderr)
 
     # ---------------------------------------------------------------------
     # Preflight: environment fingerprint (run-scoped when run_id is provided)

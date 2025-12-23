@@ -51,6 +51,7 @@ from py_screenalytics.pipeline.constants import (
     DEFAULT_NEW_TRACK_THRESH,
     DEFAULT_MIN_BOX_AREA,
 )
+from py_screenalytics import run_layout
 
 LOGGER = logging.getLogger("episode_engine")
 
@@ -193,6 +194,12 @@ class EpisodeRunConfig:
     """Optional file to write progress JSON"""
 
     # =========================================================================
+    # Run scoping
+    # =========================================================================
+    run_id: Optional[str] = None
+    """Run-scoped identifier (generated when omitted)"""
+
+    # =========================================================================
     # Stage selection
     # =========================================================================
     stages: PipelineStage = PipelineStage.ALL
@@ -249,6 +256,9 @@ class EpisodeRunConfig:
         # Convert data_root to Path if string
         if isinstance(self.data_root, str):
             self.data_root = Path(self.data_root).expanduser()
+
+        if self.run_id is not None:
+            self.run_id = run_layout.normalize_run_id(str(self.run_id))
 
 
 @dataclass
@@ -321,6 +331,9 @@ class EpisodeRunResult:
     episode_id: str
     """Episode identifier"""
 
+    run_id: Optional[str] = None
+    """Run identifier for run-scoped artifacts"""
+
     success: bool
     """Whether all stages completed successfully"""
 
@@ -358,6 +371,7 @@ class EpisodeRunResult:
         """Convert to dictionary for JSON serialization."""
         return {
             "episode_id": self.episode_id,
+            "run_id": self.run_id,
             "success": self.success,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -581,6 +595,18 @@ def run_stage(
     started_at = _utcnow_iso()
     start_time = time.time()
 
+    try:
+        config.run_id = run_layout.get_or_create_run_id(episode_id, config.run_id)
+    except ValueError as exc:
+        return StageResult(
+            stage=stage.value,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            error=str(exc),
+        )
+
     # Set up data root environment variable
     if config.data_root:
         os.environ["SCREENALYTICS_DATA_ROOT"] = str(config.data_root)
@@ -735,10 +761,27 @@ def run_episode(
     started_at = _utcnow_iso()
     start_time = time.time()
 
+    try:
+        config.run_id = run_layout.get_or_create_run_id(episode_id, config.run_id)
+    except ValueError as exc:
+        return EpisodeRunResult(
+            episode_id=episode_id,
+            run_id=config.run_id,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            config=config,
+            error=str(exc),
+        )
+
+    LOGGER.info("Pipeline run_id=%s for episode %s", config.run_id, episode_id)
+
     # Validate video path
     if not video_path.exists():
         return EpisodeRunResult(
             episode_id=episode_id,
+            run_id=config.run_id,
             success=False,
             started_at=started_at,
             finished_at=_utcnow_iso(),
@@ -765,6 +808,7 @@ def run_episode(
     if not space_ok:
         return EpisodeRunResult(
             episode_id=episode_id,
+            run_id=config.run_id,
             success=False,
             started_at=started_at,
             finished_at=_utcnow_iso(),
@@ -956,6 +1000,7 @@ def run_episode(
 
     return EpisodeRunResult(
         episode_id=episode_id,
+        run_id=config.run_id,
         success=all_success,
         started_at=started_at,
         finished_at=finished_at,

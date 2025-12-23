@@ -300,6 +300,10 @@ class EpisodeRunRequest(BaseModel):
     """Request model for running the full episode processing pipeline."""
 
     ep_id: str = Field(..., description="Episode identifier (e.g., 'rhobh-s05e14')")
+    run_id: str | None = Field(
+        None,
+        description="Optional run identifier (generated when omitted).",
+    )
     profile: PROFILE_LITERAL | None = Field(
         None,
         description="Performance profile: low_power, balanced, performance (or aliases fast_cpu, high_accuracy). Overrides stride defaults.",
@@ -360,6 +364,7 @@ def start_episode_run(req: EpisodeRunRequest) -> dict:
     try:
         record = JOB_SERVICE.start_episode_run_job(
             ep_id=req.ep_id,
+            run_id=req.run_id,
             video_path=video_path,
             device=req.device,
             stride=req.stride,
@@ -371,7 +376,11 @@ def start_episode_run(req: EpisodeRunRequest) -> dict:
             reuse_embeddings=req.reuse_embeddings,
             profile=req.profile,
         )
-        return {"job_id": record["job_id"], "status": "running"}
+        run_id = None
+        requested = record.get("requested")
+        if isinstance(requested, dict):
+            run_id = requested.get("run_id")
+        return {"job_id": record["job_id"], "status": "running", "run_id": run_id}
 
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
