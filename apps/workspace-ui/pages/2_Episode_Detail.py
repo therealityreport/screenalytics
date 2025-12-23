@@ -2308,19 +2308,6 @@ if isinstance(db_health_snapshot, dict):
 _autorun_navigate_key = f"{ep_id}::autorun_navigate_to_suggestions"
 st.session_state.pop(_autorun_navigate_key, None)
 
-# Trigger Improve Faces modal if flag is set (after cluster completion)
-if not db_available:
-    _clear_improve_faces_state(ep_id, _resolve_session_run_id(ep_id))
-elif st.session_state.get(_session_improve_faces_state_key(ep_id, "trigger")):
-    LOGGER.info("[IMPROVE_FACES] Trigger flag detected, starting Improve Faces modal")
-    _start_improve_faces_ep_detail(ep_id, force=True)
-
-# Render Improve Faces modal if active
-if db_available:
-    _render_improve_faces_modal_ep_detail(ep_id)
-# Skip heavy page rendering while modal is open to speed up YES/NO flows
-if st.session_state.get(_session_improve_faces_state_key(ep_id, "active")):
-    st.stop()
 
 running_job_key = f"{ep_id}::pipeline_job_running"
 if running_job_key not in st.session_state:
@@ -3937,15 +3924,40 @@ if ep_id == "rhoslc-s06e11":
                 st.error("Failed to clear previous attempts.")
                 st.exception(exc)
 
-faces_state_for_pipeline = "success" if faces_ready_state else faces_status_value
-pipeline_stage_states = [
-    ("detect", detect_status_value),
-    ("faces", faces_state_for_pipeline),
-    ("cluster", cluster_status_value),
-    ("body_tracking", body_tracking_status_value),
-    ("track_fusion", body_fusion_status_value),
-    ("pdf", pdf_export_status_value),
-]
+_SETUP_STAGE_PLAN = ("detect", "faces", "cluster", "body_tracking", "track_fusion", "pdf")
+
+
+def _setup_stage_plan() -> list[str]:
+    return list(_SETUP_STAGE_PLAN)
+
+
+def _normalize_stage_status(value: str | None) -> str:
+    return str(value or "").strip().lower()
+
+
+def _setup_stage_statuses() -> dict[str, str]:
+    return {
+        "detect": _normalize_stage_status(detect_status_value),
+        "faces": "success" if faces_ready_state else _normalize_stage_status(faces_status_value),
+        "cluster": _normalize_stage_status(cluster_status_value),
+        "body_tracking": _normalize_stage_status(body_tracking_status_value),
+        "track_fusion": _normalize_stage_status(body_fusion_status_value),
+        "pdf": _normalize_stage_status(pdf_export_status_value),
+    }
+
+
+def _is_setup_stage_done(status: str) -> bool:
+    return status in {"success", "completed", "done"}
+
+
+def is_setup_pipeline_complete(stage_statuses: dict[str, str] | None = None) -> bool:
+    statuses = stage_statuses or _setup_stage_statuses()
+    return all(_is_setup_stage_done(statuses.get(stage, "")) for stage in _setup_stage_plan())
+
+
+setup_stage_plan = _setup_stage_plan()
+setup_stage_statuses = _setup_stage_statuses()
+
 autorun_active_flag = bool(st.session_state.get(_autorun_key, False))
 autorun_phase_value = st.session_state.get(_autorun_phase_key)
 autorun_phase_label = None
@@ -3953,16 +3965,22 @@ if autorun_active_flag and autorun_phase_value:
     autorun_phase_key = stage_layout.normalize_stage_key(str(autorun_phase_value))
     if autorun_phase_key:
         autorun_phase_label = stage_layout.stage_label(autorun_phase_key)
-setup_complete = bool(
-    selected_attempt_run_id
-    and all(state == "success" for _, state in pipeline_stage_states)
-)
+
+setup_complete = bool(selected_attempt_run_id and is_setup_pipeline_complete(setup_stage_statuses))
 running_stage_label = next(
-    (stage_layout.stage_label(stage) for stage, state in pipeline_stage_states if state == "running"),
+    (
+        stage_layout.stage_label(stage)
+        for stage in setup_stage_plan
+        if setup_stage_statuses.get(stage) in {"running", "finalizing", "syncing"}
+    ),
     None,
 )
 error_stage_label = next(
-    (stage_layout.stage_label(stage) for stage, state in pipeline_stage_states if state in {"error", "failed"}),
+    (
+        stage_layout.stage_label(stage)
+        for stage in setup_stage_plan
+        if setup_stage_statuses.get(stage) in {"error", "failed"}
+    ),
     None,
 )
 if not selected_attempt_run_id:
@@ -3977,6 +3995,9 @@ elif running_stage_label:
     pipeline_state_label = f"Running ({running_stage_label})"
 else:
     pipeline_state_label = "Ready"
+
+if not setup_complete:
+    _clear_improve_faces_state(ep_id, _resolve_session_run_id(ep_id))
 
 header_col1, header_col2, header_col3 = st.columns(3)
 with header_col1:
@@ -4042,34 +4063,28 @@ with action_col2:
             st.session_state[_status_force_refresh_key(ep_id)] = True
             st.rerun()
 with action_col3:
-    faces_review_disabled = not setup_complete
-    if not selected_attempt_run_id:
-        faces_review_help = "Select a run-scoped attempt (run_id) above."
-    elif not setup_complete:
-        faces_review_help = "Complete the setup pipeline to continue."
+    if setup_complete:
+        if st.button(
+            "Continue to Faces Review",
+            key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::nav_faces_review",
+            use_container_width=True,
+        ):
+            try:
+                qp = st.query_params
+                qp["ep_id"] = ep_id
+                if selected_attempt_run_id:
+                    qp["run_id"] = selected_attempt_run_id
+                else:
+                    try:
+                        del qp["run_id"]
+                    except Exception:
+                        pass
+                st.query_params = qp
+            except Exception:
+                pass
+            st.switch_page("pages/3_Faces_Review.py")
     else:
-        faces_review_help = None
-    if st.button(
-        "Continue to Faces Review",
-        key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::nav_faces_review",
-        use_container_width=True,
-        disabled=faces_review_disabled,
-        help=faces_review_help,
-    ):
-        try:
-            qp = st.query_params
-            qp["ep_id"] = ep_id
-            if selected_attempt_run_id:
-                qp["run_id"] = selected_attempt_run_id
-            else:
-                try:
-                    del qp["run_id"]
-                except Exception:
-                    pass
-            st.query_params = qp
-        except Exception:
-            pass
-        st.switch_page("pages/3_Faces_Review.py")
+        st.caption("Complete the setup pipeline to continue.")
 
 st.markdown("### Selected Attempt Status")
 st.caption("Pipeline dependencies: detect → faces → cluster → body_tracking → track_fusion → pdf")
@@ -4854,12 +4869,7 @@ with st.expander("Advanced: Stage Summary", expanded=False):
     if not selected_attempt_run_id:
         st.info("Select a run-scoped attempt (run_id) to view per-stage status and artifacts.")
     else:
-        stage_plan = list(stage_layout.PIPELINE_STAGE_PLAN)
-        if isinstance(episode_status_payload, dict):
-            raw_plan = episode_status_payload.get("stage_plan")
-            if isinstance(raw_plan, list) and raw_plan:
-                normalized = [stage_layout.normalize_stage_key(str(item)) for item in raw_plan]
-                stage_plan = [item for item in normalized if item in stage_layout.PIPELINE_STAGE_PLAN]
+        stage_plan = list(setup_stage_plan)
         if episode_status_payload:
             st.caption("Source: episode_status.json (run-scoped)")
         else:
@@ -4993,10 +5003,11 @@ with st.expander("Advanced: Stage Summary", expanded=False):
             duration_label = _format_runtime(duration_val) or "n/a"
             artifacts = stage_artifact_map.get(stage_key) or []
             artifacts_label = ", ".join(_artifact_display(a) for a in artifacts if isinstance(a, dict)) or "n/a"
+            status_value = setup_stage_statuses.get(stage_key) or stage_entry.get("status") or "unknown"
             summary_rows.append(
                 {
                     "Stage": stage_layout.stage_label(stage_key),
-                    "Status": stage_entry.get("status") or "unknown",
+                    "Status": status_value,
                     "Started": started_at or "—",
                     "Ended": ended_at or "—",
                     "Duration": duration_label,
@@ -5075,12 +5086,13 @@ with st.container():
         if autorun_active:
             current_phase_key = stage_layout.normalize_stage_key(autorun_phase)
             current_phase_label = stage_layout.stage_label(current_phase_key)
-            # Get completed stages log
-            completed_stages = st.session_state.get(f"{ep_id}::autorun_completed_stages", [])
+            completed_labels = [
+                stage_layout.stage_label(stage)
+                for stage in setup_stage_plan
+                if _is_setup_stage_done(setup_stage_statuses.get(stage, ""))
+            ]
             # Build status display
-            status_lines = []
-            for stage_info in completed_stages:
-                status_lines.append(f"✅ {stage_info}")
+            status_lines = [f"✅ {label}" for label in completed_labels]
             if not status_lines:
                 status_lines.append("No stages completed yet.")
             st.info("**Setup Pipeline Active**\n\n" + "\n\n".join(status_lines))
@@ -5088,25 +5100,13 @@ with st.container():
             if active_run_id:
                 st.caption(f"Active attempt: `{active_run_id}`")
 
-            # Progress: count completed enabled stages for the selected run_id.
-            from py_screenalytics.autorun_plan import build_autorun_stage_plan
-
-            stage_plan = build_autorun_stage_plan(
-                body_tracking_enabled=body_tracking_enabled,
-                track_fusion_enabled=track_fusion_enabled,
-            )
-
-            done_map = {
-                "detect": detect_status_value == "success",
-                "faces": bool(faces_ready_state),
-                "cluster": cluster_status_value == "success",
-                "body_tracking": body_tracking_status_value == "success",
-                "track_fusion": body_fusion_status_value == "success",
-                "pdf": pdf_export_status_value == "success",
+            # Progress: count completed stages from the merged setup status model.
+            stage_plan = setup_stage_plan
+            completed_count = len(completed_labels)
+            total_count = len(stage_plan)
+            completed_keys = {
+                stage for stage in stage_plan if _is_setup_stage_done(setup_stage_statuses.get(stage, ""))
             }
-            done_labels = [stage_layout.stage_label(stage) for stage in stage_plan if done_map.get(stage)]
-            completed_count, total_count = stage_layout.progress_counts(done_labels, stage_plan)
-            completed_keys = set(stage_layout.normalize_completed_stages(done_labels))
 
             current_phase_pct = 0.0
             _running_jobs = helpers.get_all_running_jobs_for_episode(ep_id)
@@ -5890,9 +5890,6 @@ def _autorun_drive_downstream(run_id: str) -> None:
             ]
             completion_label = " · ".join(completion_bits)
             st.success(f"🎉 **Setup Pipeline Complete!** ({completion_label})")
-            # Now that setup is complete, open Improve Faces for this run (best-effort).
-            if selected_attempt_run_id:
-                st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
             st.rerun()
 
         with st.spinner("Generating PDF report..."):
@@ -6985,11 +6982,9 @@ with col_cluster:
             st.session_state[cluster_job_complete_key] = True
             # Force status refresh to pick up new data
             st.session_state[_status_force_refresh_key(ep_id)] = True
-            autorun_cluster_active = bool(st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster")
-            # Trigger Improve Faces when cluster finishes (run-scoped), but defer during Auto-Run
-            # so setup stages (body tracking/track fusion/PDF) can complete without st.stop().
-            if selected_attempt_run_id and not autorun_cluster_active:
-                st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
+            autorun_cluster_active = bool(
+                st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster"
+            )
 
             # Auto-run: advance to setup stages after clustering finishes.
             if autorun_cluster_active:
@@ -6998,14 +6993,6 @@ with col_cluster:
                 else:
                     st.session_state[_autorun_phase_key] = "body_tracking"
                     st.toast("✅ Cluster complete - advancing to Body Tracking...")
-            # Trigger Improve Faces modal on this page (not redirect)
-            if selected_attempt_run_id:
-                if autorun_cluster_active:
-                    st.caption("Cluster complete (Auto-Run). Continuing setup stages before Improve Faces.")
-                else:
-                    st.caption("Opening Improve Faces...")
-            else:
-                st.caption("Cluster complete (legacy run). Select a run-scoped attempt (run_id) to use Improve Faces.")
             time.sleep(0.3)
             st.rerun()
 
@@ -7461,74 +7448,13 @@ with col_cluster:
 
                 st.session_state["episode_detail_flash"] = flash_msg
 
-                # Trigger Improve Faces modal on this page (not redirect)
                 autorun_cluster_active = bool(
                     st.session_state.get(_autorun_key) and st.session_state.get(_autorun_phase_key) == "cluster"
                 )
-                if selected_attempt_run_id and not autorun_cluster_active and db_available:
-                    st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
-                    LOGGER.info(
-                        "[CLUSTER_COMPLETE] Set trigger flag for Improve Faces modal, ep_id=%s run_id=%s",
-                        ep_id,
-                        selected_attempt_run_id,
-                    )
-                    st.toast("🎯 Cluster complete! Opening Improve Faces...")
-                elif autorun_cluster_active:
+                if autorun_cluster_active:
                     st.toast("✅ Cluster complete (Auto-Run). Continuing setup stages…")
-                else:
-                    if db_available:
-                        st.toast("🎯 Cluster complete! Select a run-scoped attempt (run_id) to use Improve Faces.")
-                    else:
-                        st.toast("🎯 Cluster complete! Improve Faces unavailable (DB not configured).")
                 st.rerun()
 
-    # Show appropriate button based on state
-    if cluster_status_value == "success":
-        # If Improve Faces was completed, show "FACES REVIEW" button
-        improve_faces_complete = bool(
-            st.session_state.get(_improve_faces_state_key(ep_id, selected_attempt_run_id, "complete"))
-        )
-        if improve_faces_complete:
-            faces_review_disabled = not bool(selected_attempt_run_id)
-            if st.button(
-                "📋 FACES REVIEW",
-                key=f"faces_review_cta_{ep_id}",
-                use_container_width=True,
-                type="primary",
-                disabled=faces_review_disabled,
-                help="Select a run-scoped attempt (run_id) to review this run." if faces_review_disabled else None,
-            ):
-                try:
-                    qp = st.query_params
-                    qp["ep_id"] = ep_id
-                    if selected_attempt_run_id:
-                        qp["run_id"] = selected_attempt_run_id
-                    else:
-                        try:
-                            del qp["run_id"]
-                        except Exception:
-                            pass
-                    st.query_params = qp
-                except Exception:
-                    pass
-                st.switch_page("pages/3_Faces_Review.py")
-        else:
-            # Manual Improve Faces launcher
-            improve_faces_disabled = not bool(selected_attempt_run_id) or not db_available
-            improve_faces_help = None
-            if not selected_attempt_run_id:
-                improve_faces_help = "Select a run-scoped attempt (run_id) to enable Improve Faces."
-            elif not db_available:
-                improve_faces_help = "Improve Faces requires a configured DB."
-            if st.button(
-                "🎯 Improve Faces",
-                key=f"improve_faces_cta_{ep_id}",
-                use_container_width=True,
-                disabled=improve_faces_disabled,
-                help=improve_faces_help,
-            ):
-                st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
-                st.rerun()
 
 st.subheader("Debug / Export")
 
@@ -7847,16 +7773,10 @@ if _execution_mode == "local" and not _any_job_running:
 
 if _local_job_just_completed:
     # Local mode job just completed - refresh once to show updated status
-    if st.session_state.get(_session_improve_faces_state_key(ep_id, "trigger")):
-        st.caption("✅ Cluster completed! Opening Improve Faces...")
-        import time as _time
-        _time.sleep(0.5)
-        st.rerun()  # Stay on this page, modal will open
-    else:
-        st.caption("✅ Job completed! Refreshing to show results...")
-        import time as _time
-        _time.sleep(1.5)
-        st.rerun()
+    st.caption("✅ Job completed! Refreshing to show results...")
+    import time as _time
+    _time.sleep(1.5)
+    st.rerun()
 elif _any_job_running and _execution_mode != "local":
     # Celery mode: poll for updates since jobs run in background
     import time as _time
