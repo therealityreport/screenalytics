@@ -10,6 +10,7 @@
 - Mainline branch: `origin/main` (no `nov-18` branch present).
 - Feature branch: `screentime-improvements/run-scoped-observability`.
 - Base branch: `screentime-improvements/episode-details-downstream-stage`.
+- Base branch for triage: `main` (tracking `origin/main`).
 
 ## run_id generation + format
 - `py_screenalytics/run_layout.py`: `generate_run_id()` uses UUID4 hex (32 chars).
@@ -92,6 +93,16 @@ Acceptance:
 - If baseline: document as known failures and ensure this PR does not add new failures.
 - `test_run_export_s3` must be deterministic (skip when missing creds or mock S3).
 
+Node ids resolved:
+- `tests/unit/test_faces_embed_limits.py::test_episode_cap_keeps_tracks_and_downsamples`
+- `tests/unit/test_faces_embed_limits.py::test_frame_exporter_direct_s3`
+- `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_returns_upload_result`
+- `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_skips_upload_when_disabled`
+- `tests/unit/test_scene_fallback.py::test_scene_fallback_on_pyscenedetect_failure`
+- `tests/unit/test_scene_fallback.py::test_scene_fallback_when_opencv_cannot_open`
+- `tests/unit/test_scene_fallback.py::test_scene_requested_resolved_populated`
+- `tests/unit/test_track_reps_run_scoped_crops.py::test_compute_track_representative_finds_run_scoped_crops`
+
 ## PR checklist (when opening PR)
 - Include commits: `01b9842` and `774a83d`.
 - Describe run_id propagation + compatibility notes.
@@ -101,3 +112,22 @@ Acceptance:
 ## Tests run
 - `python -m pytest -q tests/unit tests/api/test_jobs_episode_run_run_id.py` (fails: `test_faces_embed_limits`, `test_run_export_s3`, `test_scene_fallback`, `test_track_reps_run_scoped_crops`).
 - `python -m pytest -q tests/unit/test_run_id_cli_status.py tests/api/test_jobs_episode_run_run_id.py`.
+
+## Test triage results (baseline vs regression)
+- Base log: `tmp/test-triage/base_2025-12-23.txt`
+- Branch log: `tmp/test-triage/branch_2025-12-23.txt`
+
+| Test | Base result | Branch result | Classification | Notes / Root cause | Fix / Follow-up |
+| --- | --- | --- | --- | --- | --- |
+| `tests/unit/test_faces_embed_limits.py::test_episode_cap_keeps_tracks_and_downsamples` | FAIL | FAIL | baseline | `_load_track_samples` does not accept `max_faces_total` | Baseline fix needed (test vs API mismatch). |
+| `tests/unit/test_faces_embed_limits.py::test_frame_exporter_direct_s3` | FAIL | FAIL | baseline | `FrameExporter.__init__` missing `storage` arg | Baseline fix needed (test vs API mismatch). |
+| `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_returns_upload_result` | FAIL | FAIL | baseline | `metrics` is `None` during PDF build (`run_export.py`) | Baseline fix needed; not run_id-related. |
+| `tests/unit/test_run_export_s3.py::TestBuildAndUploadFunctions::test_build_and_upload_pdf_skips_upload_when_disabled` | FAIL | FAIL | baseline | Same `metrics` None crash | Baseline fix needed; not run_id-related. |
+| `tests/unit/test_scene_fallback.py::test_scene_fallback_on_pyscenedetect_failure` | FAIL | FAIL | baseline | `detect_scene_cuts_pyscenedetect` exception not handled | Baseline fix needed in `episode_run.py`. |
+| `tests/unit/test_scene_fallback.py::test_scene_fallback_when_opencv_cannot_open` | FAIL | FAIL | baseline | `_opencv_can_open` missing in `episode_run.py` | Baseline fix needed in `episode_run.py`. |
+| `tests/unit/test_scene_fallback.py::test_scene_requested_resolved_populated` | FAIL | FAIL | baseline | `_opencv_has_ffmpeg` missing in `episode_run.py` | Baseline fix needed in `episode_run.py`. |
+| `tests/unit/test_track_reps_run_scoped_crops.py::test_compute_track_representative_finds_run_scoped_crops` | FAIL | FAIL | baseline | Run-scoped crop resolution returns `None` | Baseline fix needed in `track_reps` logic. |
+
+Known failing on base branch:
+- All eight node ids above fail on `main` and on this branch.
+- Failures are deterministic in local runs (not tied to AWS/S3 credentials); `test_run_export_s3` currently fails before any upload due to `metrics` being `None`.
