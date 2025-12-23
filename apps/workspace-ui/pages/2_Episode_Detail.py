@@ -1212,20 +1212,40 @@ def _cached_run_artifact_presence(
         local_exists = local_path.exists()
         remote_exists = False
         remote_key = None
+        canonical_key = None
+        legacy_key = None
+        canonical_remote = False
+        legacy_remote = False
+        try:
+            keys = run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, rel_path)
+        except Exception:
+            keys = []
+        if keys:
+            canonical_key = keys[0]
+            if len(keys) > 1 and keys[1] != canonical_key:
+                legacy_key = keys[1]
         if not local_exists and storage and storage.s3_enabled():
             try:
-                for key in run_layout.run_artifact_s3_keys_for_read(ep_id, run_id_norm, rel_path):
-                    if storage.object_exists(key):
-                        remote_exists = True
-                        remote_key = key
-                        break
+                if canonical_key:
+                    canonical_remote = storage.object_exists(canonical_key)
+                if legacy_key:
+                    legacy_remote = storage.object_exists(legacy_key)
             except Exception as exc:
                 LOGGER.warning("[RUN_ARTIFACT] S3 check failed for %s/%s: %s", ep_id, rel_path, exc)
+        remote_exists = canonical_remote or legacy_remote
+        if canonical_remote:
+            remote_key = canonical_key
+        elif legacy_remote:
+            remote_key = legacy_key
         result[rel_path] = {
             "local": local_exists,
             "remote": remote_exists,
             "s3_key": remote_key,
             "path": str(local_path),
+            "canonical_key": canonical_key,
+            "canonical_remote": canonical_remote,
+            "legacy_key": legacy_key,
+            "legacy_remote": legacy_remote,
         }
     return result
 
@@ -3209,7 +3229,7 @@ with st.expander(f"Episode {ep_id}", expanded=False):
     st.write(f"Local → {helpers.link_local(details['local']['path'])} (exists={details['local']['exists']})")
     if prefixes:
         st.caption(
-            "S3 artifacts → "
+            "Episode-level S3 prefixes (legacy, not run-scoped) → "
             f"Frames {helpers.s3_uri(prefixes['frames'], bucket_name)} | "
             f"Crops {helpers.s3_uri(prefixes['crops'], bucket_name)} | "
             f"Manifests {helpers.s3_uri(prefixes['manifests'], bucket_name)}"
@@ -3413,11 +3433,13 @@ body_tracking_status_value = "missing"
 body_tracking_error: str | None = None
 body_tracking_marker_payload: dict[str, Any] | None = None
 body_tracking_manifest_fallback = False
+body_tracking_legacy_available = False
 
 body_fusion_status_value = "missing"
 body_fusion_error: str | None = None
 body_fusion_marker_payload: dict[str, Any] | None = None
 body_fusion_manifest_fallback = False
+body_fusion_legacy_available = False
 
 pdf_export_status_value = "missing"
 pdf_export_detail: str | None = None
@@ -3459,19 +3481,17 @@ if selected_attempt_run_id:
             and stage_layout.artifact_available(body_tracks_presence)
         )
         legacy_ok = bool(legacy_body_detections_path.exists() and legacy_body_tracks_path.exists())
-        artifacts_ok = run_scoped_ok or (legacy_ok and marker_run_matches)
-        if legacy_ok and marker_run_matches and not run_scoped_ok:
-            body_tracking_manifest_fallback = True
+        body_tracking_legacy_available = bool(legacy_ok and marker_run_matches)
         if marker_status in {"error", "failed"} or marker_error:
             body_tracking_status_value = "error"
             body_tracking_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
-        elif marker_status == "success" and marker_run_matches and artifacts_ok:
+        elif marker_status == "success" and marker_run_matches and run_scoped_ok:
             body_tracking_status_value = "success"
         elif marker_status == "success":
             body_tracking_status_value = "stale"
             if not marker_run_matches:
                 body_tracking_error = "run_id_mismatch"
-            elif not artifacts_ok:
+            elif not run_scoped_ok:
                 body_tracking_error = "missing_artifacts"
     elif not body_tracking_running:
         artifacts_ok = (
@@ -3495,19 +3515,17 @@ if selected_attempt_run_id:
         marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
         run_scoped_ok = stage_layout.artifact_available(track_fusion_presence)
         legacy_ok = bool(legacy_track_fusion_path.exists())
-        artifacts_ok = run_scoped_ok or (legacy_ok and marker_run_matches)
-        if legacy_ok and marker_run_matches and not run_scoped_ok:
-            body_fusion_manifest_fallback = True
+        body_fusion_legacy_available = bool(legacy_ok and marker_run_matches)
         if marker_status in {"error", "failed"} or marker_error:
             body_fusion_status_value = "error"
             body_fusion_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
-        elif marker_status == "success" and marker_run_matches and artifacts_ok:
+        elif marker_status == "success" and marker_run_matches and run_scoped_ok:
             body_fusion_status_value = "success"
         elif marker_status == "success":
             body_fusion_status_value = "stale"
             if not marker_run_matches:
                 body_fusion_error = "run_id_mismatch"
-            elif not artifacts_ok:
+            elif not run_scoped_ok:
                 body_fusion_error = "missing_artifacts"
     elif not body_fusion_running:
         artifacts_ok = stage_layout.artifact_available(track_fusion_presence)
@@ -3749,7 +3767,7 @@ if status_refreshed_at:
 else:
     st.caption("Status will refresh when a job starts or you press refresh.")
 
-attempt_col1, attempt_col2 = st.columns([3, 1])
+attempt_col1, = st.columns([1])
 with attempt_col1:
     available_run_ids = run_layout.list_run_ids(ep_id)
     current_value = st.session_state.get(_active_run_id_key)
@@ -3762,22 +3780,13 @@ with attempt_col1:
         return "Legacy (no run_id)" if not value else value
 
     st.selectbox(
-        "Attempt (run_id)",
+        "Selected Attempt (run_id)",
         attempt_options,
         key=_active_run_id_key,
         format_func=_format_attempt,
-        help="Scopes status/artifacts and any new Detect/Faces/Cluster runs to this attempt.",
+        help="Scopes status/artifacts and per-stage runs to this attempt.",
         disabled=job_running,
     )
-with attempt_col2:
-    if st.button(
-        "New attempt",
-        key=f"{ep_id}::new_attempt_btn",
-        use_container_width=True,
-        disabled=job_running,
-    ):
-        st.session_state[_new_attempt_requested_key] = True
-        st.rerun()
 
 selected_attempt_label = st.session_state.get(_active_run_id_key)
 selected_attempt_label = selected_attempt_label.strip() if isinstance(selected_attempt_label, str) else ""
@@ -3788,6 +3797,74 @@ else:
 if isinstance(api_active_run_id, str) and api_active_run_id.strip():
     if api_active_run_id.strip() != selected_attempt_label:
         st.caption(f"API active_run_id: `{api_active_run_id.strip()}`")
+
+with st.expander("Recent Attempts", expanded=False):
+    recent_runs: list[dict[str, Any]] = []
+    for run_id in run_layout.list_run_ids(ep_id):
+        if selected_attempt_run_id and run_id == selected_attempt_run_id:
+            continue
+        run_root = run_layout.run_root(ep_id, run_id)
+        status_path = run_root / "episode_status.json"
+        status_payload = _read_json_payload(status_path) if status_path.exists() else None
+        stages = status_payload.get("stages") if isinstance(status_payload, dict) else {}
+        completed_stages = []
+        if isinstance(stages, dict):
+            for stage_key, entry in stages.items():
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("status") or "").strip().lower() == "success":
+                    completed_stages.append(stage_layout.stage_label(stage_key))
+        sort_mtime = _safe_mtime(status_path) or _safe_mtime(run_root)
+        if not sort_mtime and isinstance(status_payload, dict):
+            updated_at = status_payload.get("updated_at")
+            if isinstance(updated_at, str):
+                sort_mtime = _safe_mtime(run_root)
+        recent_runs.append(
+            {
+                "run_id": run_id,
+                "completed": ", ".join(completed_stages) if completed_stages else "No stages completed",
+                "mtime": sort_mtime,
+            }
+        )
+
+    recent_runs.sort(key=lambda item: item.get("mtime") or 0.0, reverse=True)
+    recent_runs = recent_runs[:5]
+
+    if not recent_runs:
+        st.caption("No previous attempts found.")
+    else:
+        header_cols = st.columns([3, 4, 2, 1])
+        header_cols[0].caption("Run ID")
+        header_cols[1].caption("Completed stages")
+        header_cols[2].caption("Last update")
+        header_cols[3].caption("")
+        for entry in recent_runs:
+            run_id = entry["run_id"]
+            run_root = run_layout.run_root(ep_id, run_id)
+            status_path = run_root / "episode_status.json"
+            updated_iso = None
+            if status_path.exists():
+                mtime = _safe_mtime(status_path)
+                if mtime:
+                    updated_iso = (
+                        datetime.fromtimestamp(mtime, tz=timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+            updated_label = _format_timestamp(updated_iso) or "—"
+            row_cols = st.columns([3, 4, 2, 1])
+            row_cols[0].code(run_id)
+            row_cols[1].caption(entry["completed"])
+            row_cols[2].caption(updated_label)
+            if row_cols[3].button(
+                "Select",
+                key=f"{ep_id}::select_recent_attempt::{run_id}",
+                use_container_width=True,
+            ):
+                st.session_state[_active_run_id_pending_key] = run_id
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                st.rerun()
 
 if ep_id == "rhoslc-s06e11":
     st.divider()
@@ -3869,6 +3946,13 @@ pipeline_stage_states = [
     ("track_fusion", body_fusion_status_value),
     ("pdf", pdf_export_status_value),
 ]
+autorun_active_flag = bool(st.session_state.get(_autorun_key, False))
+autorun_phase_value = st.session_state.get(_autorun_phase_key)
+autorun_phase_label = None
+if autorun_active_flag and autorun_phase_value:
+    autorun_phase_key = stage_layout.normalize_stage_key(str(autorun_phase_value))
+    if autorun_phase_key:
+        autorun_phase_label = stage_layout.stage_label(autorun_phase_key)
 setup_complete = bool(
     selected_attempt_run_id
     and all(state == "success" for _, state in pipeline_stage_states)
@@ -3885,10 +3969,12 @@ if not selected_attempt_run_id:
     pipeline_state_label = "Select run_id"
 elif error_stage_label:
     pipeline_state_label = f"Error ({error_stage_label})"
-elif running_stage_label:
-    pipeline_state_label = f"Running ({running_stage_label})"
 elif setup_complete:
     pipeline_state_label = "Complete"
+elif autorun_phase_label:
+    pipeline_state_label = f"Running ({autorun_phase_label})"
+elif running_stage_label:
+    pipeline_state_label = f"Running ({running_stage_label})"
 else:
     pipeline_state_label = "Ready"
 
@@ -3904,6 +3990,7 @@ action_col1, action_col2, action_col3 = st.columns(3)
 with action_col1:
     autorun_active = bool(st.session_state.get(_autorun_key, False))
     autorun_start_requested_key = f"{ep_id}::autorun_start_requested"
+    autorun_rerun_requested_key = f"{ep_id}::autorun_rerun_requested"
     if autorun_active:
         if st.button("⏹️ Stop Auto-Run", key=f"{ep_id}::stop_autorun_header", use_container_width=True):
             st.session_state[_autorun_key] = False
@@ -3914,13 +4001,25 @@ with action_col1:
     else:
         autorun_disabled = not local_video_exists or _job_active(ep_id) or st.session_state.get(running_job_key, False)
         if st.button(
-            "🚀 Auto-Run Setup",
+            "🚀 Run New Attempt (Setup Pipeline)",
             key=f"{ep_id}::start_autorun_header",
             use_container_width=True,
             type="primary",
             disabled=autorun_disabled,
         ):
             st.session_state[autorun_start_requested_key] = True
+            st.rerun()
+        rerun_disabled = autorun_disabled or not selected_attempt_run_id
+        rerun_help = "Select a run-scoped attempt (run_id) above." if not selected_attempt_run_id else None
+        if st.button(
+            "↻ Re-run selected attempt",
+            key=f"{ep_id}::rerun_autorun_header",
+            use_container_width=True,
+            type="secondary",
+            disabled=rerun_disabled,
+            help=rerun_help,
+        ):
+            st.session_state[autorun_rerun_requested_key] = True
             st.rerun()
 with action_col2:
     pdf_header_disabled = (
@@ -3972,191 +4071,7 @@ with action_col3:
             pass
         st.switch_page("pages/3_Faces_Review.py")
 
-if not db_available:
-    st.caption("Smart Suggestions unavailable (DB not configured).")
-elif st.button(
-    "Smart Suggestions",
-    key=f"{ep_id}::{selected_attempt_run_id or 'legacy'}::nav_smart_suggestions",
-    use_container_width=True,
-    disabled=not selected_attempt_run_id,
-    help="Select a run-scoped attempt (run_id) above." if not selected_attempt_run_id else None,
-):
-    try:
-        qp = st.query_params
-        qp["ep_id"] = ep_id
-        if selected_attempt_run_id:
-            qp["run_id"] = selected_attempt_run_id
-        else:
-            try:
-                del qp["run_id"]
-            except Exception:
-                pass
-        st.query_params = qp
-    except Exception:
-        pass
-    st.switch_page("pages/3_Smart_Suggestions.py")
-
-with st.expander("Stage Summary", expanded=False):
-    if not selected_attempt_run_id:
-        st.info("Select a run-scoped attempt (run_id) to view per-stage status and artifacts.")
-    else:
-        stage_plan = list(stage_layout.PIPELINE_STAGE_PLAN)
-        if isinstance(episode_status_payload, dict):
-            raw_plan = episode_status_payload.get("stage_plan")
-            if isinstance(raw_plan, list) and raw_plan:
-                normalized = [stage_layout.normalize_stage_key(str(item)) for item in raw_plan]
-                stage_plan = [item for item in normalized if item in stage_layout.PIPELINE_STAGE_PLAN]
-        if episode_status_payload:
-            st.caption("Source: episode_status.json (run-scoped)")
-        else:
-            st.caption("Source: stage markers + manifests (episode_status.json missing)")
-    
-        run_root = run_layout.run_root(ep_id, selected_attempt_run_id)
-        stage_artifact_map: dict[str, list[dict[str, Any]]] = {}
-        artifact_rel_paths: set[str] = set()
-    
-        def _artifact_rel(path: Path) -> str | None:
-            try:
-                return str(path.relative_to(run_root))
-            except Exception:
-                return None
-    
-        for stage_key in stage_plan:
-            stage_entry = (
-                (episode_status_payload or {}).get("stages", {}).get(stage_key)
-                if isinstance(episode_status_payload, dict)
-                else None
-            )
-            artifacts = stage_entry.get("artifacts") if isinstance(stage_entry, dict) else None
-            if not isinstance(artifacts, list):
-                artifacts = stage_artifacts(ep_id, selected_attempt_run_id, stage_key)
-            stage_artifact_map[stage_key] = artifacts
-            for artifact in artifacts:
-                path_raw = artifact.get("path") if isinstance(artifact, dict) else None
-                if not path_raw:
-                    continue
-                rel = _artifact_rel(Path(path_raw))
-                if rel:
-                    artifact_rel_paths.add(rel)
-    
-        presence_map: dict[str, dict[str, Any]] = {}
-        if artifact_rel_paths:
-            presence_map = _cached_run_artifact_presence(
-                ep_id,
-                selected_attempt_run_id,
-                tuple(sorted(artifact_rel_paths)),
-            )
-    
-        def _artifact_display(artifact: dict[str, Any]) -> str:
-            path_raw = artifact.get("path")
-            label = artifact.get("label") or (Path(path_raw).name if path_raw else "artifact")
-            scope = artifact.get("scope") or ("run" if "runs" in str(path_raw or "") else "legacy")
-            source = "missing"
-            if path_raw:
-                path_obj = Path(path_raw)
-                if path_obj.exists():
-                    source = "local"
-                else:
-                    rel = _artifact_rel(path_obj)
-                    presence = presence_map.get(rel or "")
-                    if isinstance(presence, dict) and presence.get("remote"):
-                        source = "s3"
-            return f"{label} ({scope} · {source})"
-    
-        def _fallback_stage_entry(stage_key: str) -> dict[str, Any]:
-            if stage_key == "detect":
-                return {
-                    "status": detect_status_value,
-                    "started_at": detect_phase_status.get("started_at"),
-                    "ended_at": detect_phase_status.get("finished_at"),
-                    "duration_s": detect_phase_status.get("runtime_sec"),
-                    "error_reason": detect_phase_status.get("error") or detect_phase_status.get("error_reason"),
-                }
-            if stage_key == "faces":
-                return {
-                    "status": faces_status_value,
-                    "started_at": faces_phase_status.get("started_at"),
-                    "ended_at": faces_phase_status.get("finished_at"),
-                    "duration_s": faces_phase_status.get("runtime_sec"),
-                    "error_reason": faces_phase_status.get("error") or faces_phase_status.get("error_reason"),
-                }
-            if stage_key == "cluster":
-                return {
-                    "status": cluster_status_value,
-                    "started_at": cluster_phase_status.get("started_at"),
-                    "ended_at": cluster_phase_status.get("finished_at"),
-                    "duration_s": cluster_phase_status.get("runtime_sec"),
-                    "error_reason": cluster_phase_status.get("error") or cluster_phase_status.get("error_reason"),
-                }
-            if stage_key == "body_tracking":
-                return {
-                    "status": body_tracking_status_value,
-                    "started_at": body_tracking_started_at,
-                    "ended_at": body_tracking_finished_at,
-                    "duration_s": _runtime_from_iso(body_tracking_started_at, body_tracking_finished_at),
-                    "error_reason": body_tracking_error,
-                }
-            if stage_key == "track_fusion":
-                return {
-                    "status": body_fusion_status_value,
-                    "started_at": track_fusion_started_at,
-                    "ended_at": track_fusion_finished_at,
-                    "duration_s": _runtime_from_iso(track_fusion_started_at, track_fusion_finished_at),
-                    "error_reason": body_fusion_error,
-                }
-            if stage_key == "pdf":
-                return {
-                    "status": pdf_export_status_value,
-                    "started_at": pdf_export_started_at,
-                    "ended_at": pdf_export_finished_at,
-                    "duration_s": _runtime_from_iso(pdf_export_started_at, pdf_export_finished_at),
-                    "error_reason": pdf_export_detail if pdf_export_status_value == "error" else None,
-                }
-            return {"status": "unknown"}
-    
-        def _merge_stage_entry(stage_key: str, stage_entry: dict[str, Any] | None) -> dict[str, Any]:
-            fallback_entry = _fallback_stage_entry(stage_key)
-            if not isinstance(stage_entry, dict):
-                return fallback_entry
-            stage_status = str(stage_entry.get("status") or "").strip().lower()
-            fallback_status = str(fallback_entry.get("status") or "").strip().lower()
-            if stage_status in {"missing", "unknown", "stale"} and fallback_status not in {"missing", "unknown", "stale", ""}:
-                return fallback_entry
-            merged = dict(stage_entry)
-            for key in ("started_at", "ended_at", "duration_s", "error_reason"):
-                if not merged.get(key) and fallback_entry.get(key) is not None:
-                    merged[key] = fallback_entry.get(key)
-            return merged
-    
-        summary_rows: list[dict[str, Any]] = []
-        stages_payload = episode_status_payload.get("stages", {}) if isinstance(episode_status_payload, dict) else {}
-        for stage_key in stage_plan:
-            stage_entry = _merge_stage_entry(stage_key, stages_payload.get(stage_key))
-            started_at = stage_entry.get("started_at")
-            ended_at = stage_entry.get("ended_at")
-            duration_val = stage_entry.get("duration_s")
-            if duration_val is None:
-                duration_val = _runtime_from_iso(started_at, ended_at)
-            duration_label = _format_runtime(duration_val) or "n/a"
-            artifacts = stage_artifact_map.get(stage_key) or []
-            artifacts_label = ", ".join(_artifact_display(a) for a in artifacts if isinstance(a, dict)) or "n/a"
-            summary_rows.append(
-                {
-                    "Stage": stage_layout.stage_label(stage_key),
-                    "Status": stage_entry.get("status") or "unknown",
-                    "Started": started_at or "—",
-                    "Ended": ended_at or "—",
-                    "Duration": duration_label,
-                    "Artifacts": artifacts_label,
-                    "Error": stage_entry.get("error_reason") or "",
-                }
-            )
-    
-        if summary_rows:
-            st.dataframe(summary_rows, hide_index=True, use_container_width=True)
-        else:
-            st.caption("No stage summary available.")
-    
+st.markdown("### Selected Attempt Status")
 st.caption("Pipeline dependencies: detect → faces → cluster → body_tracking → track_fusion → pdf")
 coreml_available = status_payload.get("coreml_available") if status_payload else None
 if coreml_available is False and helpers.is_apple_silicon():
@@ -4543,8 +4458,6 @@ with row2_col1:
             st.caption(f"Body detections: {body_detections_count:,}")
         if body_tracks_count is not None:
             st.caption(f"Body tracks: {body_tracks_count:,}")
-        if body_tracks_presence.remote and not body_tracks_presence.local and body_tracks_presence.s3_key:
-            st.caption(f"S3 key: `{body_tracks_presence.s3_key}`")
     elif body_tracking_status_value == "running":
         st.info("⏳ **Body Tracking**: Running")
         started = _format_timestamp(body_tracking_started_at)
@@ -4612,16 +4525,25 @@ with row2_col1:
         ("body_tracking/body_detections.jsonl", body_detections_path, "run"),
         ("body_tracking/body_tracks.jsonl", body_tracks_path, "run"),
     ]
-    if body_tracking_manifest_fallback:
+    show_legacy_body_tracking = body_tracking_legacy_available and not stage_layout.artifact_available(
+        body_tracks_presence
+    )
+    if show_legacy_body_tracking:
         body_tracking_artifacts.extend(
             [
                 ("legacy/body_tracking/body_detections.jsonl", legacy_body_detections_path, "legacy"),
                 ("legacy/body_tracking/body_tracks.jsonl", legacy_body_tracks_path, "legacy"),
             ]
         )
+    body_tracking_hint = (
+        "⚠️ Legacy artifacts detected; run-scoped artifacts are missing for this attempt."
+        if show_legacy_body_tracking
+        else None
+    )
     _render_stage_artifacts_expander(
         "Body Tracking",
         body_tracking_artifacts,
+        hint=body_tracking_hint,
     )
 
 with row2_col2:
@@ -4639,8 +4561,6 @@ with row2_col2:
             st.caption(f"Fusion output: {helpers.link_local(track_fusion_path)}")
         if screentime_comparison_path.exists():
             st.caption(f"Fusion comparison: {helpers.link_local(screentime_comparison_path)}")
-        if track_fusion_presence.remote and not track_fusion_presence.local and track_fusion_presence.s3_key:
-            st.caption(f"S3 key: `{track_fusion_presence.s3_key}`")
     elif body_fusion_status_value == "running":
         st.info("⏳ **Track Fusion**: Running")
         started = _format_timestamp(track_fusion_started_at)
@@ -4651,12 +4571,26 @@ with row2_col2:
         st.error("⚠️ **Track Fusion**: Failed")
         if body_fusion_error:
             st.caption(body_fusion_error)
-    elif body_fusion_status_value not in {"missing", "unknown"}:
-        st.warning(f"⚠️ **Track Fusion**: {body_fusion_status_value.title()}")
-    else:
-        if not track_fusion_body_tracks_ready or not track_fusion_faces_ready:
-            st.warning("⚠️ **Track Fusion**: Missing prerequisites")
+        else:
+            st.warning(f"⚠️ **Track Fusion**: {body_fusion_status_value.title()}")
+    elif body_fusion_status_value in {"missing", "unknown"}:
+        missing = []
+        if not track_fusion_body_tracks_ready:
+            missing.append("body_tracking/body_tracks.jsonl")
+        if not track_fusion_faces_ready:
+            missing.append("faces.jsonl")
+        upstream_complete = body_tracking_status_value == "success" and faces_ready_state
+        prereq_state, prereq_message = helpers.describe_prereq_state(
+            missing,
+            upstream_complete=upstream_complete,
+        )
+        if missing:
             run_label = selected_attempt_run_id or "legacy"
+            if prereq_state == "waiting":
+                st.info("⏳ **Track Fusion**: Waiting for prerequisites")
+            else:
+                st.warning("⚠️ **Track Fusion**: Missing prerequisites")
+            st.caption(prereq_message)
             if not track_fusion_body_tracks_ready:
                 st.markdown(
                     f"Run [Body Tracking](#body-tracking-card) for this run_id (`{run_label}`) to generate "
@@ -4664,8 +4598,6 @@ with row2_col2:
                     unsafe_allow_html=True,
                 )
                 st.caption(f"Missing: {helpers.link_local(body_tracks_path)}")
-                if body_tracks_presence.s3_key:
-                    st.caption(f"S3 key: `{body_tracks_presence.s3_key}`")
             if not track_fusion_faces_ready:
                 st.markdown(
                     f"Run [Faces Harvest](#faces-harvest-card) for this run_id (`{run_label}`) "
@@ -4673,8 +4605,6 @@ with row2_col2:
                     unsafe_allow_html=True,
                 )
                 st.caption(f"Missing: {helpers.link_local(faces_path)}")
-                if faces_presence.s3_key:
-                    st.caption(f"S3 key: `{faces_presence.s3_key}`")
         else:
             st.info("⏳ **Track Fusion**: Ready to run")
             st.caption("Body tracks and faces are available.")
@@ -4740,11 +4670,22 @@ with row2_col2:
         ("body_tracking/track_fusion.json", track_fusion_path, "run"),
         ("body_tracking/screentime_comparison.json", screentime_comparison_path, "run"),
     ]
-    if body_fusion_manifest_fallback:
-        track_fusion_artifacts.append(("legacy/body_tracking/track_fusion.json", legacy_track_fusion_path, "legacy"))
+    show_legacy_track_fusion = body_fusion_legacy_available and not stage_layout.artifact_available(
+        track_fusion_presence
+    )
+    if show_legacy_track_fusion:
+        track_fusion_artifacts.append(
+            ("legacy/body_tracking/track_fusion.json", legacy_track_fusion_path, "legacy")
+        )
+    track_fusion_hint = (
+        "⚠️ Legacy artifacts detected; run-scoped artifacts are missing for this attempt."
+        if show_legacy_track_fusion
+        else None
+    )
     _render_stage_artifacts_expander(
         "Track Fusion",
         track_fusion_artifacts,
+        hint=track_fusion_hint,
     )
 
 with row2_col3:
@@ -4908,6 +4849,167 @@ combo_detector, combo_tracker = helpers.detect_tracker_combo(ep_id, detect_phase
 combo_supported_harvest = helpers.pipeline_combo_supported("harvest", combo_detector, combo_tracker)
 combo_supported_cluster = helpers.pipeline_combo_supported("cluster", combo_detector, combo_tracker)
 
+with st.expander("Advanced: Stage Summary", expanded=False):
+    summary_rows: list[dict[str, Any]] = []
+    if not selected_attempt_run_id:
+        st.info("Select a run-scoped attempt (run_id) to view per-stage status and artifacts.")
+    else:
+        stage_plan = list(stage_layout.PIPELINE_STAGE_PLAN)
+        if isinstance(episode_status_payload, dict):
+            raw_plan = episode_status_payload.get("stage_plan")
+            if isinstance(raw_plan, list) and raw_plan:
+                normalized = [stage_layout.normalize_stage_key(str(item)) for item in raw_plan]
+                stage_plan = [item for item in normalized if item in stage_layout.PIPELINE_STAGE_PLAN]
+        if episode_status_payload:
+            st.caption("Source: episode_status.json (run-scoped)")
+        else:
+            st.caption("Source: stage markers + manifests (episode_status.json missing)")
+
+        run_root = run_layout.run_root(ep_id, selected_attempt_run_id)
+        stage_artifact_map: dict[str, list[dict[str, Any]]] = {}
+        artifact_rel_paths: set[str] = set()
+
+        def _artifact_rel(path: Path) -> str | None:
+            try:
+                return str(path.relative_to(run_root))
+            except Exception:
+                return None
+
+        for stage_key in stage_plan:
+            stage_entry = (
+                (episode_status_payload or {}).get("stages", {}).get(stage_key)
+                if isinstance(episode_status_payload, dict)
+                else None
+            )
+            artifacts = stage_entry.get("artifacts") if isinstance(stage_entry, dict) else None
+            if not isinstance(artifacts, list):
+                artifacts = stage_artifacts(ep_id, selected_attempt_run_id, stage_key)
+            stage_artifact_map[stage_key] = artifacts
+            for artifact in artifacts:
+                path_raw = artifact.get("path") if isinstance(artifact, dict) else None
+                if not path_raw:
+                    continue
+                rel = _artifact_rel(Path(path_raw))
+                if rel:
+                    artifact_rel_paths.add(rel)
+
+        presence_map: dict[str, dict[str, Any]] = {}
+        if artifact_rel_paths:
+            presence_map = _cached_run_artifact_presence(
+                ep_id,
+                selected_attempt_run_id,
+                tuple(sorted(artifact_rel_paths)),
+            )
+
+        def _artifact_display(artifact: dict[str, Any]) -> str:
+            path_raw = artifact.get("path")
+            label = artifact.get("label") or (Path(path_raw).name if path_raw else "artifact")
+            scope = artifact.get("scope") or ("run" if "runs" in str(path_raw or "") else "legacy")
+            source = "missing"
+            if path_raw:
+                path_obj = Path(path_raw)
+                if path_obj.exists():
+                    source = "local"
+                else:
+                    rel = _artifact_rel(path_obj)
+                    presence = presence_map.get(rel or "")
+                    if isinstance(presence, dict) and presence.get("remote"):
+                        source = "s3"
+            return f"{label} ({scope} · {source})"
+
+        def _fallback_stage_entry(stage_key: str) -> dict[str, Any]:
+            if stage_key == "detect":
+                return {
+                    "status": detect_status_value,
+                    "started_at": detect_phase_status.get("started_at"),
+                    "ended_at": detect_phase_status.get("finished_at"),
+                    "duration_s": detect_phase_status.get("runtime_sec"),
+                    "error_reason": detect_phase_status.get("error") or detect_phase_status.get("error_reason"),
+                }
+            if stage_key == "faces":
+                return {
+                    "status": faces_status_value,
+                    "started_at": faces_phase_status.get("started_at"),
+                    "ended_at": faces_phase_status.get("finished_at"),
+                    "duration_s": faces_phase_status.get("runtime_sec"),
+                    "error_reason": faces_phase_status.get("error") or faces_phase_status.get("error_reason"),
+                }
+            if stage_key == "cluster":
+                return {
+                    "status": cluster_status_value,
+                    "started_at": cluster_phase_status.get("started_at"),
+                    "ended_at": cluster_phase_status.get("finished_at"),
+                    "duration_s": cluster_phase_status.get("runtime_sec"),
+                    "error_reason": cluster_phase_status.get("error") or cluster_phase_status.get("error_reason"),
+                }
+            if stage_key == "body_tracking":
+                return {
+                    "status": body_tracking_status_value,
+                    "started_at": body_tracking_started_at,
+                    "ended_at": body_tracking_finished_at,
+                    "duration_s": _runtime_from_iso(body_tracking_started_at, body_tracking_finished_at),
+                    "error_reason": body_tracking_error,
+                }
+            if stage_key == "track_fusion":
+                return {
+                    "status": body_fusion_status_value,
+                    "started_at": track_fusion_started_at,
+                    "ended_at": track_fusion_finished_at,
+                    "duration_s": _runtime_from_iso(track_fusion_started_at, track_fusion_finished_at),
+                    "error_reason": body_fusion_error,
+                }
+            if stage_key == "pdf":
+                return {
+                    "status": pdf_export_status_value,
+                    "started_at": pdf_export_started_at,
+                    "ended_at": pdf_export_finished_at,
+                    "duration_s": _runtime_from_iso(pdf_export_started_at, pdf_export_finished_at),
+                    "error_reason": pdf_export_detail if pdf_export_status_value == "error" else None,
+                }
+            return {"status": "unknown"}
+
+        def _merge_stage_entry(stage_key: str, stage_entry: dict[str, Any] | None) -> dict[str, Any]:
+            fallback_entry = _fallback_stage_entry(stage_key)
+            if not isinstance(stage_entry, dict):
+                return fallback_entry
+            stage_status = str(stage_entry.get("status") or "").strip().lower()
+            fallback_status = str(fallback_entry.get("status") or "").strip().lower()
+            if stage_status in {"missing", "unknown", "stale"} and fallback_status not in {"missing", "unknown", "stale", ""}:
+                return fallback_entry
+            merged = dict(stage_entry)
+            for key in ("started_at", "ended_at", "duration_s", "error_reason"):
+                if not merged.get(key) and fallback_entry.get(key) is not None:
+                    merged[key] = fallback_entry.get(key)
+            return merged
+
+        stages_payload = episode_status_payload.get("stages", {}) if isinstance(episode_status_payload, dict) else {}
+        for stage_key in stage_plan:
+            stage_entry = _merge_stage_entry(stage_key, stages_payload.get(stage_key))
+            started_at = stage_entry.get("started_at")
+            ended_at = stage_entry.get("ended_at")
+            duration_val = stage_entry.get("duration_s")
+            if duration_val is None:
+                duration_val = _runtime_from_iso(started_at, ended_at)
+            duration_label = _format_runtime(duration_val) or "n/a"
+            artifacts = stage_artifact_map.get(stage_key) or []
+            artifacts_label = ", ".join(_artifact_display(a) for a in artifacts if isinstance(a, dict)) or "n/a"
+            summary_rows.append(
+                {
+                    "Stage": stage_layout.stage_label(stage_key),
+                    "Status": stage_entry.get("status") or "unknown",
+                    "Started": started_at or "—",
+                    "Ended": ended_at or "—",
+                    "Duration": duration_label,
+                    "Artifacts": artifacts_label,
+                    "Error": stage_entry.get("error_reason") or "",
+                }
+            )
+
+    if summary_rows:
+        st.dataframe(summary_rows, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No stage summary available.")
+
 # =============================================================================
 # Pipeline Settings Header with Settings Dialog Button
 # =============================================================================
@@ -4981,7 +5083,10 @@ with st.container():
                 status_lines.append(f"✅ {stage_info}")
             if not status_lines:
                 status_lines.append("No stages completed yet.")
-            st.info("**Auto-Run Pipeline Active**\n\n" + "\n\n".join(status_lines))
+            st.info("**Setup Pipeline Active**\n\n" + "\n\n".join(status_lines))
+            active_run_id = st.session_state.get(_autorun_run_id_key) or selected_attempt_run_id
+            if active_run_id:
+                st.caption(f"Active attempt: `{active_run_id}`")
 
             # Progress: count completed enabled stages for the selected run_id.
             from py_screenalytics.autorun_plan import build_autorun_stage_plan
@@ -5072,7 +5177,7 @@ with st.container():
                         st.caption(f"Total inter-stage stall: {format_timing_duration(total_stall)}")
         else:
             st.caption(
-                "Run all pipeline stages in sequence: Detect/Track → Faces → Cluster → "
+                "Run the setup pipeline in sequence: Detect/Track → Faces → Cluster → "
                 "Body Tracking → Track Fusion → PDF"
             )
     with auto_col2:
@@ -5087,6 +5192,7 @@ with st.container():
             # Disable if no video or job already running
             autorun_disabled = not local_video_exists or _job_active(ep_id) or st.session_state.get(running_job_key, False)
             autorun_start_requested_key = f"{ep_id}::autorun_start_requested"
+            autorun_rerun_requested_key = f"{ep_id}::autorun_rerun_requested"
 
             if st.session_state.pop(autorun_start_requested_key, False):
                 if autorun_disabled:
@@ -5216,65 +5322,57 @@ with st.container():
                 st.session_state[f"{ep_id}::autorun_completed_stages"] = []  # Clear completed stages log
                 st.session_state[f"{ep_id}::autorun_started_at"] = time.time()  # Track when auto-run started
                 st.session_state["episode_detail_detect_autorun_flag"] = True  # Trigger detect job
-                st.toast("Starting auto-run pipeline...")
+                st.toast("Starting setup pipeline (new attempt)...")
                 st.rerun()
+            elif st.session_state.pop(autorun_rerun_requested_key, False):
+                if autorun_disabled:
+                    st.error("Auto-run is disabled (missing video or another job is running).")
+                    st.stop()
+                if not selected_attempt_run_id:
+                    st.error("Select a run-scoped attempt before re-running the setup pipeline.")
+                    st.stop()
 
-# Debug: Show auto-run state (collapsible)
-if autorun_active:
-    with st.expander("🔍 Auto-Run Debug Info", expanded=False):
-        # Get current settings for display
-        _debug_detect_settings = _get_detect_settings(ep_id)
-        debug_cols = st.columns(2)
-        with debug_cols[0]:
-            st.markdown("**Session State (Auto-Run)**")
-            st.code(f"""
-autorun_key: {st.session_state.get(_autorun_key)}
-autorun_phase: {st.session_state.get(_autorun_phase_key)}
-completed_stages: {st.session_state.get(f"{ep_id}::autorun_completed_stages", [])}
-detect_autorun_flag: {st.session_state.get("episode_detail_detect_autorun_flag", False)}
-faces_trigger: {st.session_state.get(f"{ep_id}::autorun_faces_trigger", False)}
-cluster_trigger: {st.session_state.get(f"{ep_id}::autorun_cluster_trigger", False)}
-            """, language="yaml")
-        with debug_cols[1]:
-            st.markdown("**Job State**")
-            st.code(f"""
-running_job_key: {st.session_state.get(running_job_key, False)}
-detect_running: {st.session_state.get(_detect_job_state_key(ep_id), False)}
-job_activity: {st.session_state.get(_job_activity_key(ep_id), False)}
-tracks_just_completed: {st.session_state.get(f"{ep_id}::tracks_just_completed", False)}
-faces_just_completed: {st.session_state.get(f"{ep_id}::faces_just_completed", False)}
-            """, language="yaml")
-            st.markdown("**Completion Flags (from ui_helpers)**")
-            st.code(f"""
-detect_track_just_completed: {st.session_state.get(f"{ep_id}::detect_track_just_completed", False)}
-faces_embed_just_completed: {st.session_state.get(f"{ep_id}::faces_embed_just_completed", False)}
-cluster_just_completed: {st.session_state.get(f"{ep_id}::cluster_just_completed", False)}
-            """, language="yaml")
-        st.markdown("**Phase Status (from API)**")
-        st.code(f"""
-detect_status: {detect_phase_status.get("status", "?")}
-faces_status: {faces_phase_status.get("status", "?")}
-cluster_status: {cluster_phase_status.get("status", "?")}
-        """, language="yaml")
-        st.markdown("**Timing (for fallback checks)**")
-        _autorun_started = st.session_state.get(f"{ep_id}::autorun_started_at", 0)
-        _autorun_started_str = datetime.fromtimestamp(_autorun_started).isoformat() if _autorun_started else "N/A"
-        st.code(f"""
-autorun_started_at: {_autorun_started_str}
-faces_completed_at: {st.session_state.get(f"{ep_id}::faces_completed_at", "N/A")}
-tracks_completed_at: {st.session_state.get(f"{ep_id}::tracks_completed_at", "N/A")}
-        """, language="yaml")
-        st.markdown("**Pipeline Settings (Current)**")
-        st.code(f"""
-scene_detector: {_debug_detect_settings.get("scene_detector", "?")}
-scene_threshold: {_debug_detect_settings.get("scene_threshold", "?")}
-scene_min_len: {_debug_detect_settings.get("scene_min_len", "?")}
-scene_warmup_dets: {_debug_detect_settings.get("scene_warmup_dets", "?")}
-stride: {_debug_detect_settings.get("stride", "?")}
-device: {_debug_detect_settings.get("device", "?")}
-detector: {_debug_detect_settings.get("detector", "?")}
-tracker: {_debug_detect_settings.get("tracker", "?")}
-        """, language="yaml")
+                run_id = selected_attempt_run_id
+                run_root = run_layout.run_root(ep_id, run_id)
+
+                def _safe_mtime(path: Path) -> float:
+                    try:
+                        return path.stat().st_mtime
+                    except (FileNotFoundError, OSError):
+                        return 0.0
+
+                st.session_state[f"{ep_id}::autorun_detect_baseline_mtime"] = max(
+                    _safe_mtime(run_root / "tracks.jsonl"),
+                    _safe_mtime(run_root / "detect_track.json"),
+                )
+                st.session_state[f"{ep_id}::autorun_faces_baseline_mtime"] = max(
+                    _safe_mtime(run_root / "faces.jsonl"),
+                    _safe_mtime(run_root / "faces_embed.json"),
+                )
+                st.session_state[f"{ep_id}::autorun_cluster_baseline_mtime"] = max(
+                    _safe_mtime(run_root / "identities.json"),
+                    _safe_mtime(run_root / "cluster.json"),
+                )
+
+                st.session_state.pop(_status_mtimes_key(ep_id), None)
+                st.session_state.pop(_status_cache_key(ep_id), None)
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+                helpers.invalidate_running_jobs_cache(ep_id)
+                _cached_local_jobs.clear()
+
+                st.session_state.pop(f"{ep_id}::autorun_detect_promoted_mtime", None)
+                st.session_state.pop(f"{ep_id}::autorun_faces_promoted_mtime", None)
+                st.session_state.pop(f"{ep_id}::autorun_cluster_promoted_mtime", None)
+
+                st.session_state[_autorun_run_id_key] = run_id
+                st.session_state[_active_run_id_pending_key] = run_id
+                st.session_state[_autorun_key] = True
+                st.session_state[_autorun_phase_key] = "detect"
+                st.session_state[f"{ep_id}::autorun_completed_stages"] = []
+                st.session_state[f"{ep_id}::autorun_started_at"] = time.time()
+                st.session_state["episode_detail_detect_autorun_flag"] = True
+                st.toast("Starting setup pipeline (selected attempt)...")
+                st.rerun()
 
 st.divider()
 
@@ -5681,6 +5779,11 @@ def _autorun_drive_downstream(run_id: str) -> None:
         if not body_tracking_enabled:
             _autorun_stop("Body Tracking", "disabled_by_config")
             return
+        if body_tracking_status_value == "stale" and body_tracking_legacy_available:
+            _autorun_append_completed("Body Tracking (legacy)")
+            st.session_state[_autorun_phase_key] = "track_fusion"
+            st.toast("⚠️ Body Tracking complete (legacy artifacts).")
+            st.rerun()
         if stage_layout.downstream_stage_allows_advance(body_tracking_status_value, body_tracking_error):
             _autorun_append_completed("Body Tracking")
             st.session_state[_autorun_phase_key] = "track_fusion"
@@ -5707,6 +5810,14 @@ def _autorun_drive_downstream(run_id: str) -> None:
         if not track_fusion_enabled:
             _autorun_stop("Track Fusion", "disabled_by_config")
             return
+        if body_fusion_status_value == "stale" and body_fusion_legacy_available:
+            stage_label = "Track Fusion (legacy)"
+            if fusion_mode_label:
+                stage_label = f"{stage_label} ({fusion_mode_label})"
+            _autorun_append_completed(stage_label)
+            st.session_state[_autorun_phase_key] = "pdf"
+            st.toast("⚠️ Track Fusion complete (legacy artifacts).")
+            st.rerun()
         if stage_layout.downstream_stage_allows_advance(body_fusion_status_value, body_fusion_error):
             stage_label = "Track Fusion"
             if fusion_mode_label:
@@ -5778,7 +5889,7 @@ def _autorun_drive_downstream(run_id: str) -> None:
                 "PDF",
             ]
             completion_label = " · ".join(completion_bits)
-            st.success(f"🎉 **Auto-Run Complete!** ({completion_label})")
+            st.success(f"🎉 **Setup Pipeline Complete!** ({completion_label})")
             # Now that setup is complete, open Improve Faces for this run (best-effort).
             if selected_attempt_run_id:
                 st.session_state[_improve_faces_state_key(ep_id, selected_attempt_run_id, "trigger")] = True
@@ -6258,9 +6369,7 @@ with col_detect:
                 st.session_state[_autorun_phase_key] = None
     st.caption("Mirrors required video artifacts automatically before detect/track starts.")
 
-    # Show previous run logs (only in local mode, collapsed by default)
-    if helpers.get_execution_mode(ep_id) == "local":
-        helpers.render_previous_logs(ep_id, "detect_track", expanded=False)
+
 
 with col_faces:
     # CRITICAL: Check for detect_track completion flag set by ui_helpers
@@ -6510,7 +6619,7 @@ with col_faces:
 
     # Debug: Show why faces might be disabled (only when auto-run is active)
     if autorun_active and autorun_faces_trigger:
-        with st.expander("🔍 Faces Phase Debug", expanded=True):
+        with st.expander("🔍 Faces Phase Debug", expanded=False):
             st.markdown(f"**Trigger received**: `autorun_faces_trigger={autorun_faces_trigger}`")
             st.markdown(f"**faces_disabled**: `{faces_disabled}`")
             if faces_disabled:
@@ -6728,9 +6837,7 @@ with col_faces:
                 # Note: status refresh and auto-run progression are now set BEFORE this block
                 st.rerun()
 
-    # Show previous run logs (only in local mode, collapsed by default)
-    if helpers.get_execution_mode(ep_id) == "local":
-        helpers.render_previous_logs(ep_id, "faces_embed", expanded=False)
+
 
 with col_cluster:
     # CRITICAL: Check for faces_embed completion flag set by ui_helpers
@@ -7116,7 +7223,7 @@ with col_cluster:
 
     # Debug: Show why cluster might be disabled (only when auto-run is active)
     if autorun_active and autorun_cluster_trigger:
-        with st.expander("🔍 Cluster Phase Debug", expanded=True):
+        with st.expander("🔍 Cluster Phase Debug", expanded=False):
             st.markdown(f"**Trigger received**: `autorun_cluster_trigger={autorun_cluster_trigger}`")
             st.markdown(f"**cluster_disabled**: `{cluster_disabled}`")
             if cluster_disabled:
@@ -7375,9 +7482,6 @@ with col_cluster:
                         st.toast("🎯 Cluster complete! Improve Faces unavailable (DB not configured).")
                 st.rerun()
 
-    # Keep latest cluster log handy for copy/paste
-    helpers.render_previous_logs(ep_id, "cluster", expanded=False)
-
     # Show appropriate button based on state
     if cluster_status_value == "success":
         # If Improve Faces was completed, show "FACES REVIEW" button
@@ -7519,65 +7623,130 @@ else:
             st.session_state.pop(export_state_key, None)
             st.rerun()
 
-st.subheader("Artifacts")
-
-
-def _render_artifact_entry(label: str, local_path: Path, key_suffix: str, s3_key: str | None = None) -> None:
+def _render_artifact_entry(
+    label: str,
+    local_path: Path,
+    key_suffix: str,
+    s3_keys: list[tuple[str, str]] | None = None,
+) -> None:
     st.write(f"{label} → {helpers.link_local(local_path)}")
-    if not s3_key:
+    if not s3_keys:
         return
-    uri_col, button_col = st.columns([4, 1])
-    uri_col.code(helpers.s3_uri(s3_key, bucket_name))
-    if button_col.button("Presign", key=f"presign_{key_suffix}"):
-        try:
-            presign_resp = helpers.api_get("/files/presign", params={"key": s3_key})
-        except requests.RequestException as exc:
-            st.error(helpers.describe_error(f"{cfg['api_base']}/files/presign", exc))
-        else:
-            url_value = presign_resp.get("url")
-            if url_value:
-                st.code(url_value)
-                ttl_val = presign_resp.get("expires_in")
-                if ttl_val:
-                    st.caption(f"Expires in {ttl_val}s")
+    for scope_label, s3_key in s3_keys:
+        st.caption(scope_label)
+        uri_col, button_col = st.columns([4, 1])
+        uri_col.code(helpers.s3_uri(s3_key, bucket_name))
+        safe_label = (
+            scope_label.replace("⚠️", "legacy")
+            .replace("(", "")
+            .replace(")", "")
+            .replace("/", "_")
+            .replace(" ", "_")
+        )
+        if button_col.button("Presign", key=f"presign_{key_suffix}_{safe_label}"):
+            try:
+                presign_resp = helpers.api_get("/files/presign", params={"key": s3_key})
+            except requests.RequestException as exc:
+                st.error(helpers.describe_error(f"{cfg['api_base']}/files/presign", exc))
             else:
-                st.warning("Presign unavailable for this key.")
+                url_value = presign_resp.get("url")
+                if url_value:
+                    st.code(url_value)
+                    ttl_val = presign_resp.get("expires_in")
+                    if ttl_val:
+                        st.caption(f"Expires in {ttl_val}s")
+                else:
+                    st.warning("Presign unavailable for this key.")
 
 
-manifests_prefix = (prefixes or {}).get("manifests") if prefixes else None
-_render_artifact_entry(
-    "Video",
-    get_path(ep_id, "video"),
-    "video",
-    details["s3"]["v2_key"] or details["s3"]["v1_key"],
-)
-detections_key = f"{manifests_prefix}detections.jsonl" if manifests_prefix else None
-tracks_key = f"{manifests_prefix}tracks.jsonl" if manifests_prefix else None
-faces_key = f"{manifests_prefix}faces.jsonl" if manifests_prefix else None
-identities_key = f"{manifests_prefix}identities.json" if manifests_prefix else None
-_render_artifact_entry("Detections", detections_path, "detections", detections_key)
-_render_artifact_entry("Tracks", tracks_path, "tracks", tracks_key)
-_render_artifact_entry("Faces", faces_path, "faces", faces_key)
-_render_artifact_entry("Identities", identities_path, "identities", identities_key)
+with st.expander("Artifacts", expanded=False):
+    manifests_prefix = (prefixes or {}).get("manifests") if prefixes else None
+    video_keys: list[tuple[str, str]] = []
+    if details["s3"]["v2_key"]:
+        video_keys.append(("episode v2", details["s3"]["v2_key"]))
+    elif details["s3"]["v1_key"]:
+        video_keys.append(("episode v1 (legacy)", details["s3"]["v1_key"]))
 
-out_of_scope_artifacts: list[tuple[str, Path]] = []
-if selected_attempt_run_id:
-    run_analytics_dir = manifests_dir / "analytics"
+    _render_artifact_entry(
+        "Video",
+        get_path(ep_id, "video"),
+        "video",
+        video_keys or None,
+    )
+
+    run_presence_map: dict[str, dict[str, Any]] = {}
+    run_rel_paths = ("detections.jsonl", "tracks.jsonl", "faces.jsonl", "identities.json")
+    if selected_attempt_run_id:
+        run_presence_map = _cached_run_artifact_presence(
+            ep_id,
+            selected_attempt_run_id,
+            run_rel_paths,
+        )
+
+    def _run_s3_entries(rel_path: str, *, local_exists: bool) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        if selected_attempt_run_id:
+            presence = run_presence_map.get(rel_path) or {}
+            canonical_key = presence.get("canonical_key")
+            legacy_key = presence.get("legacy_key")
+            canonical_remote = bool(presence.get("canonical_remote"))
+            legacy_remote = bool(presence.get("legacy_remote"))
+            status = "local" if local_exists else ("present" if canonical_remote else "missing")
+            if canonical_key:
+                entries.append((f"run ({status})", canonical_key))
+            if legacy_key and (legacy_remote or (not local_exists and not canonical_remote)):
+                legacy_status = "present" if legacy_remote else "missing"
+                prefix = "⚠️ legacy" if legacy_remote and not canonical_remote else "legacy"
+                entries.append((f"{prefix} ({legacy_status})", legacy_key))
+            return entries
+
+        if manifests_prefix:
+            entries.append(("legacy (episode-level)", f"{manifests_prefix}{rel_path}"))
+        return entries
+
+    _render_artifact_entry(
+        "Detections",
+        detections_path,
+        "detections",
+        _run_s3_entries("detections.jsonl", local_exists=detections_path.exists()) or None,
+    )
+    _render_artifact_entry(
+        "Tracks",
+        tracks_path,
+        "tracks",
+        _run_s3_entries("tracks.jsonl", local_exists=tracks_path.exists()) or None,
+    )
+    _render_artifact_entry(
+        "Faces",
+        faces_path,
+        "faces",
+        _run_s3_entries("faces.jsonl", local_exists=faces_path.exists()) or None,
+    )
+    _render_artifact_entry(
+        "Identities",
+        identities_path,
+        "identities",
+        _run_s3_entries("identities.json", local_exists=identities_path.exists()) or None,
+    )
+    
+    out_of_scope_artifacts: list[tuple[str, Path]] = []
+    if selected_attempt_run_id:
+        run_analytics_dir = manifests_dir / "analytics"
+        for filename in ("screentime.json", "screentime.csv"):
+            candidate = run_analytics_dir / filename
+            if candidate.exists():
+                out_of_scope_artifacts.append((f"run analytics/{filename}", candidate))
+    legacy_analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
     for filename in ("screentime.json", "screentime.csv"):
-        candidate = run_analytics_dir / filename
+        candidate = legacy_analytics_dir / filename
         if candidate.exists():
-            out_of_scope_artifacts.append((f"run analytics/{filename}", candidate))
-legacy_analytics_dir = helpers.DATA_ROOT / "analytics" / ep_id
-for filename in ("screentime.json", "screentime.csv"):
-    candidate = legacy_analytics_dir / filename
-    if candidate.exists():
-        out_of_scope_artifacts.append((f"legacy analytics/{filename}", candidate))
-if out_of_scope_artifacts:
-    st.caption("Out-of-scope artifacts present (not used for setup completion):")
-    for label, path in out_of_scope_artifacts:
-        st.caption(f"{label} → {helpers.link_local(path)}")
-
-
+            out_of_scope_artifacts.append((f"legacy analytics/{filename}", candidate))
+    if out_of_scope_artifacts:
+        st.caption("Out-of-scope artifacts present (not used for setup completion):")
+        for label, path in out_of_scope_artifacts:
+            st.caption(f"{label} → {helpers.link_local(path)}")
+    
+    
 def _read_json_artifact(path: Path, max_lines: int = 2000) -> tuple[str | None, str | None]:
     """Return (content, error) for a JSON/JSONL artifact with defensive limits."""
     if not path.exists():
@@ -7602,40 +7771,46 @@ def _read_json_artifact(path: Path, max_lines: int = 2000) -> tuple[str | None, 
     return None, f"Unsupported file type for {path.name}"
 
 
-st.subheader("Debug: Raw JSON artifacts")
-artifact_groups = {
-    "Detect / Faces / Tracks": [
-        detections_path,
-        tracks_path,
-        faces_path,
-    ],
-    "Cluster": [
-        identities_path,
-        _track_metrics_path,
-    ],
-}
-for group, paths in artifact_groups.items():
+with st.expander("Debug: Raw JSON artifacts", expanded=False):
+    artifact_groups = {
+        "Detect / Faces / Tracks": [
+            detections_path,
+            tracks_path,
+            faces_path,
+        ],
+        "Cluster": [
+            identities_path,
+            _track_metrics_path,
+        ],
+    }
+    group_labels = list(artifact_groups.keys())
+    selected_group = st.selectbox(
+        "Artifact group",
+        group_labels,
+        index=0,
+        key="debug_artifact_group",
+    )
+    paths = artifact_groups.get(selected_group, [])
     existing = [p for p in paths if p.exists()]
-    with st.expander(group, expanded=False):
-        if not existing:
-            st.caption("No artifacts found for this stage.")
-            continue
+    if not existing:
+        st.caption("No artifacts found for this group.")
+    else:
         labels = [p.name for p in existing]
         selected = st.selectbox(
             "Choose artifact",
             labels,
-            key=f"{group}::artifact_selector",
+            key=f"{selected_group}::artifact_selector",
         )
         chosen_path = next((p for p in existing if p.name == selected), None)
         if not chosen_path:
             st.caption("Select a file to view its contents.")
-            continue
-        st.caption(f"Path: {helpers.link_local(chosen_path)}")
-        content, err = _read_json_artifact(chosen_path)
-        if err:
-            st.error(err)
-            continue
-        st.code(content or "", language="json")
+        else:
+            st.caption(f"Path: {helpers.link_local(chosen_path)}")
+            content, err = _read_json_artifact(chosen_path)
+            if err:
+                st.error(err)
+            else:
+                st.code(content or "", language="json")
 
 
 # =============================================================================

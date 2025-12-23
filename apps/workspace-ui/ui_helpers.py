@@ -17,7 +17,7 @@ import threading
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from datetime import datetime, timezone
@@ -3731,6 +3731,31 @@ def s3_uri(prefix: str | None, bucket: str | None = None) -> str:
     if not bucket_name:
         return cleaned
     return f"s3://{bucket_name}/{cleaned}"
+
+
+def run_artifact_s3_keys(ep_id: str, run_id: str, rel_path: str) -> tuple[str, str | None]:
+    """Return (canonical, legacy) S3 keys for a run-scoped artifact."""
+    from py_screenalytics import run_layout
+
+    keys = run_layout.run_artifact_s3_keys_for_read(ep_id, run_id, rel_path)
+    canonical = keys[0] if keys else ""
+    legacy = keys[1] if len(keys) > 1 and keys[1] != canonical else None
+    return canonical, legacy
+
+
+def describe_prereq_state(
+    missing: Sequence[str],
+    *,
+    upstream_complete: bool,
+) -> tuple[str, str]:
+    """Return (state, message) for prerequisite checks."""
+    missing_list = [item for item in missing if item]
+    if not missing_list:
+        return "ready", "Prerequisites satisfied."
+    pretty = " + ".join(missing_list)
+    if not upstream_complete:
+        return "waiting", f"Waiting for {pretty}."
+    return "error", f"Missing prerequisites: {pretty}."
 
 
 def run_job_with_progress(
