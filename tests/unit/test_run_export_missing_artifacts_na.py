@@ -222,3 +222,36 @@ def test_pdf_reports_body_tracker_backend_fallback_when_supervision_missing(
     assert "iou_fallback" in combined
     assert "tracking backend fallback activated" in combined
     assert "Install" in combined
+
+
+def test_pdf_setup_scope_excludes_screentime_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Episode Details PDF should omit screentime sections when include_screentime=False."""
+    import sys
+
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("SCREENALYTICS_PDF_NO_COMPRESSION", "1")
+    monkeypatch.setenv("SCREENALYTICS_FAKE_DB", "1")
+
+    from py_screenalytics import run_layout
+    from apps.api.services.run_export import build_screentime_run_debug_pdf
+
+    ep_id = "ep-setup-only"
+    run_id = "run-setup"
+
+    run_root = run_layout.run_root(ep_id, run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    pdf_bytes, _name = build_screentime_run_debug_pdf(
+        ep_id=ep_id,
+        run_id=run_id,
+        include_screentime=False,
+    )
+    combined = "\n".join(_ascii_strings(pdf_bytes))
+
+    assert "Setup Pipeline Run Debug Report" in combined
+    assert "Screen Time Analyze" not in combined

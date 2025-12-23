@@ -685,4 +685,4 @@ def test_episode_detail_autorun_track_fusion_legacy_marker_advances(tmp_path, mo
     finally:
         sys.path[:] = original_sys_path
 
-    assert st_mod.session_state.get(f"{ep_id}::autorun_phase") == "screentime"
+    assert st_mod.session_state.get(f"{ep_id}::autorun_phase") == "pdf"

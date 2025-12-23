@@ -5,41 +5,19 @@ from __future__ import annotations
 from py_screenalytics.autorun_plan import autorun_complete, build_autorun_stage_plan
 
 
-def test_stage_plan_excludes_downstream_when_disabled() -> None:
-    assert build_autorun_stage_plan(body_tracking_enabled=False, track_fusion_enabled=False) == [
-        "detect",
-        "faces",
-        "cluster",
-        "screentime",
-        "pdf",
-    ]
-
-
-def test_stage_plan_includes_body_tracking_when_enabled() -> None:
-    assert build_autorun_stage_plan(body_tracking_enabled=True, track_fusion_enabled=False) == [
-        "detect",
-        "faces",
-        "cluster",
-        "body_tracking",
-        "screentime",
-        "pdf",
-    ]
-
-
-def test_stage_plan_includes_track_fusion_when_enabled() -> None:
-    assert build_autorun_stage_plan(body_tracking_enabled=True, track_fusion_enabled=True) == [
+def test_stage_plan_requires_setup_stages_only() -> None:
+    assert build_autorun_stage_plan() == [
         "detect",
         "faces",
         "cluster",
         "body_tracking",
         "track_fusion",
-        "screentime",
         "pdf",
     ]
 
 
 def test_autorun_complete_requires_all_enabled_stages() -> None:
-    stage_plan = build_autorun_stage_plan(body_tracking_enabled=True, track_fusion_enabled=True)
+    stage_plan = build_autorun_stage_plan()
     assert autorun_complete(stage_plan, {}) is False
     assert (
         autorun_complete(
@@ -50,7 +28,6 @@ def test_autorun_complete_requires_all_enabled_stages() -> None:
                 "cluster": True,
                 "body_tracking": True,
                 "track_fusion": True,
-                "screentime": True,
                 "pdf": False,
             },
         )
@@ -65,10 +42,8 @@ def test_autorun_complete_requires_all_enabled_stages() -> None:
                 "cluster": True,
                 "body_tracking": True,
                 "track_fusion": True,
-                "screentime": True,
                 "pdf": True,
             },
         )
         is True
     )
-
