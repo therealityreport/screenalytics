@@ -376,17 +376,19 @@ def start_episode_run(req: EpisodeRunRequest) -> dict:
             reuse_embeddings=req.reuse_embeddings,
             profile=req.profile,
         )
-        run_id = None
-        requested = record.get("requested")
-        if isinstance(requested, dict):
-            run_id = requested.get("run_id")
-        return {"job_id": record["job_id"], "status": "running", "run_id": run_id}
-
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         LOGGER.exception("Failed to start episode run job: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    run_id = None
+    requested = record.get("requested")
+    if isinstance(requested, dict):
+        run_id = requested.get("run_id")
+    if run_id is None:
+        run_id = req.run_id
+    return {"job_id": record["job_id"], "status": "running", "run_id": run_id}
 
 
 @router.post("/jobs/facebank/backfill_display")
