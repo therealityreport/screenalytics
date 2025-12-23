@@ -49,6 +49,35 @@ Acceptance:
   - PDF: `pdf`, `pdf_export`.
   - Optional in export contexts: `screentime` / `screen_time` (see `apps/api/services/run_export.py`).
 
+## Prereq gating (centralized)
+- Gating module: `py_screenalytics/run_gates.py` (`check_prereqs`).
+- Enforcement points:
+  - Engine wrapper: `py_screenalytics/pipeline/episode_engine.py` (`run_stage`).
+  - CLI stages: `tools/episode_run.py`.
+  - Screentime CLI: `tools/analyze_screen_time.py`.
+  - Export PDF: `apps/api/services/run_export.py`.
+- Prereq map (stage → upstream + artifacts):
+  - `detect`: none.
+  - `faces`: upstream `detect`; artifact `tracks.jsonl`.
+  - `cluster`: upstream `faces`; artifacts `faces.jsonl`, `tracks.jsonl`.
+  - `body_tracking`: none (but `stage_disabled` when body tracking config disables).
+  - `track_fusion`: upstream `body_tracking`, `faces`; artifacts `body_tracking/body_tracks.jsonl`, `faces.jsonl`.
+  - `screentime`: upstream `cluster`; artifacts `tracks.jsonl`, `faces.jsonl`, `identities.json`.
+  - `pdf`: none.
+- Gate reasons: `missing_artifact`, `upstream_failed`, `upstream_not_success`, `run_id_mismatch`, `stage_disabled`.
+
+## Run-scoped stage manifests (schema + location)
+- Module: `py_screenalytics/run_manifests.py`.
+- Location: `data/manifests/{ep_id}/runs/{run_id}/manifests/{stage}.json`.
+- Schema (minimum fields):
+  - `schema_version`, `episode_id`, `run_id`, `stage`, `status`, `started_at`, `finished_at`, `duration_s`.
+  - `inputs`: upstream artifacts + media digests (video) when available.
+  - `model_versions`, `thresholds`, `counts` (empty dicts allowed).
+  - `artifacts`: list of `{logical_name, path, sha256}`.
+  - `error` for FAILED (code/message/exception_summary).
+  - `blocked` for BLOCKED (reasons + suggested_actions).
+- Digest caching: `data/manifests/{ep_id}/runs/{run_id}/digests.json` (size/mtime keyed sha256).
+
 ## Current status sources (writers)
 - `tools/episode_run.py` writes phase markers via `_write_run_marker(...)` for detect/track, faces_embed, cluster, body_tracking, track_fusion.
 - `_write_run_marker(...)` writes **both** legacy and run-scoped markers and calls `_update_episode_status_from_marker(...)`.

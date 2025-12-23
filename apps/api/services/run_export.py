@@ -29,14 +29,18 @@ import yaml
 from py_screenalytics import run_layout
 from py_screenalytics.artifacts import get_path
 from py_screenalytics.episode_status import (
+    BlockedReason,
     collect_git_state,
     normalize_stage_key,
     stage_artifacts,
     update_episode_status,
+    write_stage_blocked,
     write_stage_failed,
     write_stage_finished,
     write_stage_started,
 )
+from py_screenalytics.run_gates import check_prereqs
+from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -5530,6 +5534,37 @@ def build_and_upload_debug_pdf(
     finalize_started_at: str | None = None
     ended_at: str | None = None
     total_steps = 1
+    gate = check_prereqs("pdf", ep_id, run_id)
+    if not gate.ok:
+        reasons = gate.reasons or []
+        primary = reasons[0] if reasons else None
+        blocked_reason = BlockedReason(
+            code=primary.code if primary else "blocked",
+            message=primary.message if primary else "Stage blocked by prerequisites",
+            details={
+                "reasons": [reason.as_dict() for reason in reasons],
+                "suggested_actions": list(gate.suggested_actions),
+            },
+        )
+        blocked_info = StageBlockedInfo(reasons=list(reasons), suggested_actions=list(gate.suggested_actions))
+        try:
+            write_stage_blocked(ep_id, run_id, "pdf", blocked_reason)
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[export] Failed to mark PDF blocked: %s", exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id,
+                "pdf",
+                "BLOCKED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                blocked=blocked_info,
+            )
+        except Exception as exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[export] Failed to write PDF blocked manifest: %s", exc)
+        raise RuntimeError(blocked_reason.message)
     try:
         write_stage_started(
             ep_id,
@@ -5644,6 +5679,24 @@ def build_and_upload_debug_pdf(
             )
         except Exception as status_exc:
             LOGGER.warning("[export] Failed to update episode_status.json for PDF error: %s", status_exc)
+        try:
+            write_stage_manifest(
+                ep_id,
+                run_id,
+                "pdf",
+                "FAILED",
+                started_at=started_at,
+                finished_at=_now_iso(),
+                duration_s=None,
+                error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
+                artifacts={
+                    entry["label"]: entry["path"]
+                    for entry in stage_artifacts(ep_id, run_id, "pdf")
+                    if isinstance(entry, dict) and entry.get("exists")
+                },
+            )
+        except Exception as manifest_exc:
+            LOGGER.warning("[export] Failed to write PDF failed manifest: %s", manifest_exc)
         raise
 
     upload_result = None
@@ -5728,6 +5781,24 @@ def build_and_upload_debug_pdf(
         )
     except Exception as exc:
         LOGGER.warning("[export] Failed to update episode_status.json for PDF success: %s", exc)
+    try:
+        write_stage_manifest(
+            ep_id,
+            run_id,
+            "pdf",
+            "SUCCESS",
+            started_at=started_at,
+            finished_at=_now_iso(),
+            duration_s=None,
+            counts={"export_bytes": len(pdf_bytes)},
+            artifacts={
+                entry["label"]: entry["path"]
+                for entry in stage_artifacts(ep_id, run_id, "pdf")
+                if isinstance(entry, dict) and entry.get("exists")
+            },
+        )
+    except Exception as exc:
+        LOGGER.warning("[export] Failed to write PDF success manifest: %s", exc)
 
     return pdf_bytes, download_name, upload_result
 

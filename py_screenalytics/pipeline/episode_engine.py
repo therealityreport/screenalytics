@@ -53,12 +53,16 @@ from py_screenalytics.pipeline.constants import (
 )
 from py_screenalytics import run_layout
 from py_screenalytics.episode_status import (
+    BlockedReason,
     normalize_stage_key,
     stage_artifacts,
+    write_stage_blocked,
     write_stage_failed,
     write_stage_finished,
     write_stage_started,
 )
+from py_screenalytics.run_gates import GateReason, GateResult, check_prereqs
+from py_screenalytics.run_manifests import StageBlockedInfo, StageErrorInfo, write_stage_manifest
 
 LOGGER = logging.getLogger("episode_engine")
 
@@ -443,6 +447,70 @@ def _stage_counts(stage: PipelineStage, summary: Dict[str, Any]) -> Dict[str, in
     return counts
 
 
+def _stage_thresholds(stage: PipelineStage, config: EpisodeRunConfig) -> Dict[str, Any]:
+    if stage == PipelineStage.DETECT_TRACK:
+        return {
+            "det_thresh": config.det_thresh,
+            "stride": config.stride,
+            "track_high_thresh": config.track_high_thresh,
+            "new_track_thresh": config.new_track_thresh,
+        }
+    if stage == PipelineStage.FACES_EMBED:
+        return {
+            "max_samples_per_track": config.max_samples_per_track,
+            "min_samples_per_track": config.min_samples_per_track,
+            "sample_every_n_frames": config.sample_every_n_frames,
+        }
+    if stage == PipelineStage.CLUSTER:
+        return {
+            "cluster_thresh": config.cluster_thresh,
+            "min_cluster_size": config.min_cluster_size,
+            "min_identity_sim": config.min_identity_sim,
+        }
+    return {}
+
+
+def _stage_model_versions(stage: PipelineStage, summary: Dict[str, Any]) -> Dict[str, str]:
+    models: Dict[str, str] = {}
+    if stage == PipelineStage.DETECT_TRACK:
+        detector = summary.get("detector")
+        tracker = summary.get("tracker")
+        if isinstance(detector, str):
+            models["detector"] = detector
+        if isinstance(tracker, str):
+            models["tracker"] = tracker
+    elif stage == PipelineStage.FACES_EMBED:
+        embedding_model = summary.get("embedding_model")
+        if isinstance(embedding_model, str):
+            models["embedding_model"] = embedding_model
+    elif stage == PipelineStage.CLUSTER:
+        detector = summary.get("detector")
+        tracker = summary.get("tracker")
+        if isinstance(detector, str):
+            models["detector"] = detector
+        if isinstance(tracker, str):
+            models["tracker"] = tracker
+    return models
+
+
+def _blocked_details(gate: GateResult) -> tuple[BlockedReason, StageBlockedInfo]:
+    reasons = gate.reasons or [
+        GateReason(code="blocked", message="Stage blocked by prerequisites", details=None)
+    ]
+    primary = reasons[0]
+    details = {
+        "reasons": [reason.as_dict() for reason in reasons],
+        "suggested_actions": list(gate.suggested_actions),
+    }
+    blocked_reason = BlockedReason(
+        code=primary.code,
+        message=primary.message,
+        details=details,
+    )
+    blocked_info = StageBlockedInfo(reasons=list(reasons), suggested_actions=list(gate.suggested_actions))
+    return blocked_reason, blocked_info
+
+
 # Disk space constants
 MIN_DISK_SPACE_GB = 5.0  # Minimum free space required to start
 SPACE_MULTIPLIER = 3.0  # Estimated output is ~3x video size (crops, frames, manifests)
@@ -654,6 +722,39 @@ def run_stage(
             error=str(exc),
         )
 
+    gate = check_prereqs(stage.value, episode_id, config.run_id)
+    if not gate.ok:
+        blocked_reason, blocked_info = _blocked_details(gate)
+        try:
+            write_stage_blocked(episode_id, config.run_id, stage.value, blocked_reason)
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark %s blocked: %s", stage.value, exc)
+        try:
+            write_stage_manifest(
+                episode_id,
+                config.run_id,
+                stage.value,
+                "BLOCKED",
+                started_at=started_at,
+                finished_at=_utcnow_iso(),
+                duration_s=time.time() - start_time,
+                blocked=blocked_info,
+                thresholds=_stage_thresholds(stage, config),
+                counts=None,
+                artifacts=None,
+                model_versions=None,
+            )
+        except Exception as exc:  # pragma: no cover - best effort manifest write
+            LOGGER.warning("[manifest] Failed to write %s blocked manifest: %s", stage.value, exc)
+        return StageResult(
+            stage=stage.value,
+            success=False,
+            started_at=started_at,
+            finished_at=_utcnow_iso(),
+            runtime_sec=time.time() - start_time,
+            error=blocked_reason.message,
+        )
+
     # Set up data root environment variable
     if config.data_root:
         os.environ["SCREENALYTICS_DATA_ROOT"] = str(config.data_root)
@@ -701,6 +802,26 @@ def run_stage(
                     )
                 except Exception as status_exc:  # pragma: no cover - best effort status update
                     LOGGER.warning("[episode_status] Failed to mark %s failure: %s", stage.value, status_exc)
+                try:
+                    write_stage_manifest(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        "FAILED",
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_s=runtime_sec,
+                        error=StageErrorInfo(
+                            code="stage_failed",
+                            message=str(summary.get("error", "Unknown error")),
+                        ),
+                        thresholds=_stage_thresholds(stage, config),
+                        counts=_stage_counts(stage, summary),
+                        artifacts=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                        model_versions=_stage_model_versions(stage, summary),
+                    )
+                except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                    LOGGER.warning("[manifest] Failed to write %s failed manifest: %s", stage.value, manifest_exc)
             return StageResult(
                 stage=stage.value,
                 success=False,
@@ -724,6 +845,22 @@ def run_stage(
                 )
             except Exception as status_exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[episode_status] Failed to mark %s success: %s", stage.value, status_exc)
+            try:
+                write_stage_manifest(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "SUCCESS",
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_s=runtime_sec,
+                    thresholds=_stage_thresholds(stage, config),
+                    counts=_stage_counts(stage, summary),
+                    artifacts=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                    model_versions=_stage_model_versions(stage, summary),
+                )
+            except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[manifest] Failed to write %s success manifest: %s", stage.value, manifest_exc)
         return StageResult(
             stage=stage.value,
             success=True,
@@ -757,6 +894,22 @@ def run_stage(
                 )
             except Exception as status_exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[episode_status] Failed to mark %s failure: %s", stage.value, status_exc)
+            try:
+                write_stage_manifest(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    "FAILED",
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_s=runtime_sec,
+                    error=StageErrorInfo(code=type(exc).__name__, message=str(exc)),
+                    thresholds=_stage_thresholds(stage, config),
+                    artifacts=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                    model_versions=None,
+                )
+            except Exception as manifest_exc:  # pragma: no cover - best effort manifest write
+                LOGGER.warning("[manifest] Failed to write %s failed manifest: %s", stage.value, manifest_exc)
         return StageResult(
             stage=stage.value,
             success=False,

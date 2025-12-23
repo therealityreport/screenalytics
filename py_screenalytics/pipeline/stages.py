@@ -168,6 +168,7 @@ def _config_to_args_namespace(config: "EpisodeRunConfig", episode_id: str, video
     args.track_sample_limit = None
     args.quiet = False
     args.verbose = False
+    args.emit_manifests = False
 
     # Gate config defaults
     args.gate_appear_hard = 0.75
