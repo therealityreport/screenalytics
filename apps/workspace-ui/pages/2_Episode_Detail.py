@@ -1132,6 +1132,34 @@ def _read_json_payload(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _load_marker_payload_with_fallback(
+    primary_path: Path,
+    fallback_path: Path | None,
+    *,
+    run_id: str | None = None,
+    require_run_match: bool = True,
+) -> tuple[dict[str, Any] | None, float | None, bool]:
+    """Load a run marker payload, falling back to legacy markers when run-scoped is missing."""
+    payload = _read_json_payload(primary_path) if primary_path.exists() else None
+    if isinstance(payload, dict):
+        try:
+            return payload, primary_path.stat().st_mtime, False
+        except OSError:
+            return payload, None, False
+    if fallback_path and fallback_path.exists():
+        payload = _read_json_payload(fallback_path)
+        if isinstance(payload, dict):
+            if run_id and require_run_match:
+                marker_run_id = payload.get("run_id")
+                if not (isinstance(marker_run_id, str) and marker_run_id.strip() == run_id):
+                    return None, None, False
+            try:
+                return payload, fallback_path.stat().st_mtime, True
+            except OSError:
+                return payload, None, True
+    return None, None, False
+
+
 def _progress_pct_from_payload(payload: dict[str, Any] | None) -> float | None:
     if not isinstance(payload, dict):
         return None
@@ -2425,6 +2453,11 @@ current_mtimes = (
     _safe_mtime(_scoped_markers_dir / "cluster.json"),
     _safe_mtime(_scoped_markers_dir / "body_tracking.json"),
     _safe_mtime(_scoped_markers_dir / "body_tracking_fusion.json"),
+    _safe_mtime(_runs_root / "detect_track.json") if selected_attempt_run_id else 0,
+    _safe_mtime(_runs_root / "faces_embed.json") if selected_attempt_run_id else 0,
+    _safe_mtime(_runs_root / "cluster.json") if selected_attempt_run_id else 0,
+    _safe_mtime(_runs_root / "body_tracking.json") if selected_attempt_run_id else 0,
+    _safe_mtime(_runs_root / "body_tracking_fusion.json") if selected_attempt_run_id else 0,
     episode_status_mtime,
     _safe_mtime(_scoped_manifests_dir / "detections.jsonl"),
     _safe_mtime(_scoped_manifests_dir / "tracks.jsonl"),
@@ -2438,6 +2471,7 @@ current_mtimes = (
     _safe_mtime(_scoped_manifests_dir / "analytics" / "screentime.json")
     if selected_attempt_run_id
     else _safe_mtime(helpers.DATA_ROOT / "analytics" / ep_id / "screentime.json"),
+    _safe_mtime(helpers.DATA_ROOT / "analytics" / ep_id / "screentime.json") if selected_attempt_run_id else 0,
 )
 cached_mtimes = st.session_state.get(mtimes_key)
 should_refresh_status = force_refresh or _job_active(ep_id) or status_payload is None or cached_mtimes != current_mtimes
@@ -3306,13 +3340,31 @@ if screentime_job_record:
             screentime_job_record_for_run = screentime_job_record
 
 screentime_artifact_ok = False
+screentime_manifest_fallback = False
+screentime_payload: dict[str, Any] | None = None
 if screentime_json_path.exists():
-    if selected_attempt_run_id:
+    try:
+        screentime_payload = json.loads(screentime_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        screentime_payload = None
+elif selected_attempt_run_id:
+    legacy_screentime_path = helpers.DATA_ROOT / "analytics" / ep_id / "screentime.json"
+    if legacy_screentime_path.exists():
         try:
-            payload = json.loads(screentime_json_path.read_text(encoding="utf-8"))
+            screentime_payload = json.loads(legacy_screentime_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            payload = None
-        file_run_id = payload.get("run_id") if isinstance(payload, dict) else None
+            screentime_payload = None
+        if isinstance(screentime_payload, dict):
+            file_run_id = screentime_payload.get("run_id")
+            if isinstance(file_run_id, str) and file_run_id.strip() == selected_attempt_run_id:
+                screentime_json_path = legacy_screentime_path
+                screentime_manifest_fallback = True
+            else:
+                screentime_payload = None
+
+if isinstance(screentime_payload, dict):
+    if selected_attempt_run_id:
+        file_run_id = screentime_payload.get("run_id")
         screentime_artifact_ok = isinstance(file_run_id, str) and file_run_id.strip() == selected_attempt_run_id
     else:
         screentime_artifact_ok = True
@@ -3346,6 +3398,10 @@ body_detections_path = body_tracking_dir / "body_detections.jsonl"
 body_tracks_path = body_tracking_dir / "body_tracks.jsonl"
 track_fusion_path = body_tracking_dir / "track_fusion.json"
 screentime_comparison_path = body_tracking_dir / "screentime_comparison.json"
+legacy_body_tracking_dir = _manifests_root / "body_tracking"
+legacy_body_detections_path = legacy_body_tracking_dir / "body_detections.jsonl"
+legacy_body_tracks_path = legacy_body_tracking_dir / "body_tracks.jsonl"
+legacy_track_fusion_path = legacy_body_tracking_dir / "track_fusion.json"
 
 faces_presence = stage_layout.ArtifactPresence(local=faces_path.exists(), remote=False, path=str(faces_path))
 body_detections_presence = stage_layout.ArtifactPresence(local=body_detections_path.exists(), remote=False, path=str(body_detections_path))
@@ -3379,6 +3435,8 @@ if selected_attempt_run_id:
 
 body_tracking_marker_path = _scoped_markers_dir / "body_tracking.json"
 body_fusion_marker_path = _scoped_markers_dir / "body_tracking_fusion.json"
+legacy_body_tracking_marker_path = _runs_root / "body_tracking.json"
+legacy_body_fusion_marker_path = _runs_root / "body_tracking_fusion.json"
 
 body_tracking_status_value = "missing"
 body_tracking_error: str | None = None
@@ -3413,20 +3471,25 @@ if selected_attempt_run_id:
     if body_fusion_running:
         body_fusion_status_value = "running"
 
-    if body_tracking_marker_path.exists() and not body_tracking_running:
-        try:
-            payload = json.loads(body_tracking_marker_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = None
-        body_tracking_marker_payload = payload if isinstance(payload, dict) else None
+    if not body_tracking_running:
+        body_tracking_marker_payload, _marker_mtime, _ = _load_marker_payload_with_fallback(
+            body_tracking_marker_path,
+            legacy_body_tracking_marker_path,
+            run_id=selected_attempt_run_id,
+        )
+    if body_tracking_marker_payload and not body_tracking_running:
         marker_status = str((body_tracking_marker_payload or {}).get("status") or "").strip().lower()
         marker_error = (body_tracking_marker_payload or {}).get("error")
         marker_run_id = (body_tracking_marker_payload or {}).get("run_id")
         marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
-        artifacts_ok = (
+        run_scoped_ok = (
             stage_layout.artifact_available(body_detections_presence)
             and stage_layout.artifact_available(body_tracks_presence)
         )
+        legacy_ok = bool(legacy_body_detections_path.exists() and legacy_body_tracks_path.exists())
+        artifacts_ok = run_scoped_ok or (legacy_ok and marker_run_matches)
+        if legacy_ok and marker_run_matches and not run_scoped_ok:
+            body_tracking_manifest_fallback = True
         if marker_status in {"error", "failed"} or marker_error:
             body_tracking_status_value = "error"
             body_tracking_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
@@ -3447,17 +3510,22 @@ if selected_attempt_run_id:
             body_tracking_status_value = "success"
             body_tracking_manifest_fallback = True
 
-    if body_fusion_marker_path.exists() and not body_fusion_running:
-        try:
-            payload = json.loads(body_fusion_marker_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = None
-        body_fusion_marker_payload = payload if isinstance(payload, dict) else None
+    if not body_fusion_running:
+        body_fusion_marker_payload, _marker_mtime, _ = _load_marker_payload_with_fallback(
+            body_fusion_marker_path,
+            legacy_body_fusion_marker_path,
+            run_id=selected_attempt_run_id,
+        )
+    if body_fusion_marker_payload and not body_fusion_running:
         marker_status = str((body_fusion_marker_payload or {}).get("status") or "").strip().lower()
         marker_error = (body_fusion_marker_payload or {}).get("error")
         marker_run_id = (body_fusion_marker_payload or {}).get("run_id")
         marker_run_matches = isinstance(marker_run_id, str) and marker_run_id.strip() == selected_attempt_run_id
-        artifacts_ok = stage_layout.artifact_available(track_fusion_presence)
+        run_scoped_ok = stage_layout.artifact_available(track_fusion_presence)
+        legacy_ok = bool(legacy_track_fusion_path.exists())
+        artifacts_ok = run_scoped_ok or (legacy_ok and marker_run_matches)
+        if legacy_ok and marker_run_matches and not run_scoped_ok:
+            body_fusion_manifest_fallback = True
         if marker_status in {"error", "failed"} or marker_error:
             body_fusion_status_value = "error"
             body_fusion_error = str(marker_error) if marker_error else f"marker_status={marker_status}"
@@ -3474,6 +3542,16 @@ if selected_attempt_run_id:
         if artifacts_ok:
             body_fusion_status_value = "success"
             body_fusion_manifest_fallback = True
+
+    if not body_tracking_enabled and body_tracking_status_value in {"missing", "unknown"}:
+        body_tracking_status_value = "skipped"
+        body_tracking_error = body_tracking_error or "disabled_by_config"
+    if not track_fusion_enabled and body_fusion_status_value in {"missing", "unknown"}:
+        body_fusion_status_value = "skipped"
+        if not body_tracking_enabled:
+            body_fusion_error = body_fusion_error or "body_tracking_disabled"
+        else:
+            body_fusion_error = body_fusion_error or "disabled_by_config"
 
     # PDF export is run-scoped via exports/export_index.json.
     try:
@@ -3923,12 +4001,24 @@ with st.expander("Pipeline Status", expanded=False):
                 }
             return {"status": "unknown"}
 
+        def _merge_stage_entry(stage_key: str, stage_entry: dict[str, Any] | None) -> dict[str, Any]:
+            fallback_entry = _fallback_stage_entry(stage_key)
+            if not isinstance(stage_entry, dict):
+                return fallback_entry
+            stage_status = str(stage_entry.get("status") or "").strip().lower()
+            fallback_status = str(fallback_entry.get("status") or "").strip().lower()
+            if stage_status in {"missing", "unknown", "stale"} and fallback_status not in {"missing", "unknown", "stale", ""}:
+                return fallback_entry
+            merged = dict(stage_entry)
+            for key in ("started_at", "ended_at", "duration_s", "error_reason"):
+                if not merged.get(key) and fallback_entry.get(key) is not None:
+                    merged[key] = fallback_entry.get(key)
+            return merged
+
         summary_rows: list[dict[str, Any]] = []
         stages_payload = episode_status_payload.get("stages", {}) if isinstance(episode_status_payload, dict) else {}
         for stage_key in stage_plan:
-            stage_entry = stages_payload.get(stage_key)
-            if not isinstance(stage_entry, dict):
-                stage_entry = _fallback_stage_entry(stage_key)
+            stage_entry = _merge_stage_entry(stage_key, stages_payload.get(stage_key))
             started_at = stage_entry.get("started_at")
             ended_at = stage_entry.get("ended_at")
             duration_val = stage_entry.get("duration_s")
@@ -4358,7 +4448,7 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
             st.info("⏳ **Body Tracking**: Not started")
             st.caption("Run body tracking to generate body tracks.")
         if body_tracking_manifest_fallback:
-            st.caption("ℹ️ Artifacts found without a run marker; status inferred from manifests.")
+            st.caption("ℹ️ Using manifest fallback; run-scoped marker/artifacts may be missing.")
         finished = _format_timestamp(body_tracking_finished_at)
         if finished:
             st.caption(f"Last run: {finished}")
@@ -4370,7 +4460,7 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
             "Body Tracking",
             marker_payload=body_tracking_marker_payload,
             progress_payload=body_tracking_progress_payload,
-            artifacts_hint="Body tracking artifacts are present; no run marker was recorded."
+            artifacts_hint="Body tracking artifacts found via manifest fallback."
             if body_tracking_manifest_fallback
             else None,
         )
@@ -4440,12 +4530,12 @@ if "body_tracking" in stage_card_layout.primary_stage_keys or "track_fusion" in 
         elif body_fusion_status_value == "success":
             st.caption("Run Duration: n/a")
         if body_fusion_manifest_fallback:
-            st.caption("ℹ️ Artifacts found without a run marker; status inferred from manifests.")
+            st.caption("ℹ️ Using manifest fallback; run-scoped marker/artifacts may be missing.")
         _render_downstream_log_expander(
             "Track Fusion",
             marker_payload=body_fusion_marker_payload,
             progress_payload=track_fusion_progress_payload,
-            artifacts_hint="Track fusion output is present; no run marker was recorded."
+            artifacts_hint="Track fusion output found via manifest fallback."
             if body_fusion_manifest_fallback
             else None,
         )
@@ -4481,6 +4571,8 @@ if autorun_active_now and stage_card_layout.show_active_downstream_panel:
             st.caption(f"Status: {screentime_status_value or 'unknown'}")
             if screentime_started_at:
                 st.caption(f"Started at {screentime_started_at}")
+            if screentime_manifest_fallback:
+                st.caption("ℹ️ Using legacy screentime analytics (run_id matched).")
         elif active_key == "pdf":
             st.caption(f"Status: {pdf_export_status_value or 'unknown'}")
             if pdf_export_detail:
@@ -5260,17 +5352,13 @@ if autorun_active:
         cluster_job_running = helpers.get_running_job_for_episode(ep_id, "cluster") is not None
         cluster_baseline = st.session_state.get(f"{ep_id}::autorun_cluster_baseline_mtime", 0.0)
         cluster_marker_path = _scoped_markers_dir / "cluster.json"
-        marker_payload: dict[str, Any] | None = None
-        marker_mtime = 0.0
-        if cluster_marker_path.exists():
-            try:
-                marker_payload = json.loads(cluster_marker_path.read_text(encoding="utf-8"))
-                if isinstance(marker_payload, dict):
-                    marker_mtime = cluster_marker_path.stat().st_mtime
-                else:
-                    marker_payload = None
-            except (OSError, json.JSONDecodeError):
-                marker_payload = None
+        legacy_cluster_marker_path = _runs_root / "cluster.json"
+        marker_payload, marker_mtime, _ = _load_marker_payload_with_fallback(
+            cluster_marker_path,
+            legacy_cluster_marker_path,
+            run_id=selected_attempt_run_id,
+        )
+        marker_mtime = float(marker_mtime or 0.0)
         marker_status = str((marker_payload or {}).get("status") or "").strip().lower()
         marker_error = (marker_payload or {}).get("error")
         marker_run_id = (marker_payload or {}).get("run_id")
@@ -5385,6 +5473,13 @@ def _autorun_drive_downstream(run_id: str) -> None:
             st.session_state[_autorun_phase_key] = "screentime"
             st.toast("Track fusion disabled - skipping to Screentime...")
             st.rerun()
+        if stage_layout.downstream_stage_allows_advance(body_fusion_status_value, body_fusion_error):
+            stage_label = "Track Fusion"
+            if fusion_mode_label:
+                stage_label = f"{stage_label} ({fusion_mode_label})"
+            _autorun_append_completed(stage_label)
+            st.session_state[_autorun_phase_key] = "screentime"
+            st.rerun()
         prereq_ok, missing = stage_layout.track_fusion_prereq_state(faces_presence, body_tracks_presence)
         if not prereq_ok:
             _autorun_stop("Track Fusion", f"missing_prereqs: {', '.join(missing)}")
@@ -5415,13 +5510,6 @@ def _autorun_drive_downstream(run_id: str) -> None:
             else:
                 _autorun_stop("Track Fusion", "local_artifacts_missing_after_hydrate")
                 return
-        if stage_layout.downstream_stage_allows_advance(body_fusion_status_value, body_fusion_error):
-            stage_label = "Track Fusion"
-            if fusion_mode_label:
-                stage_label = f"{stage_label} ({fusion_mode_label})"
-            _autorun_append_completed(stage_label)
-            st.session_state[_autorun_phase_key] = "screentime"
-            st.rerun()
         if body_fusion_status_value in {"error", "failed"}:
             _autorun_stop("Track Fusion", body_fusion_error or body_fusion_status_value)
             return
@@ -7234,6 +7322,8 @@ else:
         st.caption(f"Status: `{screentime_status_value}`")
         if screentime_error:
             st.caption(f"Error: {screentime_error}")
+        if screentime_manifest_fallback:
+            st.caption("ℹ️ Using legacy screentime analytics (run_id matched).")
         screentime_btn_label = "Run" if screentime_status_value in {"missing", "error"} else "Rerun"
         screentime_btn_disabled = job_running or not bool(selected_attempt_run_id)
         if st.button(
