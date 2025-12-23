@@ -4986,7 +4986,10 @@ with st.container():
             # Progress: count completed enabled stages for the selected run_id.
             from py_screenalytics.autorun_plan import build_autorun_stage_plan
 
-            stage_plan = build_autorun_stage_plan()
+            stage_plan = build_autorun_stage_plan(
+                body_tracking_enabled=body_tracking_enabled,
+                track_fusion_enabled=track_fusion_enabled,
+            )
 
             done_map = {
                 "detect": detect_status_value == "success",

@@ -3,8 +3,13 @@ from __future__ import annotations
 from typing import Mapping, Sequence
 
 
-def build_autorun_stage_plan() -> list[str]:
+def build_autorun_stage_plan(
+    *,
+    body_tracking_enabled: bool | None = None,
+    track_fusion_enabled: bool | None = None,
+) -> list[str]:
     """Return the ordered Auto-Run stage plan for Episode Details setup."""
+    _ = body_tracking_enabled, track_fusion_enabled
     return ["detect", "faces", "cluster", "body_tracking", "track_fusion", "pdf"]
 
 
