@@ -241,6 +241,7 @@ def test_episode_detail_autorun_retry_does_not_shadow_manifest_helper(tmp_path, 
     monkeypatch.setattr(helpers, "get_all_running_jobs_for_episode", lambda *_a, **_k: {}, raising=False)
     monkeypatch.setattr(helpers, "get_episode_progress", lambda *_a, **_k: {}, raising=False)
     monkeypatch.setattr(helpers, "api_post", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "run_pipeline_job_with_mode", lambda *_a, **_k: (None, None), raising=False)
 
     def _api_get(path: str, params=None, timeout=None):  # noqa: ANN001
         if path == "/config/storage":
@@ -947,3 +948,236 @@ def test_episode_detail_autorun_progress_counts_and_hides_improve_faces(tmp_path
     total_count = int(numbers.group(2))
     assert completed_count == checkmarks
     assert total_count == 6
+
+
+def test_episode_detail_detect_status_heals_from_artifacts(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(time, "sleep", lambda *_args, **_kwargs: None)
+
+    project_root = Path(__file__).resolve().parents[2]
+    workspace_dir = project_root / "apps" / "workspace-ui"
+    page_path = workspace_dir / "pages" / "2_Episode_Detail.py"
+
+    st_mod = _StreamlitStub()
+    info_lines: list[str] = []
+    success_lines: list[str] = []
+
+    st_mod.info = lambda msg=None, *args, **kwargs: info_lines.append(str(msg))  # type: ignore[assignment]
+    st_mod.success = lambda msg=None, *args, **kwargs: success_lines.append(str(msg))  # type: ignore[assignment]
+
+    ep_id = "show_s01e01"
+    run_id = "Attempt2_2024-01-01_000000EST"
+    st_mod.session_state["ep_id"] = ep_id
+    st_mod.session_state[f"{ep_id}::active_run_id"] = run_id
+
+    monkeypatch.setitem(sys.modules, "streamlit", st_mod)
+    monkeypatch.setitem(sys.modules, "streamlit.runtime", types.ModuleType("streamlit.runtime"))
+
+    scriptrunner_mod = types.ModuleType("streamlit.runtime.scriptrunner")
+    scriptrunner_mod.RerunException = _RerunException  # type: ignore[attr-defined]
+    scriptrunner_mod.StopException = _StopException  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "streamlit.runtime.scriptrunner", scriptrunner_mod)
+
+    components_pkg = types.ModuleType("streamlit.components")
+    components_v1 = types.ModuleType("streamlit.components.v1")
+    components_v1.html = lambda *args, **kwargs: None  # noqa: ANN002, ANN003
+    components_pkg.v1 = components_v1  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "streamlit.components", components_pkg)
+    monkeypatch.setitem(sys.modules, "streamlit.components.v1", components_v1)
+
+    def _get_path(ep_id_value: str, kind: str) -> Path:
+        base = tmp_path / "manifests" / ep_id_value
+        base.mkdir(parents=True, exist_ok=True)
+        mapping = {
+            "video": base / "video.mp4",
+            "detections": base / "detections.jsonl",
+            "tracks": base / "tracks.jsonl",
+            "faces": base / "faces.jsonl",
+        }
+        return mapping.get(kind, base / f"{kind}.dat")
+
+    import py_screenalytics.artifacts as artifacts_mod  # noqa: E402
+
+    monkeypatch.setattr(artifacts_mod, "get_path", _get_path, raising=False)
+
+    monkeypatch.syspath_prepend(str(workspace_dir))
+    import ui_helpers as helpers  # noqa: E402
+
+    monkeypatch.setattr(helpers, "DATA_ROOT", tmp_path, raising=False)
+    run_root = tmp_path / "manifests" / ep_id / "runs" / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "detections.jsonl").write_text('{"frame_idx": 1}\n', encoding="utf-8")
+    (run_root / "tracks.jsonl").write_text('{"track_id": 1}\n', encoding="utf-8")
+    (tmp_path / "manifests" / ep_id / "detections.jsonl").write_text('{"frame_idx": 1}\n', encoding="utf-8")
+    (tmp_path / "manifests" / ep_id / "tracks.jsonl").write_text('{"track_id": 1}\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        helpers,
+        "init_page",
+        lambda title="Episode Detail": {"api_base": "http://stub", "backend": "local", "bucket": None, "ep_id": ep_id},
+        raising=False,
+    )
+    monkeypatch.setattr(helpers, "inject_log_container_css", lambda: None, raising=False)
+    monkeypatch.setattr(helpers, "hydrate_logs_for_episode", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(helpers, "invalidate_running_jobs_cache", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(helpers, "render_execution_mode_selector", lambda *_a, **_k: "local", raising=False)
+    monkeypatch.setattr(helpers, "get_execution_mode", lambda *_a, **_k: "local", raising=False)
+    monkeypatch.setattr(helpers, "get_running_job_for_episode", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(helpers, "get_all_running_jobs_for_episode", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "get_episode_progress", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "api_post", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "run_pipeline_job_with_mode", lambda *_a, **_k: (None, None), raising=False)
+
+    def _api_get(path: str, params=None, timeout=None):  # noqa: ANN001
+        if path == "/config/storage":
+            return {"status": "success", "backend_type": "local", "validation": {"warnings": []}}
+        if path == f"/episodes/{ep_id}":
+            return {
+                "ep_id": ep_id,
+                "show_slug": "show",
+                "season_number": 1,
+                "episode_number": 1,
+                "s3": {"v2_key": None, "v2_exists": False, "v1_key": None, "v1_exists": False},
+                "local": {"path": str(tmp_path / "video.mp4"), "exists": True},
+            }
+        if path == f"/episodes/{ep_id}/status":
+            return {
+                "faces_embed": {"status": "success"},
+                "cluster": {"status": "success"},
+                "tracks_ready": False,
+            }
+        if path.startswith("/jobs") or path.startswith("/celery_jobs"):
+            return {"jobs": []}
+        return {}
+
+    monkeypatch.setattr(helpers, "api_get", _api_get, raising=False)
+    monkeypatch.setattr(
+        helpers,
+        "get_episode_status",
+        lambda _ep, run_id=None: _api_get(f"/episodes/{_ep}/status"),  # noqa: ARG005
+        raising=False,
+    )
+
+    original_sys_path = list(sys.path)
+    try:
+        runpy.run_path(str(page_path), run_name="__main__")
+    except _RerunException:
+        pass
+    finally:
+        sys.path[:] = original_sys_path
+
+    combined_info = "\n".join(info_lines)
+    combined_success = "\n".join(success_lines)
+    assert "Not started" not in combined_info
+    assert "Detect/Track" in combined_success
+
+
+def test_episode_detail_detect_shows_running_on_autorun_start(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(time, "sleep", lambda *_args, **_kwargs: None)
+
+    project_root = Path(__file__).resolve().parents[2]
+    workspace_dir = project_root / "apps" / "workspace-ui"
+    page_path = workspace_dir / "pages" / "2_Episode_Detail.py"
+
+    st_mod = _StreamlitStub()
+    info_lines: list[str] = []
+
+    st_mod.info = lambda msg=None, *args, **kwargs: info_lines.append(str(msg))  # type: ignore[assignment]
+
+    ep_id = "show_s01e01"
+    run_id = "Attempt3_2024-01-01_000000EST"
+    st_mod.session_state["ep_id"] = ep_id
+    st_mod.session_state[f"{ep_id}::active_run_id"] = run_id
+    st_mod.session_state[f"{ep_id}::autorun_pipeline"] = True
+    st_mod.session_state[f"{ep_id}::autorun_phase"] = "detect"
+    st_mod.session_state["episode_detail_detect_autorun_flag"] = True
+
+    monkeypatch.setitem(sys.modules, "streamlit", st_mod)
+    monkeypatch.setitem(sys.modules, "streamlit.runtime", types.ModuleType("streamlit.runtime"))
+
+    scriptrunner_mod = types.ModuleType("streamlit.runtime.scriptrunner")
+    scriptrunner_mod.RerunException = _RerunException  # type: ignore[attr-defined]
+    scriptrunner_mod.StopException = _StopException  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "streamlit.runtime.scriptrunner", scriptrunner_mod)
+
+    components_pkg = types.ModuleType("streamlit.components")
+    components_v1 = types.ModuleType("streamlit.components.v1")
+    components_v1.html = lambda *args, **kwargs: None  # noqa: ANN002, ANN003
+    components_pkg.v1 = components_v1  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "streamlit.components", components_pkg)
+    monkeypatch.setitem(sys.modules, "streamlit.components.v1", components_v1)
+
+    def _get_path(ep_id_value: str, kind: str) -> Path:
+        base = tmp_path / "manifests" / ep_id_value
+        base.mkdir(parents=True, exist_ok=True)
+        mapping = {
+            "video": base / "video.mp4",
+            "detections": base / "detections.jsonl",
+            "tracks": base / "tracks.jsonl",
+        }
+        return mapping.get(kind, base / f"{kind}.dat")
+
+    import py_screenalytics.artifacts as artifacts_mod  # noqa: E402
+
+    monkeypatch.setattr(artifacts_mod, "get_path", _get_path, raising=False)
+
+    monkeypatch.syspath_prepend(str(workspace_dir))
+    import ui_helpers as helpers  # noqa: E402
+
+    monkeypatch.setattr(helpers, "DATA_ROOT", tmp_path, raising=False)
+    run_root = tmp_path / "manifests" / ep_id / "runs" / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        helpers,
+        "init_page",
+        lambda title="Episode Detail": {"api_base": "http://stub", "backend": "local", "bucket": None, "ep_id": ep_id},
+        raising=False,
+    )
+    monkeypatch.setattr(helpers, "inject_log_container_css", lambda: None, raising=False)
+    monkeypatch.setattr(helpers, "hydrate_logs_for_episode", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(helpers, "invalidate_running_jobs_cache", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(helpers, "render_execution_mode_selector", lambda *_a, **_k: "local", raising=False)
+    monkeypatch.setattr(helpers, "get_execution_mode", lambda *_a, **_k: "local", raising=False)
+    monkeypatch.setattr(helpers, "get_running_job_for_episode", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(helpers, "get_all_running_jobs_for_episode", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "get_episode_progress", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "api_post", lambda *_a, **_k: {}, raising=False)
+    monkeypatch.setattr(helpers, "run_pipeline_job_with_mode", lambda *_a, **_k: (None, None), raising=False)
+
+    def _api_get(path: str, params=None, timeout=None):  # noqa: ANN001
+        if path == "/config/storage":
+            return {"status": "success", "backend_type": "local", "validation": {"warnings": []}}
+        if path == f"/episodes/{ep_id}":
+            return {
+                "ep_id": ep_id,
+                "show_slug": "show",
+                "season_number": 1,
+                "episode_number": 1,
+                "s3": {"v2_key": None, "v2_exists": False, "v1_key": None, "v1_exists": False},
+                "local": {"path": str(tmp_path / "video.mp4"), "exists": True},
+            }
+        if path == f"/episodes/{ep_id}/status":
+            return {}
+        if path.startswith("/jobs") or path.startswith("/celery_jobs"):
+            return {"jobs": []}
+        return {}
+
+    monkeypatch.setattr(helpers, "api_get", _api_get, raising=False)
+    monkeypatch.setattr(
+        helpers,
+        "get_episode_status",
+        lambda _ep, run_id=None: _api_get(f"/episodes/{_ep}/status"),  # noqa: ARG005
+        raising=False,
+    )
+
+    original_sys_path = list(sys.path)
+    try:
+        runpy.run_path(str(page_path), run_name="__main__")
+    except _RerunException:
+        pass
+    finally:
+        sys.path[:] = original_sys_path
+
+    combined_info = "\n".join(info_lines)
+    assert "Detect/Track" in combined_info
+    assert "Running" in combined_info

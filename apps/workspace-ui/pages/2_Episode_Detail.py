@@ -3250,12 +3250,34 @@ with st.expander(f"Episode {ep_id}", expanded=False):
                     except Exception as e:
                         st.error(f"Sync failed: {e}")
 
-manifest_state = _detect_track_manifests_ready(detections_path, tracks_path)
+manifest_state_local = _detect_track_manifests_ready(detections_path, tracks_path)
+detections_presence = stage_layout.ArtifactPresence(local=detections_path.exists(), remote=False, path=str(detections_path))
+tracks_presence = stage_layout.ArtifactPresence(local=tracks_path.exists(), remote=False, path=str(tracks_path))
+if selected_attempt_run_id:
+    _detect_presence_map = _cached_run_artifact_presence(
+        ep_id,
+        selected_attempt_run_id,
+        (
+            "detections.jsonl",
+            "tracks.jsonl",
+        ),
+    )
+    detections_presence = _presence_from_cache(_detect_presence_map.get("detections.jsonl"), detections_path)
+    tracks_presence = _presence_from_cache(_detect_presence_map.get("tracks.jsonl"), tracks_path)
+
+detect_detections_ready = detections_path.exists() or stage_layout.artifact_available(detections_presence)
+detect_tracks_ready = tracks_path.exists() or stage_layout.artifact_available(tracks_presence)
+manifest_state = {
+    "detections_ready": detect_detections_ready,
+    "tracks_ready": detect_tracks_ready,
+    "manifest_ready": bool(detect_detections_ready and detect_tracks_ready),
+    "tracks_only_fallback": bool(detect_tracks_ready and not detect_detections_ready),
+}
 
 # Get status values from API
 faces_status_value = str(faces_phase_status.get("status") or "missing").lower()
 cluster_status_value = str(cluster_phase_status.get("status") or "missing").lower()
-tracks_ready_flag = bool((status_payload or {}).get("tracks_ready"))
+tracks_ready_flag = bool((status_payload or {}).get("tracks_ready")) or manifest_state["manifest_ready"]
 
 # FIX: Override stale "running" status if job just completed (completion flag set)
 # This ensures the UI updates immediately when a job completes via log stream,
@@ -3284,6 +3306,32 @@ detect_status_value, tracks_ready, using_manifest_fallback, tracks_only_fallback
     tracks_ready_flag=tracks_ready_flag,
     job_state=detect_job_state,
 )
+if detect_status_value in {"missing", "unknown", "stale"}:
+    if (
+        manifest_state["manifest_ready"]
+        or manifest_state_local["manifest_ready"]
+        or (detections_path.exists() and tracks_path.exists())
+    ):
+        detect_status_value = "success"
+        tracks_ready = True
+        using_manifest_fallback = True
+    elif manifest_state["detections_ready"] or manifest_state["tracks_ready"]:
+        detect_status_value = "partial"
+        tracks_ready = False
+        using_manifest_fallback = True
+if detect_status_value in {"missing", "unknown", "stale"} and faces_status_value == "success":
+    detect_status_value = "success"
+    tracks_ready = True
+    using_manifest_fallback = True
+
+autorun_phase_hint = stage_layout.normalize_stage_key(st.session_state.get(_autorun_phase_key))
+autorun_detect_pending = bool(st.session_state.get("episode_detail_detect_autorun_flag"))
+if (
+    autorun_phase_hint == "detect"
+    and autorun_detect_pending
+    and detect_status_value in {"missing", "unknown", "stale"}
+):
+    detect_status_value = "running"
 if cluster_status_value in {"missing", "unknown"}:
     identities_count_manifest = None
     cluster_metrics_block: dict[str, Any] | None = None
@@ -3664,9 +3712,9 @@ elif faces_status_value in {"missing", "unknown", "stale"} and faces_manifest_av
 if faces_count_value is None and faces_manifest_count is not None:
     faces_count_value = faces_manifest_count
 
-# If status API is missing but run-scoped artifacts exist, only synthesize a "success"
+# If status API is missing but run-scoped artifacts exist locally, only synthesize a "success"
 # when we can also validate a matching run marker (prevents stale/other-run promotion).
-if not detect_phase_status and manifest_state["manifest_ready"]:
+if not detect_phase_status and manifest_state_local["manifest_ready"]:
     marker_ok = False
     marker_payload: dict[str, Any] | None = None
     marker_path = _scoped_markers_dir / "detect_track.json"
@@ -4132,6 +4180,14 @@ with col1:
     )
     if device_label:
         detect_params.append(f"device={device_label}")
+    if (
+        detect_status_value in {"missing", "unknown", "stale"}
+        and detections_path.exists()
+        and tracks_path.exists()
+    ):
+        detect_status_value = "success"
+        tracks_ready = True
+        using_manifest_fallback = True
     if detect_status_value == "success":
         runtime_label = detect_runtime or "n/a"
         st.success(f"✅ **Detect/Track**: Complete (Runtime: {runtime_label})")
@@ -6673,6 +6729,29 @@ with col_faces:
             can_run_faces = _ensure_local_artifacts(ep_id, details)
             if can_run_faces:
                 local_video_exists = True
+        if can_run_faces and selected_attempt_run_id and (
+            (not detections_presence.local) or (not tracks_presence.local)
+        ):
+            if stage_layout.artifact_available(detections_presence) and stage_layout.artifact_available(tracks_presence):
+                with st.spinner("Mirroring detect/track manifests from S3…"):
+                    ok, err = _ensure_run_artifacts_local(
+                        ep_id,
+                        selected_attempt_run_id,
+                        {
+                            "detections.jsonl": detections_presence,
+                            "tracks.jsonl": tracks_presence,
+                        },
+                    )
+                if not ok:
+                    st.error(f"Failed to mirror detect/track manifests: {err}")
+                    can_run_faces = False
+                try:
+                    _cached_run_artifact_presence.clear()
+                except Exception as exc:
+                    LOGGER.debug("[RUN_ARTIFACT] Cache clear failed after detect hydrate: %s", exc)
+                st.session_state[_status_force_refresh_key(ep_id)] = True
+        if not can_run_faces:
+            st.session_state[_status_force_refresh_key(ep_id)] = True
         if can_run_faces:
             payload = {
                 "ep_id": ep_id,
