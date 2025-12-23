@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -9,6 +11,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from py_screenalytics import run_layout
+
+LOGGER = logging.getLogger(__name__)
+
+try:  # pragma: no cover - platform dependent
+    import fcntl
+except ImportError:  # pragma: no cover - non-posix platforms
+    fcntl = None
 
 STAGE_PLAN: tuple[str, ...] = (
     "detect",
@@ -100,6 +109,12 @@ class StageStatus(str, Enum):
         return cls.NOT_STARTED
 
 
+class StageTransitionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class BlockedReason:
     code: str
@@ -124,6 +139,8 @@ class StageState:
     counts: dict[str, int] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     derived: bool = False
+    derived_from: list[str] = field(default_factory=list)
+    derivation_reason: str | None = None
 
 
 @dataclass
@@ -164,6 +181,21 @@ def _coerce_stage(stage: Stage | str) -> Stage:
     return resolved
 
 
+@contextmanager
+def _status_lock(path: Path):
+    if fcntl is None:
+        yield
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def episode_status_path(ep_id: str, run_id: str) -> Path:
     run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
     return run_root / "episode_status.json"
@@ -178,6 +210,22 @@ def _read_status_payload(ep_id: str, run_id: str) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _update_status_payload(
+    ep_id: str,
+    run_id: str,
+    update_fn,
+) -> dict[str, Any]:
+    path = episode_status_path(ep_id, run_id)
+    with _status_lock(path):
+        payload = _read_status_payload(ep_id, run_id) or _base_status_payload(ep_id, run_id)
+        updated = update_fn(payload)
+        if isinstance(updated, dict):
+            payload = updated
+        payload["generated_at"] = _utcnow_iso()
+        write_episode_status(ep_id, run_id, payload)
+        return payload
 
 
 def read_episode_status(ep_id: str, run_id: str) -> EpisodeStatus:
@@ -298,7 +346,16 @@ def _stage_state_from_payload(
             if isinstance(value, int) and key not in counts:
                 counts[key] = value
 
-    derived = bool(payload.get("derived", False))
+    derived = bool(payload.get("is_derived") or payload.get("derived", False))
+    derived_from: list[str] = []
+    raw_derived_from = payload.get("derived_from")
+    if isinstance(raw_derived_from, list):
+        for entry in raw_derived_from:
+            if isinstance(entry, str) and entry.strip():
+                derived_from.append(entry.strip())
+    derivation_reason = payload.get("derivation_reason")
+    if isinstance(derivation_reason, str):
+        derivation_reason = derivation_reason.strip() or None
     return StageState(
         episode_id=ep_id,
         run_id=run_id,
@@ -315,6 +372,8 @@ def _stage_state_from_payload(
         counts={k: int(v) for k, v in counts.items() if isinstance(v, int)},
         metrics=metrics,
         derived=derived,
+        derived_from=derived_from,
+        derivation_reason=derivation_reason,
     )
 
 
@@ -332,6 +391,9 @@ def _stage_state_to_payload(state: StageState) -> dict[str, Any]:
         "counts": state.counts or None,
         "metrics": state.metrics or None,
         "derived": state.derived,
+        "is_derived": state.derived,
+        "derived_from": state.derived_from or None,
+        "derivation_reason": state.derivation_reason,
     }
     if state.status == StageStatus.FAILED and state.blocked_reason:
         payload.setdefault("error_reason", state.blocked_reason.message)
@@ -476,53 +538,47 @@ def update_episode_status(
     storage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_id_norm = run_layout.normalize_run_id(run_id)
-    payload = _read_status_payload(ep_id, run_id_norm) or {
-        "episode_id": ep_id,
-        "run_id": run_id_norm,
-        "stage_plan": list(stage_plan or STAGE_PLAN),
-        "stages": {},
-    }
-    payload.setdefault("episode_id", ep_id)
-    payload.setdefault("run_id", run_id_norm)
-    payload.setdefault("stage_plan", list(stage_plan or STAGE_PLAN))
-    payload.setdefault("stages", {})
-    stages = payload.get("stages")
-    if isinstance(stages, dict) and not stages:
-        for name in payload["stage_plan"]:
-            stages[name] = {"status": "missing"}
+    def _apply(payload: dict[str, Any]) -> dict[str, Any]:
+        payload.setdefault("episode_id", ep_id)
+        payload.setdefault("run_id", run_id_norm)
+        payload.setdefault("stage_plan", list(stage_plan or STAGE_PLAN))
+        payload.setdefault("stages", {})
+        stages = payload.get("stages")
+        if isinstance(stages, dict) and not stages:
+            for name in payload["stage_plan"]:
+                stages[name] = {"status": "missing"}
 
-    if stage_key and stage_update and isinstance(payload.get("stages"), dict):
-        current = payload["stages"].get(stage_key, {})
-        if not isinstance(current, dict):
-            current = {}
-        payload["stages"][stage_key] = _merge_stage(current, stage_update)
+        if stage_key and stage_update and isinstance(payload.get("stages"), dict):
+            current = payload["stages"].get(stage_key, {})
+            if not isinstance(current, dict):
+                current = {}
+            payload["stages"][stage_key] = _merge_stage(current, stage_update)
 
-    if git_info:
-        for key, value in git_info.items():
-            if value is not None:
-                payload[key] = value
+        if git_info:
+            for key, value in git_info.items():
+                if value is not None:
+                    payload[key] = value
 
-    if env:
-        payload_env = payload.get("env")
-        if not isinstance(payload_env, dict):
-            payload_env = {}
-        for key, value in env.items():
-            if value is not None:
-                payload_env[key] = value
-        payload["env"] = payload_env
+        if env:
+            payload_env = payload.get("env")
+            if not isinstance(payload_env, dict):
+                payload_env = {}
+            for key, value in env.items():
+                if value is not None:
+                    payload_env[key] = value
+            payload["env"] = payload_env
 
-    if storage:
-        payload_storage = payload.get("storage")
-        if not isinstance(payload_storage, dict):
-            payload_storage = {}
-        for key, value in storage.items():
-            if value is not None:
-                payload_storage[key] = value
-        payload["storage"] = payload_storage
+        if storage:
+            payload_storage = payload.get("storage")
+            if not isinstance(payload_storage, dict):
+                payload_storage = {}
+            for key, value in storage.items():
+                if value is not None:
+                    payload_storage[key] = value
+            payload["storage"] = payload_storage
+        return payload
 
-    payload["generated_at"] = _utcnow_iso()
-    write_episode_status(ep_id, run_id_norm, payload)
-    return payload
+    return _update_status_payload(ep_id, run_id_norm, _apply)
 
 
 def stage_update_from_marker(
@@ -623,6 +679,9 @@ def derive_status_from_artifacts(ep_id: str, run_id: str) -> EpisodeStatus:
                     if stage_key:
                         derived_payload = dict(stage_update)
                         derived_payload["derived"] = True
+                        derived_payload["is_derived"] = True
+                        derived_payload["derived_from"] = [str(marker_path)]
+                        derived_payload["derivation_reason"] = "marker"
                         stages[stage] = _stage_state_from_payload(ep_id, run_id_norm, stage, derived_payload)
                         continue
 
@@ -633,6 +692,8 @@ def derive_status_from_artifacts(ep_id: str, run_id: str) -> EpisodeStatus:
             if isinstance(entry, dict) and entry.get("exists") and isinstance(entry.get("label"), str)
         }
         status = StageStatus.SUCCESS if artifact_paths else StageStatus.NOT_STARTED
+        derived_from = list(artifact_paths.values())
+        derivation_reason = "artifacts_present" if artifact_paths else "no_artifacts"
         stages[stage] = StageState(
             episode_id=ep_id,
             run_id=run_id_norm,
@@ -640,6 +701,8 @@ def derive_status_from_artifacts(ep_id: str, run_id: str) -> EpisodeStatus:
             status=status,
             artifact_paths=artifact_paths,
             derived=True,
+            derived_from=derived_from,
+            derivation_reason=derivation_reason,
         )
 
     return EpisodeStatus(
@@ -671,12 +734,87 @@ def _merge_stage_payload(payload: dict[str, Any], stage: Stage, update: Mapping[
     payload["stages"] = stages
 
 
-def _write_stage_state(ep_id: str, run_id: str, stage: Stage, state: StageState) -> EpisodeStatus:
+def _extract_existing_stage_state(stage_entry: Mapping[str, Any]) -> tuple[StageStatus, datetime | None, datetime | None]:
+    status = StageStatus.from_value(stage_entry.get("status"))
+    timestamps = stage_entry.get("timestamps") if isinstance(stage_entry.get("timestamps"), dict) else {}
+    started_at = _parse_iso(stage_entry.get("started_at") or timestamps.get("started_at"))
+    finished_at = _parse_iso(stage_entry.get("ended_at") or stage_entry.get("finished_at") or timestamps.get("ended_at"))
+    return status, started_at, finished_at
+
+
+def _enforce_stage_transition(
+    *,
+    stage: Stage,
+    run_id: str,
+    existing_status: StageStatus,
+    new_status: StageStatus,
+    force: bool,
+) -> None:
+    if force:
+        return
+    if existing_status in {StageStatus.SUCCESS, StageStatus.FAILED} and new_status != existing_status:
+        LOGGER.warning(
+            "[episode_status] Stage transition rejected stage=%s run_id=%s existing=%s new=%s",
+            stage.value,
+            run_id,
+            existing_status.value,
+            new_status.value,
+        )
+        raise StageTransitionError(
+            "status_regression",
+            f"Stage {stage.value} already {existing_status.value}; refusing {new_status.value} without force",
+        )
+
+
+def _apply_stage_state(
+    payload: dict[str, Any],
+    *,
+    stage: Stage,
+    state: StageState,
+    force: bool,
+) -> None:
+    stages = payload.get("stages")
+    if not isinstance(stages, dict):
+        stages = {}
+    existing_entry = stages.get(stage.value, {})
+    if not isinstance(existing_entry, dict):
+        existing_entry = {}
+    existing_status, existing_started, existing_finished = _extract_existing_stage_state(existing_entry)
+    _enforce_stage_transition(
+        stage=stage,
+        run_id=payload.get("run_id", ""),
+        existing_status=existing_status,
+        new_status=state.status,
+        force=force,
+    )
+    if existing_started and not force:
+        state.started_at = existing_started
+    if existing_finished and not force:
+        state.finished_at = existing_finished
+    if state.started_at and state.finished_at and state.duration_s is None:
+        state.duration_s = _duration_s(
+            _serialize_datetime(state.started_at),
+            _serialize_datetime(state.finished_at),
+        )
+    stages[stage.value] = _merge_stage(existing_entry, _stage_state_to_payload(state))
+    payload["stages"] = stages
+
+
+def _write_stage_state(
+    ep_id: str,
+    run_id: str,
+    stage: Stage,
+    state: StageState,
+    *,
+    force: bool = False,
+) -> EpisodeStatus:
     run_id_norm = run_layout.normalize_run_id(run_id)
-    payload = _read_status_payload(ep_id, run_id_norm) or _base_status_payload(ep_id, run_id_norm)
-    _merge_stage_payload(payload, stage, _stage_state_to_payload(state))
-    payload["generated_at"] = _utcnow_iso()
-    write_episode_status(ep_id, run_id_norm, payload)
+
+    def _apply(payload: dict[str, Any]) -> dict[str, Any]:
+        _apply_stage_state(payload, stage=stage, state=state, force=force)
+        return payload
+
+    payload = _update_status_payload(ep_id, run_id_norm, _apply)
     return _episode_status_from_payload(ep_id, run_id_norm, payload)
 
 
@@ -686,6 +824,7 @@ def write_stage_started(
     stage: Stage | str,
     *,
     started_at: datetime | None = None,
+    force: bool = False,
     artifact_paths: Mapping[str, str] | None = None,
     artifact_digests: Mapping[str, str] | None = None,
     model_versions: Mapping[str, str] | None = None,
@@ -708,7 +847,7 @@ def write_stage_started(
         metrics=dict(metrics or {}),
         derived=False,
     )
-    return _write_stage_state(ep_id, run_id, stage_enum, state)
+    return _write_stage_state(ep_id, run_id, stage_enum, state, force=force)
 
 
 def write_stage_finished(
@@ -717,6 +856,7 @@ def write_stage_finished(
     stage: Stage | str,
     *,
     finished_at: datetime | None = None,
+    force: bool = False,
     artifact_paths: Mapping[str, str] | None = None,
     artifact_digests: Mapping[str, str] | None = None,
     model_versions: Mapping[str, str] | None = None,
@@ -725,29 +865,13 @@ def write_stage_finished(
     metrics: Mapping[str, Any] | None = None,
 ) -> EpisodeStatus:
     stage_enum = _coerce_stage(stage)
-    run_id_norm = run_layout.normalize_run_id(run_id)
-    payload = _read_status_payload(ep_id, run_id_norm) or _base_status_payload(ep_id, run_id_norm)
-    existing_entry = payload.get("stages", {}).get(stage_enum.value) if isinstance(payload.get("stages"), dict) else {}
-    started_at = None
-    if isinstance(existing_entry, Mapping):
-        started_at = _parse_iso(existing_entry.get("started_at"))
-    if started_at is None:
-        timestamps = existing_entry.get("timestamps") if isinstance(existing_entry, Mapping) else {}
-        started_at = _parse_iso(timestamps.get("started_at") if isinstance(timestamps, dict) else None)
-
     finished_at = finished_at or datetime.now(timezone.utc).replace(microsecond=0)
-    duration_s = None
-    if started_at:
-        duration_s = _duration_s(_serialize_datetime(started_at), _serialize_datetime(finished_at))
-
     state = StageState(
         episode_id=ep_id,
-        run_id=run_id_norm,
+        run_id=run_layout.normalize_run_id(run_id),
         stage=stage_enum,
         status=StageStatus.SUCCESS,
-        started_at=started_at,
         finished_at=finished_at,
-        duration_s=duration_s,
         artifact_paths=dict(artifact_paths or {}),
         artifact_digests=dict(artifact_digests or {}),
         model_versions=dict(model_versions or {}),
@@ -756,10 +880,7 @@ def write_stage_finished(
         metrics=dict(metrics or {}),
         derived=False,
     )
-    _merge_stage_payload(payload, stage_enum, _stage_state_to_payload(state))
-    payload["generated_at"] = _utcnow_iso()
-    write_episode_status(ep_id, run_id_norm, payload)
-    return _episode_status_from_payload(ep_id, run_id_norm, payload)
+    return _write_stage_state(ep_id, run_id, stage_enum, state, force=force)
 
 
 def write_stage_failed(
@@ -770,6 +891,7 @@ def write_stage_failed(
     error_message: str,
     *,
     finished_at: datetime | None = None,
+    force: bool = False,
     artifact_paths: Mapping[str, str] | None = None,
     artifact_digests: Mapping[str, str] | None = None,
     model_versions: Mapping[str, str] | None = None,
@@ -778,29 +900,13 @@ def write_stage_failed(
     metrics: Mapping[str, Any] | None = None,
 ) -> EpisodeStatus:
     stage_enum = _coerce_stage(stage)
-    run_id_norm = run_layout.normalize_run_id(run_id)
-    payload = _read_status_payload(ep_id, run_id_norm) or _base_status_payload(ep_id, run_id_norm)
-    existing_entry = payload.get("stages", {}).get(stage_enum.value) if isinstance(payload.get("stages"), dict) else {}
-    started_at = None
-    if isinstance(existing_entry, Mapping):
-        started_at = _parse_iso(existing_entry.get("started_at"))
-    if started_at is None:
-        timestamps = existing_entry.get("timestamps") if isinstance(existing_entry, Mapping) else {}
-        started_at = _parse_iso(timestamps.get("started_at") if isinstance(timestamps, dict) else None)
-
     finished_at = finished_at or datetime.now(timezone.utc).replace(microsecond=0)
-    duration_s = None
-    if started_at:
-        duration_s = _duration_s(_serialize_datetime(started_at), _serialize_datetime(finished_at))
-
     state = StageState(
         episode_id=ep_id,
-        run_id=run_id_norm,
+        run_id=run_layout.normalize_run_id(run_id),
         stage=stage_enum,
         status=StageStatus.FAILED,
-        started_at=started_at,
         finished_at=finished_at,
-        duration_s=duration_s,
         blocked_reason=BlockedReason(code=error_code, message=error_message),
         artifact_paths=dict(artifact_paths or {}),
         artifact_digests=dict(artifact_digests or {}),
@@ -810,10 +916,7 @@ def write_stage_failed(
         metrics=dict(metrics or {}),
         derived=False,
     )
-    _merge_stage_payload(payload, stage_enum, _stage_state_to_payload(state))
-    payload["generated_at"] = _utcnow_iso()
-    write_episode_status(ep_id, run_id_norm, payload)
-    return _episode_status_from_payload(ep_id, run_id_norm, payload)
+    return _write_stage_state(ep_id, run_id, stage_enum, state, force=force)
 
 
 def write_stage_blocked(
@@ -824,6 +927,7 @@ def write_stage_blocked(
     *,
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
+    force: bool = False,
     artifact_paths: Mapping[str, str] | None = None,
     artifact_digests: Mapping[str, str] | None = None,
     model_versions: Mapping[str, str] | None = None,
@@ -832,30 +936,15 @@ def write_stage_blocked(
     metrics: Mapping[str, Any] | None = None,
 ) -> EpisodeStatus:
     stage_enum = _coerce_stage(stage)
-    run_id_norm = run_layout.normalize_run_id(run_id)
-    payload = _read_status_payload(ep_id, run_id_norm) or _base_status_payload(ep_id, run_id_norm)
-    if started_at is None:
-        existing_entry = payload.get("stages", {}).get(stage_enum.value) if isinstance(payload.get("stages"), dict) else {}
-        if isinstance(existing_entry, Mapping):
-            started_at = _parse_iso(existing_entry.get("started_at"))
-        if started_at is None:
-            timestamps = existing_entry.get("timestamps") if isinstance(existing_entry, Mapping) else {}
-            started_at = _parse_iso(timestamps.get("started_at") if isinstance(timestamps, dict) else None)
     if finished_at is None:
         finished_at = datetime.now(timezone.utc).replace(microsecond=0)
-
-    duration_s = None
-    if started_at:
-        duration_s = _duration_s(_serialize_datetime(started_at), _serialize_datetime(finished_at))
-
     state = StageState(
         episode_id=ep_id,
-        run_id=run_id_norm,
+        run_id=run_layout.normalize_run_id(run_id),
         stage=stage_enum,
         status=StageStatus.BLOCKED,
         started_at=started_at,
         finished_at=finished_at,
-        duration_s=duration_s,
         blocked_reason=blocked_reason,
         artifact_paths=dict(artifact_paths or {}),
         artifact_digests=dict(artifact_digests or {}),
@@ -865,7 +954,4 @@ def write_stage_blocked(
         metrics=dict(metrics or {}),
         derived=False,
     )
-    _merge_stage_payload(payload, stage_enum, _stage_state_to_payload(state))
-    payload["generated_at"] = _utcnow_iso()
-    write_episode_status(ep_id, run_id_norm, payload)
-    return _episode_status_from_payload(ep_id, run_id_norm, payload)
+    return _write_stage_state(ep_id, run_id, stage_enum, state, force=force)

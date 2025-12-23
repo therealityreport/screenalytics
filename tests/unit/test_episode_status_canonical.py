@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from py_screenalytics import run_layout
+import pytest
+
 from py_screenalytics.episode_status import (
     Stage,
     StageStatus,
+    StageTransitionError,
     read_episode_status,
     write_stage_finished,
     write_stage_started,
@@ -71,6 +75,46 @@ def test_episode_status_derivation_fallback(tmp_path: Path, monkeypatch) -> None
     faces_state = status.stages[Stage.FACES]
     assert faces_state.status == StageStatus.SUCCESS
     assert faces_state.derived is True
+    assert faces_state.derived_from
+    assert faces_state.derivation_reason
     detect_state = status.stages[Stage.DETECT]
     assert detect_state.status == StageStatus.NOT_STARTED
     assert detect_state.derived is True
+
+
+def test_episode_status_lost_update_protection(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-concurrent"
+    run_id = "attempt-4"
+
+    def _worker(stage_key: str) -> None:
+        write_stage_started(ep_id, run_id, stage_key)
+
+    threads = [
+        threading.Thread(target=_worker, args=("detect",)),
+        threading.Thread(target=_worker, args=("faces",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    status = read_episode_status(ep_id, run_id)
+    assert status.stages[Stage.DETECT].status == StageStatus.RUNNING
+    assert status.stages[Stage.FACES].status == StageStatus.RUNNING
+
+
+def test_episode_status_monotonic_transition(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("SCREENALYTICS_DATA_ROOT", str(data_root))
+
+    ep_id = "ep-monotonic"
+    run_id = "attempt-5"
+
+    write_stage_finished(ep_id, run_id, "detect")
+    with pytest.raises(StageTransitionError) as excinfo:
+        write_stage_started(ep_id, run_id, "detect")
+
+    assert excinfo.value.code == "status_regression"
