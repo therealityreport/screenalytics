@@ -331,9 +331,6 @@ class EpisodeRunResult:
     episode_id: str
     """Episode identifier"""
 
-    run_id: Optional[str] = None
-    """Run identifier for run-scoped artifacts"""
-
     success: bool
     """Whether all stages completed successfully"""
 
@@ -345,6 +342,9 @@ class EpisodeRunResult:
 
     runtime_sec: float
     """Total runtime in seconds"""
+
+    run_id: Optional[str] = None
+    """Run identifier for run-scoped artifacts"""
 
     # Aggregate counts from final stage
     frames_processed: int = 0
