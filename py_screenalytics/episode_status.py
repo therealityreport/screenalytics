@@ -14,7 +14,6 @@ STAGE_PLAN: tuple[str, ...] = (
     "cluster",
     "body_tracking",
     "track_fusion",
-    "screentime",
     "pdf",
 )
 

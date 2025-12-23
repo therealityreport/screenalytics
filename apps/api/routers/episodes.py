@@ -2373,6 +2373,7 @@ def export_run_debug_bundle(
     format: str = Query("pdf", description="Export format: 'pdf' for debug report, 'zip' for raw bundle"),
     include_artifacts: bool = Query(True, description="Include raw artifacts (tracks/faces/identities) - only for zip format"),
     include_logs: bool = Query(True, description="Include persisted logs (recommended) - only for zip format"),
+    include_screentime: bool = Query(True, description="Include screentime sections in the PDF (ignored for zip format)"),
     upload_to_s3: bool = Query(True, description="Upload export to S3 if configured (silent no-op if backend=local)"),
 ) -> StreamingResponse:
     """Export a run debug report (PDF) or raw bundle (ZIP).
@@ -2447,6 +2448,7 @@ def export_run_debug_bundle(
             pdf_bytes, download_name, upload_result = build_and_upload_debug_pdf(
                 ep_id=ep_id_norm,
                 run_id=run_id,
+                include_screentime=include_screentime,
                 upload_to_s3=upload_to_s3,
                 fail_on_s3_error=False,  # Don't fail the request if S3 upload fails
             )

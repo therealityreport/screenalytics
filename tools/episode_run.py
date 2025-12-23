@@ -7033,6 +7033,26 @@ def _maybe_run_body_tracking(
     fusion_config_path = REPO_ROOT / "config" / "pipeline" / "track_fusion.yaml"
 
     started_at = _utcnow_iso()
+    stage_heartbeat = StageStatusHeartbeat(
+        ep_id=ep_id,
+        run_id=effective_run_id,
+        stage_key="body_tracking",
+        frames_total=1,
+        started_at=started_at,
+    )
+    if effective_run_id:
+        update_episode_status(
+            ep_id,
+            effective_run_id,
+            stage_key="body_tracking",
+            stage_update={"status": "running"},
+        )
+    stage_heartbeat.update(
+        done=0,
+        phase="running_frames",
+        message="Starting body tracking",
+        force=True,
+    )
     try:
         from FEATURES.body_tracking.src.body_tracking_runner import BodyTrackingRunner
     except Exception as exc:
@@ -7049,6 +7069,13 @@ def _maybe_run_body_tracking(
             "finished_at": _utcnow_iso(),
             "error": f"import_error: {exc}",
         }
+        stage_heartbeat.update(
+            done=0,
+            phase="error",
+            message=f"Import error: {exc}",
+            force=True,
+            mark_end=True,
+        )
         _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
         return payload
 
@@ -7061,8 +7088,24 @@ def _maybe_run_body_tracking(
             output_dir=output_dir,
             skip_existing=True,
         )
-        det_path = runner.run_detection()
-        tracks_path = runner.run_tracking()
+        det_path = _run_with_heartbeat(
+            runner.run_detection,
+            lambda: stage_heartbeat.update(
+                done=0,
+                phase="running_frames",
+                message="Detecting bodies",
+            ),
+            interval=stage_heartbeat.heartbeat_interval,
+        )
+        tracks_path = _run_with_heartbeat(
+            runner.run_tracking,
+            lambda: stage_heartbeat.update(
+                done=0,
+                phase="running_frames",
+                message="Tracking bodies",
+            ),
+            interval=stage_heartbeat.heartbeat_interval,
+        )
         tracker_backend_configured = getattr(runner, "tracker_backend_configured", None)
         tracker_backend_actual = getattr(runner, "tracker_backend_actual", None)
         tracker_fallback_reason = getattr(runner, "tracker_fallback_reason", None)
@@ -7089,6 +7132,15 @@ def _maybe_run_body_tracking(
                 torchreid_version = torchreid_state.get("version")
                 if isinstance(torchreid_status, str) and torchreid_status.strip():
                     torchreid_import_ok = torchreid_status.strip() == "ok"
+
+        stage_heartbeat.update(
+            done=1,
+            phase="finalizing",
+            message="Finalizing body tracking outputs",
+            force=True,
+            mark_frames_done=True,
+            mark_finalize_start=True,
+        )
 
         if not reid_enabled_config:
             embeddings_note = "disabled"
@@ -7124,7 +7176,15 @@ def _maybe_run_body_tracking(
             LOGGER.warning("[body_tracking] Re-ID embeddings skipped: %s", embeddings_note)
         else:
             try:
-                embeddings_path = runner.run_embedding()
+                embeddings_path = _run_with_heartbeat(
+                    runner.run_embedding,
+                    lambda: stage_heartbeat.update(
+                        done=1,
+                        phase="finalizing",
+                        message="Generating body embeddings",
+                    ),
+                    interval=stage_heartbeat.heartbeat_interval,
+                )
                 reid_embeddings_generated = True
                 torchreid_runtime_ok = True
             except ImportError as exc:
@@ -7256,6 +7316,13 @@ def _maybe_run_body_tracking(
                 }
             },
         }
+        stage_heartbeat.update(
+            done=1,
+            phase="done",
+            message="Body tracking complete",
+            force=True,
+            mark_end=True,
+        )
         _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
         return payload
     except Exception as exc:
@@ -7270,6 +7337,13 @@ def _maybe_run_body_tracking(
             "import_status": import_status,
             "error": str(exc),
         }
+        stage_heartbeat.update(
+            done=1,
+            phase="error",
+            message=f"Body tracking failed: {exc}",
+            force=True,
+            mark_end=True,
+        )
         _write_run_marker(ep_id, "body_tracking", payload, run_id=run_id)
         return payload
 
@@ -7311,6 +7385,26 @@ def _maybe_run_body_tracking_fusion(
     fusion_config_path = REPO_ROOT / "config" / "pipeline" / "track_fusion.yaml"
 
     started_at = _utcnow_iso()
+    stage_heartbeat = StageStatusHeartbeat(
+        ep_id=ep_id,
+        run_id=effective_run_id,
+        stage_key="track_fusion",
+        frames_total=1,
+        started_at=started_at,
+    )
+    if effective_run_id:
+        update_episode_status(
+            ep_id,
+            effective_run_id,
+            stage_key="track_fusion",
+            stage_update={"status": "running"},
+        )
+    stage_heartbeat.update(
+        done=0,
+        phase="running_frames",
+        message="Starting track fusion",
+        force=True,
+    )
     try:
         from FEATURES.body_tracking.src.body_tracking_runner import BodyTrackingRunner
     except Exception as exc:
@@ -7327,6 +7421,13 @@ def _maybe_run_body_tracking_fusion(
             "finished_at": _utcnow_iso(),
             "error": f"import_error: {exc}",
         }
+        stage_heartbeat.update(
+            done=0,
+            phase="error",
+            message=f"Import error: {exc}",
+            force=True,
+            mark_end=True,
+        )
         _write_run_marker(ep_id, "body_tracking_fusion", payload, run_id=run_id)
         return payload
 
@@ -7345,13 +7446,37 @@ def _maybe_run_body_tracking_fusion(
         )
 
         # Run fusion (associates face tracks with body tracks)
-        fusion_path = runner.run_fusion()
+        fusion_path = _run_with_heartbeat(
+            runner.run_fusion,
+            lambda: stage_heartbeat.update(
+                done=0,
+                phase="running_frames",
+                message="Fusing face/body tracks",
+            ),
+            interval=stage_heartbeat.heartbeat_interval,
+        )
         LOGGER.info("[body_tracking_fusion] Fusion complete: %s", fusion_path)
 
         # Run comparison (calculates face-only vs face+body screen time)
         comparison_path: Path | None = None
         try:
-            comparison_path = runner.run_comparison()
+            stage_heartbeat.update(
+                done=1,
+                phase="finalizing",
+                message="Computing fusion comparison",
+                force=True,
+                mark_frames_done=True,
+                mark_finalize_start=True,
+            )
+            comparison_path = _run_with_heartbeat(
+                runner.run_comparison,
+                lambda: stage_heartbeat.update(
+                    done=1,
+                    phase="finalizing",
+                    message="Computing fusion comparison",
+                ),
+                interval=stage_heartbeat.heartbeat_interval,
+            )
             LOGGER.info("[body_tracking_fusion] Comparison complete: %s", comparison_path)
         except Exception as exc:
             LOGGER.warning("[body_tracking_fusion] Comparison failed: %s", exc)
@@ -7382,6 +7507,13 @@ def _maybe_run_body_tracking_fusion(
                 }
             },
         }
+        stage_heartbeat.update(
+            done=1,
+            phase="done",
+            message="Track fusion complete",
+            force=True,
+            mark_end=True,
+        )
         _write_run_marker(ep_id, "body_tracking_fusion", payload, run_id=run_id)
         return payload
     except Exception as exc:
@@ -7395,6 +7527,13 @@ def _maybe_run_body_tracking_fusion(
             "finished_at": _utcnow_iso(),
             "error": str(exc),
         }
+        stage_heartbeat.update(
+            done=1,
+            phase="error",
+            message=f"Track fusion failed: {exc}",
+            force=True,
+            mark_end=True,
+        )
         _write_run_marker(ep_id, "body_tracking_fusion", payload, run_id=run_id)
         return payload
 
