@@ -1042,6 +1042,42 @@ def _find_body_tracking_enabled(payload: Any) -> tuple[bool, str] | None:
     return _check(payload, "request_json")
 
 
+def _resolve_lifecycle_status(stage_key: str, stage_entry: dict[str, Any] | None, artifact_state: dict[str, Any]) -> str:
+    """Resolve lifecycle status using episode_status first, then artifact presence."""
+    stage_entry = stage_entry if isinstance(stage_entry, dict) else {}
+    status_val = str(stage_entry.get("status") or "").strip().lower()
+    if status_val in {"success", "completed", "done", "error", "failed", "running", "finalizing", "syncing", "skipped"}:
+        return status_val
+
+    if stage_key == "detect":
+        detections_ok = bool(artifact_state.get("detections"))
+        tracks_ok = bool(artifact_state.get("tracks"))
+        if detections_ok and tracks_ok:
+            return "success"
+        if detections_ok or tracks_ok:
+            return "partial"
+    elif stage_key == "faces":
+        if artifact_state.get("faces"):
+            return "success"
+    elif stage_key == "cluster":
+        if artifact_state.get("identities"):
+            return "success"
+    elif stage_key == "body_tracking":
+        if artifact_state.get("body_tracks"):
+            return "success"
+        if artifact_state.get("legacy"):
+            return "success (legacy)"
+    elif stage_key == "track_fusion":
+        if artifact_state.get("track_fusion"):
+            return "success"
+        if artifact_state.get("legacy"):
+            return "success (legacy)"
+    elif stage_key == "pdf":
+        if artifact_state.get("export_index"):
+            return "success"
+    return status_val or "missing"
+
+
 def _track_fusion_overlap_diagnostics(
     *,
     face_tracks_path: Path,
@@ -1299,6 +1335,7 @@ def build_screentime_run_debug_pdf(
     if not run_root.exists():
         raise FileNotFoundError(f"Run not found on disk: {run_root}")
 
+    include_faces_review = bool(include_screentime)
     s3_layout = run_layout.get_run_s3_layout(ep_id, run_id_norm)
 
     def _safe_float_opt(value: Any) -> float | None:
@@ -3181,13 +3218,28 @@ def build_screentime_run_debug_pdf(
         "body_tracking": "body_tracking.json",
         "track_fusion": "body_tracking_fusion.json",
     }
+    export_index_path = run_root / "exports" / "export_index.json"
+    artifact_state_by_stage: dict[str, dict[str, Any]] = {
+        "detect": {"detections": detections_path.exists(), "tracks": tracks_path.exists()},
+        "faces": {"faces": faces_path.exists()},
+        "cluster": {"identities": identities_path.exists()},
+        "body_tracking": {
+            "body_tracks": body_tracks_path.exists(),
+            "legacy": legacy_body_artifacts_exist,
+        },
+        "track_fusion": {
+            "track_fusion": track_fusion_path.exists(),
+            "legacy": legacy_track_fusion_path.exists(),
+        },
+        "pdf": {"export_index": export_index_path.exists()},
+    }
     for stage_key in stage_plan:
         stage_entry = None
         if isinstance(episode_status_payload, dict):
             stage_entry = episode_status_payload.get("stages", {}).get(stage_key)
         if not isinstance(stage_entry, dict):
             stage_entry = {}
-        status_val = stage_entry.get("status") or "unknown"
+        status_val = _resolve_lifecycle_status(stage_key, stage_entry, artifact_state_by_stage.get(stage_key, {}))
         started_at = stage_entry.get("started_at")
         ended_at = stage_entry.get("ended_at")
         if not started_at and not ended_at:
@@ -4369,126 +4421,147 @@ def build_screentime_run_debug_pdf(
     story.append(Paragraph(f"&bull; cluster_centroids.json ({_file_size_str(cluster_centroids_path)})", bullet_style))
 
     # =========================================================================
-    # SECTION 8: FACES REVIEW (DB State)
+    # SECTION 8: FACES REVIEW (DB State) + SECTION 9: SMART SUGGESTIONS
     # =========================================================================
-    story.append(Paragraph("8. Faces Review (DB State)", section_style))
-    assigned_count = sum(1 for identity in identities_list if identity.get("person_id")) if identities_count_run is not None else None
-    assigned_count_display = _format_optional_count(
-        assigned_count,
-        path=identities_path,
-        label="identities.json",
-    )
-    unassigned_count = (
-        (identities_count_run - assigned_count)
-        if identities_count_run is not None and isinstance(assigned_count, int)
-        else None
-    )
-    unassigned_count_display = _format_optional_count(
-        unassigned_count,
-        path=identities_path,
-        label="identities.json",
-    )
+    if include_faces_review:
+        story.append(Paragraph("8. Faces Review (DB State)", section_style))
+        assigned_count = (
+            sum(1 for identity in identities_list if identity.get("person_id"))
+            if identities_count_run is not None
+            else None
+        )
+        assigned_count_display = _format_optional_count(
+            assigned_count,
+            path=identities_path,
+            label="identities.json",
+        )
+        unassigned_count = (
+            (identities_count_run - assigned_count)
+            if identities_count_run is not None and isinstance(assigned_count, int)
+            else None
+        )
+        unassigned_count_display = _format_optional_count(
+            unassigned_count,
+            path=identities_path,
+            label="identities.json",
+        )
 
-    # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_connected is not True:
-        locked_count_str = "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)"
+        # Show "unavailable" for DB-sourced data when DB is not connected
+        if db_connected is not True:
+            locked_count_str = "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)"
+        else:
+            locked_count = len([lock for lock in identity_locks if lock.get("locked")])
+            locked_count_str = str(locked_count)
+
+        review_stats = [
+            ["Metric", "Value"],
+            ["Total Identities", identities_count_display],
+            ["Assigned to Cast", assigned_count_display],
+            ["Locked Identities", locked_count_str],
+            ["Unassigned", unassigned_count_display],
+        ]
+        review_table = Table(review_stats, colWidths=[2 * inch, 2 * inch])
+        review_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ])
+        )
+        story.append(review_table)
+
+        if db_connected is False:
+            story.append(Paragraph(f"⚠️ <b>DB Error:</b> {db_error}", warning_style))
+            story.append(
+                Paragraph(
+                    "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
+                    note_style,
+                )
+            )
+            manual_assignments = identities_data.get("manual_assignments")
+            manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
+            if manual_assignments_count > 0:
+                story.append(Paragraph(
+                    f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
+                    note_style
+                ))
+        elif db_connected is None:
+            story.append(
+                Paragraph(
+                    f"<b>DB Not Configured:</b> {db_not_configured_reason or 'missing DB_URL'} (DB-sourced state is omitted in this report).",
+                    note_style,
+                )
+            )
+
+        story.append(Paragraph("Data Sources:", subsection_style))
+        story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
+        story.append(Paragraph("&bull; identities.json (manual_assignments)", bullet_style))
+
+        story.append(Paragraph("9. Smart Suggestions", section_style))
+
+        # Show "unavailable" for DB-sourced data when DB is not connected
+        if db_connected is not True:
+            suggestion_stats = [
+                ["Metric", "Value"],
+                [
+                    "Suggestion Batches",
+                    "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)",
+                ],
+                ["Total Suggestions", "unavailable"],
+                ["Dismissed", "unavailable"],
+                ["Applied", "unavailable"],
+                ["Pending", "unavailable"],
+            ]
+        else:
+            dismissed_count = sum(1 for s in suggestions_rows if s.get("dismissed"))
+            applied_count = len(suggestion_applies)
+            pending_count = len(suggestions_rows) - dismissed_count - applied_count
+            suggestion_stats = [
+                ["Metric", "Value"],
+                ["Suggestion Batches", str(len(suggestion_batches))],
+                ["Total Suggestions", str(len(suggestions_rows))],
+                ["Dismissed", str(dismissed_count)],
+                ["Applied", str(applied_count)],
+                ["Pending", str(pending_count)],
+            ]
+
+        suggestion_table = Table(suggestion_stats, colWidths=[2 * inch, 2 * inch])
+        suggestion_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ])
+        )
+        story.append(suggestion_table)
+
+        story.append(Paragraph("Data Sources:", subsection_style))
+        story.append(Paragraph("&bull; suggestion_batches table (DB)", bullet_style))
+        story.append(Paragraph("&bull; suggestions table (DB)", bullet_style))
+        story.append(Paragraph("&bull; suggestion_applies table (DB)", bullet_style))
     else:
-        locked_count = len([lock for lock in identity_locks if lock.get("locked")])
-        locked_count_str = str(locked_count)
-
-    review_stats = [
-        ["Metric", "Value"],
-        ["Total Identities", identities_count_display],
-        ["Assigned to Cast", assigned_count_display],
-        ["Locked Identities", locked_count_str],
-        ["Unassigned", unassigned_count_display],
-    ]
-    review_table = Table(review_stats, colWidths=[2 * inch, 2 * inch])
-    review_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ])
-    )
-    story.append(review_table)
-
-    if db_connected is False:
-        story.append(Paragraph(f"⚠️ <b>DB Error:</b> {db_error}", warning_style))
+        story.append(Paragraph("8. Out-of-Scope Sections", section_style))
         story.append(
             Paragraph(
-                "<b>Impact:</b> DB-sourced counts (locks, batches, suggestions) are unavailable in this report due to DB connection error.",
+                "Faces Review (DB state) and Smart Suggestions are out of scope for setup-only exports.",
                 note_style,
             )
         )
-        manual_assignments = identities_data.get("manual_assignments")
-        manual_assignments_count = len(manual_assignments) if isinstance(manual_assignments, dict) else 0
-        if manual_assignments_count > 0:
-            story.append(Paragraph(
-                f"Manual assignments loaded from identities.json fallback: <b>{manual_assignments_count}</b>",
-                note_style
-            ))
-    elif db_connected is None:
-        story.append(
-            Paragraph(
-                f"<b>DB Not Configured:</b> {db_not_configured_reason or 'missing DB_URL'} (DB-sourced state is omitted in this report).",
-                note_style,
-            )
-        )
-
-    story.append(Paragraph("Data Sources:", subsection_style))
-    story.append(Paragraph("&bull; identity_locks table (DB)", bullet_style))
-    story.append(Paragraph("&bull; identities.json (manual_assignments)", bullet_style))
-
-    # =========================================================================
-    # SECTION 9: SMART SUGGESTIONS
-    # =========================================================================
-    story.append(Paragraph("9. Smart Suggestions", section_style))
-
-    # Show "unavailable" for DB-sourced data when DB is not connected
-    if db_connected is not True:
-        suggestion_stats = [
-            ["Metric", "Value"],
-            [
-                "Suggestion Batches",
-                "unavailable (DB not configured)" if db_connected is None else "unavailable (DB error)",
-            ],
-            ["Total Suggestions", "unavailable"],
-            ["Dismissed", "unavailable"],
-            ["Applied", "unavailable"],
-            ["Pending", "unavailable"],
-        ]
-    else:
-        dismissed_count = sum(1 for s in suggestions_rows if s.get("dismissed"))
-        applied_count = len(suggestion_applies)
-        pending_count = len(suggestions_rows) - dismissed_count - applied_count
-        suggestion_stats = [
-            ["Metric", "Value"],
-            ["Suggestion Batches", str(len(suggestion_batches))],
-            ["Total Suggestions", str(len(suggestions_rows))],
-            ["Dismissed", str(dismissed_count)],
-            ["Applied", str(applied_count)],
-            ["Pending", str(pending_count)],
-        ]
-
-    suggestion_table = Table(suggestion_stats, colWidths=[2 * inch, 2 * inch])
-    suggestion_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ])
-    )
-    story.append(suggestion_table)
-
-    story.append(Paragraph("Data Sources:", subsection_style))
-    story.append(Paragraph("&bull; suggestion_batches table (DB)", bullet_style))
-    story.append(Paragraph("&bull; suggestions table (DB)", bullet_style))
-    story.append(Paragraph("&bull; suggestion_applies table (DB)", bullet_style))
+        out_of_scope_items: list[str] = []
+        if screentime_comparison_path.exists():
+            out_of_scope_items.append("body_tracking/screentime_comparison.json")
+        analytics_dir = run_root / "analytics"
+        for filename in ("screentime.json", "screentime.csv"):
+            if (analytics_dir / filename).exists():
+                out_of_scope_items.append(f"analytics/{filename}")
+        if out_of_scope_items:
+            story.append(Paragraph("Out-of-scope artifacts present:", subsection_style))
+            for item in out_of_scope_items:
+                story.append(Paragraph(f"&bull; {item}", bullet_style))
 
     # =========================================================================
     if include_screentime:
