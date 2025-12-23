@@ -1,5 +1,11 @@
 # Run-scoped status groundwork (repo map)
 
+## Status update (DONE in bbe3638)
+- Run ID propagation: DONE (end-to-end).
+- Repo map note: DONE (updated for run_id generation/propagation, jobs.py paths, PR checklist).
+- Regression tests for missing run_id: DONE (CLI + API coverage).
+- Dataclass init crash: DONE (EpisodeRunResult field ordering).
+
 ## Branching + mainline
 - Mainline branch: `origin/main` (no `nov-18` branch present).
 - Feature branch: `screentime-improvements/run-scoped-observability`.
@@ -73,6 +79,19 @@ Acceptance:
   - Derived-status labeling (`is_derived`, `derived_from`).
 - Next milestone after verification: wire canonical status transitions for remaining stages.
 
+## Test failure triage and containment (MERGE BLOCKER)
+- Failing tests reported on this branch:
+  - `tests/unit/test_faces_embed_limits.py`
+  - `tests/unit/test_run_export_s3.py`
+  - `tests/unit/test_scene_fallback.py`
+  - `tests/unit/test_track_reps_run_scoped_crops.py`
+- REQUIRED: Determine if failures are baseline (present on `screentime-improvements/episode-details-downstream-stage`) or regressions.
+  - Run the same failing tests on the base branch and compare results.
+  - Record outcome in PR description: "fails on base branch too" vs "regression introduced here".
+- If regressions: fix on this branch (run-scoped paths and run_id handling must be used consistently).
+- If baseline: document as known failures and ensure this PR does not add new failures.
+- `test_run_export_s3` must be deterministic (skip when missing creds or mock S3).
+
 ## PR checklist (when opening PR)
 - Include commits: `01b9842` and `774a83d`.
 - Describe run_id propagation + compatibility notes.
@@ -81,4 +100,4 @@ Acceptance:
 
 ## Tests run
 - `python -m pytest -q tests/unit tests/api/test_jobs_episode_run_run_id.py` (fails: `test_faces_embed_limits`, `test_run_export_s3`, `test_scene_fallback`, `test_track_reps_run_scoped_crops`).
-- `python -m pytest -q tests/unit/test_run_id_cli_status.py tests/api/test_jobs_episode_run_run_id.py`
+- `python -m pytest -q tests/unit/test_run_id_cli_status.py tests/api/test_jobs_episode_run_run_id.py`.
