@@ -1359,6 +1359,21 @@ def build_screentime_run_debug_pdf(
                 return int(cleaned)
         return None
 
+    def _sanitize_tensorrt_fallback_reason(
+        *,
+        configured: str | None,
+        effective: str | None,
+        reason: str | None,
+    ) -> str | None:
+        if not reason:
+            return reason
+        if configured != "tensorrt" or not effective or effective == "tensorrt":
+            return reason
+        lowered = reason.lower()
+        if "pip install" in lowered or "pycuda" in lowered:
+            return "TensorRT requires CUDA (NVIDIA) and is not available; using PyTorch backend."
+        return reason
+
     manifests_root = get_path(ep_id, "detections").parent
     # Run-scoped body_tracking is authoritative for this report; legacy artifacts are diagnostic only.
     body_tracking_dir = run_root / "body_tracking"
@@ -2527,16 +2542,11 @@ def build_screentime_run_debug_pdf(
             backend_lines.append(("configured", marker_embedding_backend_configured))
         if marker_embedding_backend_actual and embedding_backend_effective and marker_embedding_backend_actual != embedding_backend_effective:
             backend_lines.append(("runtime_actual", marker_embedding_backend_actual))
-        backend_reason = marker_embedding_backend_fallback_reason
-        if (
-            embedding_backend_effective
-            and marker_embedding_backend_configured == "tensorrt"
-            and embedding_backend_effective != "tensorrt"
-            and backend_reason
-        ):
-            lowered = backend_reason.lower()
-            if "pip install" in lowered or "pycuda" in lowered:
-                backend_reason = "TensorRT requires CUDA (NVIDIA) and is not available; using PyTorch backend."
+        backend_reason = _sanitize_tensorrt_fallback_reason(
+            configured=marker_embedding_backend_configured,
+            effective=embedding_backend_effective,
+            reason=marker_embedding_backend_fallback_reason,
+        )
         if backend_reason:
             backend_lines.append(("reason", backend_reason))
         lineage_data.append(["Embedding Backend (effective)", backend_lines])
@@ -3314,7 +3324,14 @@ def build_screentime_run_debug_pdf(
         or marker_embedding_backend_configured
         or embedding_config.get("embedding", {}).get("backend", "tensorrt")
     )
-    embedding_backend_note = marker_embedding_backend_fallback_reason or ""
+    embedding_backend_note = (
+        _sanitize_tensorrt_fallback_reason(
+            configured=marker_embedding_backend_configured,
+            effective=embedding_backend_effective,
+            reason=marker_embedding_backend_fallback_reason,
+        )
+        or ""
+    )
 
     reid_cfg_enabled = bool(track_fusion_config.get("reid_handoff", {}).get("enabled", False))
     body_reid = run_body_tracking_marker.get("body_reid") if isinstance(run_body_tracking_marker, dict) else None
