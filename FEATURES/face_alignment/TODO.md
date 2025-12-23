@@ -1,8 +1,9 @@
 # TODO: face-alignment
 
-**Status:** IN_PROGRESS
+**Status:** PARTIAL (MVP implementations integrated; full models pending)
 **Owner:** Engineering
 **Created:** 2025-12-11
+**Updated:** 2025-12-23
 **TTL:** 2026-01-10
 
 ---
@@ -10,44 +11,52 @@
 ## Overview
 
 Face alignment feature using FAN (Face Alignment Network) for 68-point landmarks,
-LUVLi for quality gating, and 3DDFA_V2 for selective 3D pose estimation.
+quality gating (heuristic-based MVP), and head pose estimation (OpenCV solvePnP MVP).
 
-**Full Documentation:** [docs/todo/feature_face_alignment_fan_luvli_3ddfa.md](../../docs/todo/feature_face_alignment_fan_luvli_3ddfa.md)
+**Full Documentation:** [docs/plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md](../../docs/plans/in_progress/feature_face_alignment_fan_luvli_3ddfa.md)
+
+**Production Code:** `py_screenalytics/face_alignment/` (integrated into harvest job)
 
 ---
 
 ## Tasks
 
-### Phase A: FAN 2D Integration (MVP) ✅ COMPLETE
-- [x] Create `src/run_fan_alignment.py` - FAN 2D landmark extraction
+### Phase A: FAN 2D Integration ✅ COMPLETE
+- [x] Create `py_screenalytics/face_alignment/fan2d.py` - FAN 2D landmark extraction
 - [x] Implement alignment transform (68-point → aligned crop)
 - [x] Add config: `config/pipeline/face_alignment.yaml`
 - [x] Write tests: `tests/test_face_alignment.py`
-- [x] Add fixtures: `tests/fixtures.py`
 - [x] Add `face-alignment>=1.4.0` to `requirements-ml.txt`
 - [x] Implement real FAN model loading with lazy initialization
-- [x] Add smoke tests with `@pytest.mark.slow` marker
-- [x] Wire `alignment_quality` heuristic into pipeline (populates field in artifacts)
-- [ ] **PENDING**: Integration with main pipeline (`tools/episode_run.py`)
+- [x] Wire into pipeline (`tools/episode_run.py` → harvest job)
+- [x] Write `aligned_faces.jsonl` artifacts
 
-### Phase B: LUVLi Quality Gate (FUTURE)
-- [ ] Replace `alignment_quality.compute_alignment_quality` heuristic with LUVLi model outputs
-- [ ] Add per-landmark uncertainty fields to `AlignedFace` dataclass
-- [ ] Add per-landmark visibility fields to artifacts
-- [ ] Update ACCEPTANCE_MATRIX.md status from "Heuristic-based" to "Model-based (LUVLi)"
-- [ ] Add quality gating to embedding pipeline with config flag
-- [ ] Write tests: `tests/test_alignment_quality_luvli.py`
+### Phase B: Quality Gate ✅ MVP IMPLEMENTED (heuristic-based)
+- [x] Implement `alignment_quality.compute_alignment_quality` heuristic in `py_screenalytics/face_alignment/fan2d.py`
+- [x] Wire heuristic quality score into `aligned_faces.jsonl` and `faces.jsonl`
+- [x] Add quality gating config: `face_alignment.quality_gate.enabled`
+- [x] Support `drop` and `downweight` modes via config
+- [ ] **FUTURE**: Replace heuristic with LUVLi model outputs (per-landmark uncertainty)
+- [ ] **FUTURE**: Add per-landmark visibility fields
+
+**Note:** MVP uses deterministic heuristics from FAN landmarks. True LUVLi model integration is future work.
+
+### Phase C: Head Pose ✅ MVP IMPLEMENTED (OpenCV solvePnP)
+- [x] Create `py_screenalytics/face_alignment/head_pose.py` - 3D pose extraction
+- [x] Implement yaw/pitch/roll extraction via OpenCV solvePnP
+- [x] Selective execution (every N frames, low-quality faces)
+- [x] Write pose fields into `aligned_faces.jsonl` and `faces.jsonl`
+- [x] Add config: `head_pose_3d.enabled`, `head_pose_3d.run_every_n_frames`
+- [ ] **FUTURE**: Replace with 3DDFA_V2 model for higher accuracy
+
+**Note:** MVP uses OpenCV solvePnP from FAN 68-point landmarks. True 3DDFA_V2 model integration is future work.
+
+---
 
 **Phase Status:**
-- Phase A (FAN 2D MVP): ✅ COMPLETE (heuristic quality wired in)
-- Phase B (LUVLi): ⏳ FUTURE - heuristic stub done, model integration pending
-- Phase C (3DDFA_V2): ⏳ FUTURE
-
-### Phase C: 3DDFA_V2 Selective 3D (FUTURE)
-- [ ] Create `src/ddfa_v2.py` - 3D alignment
-- [ ] Implement adaptive execution strategy
-- [ ] Extract and store head pose
-- [ ] Write tests: `tests/test_3ddfa.py`
+- Phase A (FAN 2D): ✅ COMPLETE - production code in `py_screenalytics/face_alignment/fan2d.py`
+- Phase B (Quality Gate): ✅ MVP - heuristic-based, integrated in harvest job
+- Phase C (Head Pose): ✅ MVP - OpenCV-based, integrated in harvest job
 
 ---
 

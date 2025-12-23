@@ -1,8 +1,9 @@
 # TODO: arcface-tensorrt
 
-**Status:** IN_PROGRESS
+**Status:** IMPLEMENTED (acceptance pending GPU validation)
 **Owner:** Engineering
 **Created:** 2025-12-11
+**Updated:** 2025-12-23
 **TTL:** 2026-01-10
 
 ---
@@ -12,40 +13,40 @@
 TensorRT-accelerated ArcFace embeddings for high-throughput face recognition.
 Targets 5x+ speedup over PyTorch with < 0.5% accuracy loss.
 
-**Full Documentation:** [docs/README.md](docs/README.md)
+**Full Documentation:** [docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md](../../docs/plans/in_progress/feature_arcface_tensorrt_onnxruntime.md)
 
 ---
 
 ## Tasks
 
-### Phase A: Engine Building ✅ SCAFFOLD COMPLETE
+### Phase A: Engine Building ✅ COMPLETE
 - [x] Create `src/tensorrt_builder.py` - ONNX to TensorRT conversion
 - [x] Implement SM architecture detection
 - [x] Add local caching with versioned filenames
-- [x] Add S3/MinIO storage support (stubbed)
+- [x] Add S3/MinIO storage support
 - [x] Add config: `config/pipeline/arcface_tensorrt.yaml`
-- [ ] **PENDING**: Test with real ONNX model
-- [ ] **PENDING**: Verify S3 upload/download
+- [ ] **ACCEPTANCE PENDING**: Test with real ONNX model on GPU
 
-### Phase B: Inference Wrapper ✅ SCAFFOLD COMPLETE
+### Phase B: Inference Wrapper ✅ COMPLETE
 - [x] Create `src/tensorrt_inference.py` - TensorRT inference
 - [x] Implement ArcFace preprocessing (matching PyTorch)
 - [x] Add batch inference support
 - [x] Add warmup and timing utilities
-- [ ] **PENDING**: Test on real GPU
+- [ ] **ACCEPTANCE PENDING**: Benchmark on real GPU
 
-### Phase C: Comparison & Validation ✅ SCAFFOLD COMPLETE
+### Phase C: Comparison & Validation ✅ COMPLETE
 - [x] Create `src/embedding_compare.py` - Backend comparison
 - [x] Implement cosine similarity and L2 distance metrics
 - [x] Add synthetic face generation for testing
 - [x] Create comparison CLI
-- [ ] **PENDING**: Run full comparison on eval set
+- [ ] **ACCEPTANCE PENDING**: Run full comparison on eval set
 
-### Phase D: Integration (FUTURE)
-- [ ] Wire into main pipeline as optional backend
-- [ ] Add config flag: `embedding.backend: tensorrt`
-- [ ] Performance benchmarks in CI
-- [ ] S3 engine distribution for team
+### Phase D: Integration ✅ COMPLETE
+- [x] Wire into main pipeline as optional backend (`tools/episode_run.py`)
+- [x] Add config flag: `embedding.backend: tensorrt`
+- [x] Automatic fallback to PyTorch when TRT unavailable
+- [ ] **ACCEPTANCE PENDING**: Performance benchmarks on GPU
+- [ ] **OPTIONAL**: S3 engine distribution for team
 
 ---
 

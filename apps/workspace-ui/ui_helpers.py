@@ -2672,6 +2672,132 @@ def _paths_present(paths_expected: Any) -> tuple[bool, list[str]]:
     return len(missing) == 0, missing
 
 
+def _parse_plan_doc_checklist(doc_path: str) -> dict[str, Any]:
+    """Parse markdown checklist from plan doc.
+
+    Returns dict with:
+        complete: list of {"id": "A1", "text": "..."}
+        incomplete: list of {"id": "C1", "text": "..."}
+        total: int
+        done: int
+        error: str or None
+    """
+    import re
+
+    repo_root = _repo_root()
+    full_path = repo_root / doc_path
+
+    if not full_path.exists():
+        return {"complete": [], "incomplete": [], "total": 0, "done": 0, "error": f"File not found: {doc_path}"}
+
+    try:
+        content = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return {"complete": [], "incomplete": [], "total": 0, "done": 0, "error": str(e)}
+
+    complete: list[dict[str, str]] = []
+    incomplete: list[dict[str, str]] = []
+
+    # Match checklist items: - [x] **A1.** Description or - [ ] **A1.** Description
+    pattern = re.compile(
+        r"^-\s*\[([xX ])\]\s*\*{0,2}([A-Z]\d+\.?)\*{0,2}\s*(.+?)$",
+        re.MULTILINE
+    )
+
+    for match in pattern.finditer(content):
+        checked = match.group(1).lower() == "x"
+        task_id = match.group(2).rstrip(".")
+        text = match.group(3).strip()
+        text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
+        if len(text) > 80:
+            text = text[:77] + "..."
+
+        item = {"id": task_id, "text": text}
+        if checked:
+            complete.append(item)
+        else:
+            incomplete.append(item)
+
+    return {
+        "complete": complete,
+        "incomplete": incomplete,
+        "total": len(complete) + len(incomplete),
+        "done": len(complete),
+        "error": None,
+    }
+
+
+def _get_anthropic_client_for_ui():
+    """Get Anthropic client for UI analysis. Returns (client, error_msg)."""
+    import os
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY not set"
+
+    try:
+        import anthropic
+        # Create client - avoid any proxy/httpx issues by using default httpx client
+        client = anthropic.Anthropic(api_key=api_key)
+        return client, None
+    except ImportError:
+        return None, "anthropic package not installed (pip install anthropic>=0.39.0)"
+    except TypeError as e:
+        return None, f"TypeError initializing client: {e}"
+    except Exception as e:
+        return None, f"Failed to initialize client: {e}"
+
+
+def _analyze_feature_with_claude(doc_path: str, feature_title: str) -> str:
+    """Use Anthropic API to analyze plan doc and generate checklist summary."""
+    import os
+
+    repo_root = _repo_root()
+    full_path = repo_root / doc_path
+
+    if not full_path.exists():
+        return f"Error: Plan doc not found at {doc_path}"
+
+    try:
+        content = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    client, error = _get_anthropic_client_for_ui()
+    if error:
+        return f"API Error: {error}"
+
+    # Use ANTHROPIC_MODEL env var, fallback to claude-sonnet-4
+    model = os.environ.get("ANTHROPIC_MODEL", os.environ.get("ANTHROPIC_DIAGNOSTIC_MODEL", "claude-sonnet-4-20250514"))
+
+    prompt = f"""Analyze this feature plan document and provide a concise checklist summary.
+
+## Feature: {feature_title}
+
+## Plan Document:
+{content}
+
+---
+
+Provide a brief analysis with:
+1. **Completed Tasks**: List the key tasks that are done (marked [x])
+2. **Remaining Tasks**: List the key tasks still pending (marked [ ])
+3. **Blocking Issues**: What's the most critical next step?
+4. **Estimated Completion**: Rough assessment of % complete
+
+Keep your response concise (under 300 words). Use bullet points."""
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"API Error: {e}"
+
+
 def _feature_present_in_ui(feature_id: str, catalog: dict[str, Any]) -> bool:
     docs = catalog.get("docs") or []
     if not isinstance(docs, list):
@@ -2976,14 +3102,23 @@ def render_page_header(page_id: str, page_title: str) -> None:
                 current_phase = first_incomplete_phase or "all complete"
                 progress = f"{complete_count}/{total_phases}" if total_phases > 0 else "—"
 
+                # Get plan doc paths for this feature
+                feature_docs = fmeta.get("docs") or []
+                if not isinstance(feature_docs, list):
+                    feature_docs = []
+                plan_docs = [d for d in feature_docs if "in_progress" in d]
+
                 # Add feature-level row to TODO table
                 feature_todo_rows.append({
+                    "fid": fid,
                     "feature": feature_title,
                     "current_phase": current_phase,
                     "progress": progress,
                     "jobs": _format_jobs(feature_jobs) if feature_jobs else "—",
                     "created": feature_created,
                     "updated": feature_updated,
+                    "plan_docs": plan_docs,
+                    "pending": fmeta.get("pending") or [],
                 })
 
             st.markdown("### Feature Status (Registry)")
@@ -2992,7 +3127,67 @@ def render_page_header(page_id: str, page_title: str) -> None:
 
             if feature_todo_rows:
                 st.markdown("**TODO** (Features)")
-                st.dataframe(feature_todo_rows, use_container_width=True, hide_index=True)
+                for row in feature_todo_rows:
+                    fid = row.get("fid", "unknown")
+                    feature_title = row.get("feature", fid)
+                    progress = row.get("progress", "—")
+                    plan_docs = row.get("plan_docs", [])
+                    pending_items = row.get("pending", [])
+
+                    # Keep expander open if there's a cached analysis
+                    analysis_key = f"feature_analysis_{fid}"
+                    has_analysis = analysis_key in st.session_state
+
+                    with st.expander(f"{feature_title} ({progress})", expanded=has_analysis):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.caption(f"Current phase: {row.get('current_phase', '—')}")
+                        with col2:
+                            st.caption(f"Jobs: {row.get('jobs', '—')}")
+
+                        if plan_docs:
+                            doc_path = plan_docs[0]
+                            checklist = _parse_plan_doc_checklist(doc_path)
+
+                            if checklist.get("error"):
+                                st.warning(checklist["error"])
+                            else:
+                                done = checklist.get("done", 0)
+                                total = checklist.get("total", 0)
+                                st.markdown(f"**Checklist Progress**: {done}/{total} tasks complete")
+
+                                complete_items = checklist.get("complete", [])
+                                if complete_items:
+                                    st.markdown("**Completed:**")
+                                    for item in complete_items[:5]:
+                                        st.markdown(f"- :white_check_mark: **{item['id']}**: {item['text']}")
+                                    if len(complete_items) > 5:
+                                        st.caption(f"...and {len(complete_items) - 5} more")
+
+                                incomplete_items = checklist.get("incomplete", [])
+                                if incomplete_items:
+                                    st.markdown("**Remaining:**")
+                                    for item in incomplete_items[:5]:
+                                        st.markdown(f"- :white_large_square: **{item['id']}**: {item['text']}")
+                                    if len(incomplete_items) > 5:
+                                        st.caption(f"...and {len(incomplete_items) - 5} more")
+
+                            if st.button("Analyze with AI", key=f"analyze_{fid}"):
+                                with st.spinner("Analyzing with Claude..."):
+                                    analysis = _analyze_feature_with_claude(doc_path, feature_title)
+                                    st.session_state[analysis_key] = analysis
+                                    st.rerun()  # Rerun to show analysis with expander open
+
+                            if analysis_key in st.session_state:
+                                st.markdown("---")
+                                st.markdown("**AI Analysis:**")
+                                st.markdown(st.session_state[analysis_key])
+                        else:
+                            st.info("No plan doc linked for this feature.")
+                            if pending_items:
+                                st.markdown("**Pending (from registry):**")
+                                for item in pending_items:
+                                    st.markdown(f"- {item}")
 
             if phase_in_progress_rows:
                 st.markdown("**IN PROGRESS** (Remaining Phases)")
