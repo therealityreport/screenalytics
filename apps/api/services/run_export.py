@@ -33,6 +33,9 @@ from py_screenalytics.episode_status import (
     normalize_stage_key,
     stage_artifacts,
     update_episode_status,
+    write_stage_failed,
+    write_stage_finished,
+    write_stage_started,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -5527,6 +5530,15 @@ def build_and_upload_debug_pdf(
     finalize_started_at: str | None = None
     ended_at: str | None = None
     total_steps = 1
+    try:
+        write_stage_started(
+            ep_id,
+            run_id,
+            "pdf",
+            started_at=datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+        )
+    except Exception as exc:  # pragma: no cover - best effort status update
+        LOGGER.warning("[export] Failed to mark PDF start: %s", exc)
 
     def _emit_pdf_progress(
         *,
@@ -5564,7 +5576,6 @@ def build_and_upload_debug_pdf(
             "ended_at": ended_at,
         }
         stage_update = {
-            "status": "running",
             "progress": progress_payload,
             "timestamps": timestamps_payload,
         }
@@ -5619,20 +5630,17 @@ def build_and_upload_debug_pdf(
             mark_end=True,
         )
         try:
-            update_episode_status(
+            write_stage_failed(
                 ep_id,
                 run_id,
-                stage_key="pdf",
-                stage_update={
-                    "status": "error",
-                    "started_at": started_at,
-                    "ended_at": _now_iso(),
-                    "duration_s": None,
-                    "error_reason": str(exc),
-                    "artifacts": stage_artifacts(ep_id, run_id, "pdf"),
-                    "metrics": {},
+                "pdf",
+                error_code=type(exc).__name__,
+                error_message=str(exc),
+                artifact_paths={
+                    entry["label"]: entry["path"]
+                    for entry in stage_artifacts(ep_id, run_id, "pdf")
+                    if isinstance(entry, dict) and entry.get("exists")
                 },
-                git_info=collect_git_state(),
             )
         except Exception as status_exc:
             LOGGER.warning("[export] Failed to update episode_status.json for PDF error: %s", status_exc)
@@ -5703,24 +5711,20 @@ def build_and_upload_debug_pdf(
     )
 
     try:
-        update_episode_status(
+        write_stage_finished(
             ep_id,
             run_id,
-            stage_key="pdf",
-            stage_update={
-                "status": "success",
-                "started_at": started_at,
-                "ended_at": _now_iso(),
-                "duration_s": None,
-                "error_reason": None,
-                "artifacts": stage_artifacts(ep_id, run_id, "pdf"),
-                "metrics": {
-                    "export_bytes": len(pdf_bytes),
-                    "export_key": upload_result.s3_key if upload_result else None,
-                    "upload_success": upload_result.success if upload_result else None,
-                },
+            "pdf",
+            artifact_paths={
+                entry["label"]: entry["path"]
+                for entry in stage_artifacts(ep_id, run_id, "pdf")
+                if isinstance(entry, dict) and entry.get("exists")
             },
-            git_info=collect_git_state(),
+            metrics={
+                "export_bytes": len(pdf_bytes),
+                "export_key": upload_result.s3_key if upload_result else None,
+                "upload_success": upload_result.success if upload_result else None,
+            },
         )
     except Exception as exc:
         LOGGER.warning("[export] Failed to update episode_status.json for PDF success: %s", exc)

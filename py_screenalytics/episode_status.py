@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,6 +49,9 @@ _STAGE_ALIASES: dict[str, str] = {
     "pdf": "pdf",
     "pdf_export": "pdf",
 }
+
+_LOCK_TIMEOUT_S = 5.0
+_LOCK_POLL_S = 0.05
 
 
 def _utcnow_iso() -> str:
@@ -183,11 +188,30 @@ def _coerce_stage(stage: Stage | str) -> Stage:
 
 @contextmanager
 def _status_lock(path: Path):
-    if fcntl is None:
-        yield
-        return
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        deadline = time.time() + _LOCK_TIMEOUT_S
+        fd: int | None = None
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                if time.time() >= deadline:
+                    LOGGER.warning("[episode_status] Lock wait timed out for %s", lock_path)
+                    break
+                time.sleep(_LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+        return
     with lock_path.open("w", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -536,6 +560,7 @@ def update_episode_status(
     git_info: Mapping[str, Any] | None = None,
     env: Mapping[str, Any] | None = None,
     storage: Mapping[str, Any] | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     run_id_norm = run_layout.normalize_run_id(run_id)
     def _apply(payload: dict[str, Any]) -> dict[str, Any]:
@@ -552,6 +577,17 @@ def update_episode_status(
             current = payload["stages"].get(stage_key, {})
             if not isinstance(current, dict):
                 current = {}
+            stage_enum = Stage.from_key(stage_key)
+            if stage_enum and "status" in stage_update:
+                existing_status, _, _ = _extract_existing_stage_state(current)
+                new_status = StageStatus.from_value(stage_update.get("status"))
+                _enforce_stage_transition(
+                    stage=stage_enum,
+                    run_id=run_id_norm,
+                    existing_status=existing_status,
+                    new_status=new_status,
+                    force=force,
+                )
             payload["stages"][stage_key] = _merge_stage(current, stage_update)
 
         if git_info:
@@ -742,6 +778,26 @@ def _extract_existing_stage_state(stage_entry: Mapping[str, Any]) -> tuple[Stage
     return status, started_at, finished_at
 
 
+_ALLOWED_TRANSITIONS: dict[StageStatus, set[StageStatus]] = {
+    StageStatus.NOT_STARTED: {
+        StageStatus.NOT_STARTED,
+        StageStatus.RUNNING,
+        StageStatus.SUCCESS,
+        StageStatus.FAILED,
+        StageStatus.BLOCKED,
+    },
+    StageStatus.RUNNING: {
+        StageStatus.RUNNING,
+        StageStatus.SUCCESS,
+        StageStatus.FAILED,
+        StageStatus.BLOCKED,
+    },
+    StageStatus.SUCCESS: {StageStatus.SUCCESS},
+    StageStatus.FAILED: {StageStatus.FAILED},
+    StageStatus.BLOCKED: {StageStatus.BLOCKED},
+}
+
+
 def _enforce_stage_transition(
     *,
     stage: Stage,
@@ -752,7 +808,9 @@ def _enforce_stage_transition(
 ) -> None:
     if force:
         return
-    if existing_status in {StageStatus.SUCCESS, StageStatus.FAILED} and new_status != existing_status:
+    if existing_status == new_status:
+        return
+    if new_status not in _ALLOWED_TRANSITIONS.get(existing_status, set()):
         LOGGER.warning(
             "[episode_status] Stage transition rejected stage=%s run_id=%s existing=%s new=%s",
             stage.value,

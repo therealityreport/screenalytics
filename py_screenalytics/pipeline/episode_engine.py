@@ -52,6 +52,13 @@ from py_screenalytics.pipeline.constants import (
     DEFAULT_MIN_BOX_AREA,
 )
 from py_screenalytics import run_layout
+from py_screenalytics.episode_status import (
+    normalize_stage_key,
+    stage_artifacts,
+    write_stage_failed,
+    write_stage_finished,
+    write_stage_started,
+)
 
 LOGGER = logging.getLogger("episode_engine")
 
@@ -396,6 +403,46 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _status_artifact_paths(ep_id: str, run_id: str, stage_key: str) -> Dict[str, str]:
+    normalized = normalize_stage_key(stage_key) or stage_key
+    try:
+        artifacts = stage_artifacts(ep_id, run_id, normalized)
+    except Exception:
+        return {}
+    paths: Dict[str, str] = {}
+    for entry in artifacts:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label")
+        path = entry.get("path")
+        if isinstance(label, str) and isinstance(path, str) and entry.get("exists"):
+            paths[label] = path
+    return paths
+
+
+def _stage_counts(stage: PipelineStage, summary: Dict[str, Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    if stage == PipelineStage.DETECT_TRACK:
+        detections = summary.get("detections")
+        tracks = summary.get("tracks")
+        if isinstance(detections, int):
+            counts["detections"] = detections
+        if isinstance(tracks, int):
+            counts["tracks"] = tracks
+    elif stage == PipelineStage.FACES_EMBED:
+        faces = summary.get("faces")
+        if isinstance(faces, int):
+            counts["faces"] = faces
+    elif stage == PipelineStage.CLUSTER:
+        identities = summary.get("identities_count", summary.get("identities"))
+        faces = summary.get("faces_count", summary.get("faces"))
+        if isinstance(identities, int):
+            counts["identities"] = identities
+        if isinstance(faces, int):
+            counts["faces"] = faces
+    return counts
+
+
 # Disk space constants
 MIN_DISK_SPACE_GB = 5.0  # Minimum free space required to start
 SPACE_MULTIPLIER = 3.0  # Estimated output is ~3x video size (crops, frames, manifests)
@@ -614,6 +661,12 @@ def run_stage(
     # Ensure directories exist
     ensure_artifact_dirs(episode_id, config.data_root)
 
+    if config.run_id:
+        try:
+            write_stage_started(episode_id, config.run_id, stage.value)
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark %s start: %s", stage.value, exc)
+
     try:
         # Import stage implementations from the stages module
         from py_screenalytics.pipeline.stages import (
@@ -637,6 +690,17 @@ def run_stage(
 
         # Check for stage-level failure
         if not summary.get("success", True):
+            if config.run_id:
+                try:
+                    write_stage_failed(
+                        episode_id,
+                        config.run_id,
+                        stage.value,
+                        error_code="stage_failed",
+                        error_message=str(summary.get("error", "Unknown error")),
+                    )
+                except Exception as status_exc:  # pragma: no cover - best effort status update
+                    LOGGER.warning("[episode_status] Failed to mark %s failure: %s", stage.value, status_exc)
             return StageResult(
                 stage=stage.value,
                 success=False,
@@ -647,6 +711,19 @@ def run_stage(
             )
 
         # Extract results from summary
+        if config.run_id:
+            try:
+                counts = _stage_counts(stage, summary)
+                write_stage_finished(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    counts=counts,
+                    metrics=counts or None,
+                    artifact_paths=_status_artifact_paths(episode_id, config.run_id, stage.value),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark %s success: %s", stage.value, status_exc)
         return StageResult(
             stage=stage.value,
             success=True,
@@ -669,6 +746,17 @@ def run_stage(
         runtime_sec = time.time() - start_time
         LOGGER.exception("Stage %s failed: %s", stage.value, exc)
 
+        if config.run_id:
+            try:
+                write_stage_failed(
+                    episode_id,
+                    config.run_id,
+                    stage.value,
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark %s failure: %s", stage.value, status_exc)
         return StageResult(
             stage=stage.value,
             success=False,

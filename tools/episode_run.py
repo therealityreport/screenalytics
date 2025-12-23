@@ -46,9 +46,12 @@ from apps.api.services.storage import (
 from py_screenalytics.artifacts import ensure_dirs, get_path
 from py_screenalytics import run_layout
 from py_screenalytics.episode_status import (
+    BlockedReason,
     collect_git_state,
+    stage_artifacts,
     stage_update_from_marker,
     update_episode_status,
+    write_stage_blocked,
     write_stage_failed,
     write_stage_finished,
     write_stage_started,
@@ -7020,6 +7023,24 @@ def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def _status_artifact_paths(ep_id: str, run_id: str, stage_key: str) -> dict[str, str]:
+    try:
+        artifacts = stage_artifacts(ep_id, run_id, stage_key)
+    except Exception:
+        return {}
+    paths: dict[str, str] = {}
+    for entry in artifacts:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label")
+        path = entry.get("path")
+        if not isinstance(label, str) or not isinstance(path, str):
+            continue
+        if entry.get("exists"):
+            paths[label] = path
+    return paths
+
+
 def _maybe_run_body_tracking(
     *,
     ep_id: str,
@@ -7031,6 +7052,20 @@ def _maybe_run_body_tracking(
     config = _load_body_tracking_config()
     enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
     if not enabled:
+        if effective_run_id:
+            try:
+                write_stage_blocked(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    BlockedReason(
+                        code="disabled",
+                        message="Body tracking disabled in config",
+                        details=None,
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark body_tracking blocked: %s", status_exc)
         return None
 
     output_dir = _body_tracking_dir_for_run(ep_id, run_id)
@@ -7046,12 +7081,15 @@ def _maybe_run_body_tracking(
         started_at=started_at,
     )
     if effective_run_id:
-        update_episode_status(
-            ep_id,
-            effective_run_id,
-            stage_key="body_tracking",
-            stage_update={"status": "running"},
-        )
+        try:
+            write_stage_started(
+                ep_id,
+                effective_run_id,
+                "body_tracking",
+                started_at=datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+            )
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark body_tracking start: %s", exc)
     stage_heartbeat.update(
         done=0,
         phase="running_frames",
@@ -7074,6 +7112,17 @@ def _maybe_run_body_tracking(
             "finished_at": _utcnow_iso(),
             "error": f"import_error: {exc}",
         }
+        if effective_run_id:
+            try:
+                write_stage_failed(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    error_code="import_error",
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark body_tracking failure: %s", status_exc)
         stage_heartbeat.update(
             done=0,
             phase="error",
@@ -7321,6 +7370,16 @@ def _maybe_run_body_tracking(
                 }
             },
         }
+        if effective_run_id:
+            try:
+                write_stage_finished(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    artifact_paths=_status_artifact_paths(ep_id, effective_run_id, "body_tracking"),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark body_tracking success: %s", status_exc)
         stage_heartbeat.update(
             done=1,
             phase="done",
@@ -7342,6 +7401,17 @@ def _maybe_run_body_tracking(
             "import_status": import_status,
             "error": str(exc),
         }
+        if effective_run_id:
+            try:
+                write_stage_failed(
+                    ep_id,
+                    effective_run_id,
+                    "body_tracking",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark body_tracking failure: %s", status_exc)
         stage_heartbeat.update(
             done=1,
             phase="error",
@@ -7371,6 +7441,20 @@ def _maybe_run_body_tracking_fusion(
     enabled = bool((config.get("body_tracking") or {}).get("enabled", False))
     if not enabled:
         LOGGER.debug("[body_tracking_fusion] Body tracking disabled, skipping fusion")
+        if effective_run_id:
+            try:
+                write_stage_blocked(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    BlockedReason(
+                        code="disabled",
+                        message="Track fusion disabled in config",
+                        details=None,
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark track_fusion blocked: %s", status_exc)
         return None
 
     # Check prerequisites
@@ -7378,11 +7462,30 @@ def _maybe_run_body_tracking_fusion(
     body_tracks_path = manifests_dir / "body_tracking" / "body_tracks.jsonl"
     faces_path = manifests_dir / "faces.jsonl"
 
+    missing_prereqs: list[str] = []
     if not body_tracks_path.exists():
-        LOGGER.debug("[body_tracking_fusion] body_tracks.jsonl not found, skipping fusion")
-        return None
+        missing_prereqs.append("body_tracking/body_tracks.jsonl")
     if not faces_path.exists():
-        LOGGER.debug("[body_tracking_fusion] faces.jsonl not found, skipping fusion")
+        missing_prereqs.append("faces.jsonl")
+    if missing_prereqs:
+        LOGGER.debug(
+            "[body_tracking_fusion] Missing prereqs %s; skipping fusion",
+            ", ".join(missing_prereqs),
+        )
+        if effective_run_id:
+            try:
+                write_stage_blocked(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    BlockedReason(
+                        code="missing_prereq",
+                        message="Track fusion prerequisites missing",
+                        details={"missing": missing_prereqs},
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark track_fusion blocked: %s", status_exc)
         return None
 
     output_dir = _body_tracking_dir_for_run(ep_id, run_id)
@@ -7398,12 +7501,15 @@ def _maybe_run_body_tracking_fusion(
         started_at=started_at,
     )
     if effective_run_id:
-        update_episode_status(
-            ep_id,
-            effective_run_id,
-            stage_key="track_fusion",
-            stage_update={"status": "running"},
-        )
+        try:
+            write_stage_started(
+                ep_id,
+                effective_run_id,
+                "track_fusion",
+                started_at=datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+            )
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark track_fusion start: %s", exc)
     stage_heartbeat.update(
         done=0,
         phase="running_frames",
@@ -7426,6 +7532,17 @@ def _maybe_run_body_tracking_fusion(
             "finished_at": _utcnow_iso(),
             "error": f"import_error: {exc}",
         }
+        if effective_run_id:
+            try:
+                write_stage_failed(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    error_code="import_error",
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark track_fusion failure: %s", status_exc)
         stage_heartbeat.update(
             done=0,
             phase="error",
@@ -7512,6 +7629,16 @@ def _maybe_run_body_tracking_fusion(
                 }
             },
         }
+        if effective_run_id:
+            try:
+                write_stage_finished(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    artifact_paths=_status_artifact_paths(ep_id, effective_run_id, "track_fusion"),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark track_fusion success: %s", status_exc)
         stage_heartbeat.update(
             done=1,
             phase="done",
@@ -7532,6 +7659,17 @@ def _maybe_run_body_tracking_fusion(
             "finished_at": _utcnow_iso(),
             "error": str(exc),
         }
+        if effective_run_id:
+            try:
+                write_stage_failed(
+                    ep_id,
+                    effective_run_id,
+                    "track_fusion",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark track_fusion failure: %s", status_exc)
         stage_heartbeat.update(
             done=1,
             phase="error",
@@ -8006,6 +8144,7 @@ def _run_detect_track_stage(
                     "detect",
                     counts={"detections": det_count, "tracks": track_count},
                     metrics={"detections": det_count, "tracks": track_count},
+                    artifact_paths=_status_artifact_paths(args.ep_id, run_id, "detect"),
                 )
             except Exception as exc:  # pragma: no cover - best effort status update
                 LOGGER.warning("[episode_status] Failed to mark detect success: %s", exc)
@@ -8146,33 +8285,66 @@ def _run_faces_embed_stage(
 
     run_id = getattr(args, "run_id", None)
     track_path = _tracks_path_for_run(args.ep_id, run_id)
-    # Validate tracks.jsonl exists and has usable data
-    require_manifest(
-        track_path,
-        "tracks.jsonl",
-        required_fields=["track_id"],
-        hint="run detect/track first",
-    )
-
-    # Load embedding config early (used for backend selection and alignment gating)
-    embedding_config = _load_embedding_config()
-
-    # Sort samples by frame to enable batch embedding per frame
-    # Apply per-track sampling to limit embedding/export volume
-    samples = _load_track_samples(
-        track_path,
-        sort_by_frame=True,
-        max_samples_per_track=getattr(args, "max_samples_per_track", 16),
-        min_samples_per_track=getattr(args, "min_samples_per_track", 4),
-        sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
-    )
-    if not samples:
-        raise ManifestValidationError(
-            "tracks.jsonl",
-            "File exists but contains no usable track samples – "
-            "detect/track likely produced tracks without valid bounding boxes",
+    try:
+        # Validate tracks.jsonl exists and has usable data
+        require_manifest(
             track_path,
+            "tracks.jsonl",
+            required_fields=["track_id"],
+            hint="run detect/track first",
         )
+
+        # Load embedding config early (used for backend selection and alignment gating)
+        embedding_config = _load_embedding_config()
+
+        # Sort samples by frame to enable batch embedding per frame
+        # Apply per-track sampling to limit embedding/export volume
+        samples = _load_track_samples(
+            track_path,
+            sort_by_frame=True,
+            max_samples_per_track=getattr(args, "max_samples_per_track", 16),
+            min_samples_per_track=getattr(args, "min_samples_per_track", 4),
+            sample_every_n_frames=getattr(args, "sample_every_n_frames", 4),
+        )
+        if not samples:
+            raise ManifestValidationError(
+                "tracks.jsonl",
+                "File exists but contains no usable track samples – "
+                "detect/track likely produced tracks without valid bounding boxes",
+                track_path,
+            )
+    except ManifestValidationError as exc:
+        if run_id:
+            try:
+                write_stage_blocked(
+                    args.ep_id,
+                    run_id,
+                    "faces",
+                    BlockedReason(
+                        code="missing_prereq",
+                        message=str(exc),
+                        details={
+                            "manifest": exc.manifest_type,
+                            "path": str(exc.path) if exc.path else None,
+                        },
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark faces blocked: %s", status_exc)
+        raise
+    except Exception as exc:
+        if run_id:
+            try:
+                write_stage_failed(
+                    args.ep_id,
+                    run_id,
+                    "faces",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark faces failure: %s", status_exc)
+        raise
 
     # Load face-alignment + alignment-quality gate config
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
@@ -8417,6 +8589,16 @@ def _run_faces_embed_stage(
         frames_total=faces_total,
         started_at=started_at,
     )
+    if run_id:
+        try:
+            write_stage_started(
+                args.ep_id,
+                run_id,
+                "faces",
+                started_at=datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+            )
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark faces start: %s", exc)
     faces_embed_succeeded = False
     try:
         def _emit_faces_progress(
@@ -9257,6 +9439,18 @@ def _run_faces_embed_stage(
             },
             run_id=run_id,
         )
+        if run_id:
+            try:
+                write_stage_finished(
+                    args.ep_id,
+                    run_id,
+                    "faces",
+                    counts={"faces": len(rows)},
+                    metrics={"faces": len(rows)},
+                    artifact_paths=_status_artifact_paths(args.ep_id, run_id, "faces"),
+                )
+            except Exception as exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark faces success: %s", exc)
 
         # Log completion for local mode streaming
         if LOCAL_MODE_INSTRUMENTATION:
@@ -9287,7 +9481,38 @@ def _run_faces_embed_stage(
 
         faces_embed_succeeded = True
         return summary
+    except ManifestValidationError as exc:
+        if run_id:
+            try:
+                write_stage_blocked(
+                    args.ep_id,
+                    run_id,
+                    "faces",
+                    BlockedReason(
+                        code="missing_prereq",
+                        message=str(exc),
+                        details={
+                            "manifest": exc.manifest_type,
+                            "path": str(exc.path) if exc.path else None,
+                        },
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark faces blocked: %s", status_exc)
+        progress.fail(str(exc))
+        raise
     except Exception as exc:
+        if run_id:
+            try:
+                write_stage_failed(
+                    args.ep_id,
+                    run_id,
+                    "faces",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark faces failure: %s", status_exc)
         progress.fail(str(exc))
         raise
     finally:
@@ -9488,68 +9713,101 @@ def _run_cluster_stage(
     run_id = getattr(args, "run_id", None)
     manifests_dir = _manifests_dir_for_run(args.ep_id, run_id)
     faces_path = manifests_dir / "faces.jsonl"
-    # Validate faces.jsonl exists, is non-empty, and has required fields
-    faces_row_count = require_manifest(
-        faces_path,
-        "faces.jsonl",
-        required_fields=["track_id", "embedding"],
-        hint="run faces embedding first",
-    )
-    faces_rows = list(_iter_jsonl(faces_path))
-    # Double-check we have usable embeddings
-    usable_faces = [r for r in faces_rows if r.get("embedding") and len(r.get("embedding", [])) > 0]
-    if not usable_faces:
-        raise ManifestValidationError(
-            "faces.jsonl",
-            f"File has {len(faces_rows)} rows but none contain valid embeddings – "
-            "faces embedding stage may have failed to compute embeddings",
+    try:
+        # Validate faces.jsonl exists, is non-empty, and has required fields
+        faces_row_count = require_manifest(
             faces_path,
+            "faces.jsonl",
+            required_fields=["track_id", "embedding"],
+            hint="run faces embedding first",
         )
-    faces_total = len(usable_faces)
-    if LOCAL_MODE_INSTRUMENTATION:
-        print(f"  faces_total={faces_total} (validated with embeddings)", flush=True)
-    faces_per_track: Dict[int, int] = defaultdict(int)
-    for face_row in usable_faces:
-        track_id_val = face_row.get("track_id")
-        try:
-            track_key = int(track_id_val)
-        except (TypeError, ValueError):
-            continue
-        faces_per_track[track_key] += 1
-    track_path = _tracks_path_for_run(args.ep_id, run_id)
-    # Validate tracks.jsonl for cross-reference
-    require_manifest(
-        track_path,
-        "tracks.jsonl",
-        required_fields=["track_id"],
-        hint="run detect/track first",
-    )
-    track_rows = list(_iter_jsonl(track_path))
-    detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
-    tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
-    distance_threshold = _cluster_distance_threshold(args.cluster_thresh)
-    flagged_tracks: set[int] = set()
-    for row in track_rows:
-        track_id_val = row.get("track_id")
-        try:
-            track_id = int(track_id_val)
-        except (TypeError, ValueError):
-            continue
-        spread_val = row.get("face_embedding_spread")
-        if spread_val is None:
-            continue
-        try:
-            spread = float(spread_val)
-        except (TypeError, ValueError):
-            continue
-        if spread >= distance_threshold:
-            flagged_tracks.add(track_id)
-    if flagged_tracks:
-        LOGGER.info(
-            "Pre-cluster sanity: %s tracks flagged as mixed (spread>=%.3f)",
-            len(flagged_tracks),
-            distance_threshold,
+        faces_rows = list(_iter_jsonl(faces_path))
+        # Double-check we have usable embeddings
+        usable_faces = [r for r in faces_rows if r.get("embedding") and len(r.get("embedding", [])) > 0]
+        if not usable_faces:
+            raise ManifestValidationError(
+                "faces.jsonl",
+                f"File has {len(faces_rows)} rows but none contain valid embeddings – "
+                "faces embedding stage may have failed to compute embeddings",
+                faces_path,
+            )
+        faces_total = len(usable_faces)
+        if LOCAL_MODE_INSTRUMENTATION:
+            print(f"  faces_total={faces_total} (validated with embeddings)", flush=True)
+        faces_per_track: Dict[int, int] = defaultdict(int)
+        for face_row in usable_faces:
+            track_id_val = face_row.get("track_id")
+            try:
+                track_key = int(track_id_val)
+            except (TypeError, ValueError):
+                continue
+            faces_per_track[track_key] += 1
+        track_path = _tracks_path_for_run(args.ep_id, run_id)
+        # Validate tracks.jsonl for cross-reference
+        require_manifest(
+            track_path,
+            "tracks.jsonl",
+            required_fields=["track_id"],
+            hint="run detect/track first",
         )
+        track_rows = list(_iter_jsonl(track_path))
+        detector_choice = _infer_detector_from_tracks(track_path) or DEFAULT_DETECTOR
+        tracker_choice = _infer_tracker_from_tracks(track_path) or DEFAULT_TRACKER
+        distance_threshold = _cluster_distance_threshold(args.cluster_thresh)
+        flagged_tracks: set[int] = set()
+        for row in track_rows:
+            track_id_val = row.get("track_id")
+            try:
+                track_id = int(track_id_val)
+            except (TypeError, ValueError):
+                continue
+            spread_val = row.get("face_embedding_spread")
+            if spread_val is None:
+                continue
+            try:
+                spread = float(spread_val)
+            except (TypeError, ValueError):
+                continue
+            if spread >= distance_threshold:
+                flagged_tracks.add(track_id)
+        if flagged_tracks:
+            LOGGER.info(
+                "Pre-cluster sanity: %s tracks flagged as mixed (spread>=%.3f)",
+                len(flagged_tracks),
+                distance_threshold,
+            )
+    except ManifestValidationError as exc:
+        if run_id:
+            try:
+                write_stage_blocked(
+                    args.ep_id,
+                    run_id,
+                    "cluster",
+                    BlockedReason(
+                        code="missing_prereq",
+                        message=str(exc),
+                        details={
+                            "manifest": exc.manifest_type,
+                            "path": str(exc.path) if exc.path else None,
+                        },
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark cluster blocked: %s", status_exc)
+        raise
+    except Exception as exc:
+        if run_id:
+            try:
+                write_stage_failed(
+                    args.ep_id,
+                    run_id,
+                    "cluster",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark cluster failure: %s", status_exc)
+        raise
 
     # =========================================================================
     # PRESERVE CAST-ASSIGNED CLUSTERS
@@ -9687,6 +9945,16 @@ def _run_cluster_stage(
         frames_total=faces_total,
         started_at=started_at,
     )
+    if run_id:
+        try:
+            write_stage_started(
+                args.ep_id,
+                run_id,
+                "cluster",
+                started_at=datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+            )
+        except Exception as exc:  # pragma: no cover - best effort status update
+            LOGGER.warning("[episode_status] Failed to mark cluster start: %s", exc)
 
     def _emit_cluster_progress(
         done: int,
@@ -10161,6 +10429,18 @@ def _run_cluster_stage(
             },
             run_id=run_id,
         )
+        if run_id:
+            try:
+                write_stage_finished(
+                    args.ep_id,
+                    run_id,
+                    "cluster",
+                    counts={"faces": faces_total, "identities": len(identity_payload)},
+                    metrics={"faces": faces_total, "identities": len(identity_payload)},
+                    artifact_paths=_status_artifact_paths(args.ep_id, run_id, "cluster"),
+                )
+            except Exception as exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark cluster success: %s", exc)
 
         if run_id:
             run_layout.write_active_run_id(
@@ -10177,7 +10457,38 @@ def _run_cluster_stage(
             print(f"  identities={identities}, faces={faces_total}, runtime={runtime_sec:.1f}s", flush=True)
 
         return summary
+    except ManifestValidationError as exc:
+        if run_id:
+            try:
+                write_stage_blocked(
+                    args.ep_id,
+                    run_id,
+                    "cluster",
+                    BlockedReason(
+                        code="missing_prereq",
+                        message=str(exc),
+                        details={
+                            "manifest": exc.manifest_type,
+                            "path": str(exc.path) if exc.path else None,
+                        },
+                    ),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark cluster blocked: %s", status_exc)
+        progress.fail(str(exc))
+        raise
     except Exception as exc:
+        if run_id:
+            try:
+                write_stage_failed(
+                    args.ep_id,
+                    run_id,
+                    "cluster",
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception as status_exc:  # pragma: no cover - best effort status update
+                LOGGER.warning("[episode_status] Failed to mark cluster failure: %s", status_exc)
         progress.fail(str(exc))
         raise
     finally:
