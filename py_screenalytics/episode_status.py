@@ -48,6 +48,9 @@ _STAGE_ALIASES: dict[str, str] = {
     "screentime": "screentime",
     "pdf": "pdf",
     "pdf_export": "pdf",
+    "segments": "segments",
+    "segments_parquet": "segments",
+    "segments_export": "segments",
 }
 
 _LOCK_TIMEOUT_S = 5.0
@@ -77,6 +80,7 @@ class Stage(str, Enum):
     TRACK_FUSION = "track_fusion"
     SCREENTIME = "screentime"
     PDF = "pdf"
+    SEGMENTS = "segments"
 
     @classmethod
     def from_key(cls, value: str | None) -> "Stage | None":
@@ -505,7 +509,12 @@ def stage_artifacts(ep_id: str, run_id: str, stage_key: str) -> list[dict[str, A
         ]
     elif stage_key == "pdf":
         artifacts = [
+            _artifact_entry(run_root / "exports" / "run_debug.pdf", "exports/run_debug.pdf"),
             _artifact_entry(run_root / "exports" / "export_index.json", "exports/export_index.json"),
+        ]
+    elif stage_key == "segments":
+        artifacts = [
+            _artifact_entry(run_root / "exports" / "segments.parquet", "exports/segments.parquet"),
         ]
     return artifacts
 

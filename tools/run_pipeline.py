@@ -176,6 +176,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _finalize_run_exports(ep_id: str, run_id: str) -> None:
+    try:
+        from apps.api.services.run_export import build_and_upload_debug_pdf, run_segments_export
+    except Exception as exc:
+        print(f"[run_pipeline] export imports failed: {exc}", file=sys.stderr)
+        return
+
+    try:
+        build_and_upload_debug_pdf(
+            ep_id=ep_id,
+            run_id=run_id,
+            upload_to_s3=False,
+            write_index=True,
+        )
+    except Exception as exc:
+        print(f"[run_pipeline] run_debug.pdf generation failed: {exc}", file=sys.stderr)
+
+    try:
+        run_segments_export(ep_id=ep_id, run_id=run_id)
+    except Exception as exc:
+        print(f"[run_pipeline] segments.parquet export failed: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     args = parse_args(argv)
@@ -227,13 +250,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print(f"[run_pipeline] Starting episode={args.ep_id} device={config.device} stride={config.stride}", file=sys.stderr)
 
-    # Run the pipeline
-    result = run_episode(args.ep_id, video_path, config)
+    result = None
+    try:
+        result = run_episode(args.ep_id, video_path, config)
+    finally:
+        _finalize_run_exports(args.ep_id, run_id)
 
     # Output results
     if args.json:
+        if result is None:
+            return 1
         print(result.to_json())
     else:
+        if result is None:
+            return 1
         if result.success:
             print(f"\n[run_pipeline] ✅ Success!", file=sys.stderr)
             print(f"  Episode:     {result.episode_id}", file=sys.stderr)

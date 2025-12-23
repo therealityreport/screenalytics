@@ -38,6 +38,29 @@ def stage_manifest_path(ep_id: str, run_id: str, stage: Stage | str) -> Path:
     return run_root / "manifests" / f"{stage_key}.json"
 
 
+def read_stage_manifest(ep_id: str, run_id: str, stage: Stage | str) -> dict[str, Any] | None:
+    """Read a stage manifest payload if present."""
+    path = stage_manifest_path(ep_id, run_id, stage)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load_stage_manifests(ep_id: str, run_id: str, stages: Iterable[Stage | str]) -> dict[str, dict[str, Any]]:
+    """Load manifests for the requested stages into a mapping keyed by stage."""
+    manifests: dict[str, dict[str, Any]] = {}
+    for stage in stages:
+        stage_key = _coerce_stage_key(stage)
+        payload = read_stage_manifest(ep_id, run_id, stage_key)
+        if isinstance(payload, dict):
+            manifests[stage_key] = payload
+    return manifests
+
+
 def write_stage_manifest(
     episode_id: str,
     run_id: str,

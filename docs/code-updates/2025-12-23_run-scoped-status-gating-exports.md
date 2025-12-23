@@ -85,6 +85,20 @@ Acceptance:
 - Writer/reader: `append_log(...)`, `tail_logs(...)`, `read_stage_progress(...)`.
 - UI: Episode Detail tail-reads per-stage logs and progress for RUNNING/FAILED stages (see `apps/workspace-ui/pages/2_Episode_Detail.py`).
 
+## Run-scoped export artifacts (audit-ready)
+- PDF debug report:
+  - Generator: `apps/api/services/run_export.py:generate_run_debug_pdf(...)`.
+  - Location: `data/manifests/{ep_id}/runs/{run_id}/exports/run_debug.pdf`.
+  - Sourcing: canonical status (`episode_status.json`) + stage manifests + run logs only (no ad-hoc artifact reads).
+- Segments parquet:
+  - Exporter: `apps/api/services/run_export.py:export_segments_parquet(...)` / `run_segments_export(...)`.
+  - Location: `data/manifests/{ep_id}/runs/{run_id}/exports/segments.parquet`.
+  - Source artifact: `body_tracking/screentime_comparison.json` (run-scoped).
+  - Schema columns: `run_id`, `episode_id`, `model_versions` (JSON), `identity`, `identity_id`, `track_id`, `segment_start`, `segment_end`, `duration_s`, `confidence`, `source`, `thresholds_snapshot_hash`.
+  - Determinism: rows sorted by identity_id → track_id → segment_start → segment_end; JSON fields serialized with sorted keys.
+  - Reconciliation: per-identity segment duration sums must match `breakdown.body_only_duration` within ±0.1s per segment.
+  - Missing segments: export stage is BLOCKED and no parquet is written.
+
 ## Current status sources (writers)
 - `tools/episode_run.py` writes phase markers via `_write_run_marker(...)` for detect/track, faces_embed, cluster, body_tracking, track_fusion.
 - `_write_run_marker(...)` writes **both** legacy and run-scoped markers and calls `_update_episode_status_from_marker(...)`.

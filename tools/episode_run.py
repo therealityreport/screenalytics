@@ -5475,6 +5475,29 @@ def _configure_logging(quiet: bool, verbose: bool) -> None:
         logging.getLogger("episode_run").setLevel(logging.DEBUG)
 
 
+def _finalize_run_exports(ep_id: str, run_id: str) -> None:
+    try:
+        from apps.api.services.run_export import build_and_upload_debug_pdf, run_segments_export
+    except Exception as exc:
+        LOGGER.warning("[export] Failed to import run_export: %s", exc)
+        return
+
+    try:
+        build_and_upload_debug_pdf(
+            ep_id=ep_id,
+            run_id=run_id,
+            upload_to_s3=False,
+            write_index=True,
+        )
+    except Exception as exc:
+        LOGGER.warning("[export] run_debug.pdf generation failed: %s", exc)
+
+    try:
+        run_segments_export(ep_id=ep_id, run_id=run_id)
+    except Exception as exc:
+        LOGGER.warning("[export] segments.parquet export failed: %s", exc)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     raw_argv: List[str] = getattr(args, "_raw_argv", [])
@@ -5614,24 +5637,29 @@ def main(argv: Iterable[str] | None = None) -> int:
     if len(phase_flags) > 1:
         raise ValueError("Specify at most one of --faces-embed/--cluster per run")
 
-    if args.faces_embed:
-        summary = _run_faces_embed_stage(args, storage, ep_ctx, s3_prefixes)
-    elif args.cluster:
-        summary = _run_cluster_stage(args, storage, ep_ctx, s3_prefixes)
-    else:
-        summary = _run_detect_track_stage(args, storage, ep_ctx, s3_prefixes)
+    summary: Dict[str, Any] | None = None
+    try:
+        if args.faces_embed:
+            summary = _run_faces_embed_stage(args, storage, ep_ctx, s3_prefixes)
+        elif args.cluster:
+            summary = _run_cluster_stage(args, storage, ep_ctx, s3_prefixes)
+        else:
+            summary = _run_detect_track_stage(args, storage, ep_ctx, s3_prefixes)
 
-    stage = summary.get("stage", "detect_track")
-    device_label = summary.get("device")
-    analyzed_fps = summary.get("analyzed_fps")
-    log_msg = f"stage={stage}"
-    if device_label:
-        log_msg += f" device={device_label}"
-    if analyzed_fps:
-        log_msg += f" analyzed_fps={analyzed_fps:.3f}"
-    print(f"[episode_run] {log_msg}", file=sys.stderr)
-    print("[episode_run] summary", summary, file=sys.stderr)
-    return 0
+        stage = summary.get("stage", "detect_track")
+        device_label = summary.get("device")
+        analyzed_fps = summary.get("analyzed_fps")
+        log_msg = f"stage={stage}"
+        if device_label:
+            log_msg += f" device={device_label}"
+        if analyzed_fps:
+            log_msg += f" analyzed_fps={analyzed_fps:.3f}"
+        print(f"[episode_run] {log_msg}", file=sys.stderr)
+        print("[episode_run] summary", summary, file=sys.stderr)
+        return 0
+    finally:
+        if getattr(args, "run_id", None):
+            _finalize_run_exports(args.ep_id, args.run_id)
 
 
 def _gate_config_from_args(args: argparse.Namespace, frame_stride: int) -> GateConfig:
