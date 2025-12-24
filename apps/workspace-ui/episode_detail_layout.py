@@ -171,7 +171,6 @@ def resolve_run_debug_pdf(
         s3_key=s3_key if isinstance(s3_key, str) and s3_key.strip() else None,
     )
 
-
 def stage_label(stage_key: str | None) -> str:
     if not stage_key:
         return "Unknown"

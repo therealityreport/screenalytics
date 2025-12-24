@@ -6,7 +6,6 @@ from pathlib import Path
 
 from py_screenalytics import run_layout
 
-
 def _load_layout_module():
     repo_root = Path(__file__).resolve().parents[2]
     module_path = repo_root / "apps" / "workspace-ui" / "episode_detail_layout.py"

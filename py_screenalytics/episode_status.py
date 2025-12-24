@@ -260,8 +260,10 @@ def read_episode_status(ep_id: str, run_id: str) -> EpisodeStatus:
     run_id_norm = run_layout.normalize_run_id(run_id)
     payload = _read_status_payload(ep_id, run_id_norm)
     if payload is None:
-        return derive_status_from_artifacts(ep_id, run_id_norm)
-    return _episode_status_from_payload(ep_id, run_id_norm, payload)
+        status = derive_status_from_artifacts(ep_id, run_id_norm)
+        return _reconcile_status_from_evidence(ep_id, run_id_norm, status)
+    status = _episode_status_from_payload(ep_id, run_id_norm, payload)
+    return _reconcile_status_from_evidence(ep_id, run_id_norm, status)
 
 
 def write_episode_status(ep_id: str, run_id: str, payload: Mapping[str, Any]) -> Path:
@@ -321,6 +323,14 @@ def _blocked_reason_to_payload(reason: BlockedReason | None) -> dict[str, Any] |
     if isinstance(reason.details, dict):
         payload["details"] = reason.details
     return payload
+
+
+def _blocked_reason_matches(left: BlockedReason | None, right: BlockedReason | None) -> bool:
+    if left is None or right is None:
+        return False
+    if left.code != right.code or left.message != right.message:
+        return False
+    return left.details == right.details
 
 
 def _artifact_paths_from_payload(payload: Mapping[str, Any]) -> dict[str, str]:
@@ -517,6 +527,103 @@ def stage_artifacts(ep_id: str, run_id: str, stage_key: str) -> list[dict[str, A
             _artifact_entry(run_root / "exports" / "segments.parquet", "exports/segments.parquet"),
         ]
     return artifacts
+
+
+def _stage_manifest_payload(ep_id: str, run_id: str, stage: Stage) -> tuple[dict[str, Any] | None, Path]:
+    run_root = run_layout.run_root(ep_id, run_layout.normalize_run_id(run_id))
+    path = run_root / "manifests" / f"{stage.value}.json"
+    if not path.exists():
+        return None, path
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, path
+    if not isinstance(payload, dict):
+        return None, path
+    return payload, path
+
+
+def _manifest_artifact_paths(payload: Mapping[str, Any]) -> dict[str, str]:
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        return {}
+    paths: dict[str, str] = {}
+    for entry in artifacts:
+        if not isinstance(entry, Mapping):
+            continue
+        label = entry.get("logical_name") or entry.get("label")
+        path = entry.get("path")
+        if isinstance(label, str) and isinstance(path, str):
+            paths[label] = path
+    return paths
+
+
+def _ensure_stage_state(ep_id: str, run_id: str, stage: Stage, state: StageState | None) -> StageState:
+    if state is not None:
+        return state
+    return StageState(
+        episode_id=ep_id,
+        run_id=run_layout.normalize_run_id(run_id),
+        stage=stage,
+        status=StageStatus.NOT_STARTED,
+    )
+
+
+def _reconcile_status_from_evidence(ep_id: str, run_id: str, status: EpisodeStatus) -> EpisodeStatus:
+    stage_plan = list(status.stage_plan) if status.stage_plan else []
+    if not stage_plan:
+        stage_plan = [stage for stage in Stage]
+    else:
+        for stage in Stage:
+            if stage not in stage_plan:
+                stage_plan.append(stage)
+
+    for stage in stage_plan:
+        current = status.stages.get(stage)
+        if current is not None and current.status != StageStatus.NOT_STARTED:
+            continue
+
+        manifest_payload, manifest_path = _stage_manifest_payload(ep_id, run_id, stage)
+        if manifest_payload is not None:
+            manifest_status = StageStatus.from_value(manifest_payload.get("status"))
+            if manifest_status != StageStatus.NOT_STARTED:
+                state = _ensure_stage_state(ep_id, run_id, stage, current)
+                state.status = manifest_status
+                state.derived = True
+                state.derived_from = [str(manifest_path)]
+                state.derivation_reason = "manifest_status"
+                if state.started_at is None:
+                    state.started_at = _parse_iso(manifest_payload.get("started_at"))
+                if state.finished_at is None:
+                    state.finished_at = _parse_iso(manifest_payload.get("finished_at"))
+                if state.duration_s is None:
+                    duration_s = manifest_payload.get("duration_s")
+                    if isinstance(duration_s, (int, float)):
+                        state.duration_s = float(duration_s)
+                manifest_artifacts = _manifest_artifact_paths(manifest_payload)
+                for key, value in manifest_artifacts.items():
+                    state.artifact_paths.setdefault(key, value)
+                status.stages[stage] = state
+                continue
+
+        artifacts = stage_artifacts(ep_id, run_id, stage.value)
+        artifact_paths = {
+            entry["label"]: entry["path"]
+            for entry in artifacts
+            if isinstance(entry, dict) and entry.get("exists") and isinstance(entry.get("label"), str)
+        }
+        if not artifact_paths:
+            continue
+        state = _ensure_stage_state(ep_id, run_id, stage, current)
+        state.status = StageStatus.SUCCESS
+        state.derived = True
+        state.derived_from = list(artifact_paths.values())
+        state.derivation_reason = "artifacts_present"
+        for key, value in artifact_paths.items():
+            state.artifact_paths.setdefault(key, value)
+        status.stages[stage] = state
+
+    return status
 
 
 def collect_git_state() -> dict[str, Any]:
@@ -885,6 +992,24 @@ def _write_stage_state(
     return _episode_status_from_payload(ep_id, run_id_norm, payload)
 
 
+def blocked_update_needed(
+    ep_id: str,
+    run_id: str,
+    stage: Stage | str,
+    blocked_reason: BlockedReason,
+) -> bool:
+    stage_enum = _coerce_stage(stage)
+    status = read_episode_status(ep_id, run_id)
+    current = status.stages.get(stage_enum)
+    if current is None:
+        return True
+    if current.status in {StageStatus.SUCCESS, StageStatus.FAILED}:
+        return False
+    if current.status == StageStatus.BLOCKED and _blocked_reason_matches(current.blocked_reason, blocked_reason):
+        return False
+    return True
+
+
 def write_stage_started(
     ep_id: str,
     run_id: str,
@@ -1003,6 +1128,17 @@ def write_stage_blocked(
     metrics: Mapping[str, Any] | None = None,
 ) -> EpisodeStatus:
     stage_enum = _coerce_stage(stage)
+    if not force:
+        current_status = read_episode_status(ep_id, run_id)
+        current_state = current_status.stages.get(stage_enum)
+        if current_state is not None:
+            if current_state.status in {StageStatus.SUCCESS, StageStatus.FAILED}:
+                return current_status
+            if current_state.status == StageStatus.BLOCKED and _blocked_reason_matches(
+                current_state.blocked_reason,
+                blocked_reason,
+            ):
+                return current_status
     if finished_at is None:
         finished_at = datetime.now(timezone.utc).replace(microsecond=0)
     state = StageState(

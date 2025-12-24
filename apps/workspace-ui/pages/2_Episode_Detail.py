@@ -2800,7 +2800,6 @@ def _canonical_stage_is_derived(entry: dict[str, Any] | None) -> bool:
         return False
     return bool(entry.get("derived") or entry.get("is_derived"))
 
-
 if status_payload is None:
     detect_phase_status: Dict[str, Any] = {}
     faces_phase_status: Dict[str, Any] = {"status": "unknown"}
